@@ -15,9 +15,15 @@ pub struct Settings {
     /// session), at the end of the config line. Set at launch and kept
     /// across reloads.
     notices: Vec<String>,
+    /// The window's transient notices (a link Brindle didn't open), after
+    /// `notices` on the config line until the window drops them. The
+    /// workspace keeps them (`workspace::notices::Notices`) and sets them
+    /// again after a reload, which makes settings without them.
+    transient_notices: Vec<String>,
     /// The window's config line (the error, the findings and the notices,
-    /// worded by [`config_line`]), shown until the file is fixed. Built
-    /// when the settings are, so drawing only reads it.
+    /// worded by [`config_line`]); the config's part shows until the file
+    /// is fixed. Built when the settings or the notices change, so drawing
+    /// only reads it.
     pub config_line: Option<SharedString>,
     /// Font size change from ctrl-+ / ctrl-- (applies to all tabs).
     pub zoom: f32,
@@ -112,6 +118,7 @@ impl Settings {
             config_error: report.error,
             config_findings: report.findings,
             notices: Vec::new(),
+            transient_notices: Vec::new(),
             config_line,
             zoom: 0.0,
             font,
@@ -160,9 +167,19 @@ impl Settings {
         &self.notices
     }
 
+    /// Makes `texts` the transient notices at the end of the config line,
+    /// after the window notices ([`Settings::with_notices`]).
+    pub fn set_transient_notices(&mut self, texts: Vec<String>) {
+        if self.transient_notices != texts {
+            self.transient_notices = texts;
+            self.reword_config_line();
+        }
+    }
+
     fn reword_config_line(&mut self) {
+        let notices: Vec<String> = self.notices.iter().chain(&self.transient_notices).cloned().collect();
         self.config_line =
-            config_line(self.config_error.as_deref(), &self.config_findings, &self.notices).map(SharedString::from);
+            config_line(self.config_error.as_deref(), &self.config_findings, &notices).map(SharedString::from);
     }
 
     /// Makes the config's global theme the active `brindle-ui` token set,
@@ -491,6 +508,31 @@ mod tests {
         let line: &str = settings.config_line.as_ref().unwrap();
         assert!(line.starts_with("Config: ") && line.ends_with(&notice), "{line}");
         assert_eq!(settings.notices(), [notice]);
+    }
+
+    /// Transient notices come after the window notices and go without
+    /// them; the config's findings and the window notices stay.
+    #[test]
+    fn transient_notices_follow_the_window_notices_and_go_alone() {
+        let finding = ConfigFinding::UnknownTheme { name: "x".into(), profile: None };
+        let report = ConfigReport { error: None, findings: vec![finding] };
+        let notice = crate::session::NO_STATE_DIR.to_string();
+        let mut settings =
+            Settings::new(Config::default(), report, names(&["DejaVu Sans Mono"])).with_notices(vec![notice.clone()]);
+        let before = settings.config_line.clone();
+        settings.set_transient_notices(vec!["couldn't open a".into(), "couldn't open b".into()]);
+        let line: &str = settings.config_line.as_ref().unwrap();
+        assert!(line.starts_with("Config: unknown theme"), "{line}");
+        assert!(line.ends_with(&format!("{notice}; couldn't open a; couldn't open b")), "{line}");
+        settings.set_transient_notices(Vec::new());
+        assert_eq!(settings.config_line, before);
+        assert_eq!(settings.notices(), [notice]);
+
+        let mut clean = Settings::new(Config::default(), ConfigReport::default(), names(&["DejaVu Sans Mono"]));
+        clean.set_transient_notices(vec!["couldn't open a".into()]);
+        assert_eq!(clean.config_line.as_ref().map(|line| line.as_ref()), Some("couldn't open a"));
+        clean.set_transient_notices(Vec::new());
+        assert_eq!(clean.config_line, None);
     }
 
     /// Every Windows has Segoe UI; no machine has the made-up family.

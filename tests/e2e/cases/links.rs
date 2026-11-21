@@ -1,7 +1,10 @@
 //! Clickable links: ctrl-click opens detected URLs and OSC 8 hyperlinks
 //! (through `BRINDLE_LINK_OPENER`, so no browser starts), ctrl-hover
-//! underlines them, and mouse-reporting programs don't get those clicks.
-//! The mouse is driven with Brindle's `--hover`/`--click` hooks.
+//! underlines them, and mouse-reporting programs don't get those clicks. A
+//! link that isn't opened is a notice on the window's config line, which
+//! goes after its lifetime or when dismissed. The mouse is driven with
+//! Brindle's `--hover`/`--click` hooks. The `refused`, `opener_fails` and
+//! notice cases run on Windows too.
 
 use std::path::{Path, PathBuf};
 
@@ -130,57 +133,157 @@ fn squeezed(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// How long a notice shows on the window's config line
+/// (`workspace::notices::NOTICE_LIFETIME`), on Brindle's own clock, which
+/// `BRINDLE_E2E_SLOW` doesn't stretch.
+const NOTICE_LIFETIME: f64 = 10.0;
+
+/// When a notice case dumps, unscaled, after its last step: well within
+/// [`NOTICE_LIFETIME`] of its clicks, and late enough that a slow first
+/// prompt (`Run::prompt`, a `--wait-for` on Windows) holding the steps back
+/// still leaves the last step before the dump (`Run::dump_after_last_step`).
+const NOTICE_SHOWN: f64 = 4.0;
+
+/// A link detected in plain text that Brindle refuses on every platform: a
+/// `file:` link to another host.
+const OTHER_HOST: &str = "file://elsewhere.invalid/x.exe";
+
+/// What the config line says of [`OTHER_HOST`].
+const OTHER_HOST_SAYS: &str = "couldn't open file://elsewhere.invalid/x.exe: it names another host (elsewhere.invalid)";
+
+/// Writes `lines` (escapes and all) to `name` in the case directory, after a
+/// clear screen and a cursor home, and gives the command that prints the
+/// file in the tab's shell, so the lines start at the top-left cell: `cat`
+/// in bash, `[Console]::Out.Write` in PowerShell. Nothing is typed but the
+/// file's path, so `--send` rewrites none of the escapes.
+fn shows(ctx: &Ctx, name: &str, lines: &[&str]) -> Result<String> {
+    let path = ctx.dir.join(name);
+    std::fs::write(&path, format!("\x1b[2J\x1b[H{}\r\n", lines.join("\r\n"))).map_err(|e| e.to_string())?;
+    let path = path.display().to_string();
+    Ok(if cfg!(windows) {
+        format!("[Console]::Out.Write([IO.File]::ReadAllText('{}'))\r", path.replace('\\', "/"))
+    } else {
+        format!("cat '{path}'\r")
+    })
+}
+
+/// The config line, which a case expects to show.
+fn config_line(out: &crate::brindle::Output) -> Result<&str> {
+    out.dump.config.as_deref().ok_or_else(|| format!("no --- config line; screen {:?}", out.dump.screen))
+}
+
+/// The screen holds none of Brindle's notices: they are the config line's.
+fn screen_untouched(out: &crate::brindle::Output) -> Result {
+    let text = out.dump.screen.join("\n");
+    ensure!(!squeezed(&text).contains(&squeezed("couldn't open")), "a notice was written into the terminal: {text:?}");
+    Ok(())
+}
+
 /// Links Brindle doesn't open: an OSC 8 hyperlink whose scheme isn't one it
-/// detects, and a `file:` link to another host. A ctrl-click on each says
-/// why in the tab, naming the link, and the opener is never run.
+/// detects, and one to a `file:` link on another host. A ctrl-click on each
+/// says why on the window's config line, naming the link, and writes
+/// nothing into the terminal. The opener is never started: it doesn't
+/// exist, and nothing says it couldn't run.
 pub fn refused(ctx: &Ctx) -> Result<Outcome> {
-    let (opener, log) = recorder(ctx)?;
-    let show = script(
+    let missing = ctx.dir.join("no-such-opener");
+    let print = shows(
         ctx,
-        "show",
-        "clear\n\
-         printf '\\033]8;;ms-settings:privacy\\033\\\\settings\\033]8;;\\033\\\\\\n'\n\
-         printf '\\033]8;;file://elsewhere.invalid/x.exe\\033\\\\tool\\033]8;;\\033\\\\\\n'\n",
+        "links.txt",
+        &[
+            "\x1b]8;;ms-settings:privacy\x1b\\[settings]\x1b]8;;\x1b\\",
+            "\x1b]8;;file://elsewhere.invalid/x.exe\x1b\\[tool]\x1b]8;;\x1b\\",
+        ],
     )?;
     let out = Run::new(ctx, "run")
-        .profile("Shell")
-        .env("BRINDLE_LINK_OPENER", &opener.display().to_string())
-        .send(&format!("sh {}\r", show.display()))
+        .env("BRINDLE_LINK_OPENER", &missing.display().to_string())
+        .prompt()
+        .send(&print)
+        .wait_for("[tool]")
         .click("ctrl-2,0")
-        .wait_for("couldn't open ms-settings")
         .click("ctrl-2,1")
-        .wait_for("couldn't open file:")
-        .dump_at(8.0)
+        .dump_after_last_step(NOTICE_SHOWN)
         .run()?;
-    let text = out.dump.screen.join("\n");
-    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {text:?}", out.dump.wait_timeouts);
-    let shown = squeezed(&text);
-    for line in [
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+    let line = config_line(&out)?;
+    for says in [
         "couldn't open ms-settings:privacy: its scheme (ms-settings) isn't one Brindle opens",
-        "couldn't open file://elsewhere.invalid/x.exe: it names another host (elsewhere.invalid)",
+        OTHER_HOST_SAYS,
     ] {
-        ensure!(shown.contains(&squeezed(line)), "the tab doesn't say {line:?}: {text:?}");
+        ensure!(line.contains(says), "the config line doesn't say {says:?}: {line:?}");
     }
-    ensure!(opened(&log).is_empty(), "the opener ran: {:?}", opened(&log));
+    ensure!(!line.contains("no-such-opener"), "the opener was started: {line:?}");
+    screen_untouched(&out)?;
     Ok(Outcome::Pass)
 }
 
-/// An opener that can't run: ctrl-click on a link says in the tab that it
-/// couldn't be opened, with the link and the cause.
+/// An opener that can't run: a ctrl-click on a link says on the config line
+/// that it couldn't be opened, with the link and the cause.
 pub fn opener_fails(ctx: &Ctx) -> Result<Outcome> {
     let missing = ctx.dir.join("no-such-opener");
-    let show = script(ctx, "show", "clear\nprintf 'see https://example.com/fails\\n'\n")?;
+    let print = shows(ctx, "link.txt", &["see https://example.com/fails"])?;
     let out = Run::new(ctx, "run")
-        .profile("Shell")
         .env("BRINDLE_LINK_OPENER", &missing.display().to_string())
-        .send(&format!("sh {}\r", show.display()))
+        .prompt()
+        .send(&print)
+        .wait_for("example.com/fails")
         .click("ctrl-10,0")
-        .wait_for("couldn't open")
-        .dump_at(6.0)
+        .dump_after_last_step(NOTICE_SHOWN)
         .run()?;
-    let text = out.dump.screen.join("\n");
-    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {text:?}", out.dump.wait_timeouts);
-    ensure!(text.contains("couldn't open https://example.com/fails"), "the tab doesn't name the link: {text:?}");
-    ensure!(text.contains("no-such-opener"), "the tab doesn't name the opener: {text:?}");
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+    let line = config_line(&out)?;
+    ensure!(line.contains("couldn't open https://example.com/fails"), "the config line doesn't name the link: {line:?}");
+    ensure!(line.contains("no-such-opener"), "the config line doesn't name the opener: {line:?}");
+    screen_untouched(&out)?;
+    Ok(Outcome::Pass)
+}
+
+/// A run that prints [`OTHER_HOST`] at the top of the tab and ctrl-clicks
+/// it, as its last step.
+fn click_other_host<'a>(ctx: &'a Ctx, label: &'static str) -> Result<Run<'a>> {
+    let print = shows(ctx, "other-host.txt", &[OTHER_HOST])?;
+    Ok(Run::new(ctx, label).prompt().send(&print).wait_for(OTHER_HOST).click("ctrl-2,0"))
+}
+
+/// A notice goes by itself once [`NOTICE_LIFETIME`] has passed: the run
+/// clicks a refused link as `links-notice-dismissed`'s first run does, and
+/// dumps after the notice's lifetime. That the click was refused is in the
+/// run's log.
+pub fn notice_expires(ctx: &Ctx) -> Result<Outcome> {
+    let out = click_other_host(ctx, "run")?
+        // `NOTICE_LIFETIME` after the click, unscaled, with the room a slow
+        // first prompt holds the click back by.
+        .dump_after_last_step(NOTICE_LIFETIME + NOTICE_SHOWN)
+        .run()?;
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+    let log = std::fs::read_to_string(ctx.dir.join("run.log")).map_err(|e| format!("run.log: {e}"))?;
+    ensure!(log.contains(OTHER_HOST_SAYS), "the click wasn't refused (run.log doesn't say {OTHER_HOST_SAYS:?})");
+    ensure!(
+        out.dump.config.as_deref().is_none_or(|line| !line.contains("couldn't open")),
+        "the notice outlived {NOTICE_LIFETIME} s: {:?}",
+        out.dump.config
+    );
+    screen_untouched(&out)?;
+    Ok(Outcome::Pass)
+}
+
+/// `dismiss_notices` drops a link's notice and leaves a config finding (an
+/// unknown theme) on the config line. The same run without it keeps both.
+pub fn notice_dismissed(ctx: &Ctx) -> Result<Outcome> {
+    const FINDING: &str = "unknown theme \"no-such-theme\"";
+    let kept = click_other_host(ctx, "kept")?.initial_theme("no-such-theme").dump_after_last_step(NOTICE_SHOWN).run()?;
+    ensure!(kept.dump.wait_timeouts.is_empty(), "kept: waits that gave up: {:?}", kept.dump.wait_timeouts);
+    let line = config_line(&kept)?;
+    ensure!(line.contains(FINDING) && line.contains(OTHER_HOST_SAYS), "kept: the config line {line:?}");
+
+    let dismissed = click_other_host(ctx, "dismissed")?
+        .initial_theme("no-such-theme")
+        .action("dismiss_notices")
+        .dump_after_last_step(NOTICE_SHOWN)
+        .run()?;
+    ensure!(dismissed.dump.wait_timeouts.is_empty(), "dismissed: waits that gave up: {:?}", dismissed.dump.wait_timeouts);
+    let line = config_line(&dismissed)?;
+    ensure!(line.contains(FINDING), "dismissing took the config finding: {line:?}");
+    ensure!(!line.contains("couldn't open"), "the notice is still shown: {line:?}");
+    screen_untouched(&dismissed)?;
     Ok(Outcome::Pass)
 }

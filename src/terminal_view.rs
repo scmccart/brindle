@@ -11,7 +11,7 @@ use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::TermMode;
 use gpui::{
-    App, Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
+    App, Bounds, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, Modifiers, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     ParentElement, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Styled, Subscription,
     Task, UTF16Selection, Window, div,
@@ -193,6 +193,15 @@ impl Focusable for TerminalView {
         self.focus_handle.clone()
     }
 }
+
+/// A ctrl-clicked link wasn't opened: Brindle refused it, or its opener
+/// couldn't run or failed. The text names the link and the cause
+/// ([`links::failure_text`]); the window shows it as a notice on its config
+/// line, and nothing is written into the terminal.
+#[derive(Clone, Debug)]
+pub struct LinkFailed(pub String);
+
+impl EventEmitter<LinkFailed> for TerminalView {}
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
@@ -551,15 +560,16 @@ impl TerminalView {
         }
     }
 
-    /// Opens `uri`, and says in this tab why it couldn't be (a notice
-    /// line), if the view still exists when the opener has answered.
+    /// Opens `uri`, and tells the window why it couldn't be
+    /// ([`LinkFailed`]), if the view still exists when the opener has
+    /// answered: at once for a refusal, later for an opener that failed.
     fn open_link(&mut self, uri: String, cx: &mut Context<Self>) {
         let opened = links::open(&uri);
         cx.spawn(async move |this, cx| {
             if let Ok(Err(error)) = opened.await {
                 let text = links::failure_text(&uri, &error);
                 log::warn!("{text}");
-                this.update(cx, |this, cx| this.terminal.update(cx, |terminal, cx| terminal.note(&text, cx))).ok();
+                this.update(cx, |_, cx| cx.emit(LinkFailed(text))).ok();
             }
         })
         .detach();

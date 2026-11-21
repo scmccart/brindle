@@ -8,9 +8,9 @@
 /// `text` as a dim line of terminal output: `\r\n`, the text in the dim
 /// style, `\r\n`.
 ///
-/// Every C0 and C1 control in `text` is dropped, so text from a server, an
-/// opener or a relay can't move the cursor, retitle the tab or end the dim
-/// style (`railway R5`). Its lines are joined with `; `, so it stays one
+/// Every C0 and C1 control in `text` is dropped, so text from a server or
+/// a relay can't move the cursor, retitle the tab or end the dim style
+/// (`railway R5`). Its lines are joined with `; `, so it stays one
 /// line.
 pub fn line(text: &str) -> String {
     let lines: Vec<String> = text

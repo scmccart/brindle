@@ -27,7 +27,7 @@ use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
-use crate::terminal_view::TerminalView;
+use crate::terminal_view::{LinkFailed, TerminalView};
 use crate::theme::Theme;
 use crate::workspace::{program_title, shortcut, terminal_automatic_title};
 
@@ -396,6 +396,9 @@ struct LaidOut {
 
 impl EventEmitter<TerminalEvent> for ZoneTreeView {}
 impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
+/// A zone's link wasn't opened, passed on to the window (whichever tab the
+/// zone is in: an opener can fail after its tab went to the background).
+impl EventEmitter<LinkFailed> for ZoneTreeView {}
 
 impl ZoneTreeView {
     /// Creates a `ZoneTreeView` with a single initial terminal zone, which
@@ -489,6 +492,7 @@ impl ZoneTreeView {
         let events = cx.subscribe_in(&terminal, window, move |this, _, event, window, cx| {
             this.on_zone_terminal_event(id, event, window, cx);
         });
+        let link_failed = cx.subscribe(&view, |_, _, failed: &LinkFailed, cx| cx.emit(failed.clone()));
         self.focus_serial += 1;
         let initial_title: SharedString = {
             let t = terminal.read(cx);
@@ -500,7 +504,7 @@ impl ZoneTreeView {
             title: initial_title,
             status,
             last_focused: self.focus_serial,
-            _subscriptions: vec![focus_in, events],
+            _subscriptions: vec![focus_in, events, link_failed],
         };
         self.zones.insert(id, zone);
     }

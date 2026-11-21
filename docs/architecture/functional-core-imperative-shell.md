@@ -74,7 +74,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
-| `src/workspace/{tabs,launch,overlays,previews}.rs` | which tab is active once one is added, removed, switched to or moved, and where a new one goes; the directory a new tab starts in; what asking for an overlay does while another shows; the theme and profile a tab shows while the settings dialog previews them |
+| `src/workspace/{tabs,launch,overlays,previews,notices}.rs` | which tab is active once one is added, removed, switched to or moved, and where a new one goes; the directory a new tab starts in; what asking for an overlay does while another shows; the theme and profile a tab shows while the settings dialog previews them; which transient notices the config line shows, and when the next one goes |
 | `src/picker/sessions.rs` | the sessions palette's state and rows: what each endpoint listed, the sessions killed from it and the failed kills, the highlighted row, whether every endpoint has answered |
 | `src/settings_dialog/themes.rs` | the settings dialog's Theme section (`ThemesState`): the theme list and its selection by name, the theme editor and its fields (`FieldId`), what deleting a theme refuses, and the `ConfigEdit` each operation writes |
 | `ui/src/filter.rs`, `ui/src/primitives/placement.rs` | filtering, where an overlay goes |

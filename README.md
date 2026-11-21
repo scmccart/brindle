@@ -607,7 +607,11 @@ detect itself:
   Only a path on a drive letter (`file:///C:/…`) is taken there.
 - **Quotes and spaces** in a link are percent-encoded before it is opened.
 
-When a link isn't opened, or the opener fails, the tab says why in a dim line.
+When a link isn't opened, or the opener fails, the line under the tab strip
+says why, naming the link, and the terminal is left alone. The notice goes
+after 10 seconds, or when you press its × button or run "Dismiss Notices"
+(`dismiss_notices`) from the command palette; config errors on that line
+stay until the config is fixed.
 
 To open links with something other than `xdg-open`, set
 `BRINDLE_LINK_OPENER` to a program; it gets the link as its only argument.
