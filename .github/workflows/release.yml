@@ -5,9 +5,10 @@
 # which bumps the four crates' versions, their Cargo.lock entries and
 # CHANGELOG.md. Merging it makes release-please tag vX.Y.Z and create a draft
 # release with that version's notes. This run then builds both platforms at
-# the tag with the same reusable workflows CI uses, attaches the Linux
-# archive, the Windows zip and SHA256SUMS, and publishes the release. A failed
-# build leaves the draft; rerunning the failed jobs completes it.
+# the tag with the same reusable workflows CI uses, signs the Windows
+# executables (the `sign` job), attaches the Linux archive, the Windows zip and
+# SHA256SUMS, and publishes the release. A failed build or signing leaves the
+# draft; rerunning the failed jobs completes it.
 #
 # release-please runs as a GitHub App (secrets RELEASE_APP_ID and
 # RELEASE_APP_PRIVATE_KEY): pull requests opened with GITHUB_TOKEN trigger no
@@ -61,8 +62,75 @@ jobs:
       ref: ${{ needs.release-please.outputs.tag }}
       winget-validate: false
 
+  # Signs brindle.exe and brindle-remote.exe in the Windows zip with Azure
+  # Artifact Signing and replaces the brindle-windows-x64 artifact with the
+  # re-zipped result. It signs in OIDC as a managed identity that trusts this
+  # repository's `release` environment (federated credential subject
+  # repo:scmccart/brindle:environment:release; see the shared-infrastructure
+  # repository). The environment holds secrets AZURE_CLIENT_ID,
+  # AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID. CI builds are not signed.
+  sign:
+    needs: [release-please, windows]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: brindle-windows-x64
+          path: unsigned
+      - name: Unpack the zip
+        shell: pwsh
+        run: |
+          $zips = @(Get-ChildItem unsigned -Filter *.zip)
+          if ($zips.Count -ne 1) { throw "expected one zip in unsigned/, found $($zips.Count)" }
+          Expand-Archive -Path $zips[0].FullName -DestinationPath stage
+          "ZIP_NAME=$($zips[0].Name)" >> $env:GITHUB_ENV
+          Get-ChildItem stage | Format-Table Name, Length
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          # The identity holds a role on the signing account, not on the subscription.
+          allow-no-subscriptions: true
+      - uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: https://eus.codesigning.azure.net/
+          signing-account-name: scmccart-signing
+          certificate-profile-name: public-trust
+          files: |
+            ${{ github.workspace }}\stage\brindle.exe
+            ${{ github.workspace }}\stage\brindle-remote.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+      - name: Check the signatures
+        shell: pwsh
+        run: |
+          foreach ($name in 'brindle.exe', 'brindle-remote.exe') {
+            $sig = Get-AuthenticodeSignature (Join-Path stage $name)
+            if ($sig.Status -ne 'Valid') { throw "$name signature is $($sig.Status): $($sig.StatusMessage)" }
+            "$name signed by $($sig.SignerCertificate.Subject)"
+          }
+      # Same layout as scripts/package-windows.ps1: the files at the zip's root.
+      - name: Repack the zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force signed | Out-Null
+          Compress-Archive -Path "stage\*" -DestinationPath (Join-Path signed $env:ZIP_NAME)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: brindle-windows-x64
+          path: signed/*.zip
+          retention-days: 14
+          overwrite: true
+
   publish:
-    needs: [release-please, linux, windows]
+    needs: [release-please, linux, windows, sign]
     if: needs.release-please.outputs.created == 'true'
     runs-on: ubuntu-26.04
     permissions:
