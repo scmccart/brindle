@@ -1,5 +1,14 @@
 {
   "enabledPlugins": {
     "architecture@scmccart-plugins": true
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git push --force*)",
+      "Bash(git push -f*)",
+      "Bash(git push * --force*)",
+      "Bash(git push * -f*)",
+      "Bash(git push *+*)"
+    ]
   }
 }

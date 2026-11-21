@@ -61,6 +61,10 @@ jobs:
             base=$BEFORE
           fi
           scripts/lint-commits ${base:+"$base"}
+      # actionlint (and shellcheck on every run: script), configured by
+      # .github/actionlint.yaml.
+      - name: Lint the workflows
+        run: scripts/lint-workflows
       # The Windows icons are rendered from the SVG and committed
       # (scripts/render-icons.sh), so the SVG's last change must be in or
       # before the .ico's.

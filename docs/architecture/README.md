@@ -2,7 +2,7 @@
 
 These are the normative architecture docs for Brindle, a GPU-accelerated terminal emulator whose tabs run in a persistent terminal server. "Normative" means code review enforces each doc's **Rules** section, and reviewers cite rule numbers from these files by the short names below (`fcis R2`, `process R5`).
 
-`CLAUDE.md`'s "Architecture" section describes how the code works today. These docs say what a change must keep true. Behaviour is specified separately, in `openspec/specs/`.
+`docs/code-map.md` describes how the code works today. These docs say what a change must keep true. Behaviour is specified separately, in `openspec/specs/`.
 
 ## Dependency rule
 

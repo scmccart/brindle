@@ -99,5 +99,5 @@ pub enum Listing { Sessions(Vec<SessionInfo>), Connecting, Offline(String), Pend
 ## References
 
 - The architecture plugin's `railway-oriented-programming` skill.
-- `CLAUDE.md`, "Brindle's client" (the link's reasons for ending) and "Terminal server" (exit codes, `ERROR` frames).
+- `docs/code-map.md`, "Brindle's client" (the link's reasons for ending) and "Terminal server" (exit codes, `ERROR` frames).
 - Exceptions in force: [README.md](README.md#exceptions-in-force).

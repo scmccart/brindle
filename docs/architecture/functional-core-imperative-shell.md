@@ -149,5 +149,5 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 ## References
 
 - The architecture plugin's `functional-core-imperative-shell` skill.
-- `CLAUDE.md`, "Architecture": `terminal/`, `brindle-term-core`, `picker.rs`, `settings.rs`.
+- `docs/code-map.md`: `terminal/`, `brindle-term-core`, `picker.rs`, `settings.rs`.
 - `openspec/changes/archive/` for `add-brindle-ui` and `terminal-server`, which set the crate split.

@@ -5,7 +5,16 @@ export default {
   extends: ['@commitlint/config-conventional'],
   // Merges keep their `Merge …` subjects; commitlint's own ignores only
   // cover git's wordings (`Merge branch …`, `Merge pull request …`).
-  ignores: [(message) => message.startsWith('Merge ')],
+  // The two older commits whose wrapped bodies read as trailers, from before
+  // footer-leading-blank was an error, so a whole-history run still passes.
+  ignores: [
+    (message) => message.startsWith('Merge '),
+    (message) =>
+      [
+        "fix: name Windows tabs after their program, not the console's path title\n",
+        'build: version information in brindle.exe\n',
+      ].some((header) => message.startsWith(header)),
+  ],
   plugins: [
     {
       rules: {
@@ -24,6 +33,11 @@ export default {
     // Not kebab-case: that rejects `e2e`.
     'scope-case': [2, 'always', 'lower-case'],
     'header-max-length': [2, 'always', 100],
+    // Errors, not config-conventional's warnings, so the commit-msg hook
+    // stops a body line that reads as a trailer (`id-token: write` after a
+    // wrap) before the commit is pushed and can only be fixed by a rewrite.
+    'body-leading-blank': [2, 'always'],
+    'footer-leading-blank': [2, 'always'],
     // Bodies are wrapped by hand; Dependabot's carry long URLs and YAML.
     'body-max-line-length': [0],
     'footer-max-line-length': [0],
