@@ -5,9 +5,10 @@
 # which bumps the four crates' versions, their Cargo.lock entries and
 # CHANGELOG.md. Merging it makes release-please tag vX.Y.Z and create a draft
 # release with that version's notes. This run then builds both platforms at
-# the tag with the same reusable workflows CI uses, attaches the Linux
-# archive, the Windows zip and SHA256SUMS, and publishes the release. A failed
-# build leaves the draft; rerunning the failed jobs completes it.
+# the tag with the same reusable workflows CI uses, attests the binaries'
+# build provenance, attaches the Linux archive, the Windows zip and
+# SHA256SUMS, and publishes the release. A failed build or attestation leaves
+# the draft; rerunning the failed jobs completes it.
 #
 # release-please runs as a GitHub App (secrets RELEASE_APP_ID and
 # RELEASE_APP_PRIVATE_KEY): pull requests opened with GITHUB_TOKEN trigger no
@@ -61,8 +62,45 @@ jobs:
       ref: ${{ needs.release-please.outputs.tag }}
       winget-validate: false
 
-  publish:
+  # Build provenance for every binary the release ships, and for the archives
+  # that carry them, so `gh attestation verify FILE -R scmccart/brindle`
+  # checks a download, or a binary unpacked from one, against this run. It
+  # runs here rather than in the reusable build workflows because CI calls
+  # those too, and a called workflow can't ask for id-token: write unless
+  # every caller grants it. The builds ran earlier in this same run, which
+  # is the run the provenance names.
+  attest:
     needs: [release-please, linux, windows]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: brindle-*-x64
+          path: dist
+          merge-multiple: true
+      - name: Unpack the binaries
+        run: |
+          mkdir -p bin/linux bin/windows
+          tar -xzf dist/*.tar.gz -C bin/linux --strip-components=1
+          unzip -q dist/*.zip -d bin/windows
+          ls -l bin/linux bin/windows
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            bin/linux/brindle
+            bin/linux/brindle-remote-linux-x86_64
+            bin/windows/brindle.exe
+            bin/windows/brindle-remote.exe
+
+  publish:
+    needs: [release-please, linux, windows, attest]
     if: needs.release-please.outputs.created == 'true'
     runs-on: ubuntu-26.04
     permissions:

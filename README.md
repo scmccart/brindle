@@ -385,6 +385,17 @@ install -Dm755 -t ~/.local/bin brindle-<version>-x86_64-unknown-linux-gnu/brindl
 
 To update, install the new release's files the same way.
 
+Each release's archives, and the binaries in them (`brindle`,
+`brindle-remote-linux-x86_64`, `brindle.exe`, `brindle-remote.exe`), carry a
+[build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds)
+from the release workflow. With the GitHub CLI, check a download, or a binary
+you unpacked from one, before running it:
+
+```sh
+gh attestation verify brindle-<version>-x86_64-unknown-linux-gnu.tar.gz -R scmccart/brindle
+gh attestation verify ~/.local/bin/brindle -R scmccart/brindle
+```
+
 From a checkout, after installing the build dependencies above:
 
 ```sh
@@ -420,7 +431,8 @@ carries the packaged ConPTY and unpacks it to
 `brindle.exe`. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
 zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with `brindle.exe`,
 `brindle-remote.exe`, the Linux remote helper and the licences (`SHA256SUMS`
-beside it lists its hash); unpack it anywhere, keeping the two exes together,
+beside it lists its hash, and `gh attestation verify` checks it and both exes
+as above); unpack it anywhere, keeping the two exes together,
 and run `brindle.exe`. Once releases are published to WinGet, it installs as
 the `brindle` command on `PATH`, with the terminal server's `brindle-remote`
 (`brindle-remote status`, `list`, `kill`, `stop`) beside it:
