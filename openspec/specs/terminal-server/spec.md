@@ -482,3 +482,10 @@ On Windows, a session's program named without a directory SHALL be found through
 #### Scenario: Program planted beside the helper
 - **WHEN** a `cmd.exe` is placed in the directory of the helper copy the server runs from, and a profile with `command = "cmd.exe"` opens a tab
 - **THEN** the tab runs `cmd.exe` from `PATH`, not the placed file
+
+### Requirement: Command lines survive attach
+The server SHALL keep each command's reported line (`OSC 633 ; E`) with its prompt marks, and an attaching or reconnecting client SHALL receive it with the marks. A client attached to a server that predates command-line tracking SHALL have the marks without the reported lines.
+
+#### Scenario: Copy after attach
+- **WHEN** a detached session's shell reported `make test` with `633;E`, and a client attaches and runs Copy Last Command Line
+- **THEN** the clipboard holds `make test`
