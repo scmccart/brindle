@@ -42,6 +42,7 @@ use crate::server::platform::{Loop, Source, Listener, Pty};
 | a remote endpoint's transport (OpenSSH, Docker and Podman exec) | `src/remote/client.rs` |
 | a local program's name and directory, the path style its directory reports use (`LOCAL_PATH_STYLE`) and whether its directory is read from the system or taken from those reports (`LOCAL_DIRECTORY`) | `src/terminal/process.rs` |
 | the primary selection | `src/primary.rs` |
+| showing the pointer a frame sets at once, not at the mouse's next move | `src/cursor.rs` |
 | desktop notifications and window activation | `src/notify/{dbus,toast,activation}.rs` |
 | launcher registration | `src/desktop.rs` |
 | opening links | `src/terminal/links.rs` |

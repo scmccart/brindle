@@ -1220,6 +1220,8 @@ const SEAMS: &[&str] = &[
     "src/terminal/process.rs",
     // the primary selection
     "src/primary.rs",
+    // showing a frame's pointer at once
+    "src/cursor.rs",
     // desktop notifications and window activation
     "src/notify/dbus.rs",
     "src/notify/toast.rs",

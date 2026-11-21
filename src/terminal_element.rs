@@ -593,6 +593,13 @@ impl Element for TerminalElement {
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
         // Over the grid only: the program's shape never reaches the chrome.
         window.set_cursor_style(frame.pointer, &frame.hitbox);
+        // A pointer that changed with no mouse move (a drag's press or
+        // release, a ctrl press, a program's OSC 22) is shown now, not at
+        // the next move (`pointer::Shown`).
+        let over_grid = frame.hitbox.is_hovered(window);
+        if self.view.read(cx).pointer_painted(frame.pointer, over_grid) {
+            crate::cursor::show_now(window, cx);
+        }
 
         // Down and wheel only count over this terminal; move and up are
         // global so drags keep tracking outside it.

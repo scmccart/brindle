@@ -1,8 +1,10 @@
 //! Pointer shapes (xterm's and kitty's `OSC 22`): the query replies, read
 //! back by the shell byte for byte, and the program's shape on each screen
 //! in the dump (`--- pointer shape=NAME screen=…`). GPUI's pointer can't be
-//! captured, so the dump line is what these check; the precedence over
-//! links and selections is `terminal::pointer::choose`'s unit tests.
+//! captured, so the dump lines are what these check: the program's shape,
+//! and the pointer the grid's last painted frame chose (`--- grid-pointer`)
+//! through a selection drag. The precedence over links and selections is
+//! `terminal::pointer::choose`'s unit tests.
 
 use crate::brindle::{Output, Run};
 use crate::{Ctx, Outcome, Result, ensure};
@@ -133,5 +135,49 @@ pub fn dump(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(out.dump.wait_timeouts.is_empty(), "after a reset: a wait gave up; screen {:?}", out.dump.screen);
     ensure!(out.dump.pointer.is_none(), "a reset leaves Brindle's own: pointer {:?}", out.dump.pointer);
+    Ok(Outcome::Pass)
+}
+
+/// A selection drag over a program's crosshair: the frames painted while
+/// the left button is held choose the text beam, and the frame after the
+/// release chooses the crosshair again. The dump's `--- grid-pointer` is
+/// the last painted frame's, so a press or a release that draws no frame
+/// shows here as the previous pointer. The release moves nothing, as a real
+/// one after a drag: the drag's own frames can't stand in for its frame.
+pub fn drag(ctx: &Ctx) -> Result<Outcome> {
+    let crosshair = format!(r"{}; echo pointer-''set\r", osc22(">crosshair"));
+    let held = Run::new(ctx, "held")
+        .profile("Shell")
+        .send(PLAIN)
+        .send(&crosshair)
+        .wait_for("pointer-set")
+        .press("0,0")
+        .dump_at(6.5)
+        .run()?;
+    ensure!(held.dump.wait_timeouts.is_empty(), "while held: a wait gave up; screen {:?}", held.dump.screen);
+    ensure!(
+        held.dump.pointer.as_deref() == Some("shape=crosshair screen=primary"),
+        "while held: the program's pointer {:?}",
+        held.dump.pointer
+    );
+    ensure!(held.dump.grid_pointer.as_deref() == Some("text"), "while held: grid pointer {:?}", held.dump.grid_pointer);
+
+    let released = Run::new(ctx, "released")
+        .profile("Shell")
+        .send(PLAIN)
+        .send(&crosshair)
+        .wait_for("pointer-set")
+        .press("0,0")
+        .hover("4,0")
+        .release("4,0")
+        .dump_at(8.5)
+        .run()?;
+    ensure!(released.dump.wait_timeouts.is_empty(), "after the release: a wait gave up; screen {:?}", released.dump.screen);
+    ensure!(released.dump.selection.is_some(), "the drag selected nothing; screen {:?}", released.dump.screen);
+    ensure!(
+        released.dump.grid_pointer.as_deref() == Some("crosshair"),
+        "after the release: grid pointer {:?}",
+        released.dump.grid_pointer
+    );
     Ok(Outcome::Pass)
 }

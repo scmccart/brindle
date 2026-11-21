@@ -2173,12 +2173,13 @@ impl Workspace {
         }
     }
 
-    /// Debug hook for `--hover` / `--click`: mouse events for a cell of the
-    /// active terminal, through its own handlers.
+    /// Debug hook for `--hover` / `--click` / `--right-click` / `--press` /
+    /// `--release`: mouse events for a cell of the active terminal, through
+    /// its own handlers.
     pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_tab().and_then(|t| t.active_view(cx)) {
             Some(view) => view.update(cx, |view, cx| view.debug_pointer(step, window, cx)),
-            None => log::error!("--hover/--click: no active terminal"),
+            None => log::error!("--hover/--click/--right-click/--press/--release: no active terminal"),
         }
     }
 
@@ -2215,7 +2216,7 @@ impl Workspace {
             }
             out.push_str(&describe_fonts(cx));
             let view = self.active_tab().and_then(|t| t.active_view(cx));
-            if let Some(link) = view.and_then(|v| v.read(cx).hovered_link.clone()) {
+            if let Some(link) = view.as_ref().and_then(|v| v.read(cx).hovered_link.clone()) {
                 out.push_str(&format!("--- link {}\n", link.uri));
             }
             if let Some(text) = terminal.selection_text() {
@@ -2224,6 +2225,11 @@ impl Workspace {
             out.push_str(&terminal.status().describe());
             out.push_str(&terminal.contexts().describe());
             out.push_str(&terminal.pointer().describe(terminal.pointer_screen()));
+            // The pointer the grid's last painted frame chose, so a check
+            // sees what the frame set, not what the state would choose now.
+            if let Some(style) = view.as_ref().and_then(|v| v.read(cx).shown_pointer()) {
+                out.push_str(&format!("--- grid-pointer {}\n", crate::terminal::pointer::css_name(style)));
+            }
             out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_progress());

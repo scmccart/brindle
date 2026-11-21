@@ -151,6 +151,7 @@ fn unix() -> Vec<Case> {
         display("pointer-query", pointer::query),
         display("pointer-current", pointer::current),
         display("pointer-dump", pointer::dump),
+        display("pointer-drag", pointer::drag),
         display("search-local", search::local),
         display("search-step", search::step),
         display("search-long-query", search::long_query),

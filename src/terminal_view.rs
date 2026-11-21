@@ -21,7 +21,7 @@ use crate::actions::*;
 use crate::find_bar::{FindBar, LastFind};
 use crate::latency::Latency;
 use crate::terminal::mouse::{self, Button};
-use crate::terminal::{Link, Terminal, keys, links, report_focus};
+use crate::terminal::{Link, Terminal, keys, links, pointer, report_focus};
 use crate::terminal_element::TerminalElement;
 
 /// Geometry of the last painted frame, used for hit-testing.
@@ -97,6 +97,12 @@ pub enum PointerAction {
     Hover,
     /// `--click` and `--right-click`: press and release a button.
     Click(PointerButton),
+    /// `--press`: press the left button and hold it, so a `--hover` drags
+    /// until a `--release`.
+    Press,
+    /// `--release`: release the held left button over the cell, with no
+    /// move first.
+    Release,
 }
 
 /// The button of a clicking pointer step.
@@ -115,9 +121,9 @@ impl PointerButton {
     }
 }
 
-/// A `--hover`, `--click` or `--right-click` debug step: `[mods-]COL,ROW`,
-/// zero-based cells of the active terminal, e.g. `ctrl-3,0` or
-/// `ctrl-shift-10,2`.
+/// A `--hover`, `--click`, `--right-click`, `--press` or `--release` debug
+/// step: `[mods-]COL,ROW`, zero-based cells of the active terminal, e.g.
+/// `ctrl-3,0` or `ctrl-shift-10,2`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointerStep {
     pub modifiers: Modifiers,
@@ -161,6 +167,9 @@ struct MouseState {
     modifiers: Modifiers,
     /// A ctrl-press on this link opens it if released over the same link.
     pending_link: Option<Link>,
+    /// A `--press` debug step holds the left button until a `--release`,
+    /// so a `--hover` between them drags.
+    debug_held: bool,
 }
 
 /// Link activation takes ctrl without alt (alt-drag stays a block selection).
@@ -182,6 +191,8 @@ pub struct TerminalView {
     /// The last search, restored when the bar opens again.
     pub last_find: Option<LastFind>,
     mouse: MouseState,
+    /// The pointer the grid's last painted frame chose.
+    pointer_shown: Cell<pointer::Shown>,
     window_active: bool,
     /// Cursor blink timer; only runs while this terminal has focus.
     _blink: Option<Task<()>>,
@@ -259,6 +270,7 @@ impl TerminalView {
             find: None,
             last_find: None,
             mouse: MouseState::default(),
+            pointer_shown: Cell::new(pointer::Shown::default()),
             window_active: true,
             _blink: None,
             _subscriptions: subscriptions,
@@ -525,7 +537,7 @@ impl TerminalView {
                     _ => SelectionType::Lines,
                 };
                 self.terminal.update(cx, |t, cx| t.start_selection(col, line, side, ty, cx));
-                self.mouse.selecting = true;
+                self.set_selecting(true, cx);
             }
             gpui::MouseButton::Middle => self.paste_primary_selection(cx),
             _ => {}
@@ -591,7 +603,7 @@ impl TerminalView {
             return;
         }
         if self.mouse.selecting && e.button == gpui::MouseButton::Left {
-            self.mouse.selecting = false;
+            self.set_selecting(false, cx);
             let to_clipboard = crate::settings::Settings::get(cx).config.copy_on_select;
             self.terminal.update(cx, |t, cx| t.finish_selection(to_clipboard, cx));
             return;
@@ -644,21 +656,66 @@ impl TerminalView {
         self.hover(e.position, e.modifiers, true, cx);
     }
 
-    /// Debug hook for `--hover` / `--click` / `--right-click`: feeds GPUI mouse events for a
-    /// cell straight to this view's handlers. No OS-level input is made.
+    /// Debug hook for `--hover` / `--click` / `--right-click` / `--press` /
+    /// `--release`: feeds GPUI mouse events for a cell straight to this
+    /// view's handlers. No OS-level input is made.
     pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout.get() else {
-            log::error!("--hover/--click/--right-click: the terminal hasn't been painted yet");
+            log::error!("--hover/--click/--right-click/--press/--release: the terminal hasn't been painted yet");
             return;
         };
         let position = layout.cell_center(step.col, step.row);
         let modifiers = step.modifiers;
-        self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
-        if let PointerAction::Click(which) = step.action {
-            let button = which.gpui();
-            self.mouse_down(&MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false }, window, cx);
-            self.mouse_up(&MouseUpEvent { button, position, modifiers, click_count: 1 }, window, cx);
+        let left = gpui::MouseButton::Left;
+        let down = |button| MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false };
+        let up = |button| MouseUpEvent { button, position, modifiers, click_count: 1 };
+        match step.action {
+            PointerAction::Hover => {
+                // A drag while a `--press` holds the button.
+                let pressed_button = self.mouse.debug_held.then_some(left);
+                self.mouse_move(&MouseMoveEvent { position, pressed_button, modifiers }, window, cx);
+            }
+            PointerAction::Click(which) => {
+                self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
+                self.mouse_down(&down(which.gpui()), window, cx);
+                self.mouse_up(&up(which.gpui()), window, cx);
+            }
+            PointerAction::Press => {
+                self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
+                self.mouse_down(&down(left), window, cx);
+                self.mouse.debug_held = true;
+            }
+            PointerAction::Release => {
+                // No move first: a release is its own event, and whatever
+                // it changes must draw its own frame.
+                self.mouse.debug_held = false;
+                self.mouse_up(&up(left), window, cx);
+            }
         }
+    }
+
+    /// Starts or ends a selection drag. The grid's pointer shows it
+    /// ([`pointer::choose`]), so a change draws a frame: a press or a
+    /// release needn't change anything else that does.
+    fn set_selecting(&mut self, selecting: bool, cx: &mut Context<Self>) {
+        if self.mouse.selecting != selecting {
+            self.mouse.selecting = selecting;
+            cx.notify();
+        }
+    }
+
+    /// Records the pointer a painted frame chose for the grid, and says
+    /// whether the platform must show it at once ([`pointer::Shown::frame`]).
+    pub fn pointer_painted(&self, chosen: gpui::CursorStyle, over_grid: bool) -> bool {
+        let mut shown = self.pointer_shown.get();
+        let show_now = shown.frame(chosen, over_grid);
+        self.pointer_shown.set(shown);
+        show_now
+    }
+
+    /// The pointer the grid's last painted frame chose, for the debug dump.
+    pub fn shown_pointer(&self) -> Option<gpui::CursorStyle> {
+        self.pointer_shown.get().last()
     }
 
     /// A selection drag, a reported button press or a press on a link is in
