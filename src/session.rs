@@ -3,7 +3,8 @@
 //!
 //! The state lives in `session.toml` under `$BRINDLE_STATE_DIR`, else
 //! `$XDG_STATE_HOME/brindle` (`~/.local/state/brindle`), or
-//! `%LOCALAPPDATA%\brindle` on Windows; with none of them, nowhere. Only
+//! `%LOCALAPPDATA%\brindle` on Windows (`%LOCALAPPDATA%\brindle\state-elevated`
+//! for an elevated Brindle); with none of them, nowhere. Only
 //! the process holding `session.lock` reads or writes it, so a second
 //! Brindle never duplicates the first one's tabs.
 
@@ -278,36 +279,87 @@ pub struct StateEnv {
     /// The home directory (`$HOME`), whose `.local/state` stands in for
     /// `$XDG_STATE_HOME`; none on Windows, which always has the platform's.
     pub home: Option<PathBuf>,
+    /// Whether Windows' rules apply, under which an elevated Brindle keeps
+    /// its state apart from an unelevated one's.
+    pub on_windows: bool,
+    /// Whether this process runs elevated (Windows' high integrity level),
+    /// which `main` reads from its token; `false` from [`StateEnv::read`].
+    /// Linux ignores it.
+    pub elevated: bool,
 }
 
 impl StateEnv {
     /// The environment's values. On Linux both come from the environment
     /// itself, never the password database, so a Brindle started without
     /// `HOME` has no state directory rather than one it wasn't told about.
+    /// On Windows the base is `%LOCALAPPDATA%` as the environment says, as
+    /// for the terminal server's directory, else the known folder.
     pub fn read() -> Self {
         let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(PathBuf::from);
         let named = set("BRINDLE_STATE_DIR");
         if cfg!(windows) {
-            return StateEnv { named, platform: dirs::data_local_dir(), home: None };
+            let platform = set("LOCALAPPDATA").filter(|dir| dir.is_absolute()).or_else(dirs::data_local_dir);
+            return StateEnv { named, platform, home: None, on_windows: true, elevated: false };
         }
-        StateEnv { named, platform: set("XDG_STATE_HOME").filter(|dir| dir.is_absolute()), home: set("HOME") }
+        StateEnv {
+            named,
+            platform: set("XDG_STATE_HOME").filter(|dir| dir.is_absolute()),
+            home: set("HOME"),
+            on_windows: false,
+            elevated: false,
+        }
     }
 }
 
+/// The directory in `%LOCALAPPDATA%\brindle` an elevated Brindle keeps its
+/// state in on Windows, as its terminal server is in `run-elevated`.
+pub const ELEVATED_DIR: &str = "state-elevated";
+
 /// Where the state file and lock live: `BRINDLE_STATE_DIR`, else `brindle`
 /// in the platform's directory for state, else in the home directory's
-/// `.local/state`. `None` when there is none of them: Brindle then runs on
-/// its own and saves nothing ([`NO_STATE_DIR`]).
+/// `.local/state`. On Windows an elevated Brindle's default is
+/// [`ELEVATED_DIR`] in that `brindle` ([`is_elevated_default`]), so it is an
+/// instance of its own; a `BRINDLE_STATE_DIR` is used as it is, whoever
+/// set it having chosen the directory. `None` when there is none of them:
+/// Brindle then runs on its own and saves nothing ([`NO_STATE_DIR`]).
 pub fn state_dir(env: &StateEnv) -> Option<PathBuf> {
     if let Some(dir) = &env.named {
         return Some(dir.clone());
     }
     let base = env.platform.clone().or_else(|| env.home.as_ref().map(|home| home.join(".local/state")))?;
-    Some(base.join("brindle"))
+    let dir = base.join("brindle");
+    Some(if is_elevated_default(env) { dir.join(ELEVATED_DIR) } else { dir })
+}
+
+/// Whether [`state_dir`] depends on the process's elevation: on Windows,
+/// with no `BRINDLE_STATE_DIR`. A Brindle that can't tell whether it runs
+/// elevated then has no state directory.
+pub fn depends_on_elevation(env: &StateEnv) -> bool {
+    env.on_windows && env.named.is_none()
+}
+
+/// Whether [`state_dir`] is an elevated Brindle's own default on Windows,
+/// which must be made for Administrators and SYSTEM only (and held) before
+/// the lock is taken or anything is read from it, so an unelevated process
+/// can't plant or swap what it holds.
+pub fn is_elevated_default(env: &StateEnv) -> bool {
+    depends_on_elevation(env) && env.elevated && env.platform.is_some()
 }
 
 /// The window's notice when there is no state directory.
 pub const NO_STATE_DIR: &str = "Brindle can't save its session: no state directory (set BRINDLE_STATE_DIR)";
+
+/// The window's notice when Brindle can't tell whether it runs elevated,
+/// which decides its state directory on Windows, and `why`.
+pub fn unknown_elevation_notice(why: &str) -> String {
+    format!("Brindle can't save its session: can't tell whether it runs elevated ({why})")
+}
+
+/// The window's notice when an elevated Brindle's state directory can't be
+/// made for Administrators and SYSTEM only, and `why`, which names it.
+pub fn elevated_dir_notice(why: &str) -> String {
+    format!("Brindle can't save its session in its elevated state directory: {why}")
+}
 
 pub fn state_path(dir: &Path) -> PathBuf {
     dir.join(FILE_NAME)
@@ -897,6 +949,7 @@ mod tests {
             named: Some("/tmp/s".into()),
             platform: Some("/state".into()),
             home: Some("/home/u".into()),
+            ..StateEnv::default()
         };
         assert_eq!(state_dir(&env), Some(PathBuf::from("/tmp/s")));
         let env = StateEnv { named: None, ..env };
@@ -923,9 +976,73 @@ mod tests {
             (None, None, None, None),
         ];
         for (named, platform, home, expected) in cases {
-            let env = StateEnv { named, platform, home };
+            let env = StateEnv { named, platform, home, ..StateEnv::default() };
             assert_eq!(state_dir(&env), expected.map(PathBuf::from), "{env:?}");
         }
+    }
+
+    /// Windows' environment: `%LOCALAPPDATA%` and no home.
+    fn windows_env(elevated: bool) -> StateEnv {
+        StateEnv { named: None, platform: Some("/local".into()), home: None, on_windows: true, elevated }
+    }
+
+    #[test]
+    fn an_elevated_brindle_on_windows_keeps_its_state_apart() {
+        let unelevated = windows_env(false);
+        assert_eq!(state_dir(&unelevated), Some(PathBuf::from("/local").join("brindle")));
+        assert!(!is_elevated_default(&unelevated));
+        let elevated = windows_env(true);
+        assert_eq!(state_dir(&elevated), Some(PathBuf::from("/local").join("brindle").join("state-elevated")));
+        assert!(is_elevated_default(&elevated), "the elevated default is made protected");
+        assert!(depends_on_elevation(&elevated) && depends_on_elevation(&unelevated));
+        // No `%LOCALAPPDATA%`: no state directory, elevated or not.
+        for elevated in [false, true] {
+            let env = StateEnv { platform: None, ..windows_env(elevated) };
+            assert_eq!(state_dir(&env), None, "{env:?}");
+            assert!(!is_elevated_default(&env), "{env:?}");
+        }
+    }
+
+    #[test]
+    fn brindle_state_dir_wins_over_the_elevated_default() {
+        for elevated in [false, true] {
+            let env = StateEnv { named: Some("/s".into()), ..windows_env(elevated) };
+            assert_eq!(state_dir(&env), Some(PathBuf::from("/s")), "{env:?}");
+            assert!(!is_elevated_default(&env), "a named directory is used as it is: {env:?}");
+            assert!(!depends_on_elevation(&env), "{env:?}");
+        }
+    }
+
+    #[test]
+    fn linux_ignores_the_elevation() {
+        for (platform, home, expected) in [
+            (Some("/state"), Some("/home/u"), Some(PathBuf::from("/state/brindle"))),
+            (None, Some("/home/u"), Some(PathBuf::from("/home/u/.local/state/brindle"))),
+            (None, None, None),
+        ] {
+            let env = |elevated| StateEnv {
+                named: None,
+                platform: platform.map(PathBuf::from),
+                home: home.map(PathBuf::from),
+                on_windows: false,
+                elevated,
+            };
+            assert_eq!(state_dir(&env(true)), expected, "{:?}", env(true));
+            assert_eq!(state_dir(&env(true)), state_dir(&env(false)));
+            assert!(!is_elevated_default(&env(true)) && !depends_on_elevation(&env(true)));
+        }
+    }
+
+    #[test]
+    fn the_notices_say_why_the_session_isnt_saved() {
+        assert_eq!(
+            unknown_elevation_notice("reading this process's token: denied"),
+            "Brindle can't save its session: can't tell whether it runs elevated (reading this process's token: denied)"
+        );
+        assert_eq!(
+            elevated_dir_notice(r"can't make C:\l\brindle\state-elevated: denied"),
+            r"Brindle can't save its session in its elevated state directory: can't make C:\l\brindle\state-elevated: denied"
+        );
     }
 
     #[test]

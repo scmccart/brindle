@@ -63,6 +63,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-message-box", local_server::message_box),
         display("local-server-inbox-host", local_server::inbox_host),
         display("local-server-elevated", local_server::elevated),
+        display("windows-elevated-instances", elevated_instances),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -893,4 +894,182 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
     ensure!(closed.dump.zones.is_none(), "single zone should have no --- zones: {:?}", closed.dump.zones);
     ensure!(screen(&closed.dump).contains("zone1-kept"), "screen: {}", screen(&closed.dump));
     Ok(Outcome::Pass)
+}
+
+/// An elevated and an unelevated Brindle, both with no `BRINDLE_STATE_DIR`,
+/// run at once, each as an instance with its own `session.toml`: the
+/// elevated one in `state-elevated` under `%LOCALAPPDATA%\brindle` (here a
+/// private `LOCALAPPDATA` in the case directory), made for Administrators
+/// and SYSTEM only, and the unelevated one in `brindle` itself. Neither
+/// runs on its own for want of the other's session lock. The unelevated one
+/// starts once the elevated one's tab is up, and the elevated one's shell
+/// waits for it to be done before Brindle quits, so they overlap. Needs an
+/// elevated runner whose desktop shell runs unelevated (UAC on); skipped
+/// otherwise, since elevating would ask through UAC.
+fn elevated_instances(ctx: &Ctx) -> Result<Outcome> {
+    if !winproc::elevated().map_err(|e| format!("reading this process's token: {e}"))? {
+        return Ok(Outcome::Skip(
+            "not elevated: an elevated Brindle beside an unelevated one needs an elevated runner \
+             (elevating here would ask through UAC)"
+                .into(),
+        ));
+    }
+    let appdata = ctx.dir.join("appdata");
+    std::fs::create_dir_all(&appdata).map_err(|e| e.to_string())?;
+    let appdata_text = appdata.to_str().ok_or("the case directory isn't UTF-8")?.to_string();
+    let (medium, high) = (appdata.join("brindle"), appdata.join("brindle").join("state-elevated"));
+    let done = ctx.dir.join("unelevated-done");
+    let slashed = |path: &std::path::Path| path.display().to_string().replace('\\', "/");
+    // The elevated tab's shell prints `both-ran` once the unelevated run is
+    // done, and Brindle quits after that, so the two overlap however slowly
+    // either runs. `--wait-for` gives up after 30 step intervals; the
+    // unelevated run is given less (`UNELEVATED_LIMIT`).
+    let gate = format!("while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 100 }}; 'both-' + 'ran'\r", slashed(&done));
+    let elevated = crate::brindle::Run::new(ctx, "elevated")
+        .env("BRINDLE_STATE_DIR", "")
+        .env("LOCALAPPDATA", &appdata_text)
+        .prompt()
+        .send(&gate)
+        .wait_for("both-ran")
+        .action("quit")
+        .expect_exit()
+        // A limit only: the run quits as soon as its shell has printed.
+        .dump_at(90.0);
+    let (beside, ran) = std::thread::scope(|scope| {
+        let running = scope.spawn(move || elevated.run());
+        let beside = unelevated_beside(ctx, &appdata, &done, &|| running.is_finished());
+        // Whatever happened beside it, the elevated Brindle may quit now.
+        if !done.exists() {
+            std::fs::write(&done, "released by the case").ok();
+        }
+        (beside, running.join().unwrap_or_else(|_| Err("the elevated run panicked".into())))
+    });
+    let outcome = beside?;
+    ran?;
+    if let Outcome::Skip(why) = outcome {
+        return Ok(Outcome::Skip(why));
+    }
+
+    let log = |label: &str| std::fs::read_to_string(ctx.dir.join(format!("{label}.log"))).unwrap_or_default();
+    for (label, dir) in [("elevated", &high), ("unelevated", &medium)] {
+        let text = log(label);
+        ensure!(!text.contains("another Brindle owns the session"), "the {label} Brindle wasn't an instance; see {label}.log");
+        ensure!(!text.contains("no state directory"), "the {label} Brindle had no state directory; see {label}.log");
+        ensure!(dir.join("session.toml").is_file(), "the {label} Brindle wrote no {}", dir.join("session.toml").display());
+    }
+    // Only Administrators and SYSTEM can change the elevated directory.
+    match brindle_remote_protocol::win::hold_protected_dir(&high) {
+        Ok(Some(_)) => {}
+        Ok(None) => return Err(format!("{} is missing", high.display())),
+        Err(why) => return Err(format!("{} isn't protected: {why}", high.display())),
+    }
+    let dump = Dump::parse(&std::fs::read_to_string(ctx.dir.join("unelevated.dump")).unwrap_or_default());
+    ensure!(screen(&dump).contains("unelevated-tab"), "the unelevated tab: see unelevated.dump");
+    ensure!(dump.config.is_none(), "the unelevated window's config line: {:?}", dump.config);
+    Ok(Outcome::Pass)
+}
+
+/// How long the unelevated run may take, under the elevated run's
+/// `--wait-for` limit of 30 step intervals.
+const UNELEVATED_LIMIT: f64 = 25.0;
+
+/// Runs the unelevated Brindle of [`elevated_instances`] once the elevated
+/// one's tab is attached in the case's server, and waits for its script to
+/// write `done`, which must come while the elevated one still runs
+/// (`elevated_ended` says whether its run has ended). Its terminal server
+/// is a directory of its own in the case directory, which it stops itself:
+/// an unelevated client may not use the elevated one's.
+fn unelevated_beside(
+    ctx: &Ctx,
+    appdata: &std::path::Path,
+    done: &std::path::Path,
+    elevated_ended: &dyn Fn() -> bool,
+) -> Result<Outcome> {
+    let up = ctx.scale().poll(30.0, "the elevated Brindle's tab attached", || {
+        if elevated_ended() {
+            return Ok(Some(false));
+        }
+        Ok(crate::brindle::listed_sessions(ctx)?.iter().any(|&(_, attached)| attached).then_some(true))
+    })?;
+    ensure!(up, "the elevated run ended before its tab was attached; see elevated.log");
+    let server = ctx.dir.join("unelevated-server");
+    let (dump, log) = (ctx.dir.join("unelevated.dump"), ctx.dir.join("unelevated.log"));
+    let script = ctx.dir.join("unelevated.cmd");
+    let quote = |path: &std::path::Path| format!("\"{}\"", path.display());
+    let body = [
+        "@echo off".to_string(),
+        "set \"BRINDLE_STATE_DIR=\"".to_string(),
+        format!("set \"LOCALAPPDATA={}\"", appdata.display()),
+        format!("set \"BRINDLE_SERVER_DIR={}\"", server.display()),
+        format!("set \"BRINDLE_CONFIG={}\"", ctx.dir.join("config.toml").display()),
+        // The case's helper: this environment is the user's own, not the
+        // test's.
+        format!("set \"BRINDLE_SERVER_HELPER={}\"", ctx.helper.display()),
+        "set \"RUST_LOG=brindle=info,warn\"".to_string(),
+        format!(
+            "{} -p Shell --no-restore --wait-for \"{}\" --send \"'unelev' + 'ated-tab'\\r\" {} --dump-screen-after {} > {} 2> {}",
+            quote(&ctx.bin),
+            crate::brindle::PROMPT,
+            ctx.step_interval().join(" "),
+            ctx.secs(7.0),
+            quote(&dump),
+            quote(&log)
+        ),
+        // Only an unelevated client may stop the unelevated server.
+        format!("{} stop > nul 2>&1", quote(&ctx.helper)),
+        format!("echo done > {}", quote(done)),
+    ];
+    std::fs::write(&script, body.join("\r\n") + "\r\n").map_err(|e| e.to_string())?;
+    let line = format!("cmd.exe /d /c \"{}\"", script.display());
+    let cmd = match winproc::start_unelevated(&line) {
+        Ok(pid) => pid,
+        Err(why) => return Ok(Outcome::Skip(format!("can't run an unelevated Brindle beside: {why}"))),
+    };
+    let finished = ctx.scale().poll(UNELEVATED_LIMIT, "the unelevated run", || {
+        if done.exists() {
+            return Ok(Some(Some(elevated_ended())));
+        }
+        // The script writes `done` last, so a cmd gone without it stopped
+        // early: most likely it couldn't write to the case directory.
+        Ok((!winproc::alive(cmd) && !done.exists()).then_some(None))
+    });
+    let result = match finished {
+        Ok(Some(false)) => Ok(Outcome::Pass),
+        Ok(Some(true)) => Err("the elevated Brindle had quit before the unelevated one was done; see elevated.log".into()),
+        Ok(None) => Err(format!(
+            "the unelevated script ended without finishing; can the unelevated user write {}? See unelevated.log",
+            ctx.dir.display()
+        )),
+        Err(why) => {
+            // Brindle and the helper commands are cmd's children.
+            let children: Vec<u32> = winproc::all()
+                .map(|all| all.into_iter().filter(|p| p.parent == cmd).map(|p| p.pid).collect())
+                .unwrap_or_default();
+            children.into_iter().chain([cmd]).for_each(winproc::kill);
+            Err(format!("{why}; see unelevated.log"))
+        }
+    };
+    // The unelevated server's roles run from its own copies; what `stop`
+    // left is ended and reported.
+    let copies = server.join("bin");
+    let left = || -> std::io::Result<Vec<u32>> {
+        let name = ctx.helper.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        Ok(winproc::all()?
+            .into_iter()
+            .filter(|p| p.name.eq_ignore_ascii_case(&name))
+            .filter(|p| winproc::image(p.pid).is_some_and(|image| crate::under(&image, &copies)))
+            .map(|p| p.pid)
+            .collect())
+    };
+    ctx.scale()
+        .poll(5.0, "the unelevated server's roles ending", || {
+            Ok(left().map_err(|e| format!("listing processes: {e}"))?.is_empty().then_some(()))
+        })
+        .ok();
+    let leftover = left();
+    leftover.iter().flatten().for_each(|&pid| winproc::kill(pid));
+    let outcome = result?;
+    let leftover = leftover.map_err(|e| format!("can't tell whether roles are left running: {e}"))?;
+    ensure!(leftover.is_empty(), "left running after `brindle-remote stop`: {leftover:?}");
+    Ok(outcome)
 }

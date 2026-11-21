@@ -112,6 +112,29 @@ pub fn hwnd(window: &gpui::Window) -> Option<windows::Win32::Foundation::HWND> {
     }
 }
 
+/// Whether this process runs elevated (high integrity or above), which
+/// decides its default state directory.
+pub fn elevated() -> Result<bool, String> {
+    crate::remote::protocol::win::is_elevated().map_err(|error| format!("reading this process's token: {error}"))
+}
+
+/// Makes or checks an elevated Brindle's state directory `dir` for
+/// Administrators and SYSTEM only, as its terminal server's `run-elevated`
+/// is ([`win::protected_dir`](crate::remote::protocol::win::protected_dir)
+/// with [`Contents::State`](crate::remote::protocol::win::Contents)), and
+/// holds it until the process exits, so an unelevated process can't add,
+/// swap or rename what is read from it. `Err` says why, naming `dir`.
+pub fn protect_state_dir(dir: &std::path::Path) -> Result<(), String> {
+    use crate::remote::protocol::win::{Contents, ProtectedDir, protected_dir};
+
+    static HELD: std::sync::OnceLock<ProtectedDir> = std::sync::OnceLock::new();
+    let held = protected_dir(dir, Contents::State).map_err(|error| error.to_string())?;
+    // Called once, before the session lock; a second hold would be the same
+    // directory's.
+    HELD.set(held).ok();
+    Ok(())
+}
+
 /// Points stdout and stderr at the console Brindle was started from, for
 /// output printed just before exiting.
 ///

@@ -665,7 +665,10 @@ sessions alone.
 The state is written to `~/.local/state/brindle/session.toml`
 (`$XDG_STATE_HOME/brindle/`, or `$BRINDLE_STATE_DIR` when it is set) a second
 or two after anything changes, and again on quit, so a crash or logout loses
-at most the last couple of seconds. If a profile or directory has gone
+at most the last couple of seconds. On Windows it is
+`%LOCALAPPDATA%\brindle\session.toml`, and an elevated Brindle keeps its own in
+`%LOCALAPPDATA%\brindle\state-elevated\`, so it runs beside an unelevated one as
+a separate Brindle with its own session. If a profile or directory has gone
 since then, the default profile or the home directory is used. Closing the last tab forgets the
 tabs, and quitting keeps everything that is open. A state that can't be saved,
 such as one with a tab in a directory whose name isn't valid UTF-8, leaves the
