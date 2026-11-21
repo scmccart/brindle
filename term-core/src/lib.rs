@@ -1,8 +1,8 @@
 //! The GPUI-free terminal state that Brindle and its server share: the
 //! shell-integration parser with its OSC 133 marks, the OSC scanner and the
 //! OSC 7501 program status records, the OSC 9;4 progress, the OSC 3008
-//! context stack, the replay renderer, and the server's per-session
-//! emulator.
+//! context stack, the OSC 22 pointer shape stacks, the replay renderer, and
+//! the server's per-session emulator.
 
 // railway R3, types R2: no `_ =>` on one of Brindle's own enums. railway R5,
 // R9: a decoder never panics on bytes from outside, and non-test code has no
@@ -16,6 +16,7 @@ pub mod emulator;
 mod fuzz;
 pub mod notice;
 pub mod osc;
+pub mod pointer;
 pub mod progress;
 pub mod replay;
 pub mod shell_integration;

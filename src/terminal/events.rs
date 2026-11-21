@@ -76,7 +76,8 @@ pub enum Admit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recovered {
     pub dropped: u64,
-    /// A status, progress or context report was among them.
+    /// A status, progress or context report, or a pointer shape op, was
+    /// among them.
     pub statuses: bool,
 }
 
@@ -106,7 +107,13 @@ pub fn kind_of(event: &ChannelEvent) -> Kind {
             Found::Status(_) | Found::Progress(_) | Found::Context(_) | Found::PromptStart | Found::Reset => {
                 Kind::Side { status: true }
             }
+            // Never sent as itself: the reader tags it with its screen
+            // ([`ChannelEvent::Pointer`]).
+            Found::Pointer(_) => Kind::Ignored,
         },
+        // A dropped pointer op leaves the stacks stale, so they start over
+        // with the records.
+        ChannelEvent::Pointer(..) => Kind::Side { status: true },
         ChannelEvent::Merged(merge) => Kind::Merged(*merge),
         ChannelEvent::Foreground => Kind::Merged(Merge::Foreground),
         ChannelEvent::Replay(_)
@@ -183,6 +190,7 @@ impl EventGate {
             ChannelEvent::Alac(AlacEvent::ClipboardStore(ty, text)) => self.put_clipboard(ty, text),
             ChannelEvent::Alac(_)
             | ChannelEvent::Osc(_)
+            | ChannelEvent::Pointer(..)
             | ChannelEvent::Merged(_)
             | ChannelEvent::Foreground
             | ChannelEvent::Replay(_)
@@ -499,6 +507,9 @@ mod tests {
         ] {
             assert_eq!(found(status), STATUS);
         }
+        let op = || crate::terminal::pointer::Op::Pop;
+        assert_eq!(kind_of(&ChannelEvent::Pointer(crate::terminal::pointer::Screen::Primary, op())), STATUS);
+        assert_eq!(found(Found::Pointer(op())), Kind::Ignored, "only the tagged op is queued");
 
         assert_eq!(alac(AlacEvent::MouseCursorDirty), Kind::Ignored);
         assert_eq!(alac(AlacEvent::CursorBlinkingChange), Kind::Ignored);
@@ -512,7 +523,9 @@ mod tests {
             ChannelEvent::Lost => "Lost".into(),
             ChannelEvent::Failed => "Failed".into(),
             ChannelEvent::InputRefused => "InputRefused".into(),
-            ChannelEvent::Osc(_) | ChannelEvent::Merged(_) | ChannelEvent::Foreground => "other".into(),
+            ChannelEvent::Osc(_) | ChannelEvent::Pointer(..) | ChannelEvent::Merged(_) | ChannelEvent::Foreground => {
+                "other".into()
+            }
         }
     }
 

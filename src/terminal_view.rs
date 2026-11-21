@@ -666,6 +666,11 @@ impl TerminalView {
     pub fn is_dragging(&self) -> bool {
         self.mouse.selecting || self.mouse.reported_button.is_some() || self.mouse.pending_link.is_some()
     }
+
+    /// A selection is being dragged, which shows the text beam.
+    pub fn is_selecting(&self) -> bool {
+        self.mouse.selecting
+    }
 }
 
 impl Render for TerminalView {

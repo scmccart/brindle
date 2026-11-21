@@ -137,7 +137,7 @@ pub(crate) fn status_body(rng: &mut XorShift) -> Vec<u8> {
 /// One OSC body (after `ESC ]`, before the terminator) of the numbers the
 /// parsers act on, or noise.
 pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
-    let text = match rng.below(12) {
+    let text = match rng.below(13) {
         0..=2 => format!("7;file://{}/{}", pick(rng, &["", "host", "localhost", "h:1"]), path(rng)),
         3 => format!("7;{}", path(rng)),
         4 => {
@@ -174,6 +174,17 @@ pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
             let long = "v".repeat(rng.below(300));
             let field = pick(rng, &["", ";targetuser=root", ";container=web\\x3bdb", ";vm=\\xff", ";hostname=h\\q", ";pid=12", ";novalue"]);
             format!("3008;{verb}{id}{kind}{field};comm={long}")
+        }
+        // OSC 22 pointer shapes: every first character, names Brindle
+        // shows and others, empty names, other characters and queries.
+        12 if rng.below(3) != 0 => {
+            let first = pick(rng, &["", "=", ">", ">", "<", "?", "x"]);
+            let names: Vec<&str> = (0..rng.below(5))
+                .map(|_| {
+                    pick(rng, &["pointer", "crosshair", "ew-resize", "text", "", "wait", "zoom-in", "__current__", "__default__", "Pointer", "é", "a b"])
+                })
+                .collect();
+            format!("22;{first}{}", names.join(","))
         }
         _ => {
             let len = rng.below(24);
@@ -300,6 +311,36 @@ fn the_osc_scanner_finds_the_same_sequences_however_the_stream_is_cut() {
         found_any += whole.len();
     }
     assert!(found_any > 0, "the generator never produced a sequence the scanner finds");
+}
+
+#[test]
+fn pointer_stacks_stay_bounded_and_every_query_gets_a_well_formed_reply() {
+    use crate::pointer::{STACK_DEPTH, Screen, Shape, Stacks};
+    let mut rng = XorShift::new(0x7e57_c0de_0000_0004);
+    let (mut ops, mut replies) = (0usize, 0usize);
+    for _ in 0..2000 {
+        let count = 1 + rng.below(40);
+        let bytes = stream(&mut rng, count);
+        let mut stacks = Stacks::default();
+        for found in osc::Scanner::new().scan(&bytes) {
+            let Found::Pointer(op) = found else { continue };
+            ops += 1;
+            let screen = Screen::of(rng.below(2) == 0);
+            if let Some(reply) = stacks.apply(screen, op) {
+                replies += 1;
+                let answers = reply
+                    .strip_prefix("\x1b]22;")
+                    .and_then(|rest| rest.strip_suffix("\x1b\\"))
+                    .unwrap_or_else(|| panic!("reply {reply:?}"));
+                for answer in answers.split(',') {
+                    let known = ["0", "1"].contains(&answer) || Shape::from_name(answer.as_bytes()).is_some();
+                    assert!(known, "answer {answer:?} in {reply:?}");
+                }
+            }
+            assert!(stacks.depth(Screen::Primary) <= STACK_DEPTH && stacks.depth(Screen::Alternate) <= STACK_DEPTH);
+        }
+    }
+    assert!(ops > 100 && replies > 10, "only {ops} pointer ops and {replies} replies");
 }
 
 #[test]

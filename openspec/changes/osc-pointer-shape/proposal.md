@@ -7,7 +7,7 @@ Brindle picks the mouse pointer itself: a text beam, an arrow while a program ha
 ## What Changes
 
 - Recognise `ESC ] 22 ; [=|>|<|?] <names> ST`: set, push, pop, reset (empty) and query, with a stack of at least 16 entries per screen (primary and alternate).
-- Map the CSS pointer names to the platform pointers GPUI offers. A list of names falls back to the first one Brindle can show, and names it can't show count as unsupported in query replies.
+- Map the CSS pointer names to the platform pointers GPUI offers. As in kitty, a set or push applies each listed name in turn and skips the ones Brindle can't show, which count as unsupported in query replies.
 - Show the program's pointer over that terminal's grid, except while a link is ctrl-hovered (the hand) or a selection is being dragged (the text beam).
 - Answer queries (`?__current__`, `?__default__`, `?__grabbed__`, `?name,…`) on the PTY of the terminal that asked.
 - Empty both stacks on a full reset and when the process exits. After an attach or a reconnect the pointer is Brindle's own until the program sets one again.

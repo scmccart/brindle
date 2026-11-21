@@ -2223,6 +2223,7 @@ impl Workspace {
             }
             out.push_str(&terminal.status().describe());
             out.push_str(&terminal.contexts().describe());
+            out.push_str(&terminal.pointer().describe(terminal.pointer_screen()));
             out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_progress());

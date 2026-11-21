@@ -18,6 +18,7 @@ pub mod keys;
 pub mod links;
 pub mod mouse;
 pub mod pace;
+pub mod pointer;
 pub mod process;
 pub mod search;
 pub mod tab_note;
@@ -66,6 +67,11 @@ pub enum ChannelEvent {
     /// A sequence the scanner found in the output (on the thread reading it).
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Osc(Found),
+    /// An `OSC 22` pointer shape op, with the screen that was active where
+    /// it sat in the output: the reader tags each [`Found::Pointer`] with
+    /// it, and this is the only way an op reaches the terminal.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    Pointer(pointer::Screen, pointer::Op),
     /// A replay of a server session starts (`true`) or ends. In between,
     /// the state updates but no attention is raised.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -315,6 +321,10 @@ pub struct Terminal {
     /// `contexts`' notable context, recomputed whenever `contexts` changes,
     /// so the chrome never computes it while drawing.
     badge: Option<Badge>,
+    /// The program's pointer shapes (OSC 22), one stack per screen, until a
+    /// full reset, the program's end or a replay's start: the server keeps
+    /// none, so an attach starts with both empty.
+    pointer: pointer::Stacks,
     /// Whether the directory the program reports exists, where that is the
     /// terminal's directory ([`Terminal::follows_reported_dir`]). It is
     /// refreshed when output brings another report, by a check off the UI
@@ -386,6 +396,7 @@ impl Terminal {
         match event {
             ChannelEvent::Alac(event) => self.handle_event(event, cx),
             ChannelEvent::Osc(found) => self.handle_found(found, cx),
+            ChannelEvent::Pointer(screen, op) => self.apply_pointer(screen, op),
             ChannelEvent::Merged(merge) => self.merged(merge, cx),
             // Never queued as itself: the gate turns it into its marker.
             ChannelEvent::Foreground => self.merged(Merge::Foreground, cx),
@@ -393,6 +404,11 @@ impl Terminal {
                 self.replaying = active;
                 // A replay's `ESC c` ends no context, and it carries the
                 // session's open ones, so the old stack goes first.
+                // Nor does it carry a pointer shape: the attached terminal
+                // starts with Brindle's own.
+                if active {
+                    self.pointer.clear();
+                }
                 if active && self.clear_contexts() {
                     cx.emit(TerminalEvent::Status(None));
                 }
@@ -447,6 +463,7 @@ impl Terminal {
             self.status.reset();
             self.progress = None;
             self.clear_contexts();
+            self.pointer.clear();
             cx.emit(TerminalEvent::Status(None));
         }
     }
@@ -492,6 +509,7 @@ impl Terminal {
             progress: None,
             contexts: Contexts::default(),
             badge: None,
+            pointer: pointer::Stacks::default(),
             dir_check: dir_check::DirCheck::default(),
             theme,
             last_activity: Instant::now(),
@@ -746,6 +764,8 @@ impl Terminal {
             let activity = self.status.end_activity();
             let progress = self.progress.take().is_some();
             let contexts = self.clear_contexts();
+            // Its pointer shapes go too; the grid repaints anyway.
+            self.pointer.clear();
             if activity || progress || contexts {
                 cx.emit(TerminalEvent::Status(None));
             }
@@ -772,6 +792,26 @@ impl Terminal {
     /// ([`Contexts::notable`]).
     pub fn badge(&self) -> Option<&Badge> {
         self.badge.as_ref()
+    }
+
+    /// The program's pointer shape stacks (OSC 22).
+    pub fn pointer(&self) -> &pointer::Stacks {
+        &self.pointer
+    }
+
+    /// The screen the grid shows now, whose stack the pointer follows. It
+    /// takes the term lock: a caller holding it reads the mode it has.
+    pub fn pointer_screen(&self) -> pointer::Screen {
+        pointer::Screen::of(self.mode().contains(TermMode::ALT_SCREEN))
+    }
+
+    /// A pointer shape op from the output, on the screen it arrived on. A
+    /// query's reply goes to this terminal's program only, and the event
+    /// task repaints after every chunk, so a new top shows.
+    fn apply_pointer(&mut self, screen: pointer::Screen, op: pointer::Op) {
+        if let Some(reply) = self.pointer.apply(screen, op) {
+            self.write(reply.into_bytes());
+        }
     }
 
     /// Emits an event the output caused, quietly during a replay.
@@ -815,7 +855,14 @@ impl Terminal {
                 changed
             }
             Found::PromptStart => self.status.end_activity(),
-            Found::Reset => self.status.reset(),
+            Found::Reset => {
+                // A full reset empties both pointer stacks too.
+                self.pointer.clear();
+                self.status.reset()
+            }
+            // Never queued: the reader sends it tagged with its screen
+            // (`ChannelEvent::Pointer`), and the gate ignores it alone.
+            Found::Pointer(_) => false,
         };
         if changed || progress_changed {
             cx.emit(TerminalEvent::Status(None));

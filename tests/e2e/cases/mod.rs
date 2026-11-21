@@ -22,6 +22,7 @@ mod multi_window;
 mod restore;
 mod notify;
 mod palette;
+mod pointer;
 mod profile_menu;
 mod progress;
 mod context;
@@ -147,6 +148,9 @@ fn unix() -> Vec<Case> {
         display("context-run0-session", context::run0_session),
         display("context-end", context::end),
         display("context-zones", context::zones),
+        display("pointer-query", pointer::query),
+        display("pointer-current", pointer::current),
+        display("pointer-dump", pointer::dump),
         display("search-local", search::local),
         display("search-step", search::step),
         display("search-long-query", search::long_query),

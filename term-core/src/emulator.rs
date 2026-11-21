@@ -155,7 +155,10 @@ impl Emulator {
                 Found::Context(message) => {
                     self.contexts.apply(message);
                 }
-                Found::Progress(_) | Found::Notice(_) => {}
+                // The pointer shape is the client's alone: the server keeps
+                // no stack, so a replay carries none, and answers no query
+                // (`process R19`).
+                Found::Progress(_) | Found::Notice(_) | Found::Pointer(_) => {}
             }
         }
         self.parser.advance(&mut self.term, &self.marks, &bytes[fed..]);
@@ -313,6 +316,16 @@ mod tests {
         assert_eq!(emulator.title().as_deref(), Some("t"));
         emulator.feed(b"\x1bc");
         assert_eq!(emulator.title(), None);
+    }
+
+    /// The server keeps no pointer shape: a query gets no reply here (the
+    /// client answers it), and a replay carries no `OSC 22`.
+    #[test]
+    fn pointer_shapes_are_ignored_and_never_replayed() {
+        let mut emulator = Emulator::new(20, 4, 0, PathStyle::Posix);
+        emulator.feed(b"a\x1b]22;>pointer\x07\x1b[?1049h\x1b]22;crosshair\x1b\\b\x1b]22;?__current__\x07");
+        assert_eq!(text(&emulator, 0).trim(), "b");
+        assert!(!replays(&emulator.render(), b"\x1b]22"));
     }
 
     #[test]

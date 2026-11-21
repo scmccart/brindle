@@ -1,7 +1,8 @@
 //! Finds the sequences Brindle acts on beside alacritty's parser, which
 //! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
 //! program status reports, ConEmu's `OSC 9 ; 4` progress reports, UAPI.15's
-//! `OSC 3008` context starts and ends, and the OSC 133 (and VS Code's OSC
+//! `OSC 3008` context starts and ends, `OSC 22` pointer shapes (xterm's,
+//! with kitty's stack and queries), and the OSC 133 (and VS Code's OSC
 //! 633) `A` prompt starts and `ESC c` resets that end status records and
 //! progress (but not contexts).
 //!
@@ -12,6 +13,7 @@
 pub use crate::{Notice, Source};
 
 use crate::context;
+use crate::pointer;
 use crate::progress::{self, Progress, Report};
 use crate::status::{self, Message};
 
@@ -25,6 +27,10 @@ pub enum Found {
     Progress(Report),
     /// An `OSC 3008` context start or end.
     Context(context::Message),
+    /// An `OSC 22` pointer shape set, push, pop or query. It acts on the
+    /// screen active where it sits in the stream, which the scanner doesn't
+    /// know: the reader tags it ([`crate::pointer::Screen`]).
+    Pointer(pointer::Op),
     /// OSC 133 `A` (or OSC 633 `A`): a new shell prompt begins.
     PromptStart,
     /// `ESC c`: a full reset.
@@ -41,7 +47,7 @@ impl Found {
         match self {
             Found::Progress(report) => progress::apply(current, *report),
             Found::PromptStart | Found::Reset => None,
-            Found::Notice(_) | Found::Status(_) | Found::Context(_) => current,
+            Found::Notice(_) | Found::Status(_) | Found::Context(_) | Found::Pointer(_) => current,
         }
     }
 }
@@ -151,7 +157,7 @@ impl Scanner {
                 }
                 b';' => {
                     // Written as the number is: `0009` isn't 9.
-                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133 | 633, 3) | (7501 | 3008, 4));
+                    let wanted = matches!((self.number, self.digits), (9, 1) | (22, 2) | (777, 3) | (133 | 633, 3) | (7501 | 3008, 4));
                     self.payload.clear();
                     self.overflow = false;
                     self.state = State::Payload { collect: wanted };
@@ -206,6 +212,7 @@ impl Scanner {
             9 => progress::parse(&payload)
                 .map(Found::Progress)
                 .or_else(|| parse_osc9(&payload).map(Found::Notice)),
+            22 => pointer::parse(&payload).map(Found::Pointer),
             777 => parse_osc777(&payload).map(Found::Notice),
             // `133;A` (or VS Code's `633;A`) may carry options after a `;`.
             133 | 633 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
@@ -452,6 +459,57 @@ mod tests {
         big.push(BEL);
         big.extend_from_slice(b"\x1b]3008;start=b\x07");
         assert_eq!(scan(&big), [context(b"start=b")]);
+    }
+
+    fn pointer(body: &[u8]) -> Found {
+        Found::Pointer(crate::pointer::parse(body).unwrap())
+    }
+
+    #[test]
+    fn pointer_sequences_with_either_terminator() {
+        assert_eq!(scan(b"\x1b]22;>pointer\x1b\\"), [pointer(b">pointer")]);
+        assert_eq!(scan(b"\x1b]22;crosshair\x07"), [pointer(b"crosshair")]);
+        // The empty body is a set of "no shape", and a pop and a query
+        // are found too.
+        assert_eq!(scan(b"\x1b]22;\x1b\\\x1b]22;<\x07\x1b]22;?__current__\x07"), [
+            pointer(b""),
+            pointer(b"<"),
+            pointer(b"?__current__")
+        ]);
+        // Nothing Brindle shows, or the number not written as is: nothing.
+        assert!(scan(b"\x1b]22;zoom-in\x07\x1b]22;>wait\x07").is_empty());
+        assert!(scan(b"\x1b]022;pointer\x07\x1b]2;pointer\x07\x1b]222;pointer\x07\x1b]22\x07").is_empty());
+        // Among other output, and other progress-keeping finds.
+        assert_eq!(scan(b"a\x1b]22;>grab\x07b"), [pointer(b">grab")]);
+        assert_eq!(pointer(b">grab").progress_after(None), None);
+    }
+
+    #[test]
+    fn a_pointer_sequence_split_at_every_byte_is_found_once() {
+        let input = b"x\x1b]22;>pointer,crosshair\x1b\\y\x1b]22;?pointer,wait\x07z\x1b]22;\x1b\\";
+        let want = [pointer(b">pointer,crosshair"), pointer(b"?pointer,wait"), pointer(b"")];
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, want, "split at {split}");
+        }
+        // The offsets point just past each terminator.
+        let positions: Vec<usize> = Scanner::new().scan_positions(input).into_iter().map(|(at, _)| at).collect();
+        assert_eq!(positions, [26, 46, 54]);
+    }
+
+    #[test]
+    fn a_cancelled_or_over_long_pointer_sequence_is_ignored() {
+        assert!(scan(b"\x1b]22;>pointer\x18").is_empty());
+        assert!(scan(b"\x1b]22;>pointer\x1a").is_empty());
+        assert!(scan(b"\x1b]22;>pointer\x1b[0m").is_empty());
+        assert_eq!(scan(b"\x1b]22;>grab\x1b]22;>copy\x07"), [pointer(b">copy")]);
+        let mut big = b"\x1b]22;?".to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAX_PAYLOAD));
+        big.push(BEL);
+        big.extend_from_slice(b"\x1b]22;>text\x07");
+        assert_eq!(scan(&big), [pointer(b">text")]);
     }
 
     #[test]

@@ -27,6 +27,8 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   bottom of the tab, and of each zone's header in a split tab.
 - **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
   logins): a yellow warning icon on a tab while it runs as root.
+- **Pointer shapes** from OSC 22, with kitty's stack and queries: a resize
+  pointer over an editor's split border, a hand over a button.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **Fonts**: the terminal font's family, size and line height, and the family of
@@ -43,8 +45,8 @@ endpoint for all its tabs. The `brindle-remote` helper is copied to a
 versioned cache on first connection (user-only on an SSH host) and reused
 while its build matches. Output remains the terminal's original byte stream,
 so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status, OSC 9;4
-progress, OSC 3008 contexts, clipboard/color replies and shell-integration marks
-work as in a local tab.
+progress, OSC 3008 contexts, OSC 22 pointer shapes, clipboard/color replies and
+shell-integration marks work as in a local tab.
 Zone splits stay on the same endpoint and inherit its remote directory.
 
 SSH uses your normal OpenSSH configuration, agent and host aliases:
@@ -881,6 +883,40 @@ Clicking a toast brings its window to the front with its tab active. If Windows
 won't hand Brindle the foreground, the taskbar button flashes instead. Turn
 Brindle's toasts off or on under Settings > System > Notifications; while they're
 off, Brindle logs one warning and carries on.
+
+### Pointer shapes
+
+Programs that use the mouse can set the pointer over their terminal with
+OSC 22, xterm's sequence with [kitty's extensions][kitty-pointer]: a stack per
+screen (primary and alternate) of up to 16 shapes, and queries.
+
+```sh
+printf '\033]22;ew-resize\033\\'          # set: replaces the top of the stack
+printf '\033]22;>pointer\033\\'           # push
+printf '\033]22;<\033\\'                  # pop
+printf '\033]22;\033\\'                   # Brindle's own pointer again
+printf '\033]22;?pointer,wait\033\\'      # query: the reply is ESC ] 22 ; 1,0 ESC \
+printf '\033]22;?__current__\033\\'       # the shape set now, or 0
+```
+
+As in kitty, a set or push applies each listed name in turn (`>a,b` pushes
+both, `=a,b` leaves `b`), and skips names Brindle can't show. It shows
+`default`, `text`, `vertical-text`, `pointer`, `crosshair`, `grab`,
+`grabbing`, `not-allowed`, `no-drop`, `alias`, `copy`, `context-menu`,
+`ew-resize`, `ns-resize`, `e-resize`, `w-resize`, `n-resize`, `s-resize`,
+`nwse-resize`, `nesw-resize`, `col-resize` and `row-resize`; there is no
+`wait`, `progress`, `help`, `cell`, `move`, `zoom-in` or `zoom-out` pointer to
+show, and queries answer `0` for them. `__default__` answers `text` and
+`__grabbed__` `default`.
+
+The shape applies over the terminal's grid only, never the tab strip or zone
+headers. A ctrl-hovered link still shows the hand, and dragging a selection
+the text beam. With no shape set, the pointer is Brindle's own: the arrow while
+the program reports the mouse, the text beam otherwise. A reset and the
+program's exit empty both stacks, and an attached or reconnected tab starts
+with Brindle's own pointer (the terminal server doesn't keep the stacks).
+
+[kitty-pointer]: https://sw.kovidgoyal.net/kitty/pointer-shapes/
 
 ### Using tmux
 
