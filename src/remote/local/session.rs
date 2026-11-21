@@ -1287,9 +1287,11 @@ mod tests {
         assert!(matches!(far.next(), ToCore::List(_)), "no ATTACH before the LIST");
         // A round trip the far end answers itself: nothing went out before
         // its LIST, and the tab heard nothing before its answer.
-        far.settle.store(true, std::sync::atomic::Ordering::Release);
-        assert!(connection.list().unwrap().is_empty());
-        assert!(matches!(far.next(), ToCore::List(_)), "nothing before the round trip's LIST");
+        let round_trip = far.round_trip(&connection);
+        assert!(
+            matches!(far.next(), ToCore::List(list) if list.req == round_trip),
+            "nothing before the round trip's LIST"
+        );
         assert!(tab.try_recv().is_err(), "the closed tab says nothing");
         assert_eq!(session.pid(), None);
     }
