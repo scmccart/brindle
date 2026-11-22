@@ -3,7 +3,9 @@
 //! query's reply.
 
 use super::Gate;
-use crate::brindle::Run;
+use super::tabs::{FACE_HEIGHT, FACE_LEFT, FACE_TOP, FACE_WIDTH, Strip};
+use crate::brindle::{Run, theme};
+use crate::capture::Image;
 use crate::{Ctx, Outcome, Result, ensure};
 
 fn notifications(ctx: &Ctx) -> Vec<String> {
@@ -31,7 +33,8 @@ fn setup(ctx: &Ctx) -> String {
 /// Two runs in a local tab (`when = "always"`, so window focus doesn't
 /// matter). First: the shell echoes the reply to `OSC 7501 ; ?`, and a
 /// program that is still running leaves its `working` child record and its
-/// `blocked` root record in the dump, the latter notifying. Second: a
+/// `blocked` root record in the dump, the latter notifying, and the tab's
+/// yellow dot sits before its title, at the face's left. Second: a
 /// `done` record outlives the program and the prompt that follows it.
 pub fn local(ctx: &Ctx) -> Result<Outcome> {
     let log = ctx.dir.join("notify.log");
@@ -50,6 +53,7 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
         .send(&setup(ctx))
         .send(&query)
         .send(&format!("printf '{working}{blocked}'; sleep 30\r"))
+        .capture_at(5.5)
         .dump_at(6.0)
         .run()?;
     ensure!(
@@ -62,6 +66,16 @@ pub fn local(ctx: &Ctx) -> Result<Outcome> {
         "state=working id=\"a\" progress=40 app=\"cargo\"",
     ];
     ensure!(out.dump.status == want, "status {:?}, expected {want:?}", out.dump.status);
+    // The blocked dot (the `e2e` theme's yellow) leads the face, in its
+    // 12px left padding's end and before the title, and none follows the
+    // title, where it used to be.
+    let image: &Image = out.image.as_ref().ok_or("no capture")?;
+    let strip = Strip::locate(&out, image)?;
+    let scale = out.dump.grid()?.scale;
+    let lead = strip.rect(FACE_LEFT + 8.0, FACE_TOP + 8.0, 14.0, FACE_HEIGHT - 16.0);
+    image.expect("the blocked dot before the title", lead, theme::YELLOW, (10.0 * scale * scale) as usize)?;
+    let after = strip.rect(FACE_LEFT + 26.0, FACE_TOP + 4.0, FACE_WIDTH - 30.0, FACE_HEIGHT - 8.0);
+    image.expect_none("a yellow dot after the title", after, theme::YELLOW)?;
     let got = notifications(ctx);
     ensure!(got.len() == 1, "one notification expected, got {got:?}");
     expect_notification(&got, "claude-code", "Run cargo test?")?;

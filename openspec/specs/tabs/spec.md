@@ -263,11 +263,11 @@ A bell from a tab that is not active, or from any tab while the window is inacti
 - **THEN** a dot appears on that tab and disappears when the tab is activated
 
 ### Requirement: Program status dot
-A tab SHALL show a status dot while any of its zones holds a program status record (see the `program-status` capability) other than `idle`. The dot's colour SHALL follow the most pressing state across those records, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit beside the bell dot when both apply.
+A tab SHALL show a status dot while any of its zones holds a program status record (see the `program-status` capability) other than `idle`. The dot's colour SHALL follow the most pressing state across those records, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit before the title, at the face's left, followed by the bell dot when both apply.
 
 #### Scenario: Blocked in a background tab
 - **WHEN** a program in a background tab reports `state=blocked:kind=permission`
-- **THEN** that tab shows a yellow dot
+- **THEN** that tab shows a yellow dot before its title
 
 #### Scenario: Zones in a tab
 - **WHEN** a program in one zone of a tab reports `state=error`, and another zone in the same tab reports `state=working`
@@ -340,3 +340,15 @@ A normal, error or paused bar SHALL fill its percent of the width from the left,
 #### Scenario: Indeterminate
 - **WHEN** a program reports `ESC ] 9 ; 4 ; 3 BEL`
 - **THEN** its tab shows a faint bar across its whole width, and the face is the same height as without one
+
+### Requirement: Tab context badge
+A tab face SHALL show, after its title, a badge for its active zone's notable context (see `program-contexts`) when it has one. The badge for `elevate`, `chpriv` and a `session` whose target user is `root` SHALL be a warning icon alone, without the label, drawn in the face's theme's yellow (ANSI 3) made legible on the face's background (at least 3:1), with a tooltip naming the target user ("Running as root"). Other badges SHALL show the label in the face's muted foreground, and SHALL give way before the title is shortened below 8 characters. A badge SHALL NOT change the face's height. A context SHALL NOT change the terminal's colours or the tab's title: what a program such as `run0` prints for itself (a tinted background, a glyph in its title) is shown as printed.
+
+#### Scenario: Elevated zone
+- **WHEN** the active zone of a tab runs `run0`, which reports a `session` context with `targetuser=root`
+- **THEN** that tab's face shows a yellow warning icon after its title, and no `root` text, until the context ends or an outer context is re-asserted, e.g. at the login shell's next prompt
+- **AND** resting the pointer on the icon shows "Running as root"
+
+#### Scenario: Background zone
+- **WHEN** a tab's inactive zone is inside a `container` context and its active zone has no contexts
+- **THEN** the tab face shows no badge

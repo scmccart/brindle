@@ -620,6 +620,49 @@ pub fn progress_attach(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A detached session's contexts (OSC 3008) stay in the server: after a
+/// quit and a plain launch, which attaches the detached session, its tab
+/// shows the privileged badge again, from the replay. Then, detached once
+/// more, the program ends the context (a file the case creates lets it),
+/// and the next attach shows no badge. Linux only: the command is bash's.
+pub fn context_attach(ctx: &Ctx) -> Result<Outcome> {
+    use super::context::{RUN0, context, echo};
+    let gate = super::Gate::new(ctx, "end-it");
+    let ended = ctx.dir.join("ended");
+    let later = format!(
+        "{{ {}; {}; {}; touch '{}'; }} &",
+        gate.wait(),
+        context("end=a1"),
+        echo("context-ended", 3),
+        ended.display()
+    );
+    let first = Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .send("PS1='$ '; HISTFILE=; set +m\\r")
+        .send(&format!("{}; {}; {later}\\r", context(RUN0), echo("context-set", 3)))
+        .wait_for("context-set")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(first.dump.wait_timeouts.is_empty(), "the start didn't run: {:?}", first.dump.screen);
+    let want = ["tab=1 kind=privileged label=\"root\" draw=icon"];
+    ensure!(first.dump.badges == want, "before the quit: {:?}", first.dump.badges);
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    let second = Run::new(ctx, "second").keep_detached().restore().wait_for("context-set").dump_at(6.0).run()?;
+    ensure!(second.dump.tabs.len() == 1, "tabs: {:?}", second.dump.tabs);
+    ensure!(second.dump.badges == want, "after the attach: {:?}; screen {:?}", second.dump.badges, second.dump.screen);
+    ensure!(second.dump.contexts == ["id=\"a1\" type=elevate label=\"root\""], "contexts {:?}", second.dump.contexts);
+
+    // Ended while no client was attached.
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    std::fs::write(&gate.0, b"").map_err(|e| e.to_string())?;
+    ctx.scale().eventually(10.0, "the detached program ending its context", || ended.exists())?;
+    let third = Run::new(ctx, "third").keep_detached().restore().wait_for("context-ended").dump_at(6.0).run()?;
+    ensure!(third.dump.wait_timeouts.is_empty(), "the end didn't run: {:?}", third.dump.screen);
+    ensure!(third.dump.badges.is_empty() && third.dump.contexts.is_empty(), "after the end: {:?} {:?}", third.dump.badges, third.dump.contexts);
+    Ok(Outcome::Pass)
+}
+
 /// Brindle killed (SIGKILL, on Windows `taskkill /F`) with a split tab: a
 /// plain launch brings back both zones' sessions, and the left one's output.
 pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {

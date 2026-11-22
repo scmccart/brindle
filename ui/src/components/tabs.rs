@@ -29,10 +29,13 @@
 //! - a middle press on a closable trigger asks the owner to close it;
 //! - with `on_context_menu`, a secondary press on an enabled trigger asks
 //!   the owner for its menu ([`TabContextMenu`]) and goes no further;
-//! - leading and trailing adornments (an icon, status dots), and a tooltip
-//!   on the trigger and on its close button;
+//! - leading elements (an icon, status and bell dots) and trailing
+//!   adornments, and a tooltip on the trigger and on its close button;
 //! - a bar along the bottom edge of a trigger ([`TabTrigger::edge_bar`]),
 //!   such as a progress bar, which doesn't change its size;
+//! - a badge after a trigger's label ([`TabTrigger::badge`]), a label cut
+//!   only once the trigger's is down to its first few characters, or an
+//!   icon;
 //! - a minimum and maximum width ([`TabWidth`]) with the label cut by an
 //!   ellipsis;
 //! - with `on_move`, a trigger can be dragged onto another, which asks the
@@ -58,6 +61,7 @@ use gpui::{
 
 use crate::components::button::Button;
 use crate::components::tooltip::{Tooltip, TooltipFor, TooltipHandler, attach};
+use crate::components::badge::{Badge, TitleText, title_and_badge};
 use crate::components::{DISABLED_OPACITY, EdgeBar, FocusRing};
 use crate::icon::{Icon, LEGIBLE_ICON_STROKE};
 use crate::primitives::focus_visible::{Modality, modality, set_modality, shows_ring};
@@ -265,6 +269,7 @@ pub struct TabTrigger {
     tooltip: Option<TooltipHandler>,
     close_tooltip: Option<TooltipHandler>,
     edge_bar: Option<EdgeBar>,
+    badge: Option<Badge>,
 }
 
 impl TabTrigger {
@@ -283,18 +288,29 @@ impl TabTrigger {
             tooltip: None,
             close_tooltip: None,
             edge_bar: None,
+            badge: None,
         }
     }
 
+    /// A badge right after the label, before the adornments. The label is
+    /// cut first, down to its first [`TITLE_KEEPS`](crate::TITLE_KEEPS)
+    /// characters, and then a label badge (an icon badge keeps its size;
+    /// [`Badge`]); the face keeps its height.
+    pub fn badge(mut self, badge: Badge) -> Self {
+        self.badge = Some(badge);
+        self
+    }
+
     /// Something before the label: an icon, drawn in the trigger's text
-    /// colour.
+    /// colour, or a status or bell dot. Leading elements keep their size
+    /// when the label is cut.
     pub fn leading(mut self, element: impl IntoElement) -> Self {
         self.leading.push(element.into_any_element());
         self
     }
 
-    /// Something after the label, before the close button: a status dot, a
-    /// bell. Adornments keep their size when the label is cut.
+    /// Something after the label and its badge, before the close button.
+    /// Adornments keep their size when the label is cut.
     pub fn adornment(mut self, element: impl IntoElement) -> Self {
         self.adornments.push(element.into_any_element());
         self
@@ -580,7 +596,8 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
     let on_move = list.on_move.clone().filter(|_| !disabled);
     let on_context_menu = list.on_context_menu.clone().filter(|_| !disabled);
 
-    let label = trigger_label(trigger.label.clone());
+    let text = TitleText { size: style.text_size, weight: style.font_weight };
+    let (label, badge) = title_and_badge(trigger.label.clone(), trigger.badge, text, window, cx);
     let close = on_close.clone().map(|on_close| {
         // An `IconXs` button (it fits the 30px face) with a 16px icon at a
         // legible stroke. It shows only while the trigger is active or
@@ -681,6 +698,7 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
         })
         .children(trigger.leading)
         .child(label)
+        .children(badge)
         .children(trigger.adornments)
         .children(close)
         .children(trigger.edge_bar.map(|bar| bar.element(style.radius)));

@@ -58,6 +58,7 @@ pub enum Icon {
     Columns2,
     Rows2,
     Lock,
+    TriangleAlert,
 }
 
 /// One stroke of an icon, in unit coordinates.
@@ -185,9 +186,36 @@ const LOCK: &[Stroke] = &[
         p(17., 11.),
     ]),
 ];
+// lucide `triangle-alert`: m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16
+// a2 2 0 0 0 1.73-3, M12 9v4, M12 17h.01. The triangle starts and ends
+// halfway along its bottom edge, so its butt-capped ends meet on a straight
+// line; its corners (radius 2) are drawn as chords every 30 degrees or so.
+// Without round caps the `h.01` dot would be invisible, so it is a 2-unit
+// rule centred on (12, 17).
+const TRIANGLE_ALERT: &[Stroke] = &[
+    Stroke::Polyline(&[
+        p(12., 21.),
+        p(20., 21.),
+        p(21.414, 20.414),
+        p(22., 19.),
+        p(21.73, 18.),
+        p(13.73, 4.),
+        p(12.99, 3.254),
+        p(11.99, 2.986),
+        p(10.99, 3.254),
+        p(10.25, 4.),
+        p(2.25, 18.),
+        p(2., 19.),
+        p(2.586, 20.414),
+        p(4., 21.),
+        p(12., 21.),
+    ]),
+    Stroke::Polyline(&[p(12., 9.), p(12., 13.)]),
+    Stroke::Polyline(&[p(12., 16.), p(12., 18.)]),
+];
 
 impl Icon {
-    pub const ALL: [Icon; 15] = [
+    pub const ALL: [Icon; 16] = [
         Icon::Check,
         Icon::ChevronDown,
         Icon::ChevronUp,
@@ -203,6 +231,7 @@ impl Icon {
         Icon::Columns2,
         Icon::Rows2,
         Icon::Lock,
+        Icon::TriangleAlert,
     ];
 
     pub(crate) fn strokes(self) -> &'static [Stroke] {
@@ -222,6 +251,7 @@ impl Icon {
             Icon::Columns2 => COLUMNS_2,
             Icon::Rows2 => ROWS_2,
             Icon::Lock => LOCK,
+            Icon::TriangleAlert => TRIANGLE_ALERT,
         }
     }
 
@@ -514,6 +544,24 @@ mod tests {
         for &(x, y) in &shackle[1..shackle.len() - 1] {
             let r = ((x - 12.).powi(2) + (y - 7.).powi(2)).sqrt();
             assert!((r - 5.).abs() < 0.01 || (x - 7.).abs() < 0.01, "({x}, {y}) is off the arc: {r}");
+        }
+        // The warning triangle is closed, its edges lucide's, with the
+        // exclamation's bar and dot on its centre line.
+        let strokes = Icon::TriangleAlert.strokes();
+        assert_eq!(strokes.len(), 3);
+        let Stroke::Polyline(triangle) = strokes[0] else {
+            panic!("triangle-alert starts with its triangle");
+        };
+        let triangle: Vec<_> = triangle.iter().copied().map(|(x, y)| (x * GRID, y * GRID)).collect();
+        assert_eq!(triangle.first(), triangle.last(), "the triangle is closed");
+        for corner in [(21.73, 18.), (13.73, 4.), (10.25, 4.), (2.25, 18.), (4., 21.), (20., 21.)] {
+            assert!(triangle.iter().any(|&pt| near(pt, corner)), "{corner:?} is missing");
+        }
+        for (stroke, (top, bottom)) in strokes[1..].iter().zip([(9., 13.), (16., 18.)]) {
+            let Stroke::Polyline(line) = stroke else {
+                panic!("the exclamation is two rules");
+            };
+            assert_eq!(line.iter().copied().map(grid).collect::<Vec<_>>(), [(12., top), (12., bottom)]);
         }
     }
 
