@@ -366,6 +366,175 @@ pub fn ssh_quit(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A restored SSH tab takes its window's size: a first run leaves an SSH
+/// tab's shell detached, and the next launch, whose grid is smaller (more
+/// padding), restores the tab attached to it. Once attached, the remote
+/// PTY's size (`stty size`) is the restored terminal's grid, not the size
+/// the session was detached at.
+pub fn ssh_reattach_size(ctx: &Ctx) -> Result<Outcome> {
+    // The command's own echo says `bef""ore=`, so only its output matches.
+    let size = |marker: &str| {
+        let (head, tail) = marker.split_at(3);
+        format!("echo \"{head}\"\"{tail}=$(stty size)\"\r")
+    };
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-reattach-size", false);
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        .default_profile(SSH_PROFILE)
+        .wait_for(SSH_PROMPT)
+        .send(&size("before"))
+        .wait_for("before=")
+        .dump_at(8.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    let before = shown_stty_size(&first.dump, "before=")?;
+    ensure!(
+        first.dump.size == Some(before),
+        "the first run's PTY is {before:?}, its grid {:?}",
+        first.dump.size
+    );
+    let docker = ssh.container.docker.clone();
+    ctx.scale().poll(10.0, "the tab's session detached", || {
+        let sessions = docker.sessions()?;
+        Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+
+    let second = needs
+        .run(ctx, "second", &config)
+        .restore()
+        .default_profile(SSH_PROFILE)
+        // A smaller grid in the same window.
+        .padding(80)
+        // The replay brings the first run's line back.
+        .wait_for("before=")
+        .send(&size("after"))
+        .wait_for("after=")
+        .dump_at(10.0)
+        .run()?;
+    no_waits_left(&second.dump)?;
+    let after = shown_stty_size(&second.dump, "after=")?;
+    ensure!(
+        second.dump.size != Some(before),
+        "the second run's grid {:?} is the first's: the case checks nothing",
+        second.dump.size
+    );
+    ensure!(
+        second.dump.size == Some(after),
+        "the reattached session's PTY is {after:?}, its grid {:?} (detached at {before:?})",
+        second.dump.size
+    );
+    Ok(Outcome::Pass)
+}
+
+/// A restored SSH tab in the background shows what its program draws at the
+/// session's own size. A first run leaves a local tab (active) and an SSH tab
+/// detached, the SSH tab's shell waiting for a file in the container. The
+/// restoring run reattaches the SSH tab while the local one is shown, so
+/// nothing has laid the SSH tab out; the file is then created, and the
+/// program clears the screen and draws `MARK` at column 90, past the
+/// default grid's 80 columns. Shown, the tab has `MARK` at column 90: the
+/// draw landed on a grid at the session's size, not clamped at column 80.
+pub fn ssh_reattach_background(ctx: &Ctx) -> Result<Outcome> {
+    const DRAWN: &str = "BACKGROUND-DRAWN";
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-reattach-background", false);
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        // The local tab's session is the next run's too.
+        .keep_detached()
+        .action("new_tab_with_profile_2")
+        .wait_for(SSH_PROMPT)
+        .send(concat!(
+            "while [ ! -e /tmp/go ]; do sleep 0.1; done; ",
+            "printf '\\033[H\\033[2J\\033[1;90HMARK'; touch /tmp/drawn; exec sleep 1000\r"
+        ))
+        .action("prev_tab")
+        .dump_at(8.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    let tabs = &first.dump.tabs;
+    ensure!(tabs.len() == 2 && tabs[0].1, "tabs: {tabs:?}");
+    let docker = ssh.container.docker.clone();
+    ctx.scale().poll(10.0, "the SSH tab's session detached", || {
+        let sessions = docker.sessions()?;
+        Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+    ctx.scale().poll(10.0, "the local tab's session detached", || {
+        let local = local_sessions(&ctx.helper, &ctx.server_dir)?;
+        Ok(matches!(local.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+
+    let (helper, server_dir, scale) = (ctx.helper.clone(), ctx.server_dir.clone(), ctx.scale());
+    let second = needs
+        .run(ctx, "second", &config)
+        .restore()
+        .call_at(1.0, move |_| {
+            scale.poll(30.0, "the SSH tab's session attached again", || {
+                let sessions = docker.sessions()?;
+                Ok(matches!(sessions.as_slice(), [session] if session.attached).then_some(()))
+            })?;
+            docker.exec(&["touch", "/tmp/go"])?;
+            scale.poll(10.0, "the SSH tab's program drawn", || {
+                Ok(docker.exec(&["test", "-e", "/tmp/drawn"]).is_ok().then_some(()))
+            })?;
+            let local = scale.poll(10.0, "the restored local tab", || {
+                Ok(local_sessions(&helper, &server_dir)?
+                    .into_iter()
+                    .find(|s| s.attached))
+            })?;
+            mark_tty(local.pid, DRAWN)
+        })
+        // The local tab, active at the quit, is shown while the SSH tab's
+        // program draws.
+        .wait_for(DRAWN)
+        .action("next_tab")
+        .dump_at(10.0)
+        .run()?;
+    no_waits_left(&second.dump)?;
+    let tabs = &second.dump.tabs;
+    ensure!(tabs.len() == 2 && tabs[1].1, "tabs: {tabs:?}");
+    // The drawn line, not the command line that typed it.
+    let marked = second
+        .dump
+        .screen
+        .iter()
+        .find(|line| line.trim_start().starts_with("MARK"))
+        .map(|line| line.len() - line.trim_start().len());
+    ensure!(
+        marked == Some(89),
+        "MARK at column {marked:?}, not 89 (from 0), on a {:?} grid: {:?}",
+        second.dump.size,
+        second.dump.screen
+    );
+    Ok(Outcome::Pass)
+}
+
+/// The `(cols, rows)` that a `MARKERROWS COLS` line (`stty size`) shows.
+fn stty_size(line: &str, marker: &str) -> Option<(u16, u16)> {
+    let (rows, cols) = line.strip_prefix(marker)?.trim().split_once(' ')?;
+    Some((cols.parse().ok()?, rows.parse().ok()?))
+}
+
+/// The size the last line starting with `marker` on the screen shows.
+fn shown_stty_size(dump: &Dump, marker: &str) -> Result<(u16, u16)> {
+    dump.screen
+        .iter()
+        .rev()
+        .find_map(|line| stty_size(line, marker))
+        .ok_or_else(|| format!("no {marker:?} line: {:?}", dump.screen))
+}
+
 /// An SSH tab split twice keeps one connection: Brindle runs one `ssh` and
 /// the container one relay for the three zones, whose sessions its server
 /// lists. Closing the tab ends the three programs, and then the unused
@@ -1425,6 +1594,11 @@ fn no_waits_left(dump: &Dump) -> Result {
 
 /// The harness's own tests of this file's parsers (`--self-test`).
 pub fn self_test() -> Result {
+    ensure!(stty_size("after=24 80", "after=") == Some((80, 24)), "stty size");
+    ensure!(
+        stty_size("after=24", "after=").is_none() && stty_size("echo \"aft\"\"er=", "after=").is_none(),
+        "stty size junk"
+    );
     let listed = parse_list(
         "3\t4242\tattached\t-\t-\tdetach\t1m05s\tbash\tbash -i\t/root\n\
          4\t77\tdetached\towned\t30s\tdetach\t2m\tsleep\tsleep 9\t/\n\
