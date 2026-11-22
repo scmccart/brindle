@@ -10,6 +10,7 @@
 //! [`OutputMarker`]: super::OutputMarker
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener as _};
 use alacritty_terminal::sync::FairMutex;
@@ -41,6 +42,9 @@ pub struct Sink {
     replay: Option<Vec<u8>>,
     /// Which notice was shown last, until the session prints again.
     gate: NoteGate,
+    /// Whether a layout has sized the term ([`super::Terminal::resize`]
+    /// sets it under the term's lock).
+    laid_out: Arc<AtomicBool>,
 }
 
 impl Sink {
@@ -50,12 +54,25 @@ impl Sink {
         marks: Arc<Mutex<Marks>>,
         listener: Listener,
         doing: String,
+        laid_out: Arc<AtomicBool>,
     ) -> Self {
-        Self { term, parser, marks, listener, scanner: Scanner::new(), doing, replay_size: None, replay: None, gate: NoteGate::default() }
+        Self {
+            term,
+            parser,
+            marks,
+            listener,
+            scanner: Scanner::new(),
+            doing,
+            replay_size: None,
+            replay: None,
+            gate: NoteGate::default(),
+            laid_out,
+        }
     }
 
     /// The first replay was rendered at `size` (an attached session's), so
-    /// it is fed at that size, then the term resizes back to its own.
+    /// it is fed at that size, then the term resizes back to its own once
+    /// a layout has sized it ([`replay_fit`]).
     pub fn replayed_at(mut self, size: GridSize) -> Self {
         self.replay_size = Some(size);
         self
@@ -72,26 +89,50 @@ impl Sink {
         let mut parser = self.parser.lock();
         let mut term = self.term.lock_unfair();
         let own = GridSize { cols: term.columns() as u16, rows: term.screen_lines() as u16, ..GridSize::default() };
-        let size = replay_resize(own, self.replay_size.take());
-        if let Some(size) = size {
-            self.marks.lock().resize(&mut *term, size);
+        // Read under the term's lock, which the layout's resize takes too.
+        let laid_out = self.laid_out.load(Ordering::Relaxed);
+        let fit = replay_fit(own, self.replay_size.take(), laid_out);
+        match fit {
+            ReplayFit::AsIs => {}
+            ReplayFit::Around(size) | ReplayFit::Adopt(size) => self.marks.lock().resize(&mut *term, size),
         }
         inject_fault(bytes);
         parser.advance(&mut *term, &self.marks, bytes);
-        if size.is_some() {
-            self.marks.lock().resize(&mut *term, own);
+        match fit {
+            ReplayFit::Around(_) => self.marks.lock().resize(&mut *term, own),
+            ReplayFit::AsIs | ReplayFit::Adopt(_) => {}
         }
     }
 }
 
-/// The size a replay rendered at `recorded` is fed at, by a terminal whose
-/// grid is `own`: the recorded size, within the limits every grid keeps
-/// ([`GridSize::clamped`]), when its columns or rows differ from the
-/// grid's; `None` when nothing was recorded or the grid already has it.
-/// The recorded size is a session's decoded one (`ListedSession::size`, or
-/// the default grid for a core that lists none), never zero.
-fn replay_resize(own: GridSize, recorded: Option<GridSize>) -> Option<GridSize> {
-    recorded.map(GridSize::clamped).filter(|size| (size.cols, size.rows) != (own.cols, own.rows))
+/// How a replay is fed to the term.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplayFit {
+    /// At the grid's own size: nothing was recorded, or the grid has it.
+    AsIs,
+    /// At this size, then back to the grid's, which a layout gave it and
+    /// the session has been (or is being) resized to.
+    Around(GridSize),
+    /// At this size, which the grid keeps: nothing has laid the terminal
+    /// out (a tab in the background), so its grid is a placeholder and the
+    /// session's own size is the one its program draws at until a layout
+    /// resizes both.
+    Adopt(GridSize),
+}
+
+/// How a replay rendered at `recorded` is fed to a terminal whose grid is
+/// `own`, `laid_out` or not: at the recorded size, within the limits every
+/// grid keeps ([`GridSize::clamped`]), when its columns or rows differ from
+/// the grid's, and then kept unless a layout has sized the grid. The
+/// recorded size is a session's decoded one (`ListedSession::size`, or the
+/// default grid for a core that lists none), never zero.
+fn replay_fit(own: GridSize, recorded: Option<GridSize>, laid_out: bool) -> ReplayFit {
+    let differs = recorded.map(GridSize::clamped).filter(|size| (size.cols, size.rows) != (own.cols, own.rows));
+    match (differs, laid_out) {
+        (None, _) => ReplayFit::AsIs,
+        (Some(size), true) => ReplayFit::Around(size),
+        (Some(size), false) => ReplayFit::Adopt(size),
+    }
 }
 
 impl Sink {
@@ -254,6 +295,11 @@ mod tests {
     /// A sink on a terminal whose events arrive on the receiver, through a
     /// gate as a terminal's do.
     fn sink() -> (Sink, UnboundedReceiver<ChannelEvent>, Arc<OutputMarker>) {
+        sink_laid_out(true)
+    }
+
+    /// A sink on a terminal a layout has sized (`laid_out`) or not.
+    fn sink_laid_out(laid_out: bool) -> (Sink, UnboundedReceiver<ChannelEvent>, Arc<OutputMarker>) {
         let (listener, rx) = Listener::channel();
         let marker = listener.output.clone();
         let term = Term::new(term::Config::default(), &GridSize::default(), listener.clone());
@@ -263,6 +309,7 @@ mod tests {
             Arc::new(Mutex::new(Marks::default())),
             listener,
             "start \"sh\"".into(),
+            Arc::new(AtomicBool::new(laid_out)),
         );
         (sink, rx, marker)
     }
@@ -430,7 +477,8 @@ mod tests {
 
     /// A replay is fed at its recorded size only when that differs from
     /// the grid's, in columns or rows, after the clamp; the cell size never
-    /// counts.
+    /// counts. A laid-out grid goes back to its own size; one nothing laid
+    /// out keeps the recorded size.
     #[test]
     fn a_replay_is_resized_for_only_when_its_recorded_size_differs() {
         let size = |cols, rows| GridSize { cols, rows, ..GridSize::default() };
@@ -450,8 +498,31 @@ mod tests {
             ("past the limits, clamped to the grid's own", size(2048, 1024), Some(size(u16::MAX, u16::MAX)), None),
         ];
         for (case, own, recorded, expected) in cases {
-            assert_eq!(replay_resize(own, recorded), expected, "{case}");
+            let (laid_out, placeholder) = match expected {
+                Some(size) => (ReplayFit::Around(size), ReplayFit::Adopt(size)),
+                None => (ReplayFit::AsIs, ReplayFit::AsIs),
+            };
+            assert_eq!(replay_fit(own, recorded, true), laid_out, "{case}, laid out");
+            assert_eq!(replay_fit(own, recorded, false), placeholder, "{case}, not laid out");
         }
+    }
+
+    /// A background tab's terminal, which nothing has laid out, keeps the
+    /// size its session's replay was rendered at, so what the program draws
+    /// next, at that size, lands where it meant: a cursor move to column 90
+    /// of a 120-column session isn't clamped to the placeholder's 80.
+    #[test]
+    fn a_replay_into_a_terminal_nothing_laid_out_keeps_the_sessions_size() {
+        let (mut sink, _rx, _) = sink_laid_out(false);
+        sink.replay_size(120, 30);
+        sink.replay(true);
+        sink.output(b"\x1bc$ ");
+        sink.replay(false);
+        sink.output(b"\x1b[1;90HMARK");
+        let term = sink.term.lock();
+        assert_eq!((term.columns(), term.screen_lines()), (120, 30));
+        let text = crate::terminal::screen_text(&term);
+        assert_eq!(text.lines().next().and_then(|line| line.find("MARK")), Some(89), "{text}");
     }
 
     /// 7.1: a recorded session's replay is fed at the size its listing

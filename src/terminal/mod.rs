@@ -33,7 +33,7 @@ pub use brindle_term_core::{context, progress, shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -273,7 +273,15 @@ pub enum TerminalEvent {
 enum Backend {
     /// A session of `host`'s terminal server.
     #[cfg(any(target_os = "linux", windows))]
-    Server { session: crate::remote::local::Session, closing: Closing, host: Host },
+    Server {
+        session: crate::remote::local::Session,
+        closing: Closing,
+        host: Host,
+        /// Whether a layout has sized the term, which the session's sink
+        /// reads to feed a replay ([`server::Sink`]); set under the term's
+        /// lock.
+        laid_out: Arc<AtomicBool>,
+    },
     /// A read-only message with no program behind it.
     Remote,
 }
@@ -606,7 +614,8 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
+        let laid_out = Arc::new(AtomicBool::new(false));
+        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing, laid_out.clone());
         let session = match host {
             Host::Local => crate::remote::local::Session::start(
                 host.clone(),
@@ -618,7 +627,7 @@ impl Terminal {
             ),
             Host::Remote(_) => crate::remote::local::Session::start(host.clone(), move || request, Box::new(sink)),
         };
-        let backend = Backend::Server { session, closing, host: host.clone() };
+        let backend = Backend::Server { session, closing, host: host.clone(), laid_out };
         Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx)
     }
 
@@ -654,12 +663,14 @@ impl Terminal {
         } else {
             format!("attach session {} ({what})", request.session)
         };
-        let mut sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
+        let laid_out = Arc::new(AtomicBool::new(false));
+        let mut sink =
+            server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing, laid_out.clone());
         if !recorded {
             sink = sink.replayed_at(size);
         }
         let session = crate::remote::local::Session::attach(host.clone(), request, Box::new(sink));
-        let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
+        let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone(), laid_out };
         let theme = config.profile_theme(profile);
         let mut this = Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx);
         this.origin = Origin::Attached;
@@ -1103,11 +1114,18 @@ impl Terminal {
             return;
         }
         let size = size.clamped();
-        if size == self.size {
+        let mut term = self.term.lock();
+        match &self.backend {
+            // Under the term's lock, which the sink feeds a replay under.
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { laid_out, .. } => laid_out.store(true, Ordering::Relaxed),
+            Backend::Remote => {}
+        }
+        let grid = (term.columns() as u16, term.screen_lines() as u16);
+        if !resize_due(size, self.size, grid) {
             return;
         }
         self.size = size;
-        let mut term = self.term.lock();
         self.marks.lock().resize(&mut *term, size);
         drop(term);
         match &self.backend {
@@ -1753,6 +1771,14 @@ pub(crate) fn with_checked_dir(
     request
 }
 
+/// Whether a layout's grid `asked` resizes the term and its session: when
+/// it isn't the size the last layout gave (`last`), or the term's grid
+/// (`grid`, columns and rows) has another size, as one a replay left at
+/// its session's size before any layout has ([`server::Sink`]).
+fn resize_due(asked: GridSize, last: GridSize, grid: (u16, u16)) -> bool {
+    asked != last || (asked.cols, asked.rows) != grid
+}
+
 /// The grid an attach starts with, and whether its session's size is still
 /// to come with a listing (a recorded session's). A session just listed is
 /// attached at its own size, so its replay, rendered at that size, lands
@@ -1890,6 +1916,21 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    /// A layout resizes when its grid is new, in cells or in pixels, or
+    /// when the term's grid isn't its size: a background tab's replay left
+    /// it at the session's 120x30 while the terminal still records the
+    /// placeholder 80x24, and a first layout at 80x24 must still resize.
+    #[test]
+    fn a_layout_resizes_when_its_grid_or_the_terms_differs() {
+        let last = GridSize::default();
+        let wider = GridSize { cols: 120, ..last };
+        let taller_cells = GridSize { cell_height: 20, ..last };
+        assert!(!resize_due(last, last, (80, 24)), "the same layout, the same grid");
+        assert!(resize_due(wider, last, (80, 24)), "more columns");
+        assert!(resize_due(taller_cells, last, (80, 24)), "other cells");
+        assert!(resize_due(last, last, (120, 30)), "the term's grid at a replay's size");
+    }
 
     #[test]
     fn a_grid_size_is_clamped_to_the_grid_limits_and_its_cells_kept() {
