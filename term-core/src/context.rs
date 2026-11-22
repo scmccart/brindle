@@ -10,6 +10,10 @@
 //! active context, and an update or end of a context ends everything after
 //! it, so the stack is a `Vec` (index 0 outermost, the last active).
 //!
+//! Where no program announces a context (local Windows sessions), the
+//! caller reads its foreground program's [`Elevation`], and [`badge`] gives
+//! the badge the two make: an announced context first.
+//!
 //! The lifetime is the callers', the client's `Terminal` and the server's
 //! [`Emulator`](crate::emulator::Emulator): only the program's exit drops
 //! the stack (UAPI's hangup reset). A full or soft reset, a new prompt and
@@ -330,6 +334,37 @@ impl Badge {
         };
         format!("kind={kind} label={:?}", self.label)
     }
+}
+
+/// The label of the badge a program running elevated gets ([`badge`]).
+pub const ELEVATED_LABEL: &str = "Administrator";
+
+/// Whether a terminal's foreground program runs elevated, as the system
+/// says: on Windows, its token's `TokenElevation`. The caller reads it; this
+/// crate only decides what it shows ([`badge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Elevation {
+    /// Its token was read, and it isn't elevated.
+    Standard,
+    /// Its token was read, and it is elevated.
+    Elevated,
+    /// No token was read: it couldn't be opened or read (a refusal
+    /// included, which is never taken for elevation), or there is none to
+    /// read (a remote session, another platform, no program yet). Kept
+    /// apart from `Standard` so a log can tell the two apart.
+    Unknown,
+}
+
+/// The badge a terminal's tab face and zone header show: its notable
+/// context ([`Contexts::notable`]) when it has one, since the program
+/// announced it; else a privileged badge labelled [`ELEVATED_LABEL`] when
+/// its foreground program runs elevated. A standard or unread elevation
+/// gives none.
+pub fn badge(notable: Option<Badge>, elevation: Elevation) -> Option<Badge> {
+    notable.or_else(|| match elevation {
+        Elevation::Elevated => Some(Badge { kind: BadgeKind::Privileged, label: ELEVATED_LABEL.to_owned() }),
+        Elevation::Standard | Elevation::Unknown => None,
+    })
 }
 
 /// A terminal's open contexts, outermost first; the last is active.
@@ -696,6 +731,50 @@ mod tests {
         let back = after(&payloads.iter().map(String::as_str).collect::<Vec<_>>());
         assert_eq!(back, contexts);
         assert!(Contexts::default().encode().is_empty());
+    }
+
+    fn badge_with(payloads: &[&str], elevation: Elevation) -> Option<(BadgeKind, String)> {
+        super::badge(after(payloads).notable(), elevation).map(|badge| (badge.kind(), badge.label().to_owned()))
+    }
+
+    #[test]
+    fn an_elevated_program_alone_gets_a_privileged_administrator_badge() {
+        use BadgeKind::Privileged;
+        assert_eq!(badge_with(&[], Elevation::Elevated), Some((Privileged, "Administrator".into())));
+        // Contexts of no notable kind leave it so.
+        assert_eq!(badge_with(&["start=s;type=shell"], Elevation::Elevated), Some((Privileged, "Administrator".into())));
+        let elevated = super::badge(None, Elevation::Elevated).unwrap();
+        assert_eq!(elevated.describe(), "kind=privileged label=\"Administrator\"");
+    }
+
+    #[test]
+    fn a_standard_or_unread_elevation_gives_no_badge() {
+        for elevation in [Elevation::Standard, Elevation::Unknown] {
+            assert_eq!(badge_with(&[], elevation), None, "{elevation:?}");
+            assert_eq!(badge_with(&["start=s;type=shell"], elevation), None, "{elevation:?}");
+        }
+    }
+
+    #[test]
+    fn an_announced_context_wins_over_any_elevation() {
+        use BadgeKind::{Elsewhere, Privileged};
+        for elevation in [Elevation::Elevated, Elevation::Standard, Elevation::Unknown] {
+            assert_eq!(
+                badge_with(&["start=c1;type=container;container=web"], elevation),
+                Some((Elsewhere, "web".into())),
+                "{elevation:?}"
+            );
+            assert_eq!(
+                badge_with(&["start=e;type=elevate;targetuser=root"], elevation),
+                Some((Privileged, "root".into())),
+                "{elevation:?}"
+            );
+        }
+        // Once the context ends, the elevation shows again.
+        assert_eq!(
+            badge_with(&["start=c1;type=container;container=web", "end=c1"], Elevation::Elevated),
+            Some((Privileged, "Administrator".into()))
+        );
     }
 
     #[test]
