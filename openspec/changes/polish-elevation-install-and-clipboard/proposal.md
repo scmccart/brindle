@@ -18,6 +18,8 @@ Five rough edges, collected into one change. On Windows nothing sends OSC 3008, 
 - **Right-click over a selection clears it and pastes.** With `right_click = "paste"`, a right-click pastes the clipboard whether or not text is selected, and the paste clears the selection, as every paste does. With `copy_on_select` on too, that is PuTTY's select-then-right-click flow. This reverses the rule from `polish-settings-and-clipboard` that a right-click over a selection does nothing. The default, `right_click = "none"`, is unchanged. An empty clipboard still pastes nothing and leaves the selection.
 - **Feedback for mouse copy and paste.** A small "Copied", "Pasted" or "Nothing to paste" label shows at the pointer for about a second, then fades. It shows only for `copy_on_select` copies and right-click pastes, never for keys. It takes no focus, lets clicks through and doesn't move the grid.
 
+- **Archives checked out of the box.** Every release archive, unpacked alone, must run local tabs and SSH and container profiles: the Windows zip with `brindle-remote.exe` (ConPTY embedded) and the Linux helper, the Linux archive with its static helper. Packaging already does this on `main` (v0.3.0 predates it). What's new is a CI check that runs the e2e local and remote cases against the installed archive instead of the build directory.
+
 No breaking changes: both new release assets are additive, and the right-click change is a behaviour change of an opt-in value, not a changed key or default.
 
 ## Capabilities
@@ -30,7 +32,7 @@ None.
 - `program-contexts`: a local Windows terminal whose foreground program runs elevated has a privileged notable context of its own, which no announced context can replace.
 - `shell-integration`: a new requirement hides Select and Copy Last Command Output, and makes them do nothing, until a prompt mark has arrived.
 - `desktop-integration`: one-command installs and uninstalls from a release, on Linux and Windows.
-- `release-process`: a new requirement adds `install.sh` and `install.ps1` to every release, listed in `SHA256SUMS`.
+- `release-process`: archives must work out of the box, locally and for SSH and container profiles; and a new requirement adds `install.sh` and `install.ps1` to every release, listed in `SHA256SUMS`.
 - `terminal-emulation`: the clipboard is the system's, shared with other applications both ways, with the line endings each side sees; right-click paste clears a selection and pastes; mouse copies and pastes show a label at the pointer.
 - `configuration`: `right_click = "paste"` is described as clearing any selection and pasting.
 
