@@ -375,7 +375,38 @@ scripts/lint-commits                      # check the commits not on origin/main
 
 ## Installing
 
-Each [GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
+On Linux x86-64, one command installs the latest release as you: `brindle`
+and its remote helper in `~/.local/bin`, with the launcher entry and icon. It
+works with `sh` or `bash`, checks the download against the release's
+`SHA256SUMS` before installing anything, says so when `brindle` can't run on
+the system (it needs the glibc and libraries named below), and uses `sudo`
+only to write a `PREFIX` you can't:
+
+```sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh
+```
+
+Run it again to update; a Brindle that is already running keeps its old build
+until it quits. `BRINDLE_VERSION` picks another release and `PREFIX` another
+directory, and `--uninstall` removes it all again, keeping your config in
+`~/.config/brindle`:
+
+```sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | env BRINDLE_VERSION=0.4.0 sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | env PREFIX=/usr/local sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh -s -- --uninstall
+```
+
+The one-command installers (`install.sh` here, `install.ps1` on Windows) come
+with the releases after 0.3.0. Each release's copy installs that release
+unless told another, and its `SHA256SUMS` lists them. That checksum catches a
+corrupt download, not a compromised release; for provenance, check the
+attestation as below. `BRINDLE_DOWNLOAD_BASE` points either script at a
+directory of built assets instead (`file:///DIR`), which is how CI tests them.
+The scripts are `scripts/get.sh` and `scripts/get.ps1` in a checkout.
+
+To install by hand instead: each
+[GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
 x86-64 archive, `brindle-<version>-x86_64-unknown-linux-gnu.tar.gz`, holding
 `brindle`, the static remote helper `brindle-remote-linux-x86_64` and the
 licences, plus a `SHA256SUMS` file. It's built on Ubuntu 26.04, so it needs a
@@ -428,14 +459,41 @@ The launcher entry runs the binary by its absolute path, so it works even when
 `~/.cargo/bin` isn't on the desktop session's `PATH`. After moving or upgrading
 the binary, run `brindle --install-desktop` again so the entry stays current.
 
-To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), or
-`brindle --uninstall-desktop` followed by `cargo uninstall brindle`. Your config
-in `~/.config/brindle` is kept either way.
+To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), which also
+removes a one-command install, or `brindle --uninstall-desktop` followed by
+`cargo uninstall brindle`. Your config in `~/.config/brindle` is kept either
+way.
 
 ### On Windows
 
-There's no installer. The terminal server's helper, `brindle-remote.exe`,
-carries the packaged ConPTY and unpacks it to
+In PowerShell 5.1 or 7, one command installs the latest release for you,
+without elevation: `brindle.exe`, the terminal server's helper
+`brindle-remote.exe` and the Linux remote helper in
+`%LOCALAPPDATA%\Programs\brindle`, that directory on your user `PATH`, and a
+Start Menu shortcut. It checks the zip against the release's `SHA256SUMS`
+before installing anything, and reports a failure as an error, leaving your
+PowerShell open:
+
+```powershell
+irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1 | iex
+```
+
+Run it again to update, even while Brindle runs: the running Brindle keeps its
+old build until it quits, and the next launch reattaches its sessions through
+the new version's terminal server. `iex` can't pass parameters, so the script
+reads `$env:BRINDLE_VERSION` (another release), `$env:BRINDLE_PREFIX` (another
+directory) and `$env:BRINDLE_UNINSTALL` (remove it all again, keeping your
+config and session state). The variables stay set in that PowerShell, so the
+script block form, which takes `-Version`, `-Prefix` and `-Uninstall`, suits a
+one-off:
+
+```powershell
+$env:BRINDLE_UNINSTALL = 1; irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1))) -Uninstall
+```
+
+To install by hand instead: the terminal server's helper,
+`brindle-remote.exe`, carries the packaged ConPTY and unpacks it to
 `%LOCALAPPDATA%\brindle\conpty\<version>` on first run; it must sit beside
 `brindle.exe`. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
 zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with `brindle.exe`,
@@ -467,13 +525,14 @@ helper you already have, which must be this version), and installs the three
 together in `%LOCALAPPDATA%\Programs\brindle` (`-Prefix DIR` picks another
 directory). It then adds that directory to your user `PATH` and creates the
 Start Menu shortcut. Re-run it to update. `scripts/uninstall.ps1` (with the
-same `-Prefix`) removes it all. Prefer it to `cargo install`, which leaves out
-the Linux helper, so remote profiles would upload a stale one or none.
+same `-Prefix`) removes it all, as it does a one-command install. Prefer it
+to `cargo install`, which leaves out the Linux helper, so remote profiles
+would upload a stale one or none.
 
 Releases aren't code-signed yet, so SmartScreen may stop the first start of a
 downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
-Run anyway. Uninstalling either way keeps your config in `%APPDATA%\brindle`
-and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
+Run anyway. Uninstalling any of these ways keeps your config in
+`%APPDATA%\brindle` and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
 builds the release zip from a release build, and `scripts/winget-manifest.ps1`
 writes its WinGet manifest.
 
