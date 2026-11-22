@@ -7,9 +7,9 @@
 - [x] 1.3 Add `needs_prompt_marks` to `src/actions.rs` and make `palette_lists` hide `SelectLastOutput` and `CopyLastOutput` as well as `CopyLastCommand` without prompt marks. Extend `palette_lists_only_available_actions`, or add a test beside it, for all three, both ways. Verify with `cargo test -p brindle actions`.
 - [x] 1.4 Add a pure `copied_text(text, LineEnd)` with `LineEnd { Lf, CrLf }` in `src/terminal/mod.rs`, and `LOCAL_LINE_END` beside `LOCAL_PATH_STYLE` in `terminal/process.rs`. Unit tests: `one\ntwo` becomes `one\r\ntwo` under `CrLf` and stays as it is under `Lf`, and an existing `\r\n` isn't doubled. Verify with `cargo test -p brindle terminal::tests` and `cargo test -p brindle --test architecture` (no `cfg` outside the seam).
 
-- [ ] 1.5 In `src/terminal/mouse.rs`, make `right_press` return `Paste` for an unreported press whenever `right_click` is `Paste`, selected text or not, and drop its `has_selection` parameter. Update its unit tests (a reported press still `Report`s, and `None` stays `Nothing`). Verify with `cargo test -p brindle terminal::mouse`.
-- [ ] 1.6 Add the pure `src/terminal/feedback.rs` (`FeedbackKind`, `Feedback`, `Phase`, `phase(now)`), add it to `PURE_MODULES`, and unit-test the phases at 0, 799, 900 and 1000 ms, and a new feedback replacing an old one. Verify with `cargo test -p brindle terminal::feedback` and `cargo test -p brindle --test architecture`.
-- [ ] 1.7 Add `Icon::ClipboardPaste` and `Icon::Ban` (lucide `clipboard-paste` and `ban`) to brindle-ui, with the icon table's existing tests. Verify with `cargo test -p brindle-ui icon`.
+- [x] 1.5 In `src/terminal/mouse.rs`, make `right_press` return `Paste` for an unreported press whenever `right_click` is `Paste`, selected text or not, and drop its `has_selection` parameter. Update its unit tests (a reported press still `Report`s, and `None` stays `Nothing`). Verify with `cargo test -p brindle terminal::mouse`.
+- [x] 1.6 Add the pure `src/terminal/feedback.rs` (`FeedbackKind`, `Feedback`, `Phase`, `phase(now)`), add it to `PURE_MODULES`, and unit-test the phases at 0, 799, 900 and 1000 ms, and a new feedback replacing an old one. Verify with `cargo test -p brindle terminal::feedback` and `cargo test -p brindle --test architecture`.
+- [x] 1.7 Add `Icon::ClipboardPaste` and `Icon::Ban` (lucide `clipboard-paste` and `ban`) to brindle-ui, with the icon table's existing tests. Verify with `cargo test -p brindle-ui icon`.
 
 ## 2. Process seam (Windows)
 

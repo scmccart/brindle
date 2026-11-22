@@ -115,3 +115,34 @@ A right press that isn't reported to the program (see "Mouse reporting") SHALL, 
 #### Scenario: A program that uses the mouse
 - **WHEN** `right_click = "paste"`, htop reports the mouse, and the user right-clicks over a selection
 - **THEN** htop receives the right press, and nothing is pasted or cleared; shift-right-click instead clears the selection and pastes
+
+### Requirement: Mouse reporting
+When the program enables mouse tracking (modes 1000, 1002 or 1003), mouse presses, releases, drags, motion and wheel events SHALL be reported to the program.
+- Coordinates SHALL be relative to the terminal's own grid.
+- SGR encoding (1006) SHALL be used when enabled; otherwise UTF-8 (1005) or legacy X10 encoding.
+- Holding shift SHALL bypass reporting: a shift-drag selects text instead, and a shift-right-click is handled as a right press that isn't reported (see "Right-click paste").
+- A ctrl-click on a link SHALL bypass reporting and open the link instead, as defined by the `links` capability.
+
+#### Scenario: SGR click
+- **WHEN** SGR mouse mode is on and the user left-clicks column 5, row 10
+- **THEN** the program receives `ESC [ < 0 ; 5 ; 10 M` and, on release, the same ending in `m`
+
+#### Scenario: Shift overrides reporting
+- **WHEN** mouse reporting is on and the user shift-drags
+- **THEN** text is selected and nothing is sent to the program
+
+#### Scenario: Right press reported
+- **WHEN** SGR mouse mode is on, `right_click = "paste"`, and the user right-clicks column 6, row 2
+- **THEN** the program receives `ESC [ < 2 ; 6 ; 2 M` and its release, and nothing is pasted
+
+#### Scenario: Shift-right-click pastes over reporting
+- **WHEN** SGR mouse mode is on, `right_click = "paste"`, no text is selected, and the user shift-right-clicks
+- **THEN** the clipboard is pasted and no mouse report is sent
+
+#### Scenario: Shift-right-click over a selection
+- **WHEN** SGR mouse mode is on, `right_click = "paste"`, the user shift-drags to select text and then shift-right-clicks
+- **THEN** the selection is cleared, the clipboard is pasted, and no mouse report is sent
+
+#### Scenario: Ctrl-click on a link overrides reporting
+- **WHEN** mouse reporting is on and the user ctrl-clicks a URL
+- **THEN** the URL opens and nothing is sent to the program

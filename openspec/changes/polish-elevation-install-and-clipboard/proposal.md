@@ -33,7 +33,7 @@ None.
 - `shell-integration`: a new requirement hides Select and Copy Last Command Output, and makes them do nothing, until a prompt mark has arrived.
 - `desktop-integration`: one-command installs and uninstalls from a release, on Linux and Windows.
 - `release-process`: archives must work out of the box, locally and for SSH and container profiles; and a new requirement adds `install.sh` and `install.ps1` to every release, listed in `SHA256SUMS`.
-- `terminal-emulation`: the clipboard is the system's, shared with other applications both ways, with the line endings each side sees; right-click paste clears a selection and pastes; mouse copies and pastes show a label at the pointer.
+- `terminal-emulation`: the clipboard is the system's, shared with other applications both ways, with the line endings each side sees; right-click paste clears a selection and pastes, shift-right-click included over mouse reporting; mouse copies and pastes show a label at the pointer.
 - `configuration`: `right_click = "paste"` is described as clearing any selection and pasting.
 
 ## Impact
