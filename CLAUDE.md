@@ -116,7 +116,10 @@ The suite never sends real keys, so these stay manual. Hand them to the user, wi
 - the palette shortcuts toggling (ctrl-shift-p and ctrl-shift-space);
 - the profile menu opening on a press on the strip's `⌄` button and closing on a second press (and press, drag onto an item, release choosing it), its Settings item opening the dialog;
 - a pointer click on the settings dialog's close × closes it from an editor;
-- right-click paste with `right_click = "paste"` (nothing selected; a right-click over a selection doing nothing; and shift-right-click over a program that uses the mouse, such as htop), and select-to-copy with `copy_on_select = true`, with a real pointer, on Linux and on Windows (no system menu on Windows);
+- right-click paste with `right_click = "paste"` (nothing selected; a right-click over a selection clearing it and pasting, and staying put when the clipboard is empty; and shift-right-click over a program that uses the mouse, such as htop), and select-to-copy with `copy_on_select = true`, with a real pointer, on Linux and on Windows (no system menu on Windows);
+- the clipboard matrix in [`docs/manual-checks/clipboard.md`](docs/manual-checks/clipboard.md): the other-application rows, Wayland, and the copy, paste and ban label beside the pointer (it fades in about a second, and a click through it reaches the terminal, on Linux and on Windows);
+- `sudo pwsh` in Windows sudo's inline mode: the Administrator badge shows on the tab, and drops within about a second of the pwsh exiting;
+- out of the box on Windows: unpack the release zip on a machine with no Brindle, then open a local tab, an SSH profile and a container profile (Docker Desktop);
 - right-click opens the tab menu (on a background tab, without activating it, its items then acting on that tab; never the window menu, and on Windows never the system menu) and a zone header's menu (focusing that zone first), each at the pointer, and a hover shows a tooltip on the strip, header and find bar buttons and on the Theme list's lock on a built-in, on Linux and on Windows.
 
 ### Performance suite
