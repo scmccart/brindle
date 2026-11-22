@@ -9,6 +9,10 @@ Track the nested contexts (elevation, containers, VMs, remote logins, commands) 
 Brindle SHALL recognise `ESC ] 3008 ; start=<id> [; <field>=<value>]…` and `ESC ] 3008 ; end=<id> [; <field>=<value>]…`, ended by BEL or ST, in the output of every terminal, however the output is split into reads. `start=` or `end=` SHALL come first; otherwise the sequence is ignored. A cancelled sequence or one longer than 4096 bytes SHALL be ignored. No sequence SHALL change the grid.
 
 #### Scenario: run0
+- **WHEN** `run0` starts a shell and prints `ESC ] 3008 ; start=bdb3ea70355040c9979877f40a12ac0a ; user=root ; hostname=A8 ; … ; targetuser=root ; sessionid=c6 ; type=session ESC \`, and never prints a matching `end`
+- **THEN** the terminal's active context is `bdb3ea70355040c9979877f40a12ac0a`, of type `session`, with target user `root`, until its program exits or an outer context is started again
+
+#### Scenario: Elevate
 - **WHEN** a program prints `ESC ] 3008 ; start=a1 ; type=elevate ; user=me ; targetuser=root ESC \`
 - **THEN** the terminal's active context is `a1`, of type `elevate`, with target user `root`
 
@@ -50,12 +54,16 @@ A terminal's contexts SHALL be dropped when its process exits. A full reset (`ES
 - **THEN** the context is still active
 
 ### Requirement: Notable context
-A terminal's notable context SHALL be the innermost context of type `elevate`, `chpriv`, `remote`, `container` or `vm` among the active context and its ancestors. Its label SHALL be the target user (else `elevated`) for `elevate` and `chpriv`; `targetuser@targethost`, the target host alone, else `remote` for `remote`; and the container or VM name, else `container` or `vm`. Labels over 24 characters SHALL end in `…`.
+A terminal's notable context SHALL be the innermost context of type `elevate`, `chpriv`, `remote`, `container` or `vm`, or of type `session` whose target user is exactly `root` (a root login, which is how `run0` reports itself), among the active context and its ancestors. A `session` with any other target user, or none, SHALL NOT be notable. Its label SHALL be the target user (else `elevated`) for `elevate` and `chpriv`, `root` for a `session`; `targetuser@targethost`, the target host alone, else `remote` for `remote`; and the container or VM name, else `container` or `vm`. Labels over 24 characters SHALL end in `…`.
 
 #### Scenario: Shell inside a container
 - **WHEN** a `container` context with `container=web` is active, and a `shell` context starts inside it
 - **THEN** the terminal's notable context is the container, labelled `web`
 
 #### Scenario: No notable context
-- **WHEN** only `session` and `shell` contexts are open
+- **WHEN** only `shell` contexts and a `session` with `targetuser=scmccart` are open
 - **THEN** the terminal has no notable context
+
+#### Scenario: Root session
+- **WHEN** a `shell` and a `command` context are open, and a `session` context with `targetuser=root` starts inside them
+- **THEN** the terminal's notable context is that session, privileged, labelled `root`

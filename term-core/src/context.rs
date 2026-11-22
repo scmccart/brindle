@@ -195,8 +195,13 @@ impl Fields {
             }
             Kind::Container => (BadgeKind::Elsewhere, text(&self.container).unwrap_or_else(|| "container".into())),
             Kind::Vm => (BadgeKind::Elsewhere, text(&self.vm).unwrap_or_else(|| "vm".into())),
+            // run0 reports its root login as a session, never as an
+            // elevate, and never ends it; only a root target is notable.
+            Kind::Session => match self.targetuser.as_ref().map(Text::as_str) {
+                Some("root") => (BadgeKind::Privileged, "root".to_owned()),
+                Some(_) | None => return None,
+            },
             Kind::Service
-            | Kind::Session
             | Kind::Shell
             | Kind::Command
             | Kind::Subcontext
@@ -612,6 +617,42 @@ mod tests {
             Some((Elsewhere, "web".into()))
         );
         assert_eq!(badge(&["start=x;type=spaceship;container=web"]), None, "an untyped context is not notable");
+    }
+
+    /// What systemd 259.9's `run0 bash` sends: no elevate, a root session
+    /// that is never ended.
+    const RUN0_SESSION: &str = "start=bdb3ea70355040c9979877f40a12ac0a;user=root;hostname=A8;\
+        machineid=0123456789abcdef0123456789abcdef;bootid=fedcba9876543210fedcba9876543210;\
+        pid=2947629;pidfdid=2963364;comm=(bash);targetuser=root;sessionid=c6;type=session";
+
+    #[test]
+    fn a_session_as_root_is_privileged() {
+        use BadgeKind::Privileged;
+        let contexts = after(&[RUN0_SESSION]);
+        let (id, fields) = active(&contexts).unwrap();
+        assert_eq!(id, "bdb3ea70355040c9979877f40a12ac0a");
+        assert_eq!((fields.kind, &fields.targetuser), (Some(Kind::Session), &text("root")));
+        let notable = contexts.notable().unwrap();
+        assert_eq!((notable.kind(), notable.label()), (Privileged, "root"));
+        // Any other target user, or none, is an ordinary login.
+        assert_eq!(badge(&["start=s;type=session;targetuser=scmccart"]), None);
+        assert_eq!(badge(&["start=s;type=session"]), None);
+        assert_eq!(badge(&["start=s;type=session;user=root"]), None);
+        assert_eq!(badge(&["start=s;type=session;targetuser=Root"]), None);
+    }
+
+    #[test]
+    fn a_root_session_nested_under_a_shell_and_command_is_privileged() {
+        use BadgeKind::Privileged;
+        let stack = ["start=sh;type=shell", "start=cmd;type=command"];
+        let mut payloads = stack.to_vec();
+        payloads.push(RUN0_SESSION);
+        assert_eq!(badge(&payloads), Some((Privileged, "root".into())));
+        // The session never ends itself. The login shell's next start of
+        // its own id ends it and everything under it, as for any known id.
+        payloads.push("start=sh;type=shell");
+        assert_eq!(badge(&payloads), None);
+        assert_eq!(ids(&after(&payloads)), ["sh"]);
     }
 
     #[test]

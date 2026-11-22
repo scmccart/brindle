@@ -28,6 +28,12 @@ pub(super) fn echo(word: &str, at: usize) -> String {
 /// The `run0` start of the spec's scenario.
 pub(super) const RUN0: &str = "start=a1;type=elevate;user=me;targetuser=root";
 
+/// What systemd 259.9's `run0 bash` really sends (captured): no `elevate`,
+/// a root `session` that is never ended.
+pub(super) const RUN0_SESSION: &str = "start=bdb3ea70355040c9979877f40a12ac0a;user=root;hostname=A8;\
+    machineid=0123456789abcdef0123456789abcdef;bootid=fedcba9876543210fedcba9876543210;\
+    pid=2947629;pidfdid=2963364;comm=(bash);targetuser=root;sessionid=c6;type=session";
+
 fn expect(out: &Output, contexts: &[&str], badges: &[&str], what: &str) -> Result {
     ensure!(out.dump.wait_timeouts.is_empty(), "{what}: a wait gave up: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
     ensure!(out.dump.contexts == contexts, "{what}: contexts {:?}, expected {contexts:?}", out.dump.contexts);
@@ -74,6 +80,34 @@ pub fn badge(ctx: &Ctx) -> Result<Outcome> {
     image.expect_none("yellow before the title", strip.rect(FACE_LEFT + 2.0, FACE_TOP + 4.0, 10.0, FACE_HEIGHT - 8.0), yellow)?;
     image.expect_none("red on the face", face, theme::RED)?;
     image.expect_none("yellow under the face", strip.under_face(0), yellow)?;
+    Ok(Outcome::Pass)
+}
+
+/// The real `run0` start, a root `session`, badges the tab as privileged,
+/// and a session for any other user doesn't.
+pub fn run0_session(ctx: &Ctx) -> Result<Outcome> {
+    let out = Run::new(ctx, "run0-session")
+        .profile("Shell")
+        .send(PLAIN)
+        .send(&format!("{}; {}\\r", context(RUN0_SESSION), echo("session-set", 4)))
+        .wait_for("session-set")
+        .dump_at(4.5)
+        .run()?;
+    expect(
+        &out,
+        &["id=\"bdb3ea70355040c9979877f40a12ac0a\" type=session label=\"root\""],
+        &["tab=1 kind=privileged label=\"root\" draw=icon"],
+        "inside run0's root session",
+    )?;
+    let other = RUN0_SESSION.replace("targetuser=root", "targetuser=nobody");
+    let out = Run::new(ctx, "other-session")
+        .profile("Shell")
+        .send(PLAIN)
+        .send(&format!("{}; {}\\r", context(&other), echo("session-set", 4)))
+        .wait_for("session-set")
+        .dump_at(4.5)
+        .run()?;
+    expect(&out, &["id=\"bdb3ea70355040c9979877f40a12ac0a\" type=session"], &[], "inside another user's session")?;
     Ok(Outcome::Pass)
 }
 

@@ -26,7 +26,7 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 - **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
   bottom of the tab, and of each zone's header in a split tab.
 - **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
-  logins): a yellow warning icon on a tab while it runs elevated.
+  logins): a yellow warning icon on a tab while it runs as root.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **Fonts**: the terminal font's family, size and line height, and the family of
@@ -843,19 +843,21 @@ systemd on the far side, and more. Brindle keeps each terminal's stack of
 contexts and shows the innermost notable one as a badge after the tab's title
 (the active zone's), and after each zone header's title in a split tab:
 
-- an elevation or privilege change (`elevate`, `chpriv`): a warning icon in
+- an elevation or privilege change (`elevate`, `chpriv`), or a login session
+  whose target user is `root` (what `run0` reports): a warning icon in
   the theme's yellow, with no name beside it; resting the pointer on it shows
   the target user ("Running as root"). Brindle leaves what the program shows
   itself alone: `run0` tints the background red and puts a glyph in the title;
 - a remote host (`remote`), a container or a VM: `user@host`, the host, or the
   container's or VM's name, in the muted foreground.
 
-Shell, session and command contexts show no badge. Labels are cut to 24
+Shell and command contexts, and sessions for any other user, show no badge. Labels are cut to 24
 characters, and a narrow tab cuts its title to 8 characters before it cuts a
 label badge.
 
 ```sh
 printf '\033]3008;start=a1;type=elevate;user=me;targetuser=root\033\\'  # a yellow warning icon
+printf '\033]3008;start=s1;type=session;targetuser=root\033\\'          # what run0 sends: the same icon
 printf '\033]3008;start=c1;type=container;container=web\033\\'          # "web", muted
 printf '\033]3008;end=a1\033\\'   # ends a1 and everything started inside it: no badge
 ```

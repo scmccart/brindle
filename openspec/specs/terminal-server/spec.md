@@ -506,7 +506,7 @@ The server SHALL keep each session's OSC 3008 contexts with the same rules as th
 
 #### Scenario: Attach inside run0
 - **WHEN** a detached session's shell runs inside a `run0` elevation, and a client attaches
-- **THEN** the session's tab shows the red `root` badge
+- **THEN** the session's tab shows the yellow warning icon for `root`
 
 #### Scenario: Ended while disconnected
 - **WHEN** the client loses its connection while a zone is inside a container context, the context ends meanwhile, and the client reconnects

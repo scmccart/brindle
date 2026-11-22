@@ -144,6 +144,7 @@ fn unix() -> Vec<Case> {
         display("progress-zones", progress::zones),
         display("progress-bar-colour", progress::bar_colour),
         display("context-badge", context::badge),
+        display("context-run0-session", context::run0_session),
         display("context-end", context::end),
         display("context-zones", context::zones),
         display("search-local", search::local),
