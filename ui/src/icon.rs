@@ -58,6 +58,9 @@ pub enum Icon {
     Columns2,
     Rows2,
     Lock,
+    TriangleAlert,
+    ClipboardPaste,
+    Ban,
 }
 
 /// One stroke of an icon, in unit coordinates.
@@ -185,9 +188,68 @@ const LOCK: &[Stroke] = &[
         p(17., 11.),
     ]),
 ];
+// lucide `triangle-alert`: m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16
+// a2 2 0 0 0 1.73-3, M12 9v4, M12 17h.01. The triangle starts and ends
+// halfway along its bottom edge, so its butt-capped ends meet on a straight
+// line; its corners (radius 2) are drawn as chords every 30 degrees or so.
+// Without round caps the `h.01` dot would be invisible, so it is a 2-unit
+// rule centred on (12, 17).
+const TRIANGLE_ALERT: &[Stroke] = &[
+    Stroke::Polyline(&[
+        p(12., 21.),
+        p(20., 21.),
+        p(21.414, 20.414),
+        p(22., 19.),
+        p(21.73, 18.),
+        p(13.73, 4.),
+        p(12.99, 3.254),
+        p(11.99, 2.986),
+        p(10.99, 3.254),
+        p(10.25, 4.),
+        p(2.25, 18.),
+        p(2., 19.),
+        p(2.586, 20.414),
+        p(4., 21.),
+        p(12., 21.),
+    ]),
+    Stroke::Polyline(&[p(12., 9.), p(12., 13.)]),
+    Stroke::Polyline(&[p(12., 16.), p(12., 18.)]),
+];
+
+// lucide `clipboard-paste`: M11 14h10, M16 4h2a2 2 0 0 1 2 2v1.344,
+// m17 18 4-4-4-4, M8 4H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0
+// 1.793-1.113, rect x=8 y=2 width=8 height=4 rx=1. The board's corners
+// (radius 2) are drawn through their quarter-circle midpoints, and its last
+// arc, which stops 26.3 degrees short of the corner's end, through its own.
+const CLIPBOARD_PASTE: &[Stroke] = &[
+    Stroke::Polyline(&[p(11., 14.), p(21., 14.)]),
+    Stroke::Polyline(&[p(16., 4.), p(18., 4.), p(19.414, 4.586), p(20., 6.), p(20., 7.344)]),
+    Stroke::Polyline(&[p(17., 18.), p(21., 14.), p(17., 10.)]),
+    Stroke::Polyline(&[
+        p(8., 4.),
+        p(6., 4.),
+        p(4.586, 4.586),
+        p(4., 6.),
+        p(4., 20.),
+        p(4.586, 21.414),
+        p(6., 22.),
+        p(18., 22.),
+        p(19.054, 21.7),
+        p(19.793, 20.887),
+    ]),
+    rect(8., 2., 8., 4., 1.),
+];
+// lucide `ban`: circle cx=12 cy=12 r=10, M4.929 4.929 19.07 19.071
+const BAN: &[Stroke] = &[
+    Stroke::Circle {
+        center: p(12., 12.),
+        radius: 10. / GRID,
+    },
+    Stroke::Polyline(&[p(4.929, 4.929), p(19.07, 19.071)]),
+];
 
 impl Icon {
-    pub const ALL: [Icon; 15] = [
+    pub const ALL: [Icon; 18] = [
         Icon::Check,
         Icon::ChevronDown,
         Icon::ChevronUp,
@@ -203,6 +265,9 @@ impl Icon {
         Icon::Columns2,
         Icon::Rows2,
         Icon::Lock,
+        Icon::TriangleAlert,
+        Icon::ClipboardPaste,
+        Icon::Ban,
     ];
 
     pub(crate) fn strokes(self) -> &'static [Stroke] {
@@ -222,6 +287,9 @@ impl Icon {
             Icon::Columns2 => COLUMNS_2,
             Icon::Rows2 => ROWS_2,
             Icon::Lock => LOCK,
+            Icon::TriangleAlert => TRIANGLE_ALERT,
+            Icon::ClipboardPaste => CLIPBOARD_PASTE,
+            Icon::Ban => BAN,
         }
     }
 
@@ -515,6 +583,60 @@ mod tests {
             let r = ((x - 12.).powi(2) + (y - 7.).powi(2)).sqrt();
             assert!((r - 5.).abs() < 0.01 || (x - 7.).abs() < 0.01, "({x}, {y}) is off the arc: {r}");
         }
+        // The warning triangle is closed, its edges lucide's, with the
+        // exclamation's bar and dot on its centre line.
+        let strokes = Icon::TriangleAlert.strokes();
+        assert_eq!(strokes.len(), 3);
+        let Stroke::Polyline(triangle) = strokes[0] else {
+            panic!("triangle-alert starts with its triangle");
+        };
+        let triangle: Vec<_> = triangle.iter().copied().map(|(x, y)| (x * GRID, y * GRID)).collect();
+        assert_eq!(triangle.first(), triangle.last(), "the triangle is closed");
+        for corner in [(21.73, 18.), (13.73, 4.), (10.25, 4.), (2.25, 18.), (4., 21.), (20., 21.)] {
+            assert!(triangle.iter().any(|&pt| near(pt, corner)), "{corner:?} is missing");
+        }
+        for (stroke, (top, bottom)) in strokes[1..].iter().zip([(9., 13.), (16., 18.)]) {
+            let Stroke::Polyline(line) = stroke else {
+                panic!("the exclamation is two rules");
+            };
+            assert_eq!(line.iter().copied().map(grid).collect::<Vec<_>>(), [(12., top), (12., bottom)]);
+        }
+        // The paste icon: the clipboard's 8 by 4 clip at the top, its board
+        // open on the right where an arrow comes out of it along y = 14.
+        let strokes = Icon::ClipboardPaste.strokes();
+        assert_eq!(strokes.len(), 5);
+        let Stroke::Rect { x, y, width, height, radius } = strokes[4] else {
+            panic!("clipboard-paste ends with its clip");
+        };
+        assert_eq!([x, y, width, height, radius].map(|v| (v * GRID).round()), [8., 2., 8., 4., 1.]);
+        let Stroke::Polyline(shaft) = strokes[0] else {
+            panic!("clipboard-paste starts with the arrow's shaft");
+        };
+        assert_eq!(shaft.iter().copied().map(grid).collect::<Vec<_>>(), [(11., 14.), (21., 14.)]);
+        let Stroke::Polyline(head) = strokes[2] else {
+            panic!("the arrow's head is a polyline");
+        };
+        assert_eq!(head.iter().copied().map(grid).collect::<Vec<_>>(), [(17., 18.), (21., 14.), (17., 10.)]);
+        let Stroke::Polyline(board) = strokes[3] else {
+            panic!("the board is a polyline");
+        };
+        let board: Vec<_> = board.iter().copied().map(|(x, y)| (x * GRID, y * GRID)).collect();
+        assert!(near(board[0], (8., 4.)) && near(board[board.len() - 1], (19.793, 20.887)));
+        // Its last arc stays on the corner's circle, radius 2 about (18, 20).
+        for &(x, y) in &board[board.len() - 2..] {
+            let r = ((x - 18.).powi(2) + (y - 20.).powi(2)).sqrt();
+            assert!((r - 2.).abs() < 0.01, "({x}, {y}) is off the corner: {r}");
+        }
+        // The ban sign: a radius 10 circle about the centre, crossed from
+        // top left to bottom right.
+        let Stroke::Circle { center, radius } = Icon::Ban.strokes()[0] else {
+            panic!("ban starts with its circle");
+        };
+        assert_eq!((grid(center), (radius * GRID).round()), ((12., 12.), 10.));
+        let Stroke::Polyline(bar) = Icon::Ban.strokes()[1] else {
+            panic!("ban ends with its bar");
+        };
+        assert_eq!(bar.iter().copied().map(grid).collect::<Vec<_>>(), [(5., 5.), (19., 19.)]);
     }
 
     #[test]

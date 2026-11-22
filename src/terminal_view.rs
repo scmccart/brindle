@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::Side;
@@ -20,8 +20,9 @@ use gpui::{
 use crate::actions::*;
 use crate::find_bar::{FindBar, LastFind};
 use crate::latency::Latency;
+use crate::terminal::feedback::{FeedbackKind, FeedbackSlot, Phase};
 use crate::terminal::mouse::{self, Button};
-use crate::terminal::{Link, Terminal, keys, links, report_focus};
+use crate::terminal::{Link, Terminal, keys, links, pointer, report_focus};
 use crate::terminal_element::TerminalElement;
 
 /// Geometry of the last painted frame, used for hit-testing.
@@ -61,6 +62,14 @@ impl GridLayout {
         )
     }
 
+    /// The grid's cells' bounds, in logical window pixels.
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.origin,
+            size: gpui::size(self.cell_width * self.cols as f32, self.line_height * self.rows as f32),
+        }
+    }
+
     /// Whether `position` is over one of the grid's cells.
     pub fn contains(&self, position: Point<Pixels>) -> bool {
         let right = self.origin.x + self.cell_width * self.cols as f32;
@@ -97,6 +106,12 @@ pub enum PointerAction {
     Hover,
     /// `--click` and `--right-click`: press and release a button.
     Click(PointerButton),
+    /// `--press`: press the left button and hold it, so a `--hover` drags
+    /// until a `--release`.
+    Press,
+    /// `--release`: release the held left button over the cell, with no
+    /// move first.
+    Release,
 }
 
 /// The button of a clicking pointer step.
@@ -115,9 +130,9 @@ impl PointerButton {
     }
 }
 
-/// A `--hover`, `--click` or `--right-click` debug step: `[mods-]COL,ROW`,
-/// zero-based cells of the active terminal, e.g. `ctrl-3,0` or
-/// `ctrl-shift-10,2`.
+/// A `--hover`, `--click`, `--right-click`, `--press` or `--release` debug
+/// step: `[mods-]COL,ROW`, zero-based cells of the active terminal, e.g.
+/// `ctrl-3,0` or `ctrl-shift-10,2`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PointerStep {
     pub modifiers: Modifiers,
@@ -161,6 +176,9 @@ struct MouseState {
     modifiers: Modifiers,
     /// A ctrl-press on this link opens it if released over the same link.
     pending_link: Option<Link>,
+    /// A `--press` debug step holds the left button until a `--release`,
+    /// so a `--hover` between them drags.
+    debug_held: bool,
 }
 
 /// Link activation takes ctrl without alt (alt-drag stays a block selection).
@@ -182,6 +200,12 @@ pub struct TerminalView {
     /// The last search, restored when the bar opens again.
     pub last_find: Option<LastFind>,
     mouse: MouseState,
+    /// The pointer the grid's last painted frame chose.
+    pointer_shown: Cell<pointer::Shown>,
+    /// The label a mouse copy or paste shows at the pointer.
+    feedback: FeedbackSlot,
+    /// Redraws the label's fade, and ends once it is gone.
+    _feedback_frames: Option<Task<()>>,
     window_active: bool,
     /// Cursor blink timer; only runs while this terminal has focus.
     _blink: Option<Task<()>>,
@@ -204,6 +228,9 @@ pub struct LinkFailed(pub String);
 impl EventEmitter<LinkFailed> for TerminalView {}
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// How far the mouse clipboard label sits down and right of the pointer.
+const FEEDBACK_OFFSET: Pixels = gpui::px(12.);
 
 impl TerminalView {
     pub fn new(
@@ -259,6 +286,9 @@ impl TerminalView {
             find: None,
             last_find: None,
             mouse: MouseState::default(),
+            pointer_shown: Cell::new(pointer::Shown::default()),
+            feedback: FeedbackSlot::default(),
+            _feedback_frames: None,
             window_active: true,
             _blink: None,
             _subscriptions: subscriptions,
@@ -329,7 +359,7 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.terminal.read(cx).selection_text() {
+        if let Some(text) = self.terminal.read(cx).selection_copy_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -459,6 +489,12 @@ impl TerminalView {
         }
     }
 
+    fn copy_last_command(&mut self, _: &CopyLastCommand, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.terminal.read(cx).last_command_line_text() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
     // ---- mouse ----------------------------------------------------------------
 
     #[allow(
@@ -486,12 +522,21 @@ impl TerminalView {
         // A right press that isn't reported pastes, or does nothing. Neither
         // records a button, so its release reports nothing either.
         if e.button == gpui::MouseButton::Right {
-            let has_selection = self.terminal.read(cx).selection_text().is_some();
             let setting = crate::settings::Settings::get(cx).config.right_click;
-            match mouse::right_press(reports, has_selection, setting) {
+            match mouse::right_press(reports, setting) {
                 mouse::RightPress::Report => {}
                 mouse::RightPress::Paste => {
-                    self.paste_clipboard(cx);
+                    // The paste clears any selection; with no text on the
+                    // clipboard nothing is sent and the selection stays.
+                    let text = cx.read_from_clipboard().and_then(|item| item.text()).filter(|text| !text.is_empty());
+                    let kind = match text {
+                        Some(text) => {
+                            self.terminal.update(cx, |t, cx| t.paste(&text, cx));
+                            FeedbackKind::Pasted
+                        }
+                        None => FeedbackKind::NothingToPaste,
+                    };
+                    self.show_feedback(kind, e.position, cx);
                     return;
                 }
                 mouse::RightPress::Nothing => return,
@@ -519,7 +564,7 @@ impl TerminalView {
                     _ => SelectionType::Lines,
                 };
                 self.terminal.update(cx, |t, cx| t.start_selection(col, line, side, ty, cx));
-                self.mouse.selecting = true;
+                self.set_selecting(true, cx);
             }
             gpui::MouseButton::Middle => self.paste_primary_selection(cx),
             _ => {}
@@ -585,9 +630,11 @@ impl TerminalView {
             return;
         }
         if self.mouse.selecting && e.button == gpui::MouseButton::Left {
-            self.mouse.selecting = false;
+            self.set_selecting(false, cx);
             let to_clipboard = crate::settings::Settings::get(cx).config.copy_on_select;
-            self.terminal.update(cx, |t, cx| t.finish_selection(to_clipboard, cx));
+            if self.terminal.update(cx, |t, cx| t.finish_selection(to_clipboard, cx)) {
+                self.show_feedback(FeedbackKind::Copied, e.position, cx);
+            }
             return;
         }
         let Some(layout) = self.layout.get() else { return };
@@ -638,21 +685,154 @@ impl TerminalView {
         self.hover(e.position, e.modifiers, true, cx);
     }
 
-    /// Debug hook for `--hover` / `--click` / `--right-click`: feeds GPUI mouse events for a
-    /// cell straight to this view's handlers. No OS-level input is made.
+    /// Debug hook for `--hover` / `--click` / `--right-click` / `--press` /
+    /// `--release`: feeds GPUI mouse events for a cell straight to this
+    /// view's handlers. No OS-level input is made.
     pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
         let Some(layout) = self.layout.get() else {
-            log::error!("--hover/--click/--right-click: the terminal hasn't been painted yet");
+            log::error!("--hover/--click/--right-click/--press/--release: the terminal hasn't been painted yet");
             return;
         };
         let position = layout.cell_center(step.col, step.row);
         let modifiers = step.modifiers;
-        self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
-        if let PointerAction::Click(which) = step.action {
-            let button = which.gpui();
-            self.mouse_down(&MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false }, window, cx);
-            self.mouse_up(&MouseUpEvent { button, position, modifiers, click_count: 1 }, window, cx);
+        let left = gpui::MouseButton::Left;
+        let down = |button| MouseDownEvent { button, position, modifiers, click_count: 1, first_mouse: false };
+        let up = |button| MouseUpEvent { button, position, modifiers, click_count: 1 };
+        match step.action {
+            PointerAction::Hover => {
+                // A drag while a `--press` holds the button.
+                let pressed_button = self.mouse.debug_held.then_some(left);
+                self.mouse_move(&MouseMoveEvent { position, pressed_button, modifiers }, window, cx);
+            }
+            PointerAction::Click(which) => {
+                self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
+                self.mouse_down(&down(which.gpui()), window, cx);
+                self.mouse_up(&up(which.gpui()), window, cx);
+            }
+            PointerAction::Press => {
+                self.mouse_move(&MouseMoveEvent { position, pressed_button: None, modifiers }, window, cx);
+                self.mouse_down(&down(left), window, cx);
+                self.mouse.debug_held = true;
+            }
+            PointerAction::Release => {
+                // No move first: a release is its own event, and whatever
+                // it changes must draw its own frame.
+                self.mouse.debug_held = false;
+                self.mouse_up(&up(left), window, cx);
+            }
         }
+    }
+
+    /// Starts or ends a selection drag. The grid's pointer shows it
+    /// ([`pointer::choose`]), so a change draws a frame: a press or a
+    /// release needn't change anything else that does.
+    fn set_selecting(&mut self, selecting: bool, cx: &mut Context<Self>) {
+        if self.mouse.selecting != selecting {
+            self.mouse.selecting = selecting;
+            cx.notify();
+        }
+    }
+
+    /// Records the pointer a painted frame chose for the grid, and says
+    /// whether the platform must show it at once ([`pointer::Shown::frame`]).
+    pub fn pointer_painted(&self, chosen: gpui::CursorStyle, over_grid: bool) -> bool {
+        let mut shown = self.pointer_shown.get();
+        let show_now = shown.frame(chosen, over_grid);
+        self.pointer_shown.set(shown);
+        show_now
+    }
+
+    /// The pointer the grid's last painted frame chose, for the debug dump.
+    pub fn shown_pointer(&self) -> Option<gpui::CursorStyle> {
+        self.pointer_shown.get().last()
+    }
+
+    /// Shows the label for a mouse copy or paste at `at` (window
+    /// coordinates), replacing any label already showing, and starts the
+    /// one task that redraws its fade. The task waits on a timer between
+    /// frames, so the UI thread's queue stays idle (`terminal/pace.rs`), and
+    /// ends once the label is gone.
+    fn show_feedback(&mut self, kind: FeedbackKind, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.feedback.show(kind, at, now);
+        cx.notify();
+        let Some(first) = self.feedback.next_frame(now) else { return };
+        self._feedback_frames = Some(cx.spawn(async move |this, cx| {
+            let mut wait = first;
+            loop {
+                cx.background_executor().timer(wait).await;
+                let next = this.update(cx, |this, cx| {
+                    let now = Instant::now();
+                    let next = this.feedback.next_frame(now);
+                    this.feedback.sweep(now);
+                    cx.notify();
+                    next
+                });
+                match next {
+                    Ok(Some(next)) => wait = next,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    /// The `--dump-screen-after` line for the label, `--- feedback
+    /// kind=NAME`, while one isn't gone at `now`; empty otherwise.
+    pub fn describe_feedback(&self, now: Instant) -> String {
+        self.feedback.describe(now)
+    }
+
+    /// The label for a mouse copy or paste, while one shows: tooltip-styled,
+    /// 12px down and right of the pointer and kept inside the grid. It has
+    /// no focus handle and no listeners, so it gets no hitbox: keys and
+    /// clicks go where they would without it.
+    fn render_feedback(&self, cx: &App) -> Option<impl IntoElement + use<>> {
+        use brindle_ui::{ActiveFont as _, ActiveTheme as _, Align, Anchored, Icon, Side};
+
+        let (feedback, phase) = self.feedback.visible(Instant::now())?;
+        let layout = self.layout.get()?;
+        let opacity = match phase {
+            Phase::Shown => 1.,
+            Phase::Fading(opacity) => opacity,
+            Phase::Gone => return None,
+        };
+        let icon = match feedback.kind {
+            FeedbackKind::Copied => Icon::Copy,
+            FeedbackKind::Pasted => Icon::ClipboardPaste,
+            FeedbackKind::NothingToPaste => Icon::Ban,
+        };
+        let style = brindle_ui::tooltip_style(cx.ui_theme());
+        // A zero-size trigger 12px right of the pointer, with the box 12px
+        // below it.
+        let trigger = Bounds {
+            origin: feedback.at + gpui::point(FEEDBACK_OFFSET, gpui::px(0.)),
+            size: gpui::Size::default(),
+        };
+        Some(
+            Anchored::new(trigger)
+                .side(Side::Bottom)
+                .align(Align::Start)
+                .offset(FEEDBACK_OFFSET)
+                .margin(gpui::px(0.))
+                .within(layout.bounds())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(style.gap)
+                        .px(style.padding_x)
+                        .py(style.padding_y)
+                        .rounded(style.radius)
+                        .bg(style.background)
+                        .text_color(style.foreground)
+                        .text_size(style.text_size)
+                        .font_family(cx.ui_font())
+                        .whitespace_nowrap()
+                        .opacity(opacity)
+                        .child(icon.size(gpui::rems(0.875)))
+                        .child(feedback.kind.label()),
+                ),
+        )
     }
 
     /// A selection drag, a reported button press or a press on a link is in
@@ -660,11 +840,17 @@ impl TerminalView {
     pub fn is_dragging(&self) -> bool {
         self.mouse.selecting || self.mouse.reported_button.is_some() || self.mouse.pending_link.is_some()
     }
+
+    /// A selection is being dragged, which shows the text beam.
+    pub fn is_selecting(&self) -> bool {
+        self.mouse.selecting
+    }
 }
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let find_bar = self.render_find_bar(window, cx);
+        let feedback = self.render_feedback(cx);
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -686,6 +872,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &JumpToNextPrompt, _, cx| this.jump_to_prompt(false, cx)))
             .on_action(cx.listener(Self::select_last_output))
             .on_action(cx.listener(Self::copy_last_output))
+            .on_action(cx.listener(Self::copy_last_command))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::find_next))
             .on_action(cx.listener(Self::find_previous))
@@ -696,6 +883,7 @@ impl Render for TerminalView {
             .size_full()
             .child(TerminalElement::new(cx.entity()))
             .children(find_bar)
+            .children(feedback)
     }
 }
 

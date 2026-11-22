@@ -573,6 +573,96 @@ pub fn reattach_quit(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A command line a shell reported with OSC 633 `E` stays with its marks in
+/// the server: after a quit and a plain launch, which attaches the detached
+/// session, Copy Last Command Line copies `make test` (not the screen's
+/// `wrong`). Linux only: the command is bash's.
+pub fn attach_633(ctx: &Ctx) -> Result<Outcome> {
+    use super::shell::{Clip, fake_633_command};
+    let clip = Clip::new(ctx, "clip")?;
+    let first = Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .send("PS1='$ '; HISTFILE=\\r")
+        .send(&fake_633_command("make test"))
+        .wait_for("fake-done")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(first.dump.wait_timeouts.is_empty(), "the command didn't run: {:?}", first.dump.screen);
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    let second = Run::new(ctx, "second").keep_detached().restore().wait_for("fake-done");
+    let out = clip.copy(second).dump_at(10.0).run()?;
+    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
+    clip.expect("make test", &out)?;
+    Ok(Outcome::Pass)
+}
+
+/// A detached session's progress (OSC 9;4) stays in the server: after a
+/// quit and a plain launch, which attaches the detached session, its tab
+/// shows the bar at 60% again, from the replay. Linux only: the command is
+/// bash's.
+pub fn progress_attach(ctx: &Ctx) -> Result<Outcome> {
+    let first = Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .send("PS1='$ '; HISTFILE=\\r")
+        .send(r"printf '\033]9;4;1;60\033\\'; echo pro''gress-set\r")
+        .wait_for("progress-set")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(first.dump.wait_timeouts.is_empty(), "the report didn't run: {:?}", first.dump.screen);
+    let want = ["tab=1 state=normal percent=60"];
+    ensure!(first.dump.progress == want, "before the quit: {:?}", first.dump.progress);
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    let second = Run::new(ctx, "second").keep_detached().restore().wait_for("progress-set").dump_at(6.0).run()?;
+    ensure!(second.dump.tabs.len() == 1, "tabs: {:?}", second.dump.tabs);
+    ensure!(second.dump.progress == want, "after the attach: {:?}; screen {:?}", second.dump.progress, second.dump.screen);
+    Ok(Outcome::Pass)
+}
+
+/// A detached session's contexts (OSC 3008) stay in the server: after a
+/// quit and a plain launch, which attaches the detached session, its tab
+/// shows the privileged badge again, from the replay. Then, detached once
+/// more, the program ends the context (a file the case creates lets it),
+/// and the next attach shows no badge. Linux only: the command is bash's.
+pub fn context_attach(ctx: &Ctx) -> Result<Outcome> {
+    use super::context::{RUN0, context, echo};
+    let gate = super::Gate::new(ctx, "end-it");
+    let ended = ctx.dir.join("ended");
+    let later = format!(
+        "{{ {}; {}; {}; touch '{}'; }} &",
+        gate.wait(),
+        context("end=a1"),
+        echo("context-ended", 3),
+        ended.display()
+    );
+    let first = Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .send("PS1='$ '; HISTFILE=; set +m\\r")
+        .send(&format!("{}; {}; {later}\\r", context(RUN0), echo("context-set", 3)))
+        .wait_for("context-set")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(first.dump.wait_timeouts.is_empty(), "the start didn't run: {:?}", first.dump.screen);
+    let want = ["tab=1 kind=privileged label=\"root\" draw=icon"];
+    ensure!(first.dump.badges == want, "before the quit: {:?}", first.dump.badges);
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    let second = Run::new(ctx, "second").keep_detached().restore().wait_for("context-set").dump_at(6.0).run()?;
+    ensure!(second.dump.tabs.len() == 1, "tabs: {:?}", second.dump.tabs);
+    ensure!(second.dump.badges == want, "after the attach: {:?}; screen {:?}", second.dump.badges, second.dump.screen);
+    ensure!(second.dump.contexts == ["id=\"a1\" type=elevate label=\"root\""], "contexts {:?}", second.dump.contexts);
+
+    // Ended while no client was attached.
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    std::fs::write(&gate.0, b"").map_err(|e| e.to_string())?;
+    ctx.scale().eventually(10.0, "the detached program ending its context", || ended.exists())?;
+    let third = Run::new(ctx, "third").keep_detached().restore().wait_for("context-ended").dump_at(6.0).run()?;
+    ensure!(third.dump.wait_timeouts.is_empty(), "the end didn't run: {:?}", third.dump.screen);
+    ensure!(third.dump.badges.is_empty() && third.dump.contexts.is_empty(), "after the end: {:?} {:?}", third.dump.badges, third.dump.contexts);
+    Ok(Outcome::Pass)
+}
+
 /// Brindle killed (SIGKILL, on Windows `taskkill /F`) with a split tab: a
 /// plain launch brings back both zones' sessions, and the left one's output.
 pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {
@@ -1638,14 +1728,19 @@ fn link_or_copy(from: &Path, to: &Path) -> Result {
 
 /// A copy of the helper with another build id (a byte of its GNU build-id
 /// note flipped) and a newer file time: what an install of a new build
-/// leaves beside Brindle. Returns it and both build ids.
+/// leaves beside Brindle. A helper whose linker wrote no note (the helper
+/// under test may be a release archive's) has a hash of its bytes for its
+/// build id, so bytes appended after its image change it instead, as for a
+/// PE file. Returns it and both build ids.
 fn other_build_elf(ctx: &Ctx) -> Result<(PathBuf, String, String)> {
     use brindle_remote_protocol::build_id;
     let mut bytes = std::fs::read(&ctx.helper).map_err(|e| format!("reading {}: {e}", ctx.helper.display()))?;
     let old = build_id::of_binary(&bytes);
     let id: Vec<u8> = (0..old.len()).step_by(2).filter_map(|at| u8::from_str_radix(&old[at..at + 2], 16).ok()).collect();
-    let at = bytes.windows(id.len()).position(|window| window == id).ok_or("the helper has no GNU build-id note")?;
-    bytes[at] ^= 0xff;
+    match bytes.windows(id.len()).position(|window| window == id) {
+        Some(at) => bytes[at] ^= 0xff,
+        None => bytes.extend_from_slice(b"brindle-e2e: another build"),
+    }
     let new = build_id::of_binary(&bytes);
     ensure!(new != old, "the patched build id is still {old}");
     let dir = ctx.dir.join("upgrade");

@@ -28,7 +28,7 @@ use std::rc::Rc;
 use brindle_ui::{
     ActiveTheme, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, Checkbox, Combobox, ComboboxEvent, Command,
     CommandEvent, CommandGroup, CommandItem,
-    ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, FocusScope, FocusStops, Icon, Input, ItemKey, Kbd,
+    Badge, ContextMenu, ContextMenuTarget, Dialog, Dismiss, DropdownMenu, EdgeBar, FocusScope, FocusStops, Icon, Input, ItemKey, Kbd,
     MenuEntry, MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
     Separator,
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
@@ -185,11 +185,26 @@ pub struct DemoTab {
     /// A status dot in this colour, and a bell dot.
     status: Option<u32>,
     bell: bool,
+    /// A progress bar along its bottom edge: the share filled and its colour.
+    bar: Option<(f32, u32)>,
+    /// A warning-icon badge after its label: the user it names in its
+    /// tooltip, and its colour.
+    badge: Option<(&'static str, u32)>,
 }
 
 impl DemoTab {
     fn new(id: usize, label: impl Into<SharedString>) -> Self {
-        Self { id, label: label.into(), disabled: false, colors: None, icon: false, status: None, bell: false }
+        Self {
+            id,
+            label: label.into(),
+            disabled: false,
+            colors: None,
+            icon: false,
+            status: None,
+            bell: false,
+            bar: None,
+            badge: None,
+        }
     }
 }
 
@@ -208,7 +223,8 @@ pub struct TabsDemo {
 ///   (active, the spec's `#c0caf5` on `#1a1b26`), a long nvim title
 ///   (Solarized light colours, inactive but on its own surface), ssh (a
 ///   leading icon, the tokens' colours) and a build with a status dot and
-///   a bell;
+///   a bell before its label, a progress bar 40% along its bottom edge and
+///   a yellow warning-icon badge ("Running as root");
 /// - `crowded`: six sessions in a list too narrow for them.
 fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
     let labelled = |labels: &[&'static str]| -> Vec<DemoTab> {
@@ -221,7 +237,13 @@ fn initial_tabs() -> HashMap<&'static str, TabsDemo> {
         DemoTab { colors: Some((0x1a1b26, 0xc0caf5)), ..DemoTab::new(0, "bash") },
         DemoTab { colors: Some((0xfdf6e3, 0x657b83)), ..DemoTab::new(1, "nvim ~/src/brindle/ui/src/components/tabs.rs") },
         DemoTab { icon: true, ..DemoTab::new(2, "ssh: work") },
-        DemoTab { status: Some(0xe0af68), bell: true, ..DemoTab::new(3, "cargo build") },
+        DemoTab {
+            status: Some(0xe0af68),
+            bell: true,
+            bar: Some((0.4, 0xe0af68)),
+            badge: Some(("root", 0xe0af68)),
+            ..DemoTab::new(3, "cargo build")
+        },
     ];
     let crowded = (0..6).map(|n| DemoTab::new(n, format!("Session {}", n + 1))).collect();
     HashMap::from([
@@ -237,7 +259,7 @@ fn demo_tab_width() -> TabWidth {
     TabWidth::new(rems(5.), rems(15.))
 }
 
-/// A 6px dot, as a tab's status and bell adornments.
+/// A 6px dot, as a tab's leading status and bell dots.
 /// The demo cards' size.
 const CARD_DEMO_WIDTH: f32 = 240.;
 const CARD_DEMO_HEIGHT: f32 = 120.;
@@ -1121,11 +1143,19 @@ impl Gallery {
                 if tab.icon {
                     trigger = trigger.leading(Icon::AppWindow.size(rems(0.875)));
                 }
+                // The dots lead the label, as on a window's tab strip.
                 if let Some(status) = tab.status {
-                    trigger = trigger.adornment(dot(rgb(status).into()));
+                    trigger = trigger.leading(dot(rgb(status).into()));
                 }
                 if tab.bell {
-                    trigger = trigger.adornment(dot(primary));
+                    trigger = trigger.leading(dot(primary));
+                }
+                if let Some((fraction, color)) = tab.bar {
+                    trigger = trigger.edge_bar(EdgeBar::new(fraction, rgb(color)));
+                }
+                if let Some((user, color)) = tab.badge {
+                    let badge = Badge::icon(Icon::TriangleAlert, rgb(color)).tooltip(format!("Running as {user}"));
+                    trigger = trigger.badge(badge);
                 }
                 trigger
             })
@@ -1253,7 +1283,10 @@ impl Gallery {
             .header(actions(
                 "owner",
                 owner.muted.unwrap_or(t.muted_foreground),
-                CardHeader::new("card-owner-header").leading(dot(rgb(0xe0af68).into())).title("nvim"),
+                CardHeader::new("card-owner-header")
+                    .leading(dot(rgb(0xe0af68).into()))
+                    .title("nvim")
+                    .badge(Badge::new("web", owner.muted.unwrap_or(t.muted_foreground))),
             ))
             .on_header_bounds(header_record("card:owner:header"))
             .child(body("~ $ ls").text_color(owner.text.unwrap_or(t.foreground)));
@@ -2541,6 +2574,8 @@ mod check {
         c.run_check("tabs-each-list-is-one-tab-stop", check).await;
         let check = tabs_widths(&mut c).await;
         c.run_check("tabs-triggers-keep-between-their-min-and-max-width", check).await;
+        let check = tabs_badge(&mut c).await;
+        c.run_check("tabs-a-badge-keeps-the-trigger-height", check).await;
         // Tabs: what is drawn and the pointer (Windows only).
         let check = tabs_ring(&mut c).await;
         c.run_check("tabs-ring-paints-around-the-active-trigger-only", check).await;
@@ -4459,6 +4494,21 @@ mod check {
         }
         c.key("shift-tab").await?;
         ensure!(c.focused_name("tabs-strip")?, "shift-Tab didn't come back to the strip list");
+        Ok(())
+    }
+
+    /// The build tab's badge keeps its trigger as tall as the others, and
+    /// within the maximum width.
+    async fn tabs_badge(c: &mut Checker) -> Check {
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        let max = super::demo_tab_width().max().0 * rem;
+        let (bash, build) = (trigger(c, "strip", 0).await?, trigger(c, "strip", 3).await?);
+        let (plain, badged) = (f32::from(bash.size.height), f32::from(build.size.height));
+        let close = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let within = |a: f32, limit: f32| a < limit + 0.5;
+        ensure!(close(plain, badged), "the badged trigger is {badged}px tall, the others {plain}px");
+        let width = f32::from(build.size.width);
+        ensure!(within(width, max), "the badged trigger is {width}px wide, past the {max}px maximum");
         Ok(())
     }
 

@@ -93,7 +93,7 @@ impl Session {
 
     fn render(&mut self) -> Vec<u8> {
         let title = self.titles.0.lock().clone();
-        render(&mut self.term, &self.marks.lock(), &self.records, title.as_deref())
+        render(&mut self.term, &self.marks.lock(), &self.records, None, &Default::default(), title.as_deref())
     }
 
     /// A fresh session of the same size and limit, fed this one's replay.
@@ -222,7 +222,8 @@ fn dump(s: &mut Session) -> Dump {
             .iter()
             .map(|c| {
                 let at = |p: Option<crate::shell_integration::Pos>| p.map(|p| (marks.line(p), p.col));
-                format!("{:?} {:?} {:?} {:?} exit={:?}", at(Some(c.prompt)), at(c.input), at(c.output), at(c.end), c.exit)
+                let (prompt, input, output, end) = (at(Some(c.prompt)), at(c.input), at(c.output), at(c.end));
+                format!("{prompt:?} {input:?} {output:?} {end:?} exit={:?} line={:?}", c.exit, c.line)
             })
             .collect(),
         reported_dir: marks.reported_dir().map(Into::into),
@@ -358,6 +359,52 @@ fn marks_for_three_commands() {
     assert_eq!(prompts, session.marks.lock().prompt_lines().collect::<Vec<_>>());
     assert_eq!(marks.jump_target(9, true), session.marks.lock().jump_target(9, true));
     assert_eq!(marks.failed_spans(0, 9), session.marks.lock().failed_spans(0, 9));
+}
+
+/// Reported lines (OSC 633 `E`) come back escaped, on commands with and
+/// without a `B` mark, and a command reported nothing for keeps none.
+#[test]
+fn reported_command_lines() {
+    let lines = ["echo \"a;b\"", "printf '\\\\x3b' \\", "two\nlines", "caf\u{e9};;"];
+    let mut fixture = String::new();
+    for line in lines {
+        let escaped = crate::shell_integration::encode_vscode(line);
+        fixture += &format!("{PROMPT}x\r\n\x1b]633;E;{escaped};nonce\x07\x1b]133;C\x07out\r\n\x1b]133;D;0\x07");
+    }
+    // fish: no `B`, the line reported after the prompt.
+    fixture += "\x1b]133;A\x07> pwd\r\n\x1b]633;E;pwd\x07\x1b]133;C\x07/\r\n\x1b]133;D;0\x07";
+    fixture += &command("plain", "", 0);
+    fixture += PROMPT;
+    let (mut session, copy) = round_trip(30, 10, 100, fixture.as_bytes());
+    let got: Vec<Option<String>> = copy.marks.lock().commands().iter().map(|c| c.line.clone()).collect();
+    let mut expected: Vec<Option<String>> = lines.iter().map(|l| Some(l.to_string())).collect();
+    expected.extend([Some("pwd".into()), None, None]);
+    assert_eq!(got, expected);
+    // The replay writes the line once, after its mark, and never the nonce.
+    let replay = String::from_utf8_lossy(&session.render()).into_owned();
+    assert_eq!(replay.matches("\x1b]633;E;").count(), 5);
+    assert!(replay.contains("\x1b]133;B\x1b\\\x1b]633;E;echo \"a\\x3bb\"\x1b\\"), "{replay:?}");
+    assert!(replay.contains("\x1b]133;A\x1b\\\x1b]633;E;pwd\x1b\\"), "{replay:?}");
+    assert!(!replay.contains("nonce"));
+}
+
+/// A client that predates OSC 633 ignores the lines and keeps the marks:
+/// stripping the `E` sequences from a replay changes nothing else.
+#[test]
+fn a_replay_without_its_lines_has_the_same_marks() {
+    let fixture = format!("{PROMPT}ls\r\n\x1b]633;E;ls\x07\x1b]133;C\x07a\r\n\x1b]133;D;2\x07{PROMPT}");
+    let mut session = Session::new(20, 6, 50);
+    session.feed(fixture.as_bytes());
+    let replay = String::from_utf8_lossy(&session.render()).replace("\x1b]633;E;ls\x1b\\", "");
+    let mut old = Session::new(20, 6, 50);
+    old.feed(replay.as_bytes());
+    let (s, o) = (session.marks.lock(), old.marks.lock());
+    assert_eq!(s.commands().len(), o.commands().len());
+    for (a, b) in s.commands().iter().zip(o.commands()) {
+        assert_eq!((a.prompt, a.input, a.output, a.end, a.exit), (b.prompt, b.input, b.output, b.end, b.exit));
+    }
+    assert_eq!(s.commands()[0].line.as_deref(), Some("ls"));
+    assert_eq!(o.commands()[0].line, None);
 }
 
 #[test]

@@ -10,7 +10,10 @@
 //!   runs and OSC 8 hyperlinks. A row joined to the next by `WRAPLINE` ends
 //!   without a line break, so the receiver wraps it itself and can rewrap it
 //!   on resize. OSC 133 marks are emitted where the receiver's cursor is at
-//!   each mark's position, so its parser records equal [`Marks`];
+//!   each mark's position, so its parser records equal [`Marks`], and each
+//!   command's reported line follows its `B` mark (its `A` without one) as
+//!   OSC 633 `E`, escaped ([`encode_vscode`]). Marks stay OSC 133, so a
+//!   client that predates OSC 633 gets them, without the lines;
 //! - if the alternate screen is active: the primary cursor, `CSI ? 1049 h`
 //!   and the alternate grid;
 //! - the active screen's saved cursor (`ESC 7`), custom tab stops, the
@@ -21,7 +24,16 @@
 //!   insert, LNM, kitty keyboard flags), the cursor shape and blink
 //!   (DECSCUSR), and the title (OSC 2);
 //! - the working directory the shell last reported (OSC 7), then the latest
-//!   OSC 7501 report of each status record, least recently updated first.
+//!   OSC 7501 report of each status record, least recently updated first;
+//! - the progress, if any, as one `OSC 9 ; 4` report. It comes last, after
+//!   the marks, because a replayed OSC 133 `A` drops the receiver's
+//!   progress. A client that predates progress ignores it (it reads `9;4`
+//!   as a ConEmu command, not a message);
+//! - one `OSC 3008 ; start=…` per open context, outermost first, its id and
+//!   values re-escaped (`;`, `\` and bytes outside 0x20–0x7E as `\xHH`).
+//!   Nothing in the stream ends a context (not even its `ESC c`), so the
+//!   receiver must start from no contexts: a client drops its own when the
+//!   replay begins. A client that predates contexts ignores them.
 //!
 //! # The receiver
 //! The stream is rendered at the session's size. The receiver must be a
@@ -29,8 +41,8 @@
 //! least the session's (use the session's limit), and it resizes to its own
 //! size only after the whole replay. Its parser must be Brindle's `Parser`
 //! (for the marks), and its OSC 7501 scanner must see the stream in order:
-//! the reports come after the marks, because OSC 133 `A` ends `working`
-//! records. A `blocked`, `done` or `error` record arrives as a fresh report,
+//! the reports and the progress come after the marks, because OSC 133 `A`
+//! ends `working` records and drops the progress. A `blocked`, `done` or `error` record arrives as a fresh report,
 //! so a client that notifies on those should not notify during a replay.
 //!
 //! # Fidelity limits
@@ -49,7 +61,8 @@
 //!   into.
 //! - **A prompt mark above the top of the scrollback**: the command's later
 //!   marks survive, but the receiver records the command as starting at its
-//!   first surviving mark.
+//!   first surviving mark. Its reported line survives only if its `B` mark
+//!   does (a command with no `B` loses it with its prompt).
 //! - **Marks recorded out of position order** (the cursor moved back between
 //!   them) are replayed in position order, which can group them into
 //!   commands differently.
@@ -83,16 +96,21 @@ use alacritty_terminal::vte::ansi::{
     CharsetIndex, Color, CursorShape, CursorStyle, Handler, NamedColor, StandardCharset,
 };
 
-use crate::shell_integration::{Mark, Marks};
+use crate::context::Contexts;
+use crate::progress::Progress;
+use crate::shell_integration::{Mark, Marks, encode_vscode};
 use crate::status::Records;
 
-/// Renders `term`, its `marks` and `records`, and the window `title` (which
-/// `Term` doesn't expose) as a replay stream. See the module docs for what
-/// the receiver must be and what doesn't round-trip.
+/// Renders `term`, its `marks`, `records`, `progress` and `contexts`, and
+/// the window `title` (which `Term` doesn't expose) as a replay stream. See
+/// the module docs for what the receiver must be and what doesn't
+/// round-trip.
 pub fn render<T: EventListener>(
     term: &mut Term<T>,
     marks: &Marks,
     records: &Records,
+    progress: Option<Progress>,
+    contexts: &Contexts,
     title: Option<&str>,
 ) -> Vec<u8> {
     let hidden = Hidden::probe(term);
@@ -236,6 +254,12 @@ pub fn render<T: EventListener>(
     }
     for (id, record) in records.iter_by_update() {
         out.raw(&format!("\x1b]7501;{}\x1b\\", record.encode(id)));
+    }
+    if let Some(progress) = progress {
+        out.raw(&format!("\x1b]9;{}\x1b\\", progress.encode()));
+    }
+    for payload in contexts.encode() {
+        out.raw(&format!("\x1b]3008;{payload}\x1b\\"));
     }
     out.buf
 }
@@ -516,13 +540,19 @@ impl Out {
         }
     }
 
-    fn mark(&mut self, mark: Mark) {
+    /// Writes a mark as OSC 133, which clients older than OSC 633 support
+    /// read too, then the command line it carries as OSC 633 `E`, which
+    /// they ignore.
+    fn mark(&mut self, mark: Mark, line: Option<&str>) {
         match mark {
             Mark::PromptStart => self.raw("\x1b]133;A\x1b\\"),
             Mark::CommandStart => self.raw("\x1b]133;B\x1b\\"),
             Mark::OutputStart => self.raw("\x1b]133;C\x1b\\"),
             Mark::CommandEnd(Some(exit)) => self.raw(&format!("\x1b]133;D;{exit}\x1b\\")),
             Mark::CommandEnd(None) => self.raw("\x1b]133;D\x1b\\"),
+        }
+        if let Some(line) = line {
+            self.raw(&format!("\x1b]633;E;{}\x1b\\", encode_vscode(line)));
         }
     }
 
@@ -559,25 +589,33 @@ impl Out {
     }
 }
 
+/// A mark at a column, and the command line (OSC 633 `E`) written right
+/// after it, if this is the mark that carries one.
+type Placed<'a> = (usize, Mark, Option<&'a str>);
+
 /// Marks by grid line, each line's in column order (stable, so marks at
-/// one position keep the order they were recorded in).
-fn mark_positions(marks: &Marks) -> BTreeMap<i64, Vec<(usize, Mark)>> {
-    let mut map: BTreeMap<i64, Vec<(usize, Mark)>> = BTreeMap::new();
+/// one position keep the order they were recorded in). A command's
+/// reported line goes with its `B` mark, or its `A` when it has no `B`: the
+/// receiver then records it before the `C` that would make it too late.
+fn mark_positions(marks: &Marks) -> BTreeMap<i64, Vec<Placed<'_>>> {
+    let mut map: BTreeMap<i64, Vec<Placed<'_>>> = BTreeMap::new();
     for c in marks.commands() {
+        let line = c.line.as_deref();
+        let (prompt_line, input_line) = if c.input.is_some() { (None, line) } else { (line, None) };
         let points = [
-            (Some(c.prompt), Mark::PromptStart),
-            (c.input, Mark::CommandStart),
-            (c.output, Mark::OutputStart),
-            (c.end, Mark::CommandEnd(c.exit)),
+            (Some(c.prompt), Mark::PromptStart, prompt_line),
+            (c.input, Mark::CommandStart, input_line),
+            (c.output, Mark::OutputStart, None),
+            (c.end, Mark::CommandEnd(c.exit), None),
         ];
-        for (pos, mark) in points {
+        for (pos, mark, line) in points {
             if let Some(pos) = pos {
-                map.entry(marks.line(pos)).or_default().push((pos.col, mark));
+                map.entry(marks.line(pos)).or_default().push((pos.col, mark, line));
             }
         }
     }
     for line in map.values_mut() {
-        line.sort_by_key(|&(col, _)| col);
+        line.sort_by_key(|&(col, ..)| col);
     }
     map
 }
@@ -593,7 +631,7 @@ fn is_blank(cell: &Cell) -> bool {
 /// Writes every row of `grid`, top of the scrollback first, starting with
 /// the receiver's cursor at the top left of a clear screen. The receiver
 /// ends on the last row; `marks` are keyed by grid line.
-fn write_grid(out: &mut Out, grid: &Grid<Cell>, marks: &BTreeMap<i64, Vec<(usize, Mark)>>) {
+fn write_grid(out: &mut Out, grid: &Grid<Cell>, marks: &BTreeMap<i64, Vec<Placed<'_>>>) {
     let cols = grid.columns();
     let top = grid.topmost_line().0;
     let bottom = grid.bottommost_line().0;
@@ -609,7 +647,7 @@ fn write_grid(out: &mut Out, grid: &Grid<Cell>, marks: &BTreeMap<i64, Vec<(usize
             // Something must wrap into this row, or the flag above is lost.
             extent = extent.max(1);
         }
-        let row_marks: &[(usize, Mark)] = marks.get(&(line as i64)).map_or(&[], Vec::as_slice);
+        let row_marks: &[Placed<'_>] = marks.get(&(line as i64)).map_or(&[], Vec::as_slice);
         let mut next_mark = 0;
         // The receiver's cursor column; `cols` is a pending wrap.
         let mut at = 0;
@@ -623,12 +661,12 @@ fn write_grid(out: &mut Out, grid: &Grid<Cell>, marks: &BTreeMap<i64, Vec<(usize
             // that, the cursor is still on the row above.
             let deferred = col == 0 && prev_wrapped;
             if !deferred {
-                while let Some(&(mark_col, mark)) = row_marks.get(next_mark).filter(|m| m.0 <= col) {
+                while let Some(&(mark_col, mark, reported)) = row_marks.get(next_mark).filter(|m| m.0 <= col) {
                     if at.min(cols - 1) != mark_col {
                         out.raw(&format!("\x1b[{}G", mark_col + 1));
                         at = mark_col;
                     }
-                    out.mark(mark);
+                    out.mark(mark, reported);
                     next_mark += 1;
                 }
             }
@@ -689,12 +727,12 @@ fn write_grid(out: &mut Out, grid: &Grid<Cell>, marks: &BTreeMap<i64, Vec<(usize
             out.plain_background();
             out.raw("\x1b[K");
         }
-        for &(mark_col, mark) in &row_marks[next_mark..] {
+        for &(mark_col, mark, reported) in &row_marks[next_mark..] {
             if at.min(cols - 1) != mark_col {
                 out.raw(&format!("\x1b[{}G", mark_col + 1));
                 at = mark_col;
             }
-            out.mark(mark);
+            out.mark(mark, reported);
         }
         if line != bottom && !wrapped {
             out.plain_background();

@@ -133,11 +133,12 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     )
     .to_string();
     let label = "container-pty";
-    let dump = Run::new(ctx, label)
+    let run = Run::new(ctx, label)
         .profile(CONTAINER_PROFILE)
         .default_profile(CONTAINER_PROFILE)
-        .config(&config)
-        .env("BRINDLE_REMOTE_AGENT", &agent.to_string_lossy())
+        .config(&config);
+    let dump = agent
+        .give(run)
         .env("BRINDLE_NOTIFY_LOG", &notify_log(ctx, label))
         .wait_for("REMOTE_CONTAINER_READY>")
         .send(&set_cwd)
@@ -201,6 +202,50 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     );
 
     Ok(Outcome::Pass)
+}
+
+/// The prompt (`PS1`) of [`in_container_tab`]'s tabs, without its trailing
+/// space.
+pub(super) const CONTAINER_PROMPT: &str = "REMOTE_CONTAINER_READY>";
+
+/// Runs `case` with a [`Run`] that opens a [`CONTAINER_PROFILE`] tab, a bash
+/// in a disposable container, for a case elsewhere that needs a remote tab:
+/// a new tab there starts in the directory the active one reported, where a
+/// local Linux tab's starts in its process's. Skips without Docker or the
+/// helper, as this file's cases do; the container is removed afterwards.
+pub(super) fn in_container_tab(
+    ctx: &Ctx,
+    label: &'static str,
+    case: impl FnOnce(Run<'_>) -> Result<Outcome>,
+) -> Result<Outcome> {
+    if let Some(outcome) = docker_outcome()? {
+        return Ok(outcome);
+    }
+    let Some(agent) = remote_agent(ctx)? else {
+        return Ok(Outcome::Skip(
+            "Linux remote helper was not built; run `cargo build -p brindle-remote-agent`".into(),
+        ));
+    };
+    let image = fixture_image(ctx)?;
+    let container = Container::start(ctx, &image, &[])?;
+    let config = format!(
+        "\n[[profiles]]\n\
+         name = {CONTAINER_PROFILE:?}\n\
+         command = \"/bin/bash\"\n\
+         args = [\"--norc\", \"--noprofile\", \"-i\"]\n\
+         env = {{ SHELL = \"/bin/bash\", PS1 = \"{CONTAINER_PROMPT} \" }}\n\
+         remote = {{ type = \"container\", engine = \"docker\", container = {:?}, user = \"remote\" }}\n",
+        container.name,
+    );
+    let run = agent.give(
+        Run::new(ctx, label)
+            .profile(CONTAINER_PROFILE)
+            .default_profile(CONTAINER_PROFILE)
+            .config(&config),
+    );
+    let outcome = case(run);
+    drop(container);
+    outcome
 }
 
 /// An SSH endpoint starts without a cached helper. Brindle must upload it
@@ -321,6 +366,175 @@ pub fn ssh_quit(ctx: &Ctx) -> Result<Outcome> {
     );
     docker.runs_in(program, "sleep", left.pid)?;
     Ok(Outcome::Pass)
+}
+
+/// A restored SSH tab takes its window's size: a first run leaves an SSH
+/// tab's shell detached, and the next launch, whose grid is smaller (more
+/// padding), restores the tab attached to it. Once attached, the remote
+/// PTY's size (`stty size`) is the restored terminal's grid, not the size
+/// the session was detached at.
+pub fn ssh_reattach_size(ctx: &Ctx) -> Result<Outcome> {
+    // The command's own echo says `bef""ore=`, so only its output matches.
+    let size = |marker: &str| {
+        let (head, tail) = marker.split_at(3);
+        format!("echo \"{head}\"\"{tail}=$(stty size)\"\r")
+    };
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-reattach-size", false);
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        .default_profile(SSH_PROFILE)
+        .wait_for(SSH_PROMPT)
+        .send(&size("before"))
+        .wait_for("before=")
+        .dump_at(8.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    let before = shown_stty_size(&first.dump, "before=")?;
+    ensure!(
+        first.dump.size == Some(before),
+        "the first run's PTY is {before:?}, its grid {:?}",
+        first.dump.size
+    );
+    let docker = ssh.container.docker.clone();
+    ctx.scale().poll(10.0, "the tab's session detached", || {
+        let sessions = docker.sessions()?;
+        Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+
+    let second = needs
+        .run(ctx, "second", &config)
+        .restore()
+        .default_profile(SSH_PROFILE)
+        // A smaller grid in the same window.
+        .padding(80)
+        // The replay brings the first run's line back.
+        .wait_for("before=")
+        .send(&size("after"))
+        .wait_for("after=")
+        .dump_at(10.0)
+        .run()?;
+    no_waits_left(&second.dump)?;
+    let after = shown_stty_size(&second.dump, "after=")?;
+    ensure!(
+        second.dump.size != Some(before),
+        "the second run's grid {:?} is the first's: the case checks nothing",
+        second.dump.size
+    );
+    ensure!(
+        second.dump.size == Some(after),
+        "the reattached session's PTY is {after:?}, its grid {:?} (detached at {before:?})",
+        second.dump.size
+    );
+    Ok(Outcome::Pass)
+}
+
+/// A restored SSH tab in the background shows what its program draws at the
+/// session's own size. A first run leaves a local tab (active) and an SSH tab
+/// detached, the SSH tab's shell waiting for a file in the container. The
+/// restoring run reattaches the SSH tab while the local one is shown, so
+/// nothing has laid the SSH tab out; the file is then created, and the
+/// program clears the screen and draws `MARK` at column 90, past the
+/// default grid's 80 columns. Shown, the tab has `MARK` at column 90: the
+/// draw landed on a grid at the session's size, not clamped at column 80.
+pub fn ssh_reattach_background(ctx: &Ctx) -> Result<Outcome> {
+    const DRAWN: &str = "BACKGROUND-DRAWN";
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-reattach-background", false);
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        // The local tab's session is the next run's too.
+        .keep_detached()
+        .action("new_tab_with_profile_2")
+        .wait_for(SSH_PROMPT)
+        .send(concat!(
+            "while [ ! -e /tmp/go ]; do sleep 0.1; done; ",
+            "printf '\\033[H\\033[2J\\033[1;90HMARK'; touch /tmp/drawn; exec sleep 1000\r"
+        ))
+        .action("prev_tab")
+        .dump_at(8.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    let tabs = &first.dump.tabs;
+    ensure!(tabs.len() == 2 && tabs[0].1, "tabs: {tabs:?}");
+    let docker = ssh.container.docker.clone();
+    ctx.scale().poll(10.0, "the SSH tab's session detached", || {
+        let sessions = docker.sessions()?;
+        Ok(matches!(sessions.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+    ctx.scale().poll(10.0, "the local tab's session detached", || {
+        let local = local_sessions(&ctx.helper, &ctx.server_dir)?;
+        Ok(matches!(local.as_slice(), [session] if !session.attached).then_some(()))
+    })?;
+
+    let (helper, server_dir, scale) = (ctx.helper.clone(), ctx.server_dir.clone(), ctx.scale());
+    let second = needs
+        .run(ctx, "second", &config)
+        .restore()
+        .call_at(1.0, move |_| {
+            scale.poll(30.0, "the SSH tab's session attached again", || {
+                let sessions = docker.sessions()?;
+                Ok(matches!(sessions.as_slice(), [session] if session.attached).then_some(()))
+            })?;
+            docker.exec(&["touch", "/tmp/go"])?;
+            scale.poll(10.0, "the SSH tab's program drawn", || {
+                Ok(docker.exec(&["test", "-e", "/tmp/drawn"]).is_ok().then_some(()))
+            })?;
+            let local = scale.poll(10.0, "the restored local tab", || {
+                Ok(local_sessions(&helper, &server_dir)?
+                    .into_iter()
+                    .find(|s| s.attached))
+            })?;
+            mark_tty(local.pid, DRAWN)
+        })
+        // The local tab, active at the quit, is shown while the SSH tab's
+        // program draws.
+        .wait_for(DRAWN)
+        .action("next_tab")
+        .dump_at(10.0)
+        .run()?;
+    no_waits_left(&second.dump)?;
+    let tabs = &second.dump.tabs;
+    ensure!(tabs.len() == 2 && tabs[1].1, "tabs: {tabs:?}");
+    // The drawn line, not the command line that typed it.
+    let marked = second
+        .dump
+        .screen
+        .iter()
+        .find(|line| line.trim_start().starts_with("MARK"))
+        .map(|line| line.len() - line.trim_start().len());
+    ensure!(
+        marked == Some(89),
+        "MARK at column {marked:?}, not 89 (from 0), on a {:?} grid: {:?}",
+        second.dump.size,
+        second.dump.screen
+    );
+    Ok(Outcome::Pass)
+}
+
+/// The `(cols, rows)` that a `MARKERROWS COLS` line (`stty size`) shows.
+fn stty_size(line: &str, marker: &str) -> Option<(u16, u16)> {
+    let (rows, cols) = line.strip_prefix(marker)?.trim().split_once(' ')?;
+    Some((cols.parse().ok()?, rows.parse().ok()?))
+}
+
+/// The size the last line starting with `marker` on the screen shows.
+fn shown_stty_size(dump: &Dump, marker: &str) -> Result<(u16, u16)> {
+    dump.screen
+        .iter()
+        .rev()
+        .find_map(|line| stty_size(line, marker))
+        .ok_or_else(|| format!("no {marker:?} line: {:?}", dump.screen))
 }
 
 /// An SSH tab split twice keeps one connection: Brindle runs one `ssh` and
@@ -983,7 +1197,7 @@ pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
 /// What a remote case needs from the machine: a Docker daemon, the Linux
 /// helper Brindle deploys, and the fixture image.
 struct Needs {
-    agent: PathBuf,
+    agent: Agent,
     image: String,
 }
 
@@ -1006,9 +1220,7 @@ impl Needs {
     /// A run of Brindle with `config` (profiles) after the test config, that
     /// deploys the helper.
     fn run<'a>(&self, ctx: &'a Ctx, label: &'static str, config: &str) -> Run<'a> {
-        Run::new(ctx, label)
-            .config(config)
-            .env("BRINDLE_REMOTE_AGENT", &self.agent.to_string_lossy())
+        self.agent.give(Run::new(ctx, label).config(config))
     }
 }
 
@@ -1382,6 +1594,11 @@ fn no_waits_left(dump: &Dump) -> Result {
 
 /// The harness's own tests of this file's parsers (`--self-test`).
 pub fn self_test() -> Result {
+    ensure!(stty_size("after=24 80", "after=") == Some((80, 24)), "stty size");
+    ensure!(
+        stty_size("after=24", "after=").is_none() && stty_size("echo \"aft\"\"er=", "after=").is_none(),
+        "stty size junk"
+    );
     let listed = parse_list(
         "3\t4242\tattached\t-\t-\tdetach\t1m05s\tbash\tbash -i\t/root\n\
          4\t77\tdetached\towned\t30s\tdetach\t2m\tsleep\tsleep 9\t/\n\
@@ -1467,21 +1684,54 @@ fn docker_outcome() -> Result<Option<Outcome>> {
     }
 }
 
-fn remote_agent(ctx: &Ctx) -> Result<Option<PathBuf>> {
-    let path = std::env::var_os("BRINDLE_REMOTE_AGENT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| ctx.bin.with_file_name("brindle-remote"));
-    if !path.is_file() {
+/// The Linux helper a remote case's Brindle deploys ([`remote_agent`]).
+enum Agent {
+    /// `BRINDLE_REMOTE_AGENT` named it: passed on resolved, since a run's
+    /// working directory may not be the suite's.
+    Named(PathBuf),
+    /// Beside the binary under test, where Brindle finds it itself, so the
+    /// run names none: an installed or unpacked archive's helper is
+    /// deployed as a user's Brindle finds it.
+    Beside,
+}
+
+impl Agent {
+    /// `run`, told about the helper when Brindle wouldn't find it itself.
+    fn give<'a>(&self, run: Run<'a>) -> Run<'a> {
+        match self {
+            Agent::Named(path) => run.env("BRINDLE_REMOTE_AGENT", &path.to_string_lossy()),
+            Agent::Beside => run,
+        }
+    }
+}
+
+/// The helper Brindle deploys: `BRINDLE_REMOTE_AGENT`, else the first of
+/// its names for the Linux helper beside the binary under test (an
+/// archive's `brindle-remote-linux-x86_64`, then cargo's `brindle-remote`),
+/// as Brindle looks for it. `None` when there is none, which
+/// `BRINDLE_REMOTE_E2E_REQUIRED=1` makes an error.
+fn remote_agent(ctx: &Ctx) -> Result<Option<Agent>> {
+    use crate::common::server::{LINUX_HELPER_NAMES, beside, bin_paths};
+    let named = std::env::var_os("BRINDLE_REMOTE_AGENT").filter(|value| !value.is_empty()).map(PathBuf::from);
+    let found = match &named {
+        Some(path) => path.is_file().then(|| path.clone()),
+        None => beside(&bin_paths(&ctx.bin), &LINUX_HELPER_NAMES, &|path: &Path| path.is_file()),
+    };
+    let Some(path) = found else {
         if std::env::var("BRINDLE_REMOTE_E2E_REQUIRED").as_deref() == Ok("1") {
-            return Err(format!(
-                "Linux remote helper not found at {}; run `cargo build -p brindle-remote-agent`",
-                path.display()
-            ));
+            let looked = named.map_or_else(
+                || format!("beside {} ({})", ctx.bin.display(), LINUX_HELPER_NAMES.join(", ")),
+                |path| format!("at {}", path.display()),
+            );
+            return Err(format!("Linux remote helper not found {looked}; run `cargo build -p brindle-remote-agent`"));
         }
         return Ok(None);
+    };
+    if named.is_none() {
+        return Ok(Some(Agent::Beside));
     }
     fs::canonicalize(&path)
-        .map(Some)
+        .map(|path| Some(Agent::Named(path)))
         .map_err(|error| format!("resolving remote helper {}: {error}", path.display()))
 }
 

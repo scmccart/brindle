@@ -6,8 +6,10 @@
 # CHANGELOG.md. Merging it makes release-please tag vX.Y.Z and create a draft
 # release with that version's notes. This run then builds both platforms at
 # the tag with the same reusable workflows CI uses, signs the Windows
-# executables (the `sign` job), attaches the Linux archive, the Windows zip and
-# SHA256SUMS, and publishes the release. A failed build or signing leaves the
+# executables (the `sign` job), attests the binaries' build provenance,
+# attaches the Linux archive, the Windows zip, the one-command installers
+# (install.sh and install.ps1, stamped with the version) and SHA256SUMS, and
+# publishes the release. A failed build, signing or attestation leaves the
 # draft; rerunning the failed jobs completes it.
 #
 # release-please runs as a GitHub App (secrets RELEASE_APP_ID and
@@ -64,11 +66,13 @@ jobs:
 
   # Signs brindle.exe and brindle-remote.exe in the Windows zip with Azure
   # Artifact Signing and replaces the brindle-windows-x64 artifact with the
-  # re-zipped result. It signs in OIDC as a managed identity that trusts this
-  # repository's `release` environment (federated credential subject
-  # repo:scmccart/brindle:environment:release; see the shared-infrastructure
-  # repository). The environment holds secrets AZURE_CLIENT_ID,
-  # AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID. CI builds are not signed.
+  # re-zipped result, so `attest` and `publish`, which run after it, attest,
+  # hash and attach the signed binaries. It signs in OIDC as a managed
+  # identity that trusts this repository's `release` environment (federated
+  # credential subject repo:scmccart/brindle:environment:release; see the
+  # shared-infrastructure repository). The environment holds secrets
+  # AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_SUBSCRIPTION_ID. CI builds are
+  # not signed.
   sign:
     needs: [release-please, windows]
     if: needs.release-please.outputs.created == 'true'
@@ -129,8 +133,47 @@ jobs:
           retention-days: 14
           overwrite: true
 
-  publish:
+  # Build provenance for every binary the release ships, and for the archives
+  # that carry them, so `gh attestation verify FILE -R scmccart/brindle`
+  # checks a download, or a binary unpacked from one, against this run. It
+  # runs here rather than in the reusable build workflows because CI calls
+  # those too, and a called workflow can't ask for id-token: write unless
+  # every caller grants it. The builds and the signing ran earlier in this
+  # same run, which is the run the provenance names; it runs after `sign`, so
+  # the Windows zip it downloads, and the executables unpacked from it, are
+  # the signed ones.
+  attest:
     needs: [release-please, linux, windows, sign]
+    if: needs.release-please.outputs.created == 'true'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: brindle-*-x64
+          path: dist
+          merge-multiple: true
+      - name: Unpack the binaries
+        run: |
+          mkdir -p bin/linux bin/windows
+          tar -xzf dist/*.tar.gz -C bin/linux --strip-components=1
+          unzip -q dist/*.zip -d bin/windows
+          ls -l bin/linux bin/windows
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            bin/linux/brindle
+            bin/linux/brindle-remote-linux-x86_64
+            bin/windows/brindle.exe
+            bin/windows/brindle-remote.exe
+
+  publish:
+    needs: [release-please, linux, windows, sign, attest]
     if: needs.release-please.outputs.created == 'true'
     runs-on: ubuntu-26.04
     permissions:
@@ -140,18 +183,36 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.release-please.outputs.tag }}
     steps:
+      # For the installer scripts, at the tag.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           pattern: brindle-*-x64
           path: dist
           merge-multiple: true
+      # The one-command installers, scripts/get.sh and get.ps1, stamped with
+      # this release's version so each installs its own release (README's
+      # Installing).
+      - name: Installers
+        run: |
+          version=${TAG#v}
+          sed "s/@VERSION@/$version/" scripts/get.sh > dist/install.sh
+          sed "s/@VERSION@/$version/" scripts/get.ps1 > dist/install.ps1
+          for f in dist/install.sh dist/install.ps1; do
+            grep -qF "'$version'" "$f" || { echo "$f isn't stamped with $version" >&2; exit 1; }
+          done
       - name: Checksums
         working-directory: dist
         run: |
           ls -l
-          sha256sum -- *.tar.gz *.zip brindle-ui-tokens.css > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip brindle-ui-tokens.css install.sh install.ps1 > SHA256SUMS
           cat SHA256SUMS
       - name: Attach the assets
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/brindle-ui-tokens.css dist/SHA256SUMS --clobber
+        run: |
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/brindle-ui-tokens.css \
+            dist/install.sh dist/install.ps1 dist/SHA256SUMS --clobber
       - name: Publish
         run: gh release edit "$TAG" --draft=false

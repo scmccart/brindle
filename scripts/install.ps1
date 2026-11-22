@@ -85,8 +85,10 @@ try {
     Install-File 'target\release\brindle-remote.exe' 'brindle-remote.exe'
     Install-File $RemoteAgent 'brindle-remote-linux-x86_64'
 
-    # Run the installed copy, so the shortcut points at it.
-    & (Join-Path $Prefix 'brindle.exe') --install-desktop
+    # Run the installed copy, so the shortcut points at it. brindle.exe is a
+    # GUI program, so PowerShell waits for it, and sets $LASTEXITCODE, only
+    # when its output is piped.
+    & (Join-Path $Prefix 'brindle.exe') --install-desktop | Write-Host
     if ($LASTEXITCODE) { throw 'install: brindle --install-desktop failed' }
 
     $path = [Environment]::GetEnvironmentVariable('Path', 'User')

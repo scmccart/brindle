@@ -125,5 +125,5 @@ Protocols: client protocol versions 1–3 and core↔holder H1 at version 2, bot
 ## References
 
 - The architecture plugin's `process-architecture` skill (its examples are this repo's).
-- `CLAUDE.md`, "Terminal server", "Brindle's client", "Relay", "Windows" pitfalls.
+- `docs/code-map.md`, "Terminal server", "Brindle's client", "Relay"; `CLAUDE.md`, the "Windows" pitfalls.
 - `openspec/changes/archive/` for `terminal-server`, `terminal-server-windows`, `terminal-server-on-close` and `session-layout-in-server`.

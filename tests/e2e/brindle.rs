@@ -37,6 +37,7 @@ pub mod theme {
         Rgb(0xff, 0xff, 0xff),
     ];
     pub const RED: Rgb = ANSI[1];
+    pub const YELLOW: Rgb = ANSI[3];
     pub const BLUE: Rgb = ANSI[4];
 
     /// The window chrome's `background` token for the `e2e` theme: its
@@ -415,6 +416,20 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Presses the left button on a cell of the active terminal and holds
+    /// it, e.g. `0,0` (`--press`); a [`Run::hover`] then drags.
+    pub fn press(mut self, pos: &str) -> Self {
+        self.steps.extend(["--press".to_string(), pos.to_string()]);
+        self
+    }
+
+    /// Releases the held left button over a cell of the active terminal,
+    /// with no move first (`--release`).
+    pub fn release(mut self, pos: &str) -> Self {
+        self.steps.extend(["--release".to_string(), pos.to_string()]);
+        self
+    }
+
     /// Adds TOML to the test config, e.g. a `[notifications]` table.
     pub fn config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);
@@ -778,6 +793,28 @@ pub struct Dump {
     /// The active terminal's program status records (`--- status …`), one
     /// line each without the prefix.
     pub status: Vec<String>,
+    /// The progress bars shown (`--- progress tab=N …` for each tab with
+    /// one, then `--- progress zone=ID …` for the active tab's zones), one
+    /// line each without the prefix.
+    pub progress: Vec<String>,
+    /// The active terminal's open contexts (`--- context …`), outermost
+    /// first, one line each without the prefix.
+    pub contexts: Vec<String>,
+    /// The context badges shown (`--- badge tab=N …` for each tab with one,
+    /// then `--- badge zone=ID …` for the active tab's zones), one line
+    /// each without the prefix.
+    pub badges: Vec<String>,
+    /// The label a mouse copy or paste shows at the pointer, while one isn't
+    /// gone (`--- feedback kind=copied|pasted|nothing-to-paste`): the kind.
+    pub feedback: Option<String>,
+    /// The program's pointer shape on the active terminal's screen
+    /// (`--- pointer shape=NAME screen=primary|alternate`), without the
+    /// prefix; none while the pointer is Brindle's own.
+    pub pointer: Option<String>,
+    /// The pointer the active terminal's last painted frame chose for its
+    /// grid (`--- grid-pointer NAME`, a CSS name such as `text`), without
+    /// the prefix.
+    pub grid_pointer: Option<String>,
     /// The active tab's zone header (`--- zones …`), when it has 2+ zones.
     pub zones: Option<String>,
     /// The active tab's zone lines (`--- zone …`), one line each without the prefix.
@@ -862,6 +899,18 @@ impl Dump {
                 in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- status ") {
                 dump.status.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- progress ") {
+                dump.progress.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- context ") {
+                dump.contexts.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- badge ") {
+                dump.badges.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- feedback ") {
+                dump.feedback = rest.strip_prefix("kind=").map(str::to_string);
+            } else if let Some(rest) = line.strip_prefix("--- pointer ") {
+                dump.pointer = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- grid-pointer ") {
+                dump.grid_pointer = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
                 dump.zones = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zone ") {
@@ -1079,6 +1128,51 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.status == ["state=done app=\"brew\"", "state=blocked id=\"b\" kind=auth"], "status {:?}", dump.status);
     ensure!(dump.screen == ["hi"], "screen after status {:?}", dump.screen);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- progress tab=1 state=paused percent=70\n\
+         --- progress zone=2 state=paused percent=70\n--- progress zone=1 state=normal percent=30\nhi\n",
+    );
+    ensure!(
+        dump.progress
+            == ["tab=1 state=paused percent=70", "zone=2 state=paused percent=70", "zone=1 state=normal percent=30"],
+        "progress {:?}",
+        dump.progress
+    );
+    ensure!(dump.screen == ["hi"], "screen after progress {:?}", dump.screen);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- context id=\"s\" type=session\n\
+         --- context id=\"e\" type=elevate label=\"root\"\n--- badge tab=1 kind=privileged label=\"root\" draw=icon\n\
+         --- badge zone=1 kind=privileged label=\"root\" draw=icon\nhi\n",
+    );
+    ensure!(
+        dump.contexts == ["id=\"s\" type=session", "id=\"e\" type=elevate label=\"root\""],
+        "contexts {:?}",
+        dump.contexts
+    );
+    ensure!(
+        dump.badges == ["tab=1 kind=privileged label=\"root\" draw=icon", "zone=1 kind=privileged label=\"root\" draw=icon"],
+        "badges {:?}",
+        dump.badges
+    );
+    ensure!(dump.screen == ["hi"], "screen after contexts {:?}", dump.screen);
+    ensure!(dump.pointer.is_none(), "no pointer line: {:?}", dump.pointer);
+    ensure!(dump.feedback.is_none(), "no feedback line: {:?}", dump.feedback);
+    for kind in ["copied", "pasted", "nothing-to-paste"] {
+        let dump = Dump::parse(&format!(
+            "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- badge tab=1 kind=privileged label=\"root\" draw=icon\n\
+             --- feedback kind={kind}\nhi\n"
+        ));
+        ensure!(dump.feedback.as_deref() == Some(kind), "feedback {:?}", dump.feedback);
+        ensure!(dump.badges.len() == 1, "badges beside the feedback {:?}", dump.badges);
+        ensure!(dump.screen == ["hi"], "screen after the feedback {:?}", dump.screen);
+    }
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR | ALT_SCREEN)\n--- pointer shape=crosshair screen=alternate\n\
+         --- grid-pointer text\nhi\n",
+    );
+    ensure!(dump.pointer.as_deref() == Some("shape=crosshair screen=alternate"), "pointer {:?}", dump.pointer);
+    ensure!(dump.grid_pointer.as_deref() == Some("text"), "grid pointer {:?}", dump.grid_pointer);
+    ensure!(dump.screen == ["hi"], "screen after the pointer {:?}", dump.screen);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
          --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",

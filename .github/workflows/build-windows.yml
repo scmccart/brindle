@@ -1,6 +1,7 @@
 # The Windows build, tests, exe checks and release zip, called by CI and by
 # releases after build-linux.yml, whose remote helper artifact the zip packs.
-# The zip is uploaded as brindle-windows-x64.
+# The zip is installed and uninstalled through the one-command installer,
+# then uploaded as brindle-windows-x64.
 #
 # No concurrency group here: the caller's applies, and a matching one would
 # cancel the caller.
@@ -156,6 +157,66 @@ jobs:
         run: |
           $zip = scripts/package-windows.ps1 -Exe target/release/brindle.exe -Helper target/release/brindle-remote.exe
           "path=$zip" >> $env:GITHUB_OUTPUT
+      # The one-command installer as a release publishes it (release.yml
+      # stamps scripts/get.ps1 as install.ps1), run through iex in a new
+      # PowerShell as a user would, against this zip in a local release
+      # directory and into a private prefix: an install (Windows PowerShell
+      # 5.1), a tampered SHA256SUMS that must fail and change nothing, and an
+      # uninstall (pwsh). A line the shell runs after the installer shows it
+      # didn't exit. The Start Menu shortcut has no prefix, so the uninstall
+      # must remove it again.
+      - name: One-command install and uninstall
+        shell: pwsh
+        env:
+          ZIP: ${{ steps.zip.outputs.path }}
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $zip = Split-Path -Leaf $env:ZIP
+          $release = Join-Path $env:RUNNER_TEMP 'release'
+          $prefix = Join-Path $env:RUNNER_TEMP 'brindle prefix'
+          $script = Join-Path $release 'install.ps1'
+          $sums = Join-Path $release 'SHA256SUMS'
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Brindle.lnk'
+          New-Item -ItemType Directory -Force $release | Out-Null
+          Copy-Item $env:ZIP $release
+          [IO.File]::WriteAllText($script, (Get-Content -Raw scripts/get.ps1).Replace('@VERSION@', $version))
+          $hash = (Get-FileHash (Join-Path $release $zip)).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText($sums, "$hash  $zip`n")
+          $env:BRINDLE_DOWNLOAD_BASE = ([Uri]$release).AbsoluteUri
+          $env:BRINDLE_PREFIX = $prefix
+          function Invoke-Installer([string]$Shell, [string]$Line) {
+            $out = @("$Line`n'shell still open'`n" | & $Shell -NoProfile -Command - 2>&1 | ForEach-Object { "$_" })
+            $out | Write-Host
+            if ($out -notcontains 'shell still open') { throw "the installer closed $Shell" }
+            $out -join "`n"
+          }
+          function Get-State {
+            Get-ChildItem -LiteralPath $prefix | ForEach-Object { "$($_.Name) $($_.LastWriteTimeUtc.Ticks) $((Get-FileHash -LiteralPath $_.FullName).Hash)" }
+          }
+          function Test-OnPath { @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') -contains $prefix }
+
+          Invoke-Installer powershell.exe "Get-Content -Raw '$script' | Invoke-Expression" | Out-Null
+          $said = (& (Join-Path $prefix 'brindle.exe') --version | Out-String).Trim()
+          if ($said -ne "brindle $version") { throw "brindle --version printed '$said'" }
+          foreach ($name in 'brindle-remote.exe', 'brindle-remote-linux-x86_64') {
+            if (-not (Test-Path -LiteralPath (Join-Path $prefix $name))) { throw "no $name in $prefix" }
+          }
+          $target = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+          if ($target -ne (Join-Path $prefix 'brindle.exe')) { throw "the shortcut's target is '$target'" }
+          if (-not (Test-OnPath)) { throw "$prefix isn't on the user PATH" }
+
+          $before = Get-State
+          [IO.File]::WriteAllText($sums, ('0' * 64) + "  $zip`n")
+          $out = Invoke-Installer pwsh "Get-Content -Raw '$script' | Invoke-Expression"
+          if ($out -notmatch 'checksum failed') { throw 'a tampered SHA256SUMS installed' }
+          if (((Get-State) -join "`n") -ne ($before -join "`n")) { throw 'a tampered SHA256SUMS changed the install' }
+
+          # As parameters this time, through the script block form.
+          Remove-Item env:BRINDLE_PREFIX
+          Invoke-Installer pwsh "& ([scriptblock]::Create((Get-Content -Raw '$script'))) -Uninstall -Prefix '$prefix'" | Out-Null
+          if (Test-Path -LiteralPath $prefix) { throw "$prefix is left" }
+          if (Test-Path $lnk) { throw 'the Start Menu shortcut is left' }
+          if (Test-OnPath) { throw "$prefix is left on the user PATH" }
       - name: WinGet manifest
         if: inputs.winget-validate
         shell: pwsh

@@ -14,10 +14,12 @@
 pub mod cmdline;
 mod dir_check;
 pub mod events;
+pub mod feedback;
 pub mod keys;
 pub mod links;
 pub mod mouse;
 pub mod pace;
+pub mod pointer;
 pub mod process;
 pub mod search;
 pub mod tab_note;
@@ -28,11 +30,11 @@ mod server;
 pub const SINK_PANIC: &str = "BRINDLE_TEST_SINK_PANIC";
 // Moved to `brindle-term-core`, which the server core shares.
 pub use brindle_term_core::emulator::MIN_COLS;
-pub use brindle_term_core::{shell_integration, status};
+pub use brindle_term_core::{context, progress, shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -45,16 +47,20 @@ use alacritty_terminal::term::{self, ClipboardType, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, NamedColor, Rgb};
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::StreamExt as _;
-use gpui::{ClipboardItem, Context, EventEmitter, Task};
+use gpui::{ClipboardItem, Context, EventEmitter, Task, WeakEntity};
 use parking_lot::Mutex;
 
 use self::events::{EventGate, Merge, Recovered};
+use self::context::{Badge, Contexts, Elevation};
 use self::pace::Pace;
+use self::progress::Progress;
 use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
 use crate::latency::Latency;
 use crate::notify::osc::{Found, Notice};
+use crate::notify::{Notifier, kitty};
+use crate::settings::Settings;
 use crate::remote::Host;
 use crate::theme::{Color, Theme};
 
@@ -64,6 +70,11 @@ pub enum ChannelEvent {
     /// A sequence the scanner found in the output (on the thread reading it).
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     Osc(Found),
+    /// An `OSC 22` pointer shape op, with the screen that was active where
+    /// it sat in the output: the reader tags each [`Found::Pointer`] with
+    /// it, and this is the only way an op reaches the terminal.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    Pointer(pointer::Screen, pointer::Op),
     /// A replay of a server session starts (`true`) or ends. In between,
     /// the state updates but no attention is raised.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
@@ -224,12 +235,35 @@ impl From<GridSize> for WindowSize {
     }
 }
 
+/// An OSC 99 request that needs `Notifier`, with the terminal its replies
+/// and reports go to. Shows, closes and alives travel as one event kind, so
+/// they reach `Notifier` in stream order: a close right after its show
+/// finds it open.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Notify99 {
+    pub request: Request99,
+    pub terminal: WeakEntity<Terminal>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request99 {
+    /// A finished notification.
+    Show(kitty::Notice99),
+    /// `p=close` of this id.
+    Close(kitty::KittyId),
+    /// `p=alive`, answered under this id.
+    Alive(kitty::KittyId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TerminalEvent {
     TitleChanged,
     Bell,
     /// A program asked for a desktop notification (OSC 9 / OSC 777).
     Notify(Notice),
+    /// A program finished an OSC 99 notification, or closed or listed its
+    /// notifications.
+    Notify99(Box<Notify99>),
     /// The child process exited (PTY) or the pane closed (remote).
     Exited,
     /// The program status records (OSC 7501) changed. The notice is set
@@ -240,7 +274,15 @@ pub enum TerminalEvent {
 enum Backend {
     /// A session of `host`'s terminal server.
     #[cfg(any(target_os = "linux", windows))]
-    Server { session: crate::remote::local::Session, closing: Closing, host: Host },
+    Server {
+        session: crate::remote::local::Session,
+        closing: Closing,
+        host: Host,
+        /// Whether a layout has sized the term, which the session's sink
+        /// reads to feed a replay ([`server::Sink`]); set under the term's
+        /// lock.
+        laid_out: Arc<AtomicBool>,
+    },
     /// A read-only message with no program behind it.
     Remote,
 }
@@ -304,6 +346,26 @@ pub struct Terminal {
     replaying: bool,
     /// Program status records (OSC 7501).
     status: status::Records,
+    /// The program's progress (OSC 9;4), until a clear report, a new
+    /// prompt, a reset or the program's end.
+    progress: Option<Progress>,
+    /// The program's open contexts (OSC 3008), until they end, the program
+    /// ends, or a replay begins (which rebuilds them); its foreground
+    /// process's elevation, as the title tick last read it
+    /// ([`Terminal::set_detected`]), until the program ends; and the badge
+    /// the two give.
+    notable: Notable,
+    /// Its foreground process's name, as the title tick last found it
+    /// ([`Terminal::set_detected`]), where the tick looks for it
+    /// ([`process::LocalForeground::Descendant`]), until the program ends.
+    foreground: Option<String>,
+    /// The program's pointer shapes (OSC 22), one stack per screen, until a
+    /// full reset, the program's end or a replay's start: the server keeps
+    /// none, so an attach starts with both empty.
+    pointer: pointer::Stacks,
+    /// The program's incomplete OSC 99 notifications, until they complete,
+    /// the program ends or a replay begins.
+    notices99: kitty::Assembly,
     /// Whether the directory the program reports exists, where that is the
     /// terminal's directory ([`Terminal::follows_reported_dir`]). It is
     /// refreshed when output brings another report, by a check off the UI
@@ -375,11 +437,23 @@ impl Terminal {
         match event {
             ChannelEvent::Alac(event) => self.handle_event(event, cx),
             ChannelEvent::Osc(found) => self.handle_found(found, cx),
+            ChannelEvent::Pointer(screen, op) => self.apply_pointer(screen, op),
             ChannelEvent::Merged(merge) => self.merged(merge, cx),
             // Never queued as itself: the gate turns it into its marker.
             ChannelEvent::Foreground => self.merged(Merge::Foreground, cx),
             ChannelEvent::Replay(active) => {
                 self.replaying = active;
+                // A replay's `ESC c` ends no context, and it carries the
+                // session's open ones, so the old stack goes first.
+                // Nor does it carry a pointer shape: the attached terminal
+                // starts with Brindle's own.
+                if active {
+                    self.pointer.clear();
+                    self.notices99 = kitty::Assembly::default();
+                }
+                if active && self.notable.clear_contexts() {
+                    cx.emit(TerminalEvent::Status(None));
+                }
                 if !active {
                     self.release_notes(cx);
                 }
@@ -418,8 +492,9 @@ impl Terminal {
     }
 
     /// The gate dropped side events while the UI thread was behind, and is
-    /// back under its marks. A dropped status report leaves the records
-    /// stale, so they start over and the tab's dot is recomputed.
+    /// back under its marks. A dropped status or progress report leaves the
+    /// records or the progress stale, so both start over and the tab's dot
+    /// and bar are recomputed.
     fn recovered(&mut self, recovered: Recovered, cx: &mut Context<Self>) {
         let Recovered { dropped, statuses } = recovered;
         log::warn!(
@@ -428,6 +503,9 @@ impl Terminal {
         );
         if statuses {
             self.status.reset();
+            self.progress = None;
+            self.notable.clear_contexts();
+            self.pointer.clear();
             cx.emit(TerminalEvent::Status(None));
         }
     }
@@ -464,6 +542,11 @@ impl Terminal {
             held_notes: None,
             replaying: false,
             status: status::Records::default(),
+            progress: None,
+            notable: Notable::default(),
+            foreground: None,
+            pointer: pointer::Stacks::default(),
+            notices99: kitty::Assembly::default(),
             dir_check: dir_check::DirCheck::default(),
             theme,
             last_activity: Instant::now(),
@@ -530,7 +613,8 @@ impl Terminal {
         let term = Arc::new(FairMutex::new(Term::new(term_config(config), &size, listener.clone())));
         let parser = Arc::new(Mutex::new(parser_for(host)));
         let marks = Arc::new(Mutex::new(Marks::default()));
-        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
+        let laid_out = Arc::new(AtomicBool::new(false));
+        let sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing, laid_out.clone());
         let session = match host {
             Host::Local => crate::remote::local::Session::start(
                 host.clone(),
@@ -542,7 +626,7 @@ impl Terminal {
             ),
             Host::Remote(_) => crate::remote::local::Session::start(host.clone(), move || request, Box::new(sink)),
         };
-        let backend = Backend::Server { session, closing, host: host.clone() };
+        let backend = Backend::Server { session, closing, host: host.clone(), laid_out };
         Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx)
     }
 
@@ -578,12 +662,14 @@ impl Terminal {
         } else {
             format!("attach session {} ({what})", request.session)
         };
-        let mut sink = server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing);
+        let laid_out = Arc::new(AtomicBool::new(false));
+        let mut sink =
+            server::Sink::new(term.clone(), parser.clone(), marks.clone(), listener.clone(), doing, laid_out.clone());
         if !recorded {
             sink = sink.replayed_at(size);
         }
         let session = crate::remote::local::Session::attach(host.clone(), request, Box::new(sink));
-        let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone() };
+        let backend = Backend::Server { session, closing: Closing::Keeps, host: host.clone(), laid_out };
         let theme = config.profile_theme(profile);
         let mut this = Self::new(term, listener, rx, backend, parser, marks, size, theme, config, cx);
         this.origin = Origin::Attached;
@@ -708,13 +794,24 @@ impl Terminal {
     }
 
     /// Moves the terminal's life on by `event`. True when that ended a
-    /// running terminal, whose status activity then ends.
+    /// running terminal, whose status activity, progress, contexts and
+    /// detected foreground process then end.
     fn end(&mut self, event: LifeEvent, cx: &mut Context<Self>) -> bool {
         let was = self.life;
         self.life = was.after(event);
         let ended = was == Life::Running;
-        if ended && self.status.end_activity() {
-            cx.emit(TerminalEvent::Status(None));
+        if ended {
+            let activity = self.status.end_activity();
+            let progress = self.progress.take().is_some();
+            let contexts = self.notable.hang_up();
+            self.foreground = None;
+            // Its pointer shapes go too; the grid repaints anyway. So do
+            // its unfinished notifications.
+            self.pointer.clear();
+            self.notices99 = kitty::Assembly::default();
+            if activity || progress || contexts {
+                cx.emit(TerminalEvent::Status(None));
+            }
         }
         ended
     }
@@ -722,6 +819,43 @@ impl Terminal {
     /// The program status records (OSC 7501).
     pub fn status(&self) -> &status::Records {
         &self.status
+    }
+
+    /// The program's progress (OSC 9;4), if it reported one.
+    pub fn progress(&self) -> Option<Progress> {
+        self.progress
+    }
+
+    /// The program's open contexts (OSC 3008), outermost first.
+    pub fn contexts(&self) -> &Contexts {
+        self.notable.contexts()
+    }
+
+    /// The badge its tab face and zone header show, if any: from its
+    /// foreground process's detected elevation and its program's notable
+    /// context ([`context::badge`]).
+    pub fn badge(&self) -> Option<&Badge> {
+        self.notable.badge()
+    }
+
+    /// The program's pointer shape stacks (OSC 22).
+    pub fn pointer(&self) -> &pointer::Stacks {
+        &self.pointer
+    }
+
+    /// The screen the grid shows now, whose stack the pointer follows. It
+    /// takes the term lock: a caller holding it reads the mode it has.
+    pub fn pointer_screen(&self) -> pointer::Screen {
+        pointer::Screen::of(self.mode().contains(TermMode::ALT_SCREEN))
+    }
+
+    /// A pointer shape op from the output, on the screen it arrived on. A
+    /// query's reply goes to this terminal's program only, and the event
+    /// task repaints after every chunk, so a new top shows.
+    fn apply_pointer(&mut self, screen: pointer::Screen, op: pointer::Op) {
+        if let Some(reply) = self.pointer.apply(screen, op) {
+            self.write(reply.into_bytes());
+        }
     }
 
     /// Emits an event the output caused, quietly during a replay.
@@ -734,9 +868,17 @@ impl Terminal {
 
     /// Acts on a sequence the scanner found in the output, in stream order.
     fn handle_found(&mut self, found: Found, cx: &mut Context<Self>) {
+        // The same rule the server's emulator follows, so a replay agrees.
+        let progress = found.progress_after(self.progress);
+        let progress_changed = progress != self.progress;
+        self.progress = progress;
         let changed = match found {
             Found::Notice(notice) => {
                 self.emit_from_output(TerminalEvent::Notify(notice), cx);
+                return;
+            }
+            Found::Kitty(chunk) => {
+                self.handle_kitty(chunk, cx);
                 return;
             }
             Found::Status(status::Message::Query) => {
@@ -750,12 +892,49 @@ impl Terminal {
                 }
                 return;
             }
+            Found::Progress(_) => false,
+            // The same stack the server's emulator keeps, so a replay
+            // agrees; resets and prompts leave it.
+            Found::Context(message) => self.notable.apply(message),
             Found::PromptStart => self.status.end_activity(),
-            Found::Reset => self.status.reset(),
+            Found::Reset => {
+                // A full reset empties both pointer stacks too.
+                self.pointer.clear();
+                self.status.reset()
+            }
+            // Never queued: the reader sends it tagged with its screen
+            // (`ChannelEvent::Pointer`), and the gate ignores it alone.
+            Found::Pointer(_) => false,
         };
-        if changed {
+        if changed || progress_changed {
             cx.emit(TerminalEvent::Status(None));
         }
+    }
+
+    /// A chunk of kitty's OSC 99 from the output: assembled, and a finished
+    /// notification, a close or an alive sent on to `Notifier` (through the
+    /// workspace, in stream order); a query answered at once, to this
+    /// terminal's program only, so its reply comes before the answer to any
+    /// request that follows it. A replay recreates a screen, not a
+    /// program's requests, so its chunks are dropped, and with `osc99` off
+    /// Brindle answers nothing, as a terminal without OSC 99.
+    fn handle_kitty(&mut self, chunk: kitty::Chunk, cx: &mut Context<Self>) {
+        let enabled = cx.try_global::<Settings>().is_none_or(|s| s.config.notifications.osc99);
+        if self.replaying || !enabled {
+            return;
+        }
+        let request = match self.notices99.feed(chunk) {
+            kitty::Step::Pending | kitty::Step::Ignored => return,
+            kitty::Step::Query(id) => {
+                self.write(kitty::reply_query(id.as_ref(), Notifier::caps(cx)).into_bytes());
+                return;
+            }
+            kitty::Step::Show(notice) => Request99::Show(notice),
+            kitty::Step::Close(id) => Request99::Close(id),
+            kitty::Step::Alive(id) => Request99::Alive(id),
+        };
+        let terminal = cx.entity().downgrade();
+        self.emit_from_output(TerminalEvent::Notify99(Box::new(Notify99 { request, terminal })), cx);
     }
 
     #[allow(
@@ -930,11 +1109,18 @@ impl Terminal {
             return;
         }
         let size = size.clamped();
-        if size == self.size {
+        let mut term = self.term.lock();
+        match &self.backend {
+            // Under the term's lock, which the sink feeds a replay under.
+            #[cfg(any(target_os = "linux", windows))]
+            Backend::Server { laid_out, .. } => laid_out.store(true, Ordering::Relaxed),
+            Backend::Remote => {}
+        }
+        let grid = (term.columns() as u16, term.screen_lines() as u16);
+        if !resize_due(size, self.size, grid) {
             return;
         }
         self.size = size;
-        let mut term = self.term.lock();
         self.marks.lock().resize(&mut *term, size);
         drop(term);
         match &self.backend {
@@ -990,10 +1176,11 @@ impl Terminal {
         true
     }
 
-    /// Selects the last command's output. Returns `false` when there is none.
+    /// Selects the last command's output. Returns `false` when there is none,
+    /// and until a prompt mark has been seen ([`Self::has_prompt_marks`]).
     pub fn select_last_output(&mut self, to_clipboard: bool, cx: &mut Context<Self>) -> bool {
         let mut term = self.term.lock();
-        let Some((start, end)) = self.marks.lock().last_output(&term) else { return false };
+        let Some((start, end)) = last_output_span(&term, &self.marks.lock()) else { return false };
         let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
         selection.update(end, Side::Right);
         term.selection = Some(selection);
@@ -1003,11 +1190,33 @@ impl Terminal {
         true
     }
 
-    /// The last command's output as text, leaving the selection alone.
+    /// The last command's output as text to copy ([`copied_text`]), leaving
+    /// the selection alone. `None` until a prompt mark has been seen
+    /// ([`Self::has_prompt_marks`]).
     pub fn last_output_text(&self) -> Option<String> {
         let term = self.term.lock();
-        let (start, end) = self.marks.lock().last_output(&term)?;
-        Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
+        last_output_string(&term, &self.marks.lock()).map(|text| copied_text(&text, process::LOCAL_LINE_END))
+    }
+
+    /// The last command's line as text: the line its shell reported (OSC
+    /// 633 `E`), else what is between its `B` and `C` marks
+    /// ([`Marks::last_command_line`]), as text to copy ([`copied_text`]).
+    /// `None` until a prompt mark has been seen ([`Self::has_prompt_marks`]):
+    /// without one, a program's stray `B`/`E` marks aren't a shell's.
+    pub fn last_command_line_text(&self) -> Option<String> {
+        let term = self.term.lock();
+        let marks = self.marks.lock();
+        if !marks.prompt_seen() {
+            return None;
+        }
+        let source = marks.last_command_line(&term)?;
+        source.text(&term).map(|text| copied_text(&text, process::LOCAL_LINE_END))
+    }
+
+    /// Whether the program has sent a prompt mark (OSC 133/633 `A`): a shell
+    /// with integration runs here. Commands that need one are hidden until.
+    pub fn has_prompt_marks(&self) -> bool {
+        self.marks.lock().prompt_seen()
     }
 
     // ---- selection ----------------------------------------------------------
@@ -1059,39 +1268,102 @@ impl Terminal {
         cx.notify();
     }
 
+    /// The selected text as the grid holds it: rows joined with `\n`.
     pub fn selection_text(&self) -> Option<String> {
         self.term.lock().selection_to_string().filter(|s| !s.is_empty())
     }
 
+    /// The selected text as it is copied: its lines joined with this
+    /// machine's line end ([`copied_text`]).
+    pub fn selection_copy_text(&self) -> Option<String> {
+        self.selection_text().map(|text| copied_text(&text, process::LOCAL_LINE_END))
+    }
+
     /// Called when a mouse selection is finished: the text goes to the
     /// primary selection, and to the clipboard when `to_clipboard` (the
-    /// `copy_on_select` setting in effect now) says so.
-    pub fn finish_selection(&mut self, to_clipboard: bool, cx: &mut Context<Self>) {
-        if let Some(text) = self.selection_text() {
-            crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
-            if to_clipboard {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+    /// `copy_on_select` setting in effect now) says so. Both get the same
+    /// text, as a copy would. Returns whether it wrote the clipboard, which
+    /// the view's "Copied" label shows.
+    pub fn finish_selection(&mut self, to_clipboard: bool, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selection_copy_text() else { return false };
+        crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
+        if to_clipboard {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        to_clipboard
     }
 
     // ---- process info -------------------------------------------------------
 
-    /// Name of the foreground process on the PTY (e.g. `vim`), for tab
-    /// titles. A session on this machine is looked up by its pid, in
-    /// `snapshot` (the title tick's look at all processes, taken the first
-    /// time a terminal needs it); a remote one's is what its host last
-    /// reported, since its pid is another machine's.
-    pub fn foreground_process_name(&self, snapshot: &mut Option<process::Snapshot>) -> Option<String> {
+    /// Where its program runs, for what the system says of it.
+    fn program(&self) -> Program {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, host: Host::Local, .. } => {
-                let pid = session.pid()?;
-                process::PtyProcess::new(pid).foreground_name(snapshot.get_or_insert_with(process::Snapshot::take))
-            }
+            Backend::Server { session, host: Host::Local, .. } => Program::Here(session.pid()),
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, .. } => session.foreground().and_then(|foreground| foreground.name),
-            Backend::Remote => None,
+            Backend::Server { session, .. } => {
+                Program::Elsewhere(session.foreground().and_then(|foreground| foreground.name))
+            }
+            Backend::Remote => Program::Message,
+        }
+    }
+
+    /// Name of the foreground process on the PTY (e.g. `vim`), for tab
+    /// titles. A session on this machine's is read from the system by its
+    /// pid where the PTY has a foreground process group, else it is what
+    /// the title tick last found ([`Terminal::set_detected`]); a remote
+    /// one's is what its host last reported, since its pid is another
+    /// machine's.
+    pub fn foreground_process_name(&self) -> Option<String> {
+        match self.program() {
+            Program::Here(pid) => match process::LOCAL_FOREGROUND {
+                process::LocalForeground::Group => process::PtyProcess::new(pid?).foreground_name(),
+                process::LocalForeground::Descendant => self.foreground.clone(),
+            },
+            Program::Elsewhere(name) => name,
+            Program::Message => None,
+        }
+    }
+
+    /// The pid of its program, while it runs, when the title tick finds its
+    /// foreground process in a look at all processes
+    /// ([`process::LocalForeground::Descendant`]: a session on this
+    /// machine, on Windows). `None` for every other terminal: a remote
+    /// session's pid is another machine's, and on Linux the title reads the
+    /// PTY's foreground process group itself, so neither gets a detected
+    /// elevation.
+    pub fn detection_root(&self) -> Option<u32> {
+        if self.life != Life::Running {
+            return None;
+        }
+        match self.program() {
+            Program::Here(pid) => match process::LOCAL_FOREGROUND {
+                process::LocalForeground::Descendant => pid,
+                process::LocalForeground::Group => None,
+            },
+            Program::Elsewhere(_) | Program::Message => None,
+        }
+    }
+
+    /// Takes what the title tick found ([`process::detect`]) for the
+    /// program it gathered as `root` ([`Terminal::detection_root`]): its
+    /// foreground process's name, for the title, and that process's
+    /// elevation, for the badge; `None` when the look didn't find the
+    /// program. A finding for a program that has ended, or been replaced
+    /// since it was gathered, is dropped. The tick refreshes the titles
+    /// next; a changed badge is told as a status change, which the zone
+    /// header and the tab face copy.
+    pub fn set_detected(&mut self, root: u32, detected: Option<process::Detected>, cx: &mut Context<Self>) {
+        if self.detection_root() != Some(root) {
+            return;
+        }
+        let (name, elevation) = match detected {
+            Some(process::Detected { name, elevation }) => (Some(name), elevation),
+            None => (None, Elevation::Unknown),
+        };
+        self.foreground = name;
+        if self.notable.set_elevation(elevation) {
+            cx.emit(TerminalEvent::Status(None));
         }
     }
 
@@ -1314,6 +1586,86 @@ impl Origin {
     }
 }
 
+/// Where a terminal's program runs, for what the system says of it
+/// ([`Terminal::program`]).
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code, reason = "only Linux and Windows have sessions"))]
+enum Program {
+    /// A session on this machine: its program's pid, once it has started.
+    Here(Option<u32>),
+    /// A session on another host: the foreground process name the host
+    /// last reported.
+    Elsewhere(Option<String>),
+    /// A message terminal, with no program.
+    Message,
+}
+
+/// A terminal's program contexts (OSC 3008), its foreground process's
+/// elevation as the title tick last read it, and the badge the two give
+/// ([`context::badge`]). The badge is recomputed whenever either changes,
+/// so the chrome never computes it while drawing.
+#[derive(Debug)]
+struct Notable {
+    contexts: Contexts,
+    elevation: Elevation,
+    badge: Option<Badge>,
+}
+
+impl Default for Notable {
+    fn default() -> Self {
+        Self { contexts: Contexts::default(), elevation: Elevation::Unknown, badge: None }
+    }
+}
+
+impl Notable {
+    fn contexts(&self) -> &Contexts {
+        &self.contexts
+    }
+
+    fn badge(&self) -> Option<&Badge> {
+        self.badge.as_ref()
+    }
+
+    /// Applies a context message; true when the stack changed.
+    fn apply(&mut self, message: context::Message) -> bool {
+        let changed = self.contexts.apply(message);
+        if changed {
+            self.rebadge();
+        }
+        changed
+    }
+
+    /// Takes the elevation the title tick read; true when the badge
+    /// changed.
+    fn set_elevation(&mut self, elevation: Elevation) -> bool {
+        self.elevation = elevation;
+        self.rebadge()
+    }
+
+    /// Drops every context: a replay is about to rebuild them, or status
+    /// reports were dropped. The elevation stays, since the same program
+    /// still runs. True when there were any, or the badge changed.
+    fn clear_contexts(&mut self) -> bool {
+        let had = self.contexts.clear();
+        self.rebadge() || had
+    }
+
+    /// The program ended (UAPI's hangup reset): its contexts and its
+    /// elevation go. True when there were any contexts, or the badge
+    /// changed.
+    fn hang_up(&mut self) -> bool {
+        self.elevation = Elevation::Unknown;
+        self.clear_contexts()
+    }
+
+    /// Recomputes the badge; true when it changed.
+    fn rebadge(&mut self) -> bool {
+        let badge = context::badge(self.contexts.notable(), self.elevation);
+        let changed = badge != self.badge;
+        self.badge = badge;
+        changed
+    }
+}
+
 impl Drop for Terminal {
     fn drop(&mut self) {
         self.leave(false, None);
@@ -1460,7 +1812,7 @@ fn palette_color(t: &Theme, index: usize) -> Color {
 /// bell, no notification, and no status notice.
 fn quiet(event: TerminalEvent) -> Option<TerminalEvent> {
     match event {
-        TerminalEvent::Bell | TerminalEvent::Notify(_) => None,
+        TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Notify99(_) => None,
         TerminalEvent::Status(Some(_)) => Some(TerminalEvent::Status(None)),
         other @ (TerminalEvent::TitleChanged | TerminalEvent::Exited | TerminalEvent::Status(_)) => Some(other),
     }
@@ -1557,6 +1909,14 @@ pub(crate) fn with_checked_dir(
         request.cwd = None;
     }
     request
+}
+
+/// Whether a layout's grid `asked` resizes the term and its session: when
+/// it isn't the size the last layout gave (`last`), or the term's grid
+/// (`grid`, columns and rows) has another size, as one a replay left at
+/// its session's size before any layout has ([`server::Sink`]).
+fn resize_due(asked: GridSize, last: GridSize, grid: (u16, u16)) -> bool {
+    asked != last || (asked.cols, asked.rows) != grid
 }
 
 /// The grid an attach starts with, and whether its session's size is still
@@ -1656,6 +2016,55 @@ fn merged_env(
     env
 }
 
+/// How lines are joined in text copied from the grid: what the platform's
+/// applications expect on the clipboard ([`process::LOCAL_LINE_END`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineEnd {
+    /// `\n`.
+    #[cfg_attr(windows, allow(dead_code, reason = "Windows copies CRLF"))]
+    Lf,
+    /// `\r\n`.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows copies CRLF"))]
+    CrLf,
+}
+
+/// Grid text (rows joined with `\n`) as it is copied: its lines joined with
+/// `end`. A line end already `\r\n` isn't doubled. Text a program sets
+/// through OSC 52 and a link's address are written as they are, not through
+/// this.
+pub fn copied_text(text: &str, end: LineEnd) -> String {
+    match end {
+        LineEnd::Lf => text.to_string(),
+        LineEnd::CrLf => {
+            let mut out = String::with_capacity(text.len());
+            let mut previous = None;
+            for c in text.chars() {
+                if c == '\n' && previous != Some('\r') {
+                    out.push('\r');
+                }
+                out.push(c);
+                previous = Some(c);
+            }
+            out
+        }
+    }
+}
+
+/// The span of the last command's output, once a prompt mark has been seen:
+/// without one, a program's stray `C`/`D` marks aren't a shell's.
+fn last_output_span<T>(term: &Term<T>, marks: &Marks) -> Option<(GridPoint, GridPoint)> {
+    if !marks.prompt_seen() {
+        return None;
+    }
+    marks.last_output(term)
+}
+
+/// The last command's output as the grid holds it ([`last_output_span`]).
+fn last_output_string<T>(term: &Term<T>, marks: &Marks) -> Option<String> {
+    let (start, end) = last_output_span(term, marks)?;
+    Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
+}
+
 /// Prepares clipboard text for the PTY.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -1696,6 +2105,21 @@ pub fn report_focus(terminal: &Terminal, focused: bool) {
 mod tests {
     use super::*;
     use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    /// A layout resizes when its grid is new, in cells or in pixels, or
+    /// when the term's grid isn't its size: a background tab's replay left
+    /// it at the session's 120x30 while the terminal still records the
+    /// placeholder 80x24, and a first layout at 80x24 must still resize.
+    #[test]
+    fn a_layout_resizes_when_its_grid_or_the_terms_differs() {
+        let last = GridSize::default();
+        let wider = GridSize { cols: 120, ..last };
+        let taller_cells = GridSize { cell_height: 20, ..last };
+        assert!(!resize_due(last, last, (80, 24)), "the same layout, the same grid");
+        assert!(resize_due(wider, last, (80, 24)), "more columns");
+        assert!(resize_due(taller_cells, last, (80, 24)), "other cells");
+        assert!(resize_due(last, last, (120, 30)), "the term's grid at a replay's size");
+    }
 
     #[test]
     fn a_grid_size_is_clamped_to_the_grid_limits_and_its_cells_kept() {
@@ -2120,6 +2544,46 @@ mod tests {
     }
 
     #[test]
+    fn copied_text_joins_lines_with_the_platforms_line_end() {
+        assert_eq!(copied_text("one\ntwo", LineEnd::CrLf), "one\r\ntwo");
+        assert_eq!(copied_text("one\ntwo", LineEnd::Lf), "one\ntwo");
+        assert_eq!(copied_text("one", LineEnd::CrLf), "one");
+        assert_eq!(copied_text("a\n\nb\n", LineEnd::CrLf), "a\r\n\r\nb\r\n");
+        // A line end that is already CRLF is not doubled, under either.
+        assert_eq!(copied_text("one\r\ntwo", LineEnd::CrLf), "one\r\ntwo");
+        assert_eq!(copied_text("one\r\ntwo", LineEnd::Lf), "one\r\ntwo");
+        assert_eq!(copied_text("é\nü", LineEnd::CrLf), "é\r\nü");
+    }
+
+    /// A terminal and its marks after `bytes`, as the parser feeds them.
+    fn marked(bytes: &[u8]) -> (Term<alacritty_terminal::event::VoidListener>, Marks) {
+        let size = GridSize { cols: 20, rows: 5, ..Default::default() };
+        let mut term = Term::new(term::Config::default(), &size, alacritty_terminal::event::VoidListener);
+        let marks = Mutex::new(Marks::default());
+        Parser::new(process::LOCAL_PATH_STYLE).advance(&mut term, &marks, bytes);
+        (term, marks.into_inner())
+    }
+
+    /// The output commands act on a shell's marks, so until a prompt mark has
+    /// arrived a program's stray output marks select and copy nothing.
+    #[test]
+    fn the_last_output_is_inert_until_a_prompt_mark() {
+        // Marks a program sent on its own, with no prompt mark among them.
+        let (term, marks) = marked(b"\x1b]133;B\x07ls\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07");
+        assert!(!marks.prompt_seen());
+        assert!(marks.last_output(&term).is_some(), "the marks themselves record it");
+        assert_eq!(last_output_span(&term, &marks), None);
+        assert_eq!(last_output_string(&term, &marks), None);
+
+        // A shell with integration: the prompt mark first.
+        let (term, marks) =
+            marked(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert!(marks.prompt_seen());
+        assert!(last_output_span(&term, &marks).is_some());
+        assert_eq!(last_output_string(&term, &marks).as_deref(), Some("one\ntwo"));
+    }
+
+    #[test]
     fn paste_normalizes_newlines() {
         assert_eq!(paste_bytes("a\nb\r\nc", false), b"a\rb\rc");
     }
@@ -2212,5 +2676,75 @@ mod tests {
         let mut processor: Processor<StdSyncHandler> = Processor::new();
         processor.advance(&mut term, b"hello\r\n\x1b[31mred\x1b[0m");
         assert_eq!(screen_text(&term), "hello\nred\n\n");
+    }
+
+    /// A terminal's badge, as its kind and label.
+    fn badge_of(notable: &Notable) -> Option<(context::BadgeKind, &str)> {
+        notable.badge().map(|badge| (badge.kind(), badge.label()))
+    }
+
+    fn feed_context(notable: &mut Notable, payload: &[u8]) -> bool {
+        notable.apply(context::parse(payload).expect("an OSC 3008 payload"))
+    }
+
+    /// A terminal fed a context, then found elevated: the elevation's badge
+    /// shows, and goes back to the context's when the elevated program
+    /// leaves the foreground.
+    #[test]
+    fn a_detected_elevation_badges_a_terminal_over_its_context() {
+        use context::BadgeKind::{Elsewhere, Privileged};
+        let mut notable = Notable::default();
+        assert!(feed_context(&mut notable, b"start=c1;type=container;container=web"));
+        assert_eq!(badge_of(&notable), Some((Elsewhere, "web")));
+        assert!(notable.set_elevation(Elevation::Elevated));
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(!notable.set_elevation(Elevation::Elevated), "the same reading changes nothing");
+        assert!(notable.set_elevation(Elevation::Standard));
+        assert_eq!(badge_of(&notable), Some((Elsewhere, "web")));
+        assert!(!notable.set_elevation(Elevation::Unknown), "unread, the context still decides");
+    }
+
+    /// The reverse: found elevated, then fed contexts, which neither hide
+    /// nor relabel the warning; once it isn't elevated the context shows.
+    #[test]
+    fn a_context_fed_to_an_elevated_terminal_leaves_its_badge() {
+        use context::BadgeKind::{Elsewhere, Privileged};
+        let mut notable = Notable::default();
+        assert_eq!(badge_of(&notable), None);
+        assert!(notable.set_elevation(Elevation::Elevated));
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(feed_context(&mut notable, b"start=c1;type=container;container=web"), "the stack changed");
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(feed_context(&mut notable, b"start=e1;type=elevate;targetuser=guest"));
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(notable.set_elevation(Elevation::Standard));
+        assert_eq!(badge_of(&notable), Some((Privileged, "guest")));
+        assert!(feed_context(&mut notable, b"end=e1"));
+        assert_eq!(badge_of(&notable), Some((Elsewhere, "web")));
+    }
+
+    /// A replay's start drops the contexts but keeps the elevation, since
+    /// the same program runs; the program's end drops both.
+    #[test]
+    fn a_replay_keeps_the_elevation_and_a_hangup_drops_it() {
+        use context::BadgeKind::Privileged;
+        let mut notable = Notable::default();
+        feed_context(&mut notable, b"start=c1;type=container;container=web");
+        notable.set_elevation(Elevation::Elevated);
+        assert!(notable.clear_contexts(), "there was a context");
+        assert!(notable.contexts().is_empty());
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(!notable.clear_contexts(), "nothing left to drop");
+        feed_context(&mut notable, b"start=c1;type=container;container=web");
+        assert!(notable.hang_up());
+        assert!(notable.contexts().is_empty());
+        assert_eq!(badge_of(&notable), None);
+        assert_eq!(notable.elevation, Elevation::Unknown);
+        assert!(!notable.hang_up());
+        // An elevation alone, hung up: the badge goes, though there was no
+        // context.
+        notable.set_elevation(Elevation::Elevated);
+        assert!(notable.hang_up());
+        assert_eq!(badge_of(&notable), None);
     }
 }

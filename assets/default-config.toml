@@ -12,8 +12,8 @@ theme = "brindle-dark"
 scrollback_lines = 10000
 padding = 6
 copy_on_select = false
-# "paste": a right-click pastes the clipboard when nothing is selected, and
-# does nothing while text is. Hold shift where a program uses the mouse.
+# "paste": a right-click clears any selection and pastes the clipboard. Hold
+# shift where a program uses the mouse.
 right_click = "none"
 # Let programs read your clipboard through OSC 52. Writing is always allowed
 # (that is what tmux `set-clipboard on` uses).
@@ -44,10 +44,14 @@ blink = true
 # Desktop notifications. Programs ask for them with OSC 9 or OSC 777, e.g.
 #   printf '\033]777;notify;Build;finished\a'
 # and a bell (BEL) raises one too. Clicking a notification shows its tab.
+# osc99 is kitty's protocol, whose notifications can be updated, closed,
+# queried, given buttons and silenced, e.g.
+#   printf '\033]99;i=1:d=0;Build\033\\\033]99;i=1:p=body;finished\033\\'
 [notifications]
 bell = true
 osc9 = true
 osc777 = true
+osc99 = true
 # "unfocused": only for a tab that isn't in front of you (a background tab,
 # or any tab while its window isn't focused). "always": every time.
 when = "unfocused"

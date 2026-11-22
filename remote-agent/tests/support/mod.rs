@@ -1279,12 +1279,13 @@ pub fn snapshot(screen: &Emulator) -> String {
     for command in marks.commands() {
         let _ = writeln!(
             out,
-            "command prompt {} input {:?} output {:?} end {:?} exit {:?}",
+            "command prompt {} input {:?} output {:?} end {:?} exit {:?} line {:?}",
             marks.line(command.prompt),
             command.input.map(|pos| (marks.line(pos), pos.col)),
             command.output.map(|pos| (marks.line(pos), pos.col)),
             command.end.map(|pos| (marks.line(pos), pos.col)),
-            command.exit
+            command.exit,
+            command.line
         );
     }
     out

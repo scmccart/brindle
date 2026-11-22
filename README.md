@@ -18,10 +18,19 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   ctrl-shift-x.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
-- **Shell integration** (OSC 133): jump between prompts, select or copy the last
-  command's output, and see failed commands marked in the gutter.
-- **Desktop notifications** from OSC 9, OSC 777 and bells in tabs you can't see;
-  clicking one takes you to its tab.
+- **Shell integration** (OSC 133, and VS Code's OSC 633): jump between prompts, select or
+  copy the last command's output or command line, and see failed commands marked in the
+  gutter.
+- **Desktop notifications** from OSC 9, OSC 777, kitty's OSC 99 and bells in tabs
+  you can't see; clicking one takes you to its tab. OSC 99 notifications can be
+  updated, closed, given buttons and silenced, and report clicks back.
+- **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
+  bottom of the tab, and of each zone's header in a split tab.
+- **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
+  logins): a yellow warning icon on a tab while it runs as root. On Windows the
+  same icon marks a tab whose program runs elevated (labelled Administrator).
+- **Pointer shapes** from OSC 22, with kitty's stack and queries: a resize
+  pointer over an editor's split border, a hand over a button.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
   previews themes live on your open tabs and has an editor for custom themes.
 - **Fonts**: the terminal font's family, size and line height, and the family of
@@ -37,8 +46,9 @@ which Brindle reaches through `brindle-remote relay`, one connection per
 endpoint for all its tabs. The `brindle-remote` helper is copied to a
 versioned cache on first connection (user-only on an SSH host) and reused
 while its build matches. Output remains the terminal's original byte stream,
-so OSC 7 directories, OSC 9/777 notifications, OSC 7501 program status,
-clipboard/color replies and shell-integration marks work as in a local tab.
+so OSC 7 directories, OSC 9/777/99 notifications, OSC 7501 program status, OSC 9;4
+progress, OSC 3008 contexts, OSC 22 pointer shapes, clipboard/color replies and
+shell-integration marks work as in a local tab.
 Zone splits stay on the same endpoint and inherit its remote directory.
 
 SSH uses your normal OpenSSH configuration, agent and host aliases:
@@ -294,8 +304,10 @@ Each case keeps its logs, screen dumps and window captures in
 
 Cases that need a debug-only fault switch are skipped, with the reason, when the binary under test has none (`cargo test --release`, or `BRINDLE_E2E_BIN` naming a release build); `BRINDLE_E2E_SWITCHES_REQUIRED=1`, as CI sets, makes that a failure.
 
+The Linux clipboard cases read and set the clipboard with `xclip`, as another program would, and skip with the reason when it is missing; `BRINDLE_E2E_CLIPBOARD_REQUIRED=1`, as CI sets, makes that a failure.
+
 To run the suite headless, the way CI does, wrap it in `scripts/with-xvfb`
-(after `sudo apt install xvfb x11-utils openbox mesa-vulkan-drivers dbus`):
+(after `sudo apt install xvfb x11-utils xclip openbox mesa-vulkan-drivers dbus`):
 
 ```sh
 BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e
@@ -366,7 +378,38 @@ scripts/lint-commits                      # check the commits not on origin/main
 
 ## Installing
 
-Each [GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
+On Linux x86-64, one command installs the latest release as you: `brindle`
+and its remote helper in `~/.local/bin`, with the launcher entry and icon. It
+works with `sh` or `bash`, checks the download against the release's
+`SHA256SUMS` before installing anything, says so when `brindle` can't run on
+the system (it needs the glibc and libraries named below), and uses `sudo`
+only to write a `PREFIX` you can't:
+
+```sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh
+```
+
+Run it again to update; a Brindle that is already running keeps its old build
+until it quits. `BRINDLE_VERSION` picks another release and `PREFIX` another
+directory, and `--uninstall` removes it all again, keeping your config in
+`~/.config/brindle`:
+
+```sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | env BRINDLE_VERSION=0.4.0 sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | env PREFIX=/usr/local sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh -s -- --uninstall
+```
+
+The one-command installers (`install.sh` here, `install.ps1` on Windows) come
+with the releases after 0.3.0. Each release's copy installs that release
+unless told another, and its `SHA256SUMS` lists them. That checksum catches a
+corrupt download, not a compromised release; for provenance, check the
+attestation as below. `BRINDLE_DOWNLOAD_BASE` points either script at a
+directory of built assets instead (`file:///DIR`), which is how CI tests them.
+The scripts are `scripts/get.sh` and `scripts/get.ps1` in a checkout.
+
+To install by hand instead: each
+[GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
 x86-64 archive, `brindle-<version>-x86_64-unknown-linux-gnu.tar.gz`, holding
 `brindle`, the static remote helper `brindle-remote-linux-x86_64` and the
 licences, plus a `SHA256SUMS` file. It's built on Ubuntu 26.04, so it needs a
@@ -384,6 +427,17 @@ install -Dm755 -t ~/.local/bin brindle-<version>-x86_64-unknown-linux-gnu/brindl
 ```
 
 To update, install the new release's files the same way.
+
+Each release's archives, and the binaries in them (`brindle`,
+`brindle-remote-linux-x86_64`, `brindle.exe`, `brindle-remote.exe`), carry a
+[build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds)
+from the release workflow. With the GitHub CLI, check a download, or a binary
+you unpacked from one, before running it:
+
+```sh
+gh attestation verify brindle-<version>-x86_64-unknown-linux-gnu.tar.gz -R scmccart/brindle
+gh attestation verify ~/.local/bin/brindle -R scmccart/brindle
+```
 
 From a checkout, after installing the build dependencies above:
 
@@ -408,19 +462,47 @@ The launcher entry runs the binary by its absolute path, so it works even when
 `~/.cargo/bin` isn't on the desktop session's `PATH`. After moving or upgrading
 the binary, run `brindle --install-desktop` again so the entry stays current.
 
-To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), or
-`brindle --uninstall-desktop` followed by `cargo uninstall brindle`. Your config
-in `~/.config/brindle` is kept either way.
+To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), which also
+removes a one-command install, or `brindle --uninstall-desktop` followed by
+`cargo uninstall brindle`. Your config in `~/.config/brindle` is kept either
+way.
 
 ### On Windows
 
-There's no installer. The terminal server's helper, `brindle-remote.exe`,
-carries the packaged ConPTY and unpacks it to
+In PowerShell 5.1 or 7, one command installs the latest release for you,
+without elevation: `brindle.exe`, the terminal server's helper
+`brindle-remote.exe` and the Linux remote helper in
+`%LOCALAPPDATA%\Programs\brindle`, that directory on your user `PATH`, and a
+Start Menu shortcut. It checks the zip against the release's `SHA256SUMS`
+before installing anything, and reports a failure as an error, leaving your
+PowerShell open:
+
+```powershell
+irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1 | iex
+```
+
+Run it again to update, even while Brindle runs: the running Brindle keeps its
+old build until it quits, and the next launch reattaches its sessions through
+the new version's terminal server. `iex` can't pass parameters, so the script
+reads `$env:BRINDLE_VERSION` (another release), `$env:BRINDLE_PREFIX` (another
+directory) and `$env:BRINDLE_UNINSTALL` (remove it all again, keeping your
+config and session state). The variables stay set in that PowerShell, so the
+script block form, which takes `-Version`, `-Prefix` and `-Uninstall`, suits a
+one-off:
+
+```powershell
+$env:BRINDLE_UNINSTALL = 1; irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1))) -Uninstall
+```
+
+To install by hand instead: the terminal server's helper,
+`brindle-remote.exe`, carries the packaged ConPTY and unpacks it to
 `%LOCALAPPDATA%\brindle\conpty\<version>` on first run; it must sit beside
 `brindle.exe`. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
 zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with `brindle.exe`,
 `brindle-remote.exe`, the Linux remote helper and the licences (`SHA256SUMS`
-beside it lists its hash); unpack it anywhere, keeping the two exes together,
+beside it lists its hash, and `gh attestation verify` checks it and both exes
+as above); unpack it anywhere, keeping the two exes together,
 and run `brindle.exe`. Once releases are published to WinGet, it installs as
 the `brindle` command on `PATH`, with the terminal server's `brindle-remote`
 (`brindle-remote status`, `list`, `kill`, `stop`) beside it:
@@ -446,13 +528,14 @@ helper you already have, which must be this version), and installs the three
 together in `%LOCALAPPDATA%\Programs\brindle` (`-Prefix DIR` picks another
 directory). It then adds that directory to your user `PATH` and creates the
 Start Menu shortcut. Re-run it to update. `scripts/uninstall.ps1` (with the
-same `-Prefix`) removes it all. Prefer it to `cargo install`, which leaves out
-the Linux helper, so remote profiles would upload a stale one or none.
+same `-Prefix`) removes it all, as it does a one-command install. Prefer it
+to `cargo install`, which leaves out the Linux helper, so remote profiles
+would upload a stale one or none.
 
 Releases aren't code-signed yet, so SmartScreen may stop the first start of a
 downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
-Run anyway. Uninstalling either way keeps your config in `%APPDATA%\brindle`
-and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
+Run anyway. Uninstalling any of these ways keeps your config in
+`%APPDATA%\brindle` and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
 builds the release zip from a release build, and `scripts/winget-manifest.ps1`
 writes its WinGet manifest.
 
@@ -504,7 +587,7 @@ family = ["Inter", "Segoe UI"]
 | the strip's `⌄` | profile menu (see below) |
 | right-click a tab / a zone header | tab menu / zone menu (see below) |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
-| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard when nothing is selected and does nothing while text is: shift-right-click where a program uses the mouse) |
+| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard over a selection too, clearing it, and a program that reports the mouse gets the click instead; shift-right-click pastes in Brindle there. See [Clipboard](#clipboard)) |
 | shift-pageup/down, shift-home/end | scrollback |
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
@@ -580,9 +663,32 @@ a chosen family goes to the front of that table's `family` list, keeping the
 others after it as fallbacks, and "Default" removes the list. Cancel, escape
 or another section drop the changes.
 
-The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes only when nothing is selected). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
+The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes over a selection too, clearing it; see [Clipboard](#clipboard)). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
+
+### Clipboard
+
+Ctrl-shift-c copies the selection and ctrl-shift-v pastes the clipboard. With
+`copy_on_select = true`, finishing a drag-selection copies it too. Middle click
+pastes Brindle's own primary selection. With `right_click = "paste"`, a
+right-click pastes the clipboard, over a selection too, which clears the
+selection; with an empty clipboard nothing is pasted and the selection stays.
+
+A program that reports the mouse (htop, or vim with the mouse on) gets the
+clicks, right-clicks included, and copies and pastes in its own way. Shift
+gives the mouse back to Brindle, so shift-drag selects and shift-right-click
+pastes there.
+
+A copy or paste made with the mouse shows a small label beside the pointer:
+"Copied" with a copy icon, "Pasted" with a paste icon, or "Nothing to paste"
+with a ban icon when a right-click found no text on the clipboard. It fades after about a second, and it takes
+no clicks, so a click on it reaches the terminal.
+
+On Windows, copied text has CRLF line ends, as Windows Terminal's copies do:
+some applications, Excel cells among them, read a bare line feed as nothing. Text a program sets with OSC 52 is copied as
+the program sent it. Paste sends each line end as a carriage return, which is
+what terminal programs expect.
 
 ### Links
 
@@ -681,7 +787,9 @@ file as it was, with a line in the log, until it can be saved again.
 
 ### Shell integration
 
-Shells can mark their prompts and command output with OSC 133 sequences. Brindle
+Shells can mark their prompts and command output with OSC 133 sequences, or with
+VS Code's OSC 633 (`A` to `D` are the same marks, `E` reports the command line and
+`P;Cwd=` the directory), so a shell set up for VS Code's terminal works too. Brindle
 ships scripts that do this for bash, zsh, fish and PowerShell. Load one at the
 **end** of your shell's startup file, after your prompt theme and anything that
 sets `PROMPT_COMMAND` or defines `prompt`:
@@ -700,7 +808,7 @@ The PowerShell script works in PowerShell 7 and Windows PowerShell 5.1, and also
 reports the current directory (OSC 7). On Windows, where Brindle can't read
 another program's directory, that report is what a new tab and a restored tab
 start in; without it they start in your home directory. Tools that report the
-directory themselves with OSC 7 or ConEmu's OSC 9;9 (oh-my-posh, starship and
+directory themselves with OSC 7, ConEmu's OSC 9;9 or OSC 633 `P;Cwd=` (oh-my-posh, starship and
 the like, when configured to) work the same way. Only a directory on a drive
 letter counts: a report of a network path (`\\server\share`) or a device path
 is ignored, so map a drive to have new tabs follow you there.
@@ -715,8 +823,18 @@ them ignore them. With a script loaded:
   To keep line scrolling on those keys, bind `"ctrl-shift-up" = "scroll_line_up"`
   and `"ctrl-shift-down" = "scroll_line_down"`.
 - **Select Last Command Output** and **Copy Last Command Output** are in the
-  command palette. They have no default key; bind `select_last_output` or
-  `copy_last_output`. Copy leaves your selection alone.
+  command palette, once the terminal has received a prompt mark, as Copy Last
+  Command Line is (below); a terminal that has received none (a shell without
+  the scripts, say) doesn't list them, and a key bound to them does nothing. They have no default key; bind
+  `select_last_output` or `copy_last_output`. Copy leaves your selection alone.
+- **Copy Last Command Line** (`copy_last_command`, no default key) copies the last
+  command as you typed it. It is in the palette only once the terminal has received a
+  prompt mark, so a shell with no script loaded doesn't list it, and a key bound to it
+  does nothing there. The scripts report each line with OSC 633 `E` (fish 4
+  reports it on its own output mark), so a right prompt or a wrapped line never gets
+  in; without a report it copies the text between the command's `B` and `C` marks.
+  bash reports a line only when it adds a history entry, so a command
+  `HISTCONTROL` or `HISTIGNORE` leaves out is read from the screen instead.
 - A thin red bar (the theme's red) marks prompts whose command exited non-zero.
   Turn it off with `mark_failed_commands = false`.
 
@@ -748,15 +866,50 @@ desktop. Configure it in `config.toml`:
 bell = true          # bells
 osc9 = true          # OSC 9
 osc777 = true        # OSC 777
+osc99 = true         # kitty's OSC 99, see below (off: no replies either)
 osc7501 = true       # program status (OSC 7501), see below
 when = "unfocused"   # or "always"
 ```
+
+#### kitty's notification protocol (OSC 99)
+
+Programs that speak [kitty's desktop notification protocol][osc99] can do more
+than raise a notification. Brindle supports:
+
+- **Titles and bodies, in chunks** (`d=0` holds a notification for more), plain
+  or base64 (`e=1`, cut anywhere between chunks), named by `i=`.
+- **Updates and closes:** a notification with the id of one still open replaces
+  it; `p=close` closes it, and `p=alive` lists the terminal's open ids.
+- **Clicks:** `a=focus` (the default) raises the window and shows the tab, as for
+  other notifications; `a=report` writes `ESC ] 99;i=<id>; ESC \` back to the
+  program; `a=-focus` leaves the window where it is. `c=1` reports the close too.
+- **Buttons** (`p=buttons`, labels separated by U+2028, up to 4): shown as
+  freedesktop actions where the notification service shows them, and as toast
+  buttons on Windows. With `a=report`, pressing button N writes
+  `ESC ] 99;i=<id>;N ESC \`, without raising the window. Some services hide or
+  fold actions, so a program asking a question should keep its tab as a fallback.
+- **When and how:** `o=unfocused` and `o=invisible` can only make a notification
+  quieter than `when`; `s=silent` (base64) shows it without a sound; on Linux,
+  `u=` sets its urgency and `w=` its timeout.
+- **The query** `p=?`, answered with what Brindle supports there.
+
+Icons, named sounds, application names and types are ignored. Replies go only to
+the program's own terminal.
+
+```sh
+printf '\033]99;i=build:d=0;Build\033\\\033]99;i=build:p=body;running\033\\'
+sleep 5
+printf '\033]99;i=build:d=0;Build\033\\\033]99;i=build:p=body;3 failed\033\\'  # updates it
+printf '\033]99;i=build:p=close;\033\\'                  # and closes it
+```
+
+[osc99]: https://sw.kovidgoyal.net/kitty/desktop-notifications/
 
 #### Program status
 
 Programs that speak the [Program Status Protocol][osc7501] (OSC 7501: Claude
 Code, Codex, Terraform, Homebrew, …) tell Brindle what they are doing, and each
-tab shows a dot for it: yellow while the program is **blocked** on you (a
+tab shows a dot before its title for it: yellow while the program is **blocked** on you (a
 permission, a question, a login), red when it **failed**, green when it is
 **done** with something you haven't looked at, and grey while it is **working**.
 A `blocked`, `done` or `error` report also raises a desktop notification, with
@@ -775,6 +928,92 @@ rsync -a ~/Photos backup:/photos && status done "Photos synced" || status error 
 
 [osc7501]: https://gist.github.com/mitchellh/7acae3abd8355c1c00287d67e96c913a
 
+#### Progress
+
+Programs that report progress with ConEmu's `OSC 9;4`, as Windows Terminal and
+Ghostty show it, get a 2-pixel bar along the bottom of their tab, and of their
+zone's header in a split tab. The tab shows its most pressing zone: an error,
+then a pause, then the least far along, then one of unknown length.
+
+```sh
+printf '\033]9;4;1;30\033\\'   # normal, 30%: the muted foreground, a third of the way
+printf '\033]9;4;2\033\\'      # error, at the last percent: the theme's red
+printf '\033]9;4;4;50\033\\'   # paused, 50%: the theme's yellow
+printf '\033]9;4;3\033\\'      # under way, length unknown: a faint bar across the tab
+printf '\033]9;4;0\033\\'      # done: no bar
+```
+
+The bar also goes at the next shell prompt (with shell integration), when the
+program exits and on a reset, and a detached tab keeps it in the terminal
+server. It never notifies.
+
+Recent cargo releases report build progress this way only in terminals they
+recognise (Windows Terminal, ConEmu, Ghostty, WezTerm), not yet Brindle, so
+turn it on for Brindle with `CARGO_TERM_PROGRESS_TERM_INTEGRATION=true` or in
+`~/.cargo/config.toml`:
+
+```toml
+[term]
+progress.term-integration = true
+```
+
+winget reports its downloads and installs the same way.
+
+#### Context badges
+
+systemd 257 and later announce where a terminal's output comes from with
+OSC 3008, the UAPI group's [context signalling][uapi15]: `run0` (elevation),
+`systemd-nspawn` and `machinectl` (containers and VMs), ssh logins with
+systemd on the far side, and more. Brindle keeps each terminal's stack of
+contexts and shows the innermost notable one as a badge after the tab's title
+(the active zone's), and after each zone header's title in a split tab:
+
+- an elevation or privilege change (`elevate`, `chpriv`), or a login session
+  whose target user is `root` (what `run0` reports): a warning icon in
+  the theme's yellow, with no name beside it; resting the pointer on it shows
+  the target user ("Running as root"). Brindle leaves what the program shows
+  itself alone: `run0` tints the background red and puts a glyph in the title;
+- a remote host (`remote`), a container or a VM: `user@host`, the host, or the
+  container's or VM's name, in the muted foreground.
+
+On Windows the elevation badge comes from the system instead. A local tab whose
+foreground program runs elevated shows the same warning icon, and resting the
+pointer on it shows "Running as Administrator". Brindle reads the token of the
+tab's newest child process, so a program started as administrator from the
+tab's shell shows it, whether Brindle runs elevated or not. Windows `sudo` in
+inline mode doesn't: its elevated shell is no longer a child of the tab's
+process by the time its prompt shows, so the badge shows for about a second at
+most. An elevated Brindle's tabs show it too, since their programs
+are elevated. It takes precedence over any context a program announces, so
+a program can't swap the warning for a muted label. It comes up within about
+a second of the program's start and goes within about a second of its exit,
+as the tab's title does. A program started elevated in its own window
+(`Start-Process -Verb RunAs`) counts too, while it runs as the tab's newest
+child. When Brindle can't read a program's token (a process it isn't allowed
+to open), no badge shows, so an elevated program can go unmarked.
+
+Shell and command contexts, and sessions for any other user, show no badge. Labels are cut to 24
+characters, and a narrow tab cuts its title to 8 characters before it cuts a
+label badge.
+
+```sh
+printf '\033]3008;start=a1;type=elevate;user=me;targetuser=root\033\\'  # a yellow warning icon
+printf '\033]3008;start=s1;type=session;targetuser=root\033\\'          # what run0 sends: the same icon
+printf '\033]3008;start=c1;type=container;container=web\033\\'          # "web", muted
+printf '\033]3008;end=a1\033\\'   # ends a1 and everything started inside it: no badge
+```
+
+Contexts outlive resets, prompts and full-screen programs; they end when their
+program sends the end, or when the terminal's program exits. A detached tab keeps
+them in the terminal server. Up to 32 nest, and malformed sequences are ignored.
+A context whose end never arrives (an ssh connection that dropped) keeps its
+badge until the zone's program exits.
+
+The badge is informational: any program can print these sequences, so a badge
+can be spoofed, and Brindle grants nothing on the strength of one.
+
+[uapi15]: https://uapi-group.org/specifications/specs/osc_context/
+
 On Windows, notifications are toasts from "Brindle". Brindle registers that name
 for your user account the first time it shows one (under
 `HKCU\Software\Classes\AppUserModelId\Brindle.Terminal`), so toasts work without
@@ -783,6 +1022,40 @@ Clicking a toast brings its window to the front with its tab active. If Windows
 won't hand Brindle the foreground, the taskbar button flashes instead. Turn
 Brindle's toasts off or on under Settings > System > Notifications; while they're
 off, Brindle logs one warning and carries on.
+
+### Pointer shapes
+
+Programs that use the mouse can set the pointer over their terminal with
+OSC 22, xterm's sequence with [kitty's extensions][kitty-pointer]: a stack per
+screen (primary and alternate) of up to 16 shapes, and queries.
+
+```sh
+printf '\033]22;ew-resize\033\\'          # set: replaces the top of the stack
+printf '\033]22;>pointer\033\\'           # push
+printf '\033]22;<\033\\'                  # pop
+printf '\033]22;\033\\'                   # Brindle's own pointer again
+printf '\033]22;?pointer,wait\033\\'      # query: the reply is ESC ] 22 ; 1,0 ESC \
+printf '\033]22;?__current__\033\\'       # the shape set now, or 0
+```
+
+As in kitty, a set or push applies each listed name in turn (`>a,b` pushes
+both, `=a,b` leaves `b`), and skips names Brindle can't show. It shows
+`default`, `text`, `vertical-text`, `pointer`, `crosshair`, `grab`,
+`grabbing`, `not-allowed`, `no-drop`, `alias`, `copy`, `context-menu`,
+`ew-resize`, `ns-resize`, `e-resize`, `w-resize`, `n-resize`, `s-resize`,
+`nwse-resize`, `nesw-resize`, `col-resize` and `row-resize`; there is no
+`wait`, `progress`, `help`, `cell`, `move`, `zoom-in` or `zoom-out` pointer to
+show, and queries answer `0` for them. `__default__` answers `text` and
+`__grabbed__` `default`.
+
+The shape applies over the terminal's grid only, never the tab strip or zone
+headers. A ctrl-hovered link still shows the hand, and dragging a selection
+the text beam. With no shape set, the pointer is Brindle's own: the arrow while
+the program reports the mouse, the text beam otherwise. A reset and the
+program's exit empty both stacks, and an attached or reconnected tab starts
+with Brindle's own pointer (the terminal server doesn't keep the stacks).
+
+[kitty-pointer]: https://sw.kovidgoyal.net/kitty/pointer-shapes/
 
 ### Using tmux
 

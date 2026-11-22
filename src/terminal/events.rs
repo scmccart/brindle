@@ -76,7 +76,8 @@ pub enum Admit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Recovered {
     pub dropped: u64,
-    /// A status report was among them.
+    /// A status, progress or context report, or a pointer shape op, was
+    /// among them.
     pub statuses: bool,
 }
 
@@ -99,9 +100,22 @@ pub fn kind_of(event: &ChannelEvent) -> Kind {
             AlacEvent::MouseCursorDirty | AlacEvent::CursorBlinkingChange => Kind::Ignored,
         },
         ChannelEvent::Osc(found) => match found {
-            Found::Notice(_) => SIDE,
-            Found::Status(_) | Found::PromptStart | Found::Reset => Kind::Side { status: true },
+            // A dropped OSC 99 chunk loses that part of its notification
+            // only.
+            Found::Notice(_) | Found::Kitty(_) => SIDE,
+            // A dropped progress report or context message leaves the
+            // progress or the contexts stale, as a dropped status report
+            // leaves the records: all three start over.
+            Found::Status(_) | Found::Progress(_) | Found::Context(_) | Found::PromptStart | Found::Reset => {
+                Kind::Side { status: true }
+            }
+            // Never sent as itself: the reader tags it with its screen
+            // ([`ChannelEvent::Pointer`]).
+            Found::Pointer(_) => Kind::Ignored,
         },
+        // A dropped pointer op leaves the stacks stale, so they start over
+        // with the records.
+        ChannelEvent::Pointer(..) => Kind::Side { status: true },
         ChannelEvent::Merged(merge) => Kind::Merged(*merge),
         ChannelEvent::Foreground => Kind::Merged(Merge::Foreground),
         ChannelEvent::Replay(_)
@@ -178,6 +192,7 @@ impl EventGate {
             ChannelEvent::Alac(AlacEvent::ClipboardStore(ty, text)) => self.put_clipboard(ty, text),
             ChannelEvent::Alac(_)
             | ChannelEvent::Osc(_)
+            | ChannelEvent::Pointer(..)
             | ChannelEvent::Merged(_)
             | ChannelEvent::Foreground
             | ChannelEvent::Replay(_)
@@ -484,10 +499,21 @@ mod tests {
         }
         let notice = Notice { source: Source::Osc9, title: "t".into(), body: "b".into() };
         assert_eq!(found(Found::Notice(notice)), SIDE);
-        for status in [Found::Status(Message::Query), Found::Status(Message::Clear { id: None }), Found::PromptStart, Found::Reset]
-        {
+        let chunk = brindle_term_core::kitty::parse(b"i=a:d=0;part").unwrap();
+        assert_eq!(found(Found::Kitty(chunk)), SIDE, "a dropped chunk resets nothing");
+        for status in [
+            Found::Status(Message::Query),
+            Found::Status(Message::Clear { id: None }),
+            Found::Progress(brindle_term_core::progress::Report::Clear),
+            Found::Context(brindle_term_core::context::parse(b"end=a").unwrap()),
+            Found::PromptStart,
+            Found::Reset,
+        ] {
             assert_eq!(found(status), STATUS);
         }
+        let op = || crate::terminal::pointer::Op::Pop;
+        assert_eq!(kind_of(&ChannelEvent::Pointer(crate::terminal::pointer::Screen::Primary, op())), STATUS);
+        assert_eq!(found(Found::Pointer(op())), Kind::Ignored, "only the tagged op is queued");
 
         assert_eq!(alac(AlacEvent::MouseCursorDirty), Kind::Ignored);
         assert_eq!(alac(AlacEvent::CursorBlinkingChange), Kind::Ignored);
@@ -501,7 +527,9 @@ mod tests {
             ChannelEvent::Lost => "Lost".into(),
             ChannelEvent::Failed => "Failed".into(),
             ChannelEvent::InputRefused => "InputRefused".into(),
-            ChannelEvent::Osc(_) | ChannelEvent::Merged(_) | ChannelEvent::Foreground => "other".into(),
+            ChannelEvent::Osc(_) | ChannelEvent::Pointer(..) | ChannelEvent::Merged(_) | ChannelEvent::Foreground => {
+                "other".into()
+            }
         }
     }
 

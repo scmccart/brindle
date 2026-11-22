@@ -134,22 +134,115 @@ pub(crate) fn status_body(rng: &mut XorShift) -> Vec<u8> {
     body
 }
 
+/// One OSC 99 body (after `99;`): a few metadata keys, good and bad, with
+/// a payload of every type, plain or base64 (cut mid-quad, padded or not,
+/// or corrupt), button labels with U+2028, and the odd missing `;`.
+pub(crate) fn kitty_body(rng: &mut XorShift) -> Vec<u8> {
+    let mut parts: Vec<String> = Vec::new();
+    if rng.below(3) != 0 {
+        parts.push(format!("i={}", pick(rng, &["a", "b", "job", "q", "0", "a b", "", "x/y", "é"])));
+    }
+    if rng.below(2) == 0 {
+        parts.push(format!("p={}", pick(rng, &["title", "body", "buttons", "close", "?", "alive", "icon", "bogus"])));
+    }
+    if rng.below(2) == 0 {
+        parts.push(format!("d={}", pick(rng, &["0", "0", "1", "x"])));
+    }
+    let encoded = rng.below(3) == 0;
+    if encoded {
+        parts.push("e=1".to_string());
+    }
+    for (key, values) in [
+        ("a", &["focus", "-focus", "report", "-focus,report", "wiggle"][..]),
+        ("c", &["0", "1"][..]),
+        ("o", &["always", "unfocused", "invisible", "never"][..]),
+        ("u", &["0", "1", "2", "9"][..]),
+        ("w", &["-1", "0", "1500", "-7", "x", "99999999999999999999"][..]),
+        ("s", &["c2lsZW50", "c3lzdGVt", "silent", "!!"][..]),
+        ("f", &["a2l0dHk=", "?"][..]),
+    ] {
+        if rng.below(5) == 0 {
+            parts.push(format!("{key}={}", pick(rng, values)));
+        }
+    }
+    if rng.below(10) == 0 {
+        parts.push(pick(rng, &["novalue", "zz=1", "=x"]).to_string());
+    }
+    let text = match rng.below(5) {
+        0 => String::new(),
+        1 => pick(rng, &["Allow", "Deny", "", "é"]).to_string() + "\u{2028}" + &name(rng, 8),
+        2 => "\u{202e}bidi ✓".to_string(),
+        _ => name(rng, 30),
+    };
+    let payload = if encoded {
+        let mut out = STANDARD.encode(text);
+        match rng.below(6) {
+            0 => out.truncate(rng.below(out.len() + 1)),
+            1 => out.push_str(pick(rng, &["!", "=", "A", " "])),
+            2 => out = out.trim_end_matches('=').to_string(),
+            _ => {}
+        }
+        out
+    } else {
+        text
+    };
+    let separator = if rng.below(20) == 0 { "" } else { ";" };
+    format!("{}{separator}{payload}", parts.join(":")).into_bytes()
+}
+
 /// One OSC body (after `ESC ]`, before the terminator) of the numbers the
 /// parsers act on, or noise.
 pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
-    let text = match rng.below(12) {
+    let text = match rng.below(14) {
         0..=2 => format!("7;file://{}/{}", pick(rng, &["", "host", "localhost", "h:1"]), path(rng)),
         3 => format!("7;{}", path(rng)),
-        4 | 5 => {
+        4 => {
             let quote = pick(rng, &["", "\""]);
             format!("9;9;{quote}{}{quote}", path(rng))
         }
+        // VS Code's directory report and command line, with its escapes.
+        5 => {
+            let escape = pick(rng, &["", "\\\\", "\\x3b", "\\x5c", "\\x0a", "\\x07", "\\xff", "\\x", "\\q", ";", ";nonce"]);
+            let kind = pick(rng, &["P;Cwd=", "E;", "E", "P;IsWindows=True;", "C;cmdline_url="]);
+            format!("633;{kind}{}{escape}{}", path(rng), path(rng))
+        }
         6 | 7 => {
-            let mark = pick(rng, &["A", "B", "C", "D", "D;0", "D;1", "D;-3", "D;x", "D;999999999999", "E", ""]);
-            format!("133;{mark}")
+            let number = pick(rng, &["133", "633"]);
+            let mark = pick(rng, &["A", "B", "C", "D", "D;0", "D;1", "D;-3", "D;x", "D;999999999999", "E", "F", ""]);
+            format!("{number};{mark}")
         }
         8 | 9 => return [b"7501;".as_slice(), &status_body(rng)].concat(),
+        // ConEmu's progress: every state, a known one more often, and
+        // percents in range, over it, negative and not numbers.
+        10 if rng.below(2) == 0 => {
+            let state = pick(rng, &["0", "1", "1", "2", "3", "4", "4", "5", "7", "", "x", "01"]);
+            let percent = pick(rng, &["", ";0", ";30", ";100", ";250", ";-1", ";x", ";99999999999999999999", ";5;extra"]);
+            format!("9;4;{state}{percent}")
+        }
         10 => format!("{};{}", pick(rng, &["9", "777", "777;notify", "0009;x", "9;4"]), name(rng, 20)),
+        // UAPI.15's contexts: starts and ends of a few ids (so they nest,
+        // update and end), escapes good and bad, long values, unknown
+        // types and fields, and a missing or misplaced `start=`.
+        11 if rng.below(2) == 0 => {
+            let id = pick(rng, &["a", "b", "c", "d", "a\\x3bb", "", "\\x", "\\x0a", "é"]);
+            let verb = pick(rng, &["start=", "start=", "start=", "end=", "type=shell;start=", "", "start"]);
+            let kind = pick(rng, &["", ";type=elevate", ";type=container", ";type=remote", ";type=shell", ";type=spaceship"]);
+            let long = "v".repeat(rng.below(300));
+            let field = pick(rng, &["", ";targetuser=root", ";container=web\\x3bdb", ";vm=\\xff", ";hostname=h\\q", ";pid=12", ";novalue"]);
+            format!("3008;{verb}{id}{kind}{field};comm={long}")
+        }
+        // OSC 22 pointer shapes: every first character, names Brindle
+        // shows and others, empty names, other characters and queries.
+        12 if rng.below(3) != 0 => {
+            let first = pick(rng, &["", "=", ">", ">", "<", "?", "x"]);
+            let names: Vec<&str> = (0..rng.below(5))
+                .map(|_| {
+                    pick(rng, &["pointer", "crosshair", "ew-resize", "text", "", "wait", "zoom-in", "__current__", "__default__", "Pointer", "é", "a b"])
+                })
+                .collect();
+            format!("22;{first}{}", names.join(","))
+        }
+        13 if rng.below(4) != 0 => return [b"99;".as_slice(), &kitty_body(rng)].concat(),
         _ => {
             let len = rng.below(24);
             return [format!("{};", rng.below(10_000)).into_bytes(), rng.bytes(len)].concat();
@@ -250,6 +343,11 @@ fn the_emulator_never_panics_on_random_streams() {
         let mut fresh = Emulator::new(cols, rows, scrollback, style);
         fresh.feed(&replay);
         assert!(fresh.records().iter().count() <= status::MAX_RECORDS);
+        // The progress is replayed last, so nothing in the replay drops it.
+        assert_eq!(fresh.progress(), emulator.progress(), "round {round}");
+        // Nothing in a replay ends a context, and none outlives the limit.
+        assert!(emulator.contexts().iter().count() <= crate::context::MAX_DEPTH);
+        assert_eq!(fresh.contexts(), emulator.contexts(), "round {round}");
     }
 }
 
@@ -270,6 +368,69 @@ fn the_osc_scanner_finds_the_same_sequences_however_the_stream_is_cut() {
         found_any += whole.len();
     }
     assert!(found_any > 0, "the generator never produced a sequence the scanner finds");
+}
+
+#[test]
+fn pointer_stacks_stay_bounded_and_every_query_gets_a_well_formed_reply() {
+    use crate::pointer::{STACK_DEPTH, Screen, Shape, Stacks};
+    let mut rng = XorShift::new(0x7e57_c0de_0000_0004);
+    let (mut ops, mut replies) = (0usize, 0usize);
+    for _ in 0..2000 {
+        let count = 1 + rng.below(40);
+        let bytes = stream(&mut rng, count);
+        let mut stacks = Stacks::default();
+        for found in osc::Scanner::new().scan(&bytes) {
+            let Found::Pointer(op) = found else { continue };
+            ops += 1;
+            let screen = Screen::of(rng.below(2) == 0);
+            if let Some(reply) = stacks.apply(screen, op) {
+                replies += 1;
+                let answers = reply
+                    .strip_prefix("\x1b]22;")
+                    .and_then(|rest| rest.strip_suffix("\x1b\\"))
+                    .unwrap_or_else(|| panic!("reply {reply:?}"));
+                for answer in answers.split(',') {
+                    let known = ["0", "1"].contains(&answer) || Shape::from_name(answer.as_bytes()).is_some();
+                    assert!(known, "answer {answer:?} in {reply:?}");
+                }
+            }
+            assert!(stacks.depth(Screen::Primary) <= STACK_DEPTH && stacks.depth(Screen::Alternate) <= STACK_DEPTH);
+        }
+    }
+    assert!(ops > 100 && replies > 10, "only {ops} pointer ops and {replies} replies");
+}
+
+#[test]
+fn kitty_chunks_hold_only_checked_ids_and_bounded_data() {
+    use crate::kitty::{self, Data, KittyId};
+    let mut rng = XorShift::new(0x7e57_c0de_0000_0005);
+    let mut chunks = 0usize;
+    for _ in 0..3000 {
+        let body = kitty_body(&mut rng);
+        let Some(chunk) = kitty::parse(&body) else { continue };
+        chunks += 1;
+        if let Some(id) = &chunk.id {
+            assert_eq!(KittyId::parse(id.as_str().as_bytes()).as_ref(), Some(id), "body {body:?}");
+        }
+        match &chunk.data {
+            Data::Plain(bytes) => assert!(bytes.len() <= kitty::MAX_PAYLOAD),
+            Data::Base64(bytes) => {
+                assert!(bytes.len() <= kitty::MAX_PAYLOAD);
+                assert!(bytes.iter().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(b)), "body {body:?}");
+            }
+        }
+        assert!(chunk.payload.is_text() || chunk.data.is_empty());
+    }
+    assert!(chunks > 1000, "only {chunks} bodies parsed as chunks");
+    // And in streams, among everything else.
+    let found = (0..400)
+        .flat_map(|_| {
+            let count = 1 + rng.below(40);
+            osc::Scanner::new().scan(&stream(&mut rng, count))
+        })
+        .filter(|found| matches!(found, Found::Kitty(_)))
+        .count();
+    assert!(found > 20, "only {found} OSC 99 chunks in the streams");
 }
 
 #[test]

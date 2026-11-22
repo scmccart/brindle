@@ -22,7 +22,10 @@ mod multi_window;
 mod restore;
 mod notify;
 mod palette;
+mod pointer;
 mod profile_menu;
+mod progress;
+mod context;
 mod remote;
 mod reload;
 mod search;
@@ -60,6 +63,8 @@ fn unix() -> Vec<Case> {
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
         display("remote-ssh-quit", remote::ssh_quit),
+        display("remote-ssh-reattach-size", remote::ssh_reattach_size),
+        display("remote-ssh-reattach-background", remote::ssh_reattach_background),
         display("remote-ssh-split", remote::ssh_split),
         display("remote-ssh-network", remote::ssh_network),
         display("remote-ssh-connect-at-launch", remote::ssh_connect_at_launch),
@@ -104,6 +109,14 @@ fn unix() -> Vec<Case> {
         display("clipboard-right-click-selection", clipboard::right_click_selection),
         display("clipboard-right-click-mouse-mode", clipboard::right_click_mouse_mode),
         display("clipboard-right-click-reload", clipboard::right_click_reload),
+        display("clipboard-right-click-empty", clipboard::right_click_empty),
+        display("clipboard-select-label", clipboard::select_label),
+        display("clipboard-copy-to-app", clipboard::copy_to_app),
+        display("clipboard-paste-from-app", clipboard::paste_from_app),
+        display("clipboard-osc52-to-app", clipboard::osc52_to_app),
+        display("clipboard-primary-both-ways", clipboard::primary_both_ways),
+        display("clipboard-image-pastes-nothing", clipboard::image_pastes_nothing),
+        display("clipboard-multiline-line-ends", clipboard::multiline_line_ends),
         display("links-local-click", links::local_click),
         display("links-mouse-mode", links::mouse_mode),
         display("links-opener-fails", links::opener_fails),
@@ -125,11 +138,38 @@ fn unix() -> Vec<Case> {
         display("shell-failed-mark", shell::failed_mark),
         display("shell-select-output", shell::select_output),
         display("shell-clear-up-down", shell::clear_up_down),
+        display("shell-633-marks", shell::marks_633),
+        display("shell-633-copy-line", shell::copy_line_633),
+        display("shell-633-cwd", shell::cwd_633),
+        display("shell-633-palette", shell::palette_gating_633),
+        display("palette-output-hidden-without-integration", shell::palette_output_hidden_without_integration),
+        display("shell-script-line-bash", shell::script_line_bash),
+        display("shell-script-line-zsh", shell::script_line_zsh),
+        display("shell-script-line-fish", shell::script_line_fish),
         display("notify-osc-local", notify::osc_local),
         display("notify-background-tab", notify::background_tab),
         display("notify-log-at-exit", notify::log_at_exit),
+        display("notify-osc99-chunks", notify::osc99_chunks),
+        display("notify-osc99-update", notify::osc99_update),
+        display("notify-osc99-query", notify::osc99_query),
+        display("notify-osc99-alive", notify::osc99_alive),
+        display("notify-osc99-off", notify::osc99_off),
+        display("notify-osc99-buttons", notify::osc99_buttons),
+        display("notify-osc99-silent", notify::osc99_silent),
         display("status-local", status::local),
         display("status-background-tab", status::background_tab),
+        display("progress-report", progress::report_split),
+        display("progress-clears-at-prompt", progress::clears_at_prompt),
+        display("progress-zones", progress::zones),
+        display("progress-bar-colour", progress::bar_colour),
+        display("context-badge", context::badge),
+        display("context-run0-session", context::run0_session),
+        display("context-end", context::end),
+        display("context-zones", context::zones),
+        display("pointer-query", pointer::query),
+        display("pointer-current", pointer::current),
+        display("pointer-dump", pointer::dump),
+        display("pointer-drag", pointer::drag),
         display("search-local", search::local),
         display("search-step", search::step),
         display("search-long-query", search::long_query),
@@ -178,6 +218,9 @@ fn unix() -> Vec<Case> {
         display("local-server-close-window", local_server::close_window),
         display("local-server-close-command", local_server::close_command),
         display("local-server-reattach-quit", local_server::reattach_quit),
+        display("local-server-633-attach", local_server::attach_633),
+        display("local-server-progress-attach", local_server::progress_attach),
+        display("local-server-context-attach", local_server::context_attach),
         display("local-server-reattach-crash", local_server::reattach_crash),
         display("local-server-reattach-killed", local_server::reattach_killed),
         display("local-server-reattach-inactive", local_server::reattach_inactive),
@@ -208,6 +251,11 @@ fn unix() -> Vec<Case> {
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),
     ]
+}
+
+/// The clipboard cases' helpers (`--self-test`).
+pub fn self_test_clipboard() -> Result {
+    clipboard::self_test()
 }
 
 /// The remote cases' parsers (`--self-test`).

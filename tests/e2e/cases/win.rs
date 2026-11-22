@@ -25,10 +25,17 @@ pub fn all() -> Vec<Case> {
         display("windows-flood-responsive", flood_responsive),
         display("windows-title-child", title_child),
         display("windows-pwsh-integration", pwsh_integration),
+        display("windows-pwsh-line", pwsh_line),
         display("windows-caption", caption),
         display("windows-tab-menu-background", tab_menu_background),
         display("windows-zones", zones),
         display("clipboard-right-click-paste", super::clipboard::right_click_paste),
+        display("clipboard-right-click-selection", super::clipboard::right_click_selection),
+        display("clipboard-copy-to-app", super::clipboard::copy_to_app),
+        display("clipboard-paste-from-app", super::clipboard::paste_from_app),
+        display("clipboard-osc52-to-app", super::clipboard::osc52_to_app),
+        display("clipboard-image-pastes-nothing", super::clipboard::image_pastes_nothing),
+        display("clipboard-multiline-line-ends", super::clipboard::multiline_line_ends),
         display("links-refused", super::links::refused),
         display("links-opener-fails", super::links::opener_fails),
         display("links-notice-expires", super::links::notice_expires),
@@ -68,6 +75,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-inbox-host", local_server::inbox_host),
         display("local-server-elevated", local_server::elevated),
         display("windows-elevated-instances", elevated_instances),
+        display("windows-elevation-badge", elevation_badge),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -734,6 +742,62 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// Brindle's PowerShell script reports each command line with OSC 633 `E`,
+/// in PowerShell 7 and 5.1: Copy Last Command Line copies the line as typed,
+/// `;` included, which the shell then reads back with `Get-Clipboard`
+/// (printed as `clip=[…]`, split so the typed line doesn't match). Windows
+/// PowerShell is skipped where it isn't installed. The command prints only
+/// its marker: a table before it would end in a blank line, and the wait for
+/// the marker over the next prompt would never match.
+fn pwsh_line(ctx: &Ctx) -> Result<Outcome> {
+    let bin = ctx.bin.display().to_string().replace('\\', "/");
+    let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression");
+    let typed = "$null = Get-ChildItem C:/; 'gci' + 'done'";
+    let send = format!("{typed}\r");
+    for shell in ["pwsh.exe", "powershell.exe"] {
+        if shell == "powershell.exe" && !on_path(shell) {
+            println!("         {shell} isn't on PATH; its checks are skipped");
+            continue;
+        }
+        let config = format!(
+            "default_profile = \"si\"\n\n[[profiles]]\nname = \"si\"\ncommand = \"{shell}\"\n\
+             args = [\"-NoLogo\", \"-NoProfile\", \"-NoExit\", \"-Command\", \"function prompt {{ 'MYPROMPT> ' }}; {load}\"]\n"
+        );
+        let label = format!("{}-line", shell.trim_end_matches(".exe"));
+        if shell == "powershell.exe" {
+            powershell_warmup(ctx, &bin);
+        }
+        let ran = run_with(
+            ctx,
+            &config,
+            &label,
+            &[
+                "-p",
+                "si",
+                "--wait-for",
+                "MYPROMPT>",
+                "--send",
+                send.as_str(),
+                "--wait-for",
+                "gcidone\\nMYPROMPT>",
+                "--action",
+                "copy_last_command",
+                "--send",
+                "'cl' + 'ip=[' + (Get-Clipboard -Raw) + ']'\r",
+                "--wait-for",
+                "clip=[",
+            ],
+            &[],
+            15.0,
+            None,
+        )?;
+        let text = screen(&ran.dump);
+        ensure!(ran.dump.wait_timeouts.is_empty(), "{shell}: waits {:?}; see {label}.dump", ran.dump.wait_timeouts);
+        ensure!(text.contains(&format!("clip=[{typed}]")), "{shell}: the clipboard isn't the typed line:\n{text}");
+    }
+    Ok(Outcome::Pass)
+}
+
 /// Starts Windows PowerShell 5.1 once, headless, doing what the case's tabs
 /// do before their first prompt, and writes how long it took to
 /// `powershell-warmup.txt`. On CI the case's tab is the job's first 5.1
@@ -990,6 +1054,37 @@ fn elevated_instances(ctx: &Ctx) -> Result<Outcome> {
     let dump = Dump::parse(&std::fs::read_to_string(ctx.dir.join("unelevated.dump")).unwrap_or_default());
     ensure!(screen(&dump).contains("unelevated-tab"), "the unelevated tab: see unelevated.dump");
     ensure!(dump.config.is_none(), "the unelevated window's config line: {:?}", dump.config);
+    ensure!(dump.badges.is_empty(), "the unelevated window shows a badge: {:?}", dump.badges);
+    Ok(Outcome::Pass)
+}
+
+/// A tab whose program runs elevated shows the privileged badge, labelled
+/// `Administrator`, on its face (the dump's `--- badge tab=1 …` line: the
+/// tab lines count from 1), and one that doesn't shows none. This process's
+/// token decides which Brindle's programs get, so an unelevated runner can
+/// check the second half only (and skips, saying so); the unelevated
+/// Brindle beside an elevated one has its dump checked for a badge in
+/// [`elevated_instances`]. The badge is read once a second, so the dump is
+/// taken well after the shell is up.
+fn elevation_badge(ctx: &Ctx) -> Result<Outcome> {
+    let elevated = winproc::elevated().map_err(|e| format!("reading this process's token: {e}"))?;
+    let out = crate::brindle::Run::new(ctx, "run")
+        .prompt()
+        .send("'rea' + 'dy'\r")
+        .wait_for("ready")
+        .dump_at(12.0)
+        .run()?;
+    ensure!(out.dump.wait_timeouts.is_empty(), "a wait gave up: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+    if !elevated {
+        ensure!(out.dump.badges.is_empty(), "an unelevated tab shows a badge: {:?}", out.dump.badges);
+        return Ok(Outcome::Skip(
+            "not elevated: an unelevated tab shows no badge, but the elevated half needs an elevated runner \
+             (elevating here would ask through UAC)"
+                .into(),
+        ));
+    }
+    let want = ["tab=1 kind=privileged label=\"Administrator\" draw=icon"];
+    ensure!(out.dump.badges == want, "an elevated tab's badges: {:?}, want {want:?}", out.dump.badges);
     Ok(Outcome::Pass)
 }
 

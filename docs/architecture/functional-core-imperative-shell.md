@@ -68,8 +68,15 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | Pure code | What it decides |
 | --- | --- |
 | `brindle-term-core` (whole crate) | parsing, OSC 133 marks, OSC 7501 status records, replay rendering, the emulator's state |
+| `term-core/src/progress.rs` | a terminal's OSC 9;4 progress after each report, and which of its terminals' progress a tab's bar shows |
+| `term-core/src/context.rs` | a terminal's OSC 3008 context stack after each start or end, its limits, and the badge its notable context gives |
+| `term-core/src/pointer.rs` | a terminal's OSC 22 pointer shape stacks after each set, push or pop, the names Brindle shows, and the reply each query gets |
+| `term-core/src/kitty.rs` | what one OSC 99 chunk says: its id, payload type, metadata and checked payload, or that it is ignored |
+| `src/notify/kitty.rs` | how a terminal's OSC 99 chunks come together into notifications, the replies and reports written back byte for byte, what a click or a close writes, and which notifications are open, replaced or closed |
 | `src/terminal/{keys,mouse}.rs` | xterm key and mouse encodings |
+| `src/terminal/pointer.rs` | the platform pointer each OSC 22 shape shows as, and which pointer the grid shows (link, selection, program, Brindle's own) |
 | `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment, the Unix default program |
+| `src/terminal/feedback.rs` | the label a mouse copy or paste shows at the pointer: its text, whether it shows, fades or is gone at a moment, when it must next be drawn, and that a new one replaces the old |
 | `src/terminal/dir_check.rs` | whether the directory a local program last reported exists, from checks the terminal runs off the UI thread: which directory to check next, one at a time, and which answer still counts |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
@@ -98,6 +105,7 @@ These modules mix pure items with shell code, which a text search can't tell apa
 | `src/workspace.rs` (`program_title`) | whether an OSC title is the program's own, by the path style of the programs' paths |
 | `src/desktop.rs` (`without_verbatim_prefix`) | a Windows path without its verbatim `\\?\` prefix |
 | `src/notify/mod.rs` (`escape_markup`) | a notification's text as D-Bus markup |
+| `src/notify/toast.rs` (`xml`, `action_key`) | a toast's XML, with its buttons and silence, and the action a toast's activation arguments stand for |
 | `src/instance.rs` (`socket_path_in`, `pipe_name_for`) | where the instance listens: its socket's path and its pipe's name |
 
 The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Palette`, the settings dialog), `TerminalElement`'s paint, the connection's reader and writer threads, the holder's and the server core's loop handlers, and `main.rs`.
@@ -149,5 +157,5 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 ## References
 
 - The architecture plugin's `functional-core-imperative-shell` skill.
-- `CLAUDE.md`, "Architecture": `terminal/`, `brindle-term-core`, `picker.rs`, `settings.rs`.
+- `docs/code-map.md`: `terminal/`, `brindle-term-core`, `picker.rs`, `settings.rs`.
 - `openspec/changes/archive/` for `add-brindle-ui` and `terminal-server`, which set the crate split.

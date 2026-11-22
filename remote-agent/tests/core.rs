@@ -1038,6 +1038,107 @@ fn attaching_replays_status_records_and_prompt_marks() {
     assert_eq!(marks.prompt_lines().collect::<Vec<_>>(), [0, 2, 4, 6]);
 }
 
+/// The core keeps a detached session's reported command lines (OSC 633
+/// `E`) with its marks, and an attach replays them: Copy Last Command Line
+/// after the attach gets `make test`.
+#[cfg(unix)]
+#[test]
+fn attaching_replays_reported_command_lines() {
+    let (dir, mut client) = core("attach-lines");
+    let fixture = b"\x1b]633;A\x07$ \x1b]633;B\x07make test\r\n\x1b]633;E;make test;n0nce\x07\x1b]633;C\x07ok\r\n\
+        \x1b]633;D;0\x07\x1b]633;A\x07$ \x1b]633;B\x07printf a\\x3bb\r\n\x1b]633;E;printf a\\\\x3bb\x07\x1b]633;C\x07a;b\r\n\
+        \x1b]633;D;0\x07\x1b]633;A\x07$ ";
+    let (session, _) = detached_fixture(&dir, &mut client, fixture, 1000);
+    let expected = snapshot(&replayed(fixture, 80, 24, 1000));
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    let marks = screen.marks();
+    let lines: Vec<Option<&str>> = marks.commands().iter().map(|c| c.line.as_deref()).collect();
+    assert_eq!(lines, [Some("make test"), Some("printf a\\x3bb"), None]);
+    use brindle_term_core::shell_integration::LineSource;
+    assert_eq!(
+        marks.last_command_line(screen.term()),
+        Some(LineSource::Reported("printf a\\x3bb".into()))
+    );
+}
+
+/// The core keeps a detached session's progress (OSC 9;4) through the
+/// prompt marks before it, an attach replays it, and so does a restarted
+/// core: paused, keeping the 60% the program reported before.
+#[cfg(unix)]
+#[test]
+fn attaching_replays_progress_and_so_does_a_restarted_core() {
+    use brindle_term_core::progress::{Percent, Progress};
+    let mut dir = TempDir::new("attach-progress");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    // The text comes after the reports, so a screen that shows it has had
+    // them.
+    let fixture = b"\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07\
+        \x1b]9;4;1;60\x07\x1b]9;4;4\x1b\\paused\r\n";
+    let (session, pid) = detached_fixture(&dir, &mut client, fixture, 1000);
+    dir.track(parent(pid).unwrap());
+    let paused = Some(Progress::Paused(Some(Percent::clamped(60))));
+    let expected = snapshot(&replayed(fixture, 80, 24, 1000));
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(screen.progress(), paused);
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let (start, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(start.pid, pid);
+    assert_eq!(screen.progress(), paused);
+}
+
+/// The core keeps a detached session's contexts (OSC 3008) through the
+/// `ESC c` and prompt after them, and an attach replays them, as does a
+/// restarted core. Once the program exits they are gone with it: the
+/// client gets the `EXIT`, and an attach after it is refused rather than
+/// replaying them.
+#[cfg(unix)]
+#[test]
+fn attaching_replays_contexts_until_the_program_exits() {
+    let mut dir = TempDir::new("attach-contexts");
+    start_core(&dir.path, &[SUPERVISED]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "first");
+    // The text comes after the sequences, so a screen that shows it has
+    // had them.
+    let fixture = b"\x1b]3008;start=s1;type=session;user=me\x1b\\\
+        \x1b]3008;start=e1;type=elevate;user=me;targetuser=root\x1b\\\
+        \x1bc\x1b]133;A\x07# \x1b]3008;start=c\\x3b1;type=container;container=web\x07\
+        \x1b]3008;end=c\\x3b1\x07elevated\r\n";
+    let path = dir.path.join("fixture");
+    fs::write(&path, fixture).unwrap();
+    // It exits on the first byte it is sent.
+    let mut spawn = client_shell(&format!(
+        "stty raw -echo; cat '{}'; head -c 1 >/dev/null",
+        path.display()
+    ));
+    spawn.scrollback = 1000;
+    spawn.policy = client::Policy::Detach;
+    let (session, pid) = client.spawn(spawn);
+    client.detach(session);
+    dir.track(parent(pid).unwrap());
+    let expected = snapshot(&replayed(fixture, 80, 24, 1000));
+    let ids = |screen: &brindle_term_core::emulator::Emulator| -> Vec<String> {
+        screen.contexts().iter().map(|(id, _)| id.as_str().to_owned()).collect()
+    };
+    let (_, screen) = client.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(ids(&screen), ["s1", "e1"]);
+    let badge = screen.contexts().notable().unwrap();
+    assert_eq!(badge.label(), "root");
+
+    kill_core_and_wait_for_another(&dir, &mut client);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let (start, screen) = other.attach_until(session, 1000, |screen| snapshot(screen) == expected);
+    assert_eq!(start.pid, pid);
+    assert_eq!(ids(&screen), ["s1", "e1"]);
+
+    other.input(session, b"x");
+    other.exit_code(session);
+    let mut late = TestClient::hello(&dir.path, "late");
+    assert!(late.attach(session, 80, 24).is_err(), "an exited session replayed");
+}
+
 #[cfg(unix)]
 #[test]
 fn an_attached_session_cant_be_taken_and_the_attach_size_applies() {
@@ -2189,12 +2290,23 @@ mod on_windows {
         let held = working_set_kib(core_pid);
         assert!(held < 128 * 1024, "the core holds {held} KiB");
 
-        // Once the stalled client reads again, its session flows again: far
-        // more arrives than was queued when it was paused.
+        // Once the stalled client reads again, its session flows again. Two
+        // things say so, and neither is an amount within a time, which the
+        // pseudoconsole's rate would decide (under 0.5 MB/s on a slow CI
+        // runner): more of the flood arrives than the holder had read at all
+        // while the session was paused, so the holder reads the console
+        // again and the core passes it on, and the program writes again.
+        let queued = bytes_read(holder).expect("the holder") as usize;
+        let blocked_at = io_calls(flood_pid).expect("the flooding program");
+        let writes_again = || io_calls(flood_pid).is_some_and(|calls| calls != blocked_at);
         let mut received = 0usize;
         let deadline = Instant::now() + TIMEOUT;
-        while received < 16 * 1024 * 1024 {
-            assert!(Instant::now() < deadline, "only {received} bytes resumed");
+        while received <= queued || !writes_again() {
+            assert!(
+                Instant::now() < deadline,
+                "only {received} bytes resumed, with {queued} queued (writing again: {})",
+                writes_again()
+            );
             match stalled.recv() {
                 ToClient::Data(data) if data.session == flood => received += data.bytes.len(),
                 _ => {}

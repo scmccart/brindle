@@ -140,7 +140,8 @@ pub struct Config {
     /// value) so old configs load. Parsing reports that it's ignored.
     #[serde(rename = "tmux_session_end")]
     removed_tmux_session_end: Option<toml::Value>,
-    /// Desktop notifications from bells and OSC 9/777.
+    /// Desktop notifications from bells, OSC 9/777, kitty's OSC 99 and
+    /// program status records.
     pub notifications: NotificationConfig,
     pub profiles: Vec<Profile>,
     pub themes: BTreeMap<String, Theme>,
@@ -221,7 +222,8 @@ pub enum RightClick {
     #[default]
     #[serde(rename = "none")]
     Nothing,
-    /// Paste the clipboard when no text is selected.
+    /// Clear any selection and paste the clipboard; with no text on the
+    /// clipboard, nothing is pasted and the selection stays.
     #[serde(rename = "paste")]
     Paste,
 }
@@ -287,6 +289,9 @@ pub struct NotificationConfig {
     pub osc9: bool,
     /// `OSC 777 ; notify ; title ; body`.
     pub osc777: bool,
+    /// kitty's `OSC 99`: notifications, their updates and closes, and the
+    /// replies to its queries (off, Brindle answers none of them).
+    pub osc99: bool,
     /// A program status record (OSC 7501) that becomes blocked, done or
     /// error.
     pub osc7501: bool,
@@ -295,7 +300,7 @@ pub struct NotificationConfig {
 
 impl Default for NotificationConfig {
     fn default() -> Self {
-        Self { bell: true, osc9: true, osc777: true, osc7501: true, when: NotifyWhen::Unfocused }
+        Self { bell: true, osc9: true, osc777: true, osc99: true, osc7501: true, when: NotifyWhen::Unfocused }
     }
 }
 
@@ -1195,12 +1200,15 @@ mod tests {
         let config = parsed("").unwrap();
         assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.notifications.bell && config.notifications.osc9 && config.notifications.osc777);
-        assert!(config.notifications.osc7501);
+        assert!(config.notifications.osc7501 && config.notifications.osc99);
         let config = parsed("[notifications]\nbell = false\nosc7501 = false\nwhen = \"always\"").unwrap();
         assert!(!config.notifications.bell);
-        assert!(config.notifications.osc9);
+        assert!(config.notifications.osc9 && config.notifications.osc99);
         assert!(!config.notifications.osc7501);
         assert_eq!(config.notifications.when, NotifyWhen::Always);
+        let config = parsed("[notifications]\nosc99 = false").unwrap();
+        assert!(!config.notifications.osc99);
+        assert!(config.notifications.osc9 && config.notifications.osc777 && config.notifications.osc7501);
         assert!(parsed("[notifications]\nwhen = \"sometimes\"").is_err());
         assert!(parsed("[notifications]\nsound = true").is_err());
     }

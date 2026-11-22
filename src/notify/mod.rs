@@ -7,15 +7,17 @@
 //! `BRINDLE_NOTIFY_LOG` is set, a file that tests read, appended by a
 //! `notify-log` writer thread that quitting waits for ([`LogWriter`]). It
 //! remembers which window and tab each notification came from, so a click
-//! can show that tab.
+//! can show that tab, and which of kitty's OSC 99 notifications are open
+//! ([`kitty::Open`]), so a program can update, close and list them and hear
+//! of clicks and closes.
 
 #[cfg(target_os = "linux")]
 pub mod activation;
 #[cfg(target_os = "linux")]
 mod dbus;
+pub mod kitty;
 pub mod osc;
 pub mod policy;
-#[cfg(windows)]
 mod toast;
 
 /// Raising a window on Windows for a notification click: restore it if
@@ -80,10 +82,12 @@ use futures::channel::mpsc::UnboundedSender;
 use futures::channel::mpsc::unbounded;
 #[cfg(target_os = "linux")]
 use gpui::AppContext as _;
-use gpui::{App, BorrowAppContext as _, Global, WindowHandle};
+use gpui::{App, BorrowAppContext as _, EntityId, Global, WeakEntity, WindowHandle};
 
+use self::kitty::{Arrival, Caps, Closing, Expiry, KittyId, Program, Replace, Sound, Urgency};
 use self::osc::Source;
 use self::policy::RateLimiter;
+use crate::terminal::Terminal;
 use crate::workspace::Workspace;
 
 /// Environment variable naming a file that receives notifications instead
@@ -93,6 +97,15 @@ pub const LOG_ENV: &str = "BRINDLE_NOTIFY_LOG";
 /// How many clicked-on-able notifications are remembered.
 const MAX_REMEMBERED: usize = 256;
 
+/// What the platform's sink can show until it says otherwise, for the
+/// OSC 99 query's reply. The log sink stands in for the platform's.
+#[cfg(target_os = "linux")]
+const PLATFORM_CAPS: Caps = dbus::CAPS;
+#[cfg(windows)]
+const PLATFORM_CAPS: Caps = toast::CAPS;
+#[cfg(not(any(target_os = "linux", windows)))]
+const PLATFORM_CAPS: Caps = Caps { hints: false, buttons: false };
+
 /// A notification to show for a tab.
 pub struct Request {
     pub source: Source,
@@ -100,13 +113,43 @@ pub struct Request {
     pub body: String,
     pub window: WindowHandle<Workspace>,
     pub tab: u64,
+    /// What an OSC 99 notification asks of clicks, closes and the sink.
+    pub program: Option<ProgramNotice>,
 }
 
-#[derive(Clone, Copy)]
+/// An OSC 99 notification's program part: the terminal its reports go to,
+/// and what it asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProgramNotice {
+    pub terminal: WeakEntity<Terminal>,
+    pub program: Program,
+}
+
+#[derive(Clone)]
 struct Target {
     window: WindowHandle<Workspace>,
     tab: u64,
     source: Source,
+    program: Option<ProgramNotice>,
+}
+
+/// What a notification asks of the platform beyond its text. Only OSC 99
+/// sets anything but the defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+pub(crate) struct Hints {
+    /// Toasts have no urgency or expiry.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub urgency: Urgency,
+    #[cfg_attr(windows, allow(dead_code))]
+    pub expiry: Expiry,
+    pub silent: bool,
+}
+
+impl Default for Hints {
+    fn default() -> Self {
+        Self { urgency: Urgency::Normal, expiry: Expiry::Default, silent: false }
+    }
 }
 
 /// What [`Notifier`] asks a desktop sink to do.
@@ -119,18 +162,50 @@ pub(crate) enum Command {
         replaces: u32,
         summary: String,
         body: String,
+        hints: Hints,
+        /// Button labels, whose actions are keyed `"1"`, `"2"`, … (empty
+        /// where the sink shows no actions).
+        buttons: Vec<String>,
     },
+    /// Close the notification the sink showed as `id`.
+    Close { id: u32 },
 }
 
 /// What a desktop sink reports back.
 #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
 pub(crate) enum Reply {
-    Shown { key: u64, id: u32 },
-    Action { id: u32, action: String },
+    Shown {
+        key: u64,
+        id: u32,
+    },
+    /// `action` is `"default"` for the notification itself, or a button's
+    /// key.
+    Action {
+        id: u32,
+        action: String,
+    },
     /// Wayland's activation token, for raising the window on a click.
     #[cfg_attr(windows, allow(dead_code))]
-    Token { id: u32, token: String },
-    Closed { id: u32 },
+    Token {
+        id: u32,
+        token: String,
+    },
+    Closed {
+        id: u32,
+    },
+    /// Whether the notification service shows buttons (actions).
+    #[cfg_attr(windows, allow(dead_code))]
+    Capabilities {
+        buttons: bool,
+    },
+}
+
+/// What [`Notifier`] does once it is done with its own state: show a tab,
+/// write a report to a terminal.
+#[derive(Default)]
+struct Effects {
+    show: Option<(Target, Option<String>)>,
+    write: Option<(WeakEntity<Terminal>, String)>,
 }
 
 /// What the `notify-log` thread is asked to do, in order.
@@ -224,6 +299,10 @@ pub struct Notifier {
     bell_ids: HashMap<u64, u32>,
     /// Activation tokens, which arrive just before the click itself.
     tokens: HashMap<u32, String>,
+    /// What the sink can show, for the OSC 99 query's reply.
+    caps: Caps,
+    /// The open OSC 99 notifications with ids, by terminal.
+    open: kitty::Open<EntityId>,
 }
 
 impl Global for Notifier {}
@@ -285,7 +364,41 @@ impl Notifier {
             order: VecDeque::new(),
             bell_ids: HashMap::new(),
             tokens: HashMap::new(),
+            caps: PLATFORM_CAPS,
+            open: kitty::Open::default(),
         });
+    }
+
+    /// What OSC 99 can do here, for the query's reply: the sink's latest
+    /// word on it.
+    pub fn caps(cx: &App) -> Caps {
+        cx.try_global::<Notifier>().map_or(PLATFORM_CAPS, |this| this.caps)
+    }
+
+    /// The program in `terminal` asks for the ids of its open OSC 99
+    /// notifications: the reply, oldest first, is written back to it.
+    pub fn answer_alive(terminal: &WeakEntity<Terminal>, id: &KittyId, cx: &mut App) {
+        let open = cx.try_global::<Notifier>().map_or_else(Vec::new, |this| this.open.alive(terminal.entity_id()));
+        Self::report(terminal, kitty::reply_alive(id, &open), cx);
+    }
+
+    /// The program in `terminal` closes its notification `id`: closes it,
+    /// and writes the close report back when it asked for one.
+    pub fn close_program(terminal: &WeakEntity<Terminal>, id: &KittyId, cx: &mut App) {
+        if !cx.has_global::<Notifier>() {
+            return;
+        }
+        let report = cx.update_global::<Notifier, _>(|this, _| this.close_request(terminal.entity_id(), id));
+        if let Some(report) = report {
+            Self::report(terminal, report, cx);
+        }
+    }
+
+    /// Writes `text` to `terminal`'s program, unless the terminal closed.
+    fn report(terminal: &WeakEntity<Terminal>, text: String, cx: &mut App) {
+        if terminal.update(cx, |terminal, _| terminal.write(text.into_bytes())).is_err() {
+            log::debug!("an OSC 99 reply found its terminal closed");
+        }
     }
 
     /// Shows `request` unless a rate limit says no. Never blocks on D-Bus.
@@ -301,40 +414,121 @@ impl Notifier {
             log::debug!("rate limit: dropping a {} notification", request.source.name());
             return;
         }
-        let target = Target { window: request.window, tab: request.tab, source: request.source };
-        let replaces = match request.source {
-            Source::Bell => self.bell_ids.get(&request.tab).copied().unwrap_or(0),
-            Source::Osc9 | Source::Osc777 | Source::Osc7501 => 0,
+        let key = self.next_key;
+        self.next_key += 1;
+        // An OSC 99 update replaces its open notification; one sent before
+        // the first had an id closes the first once it has.
+        let replace = match (&request.program, request.source) {
+            (Some(notice), _) => notice.program.id.as_ref().map_or(Replace::Nothing, |id| {
+                self.open.send(notice.terminal.entity_id(), id, key)
+            }),
+            (None, Source::Bell) => self.bell_ids.get(&request.tab).map_or(Replace::Nothing, |&id| Replace::Id(id)),
+            (None, Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501) => Replace::Nothing,
         };
+        let replaces = match replace {
+            Replace::Id(id) => id,
+            Replace::Nothing => 0,
+        };
+        let (hints, buttons) = match &request.program {
+            Some(notice) => {
+                let program = &notice.program;
+                let hints = Hints { urgency: program.urgency, expiry: program.expiry, silent: program.sound == Sound::Silent };
+                let buttons = if self.caps.buttons {
+                    program.buttons.iter().map(|label| label.as_str().to_string()).collect()
+                } else {
+                    Vec::new()
+                };
+                (hints, buttons)
+            }
+            None => (Hints::default(), Vec::new()),
+        };
+        let target = Target { window: request.window, tab: request.tab, source: request.source, program: request.program };
+        self.pending.insert(key, target);
         match &mut self.sink {
             Sink::Log { writer, next_id } => {
-                writer.write(log_line(request.source, &request.summary, &request.body));
+                let line = match &self.pending[&key].program {
+                    Some(notice) => {
+                        let flags = LogFlags { replaces: replaces != 0, caps: self.caps };
+                        log_line_99(&request.summary, &request.body, &notice.program, flags)
+                    }
+                    None => log_line(request.source, &request.summary, &request.body),
+                };
+                writer.write(line);
                 let id = if replaces != 0 { replaces } else { std::mem::replace(next_id, *next_id + 1) };
-                self.remember(id, target);
+                // The log shows at once, so nothing waits for an id.
+                self.on_shown(key, id);
             }
             #[cfg(target_os = "linux")]
             Sink::Bus(commands) => {
-                let key = self.next_key;
-                self.next_key += 1;
-                self.pending.insert(key, target);
-                let command = Command::Notify { key, replaces, summary: request.summary, body: request.body };
+                let command = Command::Notify { key, replaces, summary: request.summary, body: request.body, hints, buttons };
                 commands.unbounded_send(command).ok();
             }
             #[cfg(windows)]
             Sink::Toast(commands) => {
-                let key = self.next_key;
-                self.next_key += 1;
-                self.pending.insert(key, target);
-                let command = Command::Notify { key, replaces, summary: request.summary, body: request.body };
+                let command = Command::Notify { key, replaces, summary: request.summary, body: request.body, hints, buttons };
                 commands.send(command).ok();
             }
             #[cfg(not(any(target_os = "linux", windows)))]
             Sink::Off { warned } => {
+                let _ = (hints, buttons);
+                self.pending.remove(&key);
                 if !std::mem::replace(warned, true) {
                     log::warn!("desktop notifications aren't supported on this platform yet; dropping them");
                 }
             }
         }
+    }
+
+    /// Hands `command` to the desktop sink. The log has nothing to close.
+    fn command(&mut self, command: Command) {
+        match &mut self.sink {
+            Sink::Log { .. } => {}
+            #[cfg(target_os = "linux")]
+            Sink::Bus(commands) => {
+                commands.unbounded_send(command).ok();
+            }
+            #[cfg(windows)]
+            Sink::Toast(commands) => {
+                commands.send(command).ok();
+            }
+            #[cfg(not(any(target_os = "linux", windows)))]
+            Sink::Off { .. } => drop(command),
+        }
+    }
+
+    /// The sink showed `key` as `id`: remember it for clicks, or close it
+    /// when an update or the program's close came first.
+    fn on_shown(&mut self, key: u64, id: u32) {
+        let target = self.pending.remove(&key);
+        match self.open.shown(key, id) {
+            Arrival::Keep => {
+                if let Some(target) = target {
+                    self.remember(id, target);
+                }
+            }
+            Arrival::Close => self.command(Command::Close { id }),
+        }
+    }
+
+    /// The program closed `id` in `terminal`; the close report to write,
+    /// if it asked for one.
+    fn close_request(&mut self, terminal: EntityId, id: &KittyId) -> Option<String> {
+        let target = match self.open.close(terminal, id) {
+            Closing::Unknown => return None,
+            Closing::Now(sink) => {
+                self.order.retain(|&i| i != sink);
+                let target = self.shown.get(&sink).cloned();
+                self.forget(sink);
+                self.command(Command::Close { id: sink });
+                target
+            }
+            // Its sink id hasn't come yet: the table closes it then.
+            Closing::WhenShown(key) => self.pending.remove(&key),
+        };
+        if let Sink::Log { writer, .. } = &self.sink {
+            writer.write(log_close_line(id));
+        }
+        kitty::on_close(target.as_ref().and_then(|t| t.program.as_ref()).map(|n| &n.program))
     }
 
     fn remember(&mut self, id: u32, target: Target) {
@@ -361,32 +555,49 @@ impl Notifier {
     }
 
     fn on_reply(reply: Reply, cx: &mut App) {
-        let click = cx.update_global::<Notifier, _>(|this, _| match reply {
+        let effects = cx.update_global::<Notifier, _>(|this, _| this.apply_reply(reply));
+        if let Some((terminal, text)) = effects.write {
+            Self::report(&terminal, text, cx);
+        }
+        if let Some((target, token)) = effects.show {
+            Self::show(target, token, cx);
+        }
+    }
+
+    fn apply_reply(&mut self, reply: Reply) -> Effects {
+        match reply {
             Reply::Shown { key, id } => {
-                if let Some(target) = this.pending.remove(&key) {
-                    this.remember(id, target);
-                }
-                None
+                self.on_shown(key, id);
+                Effects::default()
             }
             Reply::Token { id, token } => {
-                if this.shown.contains_key(&id) {
-                    this.tokens.insert(id, token);
+                if self.shown.contains_key(&id) {
+                    self.tokens.insert(id, token);
                 }
-                None
+                Effects::default()
             }
             Reply::Action { id, action } => {
-                let token = this.tokens.remove(&id);
-                let target = this.shown.get(&id).copied();
-                (action == "default").then_some(target.map(|t| (t, token))).flatten()
+                let token = self.tokens.remove(&id);
+                let Some(target) = self.shown.get(&id).cloned() else { return Effects::default() };
+                let notice = target.program.as_ref();
+                let activation = kitty::activation(notice.map(|n| &n.program), &action);
+                let write = activation.write.zip(notice).map(|(text, n)| (n.terminal.clone(), text));
+                let show = activation.raise.then_some((target, token));
+                Effects { show, write }
             }
             Reply::Closed { id } => {
-                this.order.retain(|&i| i != id);
-                this.forget(id);
-                None
+                self.order.retain(|&i| i != id);
+                let target = self.shown.get(&id).cloned();
+                self.forget(id);
+                self.open.closed(id);
+                let notice = target.and_then(|t| t.program);
+                let write = notice.and_then(|n| kitty::on_close(Some(&n.program)).map(|text| (n.terminal, text)));
+                Effects { show: None, write }
             }
-        });
-        if let Some((target, token)) = click {
-            Self::show(target, token, cx);
+            Reply::Capabilities { buttons } => {
+                self.caps.buttons = buttons;
+                Effects::default()
+            }
         }
     }
 
@@ -400,20 +611,6 @@ impl Notifier {
             log::debug!("a notification was clicked after its window closed");
         }
     }
-}
-
-/// A `ToastGeneric` toast with `title` and `body`, escaped so markup in them
-/// stays text.
-#[cfg_attr(not(windows), allow(dead_code))]
-fn toast_xml(title: &str, body: &str) -> String {
-    let escape = |text: &str| {
-        text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
-    };
-    format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
-        escape(title),
-        escape(body)
-    )
 }
 
 /// A notification body escaped for servers with `body-markup`, which read
@@ -442,24 +639,111 @@ fn icon_path() -> Option<PathBuf> {
     }
 }
 
+/// A field of a test log line, kept on its line and in its column.
+fn log_field(text: &str) -> String {
+    text.replace(['\t', '\n', '\r'], " ")
+}
+
 /// One line of the test log: source, title and body, separated by tabs.
 pub fn log_line(source: Source, summary: &str, body: &str) -> String {
-    let field = |s: &str| s.replace(['\t', '\n', '\r'], " ");
-    format!("{}\t{}\t{}\n", source.name(), field(summary), field(body))
+    format!("{}\t{}\t{}\n", source.name(), log_field(summary), log_field(body))
+}
+
+/// What an OSC 99 log line says beyond the notification itself.
+#[derive(Clone, Copy, Debug)]
+struct LogFlags {
+    /// It replaced an open notification.
+    replaces: bool,
+    /// What the platform's sink would show: buttons and hints are logged
+    /// only where they would be sent.
+    caps: Caps,
+}
+
+/// The test log's line for an OSC 99 notification: [`log_line`]'s, then
+/// tab-separated flags in a fixed order, each only when it applies: `i=ID`,
+/// `replaces`, `buttons=A|B`, `silent`, `urgency=low|critical`,
+/// `expiry=never|MS`.
+fn log_line_99(summary: &str, body: &str, program: &Program, flags: LogFlags) -> String {
+    let mut line = format!("{}\t{}\t{}", Source::Osc99.name(), log_field(summary), log_field(body));
+    if let Some(id) = &program.id {
+        line.push_str(&format!("\ti={}", id.as_str()));
+    }
+    if flags.replaces {
+        line.push_str("\treplaces");
+    }
+    if flags.caps.buttons && !program.buttons.is_empty() {
+        let labels: Vec<String> = program.buttons.iter().map(|label| log_field(label.as_str())).collect();
+        line.push_str(&format!("\tbuttons={}", labels.join("|")));
+    }
+    if program.sound == Sound::Silent {
+        line.push_str("\tsilent");
+    }
+    if flags.caps.hints {
+        match program.urgency {
+            Urgency::Low => line.push_str("\turgency=low"),
+            Urgency::Normal => {}
+            Urgency::Critical => line.push_str("\turgency=critical"),
+        }
+        match program.expiry {
+            Expiry::Default => {}
+            Expiry::Never => line.push_str("\texpiry=never"),
+            Expiry::After(after) => line.push_str(&format!("\texpiry={}", after.as_millis())),
+        }
+    }
+    line.push('\n');
+    line
+}
+
+/// The test log's line for a program's close of its notification `id`.
+fn log_close_line(id: &KittyId) -> String {
+    format!("close\t{}\ti={}\n", Source::Osc99.name(), id.as_str())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn program(id: Option<&str>) -> Program {
+        Program {
+            id: id.map(|id| KittyId::parse(id.as_bytes()).unwrap()),
+            focus: true,
+            report: false,
+            close_report: false,
+            urgency: Urgency::Normal,
+            expiry: Expiry::Default,
+            sound: Sound::Default,
+            buttons: Vec::new(),
+        }
+    }
 
     #[test]
-    fn toast_markup_stays_text() {
-        let xml = toast_xml("make <all> & \"go\"", "it's </text><text>done");
+    fn osc99_log_lines() {
+        const ALL: Caps = Caps { hints: true, buttons: true };
+        let plain = LogFlags { replaces: false, caps: ALL };
+        assert_eq!(log_line_99("Hi — sh", "", &program(None), plain), "osc99\tHi — sh\t\n");
         assert_eq!(
-            xml,
-            "<toast><visual><binding template=\"ToastGeneric\"><text>make &lt;all&gt; &amp; &quot;go&quot;</text>\
-             <text>it&apos;s &lt;/text&gt;&lt;text&gt;done</text></binding></visual></toast>"
+            log_line_99("Failed — sh", "b", &program(Some("job")), LogFlags { replaces: true, caps: ALL }),
+            "osc99\tFailed — sh\tb\ti=job\treplaces\n"
         );
+        let full = Program {
+            buttons: ["Allow", "Deny"].iter().map(|l| kitty::Label::new(l).unwrap()).collect(),
+            sound: Sound::Silent,
+            urgency: Urgency::Critical,
+            expiry: Expiry::After(Duration::from_millis(1500)),
+            ..program(Some("p"))
+        };
+        assert_eq!(
+            log_line_99("t", "b", &full, plain),
+            "osc99\tt\tb\ti=p\tbuttons=Allow|Deny\tsilent\turgency=critical\texpiry=1500\n"
+        );
+        // What the sink wouldn't send isn't logged.
+        let toast = LogFlags { replaces: false, caps: Caps { hints: false, buttons: true } };
+        assert_eq!(log_line_99("t", "b", &full, toast), "osc99\tt\tb\ti=p\tbuttons=Allow|Deny\tsilent\n");
+        let no_actions = LogFlags { replaces: false, caps: Caps { hints: true, buttons: false } };
+        let quiet = Program { urgency: Urgency::Low, expiry: Expiry::Never, ..full };
+        assert_eq!(log_line_99("t", "b", &quiet, no_actions), "osc99\tt\tb\ti=p\tsilent\turgency=low\texpiry=never\n");
+        assert_eq!(log_close_line(&KittyId::parse(b"n1").unwrap()), "close\tosc99\ti=n1\n");
     }
 
     #[test]

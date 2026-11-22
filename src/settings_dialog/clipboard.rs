@@ -35,7 +35,7 @@ impl ClipboardField {
         match self {
             ClipboardField::CopyOnSelect => None,
             ClipboardField::RightClick => {
-                Some("Pastes only when nothing is selected. Hold shift to paste where a program uses the mouse.")
+                Some("Clears any selection and pastes. Hold shift to paste where a program uses the mouse.")
             }
         }
     }
@@ -499,7 +499,7 @@ mod tests {
         assert_eq!(CLIPBOARD_FIELDS.map(ClipboardField::label), ["Copy on select", "Right-click pastes"]);
         assert_eq!(
             CLIPBOARD_FIELDS.map(ClipboardField::hint),
-            [None, Some("Pastes only when nothing is selected. Hold shift to paste where a program uses the mouse.")]
+            [None, Some("Clears any selection and pastes. Hold shift to paste where a program uses the mouse.")]
         );
         let on = values(true, RightClick::Paste);
         assert!(CLIPBOARD_FIELDS.iter().all(|&f| is_on(&on, f)));

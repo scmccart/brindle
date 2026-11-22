@@ -482,3 +482,32 @@ On Windows, a session's program named without a directory SHALL be found through
 #### Scenario: Program planted beside the helper
 - **WHEN** a `cmd.exe` is placed in the directory of the helper copy the server runs from, and a profile with `command = "cmd.exe"` opens a tab
 - **THEN** the tab runs `cmd.exe` from `PATH`, not the placed file
+
+### Requirement: Command lines survive attach
+The server SHALL keep each command's reported line (`OSC 633 ; E`) with its prompt marks, and an attaching or reconnecting client SHALL receive it with the marks. A client attached to a server that predates command-line tracking SHALL have the marks without the reported lines.
+
+#### Scenario: Copy after attach
+- **WHEN** a detached session's shell reported `make test` with `633;E`, and a client attaches and runs Copy Last Command Line
+- **THEN** the clipboard holds `make test`
+
+### Requirement: Progress survives attach
+The server SHALL keep each session's progress (`OSC 9 ; 4`) with the same lifetime rules as the client, and an attaching or reconnecting client SHALL receive it with the session's replay. A client attached to a server that predates progress tracking SHALL show no progress for that session until the program reports again.
+
+#### Scenario: Progress after attach
+- **WHEN** a program in a detached session reported normal at 60%, and a client attaches
+- **THEN** the session's tab shows a bar 60% of its width long
+
+#### Scenario: Core restart
+- **WHEN** a session's program reported paused at 20% and the core is restarted
+- **THEN** after the client reconnects, the tab shows a yellow bar 20% of its width long
+
+### Requirement: Contexts survive attach
+The server SHALL keep each session's OSC 3008 contexts with the same rules as the client, and an attaching or reconnecting client SHALL replace the session's contexts with those in its replay. A client attached to a server that predates context tracking SHALL show no contexts for that session until a program starts one.
+
+#### Scenario: Attach inside run0
+- **WHEN** a detached session's shell runs inside a `run0` elevation, and a client attaches
+- **THEN** the session's tab shows the yellow warning icon for `root`
+
+#### Scenario: Ended while disconnected
+- **WHEN** the client loses its connection while a zone is inside a container context, the context ends meanwhile, and the client reconnects
+- **THEN** the zone shows no badge

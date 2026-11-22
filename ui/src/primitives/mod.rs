@@ -18,5 +18,5 @@ pub use overlay::{
     enter_animation_id, initial_focus, restore_focus, wrap_in_deferred,
 };
 pub use placement::{
-    Align, Anchored, EDGE_MARGIN, Placement, SIDE_OFFSET, Side, anchor_trigger, available_height, place,
+    Align, Anchored, EDGE_MARGIN, Placement, SIDE_OFFSET, Side, anchor_trigger, available_height, place, place_within,
 };

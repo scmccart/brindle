@@ -202,3 +202,17 @@ While a local tab has two or more zones, the active zone's card SHALL show the f
 #### Scenario: One zone
 - **WHEN** a tab has one zone and the user focuses it with the keyboard
 - **THEN** its card shows no ring
+
+### Requirement: Zone header progress bar
+While a local tab has two or more zones, each zone whose terminal has progress SHALL show it as a 2-pixel bar along the bottom edge of its header bar, drawn as the tab's bar is for that one terminal (length by percent, colour by state, indeterminate across the whole width without animation).
+
+#### Scenario: Two builds side by side
+- **WHEN** a tab has two zones, one reporting normal at 30% and the other paused at 70%
+- **THEN** the first zone's header shows a muted bar 30% of its width long, the second a yellow bar 70% long, and the tab shows the yellow one
+
+### Requirement: Zone header context badge
+While a local tab has two or more zones, each zone header SHALL show its zone's notable-context badge after the title, drawn as on the tab face (a yellow warning icon with the target user in its tooltip for `elevate`, `chpriv` and a root `session`, the muted label otherwise).
+
+#### Scenario: Two zones, one elevated
+- **WHEN** a tab has two zones and one of them runs `run0`
+- **THEN** that zone's header shows the yellow warning icon, and the other zone's header shows none

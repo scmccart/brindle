@@ -8,6 +8,7 @@
 mod actions;
 mod config;
 mod config_edit;
+mod cursor;
 mod desktop;
 mod find_bar;
 mod instance;
@@ -99,6 +100,9 @@ DEBUGGING:
         --click [MODS-]COL,ROW   Left-click that cell (e.g. ctrl-3,0 opens a link)
         --right-click [MODS-]COL,ROW
                                  Right-click that cell (e.g. shift-5,1)
+        --press [MODS-]COL,ROW   Press the left button on that cell and hold it, so
+                                 a --hover drags
+        --release [MODS-]COL,ROW Release the held left button over that cell
         --find <TEXT>            Open the find bar on the active terminal and search for TEXT
         --wait-for <TEXT>        Hold the later steps until the active terminal shows
                                  TEXT (\\n = a line break), for at most 30 step
@@ -129,7 +133,7 @@ enum Step {
     /// `--action`: an action's name, checked against the action table when
     /// the arguments were parsed.
     Action(String),
-    /// `--hover` / `--click` / `--right-click`.
+    /// `--hover` / `--click` / `--right-click` / `--press` / `--release`.
     Pointer(terminal_view::PointerStep),
     Find(String),
     /// `--wait-for`: the text the active terminal must show before the
@@ -378,11 +382,13 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                 }
                 args.steps.push(Step::Action(name));
             }
-            "--hover" | "--click" | "--right-click" => {
+            "--hover" | "--click" | "--right-click" | "--press" | "--release" => {
                 let pos = value_of(it, &arg, "a cell, [MODS-]COL,ROW")?;
                 let action = match arg.as_str() {
                     "--click" => PointerAction::Click(PointerButton::Left),
                     "--right-click" => PointerAction::Click(PointerButton::Right),
+                    "--press" => PointerAction::Press,
+                    "--release" => PointerAction::Release,
                     _ => PointerAction::Hover,
                 };
                 let step = terminal_view::PointerStep::parse(&pos, action).map_err(|why| format!("{arg}: {why}"))?;
@@ -1473,6 +1479,8 @@ mod tests {
             "--hover",
             "--click",
             "--right-click",
+            "--press",
+            "--release",
             "--dump-screen-after",
             "--latency-log",
             "--prefix",
@@ -1507,7 +1515,15 @@ mod tests {
     #[test]
     fn a_bad_pointer_position_is_a_usage_error() {
         for (option, position) in
-            [("--hover", "3"), ("--click", "hyper-3,0"), ("--click", "a,b"), ("--right-click", "3"), ("--right-click", "hyper-3,0")]
+            [
+            ("--hover", "3"),
+            ("--click", "hyper-3,0"),
+            ("--click", "a,b"),
+            ("--right-click", "3"),
+            ("--right-click", "hyper-3,0"),
+            ("--press", "3"),
+            ("--release", "a,b"),
+        ]
         {
             let why = refused(&[option, position]);
             assert!(why.starts_with(&format!("{option}: ")), "{option} {position}: {why}");
@@ -1518,6 +1534,10 @@ mod tests {
         let args = parse(&["--right-click", "shift-5,2"]);
         let [Step::Pointer(step)] = &args.steps[..] else { panic!("{:?}", args.steps) };
         assert_eq!((step.col, step.row, step.action, step.modifiers.shift), (5, 2, PointerAction::Click(PointerButton::Right), true));
+        let args = parse(&["--press", "0,0", "--release", "alt-4,1"]);
+        let [Step::Pointer(press), Step::Pointer(release)] = &args.steps[..] else { panic!("{:?}", args.steps) };
+        assert_eq!((press.col, press.row, press.action), (0, 0, PointerAction::Press));
+        assert_eq!((release.col, release.row, release.action, release.modifiers.alt), (4, 1, PointerAction::Release, true));
     }
 
     #[test]

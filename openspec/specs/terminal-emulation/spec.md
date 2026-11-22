@@ -58,7 +58,7 @@ Special keys and modifier combinations SHALL be sent as xterm byte sequences. Pl
 When the program enables mouse tracking (modes 1000, 1002 or 1003), mouse presses, releases, drags, motion and wheel events SHALL be reported to the program.
 - Coordinates SHALL be relative to the terminal's own grid.
 - SGR encoding (1006) SHALL be used when enabled; otherwise UTF-8 (1005) or legacy X10 encoding.
-- Holding shift SHALL bypass reporting: a shift-drag selects text instead, and a shift-right-click is handled as a right press that isn't reported (see "Right-click paste"), so it pastes only when right-click paste is on and no text is selected.
+- Holding shift SHALL bypass reporting: a shift-drag selects text instead, and a shift-right-click is handled as a right press that isn't reported (see "Right-click paste").
 - A ctrl-click on a link SHALL bypass reporting and open the link instead, as defined by the `links` capability.
 
 #### Scenario: SGR click
@@ -79,7 +79,7 @@ When the program enables mouse tracking (modes 1000, 1002 or 1003), mouse presse
 
 #### Scenario: Shift-right-click over a selection
 - **WHEN** SGR mouse mode is on, `right_click = "paste"`, the user shift-drags to select text and then shift-right-clicks
-- **THEN** nothing is pasted, no mouse report is sent, and the text stays selected
+- **THEN** the selection is cleared, the clipboard is pasted, and no mouse report is sent
 
 #### Scenario: Ctrl-click on a link overrides reporting
 - **WHEN** mouse reporting is on and the user ctrl-clicks a URL
@@ -353,7 +353,7 @@ When the terminal server reports an error about a session a tab shows, or Brindl
 - **THEN** the tab shows that line once
 
 ### Requirement: Right-click paste
-A right press that isn't reported to the program (see "Mouse reporting") SHALL paste the clipboard, as the paste key does, when `right_click` is `"paste"` and no text is selected in the terminal. Otherwise it SHALL do nothing: with `right_click = "none"`, the default, or while text is selected, it neither pastes nor copies, and the selection stays. The setting and the selection at the press SHALL decide, so a reload changes it for open tabs. Its release SHALL NOT be reported either.
+A right press that isn't reported to the program (see "Mouse reporting") SHALL, when `right_click` is `"paste"`, clear any selection in the terminal and paste the clipboard, as the paste key does. When the clipboard holds no text it SHALL do neither. With `right_click = "none"`, the default, it SHALL do nothing and leave any selection. The setting at the press SHALL decide, so a reload changes it for open tabs. Its release SHALL NOT be reported either.
 
 #### Scenario: Paste at a prompt
 - **WHEN** `right_click = "paste"`, the clipboard holds `echo pasted`, no text is selected, and the user right-clicks in a shell's terminal and presses enter
@@ -364,8 +364,16 @@ A right press that isn't reported to the program (see "Mouse reporting") SHALL p
 - **THEN** nothing is typed into the shell
 
 #### Scenario: Nothing happens over a selection
+- **WHEN** the config sets no `right_click`, the clipboard holds `echo pasted`, and the user selects text in a shell's terminal and right-clicks
+- **THEN** nothing is typed into the shell, and the text stays selected
+
+#### Scenario: Over a selection, clears and pastes
 - **WHEN** `right_click = "paste"`, `copy_on_select = false`, the clipboard holds `echo pasted`, and the user selects text in a shell's terminal and right-clicks
-- **THEN** nothing is typed into the shell, the text stays selected, and the clipboard still holds `echo pasted`
+- **THEN** the selection is cleared, `echo pasted` is typed into the shell, and the clipboard still holds `echo pasted`
+
+#### Scenario: Select, then right-click to paste it
+- **WHEN** `right_click = "paste"` and `copy_on_select = true`, and the user selects `ls -la` in a shell's terminal and right-clicks
+- **THEN** the selection is cleared and `ls -la` is typed into the shell
 
 #### Scenario: Pastes once the selection is cleared
 - **WHEN** `right_click = "paste"`, the clipboard holds `echo pasted`, and the user selects text in a shell's terminal, left-clicks in it to clear the selection, then right-clicks
@@ -380,5 +388,145 @@ A right press that isn't reported to the program (see "Mouse reporting") SHALL p
 - **THEN** the clipboard is pasted
 
 #### Scenario: Empty clipboard
-- **WHEN** `right_click = "paste"`, the clipboard holds no text, and the user right-clicks
+- **WHEN** `right_click = "paste"`, the clipboard holds no text, and the user right-clicks over a selection
+- **THEN** nothing is sent to the program, and the selection stays
+
+#### Scenario: A program that uses the mouse
+- **WHEN** `right_click = "paste"`, htop reports the mouse, and the user right-clicks over a selection
+- **THEN** htop receives the right press, and nothing is pasted or cleared; shift-right-click instead clears the selection and pastes
+
+### Requirement: Pointer shape sequences
+A terminal SHALL recognise `ESC ] 22 ; <body> ST`, ended by BEL or ST, however the output is split into reads. The body is an optional first character and a comma-separated list of names. With `=` or no first character, each name SHALL set the top of the stack in turn (pushing onto an empty stack); an empty name, as in an empty body, sets Brindle's own pointer. With `>`, each name SHALL be pushed in turn. With `<`, the top SHALL be popped (if any) and the names ignored.
+
+#### Scenario: Push and pop
+- **WHEN** a program prints `ESC ] 22 ; >pointer ESC \`, then `ESC ] 22 ; >wait,progress,default ESC \`, then `ESC ] 22 ; < ESC \`
+- **THEN** the terminal's pointer shape is `pointer`
+
+#### Scenario: Several names pushed at once
+- **WHEN** a program prints `ESC ] 22 ; >pointer,crosshair ESC \`, then `ESC ] 22 ; < ESC \`
+- **THEN** the terminal's pointer shape is `pointer`
+
+#### Scenario: Several names set at once
+- **WHEN** a program prints `ESC ] 22 ; pointer,crosshair ESC \`
+- **THEN** the terminal's pointer shape is `crosshair`, and one pop leaves Brindle's own
+
+#### Scenario: Reset
+- **WHEN** a program pushed `crosshair` and prints `ESC ] 22 ; ESC \`
+- **THEN** the pointer over the terminal is Brindle's own again
+
+#### Scenario: Reset keeps the entries below
+- **WHEN** a program pushed `pointer` and `crosshair`, prints `ESC ] 22 ; ESC \`, and then `ESC ] 22 ; < ESC \`
+- **THEN** the terminal's pointer shape is `pointer`
+
+### Requirement: Pointer shape stacks
+Each terminal SHALL keep a separate stack for its primary and alternate screen, of up to 16 entries; a push onto a full stack SHALL drop the bottom entry. A sequence SHALL act on the screen active when it arrived. A full reset and the process exiting SHALL empty both. A terminal attached or reconnected to its session SHALL start with both empty.
+
+#### Scenario: Alternate screen keeps its own
+- **WHEN** a shell pushes `pointer`, a full-screen program then switches to the alternate screen and pushes `crosshair`, and then exits it
+- **THEN** the pointer shape over the terminal is `pointer`
+
+#### Scenario: Seventeen pushes
+- **WHEN** a program pushes 17 shapes and then pops 16 times
+- **THEN** the stack is empty and the pointer is Brindle's own
+
+### Requirement: Supported pointer shapes
+Brindle SHALL show `default`, `text`, `vertical-text`, `pointer`, `crosshair`, `grab`, `grabbing`, `not-allowed`, `no-drop`, `alias`, `copy`, `context-menu`, `ew-resize`, `ns-resize`, `e-resize`, `w-resize`, `n-resize`, `s-resize`, `nwse-resize`, `nesw-resize`, `col-resize` and `row-resize`, each as the platform pointer of that meaning. Other names are skipped, so a list falls back to the names Brindle shows, and a sequence naming none of them SHALL leave the stack as it was.
+
+#### Scenario: Fallback list
+- **WHEN** a program prints `ESC ] 22 ; zoom-in,pointer ESC \`
+- **THEN** the pointer over the terminal is the pointing hand
+
+#### Scenario: Nothing supported
+- **WHEN** a program has set `crosshair` and prints `ESC ] 22 ; zoom-in ESC \`
+- **THEN** the pointer over the terminal stays the crosshair
+
+### Requirement: Pointer shape precedence
+Over a terminal's grid, the pointer SHALL be the hand while a link is ctrl-hovered, the text beam while a selection is being dragged, and otherwise the top of the active screen's stack. With an empty stack, or Brindle's own on top, it SHALL be Brindle's own: the arrow while the program reports the mouse, the text beam otherwise. The program's shape SHALL NOT apply outside the grid.
+
+#### Scenario: Link over a program shape
+- **WHEN** a program has set `crosshair` and the user holds ctrl over a link in that terminal
+- **THEN** the pointer is the pointing hand, and the crosshair returns when ctrl is released
+
+### Requirement: Pointer shape queries
+A body starting with `?` SHALL be a query, answered on that terminal's PTY as `ESC ] 22 ; <reply> ESC \`, with one comma-separated answer per name: for a shape name `1` or `0`, whether Brindle shows it; for `__current__` the top of the active screen's stack, or `0` when the stack is empty or Brindle's own is on top; for `__default__` `text`, and for `__grabbed__` `default`.
+
+#### Scenario: Support query
+- **WHEN** a program prints `ESC ] 22 ; ?pointer,crosshair,no-such-name,wait ESC \`
+- **THEN** it reads `ESC ] 22 ; 1,1,0,0 ESC \`
+
+#### Scenario: Current
+- **WHEN** a program pushed `grab` and prints `ESC ] 22 ; ?__current__ ESC \`
+- **THEN** it reads `ESC ] 22 ; grab ESC \`
+
+#### Scenario: Mixed query on an empty stack
+- **WHEN** a program that set no shape prints `ESC ] 22 ; ?__current__,pointer,__default__ ESC \`
+- **THEN** it reads `ESC ] 22 ; 0,1,text ESC \`
+
+### Requirement: Clipboard shared with other applications
+Every copy Brindle makes (the copy keys, `copy_on_select`, Copy Link, the Copy Last commands and OSC 52) SHALL write the system clipboard, readable by other applications while Brindle runs, and paste SHALL read the plain text another application put there. A clipboard holding no text SHALL paste nothing. On Linux the primary selection SHALL be the desktop's, shared the same way both ways.
+
+#### Scenario: Copy to another application
+- **WHEN** the user selects `hello` in a tab and presses ctrl-shift-c, then pastes in a text editor
+- **THEN** the editor receives `hello`
+
+#### Scenario: Paste from another application
+- **WHEN** the user copies `echo from-editor` in a text editor, then presses ctrl-shift-v in a tab at a shell prompt
+- **THEN** the shell's line reads `echo from-editor`, not yet run
+
+#### Scenario: Rich text pastes as plain text
+- **WHEN** the user copies a bold link from a web page, then pastes in a tab
+- **THEN** the tab receives the link's visible text, with no markup
+
+#### Scenario: Image on the clipboard
+- **WHEN** the clipboard holds only an image, and the user pastes in a tab
 - **THEN** nothing is sent to the program
+
+#### Scenario: OSC 52 reaches other applications
+- **WHEN** a program prints `ESC ] 52 ; c ; aGk= BEL`, and the user then pastes in a text editor
+- **THEN** the editor receives `hi`
+
+#### Scenario: Primary selection from another application on Linux
+- **WHEN** on Linux the user selects `abc` in a text editor and middle-clicks in a tab
+- **THEN** the tab receives `abc`
+
+#### Scenario: A copy outlives its tab
+- **WHEN** the user copies text in a tab, closes that tab, and pastes in another application
+- **THEN** the application receives the copied text
+
+### Requirement: Copied line ends
+Text Brindle copies from the grid SHALL join its lines with the platform's line end: `\r\n` on Windows, `\n` elsewhere. A line the program wrapped SHALL be copied as one line. Trailing blanks of a row SHALL NOT be copied. Text a program sets through OSC 52 SHALL be written as the program sent it.
+
+#### Scenario: Two lines on Windows
+- **WHEN** on Windows the user selects two printed lines `one` and `two` and copies them, then pastes in Notepad
+- **THEN** the clipboard holds `one\r\ntwo`, and Notepad shows two lines
+
+#### Scenario: Wrapped line
+- **WHEN** a program prints a 100-character line in an 80-column tab, and the user triple-clicks it and copies
+- **THEN** the clipboard holds the 100 characters with no line end inside
+
+#### Scenario: Paste with Windows line ends
+- **WHEN** the clipboard holds `a\r\nb` and bracketed paste is off
+- **THEN** the program receives `a\rb`
+
+### Requirement: Mouse clipboard feedback
+A copy or paste made with the mouse SHALL show a small label at the pointer for about one second, then fade out: "Copied" when finishing a selection copies it to the clipboard (`copy_on_select`), "Pasted" when a right-click pastes, and "Nothing to paste" when a right-click finds no text on the clipboard. The label SHALL NOT take focus, catch the pointer or move the grid. Key and palette copies and pastes SHALL show none.
+
+#### Scenario: Copy on select
+- **WHEN** `copy_on_select = true` and the user drags over text and releases
+- **THEN** "Copied" shows beside the pointer and is gone about a second later
+
+#### Scenario: Right-click paste
+- **WHEN** `right_click = "paste"`, the clipboard holds text, and the user right-clicks in a shell's terminal
+- **THEN** the text is pasted and "Pasted" shows beside the pointer
+
+#### Scenario: Primary only
+- **WHEN** `copy_on_select = false` and the user finishes a selection
+- **THEN** no label shows, since the clipboard didn't change
+
+#### Scenario: Keys show nothing
+- **WHEN** the user presses ctrl-shift-c over a selection, or ctrl-shift-v
+- **THEN** no label shows
+
+#### Scenario: Clicks pass through
+- **WHEN** "Copied" is showing and the user clicks where it is drawn
+- **THEN** the click reaches the grid as if no label were there

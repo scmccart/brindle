@@ -124,6 +124,8 @@ Each recorded zone, local on Linux and Windows or remote, SHALL record which ter
 
 A remote zone with a session record SHALL be restored without waiting for its endpoint. It SHALL show that it is connecting, and attach once its endpoint answers. If the session is gone, attached elsewhere or not the recorded one, the zone SHALL say so and stay open until the user closes it. A zone that only shows such a message SHALL NOT be recorded.
 
+A reattached session, local or remote, SHALL take its zone's size once the zone is laid out, whatever size it was detached at. Until then (its tab is in the background), the zone's terminal SHALL keep the session's own size, so the replay and what the program draws meanwhile land as the program drew them, not clipped to the default grid.
+
 #### Scenario: Programs survive a quit
 - **WHEN** a tab runs `htop`, and the user quits and relaunches
 - **THEN** the restored tab shows the same `htop` process, with the same pid
@@ -155,6 +157,14 @@ A remote zone with a session record SHALL be restored without waiting for its en
 #### Scenario: Remote programs survive a quit
 - **WHEN** a split SSH tab on `A8` runs `htop` and a shell, and the user quits and relaunches
 - **THEN** the restored tab shows the same `htop` and shell processes on `A8`, with their pids and scrollback
+
+#### Scenario: A remote session reattached into a window of another size takes the window's size
+- **WHEN** an SSH tab's shell on `A8` was detached at 113×32, and the relaunch lays the restored tab out at 95×24
+- **THEN** `stty size` in the tab says `24 95`
+
+#### Scenario: A remote session reattached in a background tab keeps its own size until shown
+- **WHEN** Brindle quit with a local tab active and an SSH tab on `A8` whose program, 113 columns wide, draws at column 90 after the relaunch reattaches it, while the local tab is still the one shown
+- **THEN** switching to the SSH tab shows the drawing at column 90, not clipped at column 80
 
 #### Scenario: Remote host unreachable at launch
 - **WHEN** Brindle quit with a tab on `A8`, and `A8` can't be reached at the next launch

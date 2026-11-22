@@ -847,6 +847,10 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         log!("session {id}: exited ({code:?})");
+        // Whatever happens to the session, a replay of it now (one kept for
+        // its owner, or one a client is still waiting for) shows no
+        // contexts: the program that announced them is gone.
+        session.screen.process_exited(id);
         match policy::exit_fate(&session.ownership, &session.life) {
             ExitFate::KeepForOwner => return session.life.exited(code),
             ExitFate::Report => {}

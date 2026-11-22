@@ -1,5 +1,14 @@
 //! Shell integration (OSC 133): prompt jumps, failed-command marks and
-//! last-output selection, in local tabs.
+//! last-output selection, in local tabs. VS Code's OSC 633: its marks, a
+//! reported command line copied with Copy Last Command Line, and its
+//! directory report (in a container tab, where a new tab starts in the
+//! reported directory); Copy Last Command Line listed in the palette only
+//! after a prompt mark; and each shipped script reporting its command lines.
+//!
+//! What Copy Last Command Line put on the clipboard is read back by pasting
+//! it into a bash `read` in the tab ([`Clip`]), which saves it to a file.
+
+use std::path::PathBuf;
 
 use crate::brindle::{Output, Run, theme};
 use crate::capture::{Cells, PxRect};
@@ -133,5 +142,272 @@ pub fn clear_up_down(ctx: &Ctx) -> Result<Outcome> {
          it ends {tail:?} (starts {:?})",
         screen.first()
     );
+    Ok(Outcome::Pass)
+}
+
+// ---- OSC 633 ----------------------------------------------------------------------
+
+/// The clipboard, read back: a bash script typed into the tab, which waits
+/// for a paste ended by GS (`\x1d`, an ordinary byte to a tty, which then
+/// passes it on with the line) and saves what it read to a file.
+pub(super) struct Clip {
+    name: &'static str,
+    script: PathBuf,
+    file: PathBuf,
+}
+
+/// GS: what ends the paste [`Clip`]'s script reads.
+const PASTE_END: char = '\u{1d}';
+
+impl Clip {
+    pub(super) fn new(ctx: &Ctx, name: &'static str) -> Result<Self> {
+        let file = ctx.dir.join(format!("{name}.txt"));
+        let script = ctx.dir.join(format!("{name}.sh"));
+        let _ = std::fs::remove_file(&file);
+        // Its markers are printed in pieces, so the line that runs it
+        // doesn't show them.
+        let body = format!(
+            "printf '%s-%s\\n' {name} ready\n\
+             IFS= read -r -d $'\\035' clip\n\
+             printf '%s' \"$clip\" > '{}'\n\
+             printf '%s-%s\\n' {name} saved\n",
+            file.display()
+        );
+        std::fs::write(&script, body).map_err(|e| format!("writing {}: {e}", script.display()))?;
+        Ok(Clip { name, script, file })
+    }
+
+    /// Copy Last Command Line, then the paste into the script, until it has
+    /// saved it.
+    pub(super) fn copy<'a>(&self, run: Run<'a>) -> Run<'a> {
+        self.paste(run.action("copy_last_command"))
+    }
+
+    /// The paste into the script, until it has saved what the clipboard
+    /// held.
+    pub(super) fn paste<'a>(&self, run: Run<'a>) -> Run<'a> {
+        run.send(&format!("bash '{}'\\r", self.script.display()))
+            .wait_for(&format!("{}-ready", self.name))
+            .action("paste")
+            .send(&format!("{PASTE_END}\\r"))
+            .wait_for(&format!("{}-saved", self.name))
+    }
+
+    /// The clipboard held `expected`, and every wait was met.
+    pub(super) fn expect(&self, expected: &str, out: &Output) -> Result {
+        ensure!(
+            out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+            "waits {:?} {:?}; screen {:?}",
+            out.dump.wait_timeouts,
+            out.dump.wait_pending,
+            out.dump.screen
+        );
+        let text = std::fs::read_to_string(&self.file)
+            .map_err(|e| format!("the clipboard wasn't saved to {}: {e}", self.file.display()))?;
+        ensure!(text == expected, "{}: the clipboard held {text:?}, not {expected:?}", self.name);
+        Ok(())
+    }
+}
+
+/// A bash command that prints a whole command with OSC 633 marks, as a
+/// shell would: `$ wrong` on the screen between `B` and `C`, then `E` with
+/// `line` (as it goes in the sequence, escaped, then a nonce), and
+/// `fake-done` after it.
+pub(super) fn fake_633_command(line: &str) -> String {
+    format!(
+        r"printf '\033]633;A\007$ \033]633;B\007wrong\015\012\033]633;E;{line};n0nce\007\033]633;C\007\033]633;D;0\007'; printf 'fake-%s\012' done\r"
+    )
+}
+
+/// A bash prompt that marks itself with OSC 633 only, as VS Code's scripts
+/// do, then the jumps that [`prompt_jump`] makes.
+pub fn marks_633(ctx: &Ctx) -> Result<Outcome> {
+    let setup = r#"PS1='\[\033]633;A\007\]$ \[\033]633;B\007\]'; PS0='\033]633;C\007'; PROMPT_COMMAND='printf "\033]633;D;%s\007" $?'; clear\r"#;
+    let out = Run::new(ctx, "run")
+        .profile("Shell")
+        .send(setup)
+        .send("seq 1 60\\r")
+        .send("seq 61 120\\r")
+        .action("jump_to_previous_prompt")
+        .action("jump_to_previous_prompt")
+        .dump_at(7.0)
+        .run()?;
+    expect_jumped(&out)?;
+    Ok(Outcome::Pass)
+}
+
+/// The line a program reports with `633;E`, decoded, is what Copy Last
+/// Command Line copies, not the screen's text between the marks.
+pub fn copy_line_633(ctx: &Ctx) -> Result<Outcome> {
+    let clip = Clip::new(ctx, "clip")?;
+    let run = Run::new(ctx, "run")
+        .profile("Shell")
+        .send("PS1='$ '; HISTFILE=; clear\\r")
+        .send(&fake_633_command(r"echo copied-$((6*7))\\x3b echo \\\\done"))
+        .wait_for("fake-done");
+    let out = clip.copy(run).dump_at(12.0).run()?;
+    clip.expect(r"echo copied-$((6*7)); echo \done", &out)?;
+    Ok(Outcome::Pass)
+}
+
+/// `633;P;Cwd` sets the directory a new tab on the same endpoint starts
+/// in. Local Linux tabs start in their process's directory, so this runs in
+/// a container tab, whose shell reports a directory it never went to.
+pub fn cwd_633(ctx: &Ctx) -> Result<Outcome> {
+    use super::remote::{CONTAINER_PROMPT, in_container_tab};
+    in_container_tab(ctx, "run", |run| {
+        let out = run
+            .wait_for(CONTAINER_PROMPT)
+            .send(r"mkdir -p '/tmp/a;b'; printf '\033]633;P;Cwd=%s\007' '/tmp/a\x3bb'; printf 'cwd-%s\012' set\r")
+            .wait_for("cwd-set")
+            .action("new_tab")
+            .wait_for(CONTAINER_PROMPT)
+            .send(r"printf 'pwd-%s:' is; pwd\r")
+            .wait_for("pwd-is:/")
+            .dump_at(20.0)
+            .run()?;
+        ensure!(out.dump.wait_timeouts.is_empty(), "waits {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+        ensure!(out.dump.tabs.len() == 2, "tabs: {:?}", out.dump.tabs);
+        ensure!(
+            out.dump.screen.iter().any(|l| l == "pwd-is:/tmp/a;b"),
+            "the new tab didn't start in the reported directory: {:?}",
+            out.dump.screen
+        );
+        Ok(Outcome::Pass)
+    })
+}
+
+/// Whether `program` is on `PATH`.
+fn installed(program: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+/// Brindle's bash script reports a line from history: Copy Last Command
+/// Line gets it, `;` and `\` included. With `HISTCONTROL=ignoreboth` a
+/// command typed after a space adds no entry, so none is sent, and the copy
+/// is the screen's text between the marks: `ls -d /`, not the `echo make`
+/// before it.
+pub fn script_line_bash(ctx: &Ctx) -> Result<Outcome> {
+    let (first, second) = (Clip::new(ctx, "first")?, Clip::new(ctx, "second")?);
+    let run = Run::new(ctx, "run")
+        .profile("Shell")
+        .send(&format!("HISTFILE=; {}", setup(ctx)))
+        .send(r#"echo "a;b" 'c\d'\r"#);
+    let run = first.copy(run).send("HISTCONTROL=ignoreboth\\r").send("echo make\\r").send(" ls -d /\\r");
+    let out = second.copy(run).dump_at(20.0).run()?;
+    first.expect(r#"echo "a;b" 'c\d'"#, &out)?;
+    second.expect("ls -d /", &out)?;
+    Ok(Outcome::Pass)
+}
+
+/// Brindle's zsh script reports the line as typed: without the right
+/// prompt the screen shows beside it, and a command continued onto a
+/// second line with both lines.
+pub fn script_line_zsh(ctx: &Ctx) -> Result<Outcome> {
+    if !installed("zsh") {
+        return Ok(Outcome::Skip("zsh isn't installed".into()));
+    }
+    let (first, second) = (Clip::new(ctx, "first")?, Clip::new(ctx, "second")?);
+    let setup =
+        format!("PS1='$ '; RPROMPT='right-prompt'; eval \"$({} --shell-integration zsh)\"; clear\\r", ctx.bin.display());
+    let run = Run::new(ctx, "run").command(&["zsh", "-f"]).send(&setup).send("ls -la /\\r");
+    // `\\r` after a backslash: the line ends `one \`, and Enter continues it.
+    let run = first.copy(run).send(r"echo one \\rtwo\r");
+    let out = second.copy(run).dump_at(18.0).run()?;
+    first.expect("ls -la /", &out)?;
+    second.expect("echo one \\\ntwo", &out)?;
+    ensure!(
+        out.dump.screen.iter().any(|l| l.ends_with("right-prompt")),
+        "no right prompt on the screen: {:?}",
+        out.dump.screen
+    );
+    Ok(Outcome::Pass)
+}
+
+/// Brindle's fish script, which sends no `B`, reports the line: the only
+/// way Copy Last Command Line gets it.
+pub fn script_line_fish(ctx: &Ctx) -> Result<Outcome> {
+    if !installed("fish") {
+        return Ok(Outcome::Skip("fish isn't installed".into()));
+    }
+    let clip = Clip::new(ctx, "clip")?;
+    // fish keeps its universal variables under these; not the user's.
+    let config = format!("XDG_CONFIG_HOME={}", ctx.dir.join("fish-config").display());
+    let data = format!("XDG_DATA_HOME={}", ctx.dir.join("fish-data").display());
+    let setup =
+        format!("function fish_prompt; echo -n '$ '; end; {} --shell-integration fish | source; clear\\r", ctx.bin.display());
+    let run = Run::new(ctx, "run")
+        .command(&["env", &config, &data, "fish", "--no-config"])
+        .send(&setup)
+        .send(r#"echo "a;b"\r"#);
+    let out = clip.copy(run).dump_at(12.0).run()?;
+    clip.expect(r#"echo "a;b""#, &out)?;
+    Ok(Outcome::Pass)
+}
+
+/// The palette's rows (its header first) for the filter `last command`,
+/// after `line` ran in a bash tab that then printed `gate-ready`. The
+/// marker is printed in pieces, so the line that runs it doesn't show it.
+fn last_command_rows(ctx: &Ctx, label: &'static str, line: &str) -> Result<Vec<String>> {
+    let out = Run::new(ctx, label)
+        .profile("Shell")
+        .send(&format!("{line}printf '%s-%s\\012' gate ready\\r"))
+        .wait_for("gate-ready")
+        .action("open_command_palette")
+        .send("last command")
+        .dump_after_last_step(1.0) // one step interval, Brindle's own
+        .run()?;
+    ensure!(
+        out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+        "{label}: waits {:?} {:?}",
+        out.dump.wait_timeouts,
+        out.dump.wait_pending
+    );
+    ensure!(
+        out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"last command\" ")),
+        "{label}: palette {:?}",
+        out.dump.palette
+    );
+    Ok(out.dump.palette)
+}
+
+/// Whether a palette row starts with `title`.
+fn listed(rows: &[String], title: &str) -> bool {
+    rows.iter().any(|row| row.starts_with(title))
+}
+
+/// The three commands on the last command's line and output are in the
+/// palette only once the terminal has sent a prompt mark: a bash tab with no
+/// integration lists none of them, and the same tab lists them after a
+/// printed `A` mark.
+pub fn palette_gating_633(ctx: &Ctx) -> Result<Outcome> {
+    const TITLES: [&str; 3] = ["Copy Last Command Line", "Select Last Command Output", "Copy Last Command Output"];
+    let rows = last_command_rows(ctx, "plain", "PS1='$ '; clear; ")?;
+    ensure!(!TITLES.iter().any(|title| listed(&rows, title)), "listed with no prompt mark: {rows:?}");
+    let rows = last_command_rows(ctx, "marked", r"PS1='$ '; clear; printf '\033]133;A\007'; ")?;
+    ensure!(TITLES.iter().all(|title| listed(&rows, title)), "not all listed after a prompt mark: {rows:?}");
+    Ok(Outcome::Pass)
+}
+
+/// Without shell integration the output commands aren't in the palette, and
+/// `copy_last_output` does nothing: a clipboard another program set (OSC 52
+/// here) is as it was, read back by pasting it into a script. With
+/// integration loaded, Select and Copy Last Command Output are listed.
+pub fn palette_output_hidden_without_integration(ctx: &Ctx) -> Result<Outcome> {
+    let rows = last_command_rows(ctx, "plain", "PS1='$ '; clear; ")?;
+    for title in ["Select Last Command Output", "Copy Last Command Output"] {
+        ensure!(!listed(&rows, title), "{title} is listed without integration: {rows:?}");
+    }
+
+    let clip = Clip::new(ctx, "clip")?;
+    let set = r"PS1='$ '; clear; printf '\033]52;c;%s\007' $(printf '%s' unchanged-42 | base64); printf '%s-%s\012' set done\r";
+    let run = Run::new(ctx, "inert").profile("Shell").send(set).wait_for("set-done").action("copy_last_output");
+    let out = clip.paste(run).dump_at(14.0).run()?;
+    clip.expect("unchanged-42", &out)?;
+
+    let rows = last_command_rows(ctx, "integrated", &format!("{}; ", setup(ctx).trim_end_matches("\\r")))?;
+    for title in ["Select Last Command Output", "Copy Last Command Output"] {
+        ensure!(listed(&rows, title), "{title} isn't listed with integration: {rows:?}");
+    }
     Ok(Outcome::Pass)
 }

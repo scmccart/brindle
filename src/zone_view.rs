@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardHeader, ContextMenuTarget as _, Icon, Modality,
-    Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardHeader, ContextMenuTarget as _, EdgeBar, Icon,
+    Modality, Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -23,7 +23,9 @@ use crate::config::{Config, Profile};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
-use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
+use crate::terminal::context::{Badge, BadgeKind};
+use crate::terminal::process::LOCAL_PATH_STYLE;
+use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
@@ -337,6 +339,86 @@ pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
     out
 }
 
+/// How a context badge is drawn on a tab face or a zone header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BadgeDraw {
+    /// A warning icon, its label in the tooltip.
+    Icon,
+    /// The label as text.
+    Text,
+}
+
+impl BadgeDraw {
+    /// The user's call: "a warning icon, follow the theme's color, no name
+    /// needed" for an elevation or privilege change; the other contexts
+    /// (a host, a container, a VM) keep their name.
+    pub fn of(kind: BadgeKind) -> Self {
+        match kind {
+            BadgeKind::Privileged => BadgeDraw::Icon,
+            BadgeKind::Elsewhere => BadgeDraw::Text,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            BadgeDraw::Icon => "icon",
+            BadgeDraw::Text => "text",
+        }
+    }
+}
+
+/// The `brindle-ui` badge a tab face or zone header shows for `badge`, in
+/// `theme` (the face's or header's own, `Theme::badge_color`): a warning
+/// icon whose tooltip names the target user ("Running as root"), or the
+/// label ([`BadgeDraw::of`]).
+pub fn ui_badge(badge: &Badge, theme: &Theme) -> brindle_ui::Badge {
+    let color = theme.badge_color(badge.kind());
+    match BadgeDraw::of(badge.kind()) {
+        BadgeDraw::Icon => {
+            brindle_ui::Badge::icon(Icon::TriangleAlert, color).tooltip(format!("Running as {}", badge.label()))
+        }
+        BadgeDraw::Text => brindle_ui::Badge::new(badge.label().to_owned(), color),
+    }
+}
+
+/// A badge for the dump: `kind=… label="…" draw=icon|text`, the label kept
+/// as data even when only an icon is drawn.
+pub fn describe_badge(badge: &Badge) -> String {
+    format!("{} draw={}", badge.describe(), BadgeDraw::of(badge.kind()).name())
+}
+
+/// Formats `--dump-screen-after` zone badge lines when a tab has 2 or more
+/// zones (`--- badge zone=ID kind=… label="…" draw=…`, the active zone
+/// first, then by id), one per zone whose header shows a badge, or returns
+/// an empty string for a single-zone tab, which has no headers.
+pub fn describe_zone_badges<'a>(zones: impl IntoIterator<Item = (ZoneId, Option<&'a Badge>)>, active: ZoneId) -> String {
+    let mut zones: Vec<(ZoneId, Option<&Badge>)> = zones.into_iter().collect();
+    if zones.len() < 2 {
+        return String::new();
+    }
+    zones.sort_by_key(|(id, _)| (*id != active, id.0));
+    zones
+        .into_iter()
+        .filter_map(|(id, badge)| Some(format!("--- badge zone={} {}\n", id.0, describe_badge(badge?))))
+        .collect()
+}
+
+/// Formats `--dump-screen-after` zone progress lines when a tab has 2 or
+/// more zones (`--- progress zone=ID state=…[ percent=N]`, the active zone
+/// first, then by id), one per zone with progress, or returns an empty
+/// string for a single-zone tab, whose tab line says the same.
+pub fn describe_zone_progress(zones: impl IntoIterator<Item = (ZoneId, Option<Progress>)>, active: ZoneId) -> String {
+    let mut zones: Vec<(ZoneId, Option<Progress>)> = zones.into_iter().collect();
+    if zones.len() < 2 {
+        return String::new();
+    }
+    zones.sort_by_key(|(id, _)| (*id != active, id.0));
+    zones
+        .into_iter()
+        .filter_map(|(id, progress)| Some(format!("--- progress zone={} {}\n", id.0, progress?.describe())))
+        .collect()
+}
+
 fn fmt_unit(v: f64) -> String {
     if v == 0.0 { "0".into() } else { format!("{v}") }
 }
@@ -359,6 +441,11 @@ pub struct Zone {
     pub content: ZoneContent,
     pub title: SharedString,
     pub status: Option<State>,
+    /// Its terminal's progress, cached for its header's bar.
+    pub progress: Option<Progress>,
+    /// Its terminal's context badge, cached for its header and the tab's
+    /// face; both refreshed on its terminal's `Status`.
+    pub badge: Option<Badge>,
     pub last_focused: u64,
     _subscriptions: Vec<Subscription>,
 }
@@ -499,10 +586,14 @@ impl ZoneTreeView {
             terminal_automatic_title(t.title(), &self.profile.name, LOCAL_PATH_STYLE, None).into()
         };
         let status = terminal.read(cx).status().summary();
+        let progress = terminal.read(cx).progress();
+        let badge = terminal.read(cx).badge().cloned();
         let zone = Zone {
             content: ZoneContent::Terminal(view),
             title: initial_title,
             status,
+            progress,
+            badge,
             last_focused: self.focus_serial,
             _subscriptions: vec![focus_in, events, link_failed],
         };
@@ -534,20 +625,20 @@ impl ZoneTreeView {
             TerminalEvent::Exited => {
                 self.close_zone_by_id(id, window, cx);
             }
-            TerminalEvent::Bell | TerminalEvent::Notify(_) => {
+            TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Notify99(_) => {
                 cx.emit(event.clone());
             }
             TerminalEvent::Status(_) => {
                 if let Some(zone) = self.zones.get_mut(&id) {
-                    let status = zone.content.as_terminal_view().read(cx).terminal.read(cx).status().summary();
-                    zone.status = status;
+                    let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
+                    (zone.status, zone.progress) = (terminal.status().summary(), terminal.progress());
+                    zone.badge = terminal.badge().cloned();
                 }
                 cx.emit(event.clone());
                 cx.notify();
             }
             TerminalEvent::TitleChanged => {
-                let mut snapshot = None;
-                let changed = self.refresh_zone_title(id, &mut snapshot, cx);
+                let changed = self.refresh_zone_title(id, cx);
                 if id == self.active {
                     cx.emit(TerminalEvent::TitleChanged);
                 } else if changed {
@@ -637,24 +728,25 @@ impl ZoneTreeView {
     }
 
     /// Refreshes cached zone header titles for all zones in this tab.
-    pub fn refresh_titles(&mut self, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+    pub fn refresh_titles(&mut self, cx: &App) -> bool {
         let ids: Vec<ZoneId> = self.zones.keys().copied().collect();
         let mut any = false;
         for id in ids {
-            any |= self.refresh_zone_title(id, snapshot, cx);
+            any |= self.refresh_zone_title(id, cx);
         }
         any
     }
 
-    fn refresh_zone_title(&mut self, id: ZoneId, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+    fn refresh_zone_title(&mut self, id: ZoneId, cx: &App) -> bool {
         let profile_name = self.profile.name.clone();
         let Some(zone) = self.zones.get_mut(&id) else { return false };
         let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        // The process name costs a look at the processes: only when the
-        // program set no title of its own.
+        // The process name can cost a read of `/proc`: only when the
+        // program set no title of its own. On Windows it is what the title
+        // tick found off the UI thread.
         let process_name = match program_title(terminal.title(), LOCAL_PATH_STYLE) {
             Some(_) => None,
-            None => terminal.foreground_process_name(snapshot),
+            None => terminal.foreground_process_name(),
         };
         let title: SharedString =
             terminal_automatic_title(terminal.title(), &profile_name, LOCAL_PATH_STYLE, process_name).into();
@@ -669,6 +761,30 @@ impl ZoneTreeView {
             .values()
             .filter_map(|z| z.content.as_terminal_view().read(cx).terminal.read(cx).status().summary())
             .max()
+    }
+
+    /// The most pressing progress across all zones in this tab
+    /// ([`progress::most_pressing`]), from the zones' cached values.
+    pub fn progress_summary(&self) -> Option<Progress> {
+        progress::most_pressing(self.zones.values().filter_map(|z| z.progress))
+    }
+
+    /// The zones' progress lines for `--dump-screen-after`
+    /// ([`describe_zone_progress`]).
+    pub fn describe_progress(&self) -> String {
+        describe_zone_progress(self.zones.iter().map(|(id, z)| (*id, z.progress)), self.active)
+    }
+
+    /// The active zone's context badge, from its cached value: what the
+    /// tab's face shows.
+    pub fn active_badge(&self) -> Option<&Badge> {
+        self.zones.get(&self.active).and_then(|z| z.badge.as_ref())
+    }
+
+    /// The zones' badge lines for `--dump-screen-after`
+    /// ([`describe_zone_badges`]).
+    pub fn describe_badges(&self) -> String {
+        describe_zone_badges(self.zones.iter().map(|(id, z)| (*id, z.badge.as_ref())), self.active)
     }
 
     /// Takes the tab's profile as the config now has it (or the settings
@@ -840,10 +956,9 @@ impl ZoneTreeView {
         let terminal = cx.new(|cx| Terminal::spawn(&self.profile, &host, None, cwd, &config, cx));
 
         // Refresh the existing zone's title so its header bar has an up-to-date label.
-        let mut snapshot = None;
-        self.refresh_zone_title(target, &mut snapshot, cx);
+        self.refresh_zone_title(target, cx);
         self.insert_terminal_zone(new_id, terminal, window, cx);
-        self.refresh_zone_title(new_id, &mut snapshot, cx);
+        self.refresh_zone_title(new_id, cx);
         self.active = new_id;
         let focus = self.focus_handle(cx);
         window.focus(&focus);
@@ -1001,6 +1116,11 @@ impl ZoneTreeView {
         // Status dots in the chrome theme's colours, like the strip's.
         let status_color =
             zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
+        // Its progress bar, drawn as the tab's is, from the same colours.
+        let progress_bar = zone.progress.map(|progress| {
+            let (length, color) = Settings::chrome_theme(cx).progress_bar(progress, tokens.muted_foreground);
+            EdgeBar::new(length, color)
+        });
         let title = zone.title.clone();
         let muted = colors.muted.unwrap_or(tokens.muted_foreground);
 
@@ -1048,6 +1168,13 @@ impl ZoneTreeView {
         let mut header = CardHeader::new(("zone-header", id.0 as usize));
         if let Some(color) = status_color {
             header = header.leading(div().flex_none().size(px(6.0)).rounded_full().bg(color));
+        }
+        if let Some(bar) = progress_bar {
+            header = header.edge_bar(bar);
+        }
+        // Its context badge, drawn as the tab face's is.
+        if let Some(badge) = &zone.badge {
+            header = header.badge(ui_badge(badge, &self.theme));
         }
         let header = header
             .title(title)
@@ -1280,6 +1407,78 @@ mod tests {
         assert_eq!(
             describe_zone_tree(&tree, z2),
             "--- zones count=2 active=2\n--- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\n"
+        );
+    }
+
+    /// Zone badge lines: none for one zone (it has no header), else one per
+    /// zone with a badge, the active one first.
+    #[test]
+    fn zone_badge_lines_put_the_active_zone_first() {
+        use crate::terminal::context::{Contexts, parse};
+        let badge = |payload: &[u8]| {
+            let mut contexts = Contexts::default();
+            contexts.apply(parse(payload).unwrap());
+            contexts.notable()
+        };
+        let root = badge(b"start=a;type=elevate;targetuser=root");
+        let web = badge(b"start=c;type=container;container=web");
+        assert_eq!(describe_zone_badges([(ZoneId(1), root.as_ref())], ZoneId(1)), "");
+        let zones = [(ZoneId(3), web.as_ref()), (ZoneId(1), root.as_ref()), (ZoneId(2), None)];
+        assert_eq!(
+            describe_zone_badges(zones, ZoneId(3)),
+            "--- badge zone=3 kind=elsewhere label=\"web\" draw=text\n\
+             --- badge zone=1 kind=privileged label=\"root\" draw=icon\n"
+        );
+        assert_eq!(describe_zone_badges(zones, ZoneId(2)).lines().count(), 2);
+    }
+
+    /// The user's decision: a privileged context is a warning icon in the
+    /// theme's yellow, its target user only in the tooltip; the others keep
+    /// their muted label and have no tooltip. The dump says which.
+    #[test]
+    fn a_privileged_badge_draws_as_a_warning_icon() {
+        use crate::terminal::context::{Contexts, parse};
+        use brindle_ui::BadgeContent;
+        let badge = |payload: &[u8]| {
+            let mut contexts = Contexts::default();
+            contexts.apply(parse(payload).unwrap());
+            contexts.notable().unwrap()
+        };
+        let theme = crate::theme::builtin_theme("tokyo-night").unwrap();
+        let root = badge(b"start=a;type=elevate;targetuser=root");
+        let drawn = ui_badge(&root, &theme);
+        assert_eq!(drawn.content(), &BadgeContent::Icon(Icon::TriangleAlert));
+        assert_eq!(drawn.color(), theme.badge_color(BadgeKind::Privileged));
+        assert_eq!(drawn.tooltip_text().map(|text| text.as_ref()), Some("Running as root"));
+        assert_eq!(describe_badge(&root), "kind=privileged label=\"root\" draw=icon");
+        let chpriv = badge(b"start=b;type=chpriv;targetuser=postgres");
+        assert_eq!(BadgeDraw::of(chpriv.kind()), BadgeDraw::Icon);
+        assert_eq!(ui_badge(&chpriv, &theme).tooltip_text().map(|text| text.as_ref()), Some("Running as postgres"));
+
+        let web = badge(b"start=c;type=container;container=web");
+        let drawn = ui_badge(&web, &theme);
+        assert_eq!(drawn.content(), &BadgeContent::Label("web".into()));
+        assert_eq!(drawn.color(), theme.badge_color(BadgeKind::Elsewhere));
+        assert_eq!(drawn.tooltip_text(), None);
+        assert_eq!(describe_badge(&web), "kind=elsewhere label=\"web\" draw=text");
+    }
+
+    /// Zone progress lines: none for one zone (the tab's line says it),
+    /// else one per zone with progress, the active one first.
+    #[test]
+    fn zone_progress_lines_put_the_active_zone_first() {
+        use crate::terminal::progress::Percent;
+        let normal = Some(Progress::Normal(Percent::clamped(30)));
+        let paused = Some(Progress::Paused(Some(Percent::clamped(70))));
+        assert_eq!(describe_zone_progress([(ZoneId(1), normal)], ZoneId(1)), "");
+        let zones = [(ZoneId(3), paused), (ZoneId(1), normal), (ZoneId(2), None)];
+        assert_eq!(
+            describe_zone_progress(zones, ZoneId(3)),
+            "--- progress zone=3 state=paused percent=70\n--- progress zone=1 state=normal percent=30\n"
+        );
+        assert_eq!(
+            describe_zone_progress(zones, ZoneId(1)),
+            "--- progress zone=1 state=normal percent=30\n--- progress zone=3 state=paused percent=70\n"
         );
     }
 }

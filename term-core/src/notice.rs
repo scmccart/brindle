@@ -8,6 +8,8 @@ pub enum Source {
     Bell,
     Osc9,
     Osc777,
+    /// kitty's desktop notification protocol (OSC 99).
+    Osc99,
     /// A program status record (OSC 7501) that needs the user.
     Osc7501,
 }
@@ -18,6 +20,7 @@ impl Source {
             Source::Bell => "bell",
             Source::Osc9 => "osc9",
             Source::Osc777 => "osc777",
+            Source::Osc99 => "osc99",
             Source::Osc7501 => "osc7501",
         }
     }
@@ -44,6 +47,7 @@ mod tests {
             (Source::Bell, "bell"),
             (Source::Osc9, "osc9"),
             (Source::Osc777, "osc777"),
+            (Source::Osc99, "osc99"),
             (Source::Osc7501, "osc7501"),
         ];
         for (source, name) in names {

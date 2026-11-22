@@ -11,7 +11,7 @@ use gpui::{
     FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
+    Task, WeakEntity, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
 
 mod launch;
@@ -37,7 +37,7 @@ use crate::picker::{
 };
 use crate::settings::Zoom;
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
@@ -47,13 +47,15 @@ use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState};
 use crate::settings::{FontPreview, Settings};
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
-use crate::terminal::process::Snapshot;
+use crate::terminal::process::{self, ElevationCache};
 use crate::terminal::shell_integration::PathStyle;
+use crate::terminal::context::Badge;
+use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
-use crate::terminal::{Terminal, TerminalEvent};
+use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
-use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView};
+use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView, describe_badge, ui_badge};
 
 /// The tab strip's height in logical pixels: the pill tab list's
 /// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default rem,
@@ -93,6 +95,13 @@ pub struct Tab {
     /// The most pressing program status (OSC 7501) across the tab's
     /// terminals; see [`Workspace::refresh_status`].
     pub status: Option<State>,
+    /// The most pressing progress (OSC 9;4) across the tab's terminals,
+    /// drawn as the bar on its face; refreshed with `status`.
+    pub progress: Option<Progress>,
+    /// The active zone's context badge (OSC 3008), drawn after the title on
+    /// its face; refreshed with `status`, and when another zone becomes
+    /// active (the tree's `TitleChanged`).
+    pub badge: Option<Badge>,
     /// A user-chosen label (`Rename Tab`), shown instead of the automatic
     /// title until changed or cleared.
     manual_title: Option<String>,
@@ -119,31 +128,34 @@ impl Tab {
             origin,
             bell: false,
             status: None,
+            progress: None,
+            badge: None,
             manual_title: None,
             title: SharedString::default(),
             _subscriptions: subscriptions,
         };
-        tab.refresh_title(&mut None, cx);
+        tab.refresh_title(cx);
         tab
     }
 
     /// Recomputes the zones' titles, then the tab's: its manual title, else
     /// its active zone's title (the program's own title, else the
     /// foreground process name, else the profile name; see
-    /// [`terminal_automatic_title`]). Returns whether either changed.
-    /// `snapshot` is the processes running, for the foreground name, taken
-    /// only when a title needs it (a program's own title, which can change
-    /// thousands of times a second, never does).
-    fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
-        let zone_changed = self.zones.update(cx, |v, cx| v.refresh_titles(snapshot, cx));
+    /// [`terminal_automatic_title`]). Returns whether either changed. The
+    /// foreground name is read only when a title needs it (a program's own
+    /// title, which can change thousands of times a second, never does),
+    /// and on Windows is what the title tick last found off the UI thread
+    /// ([`Terminal::set_detected`]).
+    fn refresh_title(&mut self, cx: &mut App) -> bool {
+        let zone_changed = self.zones.update(cx, |v, cx| v.refresh_titles(cx));
         let automatic = self.zones.read(cx).active_title();
         let changed = refresh_displayed_title(&mut self.title, self.manual_title.as_deref(), &automatic);
         changed || zone_changed
     }
 
-    fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
+    fn set_manual_title(&mut self, text: &str, cx: &mut App) -> bool {
         self.manual_title = parse_manual_title(text);
-        self.refresh_title(snapshot, cx)
+        self.refresh_title(cx)
     }
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -561,14 +573,36 @@ impl Workspace {
             // Foreground processes change without any event (e.g. `vim`
             // starting), so poll their names gently. The same poll records
             // the window for session restore (directories have no events).
+            // Where a foreground process is found in a look at all
+            // processes (Windows' local sessions), the look and the token
+            // reads for the badge happen off the UI thread, and the
+            // elevations read stay known between looks.
+            let mut elevations = ElevationCache::default();
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let Ok(roots) = this.update(cx, |this, cx| this.detection_roots(cx)) else { break };
+                let found = if roots.is_empty() {
+                    Vec::new()
+                } else {
+                    let pids: Vec<u32> = roots.iter().map(|&(_, pid)| pid).collect();
+                    let (found, kept) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let found = process::detect(&pids, &mut elevations);
+                            (found, elevations)
+                        })
+                        .await;
+                    elevations = kept;
+                    found
+                };
                 let alive = this.update_in(cx, |this, window, cx| {
+                    // One finding per root, in the order gathered.
+                    for ((terminal, root), detected) in roots.into_iter().zip(found) {
+                        terminal.update(cx, |terminal, cx| terminal.set_detected(root, detected, cx)).ok();
+                    }
                     let mut changed = false;
-                    // At most one look at the processes for every tab.
-                    let mut snapshot = None;
                     for tab in &mut this.tabs {
-                        changed |= tab.refresh_title(&mut snapshot, cx);
+                        changed |= tab.refresh_title(cx);
                     }
                     if changed {
                         cx.notify();
@@ -582,6 +616,18 @@ impl Workspace {
         });
         this.open(launch, window, cx);
         this
+    }
+
+    /// The terminals whose foreground process the title tick finds in its
+    /// look at all processes, each with its program's pid
+    /// ([`Terminal::detection_root`]). Gathered on the UI thread, which only
+    /// reads them; none on Linux, and none for a remote session.
+    fn detection_roots(&self, cx: &App) -> Vec<(WeakEntity<Terminal>, u32)> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.zones.read(cx).terminals(cx))
+            .filter_map(|terminal| Some((terminal.downgrade(), terminal.read(cx).detection_root()?)))
+            .collect()
     }
 
     /// Opens what a launch asks for in this window.
@@ -649,7 +695,7 @@ impl Workspace {
                         terminal.update(cx, |terminal, cx| terminal.note(note, cx));
                     }
                     if let Some(title) = title {
-                        tab.set_manual_title(&title, &mut None, cx);
+                        tab.set_manual_title(&title, cx);
                     }
                     if ix == state.active {
                         active_tab = Some(tab.id);
@@ -954,7 +1000,7 @@ impl Workspace {
         if let Some(title) = title
             && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
         {
-            tab.set_manual_title(&title, &mut None, cx);
+            tab.set_manual_title(&title, cx);
         }
     }
 
@@ -1224,12 +1270,29 @@ impl Workspace {
             TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Status(_) => {
                 self.on_attention(ix, event, window, cx)
             }
+            TerminalEvent::Notify99(notify) => match &notify.request {
+                Request99::Show(_) => self.on_attention(ix, event, window, cx),
+                Request99::Close(id) => Notifier::close_program(&notify.terminal, id, cx),
+                Request99::Alive(id) => Notifier::answer_alive(&notify.terminal, id, cx),
+            },
             TerminalEvent::TitleChanged => {
-                if self.tabs[ix].refresh_title(&mut None, cx) {
+                // The tree says so when another zone becomes active, whose
+                // badge the face then shows.
+                if self.tabs[ix].refresh_title(cx) | self.refresh_badge(ix, cx) {
                     cx.notify();
                 }
             }
         }
+    }
+
+    /// Takes tab `ix`'s badge from its active zone's cached one; true when
+    /// it changed.
+    fn refresh_badge(&mut self, ix: usize, cx: &mut Context<Self>) -> bool {
+        let badge = self.tabs[ix].zones.read(cx).active_badge().cloned();
+        let tab = &mut self.tabs[ix];
+        let changed = tab.badge != badge;
+        tab.badge = badge;
+        changed
     }
 
     /// A bell, a notification request or a program status change from tab
@@ -1240,30 +1303,37 @@ impl Workspace {
         if ix >= self.tabs.len() {
             return;
         }
-        let visible = Some(self.tabs[ix].id) == self.strip.active() && window.is_window_active();
-        let (source, title, body) = match event {
+        let active = Some(self.tabs[ix].id) == self.strip.active();
+        let visible = active && window.is_window_active();
+        let always = notify::kitty::Occasion::Always;
+        let (source, title, body, occasion, program) = match event {
             TerminalEvent::Bell => {
                 if !visible {
                     self.tabs[ix].bell = true;
                     cx.notify();
                 }
-                (Source::Bell, "", "")
+                (Source::Bell, "", "", always, None)
             }
-            TerminalEvent::Notify(notice) => (notice.source, notice.title.as_str(), notice.body.as_str()),
+            TerminalEvent::Notify(notice) => (notice.source, notice.title.as_str(), notice.body.as_str(), always, None),
+            TerminalEvent::Notify99(notify) => {
+                let Request99::Show(notice) = &notify.request else { return };
+                let program = notify::ProgramNotice { terminal: notify.terminal.clone(), program: notice.program.clone() };
+                (Source::Osc99, notice.title.as_str(), notice.body.as_str(), notice.occasion, Some(program))
+            }
             TerminalEvent::Status(notice) => {
                 self.refresh_status(ix, cx);
                 let Some(notice) = notice else { return };
-                (notice.source, notice.title.as_str(), notice.body.as_str())
+                (notice.source, notice.title.as_str(), notice.body.as_str(), always, None)
             }
             TerminalEvent::TitleChanged | TerminalEvent::Exited => return,
         };
-        if !notify::policy::wanted(&Self::settings(cx).notifications, source, visible) {
+        if !notify::policy::wanted(&Self::settings(cx).notifications, source, occasion, visible, active) {
             return;
         }
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
         let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
-        let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0 };
+        let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0, program };
         Notifier::send(request, cx);
     }
 
@@ -1272,8 +1342,11 @@ impl Workspace {
     /// records do (a new report, a new prompt, the user typing).
     fn refresh_status(&mut self, ix: usize, cx: &mut Context<Self>) {
         let status = self.tabs[ix].status_summary(cx);
-        if self.tabs[ix].status != status {
-            self.tabs[ix].status = status;
+        let progress = self.tabs[ix].zones.read(cx).progress_summary();
+        let badge = self.refresh_badge(ix, cx);
+        let tab = &mut self.tabs[ix];
+        if (tab.status, tab.progress) != (status, progress) || badge {
+            (tab.status, tab.progress) = (status, progress);
             cx.notify();
         }
     }
@@ -1466,7 +1539,7 @@ impl Workspace {
         let submit: SubmitFn = Rc::new(move |text, cx| {
             this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id)
-                    && tab.set_manual_title(&text, &mut None, cx)
+                    && tab.set_manual_title(&text, cx)
                 {
                     cx.notify();
                 }
@@ -1632,8 +1705,15 @@ impl Workspace {
         let types: std::collections::HashSet<std::any::TypeId> =
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
         // The palette lists what the tab can run: GPUI's answer, applied.
+        let facts = PaletteFacts {
+            prompt_marks: self
+                .active_tab()
+                .and_then(|t| t.active_terminal(cx))
+                .is_some_and(|t| t.read(cx).has_prompt_marks()),
+        };
         let commands: Vec<_> = palette_commands()
             .into_iter()
+            .filter(|(_, a)| palette_lists(&**a, facts))
             .filter(|(_, a)| types.contains(&a.as_any().type_id()) || window.is_action_available(&**a, cx))
             .collect();
         let rows = commands
@@ -2102,9 +2182,8 @@ impl Workspace {
                 tab.profile = profile;
             }
         }
-        let mut snapshot = None;
         for tab in &mut self.tabs {
-            tab.refresh_title(&mut snapshot, cx);
+            tab.refresh_title(cx);
         }
         self.apply_tab_themes(cx);
         // The reload made new settings, without the notices.
@@ -2140,12 +2219,13 @@ impl Workspace {
         }
     }
 
-    /// Debug hook for `--hover` / `--click`: mouse events for a cell of the
-    /// active terminal, through its own handlers.
+    /// Debug hook for `--hover` / `--click` / `--right-click` / `--press` /
+    /// `--release`: mouse events for a cell of the active terminal, through
+    /// its own handlers.
     pub fn debug_pointer(&mut self, step: &PointerStep, window: &mut Window, cx: &mut Context<Self>) {
         match self.active_tab().and_then(|t| t.active_view(cx)) {
             Some(view) => view.update(cx, |view, cx| view.debug_pointer(step, window, cx)),
-            None => log::error!("--hover/--click: no active terminal"),
+            None => log::error!("--hover/--click/--right-click/--press/--release: no active terminal"),
         }
     }
 
@@ -2182,13 +2262,31 @@ impl Workspace {
             }
             out.push_str(&describe_fonts(cx));
             let view = self.active_tab().and_then(|t| t.active_view(cx));
-            if let Some(link) = view.and_then(|v| v.read(cx).hovered_link.clone()) {
+            if let Some(link) = view.as_ref().and_then(|v| v.read(cx).hovered_link.clone()) {
                 out.push_str(&format!("--- link {}\n", link.uri));
             }
             if let Some(text) = terminal.selection_text() {
                 out.push_str(&format!("--- selection {text:?}\n"));
             }
             out.push_str(&terminal.status().describe());
+            out.push_str(&terminal.contexts().describe());
+            out.push_str(&terminal.pointer().describe(terminal.pointer_screen()));
+            // The pointer the grid's last painted frame chose, so a check
+            // sees what the frame set, not what the state would choose now.
+            if let Some(style) = view.as_ref().and_then(|v| v.read(cx).shown_pointer()) {
+                out.push_str(&format!("--- grid-pointer {}\n", crate::terminal::pointer::css_name(style)));
+            }
+            out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_progress());
+            }
+            out.push_str(&describe_tab_badges(self.tabs.iter().map(|tab| tab.badge.as_ref())));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_badges());
+            }
+            if let Some(view) = view.as_ref() {
+                out.push_str(&view.read(cx).describe_feedback(std::time::Instant::now()));
+            }
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
@@ -2279,6 +2377,11 @@ impl Workspace {
         let global = Settings::chrome_theme(cx).clone();
         let status_color = |state: State| global.status_color(state, tokens.muted_foreground);
         let dot = |color: Hsla| div().flex_none().size(px(6.0)).rounded_full().bg(color);
+        // Progress bars take the same theme's colours as the dots.
+        let progress_bar = |progress: Progress| {
+            let (length, color) = global.progress_bar(progress, tokens.muted_foreground);
+            EdgeBar::new(length, color)
+        };
 
         // A tooltip naming a control and the key bound to its action in this
         // window, looked up when the tooltip is shown (a rebound key shows
@@ -2300,11 +2403,21 @@ impl Workspace {
                     .close_tooltip(close_tip.clone())
                     .surface(surface)
                     .text_color(text);
+                // The status and bell dots lead the face, before its title.
                 if let Some(state) = tab.status {
-                    trigger = trigger.adornment(dot(status_color(state)));
+                    trigger = trigger.leading(dot(status_color(state)));
                 }
                 if tab.bell {
-                    trigger = trigger.adornment(dot(tokens.primary));
+                    trigger = trigger.leading(dot(tokens.primary));
+                }
+                if let Some(progress) = tab.progress {
+                    trigger = trigger.edge_bar(progress_bar(progress));
+                }
+                // The face's own theme colours its badge, as it does the
+                // face: a yellow warning icon for an elevation, its muted
+                // text otherwise.
+                if let Some(badge) = &tab.badge {
+                    trigger = trigger.badge(ui_badge(badge, &tab.zones.read(cx).theme));
                 }
                 trigger
             })
@@ -2851,6 +2964,26 @@ fn describe_fonts(cx: &App) -> String {
 /// the text escaped onto one line, or nothing when the window shows none.
 fn describe_config(line: Option<&str>) -> String {
     line.map_or_else(String::new, |line| format!("--- config {line:?}\n"))
+}
+
+/// The tabs' bars, for `--dump-screen-after`: `--- progress tab=N
+/// state=…[ percent=N]` for each tab whose face shows one, numbered from 1
+/// as the `--- tab` lines are.
+fn describe_tab_progress(tabs: impl IntoIterator<Item = Option<Progress>>) -> String {
+    tabs.into_iter()
+        .enumerate()
+        .filter_map(|(ix, progress)| Some(format!("--- progress tab={} {}\n", ix + 1, progress?.describe())))
+        .collect()
+}
+
+/// The tabs' context badges, for `--dump-screen-after`: `--- badge tab=N
+/// kind=… label="…" draw=icon|text` for each tab whose face shows one,
+/// numbered from 1 as the `--- tab` lines are.
+fn describe_tab_badges<'a>(tabs: impl IntoIterator<Item = Option<&'a Badge>>) -> String {
+    tabs.into_iter()
+        .enumerate()
+        .filter_map(|(ix, badge)| Some(format!("--- badge tab={} {}\n", ix + 1, describe_badge(badge?))))
+        .collect()
 }
 
 /// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
@@ -3551,6 +3684,26 @@ mod tests {
             "--- menu items=Shell|[Off]|-|htop highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\nhtop\n"
         );
         assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|htop highlighted=3\n"));
+    }
+
+    #[test]
+    fn tab_badge_lines_name_the_tabs_with_a_badge() {
+        use crate::terminal::context::{Contexts, parse};
+        let mut contexts = Contexts::default();
+        contexts.apply(parse(b"start=a;type=remote;targetuser=me;targethost=box").unwrap());
+        let badge = contexts.notable();
+        assert_eq!(describe_tab_badges([None, None]), "");
+        assert_eq!(describe_tab_badges([None, badge.as_ref()]), "--- badge tab=2 kind=elsewhere label=\"me@box\" draw=text\n");
+    }
+
+    #[test]
+    fn tab_progress_lines_name_the_tabs_with_a_bar() {
+        use crate::terminal::progress::Percent;
+        assert_eq!(describe_tab_progress([None, None]), "");
+        assert_eq!(
+            describe_tab_progress([None, Some(Progress::Normal(Percent::clamped(25))), Some(Progress::Indeterminate)]),
+            "--- progress tab=2 state=normal percent=25\n--- progress tab=3 state=indeterminate\n"
+        );
     }
 
     #[test]

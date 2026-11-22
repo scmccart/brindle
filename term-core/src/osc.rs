@@ -1,7 +1,11 @@
 //! Finds the sequences Brindle acts on beside alacritty's parser, which
-//! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
-//! program status reports, and the OSC 133 `A` prompt starts and `ESC c`
-//! resets that end status records.
+//! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, kitty's
+//! OSC 99 notification chunks, OSC 7501
+//! program status reports, ConEmu's `OSC 9 ; 4` progress reports, UAPI.15's
+//! `OSC 3008` context starts and ends, `OSC 22` pointer shapes (xterm's,
+//! with kitty's stack and queries), and the OSC 133 (and VS Code's OSC
+//! 633) `A` prompt starts and `ESC c` resets that end status records and
+//! progress (but not contexts).
 //!
 //! The scanner keeps its state between calls, so a sequence split across
 //! reads is still found, and it never buffers anything but the payload of
@@ -9,21 +13,53 @@
 
 pub use crate::{Notice, Source};
 
+use crate::context;
+use crate::kitty;
+use crate::pointer;
+use crate::progress::{self, Progress, Report};
 use crate::status::{self, Message};
 
 /// What the scanner found.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
     Notice(Notice),
+    /// One chunk of kitty's `OSC 99` notification protocol: part of a
+    /// notification, a close, or a query. The client puts the parts
+    /// together; the server's emulator ignores it.
+    Kitty(kitty::Chunk),
     /// An OSC 7501 report, clear or query.
     Status(Message),
-    /// OSC 133 `A`: a new shell prompt begins.
+    /// An `OSC 9 ; 4` progress report.
+    Progress(Report),
+    /// An `OSC 3008` context start or end.
+    Context(context::Message),
+    /// An `OSC 22` pointer shape set, push, pop or query. It acts on the
+    /// screen active where it sits in the stream, which the scanner doesn't
+    /// know: the reader tags it ([`crate::pointer::Screen`]).
+    Pointer(pointer::Op),
+    /// OSC 133 `A` (or OSC 633 `A`): a new shell prompt begins.
     PromptStart,
     /// `ESC c`: a full reset.
     Reset,
 }
 
-/// Payloads longer than this are ignored.
+impl Found {
+    /// A terminal's progress once this find is applied to `current`: a
+    /// report replaces it, a new prompt and a full reset drop it, anything
+    /// else keeps it. The client and the server's emulator both use it, so
+    /// their progress follows the stream alike (a program's exit, which no
+    /// find marks, drops it too).
+    pub fn progress_after(&self, current: Option<Progress>) -> Option<Progress> {
+        match self {
+            Found::Progress(report) => progress::apply(current, *report),
+            Found::PromptStart | Found::Reset => None,
+            Found::Notice(_) | Found::Kitty(_) | Found::Status(_) | Found::Context(_) | Found::Pointer(_) => current,
+        }
+    }
+}
+
+/// Payloads longer than this are ignored (OSC 99's may be longer:
+/// [`kitty::MAX_BODY`]).
 pub const MAX_PAYLOAD: usize = 4096;
 /// Longest title and body shown, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
@@ -128,7 +164,10 @@ impl Scanner {
                 }
                 b';' => {
                     // Written as the number is: `0009` isn't 9.
-                    let wanted = matches!((self.number, self.digits), (9, 1) | (777, 3) | (133, 3) | (7501, 4));
+                    let wanted = matches!(
+                        (self.number, self.digits),
+                        (9, 1) | (22 | 99, 2) | (777, 3) | (133 | 633, 3) | (7501 | 3008, 4)
+                    );
                     self.payload.clear();
                     self.overflow = false;
                     self.state = State::Payload { collect: wanted };
@@ -163,7 +202,9 @@ impl Scanner {
             _ => {
                 self.state = State::Payload { collect };
                 if collect {
-                    if self.payload.len() < MAX_PAYLOAD {
+                    // OSC 99 limits its payload, not its metadata with it.
+                    let limit = if self.number == 99 { kitty::MAX_BODY } else { MAX_PAYLOAD };
+                    if self.payload.len() < limit {
                         self.payload.push(byte);
                     } else {
                         self.overflow = true;
@@ -180,18 +221,25 @@ impl Scanner {
         }
         let payload = std::mem::take(&mut self.payload);
         match self.number {
-            9 => parse_osc9(&payload).map(Found::Notice),
+            9 => progress::parse(&payload)
+                .map(Found::Progress)
+                .or_else(|| parse_osc9(&payload).map(Found::Notice)),
+            22 => pointer::parse(&payload).map(Found::Pointer),
+            99 => kitty::parse(&payload).map(Found::Kitty),
             777 => parse_osc777(&payload).map(Found::Notice),
-            // `133;A` may carry options after a `;`.
-            133 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
+            // `133;A` (or VS Code's `633;A`) may carry options after a `;`.
+            133 | 633 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
             7501 => status::parse(&payload).map(Found::Status),
+            3008 => context::parse(&payload).map(Found::Context),
             _ => None,
         }
     }
 }
 
 /// `OSC 9 ; <message>`. ConEmu uses `OSC 9 ; <1-12> [; ...]` for commands
-/// (progress, working directory, ...), which are not messages.
+/// (progress, working directory, ...), which are not messages; the
+/// scanner reads `4` as progress ([`progress::parse`]) first, and the
+/// others are ignored.
 pub fn parse_osc9(payload: &[u8]) -> Option<Notice> {
     let text = String::from_utf8_lossy(payload);
     let first = text.split(';').next().unwrap_or("");
@@ -317,7 +365,9 @@ mod tests {
 
     #[test]
     fn conemu_subcommands_are_not_messages() {
-        for seq in ["4;1;50", "4;0", "9;/home/me", "1;100", "12", "2;box", "3;tab"] {
+        // `4;…` with a known state is progress (below); the rest are not
+        // messages.
+        for seq in ["4", "4;", "4;7;50", "4;x", "9;/home/me", "1;100", "12", "2;box", "3;tab"] {
             assert!(scan(format!("\x1b]9;{seq}\x07").as_bytes()).is_empty(), "{seq}");
         }
         assert_eq!(scan(b"\x1b]9;42\x07"), [osc9("42")]);
@@ -325,6 +375,198 @@ mod tests {
         assert_eq!(scan(b"\x1b]9;3 files copied\x07"), [osc9("3 files copied")]);
         assert_eq!(scan(b"\x1b]9;a;b\x07"), [osc9("a;b")]);
         assert!(scan(b"\x1b]9;\x07").is_empty());
+    }
+
+    fn normal(percent: u64) -> Found {
+        Found::Progress(Report::Set(progress::Reported::Normal(Some(progress::Percent::clamped(percent)))))
+    }
+
+    #[test]
+    fn progress_reports_with_either_terminator() {
+        assert_eq!(scan(b"\x1b]9;4;1;30\x07"), [normal(30)]);
+        assert_eq!(scan(b"\x1b]9;4;1;30\x1b\\"), [normal(30)]);
+        assert_eq!(scan(b"\x1b]9;4;0\x07"), [Found::Progress(Report::Clear)]);
+        assert_eq!(
+            scan(b"\x1b]9;4;3\x07"),
+            [Found::Progress(Report::Set(progress::Reported::Indeterminate))]
+        );
+        // `9;4` is progress, `9;9` a directory (shell integration's), and
+        // `9;42` a message.
+        assert_eq!(scan(b"\x1b]9;4;1;5\x07\x1b]9;9;/home\x07\x1b]9;42\x07"), [normal(5), osc9("42")]);
+    }
+
+    #[test]
+    fn a_progress_report_split_at_every_byte_is_found_once() {
+        let input = b"a\x1b]9;4;1;30\x07b\x1b]9;4;2\x1b\\";
+        let error = Found::Progress(Report::Set(progress::Reported::Error(None)));
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, [normal(30), error.clone()], "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_progress_report_is_ignored() {
+        assert!(scan(b"\x1b]9;4;1;30\x18").is_empty());
+        assert!(scan(b"\x1b]9;4;1;30\x1a").is_empty());
+        assert!(scan(b"\x1b]9;4;1;30\x1b[0m").is_empty());
+        assert_eq!(scan(b"\x1b]9;4;1;10\x1b]9;4;1;20\x07"), [normal(20)]);
+    }
+
+    #[test]
+    fn progress_follows_reports_prompts_and_resets() {
+        let fold = |bytes: &[u8]| scan(bytes).iter().fold(None, |current, found| found.progress_after(current));
+        let p = |n| Some(Progress::Normal(progress::Percent::clamped(n)));
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07"), p(40));
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]133;A\x07"), None);
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]633;A\x07"), None);
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1bc"), None);
+        // Notices, status reports and other marks leave it.
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]9;hi\x07\x1b]7501;state=working\x07\x1b]133;B\x07"), p(40));
+        // A report after the prompt sets it again.
+        assert_eq!(fold(b"\x1b]133;A\x07\x1b]9;4;1;7\x07"), p(7));
+        // A context start leaves it.
+        assert_eq!(fold(b"\x1b]9;4;1;40\x07\x1b]3008;start=a\x07"), p(40));
+    }
+
+    fn context(payload: &[u8]) -> Found {
+        Found::Context(crate::context::parse(payload).unwrap())
+    }
+
+    #[test]
+    fn context_sequences_with_either_terminator() {
+        assert_eq!(
+            scan(b"\x1b]3008;start=a1;type=elevate;targetuser=root\x1b\\"),
+            [context(b"start=a1;type=elevate;targetuser=root")]
+        );
+        assert_eq!(scan(b"\x1b]3008;end=a1\x07"), [context(b"end=a1")]);
+        // Not first, a bad id, or the number not written as is: nothing.
+        assert!(scan(b"\x1b]3008;type=elevate;start=a1\x1b\\").is_empty());
+        assert!(scan(b"\x1b]3008;start=\x07").is_empty());
+        assert!(scan(b"\x1b]03008;start=a\x07\x1b]300;start=a\x07").is_empty());
+        // The scanner never changes the grid: it only reports.
+        assert_eq!(scan(b"a\x1b]3008;start=b\x07c"), [context(b"start=b")]);
+    }
+
+    #[test]
+    fn a_context_sequence_split_at_every_byte_is_found_once() {
+        let input = b"x\x1b]3008;start=c1;type=container;container=web\\x3bdb\x1b\\y\x1b]3008;end=c1\x07";
+        let want = [context(b"start=c1;type=container;container=web\\x3bdb"), context(b"end=c1")];
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, want, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_or_over_long_context_sequence_is_ignored() {
+        assert!(scan(b"\x1b]3008;start=a\x18").is_empty());
+        assert!(scan(b"\x1b]3008;start=a\x1a").is_empty());
+        assert!(scan(b"\x1b]3008;start=a\x1b[0m").is_empty());
+        let mut big = b"\x1b]3008;start=a;comm=".to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAX_PAYLOAD));
+        big.push(BEL);
+        big.extend_from_slice(b"\x1b]3008;start=b\x07");
+        assert_eq!(scan(&big), [context(b"start=b")]);
+    }
+
+    fn pointer(body: &[u8]) -> Found {
+        Found::Pointer(crate::pointer::parse(body).unwrap())
+    }
+
+    #[test]
+    fn pointer_sequences_with_either_terminator() {
+        assert_eq!(scan(b"\x1b]22;>pointer\x1b\\"), [pointer(b">pointer")]);
+        assert_eq!(scan(b"\x1b]22;crosshair\x07"), [pointer(b"crosshair")]);
+        // The empty body is a set of "no shape", and a pop and a query
+        // are found too.
+        assert_eq!(scan(b"\x1b]22;\x1b\\\x1b]22;<\x07\x1b]22;?__current__\x07"), [
+            pointer(b""),
+            pointer(b"<"),
+            pointer(b"?__current__")
+        ]);
+        // Nothing Brindle shows, or the number not written as is: nothing.
+        assert!(scan(b"\x1b]22;zoom-in\x07\x1b]22;>wait\x07").is_empty());
+        assert!(scan(b"\x1b]022;pointer\x07\x1b]2;pointer\x07\x1b]222;pointer\x07\x1b]22\x07").is_empty());
+        // Among other output, and other progress-keeping finds.
+        assert_eq!(scan(b"a\x1b]22;>grab\x07b"), [pointer(b">grab")]);
+        assert_eq!(pointer(b">grab").progress_after(None), None);
+    }
+
+    #[test]
+    fn a_pointer_sequence_split_at_every_byte_is_found_once() {
+        let input = b"x\x1b]22;>pointer,crosshair\x1b\\y\x1b]22;?pointer,wait\x07z\x1b]22;\x1b\\";
+        let want = [pointer(b">pointer,crosshair"), pointer(b"?pointer,wait"), pointer(b"")];
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, want, "split at {split}");
+        }
+        // The offsets point just past each terminator.
+        let positions: Vec<usize> = Scanner::new().scan_positions(input).into_iter().map(|(at, _)| at).collect();
+        assert_eq!(positions, [26, 46, 54]);
+    }
+
+    #[test]
+    fn a_cancelled_or_over_long_pointer_sequence_is_ignored() {
+        assert!(scan(b"\x1b]22;>pointer\x18").is_empty());
+        assert!(scan(b"\x1b]22;>pointer\x1a").is_empty());
+        assert!(scan(b"\x1b]22;>pointer\x1b[0m").is_empty());
+        assert_eq!(scan(b"\x1b]22;>grab\x1b]22;>copy\x07"), [pointer(b">copy")]);
+        let mut big = b"\x1b]22;?".to_vec();
+        big.extend(std::iter::repeat_n(b'a', MAX_PAYLOAD));
+        big.push(BEL);
+        big.extend_from_slice(b"\x1b]22;>text\x07");
+        assert_eq!(scan(&big), [pointer(b">text")]);
+    }
+
+    fn kitty(body: &[u8]) -> Found {
+        Found::Kitty(crate::kitty::parse(body).unwrap())
+    }
+
+    #[test]
+    fn kitty_chunks_with_either_terminator() {
+        assert_eq!(scan(b"\x1b]99;;Hello world\x1b\\"), [kitty(b";Hello world")]);
+        assert_eq!(scan(b"\x1b]99;i=1:d=0;Hello\x07"), [kitty(b"i=1:d=0;Hello")]);
+        // The U+2028 between button labels survives the scanner.
+        assert_eq!(scan("\x1b]99;p=buttons;A\u{2028}B\x07".as_bytes()), [kitty("p=buttons;A\u{2028}B".as_bytes())]);
+        // Ignored ones, and the number not written as is: nothing.
+        assert!(scan(b"\x1b]99;i=a b;x\x07\x1b]99;no second\x07").is_empty());
+        assert!(scan(b"\x1b]099;;x\x07\x1b]9;9;;x\x07\x1b]999;;x\x07").is_empty());
+        assert_eq!(kitty(b";x").progress_after(None), None);
+    }
+
+    #[test]
+    fn a_kitty_chunk_split_at_every_byte_is_found_once() {
+        let input = "x\x1b]99;i=b:d=0:p=buttons;Allow\u{2028}Deny\x1b\\y\x1b]99;i=b:e=1;SGk=\x07".as_bytes();
+        let want = [kitty("i=b:d=0:p=buttons;Allow\u{2028}Deny".as_bytes()), kitty(b"i=b:e=1;SGk=")];
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, want, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_or_over_long_kitty_chunk_is_ignored() {
+        assert!(scan(b"\x1b]99;;hi\x18").is_empty());
+        assert!(scan(b"\x1b]99;;hi\x1a").is_empty());
+        assert!(scan(b"\x1b]99;;hi\x1b[0m").is_empty());
+        // A whole payload fits beside its metadata...
+        let full = format!("\x1b]99;i=long:d=0:a=report;{}\x07", "a".repeat(crate::kitty::MAX_PAYLOAD));
+        assert_eq!(scan(full.as_bytes()).len(), 1);
+        // ...and one past the scanner's limit is dropped, the next kept.
+        let mut big = b"\x1b]99;;".to_vec();
+        big.extend(std::iter::repeat_n(b'a', crate::kitty::MAX_BODY));
+        big.push(BEL);
+        big.extend_from_slice(b"\x1b]99;;after\x07");
+        assert_eq!(scan(&big), [kitty(b";after")]);
     }
 
     #[test]
@@ -382,6 +624,9 @@ mod tests {
         let two_prompts = b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;A;k=i\x1b\\";
         assert_eq!(scan(two_prompts), [Found::PromptStart, Found::PromptStart]);
         assert!(scan(b"\x1b]133;D;0\x07\x1b]133;AB\x07").is_empty());
+        // VS Code's prompt start is the same, and its other kinds are not.
+        assert_eq!(scan(b"\x1b]633;A\x07"), [Found::PromptStart]);
+        assert!(scan(b"\x1b]633;E;A\x07\x1b]633;P;Cwd=/A\x07\x1b]6330;A\x07").is_empty());
         assert_eq!(scan(b"a\x1bcb\x1b[0m\x1b]9;x\x07"), [Found::Reset, osc9("x")]);
         // `ESC c` inside an OSC cancels it, as any other ESC does.
         assert_eq!(scan(b"\x1b]9;lost\x1bc"), [Found::Reset]);

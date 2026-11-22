@@ -959,11 +959,18 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 35] = [
+const PURE_MODULES: [&str; 42] = [
+    "term-core/src/progress.rs",
+    "term-core/src/context.rs",
+    "term-core/src/pointer.rs",
+    "term-core/src/kitty.rs",
+    "src/notify/kitty.rs",
     "src/terminal/keys.rs",
     "src/terminal/mouse.rs",
+    "src/terminal/pointer.rs",
     "src/terminal/cmdline.rs",
     "src/terminal/dir_check.rs",
+    "src/terminal/feedback.rs",
     "src/notify/policy.rs",
     "src/layout.rs",
     "src/reattach.rs",
@@ -1216,6 +1223,8 @@ const SEAMS: &[&str] = &[
     "src/terminal/process.rs",
     // the primary selection
     "src/primary.rs",
+    // showing a frame's pointer at once
+    "src/cursor.rs",
     // desktop notifications and window activation
     "src/notify/dbus.rs",
     "src/notify/toast.rs",
@@ -2196,9 +2205,11 @@ const NEUTRAL_MODULES: [&str; 1] = ["remote-protocol/src/server_dir.rs"];
 /// Pure items in seam and shell files that one platform's code calls, as
 /// (file, `fn` name), from `fcis`'s "Pure items in shell modules" table:
 /// each is a `fn` at the top of its file with no platform `cfg` on it.
-const NEUTRAL_ITEMS: [(&str, &str); 5] = [
+const NEUTRAL_ITEMS: [(&str, &str); 7] = [
     ("src/desktop.rs", "without_verbatim_prefix"),
     ("src/notify/mod.rs", "escape_markup"),
+    ("src/notify/toast.rs", "xml"),
+    ("src/notify/toast.rs", "action_key"),
     ("src/instance.rs", "socket_path_in"),
     ("src/instance.rs", "pipe_name_for"),
     ("src/workspace.rs", "program_title"),
