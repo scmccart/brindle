@@ -18,8 +18,9 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   ctrl-shift-x.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
-- **Shell integration** (OSC 133): jump between prompts, select or copy the last
-  command's output, and see failed commands marked in the gutter.
+- **Shell integration** (OSC 133, and VS Code's OSC 633): jump between prompts, select or
+  copy the last command's output or command line, and see failed commands marked in the
+  gutter.
 - **Desktop notifications** from OSC 9, OSC 777 and bells in tabs you can't see;
   clicking one takes you to its tab.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
@@ -693,7 +694,9 @@ file as it was, with a line in the log, until it can be saved again.
 
 ### Shell integration
 
-Shells can mark their prompts and command output with OSC 133 sequences. Brindle
+Shells can mark their prompts and command output with OSC 133 sequences, or with
+VS Code's OSC 633 (`A` to `D` are the same marks, `E` reports the command line and
+`P;Cwd=` the directory), so a shell set up for VS Code's terminal works too. Brindle
 ships scripts that do this for bash, zsh, fish and PowerShell. Load one at the
 **end** of your shell's startup file, after your prompt theme and anything that
 sets `PROMPT_COMMAND` or defines `prompt`:
@@ -712,7 +715,7 @@ The PowerShell script works in PowerShell 7 and Windows PowerShell 5.1, and also
 reports the current directory (OSC 7). On Windows, where Brindle can't read
 another program's directory, that report is what a new tab and a restored tab
 start in; without it they start in your home directory. Tools that report the
-directory themselves with OSC 7 or ConEmu's OSC 9;9 (oh-my-posh, starship and
+directory themselves with OSC 7, ConEmu's OSC 9;9 or OSC 633 `P;Cwd=` (oh-my-posh, starship and
 the like, when configured to) work the same way. Only a directory on a drive
 letter counts: a report of a network path (`\\server\share`) or a device path
 is ignored, so map a drive to have new tabs follow you there.
@@ -729,6 +732,14 @@ them ignore them. With a script loaded:
 - **Select Last Command Output** and **Copy Last Command Output** are in the
   command palette. They have no default key; bind `select_last_output` or
   `copy_last_output`. Copy leaves your selection alone.
+- **Copy Last Command Line** (`copy_last_command`, no default key) copies the last
+  command as you typed it. It is in the palette only once the terminal has received a
+  prompt mark, so a shell with no script loaded doesn't list it, and a key bound to it
+  does nothing there. The scripts report each line with OSC 633 `E` (fish 4
+  reports it on its own output mark), so a right prompt or a wrapped line never gets
+  in; without a report it copies the text between the command's `B` and `C` marks.
+  bash reports a line only when it adds a history entry, so a command
+  `HISTCONTROL` or `HISTIGNORE` leaves out is read from the screen instead.
 - A thin red bar (the theme's red) marks prompts whose command exited non-zero.
   Turn it off with `mark_failed_commands = false`.
 

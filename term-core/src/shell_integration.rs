@@ -1,10 +1,18 @@
-//! Shell integration: OSC 133 semantic prompt marks.
+//! Shell integration: OSC 133 semantic prompt marks, and VS Code's OSC 633.
 //!
 //! Shells that load one of the scripts in `shell-integration/` emit
 //! `ESC ]133;A` (prompt start), `B` (command start), `C` (output start) and
 //! `D;<exit>` (command finished). vte drops unknown OSCs, so [`Parser`]
 //! scans the byte stream itself, splits it at each mark, and records the
 //! mark at the cursor position the output before it produced.
+//!
+//! VS Code's shell integration (OSC 633) is a superset: its `A`–`D` are the
+//! same marks, `633;E;<line>[;<nonce>]` reports the command line as typed
+//! (with `\\` and `\xHH` escapes, [`decode_vscode`]), and `633;P;Cwd=<path>`
+//! reports the working directory. Its other kinds are ignored, and so is
+//! the nonce: a reported line is only ever copied, never run. fish 4, which
+//! writes its own OSC 133 marks, reports the line on its `C` instead
+//! (`133;C;cmdline_url=<percent-encoded line>`), which counts the same.
 //!
 //! Marks are stored as absolute line numbers (`base + Line`). `base` counts
 //! every line that scrolled off the top of the live screen. It is kept up
@@ -15,6 +23,7 @@
 //! `openspec/changes/archive/2026-10-08-add-shell-integration/design.md`.
 
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -26,7 +35,7 @@ use alacritty_terminal::term::{Term, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use parking_lot::Mutex;
 
-/// One OSC 133 mark.
+/// One OSC 133 (or OSC 633) mark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mark {
     PromptStart,
@@ -52,9 +61,11 @@ enum Split {
     Erase { above: bool },
     /// After `ESC c`.
     Reset,
-    /// After an OSC 7 or OSC 9;9 working-directory report, which the
-    /// scanner holds in `cwd`.
+    /// After an OSC 7, OSC 9;9 or OSC 633 `P;Cwd` working-directory report,
+    /// which the scanner holds in `cwd`.
     Cwd,
+    /// After an OSC 633 `E` command line, which the scanner holds in `line`.
+    CommandLine,
 }
 
 impl Split {
@@ -136,11 +147,21 @@ pub struct Scanner {
     style: PathStyle,
     /// The directory the last [`Split::Cwd`] reported.
     cwd: Option<PathBuf>,
+    /// The command line the last [`Split::CommandLine`] reported.
+    line: Option<String>,
 }
 
 impl Scanner {
     fn new(style: PathStyle) -> Self {
-        Self { state: State::default(), buf: Vec::new(), overflow: false, intermediate: false, style, cwd: None }
+        Self {
+            state: State::default(),
+            buf: Vec::new(),
+            overflow: false,
+            intermediate: false,
+            style,
+            cwd: None,
+            line: None,
+        }
     }
 
     /// Scans `bytes` up to the first split point. Returns the index of the
@@ -286,11 +307,22 @@ impl Scanner {
     }
 
     fn osc_split(&mut self) -> Option<Split> {
-        if let Some(mark) = parse_osc133(&self.buf) {
+        if let Some(mark) = parse_mark(&self.buf) {
+            // fish 4 writes its own `C` with the line, before the script's
+            // `E` (sent from `fish_preexec`, which runs after it) could.
+            self.line = (mark == Mark::OutputStart && !self.overflow).then(|| output_mark_line(&self.buf)).flatten();
             return Some(Split::Mark(mark));
         }
-        // A cut-off path would name the wrong directory.
-        let dir = (!self.overflow).then(|| reported_dir(&self.buf, self.style)).flatten()?;
+        // A cut-off path would name the wrong directory, and a cut-off line
+        // the wrong command.
+        if self.overflow {
+            return None;
+        }
+        if let Some(line) = parse_command_line(&self.buf) {
+            self.line = Some(line);
+            return Some(Split::CommandLine);
+        }
+        let dir = reported_dir(&self.buf, self.style)?;
         self.cwd = Some(PathBuf::from(dir));
         Some(Split::Cwd)
     }
@@ -298,8 +330,11 @@ impl Scanner {
 
 /// The directory an OSC body reports, if it is a plain absolute path in
 /// `style` ([`is_absolute_path`]): OSC 7's
-/// `7;file://<host>/<percent-encoded path>`, or ConEmu's `9;9;<path>`, the
-/// path optionally in double quotes.
+/// `7;file://<host>/<percent-encoded path>`, ConEmu's `9;9;<path>`, the
+/// path optionally in double quotes, or VS Code's `633;P;Cwd=<path>`, its
+/// escapes decoded ([`decode_vscode`]). A `Cwd` value with a raw `;` is
+/// refused: VS Code ends the value there, and a cut-off path would name the
+/// wrong directory.
 ///
 /// In the Windows style OSC 7's `/C:/src` means `C:\src`, and its path is a
 /// directory only in that form, a slash before a drive letter. Any other
@@ -318,11 +353,94 @@ fn reported_dir(body: &[u8], style: PathStyle) -> Option<String> {
                 drive_path.replace('/', "\\")
             }
         }
+    } else if let Some(value) = body.strip_prefix("633;P;Cwd=") {
+        if value.contains(';') {
+            return None;
+        }
+        decode_vscode(value.as_bytes())?
     } else {
         let path = body.strip_prefix("9;9;")?.trim();
         path.strip_prefix('"').and_then(|p| p.strip_suffix('"')).unwrap_or(path).to_string()
     };
     is_absolute_path(&path, style).then_some(path)
+}
+
+/// VS Code's OSC 633 escapes decoded, as UTF-8: `\\` is `\` and `\xHH` the
+/// byte `HH` (either case). A backslash before anything else stays itself,
+/// as VS Code leaves it. `None` when the result isn't UTF-8.
+pub fn decode_vscode(text: &[u8]) -> Option<String> {
+    fn nibble(d: u8) -> Option<u8> {
+        match d {
+            b'0'..=b'9' => Some(d - b'0'),
+            b'a'..=b'f' => Some(d - b'a' + 10),
+            b'A'..=b'F' => Some(d - b'A' + 10),
+            _ => None,
+        }
+    }
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text;
+    while let Some((&b, tail)) = rest.split_first() {
+        let escape = match (b, tail) {
+            (b'\\', [b'\\', after @ ..]) => Some((b'\\', after)),
+            (b'\\', [b'x', high, low, after @ ..]) => {
+                nibble(*high).zip(nibble(*low)).map(|(high, low)| (high << 4 | low, after))
+            }
+            _ => None,
+        };
+        let (byte, after) = escape.unwrap_or((b, tail));
+        bytes.push(byte);
+        rest = after;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// `line` in VS Code's OSC 633 escapes, as [`decode_vscode`] reads them:
+/// `\` as `\\`, and `;` and control characters as `\xHH` (a character
+/// above U+007F is a control only in C1, which it writes as its UTF-8
+/// bytes). The replay writes reported lines with it.
+pub fn encode_vscode(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut utf8 = [0; 4];
+    for c in line.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ';' => out.push_str("\\x3b"),
+            c if c.is_control() => {
+                for b in c.encode_utf8(&mut utf8).bytes() {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The command line an OSC body reports, VS Code's
+/// `633;E;<line>[;<nonce>]`: the line up to the first raw `;` (the nonce
+/// after it is ignored), its escapes decoded. `None` for an empty line, one
+/// that isn't UTF-8, or one with a control character other than a newline.
+fn parse_command_line(body: &[u8]) -> Option<String> {
+    let rest = body.strip_prefix(b"633;E;")?;
+    let escaped = rest.split(|&b| b == b';').next().unwrap_or_default();
+    clean_line(decode_vscode(escaped)?)
+}
+
+/// The command line an output mark carries, as fish 4 sends it with the
+/// marks it writes itself: `133;C;cmdline_url=<percent-encoded line>`
+/// (or `633;C;…`), among the mark's other `;` parameters. `None` for a mark
+/// without one, or a line [`parse_command_line`] would refuse.
+fn output_mark_line(body: &[u8]) -> Option<String> {
+    let rest = body.strip_prefix(b"133;C;").or_else(|| body.strip_prefix(b"633;C;"))?;
+    let encoded = rest.split(|&b| b == b';').find_map(|param| param.strip_prefix(b"cmdline_url="))?;
+    clean_line(percent_decode(std::str::from_utf8(encoded).ok()?)?)
+}
+
+/// `line`, if it is one a command can have: not empty, and with no control
+/// character other than a newline.
+fn clean_line(line: String) -> Option<String> {
+    let clean = !line.is_empty() && !line.chars().any(|c| c.is_control() && c != '\n');
+    clean.then_some(line)
 }
 
 /// `%XX` escapes decoded, as UTF-8.
@@ -342,10 +460,11 @@ fn percent_decode(text: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Parses the body of an OSC (`133;D;1`) into a mark.
-fn parse_osc133(body: &[u8]) -> Option<Mark> {
+/// Parses the body of an OSC (`133;D;1`, or VS Code's `633;D;1`) into a
+/// mark. 633's other kinds (`E`, `F`, `G`, `H`, `P`) are no mark.
+fn parse_mark(body: &[u8]) -> Option<Mark> {
     let mut fields = body.split(|&b| b == b';');
-    if fields.next()? != b"133" {
+    if !matches!(fields.next()?, b"133" | b"633") {
         return None;
     }
     let mark = match fields.next()? {
@@ -377,11 +496,16 @@ pub struct Command {
     pub output: Option<Pos>,
     pub end: Option<Pos>,
     pub exit: Option<i32>,
+    /// The command line the shell reported (OSC 633 `E`, or the
+    /// `cmdline_url` of its `C` mark) before its output started: at most
+    /// [`OSC_KEEP`] bytes, with no control character but newlines. Only ever
+    /// copied, never run.
+    pub line: Option<String>,
 }
 
 impl Command {
     fn new(prompt: Pos) -> Self {
-        Self { prompt, input: None, output: None, end: None, exit: None }
+        Self { prompt, input: None, output: None, end: None, exit: None, line: None }
     }
 
     /// The last line any of its marks is on.
@@ -489,12 +613,22 @@ pub struct Marks {
     alt_resized: bool,
     /// Absolute line of the top of the history, as of the last prune.
     top: i64,
-    /// The working directory the program last reported (OSC 7 or 9;9). A
-    /// reset keeps it: the shell is still there.
+    /// The working directory the program last reported (OSC 7, 9;9 or 633
+    /// `P;Cwd`). A reset keeps it: the shell is still there.
     reported_dir: Option<PathBuf>,
+    /// Whether a prompt mark (`A`) has ever been recorded: the program
+    /// runs a shell-integration script. Sticky: a reset, a clear or a
+    /// prune keeps it.
+    prompt_seen: bool,
 }
 
 impl Marks {
+    /// Whether the program has sent a prompt mark (OSC 133 or 633 `A`),
+    /// which is what tells a shell with integration from one without.
+    pub fn prompt_seen(&self) -> bool {
+        self.prompt_seen
+    }
+
     /// The commands recorded, oldest first.
     pub fn commands(&self) -> &VecDeque<Command> {
         &self.commands
@@ -515,13 +649,16 @@ impl Marks {
         self.alt_snapshot = None;
     }
 
-    /// The working directory the program last reported (OSC 7 or 9;9).
+    /// The working directory the program last reported (OSC 7, 9;9 or 633 `P;Cwd`).
     pub fn reported_dir(&self) -> Option<&Path> {
         self.reported_dir.as_deref()
     }
 
     /// Records `mark` at the cursor.
     pub fn record<T>(&mut self, term: &Term<T>, mark: Mark) {
+        if mark == Mark::PromptStart {
+            self.prompt_seen = true;
+        }
         if term.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
@@ -534,6 +671,7 @@ impl Marks {
                 Some(c) if c.output.is_none() && c.prompt.line == pos.line => {
                     c.prompt = pos;
                     c.input = None;
+                    c.line = None;
                 }
                 _ => self.push(Command::new(pos)),
             },
@@ -558,6 +696,17 @@ impl Marks {
                     c.exit = exit;
                 }
             }
+        }
+    }
+
+    /// Sets the latest command's reported line (OSC 633 `E`), unless its
+    /// output has started: a line reported after `C` belongs to no command
+    /// it can be told apart from, so it is ignored.
+    pub fn set_line(&mut self, line: String) {
+        if let Some(c) = self.commands.back_mut()
+            && c.output.is_none()
+        {
+            c.line = Some(line);
         }
     }
 
@@ -761,6 +910,39 @@ impl Marks {
         ))
     }
 
+    /// Where the most recent command's line is: the line its shell reported
+    /// (OSC 633 `E`), or else the text from its `B` mark to its `C` mark, for
+    /// the most recent command with either. `None` when there is none, or
+    /// when its `B` mark has left the scrollback (an older command is never
+    /// taken instead), or when that text is empty.
+    pub fn last_command_line<T>(&self, term: &Term<T>) -> Option<LineSource> {
+        let command = self.commands.iter().rev().find(|c| c.line.is_some() || (c.input.is_some() && c.output.is_some()))?;
+        if let Some(line) = &command.line {
+            return Some(LineSource::Reported(line.clone()));
+        }
+        let (start, end) = (command.input?, command.output?);
+        let grid = term.grid();
+        let top = grid.topmost_line().0 as i64;
+        let last_col = grid.columns() - 1;
+        let start_line = self.line(start);
+        if start_line < top {
+            return None;
+        }
+        // The output mark is exclusive.
+        let (end_line, end_col) = if end.col == 0 {
+            (self.line(end) - 1, last_col)
+        } else {
+            (self.line(end), end.col - 1)
+        };
+        if end_line < start_line || (end_line == start_line && end_col < start.col) {
+            return None;
+        }
+        Some(LineSource::Span(
+            Point::new(Line(start_line as i32), Column(start.col.min(last_col))),
+            Point::new(Line(end_line as i32), Column(end_col.min(last_col))),
+        ))
+    }
+
     /// Line ranges (inclusive, grid lines) to mark as failed, for commands
     /// overlapping lines `top..=bottom`.
     pub fn failed_spans(&self, top: i64, bottom: i64) -> Vec<(i64, i64)> {
@@ -776,6 +958,28 @@ impl Marks {
             }
         }
         spans
+    }
+}
+
+/// Where a command's line comes from ([`Marks::last_command_line`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LineSource {
+    /// The line the shell reported with OSC 633 `E`.
+    Reported(String),
+    /// The grid text between its `B` and `C` marks, both points inclusive.
+    Span(Point, Point),
+}
+
+impl LineSource {
+    /// The command line as text: a reported line as it is, a span read from
+    /// `term` (wrapped rows joined) with leading and trailing whitespace
+    /// removed. `None` when that leaves nothing.
+    pub fn text<T>(self, term: &Term<T>) -> Option<String> {
+        let text = match self {
+            LineSource::Reported(line) => line,
+            LineSource::Span(start, end) => term.bounds_to_string(start, end).trim().to_string(),
+        };
+        (!text.is_empty()).then_some(text)
     }
 }
 
@@ -825,10 +1029,25 @@ impl Parser {
                 match split {
                     Split::Mark(mark) => {
                         self.end_sync(term, marks);
-                        marks.lock().record(term, mark);
+                        let line = self.scanner.line.take();
+                        let mut marks = marks.lock();
+                        // A line on an output mark is the command's, set
+                        // before the mark makes any later one too late; on
+                        // the alternate screen it goes with its mark.
+                        if let Some(line) = line
+                            && !term.mode().contains(TermMode::ALT_SCREEN)
+                        {
+                            marks.set_line(line);
+                        }
+                        marks.record(term, mark);
                     }
                     Split::Reset => marks.lock().clear(),
                     Split::Cwd => marks.lock().reported_dir = self.scanner.cwd.take(),
+                    Split::CommandLine => {
+                        if let Some(line) = self.scanner.line.take() {
+                            marks.lock().set_line(line);
+                        }
+                    }
                     Split::AltScreen | Split::ClearHistory | Split::Erase { .. } => {}
                 }
             }
@@ -928,14 +1147,14 @@ mod tests {
 
     #[test]
     fn exit_status_parsing() {
-        assert_eq!(parse_osc133(b"133;D"), Some(Mark::CommandEnd(None)));
-        assert_eq!(parse_osc133(b"133;D;x"), Some(Mark::CommandEnd(None)));
-        assert_eq!(parse_osc133(b"133;D;-1"), Some(Mark::CommandEnd(Some(-1))));
-        assert_eq!(parse_osc133(b"133;D;130;aid=7"), Some(Mark::CommandEnd(Some(130))));
-        assert_eq!(parse_osc133(b"133;A;click_events=1"), Some(Mark::PromptStart));
-        assert_eq!(parse_osc133(b"133;P;k=i"), None);
-        assert_eq!(parse_osc133(b"1337;A"), None);
-        assert_eq!(parse_osc133(b"2;133;A"), None);
+        assert_eq!(parse_mark(b"133;D"), Some(Mark::CommandEnd(None)));
+        assert_eq!(parse_mark(b"133;D;x"), Some(Mark::CommandEnd(None)));
+        assert_eq!(parse_mark(b"133;D;-1"), Some(Mark::CommandEnd(Some(-1))));
+        assert_eq!(parse_mark(b"133;D;130;aid=7"), Some(Mark::CommandEnd(Some(130))));
+        assert_eq!(parse_mark(b"133;A;click_events=1"), Some(Mark::PromptStart));
+        assert_eq!(parse_mark(b"133;P;k=i"), None);
+        assert_eq!(parse_mark(b"1337;A"), None);
+        assert_eq!(parse_mark(b"2;133;A"), None);
     }
 
     #[test]
@@ -1009,7 +1228,10 @@ mod tests {
                 windows += 1;
             }
             // Any body, a mark or not, must come back as a value.
-            let _ = parse_osc133(&body);
+            let _ = parse_mark(&body);
+            if let Some(line) = parse_command_line(&body) {
+                assert!(!line.is_empty() && !line.chars().any(|c| c.is_control() && c != '\n'), "{line:?}");
+            }
         }
         assert!(posix > 0 && windows > 0, "the generator never produced a directory ({posix}, {windows})");
     }
@@ -1512,5 +1734,321 @@ mod tests {
         let up = marks.jump_target(0, true).expect("a prompt above the bottom view");
         assert_eq!(up, lines[0]);
         assert_eq!(marks.jump_target(up, false), Some(lines[1]));
+    }
+
+    // ---- OSC 633 ----------------------------------------------------------------
+
+    #[test]
+    fn vscode_marks_are_the_same_marks() {
+        assert_eq!(parse_mark(b"633;A"), Some(Mark::PromptStart));
+        assert_eq!(parse_mark(b"633;B"), Some(Mark::CommandStart));
+        assert_eq!(parse_mark(b"633;C"), Some(Mark::OutputStart));
+        assert_eq!(parse_mark(b"633;D"), Some(Mark::CommandEnd(None)));
+        assert_eq!(parse_mark(b"633;D;1"), Some(Mark::CommandEnd(Some(1))));
+        // The other kinds are no mark, and neither is a lookalike number.
+        for body in [&b"633;E;ls"[..], b"633;F", b"633;G", b"633;H", b"633;P;IsWindows=True", b"6330;A", b"63;A"] {
+            assert_eq!(parse_mark(body), None, "{:?}", String::from_utf8_lossy(body));
+        }
+        let found = scan_all(&[b"\x1b]633;A\x07$ \x1b]633;B\x07ls\r\n\x1b]633;F\x07\x1b]633;C\x07\x1b]633;D;1\x07"]);
+        assert_eq!(
+            found,
+            [
+                Split::Mark(Mark::PromptStart),
+                Split::Mark(Mark::CommandStart),
+                Split::Mark(Mark::OutputStart),
+                Split::Mark(Mark::CommandEnd(Some(1)))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_vscode_command_records_its_exit_status_and_its_prompt() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        h.feed(b"\x1b]633;A\x07$ \x1b]633;B\x07false\r\n\x1b]633;C\x07\x1b]633;D;1\x07\x1b]633;A\x07$ ");
+        h.feed(b"\x1b]633;P;IsWindows=True\x07\x1b]633;F\x07");
+        assert_eq!(h.prompts(), ["$ false", "$"]);
+        let marks = h.marks.lock();
+        assert!(marks.commands()[0].failed());
+        let lines: Vec<i64> = marks.prompt_lines().collect();
+        assert_eq!(marks.jump_target(lines[1], true), Some(lines[0]));
+        assert_eq!(h.text(0), "$ false", "the marks print nothing");
+    }
+
+    /// A shell whose prompt emits both integrations' marks (VS Code's
+    /// scripts nested in Brindle's) makes one command of them.
+    #[test]
+    fn a_doubled_133_and_633_prompt_is_one_command() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        h.feed(b"\x1b]133;A\x07\x1b]633;A\x07$ \x1b]133;B\x07\x1b]633;B\x07ls\r\n");
+        h.feed(b"\x1b]633;E;ls\x07\x1b]133;C\x07\x1b]633;C\x07out\r\n\x1b]633;D;0\x07\x1b]133;D;0\x07");
+        let marks = h.marks.lock();
+        assert_eq!(marks.commands().len(), 1, "{:?}", marks.commands());
+        let c = &marks.commands()[0];
+        assert_eq!((c.exit, c.line.as_deref()), (Some(0), Some("ls")));
+        assert_eq!(h.text(marks.line(c.output.unwrap())), "out");
+    }
+
+    #[test]
+    fn vscode_escapes_decode() {
+        let decode = |s: &[u8]| decode_vscode(s);
+        assert_eq!(decode(b"echo a\\x3bb").as_deref(), Some("echo a;b"));
+        assert_eq!(decode(b"a\\\\b").as_deref(), Some("a\\b"));
+        assert_eq!(decode(b"\\\\x3b").as_deref(), Some("\\x3b"), "an escaped backslash ends its escape");
+        assert_eq!(decode(b"\\x3B\\x5C\\x0a").as_deref(), Some(";\\\n"), "either case");
+        assert_eq!(decode(b"caf\\xc3\\xa9").as_deref(), Some("café"), "bytes of a UTF-8 character");
+        // What isn't one of the two escapes stays as it was written.
+        for kept in ["\\q", "\\x4", "\\xzz", "\\x+f", "end\\", "\\"] {
+            assert_eq!(decode(kept.as_bytes()).as_deref(), Some(kept));
+        }
+        assert_eq!(decode(b"\\xff"), None, "not UTF-8");
+        assert_eq!(decode(b"\\xc3"), None, "half a character");
+    }
+
+    #[test]
+    fn encoded_lines_decode_to_themselves() {
+        for line in ["make test", "echo \"a;b\" \\ c", "two\nlines", "a;;b;", "\\x3b", "caf\u{e9} \u{1f600}", "\u{85}"] {
+            let encoded = encode_vscode(line);
+            assert!(!encoded.contains(';') && !encoded.chars().any(char::is_control), "{encoded:?}");
+            assert_eq!(decode_vscode(encoded.as_bytes()).as_deref(), Some(line));
+        }
+        assert_eq!(encode_vscode("a;b\\c\n"), "a\\x3bb\\\\c\\x0a");
+    }
+
+    #[test]
+    fn command_line_reports() {
+        let line = |s: &[u8]| parse_command_line(s);
+        assert_eq!(line(b"633;E;echo a\\x3bb;1f2e").as_deref(), Some("echo a;b"), "the nonce is dropped");
+        assert_eq!(line(b"633;E;ls").as_deref(), Some("ls"));
+        assert_eq!(line(b"633;E;ls;").as_deref(), Some("ls"));
+        assert_eq!(line(b"633;E;a\\\\;n").as_deref(), Some("a\\"), "a raw `;` after an escaped backslash");
+        assert_eq!(line(b"633;E;one\\x0atwo").as_deref(), Some("one\ntwo"), "a newline is kept");
+        // Controls other than a newline, text that isn't UTF-8, and nothing.
+        for body in [
+            &b"633;E;a\\x07b"[..],
+            b"633;E;a\\x0db",
+            b"633;E;a\\x1bb",
+            b"633;E;a\\x7fb",
+            b"633;E;a\\xc2\\x9bb",
+            b"633;E;\\xff",
+            b"633;E;",
+            b"633;E;;nonce",
+            b"633;E",
+            b"133;E;ls",
+            b"633;P;Cwd=/x",
+        ] {
+            assert_eq!(line(body), None, "{:?}", String::from_utf8_lossy(body));
+        }
+        assert_eq!(scan_all(&[b"\x1b]633;E;ls\x1b\\"]), [Split::CommandLine]);
+    }
+
+    #[test]
+    fn vscode_cwd_reports_in_either_path_style() {
+        let (posix, windows) = (PathStyle::Posix, PathStyle::Windows);
+        assert_eq!(reported_dir(b"633;P;Cwd=/home/me/a\\x3bb", posix).as_deref(), Some("/home/me/a;b"));
+        assert_eq!(reported_dir(b"633;P;Cwd=/srv/My Dir", posix).as_deref(), Some("/srv/My Dir"));
+        assert_eq!(reported_dir(b"633;P;Cwd=C:\\\\src", windows).as_deref(), Some("C:\\src"));
+        assert_eq!(reported_dir(b"633;P;Cwd=C:/src", windows).as_deref(), Some("C:/src"));
+        // Not absolute in the style, a raw `;`, or another property.
+        let ignored: [(&[u8], PathStyle); 9] = [
+            (b"633;P;Cwd=src", posix),
+            (b"633;P;Cwd=/a;b", posix),
+            (b"633;P;Cwd=C:\\\\src", posix),
+            (b"633;P;Cwd=/home/u", windows),
+            (b"633;P;IsWindows=True", windows),
+            (b"633;P;Cwd=\\xff", posix),
+            // A network or device path, however it is escaped.
+            (b"633;P;Cwd=\\\\\\\\host\\\\share", windows),
+            (b"633;P;Cwd=\\x5c\\x5chost\\x5cshare", windows),
+            (b"633;P;Cwd=\\\\\\\\?\\\\C:\\\\src", windows),
+        ];
+        for (body, style) in ignored {
+            assert_eq!(reported_dir(body, style), None, "{:?} {style:?}", String::from_utf8_lossy(body));
+        }
+        let mut h = Harness::new(posix, 20, 5, 100);
+        h.feed(b"\x1b]633;P;Cwd=/tmp/a\\x3bb\x07");
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new("/tmp/a;b")));
+        h.feed(b"\x1b]633;P;Cwd=relative\x07");
+        assert_eq!(h.marks.lock().reported_dir(), Some(Path::new("/tmp/a;b")), "an ignored report keeps the last");
+    }
+
+    /// `A`, `B`, a `633;E` for `line` (raw bytes after `E;`), then `C`.
+    fn reported(h: &mut Harness, typed: &str, line: &str) {
+        h.feed(format!("\x1b]133;A\x07$ \x1b]133;B\x07{typed}\r\n\x1b]633;E;{line}\x07\x1b]133;C\x07").as_bytes());
+    }
+
+    #[test]
+    fn a_line_reported_before_output_starts_is_the_commands() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        reported(&mut h, "echo a;b", "echo a\\x3bb ; 1f2e");
+        h.feed(b"a\r\n\x1b]133;D;0\x07");
+        assert_eq!(h.marks.lock().commands()[0].line.as_deref(), Some("echo a;b "), "up to the nonce's `;`");
+        // Reported only after `C`: too late.
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b]633;E;ls\x07\x1b]133;D;0\x07");
+        assert_eq!(h.marks.lock().commands()[1].line, None);
+        // With no command at all, there is nothing to set.
+        let mut empty = Harness::new(PathStyle::Posix, 20, 5, 100);
+        empty.feed(b"\x1b]633;E;ls\x07");
+        assert!(empty.marks.lock().commands().is_empty());
+    }
+
+    #[test]
+    fn output_mark_lines() {
+        let line = |s: &[u8]| output_mark_line(s);
+        assert_eq!(line(b"133;C;cmdline_url=echo%20%22a%3Bb%22").as_deref(), Some("echo \"a;b\""));
+        assert_eq!(line(b"633;C;cmdline_url=ls").as_deref(), Some("ls"));
+        assert_eq!(line(b"133;C;aid=1;cmdline_url=two%0Alines;x").as_deref(), Some("two\nlines"));
+        for body in [
+            &b"133;C"[..],
+            b"133;C;",
+            b"133;C;cmdline=ls",
+            b"133;C;cmdline_url=",
+            b"133;C;cmdline_url=a%07b",
+            b"133;C;cmdline_url=%ff",
+            b"133;C;cmdline_url=bad%2",
+            b"133;D;cmdline_url=ls",
+            b"133;B;cmdline_url=ls",
+        ] {
+            assert_eq!(line(body), None, "{:?}", String::from_utf8_lossy(body));
+        }
+        // The parameter doesn't change the mark.
+        assert_eq!(parse_mark(b"133;C;cmdline_url=ls"), Some(Mark::OutputStart));
+    }
+
+    /// fish 4 writes its own marks, and its `C` carries the line. The
+    /// script's `E`, sent from `fish_preexec` after that `C`, comes too late
+    /// and changes nothing.
+    #[test]
+    fn fish_4s_output_mark_reports_the_line() {
+        let mut h = Harness::new(PathStyle::Posix, 30, 5, 100);
+        h.feed(b"\x1b]133;A\x07\x1b]133;A;click_events=1\x1b\\$ echo \"a;b\"\r\n");
+        h.feed(b"\x1b]133;C;cmdline_url=echo%20%22a%3Bb%22\x1b\\\x1b]633;E;other\x07\x1b]133;C\x07a;b\r\n\x1b]133;D;0\x07");
+        let marks = h.marks.lock();
+        assert_eq!(marks.commands().len(), 1);
+        assert_eq!(marks.commands()[0].line.as_deref(), Some("echo \"a;b\""));
+        drop(marks);
+        assert_eq!(last_line(&h).as_deref(), Some("echo \"a;b\""));
+        // On the alternate screen the mark, and so its line, is ignored.
+        h.feed(b"\x1b]133;A\x07$ \x1b[?1049h\x1b]133;C;cmdline_url=vim\x07\x1b[?1049l");
+        assert_eq!(h.marks.lock().commands().back().and_then(|c| c.line.as_deref()), None);
+    }
+
+    #[test]
+    fn a_redrawn_prompt_forgets_a_reported_line() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]633;E;old\x07\r\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(h.marks.lock().commands()[0].line, None);
+    }
+
+    #[test]
+    fn a_line_in_an_overflowed_sequence_is_ignored() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        let long = "x".repeat(OSC_KEEP);
+        reported(&mut h, "x", &long);
+        assert_eq!(h.marks.lock().commands()[0].line, None, "{} bytes of body", long.len() + 6);
+        // At the limit, the body (`633;E;` included) still fits.
+        let fits = "y".repeat(OSC_KEEP - 6);
+        reported(&mut h, "y", &fits);
+        assert_eq!(h.marks.lock().commands()[1].line.as_deref(), Some(fits.as_str()));
+    }
+
+    #[test]
+    fn a_reported_line_split_anywhere() {
+        let input = b"\x1b]133;A\x07$ \x1b]133;B\x07\x1b]633;E;a\\x3bb\x1b\\\x1b]133;C\x07";
+        for cut in 0..=input.len() {
+            let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+            let (a, b) = input.split_at(cut);
+            h.feed(a).feed(b);
+            assert_eq!(h.marks.lock().commands()[0].line.as_deref(), Some("a;b"), "cut at {cut}");
+        }
+    }
+
+    fn last_line(h: &Harness) -> Option<String> {
+        h.marks.lock().last_command_line(&h.term).and_then(|source| source.text(&h.term))
+    }
+
+    #[test]
+    fn a_prompt_mark_is_what_shows_a_shell_with_integration() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 100);
+        assert!(!h.marks.lock().prompt_seen());
+        // Marks after the prompt's own, and a reported directory, don't count.
+        h.feed(b"\x1b]7;file:///tmp\x07\x1b]133;B\x07ls\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert!(!h.marks.lock().prompt_seen());
+        h.feed(b"\x1b]633;A\x07");
+        assert!(h.marks.lock().prompt_seen());
+        // It stays once the marks are gone, and for a prompt on the alternate screen.
+        h.marks.lock().clear();
+        assert!(h.marks.lock().commands().is_empty());
+        assert!(h.marks.lock().prompt_seen());
+        let mut alt = Harness::new(PathStyle::Posix, 20, 5, 100);
+        alt.feed(b"\x1b[?1049h\x1b]133;A\x07");
+        assert!(alt.marks.lock().prompt_seen());
+    }
+
+    #[test]
+    fn the_last_command_line_prefers_the_reported_line() {
+        // A prompt that wraps: the screen holds the line across two rows.
+        let mut h = Harness::new(PathStyle::Posix, 10, 5, 100);
+        reported(&mut h, "git commit -m \"x\"", "git commit -m \"x\"");
+        let marks = h.marks.lock();
+        assert_eq!(marks.last_command_line(&h.term), Some(LineSource::Reported("git commit -m \"x\"".into())));
+        drop(marks);
+        assert_eq!(last_line(&h).as_deref(), Some("git commit -m \"x\""));
+    }
+
+    #[test]
+    fn the_last_command_line_from_the_marks() {
+        let mut h = Harness::new(PathStyle::Posix, 10, 5, 100);
+        // `B` before trailing blanks, a line that wraps, and `C` on the next row.
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07  ls -la /tmp  \r\n\x1b]133;C\x07x\r\n\x1b]133;D;0\x07");
+        assert!(matches!(h.marks.lock().last_command_line(&h.term), Some(LineSource::Span(..))));
+        assert_eq!(last_line(&h).as_deref(), Some("ls -la /tmp"));
+        // A newer prompt that hasn't run anything doesn't count.
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert_eq!(last_line(&h).as_deref(), Some("ls -la /tmp"));
+        // A command with no `B` and no reported line (fish without the
+        // script's `E`) has no line, and the older one isn't taken instead.
+        h.feed(b"pwd\r\n\x1b]133;C\x07/\r\n\x1b]133;D;0\x07");
+        h.feed(b"\x1b]133;A\x07$ cat\r\n\x1b]133;C\x07");
+        assert_eq!(last_line(&h).as_deref(), Some("pwd"));
+        // Nothing typed between the marks is no line.
+        h.feed(b"\x1b]133;D;0\x07\x1b]133;A\x07$ \x1b]133;B\x07   \r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        assert_eq!(last_line(&h), None);
+    }
+
+    #[test]
+    fn no_last_command_line_without_marks_or_once_they_scrolled_away() {
+        let mut h = Harness::new(PathStyle::Posix, 20, 5, 3);
+        assert_eq!(last_line(&h), None, "no commands");
+        h.command("seq", 1, 0);
+        assert_eq!(last_line(&h).as_deref(), Some("seq"));
+        // A line that wraps over four rows: its command is kept while any
+        // of its marks is in the 8-line grid, but once `B` has scrolled
+        // away, so has the start of the line.
+        h.feed(b"\x1b]133;A\x07$ \x1b]133;B\x07");
+        h.feed("x".repeat(60).as_bytes());
+        h.feed(b"\r\n\x1b]133;C\x07");
+        let mut scrolled = 0;
+        loop {
+            h.feed(b"\r\n");
+            scrolled += 1;
+            let marks = h.marks.lock();
+            let top = h.term.grid().topmost_line().0 as i64;
+            let command = marks.commands().back().expect("the command is kept for its `C`");
+            if marks.line(command.input.unwrap()) < top {
+                assert!(command.output.is_some_and(|p| marks.line(p) >= top));
+                break;
+            }
+            assert_eq!(marks.last_command_line(&h.term).and_then(|s| s.text(&h.term)), Some("x".repeat(60)));
+            assert!(scrolled < 20, "`B` never left the grid");
+        }
+        assert_eq!(h.marks.lock().last_command_line(&h.term), None);
+        // And the earlier command, still listed or not, isn't taken instead.
+        assert_eq!(last_line(&h), None);
+        // Once everything has scrolled away, there is no command at all.
+        for i in 0..12 {
+            h.feed(format!("{i}\r\n").as_bytes());
+        }
+        assert!(h.marks.lock().commands().is_empty());
+        assert_eq!(last_line(&h), None);
     }
 }

@@ -140,13 +140,20 @@ pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
     let text = match rng.below(12) {
         0..=2 => format!("7;file://{}/{}", pick(rng, &["", "host", "localhost", "h:1"]), path(rng)),
         3 => format!("7;{}", path(rng)),
-        4 | 5 => {
+        4 => {
             let quote = pick(rng, &["", "\""]);
             format!("9;9;{quote}{}{quote}", path(rng))
         }
+        // VS Code's directory report and command line, with its escapes.
+        5 => {
+            let escape = pick(rng, &["", "\\\\", "\\x3b", "\\x5c", "\\x0a", "\\x07", "\\xff", "\\x", "\\q", ";", ";nonce"]);
+            let kind = pick(rng, &["P;Cwd=", "E;", "E", "P;IsWindows=True;", "C;cmdline_url="]);
+            format!("633;{kind}{}{escape}{}", path(rng), path(rng))
+        }
         6 | 7 => {
-            let mark = pick(rng, &["A", "B", "C", "D", "D;0", "D;1", "D;-3", "D;x", "D;999999999999", "E", ""]);
-            format!("133;{mark}")
+            let number = pick(rng, &["133", "633"]);
+            let mark = pick(rng, &["A", "B", "C", "D", "D;0", "D;1", "D;-3", "D;x", "D;999999999999", "E", "F", ""]);
+            format!("{number};{mark}")
         }
         8 | 9 => return [b"7501;".as_slice(), &status_body(rng)].concat(),
         10 => format!("{};{}", pick(rng, &["9", "777", "777;notify", "0009;x", "9;4"]), name(rng, 20)),

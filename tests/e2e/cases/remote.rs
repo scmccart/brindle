@@ -203,6 +203,49 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The prompt (`PS1`) of [`in_container_tab`]'s tabs, without its trailing
+/// space.
+pub(super) const CONTAINER_PROMPT: &str = "REMOTE_CONTAINER_READY>";
+
+/// Runs `case` with a [`Run`] that opens a [`CONTAINER_PROFILE`] tab, a bash
+/// in a disposable container, for a case elsewhere that needs a remote tab:
+/// a new tab there starts in the directory the active one reported, where a
+/// local Linux tab's starts in its process's. Skips without Docker or the
+/// helper, as this file's cases do; the container is removed afterwards.
+pub(super) fn in_container_tab(
+    ctx: &Ctx,
+    label: &'static str,
+    case: impl FnOnce(Run<'_>) -> Result<Outcome>,
+) -> Result<Outcome> {
+    if let Some(outcome) = docker_outcome()? {
+        return Ok(outcome);
+    }
+    let Some(agent) = remote_agent(ctx)? else {
+        return Ok(Outcome::Skip(
+            "Linux remote helper was not built; run `cargo build -p brindle-remote-agent`".into(),
+        ));
+    };
+    let image = fixture_image(ctx)?;
+    let container = Container::start(ctx, &image, &[])?;
+    let config = format!(
+        "\n[[profiles]]\n\
+         name = {CONTAINER_PROFILE:?}\n\
+         command = \"/bin/bash\"\n\
+         args = [\"--norc\", \"--noprofile\", \"-i\"]\n\
+         env = {{ SHELL = \"/bin/bash\", PS1 = \"{CONTAINER_PROMPT} \" }}\n\
+         remote = {{ type = \"container\", engine = \"docker\", container = {:?}, user = \"remote\" }}\n",
+        container.name,
+    );
+    let run = Run::new(ctx, label)
+        .profile(CONTAINER_PROFILE)
+        .default_profile(CONTAINER_PROFILE)
+        .config(&config)
+        .env("BRINDLE_REMOTE_AGENT", &agent.to_string_lossy());
+    let outcome = case(run);
+    drop(container);
+    outcome
+}
+
 /// An SSH endpoint starts without a cached helper. Brindle must upload it
 /// through the generated key before the remote interactive shell can run.
 pub fn ssh_container(ctx: &Ctx) -> Result<Outcome> {

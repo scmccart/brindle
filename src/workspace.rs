@@ -1632,8 +1632,15 @@ impl Workspace {
         let types: std::collections::HashSet<std::any::TypeId> =
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
         // The palette lists what the tab can run: GPUI's answer, applied.
+        let facts = PaletteFacts {
+            prompt_marks: self
+                .active_tab()
+                .and_then(|t| t.active_terminal(cx))
+                .is_some_and(|t| t.read(cx).has_prompt_marks()),
+        };
         let commands: Vec<_> = palette_commands()
             .into_iter()
+            .filter(|(_, a)| palette_lists(&**a, facts))
             .filter(|(_, a)| types.contains(&a.as_any().type_id()) || window.is_action_available(&**a, cx))
             .collect();
         let rows = commands

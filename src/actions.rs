@@ -36,6 +36,7 @@ actions!(
         JumpToNextPrompt,
         SelectLastOutput,
         CopyLastOutput,
+        CopyLastCommand,
         Find,
         FindNext,
         FindPrevious,
@@ -143,6 +144,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("jump_to_next_prompt", Some("Jump to Next Prompt"), || Box::new(JumpToNextPrompt)),
     ("select_last_output", Some("Select Last Command Output"), || Box::new(SelectLastOutput)),
     ("copy_last_output", Some("Copy Last Command Output"), || Box::new(CopyLastOutput)),
+    ("copy_last_command", Some("Copy Last Command Line"), || Box::new(CopyLastCommand)),
     ("find", Some("Find"), || Box::new(Find)),
     // The find bar's own actions act on an open bar, so they stay out of
     // the palette.
@@ -264,6 +266,22 @@ pub fn action_names() -> impl Iterator<Item = String> {
 /// label). The workspace keeps those available from the focused tab.
 pub fn palette_commands() -> Vec<(&'static str, Box<dyn Action>)> {
     ACTIONS.iter().filter_map(|(_, label, build)| Some(((*label)?, build()))).collect()
+}
+
+/// What the active terminal says about which commands make sense for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteFacts {
+    /// It has sent a prompt mark (OSC 133/633 `A`): a shell with
+    /// integration runs in it.
+    pub prompt_marks: bool,
+}
+
+/// Whether the palette lists `action` for a terminal with these `facts`.
+/// The commands that read shell-integration marks are hidden until a prompt
+/// mark has arrived (without one they would do nothing); every other action
+/// is the focused tab's to answer.
+pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
+    facts.prompt_marks || !action.partial_eq(&CopyLastCommand)
 }
 
 /// An action's label as a menu item shows it: its command palette label.
@@ -744,6 +762,22 @@ mod tests {
             .map(|(l, _)| l)
             .collect();
         assert_eq!(labels, ["Go to Last Tab", "Clear Scrollback", "Reload Config"]);
+    }
+
+    /// Copy Last Command Line needs a shell that marks its prompts, so the
+    /// palette lists it only once the terminal has sent a prompt mark.
+    #[test]
+    fn copy_last_command_is_listed_only_after_a_prompt_mark() {
+        let (without, with) = (PaletteFacts { prompt_marks: false }, PaletteFacts { prompt_marks: true });
+        let listed = |facts| -> Vec<&'static str> {
+            palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, facts)).map(|(l, _)| l).collect()
+        };
+        assert!(!listed(without).contains(&"Copy Last Command Line"));
+        assert!(listed(with).contains(&"Copy Last Command Line"));
+        // Nothing else depends on it.
+        let all = palette_commands().len();
+        assert_eq!(listed(without).len(), all - 1);
+        assert_eq!(listed(with).len(), all);
     }
 
     /// ctrl-shift-d has no default binding anywhere, so it reaches the

@@ -1010,6 +1010,27 @@ impl Terminal {
         Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
     }
 
+    /// The last command's line as text: the line its shell reported (OSC
+    /// 633 `E`), else what is between its `B` and `C` marks
+    /// ([`Marks::last_command_line`]).
+    /// `None` until a prompt mark has been seen ([`Self::has_prompt_marks`]):
+    /// without one, a program's stray `B`/`E` marks aren't a shell's.
+    pub fn last_command_line_text(&self) -> Option<String> {
+        let term = self.term.lock();
+        let marks = self.marks.lock();
+        if !marks.prompt_seen() {
+            return None;
+        }
+        let source = marks.last_command_line(&term)?;
+        source.text(&term)
+    }
+
+    /// Whether the program has sent a prompt mark (OSC 133/633 `A`): a shell
+    /// with integration runs here. Commands that need one are hidden until.
+    pub fn has_prompt_marks(&self) -> bool {
+        self.marks.lock().prompt_seen()
+    }
+
     // ---- selection ----------------------------------------------------------
 
     /// Converts a viewport cell to a grid point (accounting for scrollback).
