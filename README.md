@@ -27,7 +27,8 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 - **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
   bottom of the tab, and of each zone's header in a split tab.
 - **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
-  logins): a yellow warning icon on a tab while it runs as root.
+  logins): a yellow warning icon on a tab while it runs as root. On Windows the
+  same icon marks a tab whose program runs elevated (labelled Administrator).
 - **Pointer shapes** from OSC 22, with kitty's stack and queries: a resize
   pointer over an editor's split border, a hand over a button.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
@@ -586,7 +587,7 @@ family = ["Inter", "Segoe UI"]
 | the strip's `⌄` | profile menu (see below) |
 | right-click a tab / a zone header | tab menu / zone menu (see below) |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
-| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard when nothing is selected and does nothing while text is: shift-right-click where a program uses the mouse) |
+| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard over a selection too, clearing it, and a program that reports the mouse gets the click instead; shift-right-click pastes in Brindle there. See [Clipboard](#clipboard)) |
 | shift-pageup/down, shift-home/end | scrollback |
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
@@ -662,9 +663,32 @@ a chosen family goes to the front of that table's `family` list, keeping the
 others after it as fallbacks, and "Default" removes the list. Cancel, escape
 or another section drop the changes.
 
-The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes only when nothing is selected). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
+The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes over a selection too, clearing it; see [Clipboard](#clipboard)). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
+
+### Clipboard
+
+Ctrl-shift-c copies the selection and ctrl-shift-v pastes the clipboard. With
+`copy_on_select = true`, finishing a drag-selection copies it too. Middle click
+pastes Brindle's own primary selection. With `right_click = "paste"`, a
+right-click pastes the clipboard, over a selection too, which clears the
+selection; with an empty clipboard nothing is pasted and the selection stays.
+
+A program that reports the mouse (htop, or vim with the mouse on) gets the
+clicks, right-clicks included, and copies and pastes in its own way. Shift
+gives the mouse back to Brindle, so shift-drag selects and shift-right-click
+pastes there.
+
+A copy or paste made with the mouse shows a small icon beside the pointer: a
+copy icon for a copy, a paste icon for a paste, and a ban icon when a
+right-click found nothing to paste. It fades after about a second, and it takes
+no clicks, so a click on it reaches the terminal.
+
+On Windows, copied text has CRLF line ends, as Windows Terminal's copies do:
+some applications, Excel cells among them, read a bare line feed as nothing. Text a program sets with OSC 52 is copied as
+the program sent it. Paste sends each line end as a carriage return, which is
+what terminal programs expect.
 
 ### Links
 
@@ -799,8 +823,10 @@ them ignore them. With a script loaded:
   To keep line scrolling on those keys, bind `"ctrl-shift-up" = "scroll_line_up"`
   and `"ctrl-shift-down" = "scroll_line_down"`.
 - **Select Last Command Output** and **Copy Last Command Output** are in the
-  command palette. They have no default key; bind `select_last_output` or
-  `copy_last_output`. Copy leaves your selection alone.
+  command palette, once the terminal has received a prompt mark, as Copy Last
+  Command Line is (below); a terminal that has received none (a shell without
+  the scripts, say) doesn't list them, and a key bound to them does nothing. They have no default key; bind
+  `select_last_output` or `copy_last_output`. Copy leaves your selection alone.
 - **Copy Last Command Line** (`copy_last_command`, no default key) copies the last
   command as you typed it. It is in the palette only once the terminal has received a
   prompt mark, so a shell with no script loaded doesn't list it, and a key bound to it
@@ -949,6 +975,20 @@ contexts and shows the innermost notable one as a badge after the tab's title
   itself alone: `run0` tints the background red and puts a glyph in the title;
 - a remote host (`remote`), a container or a VM: `user@host`, the host, or the
   container's or VM's name, in the muted foreground.
+
+On Windows the elevation badge comes from the system instead. A local tab whose
+foreground program runs elevated shows the same warning icon, and resting the
+pointer on it shows "Running as Administrator". Brindle reads the token of the
+tab's newest child process, so `sudo` in inline mode shows it, and so does a
+program started as administrator from the tab's shell, whether Brindle runs
+elevated or not. An elevated Brindle's tabs show it too, since their programs
+are elevated. It takes precedence over any context a program announces, so
+a program can't swap the warning for a muted label. It comes up within about
+a second of the program's start and goes within about a second of its exit,
+as the tab's title does. A program started elevated in its own window
+(`Start-Process -Verb RunAs`) counts too, while it runs as the tab's newest
+child. When Brindle can't read a program's token (a process it isn't allowed
+to open), no badge shows, so an elevated program can go unmarked.
 
 Shell and command contexts, and sessions for any other user, show no badge. Labels are cut to 24
 characters, and a narrow tab cuts its title to 8 characters before it cuts a
