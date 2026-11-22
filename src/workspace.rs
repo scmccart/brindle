@@ -11,7 +11,7 @@ use gpui::{
     FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, KeyDownEvent, Modifiers, MouseButton, MouseDownEvent,
     ParentElement, Pixels, Point,
     Render, ResizeEdge, SharedString, Size, StatefulInteractiveElement, Styled, Subscription,
-    Task, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
+    Task, WeakEntity, Window, WindowBounds, WindowControlArea, canvas, div, point, px, rems,
 };
 
 mod launch;
@@ -47,7 +47,7 @@ use crate::remote::protocol::client::SessionInfo;
 use crate::session::{self, RestoredTab, RestoredZoneNode, SessionStore, SnapshotTab, WindowState};
 use crate::settings::{FontPreview, Settings};
 use crate::settings_dialog::{self, SettingsDialog, SettingsEvent};
-use crate::terminal::process::Snapshot;
+use crate::terminal::process::{self, ElevationCache};
 use crate::terminal::shell_integration::PathStyle;
 use crate::terminal::context::Badge;
 use crate::terminal::progress::Progress;
@@ -134,27 +134,28 @@ impl Tab {
             title: SharedString::default(),
             _subscriptions: subscriptions,
         };
-        tab.refresh_title(&mut None, cx);
+        tab.refresh_title(cx);
         tab
     }
 
     /// Recomputes the zones' titles, then the tab's: its manual title, else
     /// its active zone's title (the program's own title, else the
     /// foreground process name, else the profile name; see
-    /// [`terminal_automatic_title`]). Returns whether either changed.
-    /// `snapshot` is the processes running, for the foreground name, taken
-    /// only when a title needs it (a program's own title, which can change
-    /// thousands of times a second, never does).
-    fn refresh_title(&mut self, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
-        let zone_changed = self.zones.update(cx, |v, cx| v.refresh_titles(snapshot, cx));
+    /// [`terminal_automatic_title`]). Returns whether either changed. The
+    /// foreground name is read only when a title needs it (a program's own
+    /// title, which can change thousands of times a second, never does),
+    /// and on Windows is what the title tick last found off the UI thread
+    /// ([`Terminal::set_detected`]).
+    fn refresh_title(&mut self, cx: &mut App) -> bool {
+        let zone_changed = self.zones.update(cx, |v, cx| v.refresh_titles(cx));
         let automatic = self.zones.read(cx).active_title();
         let changed = refresh_displayed_title(&mut self.title, self.manual_title.as_deref(), &automatic);
         changed || zone_changed
     }
 
-    fn set_manual_title(&mut self, text: &str, snapshot: &mut Option<Snapshot>, cx: &mut App) -> bool {
+    fn set_manual_title(&mut self, text: &str, cx: &mut App) -> bool {
         self.manual_title = parse_manual_title(text);
-        self.refresh_title(snapshot, cx)
+        self.refresh_title(cx)
     }
 
     fn focus_handle(&self, cx: &App) -> FocusHandle {
@@ -572,14 +573,36 @@ impl Workspace {
             // Foreground processes change without any event (e.g. `vim`
             // starting), so poll their names gently. The same poll records
             // the window for session restore (directories have no events).
+            // Where a foreground process is found in a look at all
+            // processes (Windows' local sessions), the look and the token
+            // reads for the badge happen off the UI thread, and the
+            // elevations read stay known between looks.
+            let mut elevations = ElevationCache::default();
             loop {
                 cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
+                let Ok(roots) = this.update(cx, |this, cx| this.detection_roots(cx)) else { break };
+                let found = if roots.is_empty() {
+                    Vec::new()
+                } else {
+                    let pids: Vec<u32> = roots.iter().map(|&(_, pid)| pid).collect();
+                    let (found, kept) = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let found = process::detect(&pids, &mut elevations);
+                            (found, elevations)
+                        })
+                        .await;
+                    elevations = kept;
+                    found
+                };
                 let alive = this.update_in(cx, |this, window, cx| {
+                    // One finding per root, in the order gathered.
+                    for ((terminal, root), detected) in roots.into_iter().zip(found) {
+                        terminal.update(cx, |terminal, cx| terminal.set_detected(root, detected, cx)).ok();
+                    }
                     let mut changed = false;
-                    // At most one look at the processes for every tab.
-                    let mut snapshot = None;
                     for tab in &mut this.tabs {
-                        changed |= tab.refresh_title(&mut snapshot, cx);
+                        changed |= tab.refresh_title(cx);
                     }
                     if changed {
                         cx.notify();
@@ -593,6 +616,18 @@ impl Workspace {
         });
         this.open(launch, window, cx);
         this
+    }
+
+    /// The terminals whose foreground process the title tick finds in its
+    /// look at all processes, each with its program's pid
+    /// ([`Terminal::detection_root`]). Gathered on the UI thread, which only
+    /// reads them; none on Linux, and none for a remote session.
+    fn detection_roots(&self, cx: &App) -> Vec<(WeakEntity<Terminal>, u32)> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.zones.read(cx).terminals(cx))
+            .filter_map(|terminal| Some((terminal.downgrade(), terminal.read(cx).detection_root()?)))
+            .collect()
     }
 
     /// Opens what a launch asks for in this window.
@@ -660,7 +695,7 @@ impl Workspace {
                         terminal.update(cx, |terminal, cx| terminal.note(note, cx));
                     }
                     if let Some(title) = title {
-                        tab.set_manual_title(&title, &mut None, cx);
+                        tab.set_manual_title(&title, cx);
                     }
                     if ix == state.active {
                         active_tab = Some(tab.id);
@@ -965,7 +1000,7 @@ impl Workspace {
         if let Some(title) = title
             && let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id)
         {
-            tab.set_manual_title(&title, &mut None, cx);
+            tab.set_manual_title(&title, cx);
         }
     }
 
@@ -1243,7 +1278,7 @@ impl Workspace {
             TerminalEvent::TitleChanged => {
                 // The tree says so when another zone becomes active, whose
                 // badge the face then shows.
-                if self.tabs[ix].refresh_title(&mut None, cx) | self.refresh_badge(ix, cx) {
+                if self.tabs[ix].refresh_title(cx) | self.refresh_badge(ix, cx) {
                     cx.notify();
                 }
             }
@@ -1504,7 +1539,7 @@ impl Workspace {
         let submit: SubmitFn = Rc::new(move |text, cx| {
             this.update(cx, |this, cx| {
                 if let Some(tab) = this.tabs.iter_mut().find(|t| t.id == tab_id)
-                    && tab.set_manual_title(&text, &mut None, cx)
+                    && tab.set_manual_title(&text, cx)
                 {
                     cx.notify();
                 }
@@ -2147,9 +2182,8 @@ impl Workspace {
                 tab.profile = profile;
             }
         }
-        let mut snapshot = None;
         for tab in &mut self.tabs {
-            tab.refresh_title(&mut snapshot, cx);
+            tab.refresh_title(cx);
         }
         self.apply_tab_themes(cx);
         // The reload made new settings, without the notices.

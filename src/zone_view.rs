@@ -24,7 +24,7 @@ use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
 use crate::terminal::context::{Badge, BadgeKind};
-use crate::terminal::process::{LOCAL_PATH_STYLE, Snapshot};
+use crate::terminal::process::LOCAL_PATH_STYLE;
 use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
@@ -638,8 +638,7 @@ impl ZoneTreeView {
                 cx.notify();
             }
             TerminalEvent::TitleChanged => {
-                let mut snapshot = None;
-                let changed = self.refresh_zone_title(id, &mut snapshot, cx);
+                let changed = self.refresh_zone_title(id, cx);
                 if id == self.active {
                     cx.emit(TerminalEvent::TitleChanged);
                 } else if changed {
@@ -729,24 +728,25 @@ impl ZoneTreeView {
     }
 
     /// Refreshes cached zone header titles for all zones in this tab.
-    pub fn refresh_titles(&mut self, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+    pub fn refresh_titles(&mut self, cx: &App) -> bool {
         let ids: Vec<ZoneId> = self.zones.keys().copied().collect();
         let mut any = false;
         for id in ids {
-            any |= self.refresh_zone_title(id, snapshot, cx);
+            any |= self.refresh_zone_title(id, cx);
         }
         any
     }
 
-    fn refresh_zone_title(&mut self, id: ZoneId, snapshot: &mut Option<Snapshot>, cx: &App) -> bool {
+    fn refresh_zone_title(&mut self, id: ZoneId, cx: &App) -> bool {
         let profile_name = self.profile.name.clone();
         let Some(zone) = self.zones.get_mut(&id) else { return false };
         let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        // The process name costs a look at the processes: only when the
-        // program set no title of its own.
+        // The process name can cost a read of `/proc`: only when the
+        // program set no title of its own. On Windows it is what the title
+        // tick found off the UI thread.
         let process_name = match program_title(terminal.title(), LOCAL_PATH_STYLE) {
             Some(_) => None,
-            None => terminal.foreground_process_name(snapshot),
+            None => terminal.foreground_process_name(),
         };
         let title: SharedString =
             terminal_automatic_title(terminal.title(), &profile_name, LOCAL_PATH_STYLE, process_name).into();
@@ -956,10 +956,9 @@ impl ZoneTreeView {
         let terminal = cx.new(|cx| Terminal::spawn(&self.profile, &host, None, cwd, &config, cx));
 
         // Refresh the existing zone's title so its header bar has an up-to-date label.
-        let mut snapshot = None;
-        self.refresh_zone_title(target, &mut snapshot, cx);
+        self.refresh_zone_title(target, cx);
         self.insert_terminal_zone(new_id, terminal, window, cx);
-        self.refresh_zone_title(new_id, &mut snapshot, cx);
+        self.refresh_zone_title(new_id, cx);
         self.active = new_id;
         let focus = self.focus_handle(cx);
         window.focus(&focus);

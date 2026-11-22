@@ -50,7 +50,7 @@ use gpui::{ClipboardItem, Context, EventEmitter, Task, WeakEntity};
 use parking_lot::Mutex;
 
 use self::events::{EventGate, Merge, Recovered};
-use self::context::{Badge, Contexts};
+use self::context::{Badge, Contexts, Elevation};
 use self::pace::Pace;
 use self::progress::Progress;
 use self::shell_integration::{Marks, Parser};
@@ -349,11 +349,15 @@ pub struct Terminal {
     /// prompt, a reset or the program's end.
     progress: Option<Progress>,
     /// The program's open contexts (OSC 3008), until they end, the program
-    /// ends, or a replay begins (which rebuilds them).
-    contexts: Contexts,
-    /// `contexts`' notable context, recomputed whenever `contexts` changes,
-    /// so the chrome never computes it while drawing.
-    badge: Option<Badge>,
+    /// ends, or a replay begins (which rebuilds them); its foreground
+    /// process's elevation, as the title tick last read it
+    /// ([`Terminal::set_detected`]), until the program ends; and the badge
+    /// the two give.
+    notable: Notable,
+    /// Its foreground process's name, as the title tick last found it
+    /// ([`Terminal::set_detected`]), where the tick looks for it
+    /// ([`process::LocalForeground::Descendant`]), until the program ends.
+    foreground: Option<String>,
     /// The program's pointer shapes (OSC 22), one stack per screen, until a
     /// full reset, the program's end or a replay's start: the server keeps
     /// none, so an attach starts with both empty.
@@ -446,7 +450,7 @@ impl Terminal {
                     self.pointer.clear();
                     self.notices99 = kitty::Assembly::default();
                 }
-                if active && self.clear_contexts() {
+                if active && self.notable.clear_contexts() {
                     cx.emit(TerminalEvent::Status(None));
                 }
                 if !active {
@@ -499,16 +503,10 @@ impl Terminal {
         if statuses {
             self.status.reset();
             self.progress = None;
-            self.clear_contexts();
+            self.notable.clear_contexts();
             self.pointer.clear();
             cx.emit(TerminalEvent::Status(None));
         }
-    }
-
-    /// Drops every context and the badge; true when there were any.
-    fn clear_contexts(&mut self) -> bool {
-        self.badge = None;
-        self.contexts.clear()
     }
 
     #[allow(
@@ -544,8 +542,8 @@ impl Terminal {
             replaying: false,
             status: status::Records::default(),
             progress: None,
-            contexts: Contexts::default(),
-            badge: None,
+            notable: Notable::default(),
+            foreground: None,
             pointer: pointer::Stacks::default(),
             notices99: kitty::Assembly::default(),
             dir_check: dir_check::DirCheck::default(),
@@ -795,8 +793,8 @@ impl Terminal {
     }
 
     /// Moves the terminal's life on by `event`. True when that ended a
-    /// running terminal, whose status activity, progress and contexts then
-    /// end.
+    /// running terminal, whose status activity, progress, contexts and
+    /// detected foreground process then end.
     fn end(&mut self, event: LifeEvent, cx: &mut Context<Self>) -> bool {
         let was = self.life;
         self.life = was.after(event);
@@ -804,7 +802,8 @@ impl Terminal {
         if ended {
             let activity = self.status.end_activity();
             let progress = self.progress.take().is_some();
-            let contexts = self.clear_contexts();
+            let contexts = self.notable.hang_up();
+            self.foreground = None;
             // Its pointer shapes go too; the grid repaints anyway. So do
             // its unfinished notifications.
             self.pointer.clear();
@@ -828,13 +827,14 @@ impl Terminal {
 
     /// The program's open contexts (OSC 3008), outermost first.
     pub fn contexts(&self) -> &Contexts {
-        &self.contexts
+        self.notable.contexts()
     }
 
-    /// The badge of the program's notable context, if any
-    /// ([`Contexts::notable`]).
+    /// The badge its tab face and zone header show, if any: from its
+    /// foreground process's detected elevation and its program's notable
+    /// context ([`context::badge`]).
     pub fn badge(&self) -> Option<&Badge> {
-        self.badge.as_ref()
+        self.notable.badge()
     }
 
     /// The program's pointer shape stacks (OSC 22).
@@ -894,13 +894,7 @@ impl Terminal {
             Found::Progress(_) => false,
             // The same stack the server's emulator keeps, so a replay
             // agrees; resets and prompts leave it.
-            Found::Context(message) => {
-                let changed = self.contexts.apply(message);
-                if changed {
-                    self.badge = self.contexts.notable();
-                }
-                changed
-            }
+            Found::Context(message) => self.notable.apply(message),
             Found::PromptStart => self.status.end_activity(),
             Found::Reset => {
                 // A full reset empties both pointer stacks too.
@@ -1289,21 +1283,75 @@ impl Terminal {
 
     // ---- process info -------------------------------------------------------
 
-    /// Name of the foreground process on the PTY (e.g. `vim`), for tab
-    /// titles. A session on this machine is looked up by its pid, in
-    /// `snapshot` (the title tick's look at all processes, taken the first
-    /// time a terminal needs it); a remote one's is what its host last
-    /// reported, since its pid is another machine's.
-    pub fn foreground_process_name(&self, snapshot: &mut Option<process::Snapshot>) -> Option<String> {
+    /// Where its program runs, for what the system says of it.
+    fn program(&self) -> Program {
         match &self.backend {
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, host: Host::Local, .. } => {
-                let pid = session.pid()?;
-                process::PtyProcess::new(pid).foreground_name(snapshot.get_or_insert_with(process::Snapshot::take))
-            }
+            Backend::Server { session, host: Host::Local, .. } => Program::Here(session.pid()),
             #[cfg(any(target_os = "linux", windows))]
-            Backend::Server { session, .. } => session.foreground().and_then(|foreground| foreground.name),
-            Backend::Remote => None,
+            Backend::Server { session, .. } => {
+                Program::Elsewhere(session.foreground().and_then(|foreground| foreground.name))
+            }
+            Backend::Remote => Program::Message,
+        }
+    }
+
+    /// Name of the foreground process on the PTY (e.g. `vim`), for tab
+    /// titles. A session on this machine's is read from the system by its
+    /// pid where the PTY has a foreground process group, else it is what
+    /// the title tick last found ([`Terminal::set_detected`]); a remote
+    /// one's is what its host last reported, since its pid is another
+    /// machine's.
+    pub fn foreground_process_name(&self) -> Option<String> {
+        match self.program() {
+            Program::Here(pid) => match process::LOCAL_FOREGROUND {
+                process::LocalForeground::Group => process::PtyProcess::new(pid?).foreground_name(),
+                process::LocalForeground::Descendant => self.foreground.clone(),
+            },
+            Program::Elsewhere(name) => name,
+            Program::Message => None,
+        }
+    }
+
+    /// The pid of its program, while it runs, when the title tick finds its
+    /// foreground process in a look at all processes
+    /// ([`process::LocalForeground::Descendant`]: a session on this
+    /// machine, on Windows). `None` for every other terminal: a remote
+    /// session's pid is another machine's, and on Linux the title reads the
+    /// PTY's foreground process group itself, so neither gets a detected
+    /// elevation.
+    pub fn detection_root(&self) -> Option<u32> {
+        if self.life != Life::Running {
+            return None;
+        }
+        match self.program() {
+            Program::Here(pid) => match process::LOCAL_FOREGROUND {
+                process::LocalForeground::Descendant => pid,
+                process::LocalForeground::Group => None,
+            },
+            Program::Elsewhere(_) | Program::Message => None,
+        }
+    }
+
+    /// Takes what the title tick found ([`process::detect`]) for the
+    /// program it gathered as `root` ([`Terminal::detection_root`]): its
+    /// foreground process's name, for the title, and that process's
+    /// elevation, for the badge; `None` when the look didn't find the
+    /// program. A finding for a program that has ended, or been replaced
+    /// since it was gathered, is dropped. The tick refreshes the titles
+    /// next; a changed badge is told as a status change, which the zone
+    /// header and the tab face copy.
+    pub fn set_detected(&mut self, root: u32, detected: Option<process::Detected>, cx: &mut Context<Self>) {
+        if self.detection_root() != Some(root) {
+            return;
+        }
+        let (name, elevation) = match detected {
+            Some(process::Detected { name, elevation }) => (Some(name), elevation),
+            None => (None, Elevation::Unknown),
+        };
+        self.foreground = name;
+        if self.notable.set_elevation(elevation) {
+            cx.emit(TerminalEvent::Status(None));
         }
     }
 
@@ -1523,6 +1571,86 @@ impl Origin {
     /// no session: an attach that failed, which restore doesn't record.
     fn shows_only_message(self, life: Life) -> bool {
         self == Self::Attached && life == Life::Failed
+    }
+}
+
+/// Where a terminal's program runs, for what the system says of it
+/// ([`Terminal::program`]).
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code, reason = "only Linux and Windows have sessions"))]
+enum Program {
+    /// A session on this machine: its program's pid, once it has started.
+    Here(Option<u32>),
+    /// A session on another host: the foreground process name the host
+    /// last reported.
+    Elsewhere(Option<String>),
+    /// A message terminal, with no program.
+    Message,
+}
+
+/// A terminal's program contexts (OSC 3008), its foreground process's
+/// elevation as the title tick last read it, and the badge the two give
+/// ([`context::badge`]). The badge is recomputed whenever either changes,
+/// so the chrome never computes it while drawing.
+#[derive(Debug)]
+struct Notable {
+    contexts: Contexts,
+    elevation: Elevation,
+    badge: Option<Badge>,
+}
+
+impl Default for Notable {
+    fn default() -> Self {
+        Self { contexts: Contexts::default(), elevation: Elevation::Unknown, badge: None }
+    }
+}
+
+impl Notable {
+    fn contexts(&self) -> &Contexts {
+        &self.contexts
+    }
+
+    fn badge(&self) -> Option<&Badge> {
+        self.badge.as_ref()
+    }
+
+    /// Applies a context message; true when the stack changed.
+    fn apply(&mut self, message: context::Message) -> bool {
+        let changed = self.contexts.apply(message);
+        if changed {
+            self.rebadge();
+        }
+        changed
+    }
+
+    /// Takes the elevation the title tick read; true when the badge
+    /// changed.
+    fn set_elevation(&mut self, elevation: Elevation) -> bool {
+        self.elevation = elevation;
+        self.rebadge()
+    }
+
+    /// Drops every context: a replay is about to rebuild them, or status
+    /// reports were dropped. The elevation stays, since the same program
+    /// still runs. True when there were any, or the badge changed.
+    fn clear_contexts(&mut self) -> bool {
+        let had = self.contexts.clear();
+        self.rebadge() || had
+    }
+
+    /// The program ended (UAPI's hangup reset): its contexts and its
+    /// elevation go. True when there were any contexts, or the badge
+    /// changed.
+    fn hang_up(&mut self) -> bool {
+        self.elevation = Elevation::Unknown;
+        self.clear_contexts()
+    }
+
+    /// Recomputes the badge; true when it changed.
+    fn rebadge(&mut self) -> bool {
+        let badge = context::badge(self.contexts.notable(), self.elevation);
+        let changed = badge != self.badge;
+        self.badge = badge;
+        changed
     }
 }
 
@@ -2447,5 +2575,75 @@ mod tests {
         let mut processor: Processor<StdSyncHandler> = Processor::new();
         processor.advance(&mut term, b"hello\r\n\x1b[31mred\x1b[0m");
         assert_eq!(screen_text(&term), "hello\nred\n\n");
+    }
+
+    /// A terminal's badge, as its kind and label.
+    fn badge_of(notable: &Notable) -> Option<(context::BadgeKind, &str)> {
+        notable.badge().map(|badge| (badge.kind(), badge.label()))
+    }
+
+    fn feed_context(notable: &mut Notable, payload: &[u8]) -> bool {
+        notable.apply(context::parse(payload).expect("an OSC 3008 payload"))
+    }
+
+    /// A terminal fed a context, then found elevated: the elevation's badge
+    /// shows, and goes back to the context's when the elevated program
+    /// leaves the foreground.
+    #[test]
+    fn a_detected_elevation_badges_a_terminal_over_its_context() {
+        use context::BadgeKind::{Elsewhere, Privileged};
+        let mut notable = Notable::default();
+        assert!(feed_context(&mut notable, b"start=c1;type=container;container=web"));
+        assert_eq!(badge_of(&notable), Some((Elsewhere, "web")));
+        assert!(notable.set_elevation(Elevation::Elevated));
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(!notable.set_elevation(Elevation::Elevated), "the same reading changes nothing");
+        assert!(notable.set_elevation(Elevation::Standard));
+        assert_eq!(badge_of(&notable), Some((Elsewhere, "web")));
+        assert!(!notable.set_elevation(Elevation::Unknown), "unread, the context still decides");
+    }
+
+    /// The reverse: found elevated, then fed contexts, which neither hide
+    /// nor relabel the warning; once it isn't elevated the context shows.
+    #[test]
+    fn a_context_fed_to_an_elevated_terminal_leaves_its_badge() {
+        use context::BadgeKind::{Elsewhere, Privileged};
+        let mut notable = Notable::default();
+        assert_eq!(badge_of(&notable), None);
+        assert!(notable.set_elevation(Elevation::Elevated));
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(feed_context(&mut notable, b"start=c1;type=container;container=web"), "the stack changed");
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(feed_context(&mut notable, b"start=e1;type=elevate;targetuser=guest"));
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(notable.set_elevation(Elevation::Standard));
+        assert_eq!(badge_of(&notable), Some((Privileged, "guest")));
+        assert!(feed_context(&mut notable, b"end=e1"));
+        assert_eq!(badge_of(&notable), Some((Elsewhere, "web")));
+    }
+
+    /// A replay's start drops the contexts but keeps the elevation, since
+    /// the same program runs; the program's end drops both.
+    #[test]
+    fn a_replay_keeps_the_elevation_and_a_hangup_drops_it() {
+        use context::BadgeKind::Privileged;
+        let mut notable = Notable::default();
+        feed_context(&mut notable, b"start=c1;type=container;container=web");
+        notable.set_elevation(Elevation::Elevated);
+        assert!(notable.clear_contexts(), "there was a context");
+        assert!(notable.contexts().is_empty());
+        assert_eq!(badge_of(&notable), Some((Privileged, "Administrator")));
+        assert!(!notable.clear_contexts(), "nothing left to drop");
+        feed_context(&mut notable, b"start=c1;type=container;container=web");
+        assert!(notable.hang_up());
+        assert!(notable.contexts().is_empty());
+        assert_eq!(badge_of(&notable), None);
+        assert_eq!(notable.elevation, Elevation::Unknown);
+        assert!(!notable.hang_up());
+        // An elevation alone, hung up: the badge goes, though there was no
+        // context.
+        notable.set_elevation(Elevation::Elevated);
+        assert!(notable.hang_up());
+        assert_eq!(badge_of(&notable), None);
     }
 }
