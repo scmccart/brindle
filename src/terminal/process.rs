@@ -1,7 +1,8 @@
 //! Process info for tab titles, badges and new-tab directories: which
 //! process is in the foreground on a tab's PTY, its name, its elevation and
 //! its working directory, the path style its directory reports use
-//! ([`LOCAL_PATH_STYLE`]), where its foreground program comes from
+//! ([`LOCAL_PATH_STYLE`]), the line end of what is copied from its grid
+//! ([`LOCAL_LINE_END`]), where its foreground program comes from
 //! ([`LOCAL_FOREGROUND`]) and where its directory comes from
 //! ([`LOCAL_DIRECTORY`]).
 //!
@@ -15,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use super::LineEnd;
 use super::context::Elevation;
 use super::shell_integration::PathStyle;
 
@@ -27,6 +29,14 @@ pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Windows;
 /// 9;9). [`crate::remote::Host::path_style`] picks it for a local session.
 #[cfg(not(windows))]
 pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Posix;
+
+/// The line end of text copied from a grid on this machine.
+#[cfg(windows)]
+pub const LOCAL_LINE_END: LineEnd = LineEnd::CrLf;
+
+/// The line end of text copied from a grid on this machine.
+#[cfg(not(windows))]
+pub const LOCAL_LINE_END: LineEnd = LineEnd::Lf;
 
 /// Where the directory of a program on this machine comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

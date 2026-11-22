@@ -276,12 +276,19 @@ pub struct PaletteFacts {
     pub prompt_marks: bool,
 }
 
+/// Whether `action` reads the marks of a shell with integration, and so does
+/// nothing without them: the commands on the last command's line and output.
+/// The jump-to-prompt actions aren't among them: they scroll a line instead.
+fn needs_prompt_marks(action: &dyn Action) -> bool {
+    action.partial_eq(&CopyLastCommand) || action.partial_eq(&SelectLastOutput) || action.partial_eq(&CopyLastOutput)
+}
+
 /// Whether the palette lists `action` for a terminal with these `facts`.
 /// The commands that read shell-integration marks are hidden until a prompt
 /// mark has arrived (without one they would do nothing); every other action
 /// is the focused tab's to answer.
 pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
-    facts.prompt_marks || !action.partial_eq(&CopyLastCommand)
+    facts.prompt_marks || !needs_prompt_marks(action)
 }
 
 /// An action's label as a menu item shows it: its command palette label.
@@ -764,20 +771,28 @@ mod tests {
         assert_eq!(labels, ["Go to Last Tab", "Clear Scrollback", "Reload Config"]);
     }
 
-    /// Copy Last Command Line needs a shell that marks its prompts, so the
-    /// palette lists it only once the terminal has sent a prompt mark.
+    /// The commands on the last command's line and output need a shell that
+    /// marks its prompts, so the palette lists them only once the terminal has
+    /// sent a prompt mark. The jump-to-prompt actions stay listed.
     #[test]
-    fn copy_last_command_is_listed_only_after_a_prompt_mark() {
+    fn the_last_command_actions_are_listed_only_after_a_prompt_mark() {
         let (without, with) = (PaletteFacts { prompt_marks: false }, PaletteFacts { prompt_marks: true });
         let listed = |facts| -> Vec<&'static str> {
             palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, facts)).map(|(l, _)| l).collect()
         };
-        assert!(!listed(without).contains(&"Copy Last Command Line"));
-        assert!(listed(with).contains(&"Copy Last Command Line"));
+        let hidden = ["Copy Last Command Line", "Select Last Command Output", "Copy Last Command Output"];
+        for label in hidden {
+            assert!(!listed(without).contains(&label), "{label} without a prompt mark");
+            assert!(listed(with).contains(&label), "{label} with one");
+        }
         // Nothing else depends on it.
         let all = palette_commands().len();
-        assert_eq!(listed(without).len(), all - 1);
+        assert_eq!(listed(without).len(), all - hidden.len());
         assert_eq!(listed(with).len(), all);
+        let jumps = palette_commands().into_iter().filter(|(_, a)| a.partial_eq(&JumpToPreviousPrompt) || a.partial_eq(&JumpToNextPrompt));
+        for (label, action) in jumps {
+            assert!(palette_lists(&*action, without), "{label} stays listed");
+        }
     }
 
     /// ctrl-shift-d has no default binding anywhere, so it reaches the

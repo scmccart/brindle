@@ -1175,10 +1175,11 @@ impl Terminal {
         true
     }
 
-    /// Selects the last command's output. Returns `false` when there is none.
+    /// Selects the last command's output. Returns `false` when there is none,
+    /// and until a prompt mark has been seen ([`Self::has_prompt_marks`]).
     pub fn select_last_output(&mut self, to_clipboard: bool, cx: &mut Context<Self>) -> bool {
         let mut term = self.term.lock();
-        let Some((start, end)) = self.marks.lock().last_output(&term) else { return false };
+        let Some((start, end)) = last_output_span(&term, &self.marks.lock()) else { return false };
         let mut selection = Selection::new(SelectionType::Simple, start, Side::Left);
         selection.update(end, Side::Right);
         term.selection = Some(selection);
@@ -1188,16 +1189,17 @@ impl Terminal {
         true
     }
 
-    /// The last command's output as text, leaving the selection alone.
+    /// The last command's output as text to copy ([`copied_text`]), leaving
+    /// the selection alone. `None` until a prompt mark has been seen
+    /// ([`Self::has_prompt_marks`]).
     pub fn last_output_text(&self) -> Option<String> {
         let term = self.term.lock();
-        let (start, end) = self.marks.lock().last_output(&term)?;
-        Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
+        last_output_string(&term, &self.marks.lock()).map(|text| copied_text(&text, process::LOCAL_LINE_END))
     }
 
     /// The last command's line as text: the line its shell reported (OSC
     /// 633 `E`), else what is between its `B` and `C` marks
-    /// ([`Marks::last_command_line`]).
+    /// ([`Marks::last_command_line`]), as text to copy ([`copied_text`]).
     /// `None` until a prompt mark has been seen ([`Self::has_prompt_marks`]):
     /// without one, a program's stray `B`/`E` marks aren't a shell's.
     pub fn last_command_line_text(&self) -> Option<String> {
@@ -1207,7 +1209,7 @@ impl Terminal {
             return None;
         }
         let source = marks.last_command_line(&term)?;
-        source.text(&term)
+        source.text(&term).map(|text| copied_text(&text, process::LOCAL_LINE_END))
     }
 
     /// Whether the program has sent a prompt mark (OSC 133/633 `A`): a shell
@@ -1265,15 +1267,23 @@ impl Terminal {
         cx.notify();
     }
 
+    /// The selected text as the grid holds it: rows joined with `\n`.
     pub fn selection_text(&self) -> Option<String> {
         self.term.lock().selection_to_string().filter(|s| !s.is_empty())
     }
 
+    /// The selected text as it is copied: its lines joined with this
+    /// machine's line end ([`copied_text`]).
+    pub fn selection_copy_text(&self) -> Option<String> {
+        self.selection_text().map(|text| copied_text(&text, process::LOCAL_LINE_END))
+    }
+
     /// Called when a mouse selection is finished: the text goes to the
     /// primary selection, and to the clipboard when `to_clipboard` (the
-    /// `copy_on_select` setting in effect now) says so.
+    /// `copy_on_select` setting in effect now) says so. Both get the same
+    /// text, as a copy would.
     pub fn finish_selection(&mut self, to_clipboard: bool, cx: &mut Context<Self>) {
-        if let Some(text) = self.selection_text() {
+        if let Some(text) = self.selection_copy_text() {
             crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
             if to_clipboard {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
@@ -2004,6 +2014,55 @@ fn merged_env(
     env
 }
 
+/// How lines are joined in text copied from the grid: what the platform's
+/// applications expect on the clipboard ([`process::LOCAL_LINE_END`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineEnd {
+    /// `\n`.
+    #[cfg_attr(windows, allow(dead_code, reason = "Windows copies CRLF"))]
+    Lf,
+    /// `\r\n`.
+    #[cfg_attr(not(windows), allow(dead_code, reason = "only Windows copies CRLF"))]
+    CrLf,
+}
+
+/// Grid text (rows joined with `\n`) as it is copied: its lines joined with
+/// `end`. A line end already `\r\n` isn't doubled. Text a program sets
+/// through OSC 52 and a link's address are written as they are, not through
+/// this.
+pub fn copied_text(text: &str, end: LineEnd) -> String {
+    match end {
+        LineEnd::Lf => text.to_string(),
+        LineEnd::CrLf => {
+            let mut out = String::with_capacity(text.len());
+            let mut previous = None;
+            for c in text.chars() {
+                if c == '\n' && previous != Some('\r') {
+                    out.push('\r');
+                }
+                out.push(c);
+                previous = Some(c);
+            }
+            out
+        }
+    }
+}
+
+/// The span of the last command's output, once a prompt mark has been seen:
+/// without one, a program's stray `C`/`D` marks aren't a shell's.
+fn last_output_span<T>(term: &Term<T>, marks: &Marks) -> Option<(GridPoint, GridPoint)> {
+    if !marks.prompt_seen() {
+        return None;
+    }
+    marks.last_output(term)
+}
+
+/// The last command's output as the grid holds it ([`last_output_span`]).
+fn last_output_string<T>(term: &Term<T>, marks: &Marks) -> Option<String> {
+    let (start, end) = last_output_span(term, marks)?;
+    Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
+}
+
 /// Prepares clipboard text for the PTY.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -2480,6 +2539,46 @@ mod tests {
         assert_eq!(pairs, [("TEMP", "C:\\t"), ("TERM", "xterm-256color"), ("path", "C:\\tools")]);
         // Elsewhere they are different variables.
         assert_eq!(merged_env(own, set, false).len(), 5);
+    }
+
+    #[test]
+    fn copied_text_joins_lines_with_the_platforms_line_end() {
+        assert_eq!(copied_text("one\ntwo", LineEnd::CrLf), "one\r\ntwo");
+        assert_eq!(copied_text("one\ntwo", LineEnd::Lf), "one\ntwo");
+        assert_eq!(copied_text("one", LineEnd::CrLf), "one");
+        assert_eq!(copied_text("a\n\nb\n", LineEnd::CrLf), "a\r\n\r\nb\r\n");
+        // A line end that is already CRLF is not doubled, under either.
+        assert_eq!(copied_text("one\r\ntwo", LineEnd::CrLf), "one\r\ntwo");
+        assert_eq!(copied_text("one\r\ntwo", LineEnd::Lf), "one\r\ntwo");
+        assert_eq!(copied_text("é\nü", LineEnd::CrLf), "é\r\nü");
+    }
+
+    /// A terminal and its marks after `bytes`, as the parser feeds them.
+    fn marked(bytes: &[u8]) -> (Term<alacritty_terminal::event::VoidListener>, Marks) {
+        let size = GridSize { cols: 20, rows: 5, ..Default::default() };
+        let mut term = Term::new(term::Config::default(), &size, alacritty_terminal::event::VoidListener);
+        let marks = Mutex::new(Marks::default());
+        Parser::new(process::LOCAL_PATH_STYLE).advance(&mut term, &marks, bytes);
+        (term, marks.into_inner())
+    }
+
+    /// The output commands act on a shell's marks, so until a prompt mark has
+    /// arrived a program's stray output marks select and copy nothing.
+    #[test]
+    fn the_last_output_is_inert_until_a_prompt_mark() {
+        // Marks a program sent on its own, with no prompt mark among them.
+        let (term, marks) = marked(b"\x1b]133;B\x07ls\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07");
+        assert!(!marks.prompt_seen());
+        assert!(marks.last_output(&term).is_some(), "the marks themselves record it");
+        assert_eq!(last_output_span(&term, &marks), None);
+        assert_eq!(last_output_string(&term, &marks), None);
+
+        // A shell with integration: the prompt mark first.
+        let (term, marks) =
+            marked(b"\x1b]133;A\x07$ \x1b]133;B\x07ls\r\n\x1b]133;C\x07one\r\ntwo\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+        assert!(marks.prompt_seen());
+        assert!(last_output_span(&term, &marks).is_some());
+        assert_eq!(last_output_string(&term, &marks).as_deref(), Some("one\ntwo"));
     }
 
     #[test]

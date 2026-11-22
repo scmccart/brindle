@@ -341,7 +341,7 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.terminal.read(cx).selection_text() {
+        if let Some(text) = self.terminal.read(cx).selection_copy_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
