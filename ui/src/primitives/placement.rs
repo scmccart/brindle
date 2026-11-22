@@ -92,6 +92,23 @@ pub fn place(
     Placement { origin: clamp(at(side), size, viewport, margin), side }
 }
 
+/// [`place`] inside `area`, a region of the window (in window coordinates)
+/// instead of the whole viewport: the box flips and is clamped to stay
+/// within `area` less `margin`.
+pub fn place_within(
+    trigger: Bounds<Pixels>,
+    size: Size<Pixels>,
+    area: Bounds<Pixels>,
+    side: Side,
+    align: Align,
+    offset: Pixels,
+    margin: Pixels,
+) -> Placement {
+    let local = Bounds { origin: trigger.origin - area.origin, size: trigger.size };
+    let placement = place(local, size, area.size, side, align, offset, margin);
+    Placement { origin: placement.origin + area.origin, side: placement.side }
+}
+
 /// The greatest height a box placed against `trigger` on `side`, `offset`
 /// away, can have and still fit in a viewport `viewport` large less
 /// `margin` at each edge, which is Radix's available height. Above or
@@ -181,13 +198,16 @@ fn union(bounds: impl IntoIterator<Item = Bounds<Pixels>>) -> Option<Bounds<Pixe
 ///
 /// By default the box goes below the trigger, centred, [`SIDE_OFFSET`] (4px,
 /// shadcn's `sideOffset`) away, and stays [`EDGE_MARGIN`] (8px) from the
-/// window's edges.
+/// window's edges, or from the edges of the area [`Anchored::within`] names.
 pub struct Anchored {
     trigger: Bounds<Pixels>,
     side: Side,
     align: Align,
     offset: Pixels,
     margin: Pixels,
+    /// The region it stays inside, in window coordinates; the viewport
+    /// when `None`.
+    area: Option<Bounds<Pixels>>,
     children: Vec<AnyElement>,
 }
 
@@ -201,6 +221,7 @@ impl Anchored {
             align: Align::default(),
             offset: SIDE_OFFSET,
             margin: EDGE_MARGIN,
+            area: None,
             children: Vec::new(),
         }
     }
@@ -224,6 +245,13 @@ impl Anchored {
     /// The least distance kept from the window's edges.
     pub fn margin(mut self, margin: Pixels) -> Self {
         self.margin = margin;
+        self
+    }
+
+    /// Keeps the box inside `area` (window coordinates) instead of the
+    /// window ([`place_within`]); the margin is then kept from its edges.
+    pub fn within(mut self, area: Bounds<Pixels>) -> Self {
+        self.area = Some(area);
         self
     }
 }
@@ -297,15 +325,9 @@ impl Element for Anchored {
         let Some(extent) = union(layout.child_layout_ids.iter().map(|id| window.layout_bounds(*id))) else {
             return;
         };
-        let placement = place(
-            self.trigger,
-            extent.size,
-            window.viewport_size(),
-            self.side,
-            self.align,
-            self.offset,
-            self.margin,
-        );
+        let area = self.area.unwrap_or(Bounds { origin: Point::default(), size: window.viewport_size() });
+        let placement =
+            place_within(self.trigger, extent.size, area, self.side, self.align, self.offset, self.margin);
         let shift = placement.origin - extent.origin;
         let shift = point(shift.x.round(), shift.y.round());
         window.with_element_offset(shift, |window| {
@@ -514,6 +536,30 @@ mod tests {
         // No room at all is no height, never a negative one.
         assert_eq!(available_height(b(0., 0., 10., 10.), size(px(10.), px(10.)), Side::Left, OFFSET, MARGIN), px(0.));
         assert_eq!(available_height(b(0., 0., 10., 10.), size(px(10.), px(10.)), Side::Bottom, OFFSET, MARGIN), px(0.));
+    }
+
+    #[test]
+    fn placed_within_an_area_stays_inside_it() {
+        // A 100x40 box 12px down and right of a pointer at (290, 170), in an
+        // area from (10, 20) to (310, 220): it would end at 402, so it is
+        // moved left to end on the area's edge; below it would end at 222,
+        // so it flips above.
+        let area = b(10., 20., 300., 200.);
+        let box_size = size(px(100.), px(40.));
+        let pointer = |x: f32, y: f32| b(x + 12., y, 0., 0.);
+        let go = |trigger| place_within(trigger, box_size, area, Side::Bottom, Align::Start, px(12.), px(0.));
+        assert_eq!(go(pointer(50., 30.)), at(62., 42., Side::Bottom));
+        assert_eq!(go(pointer(290., 170.)), at(210., 118., Side::Top));
+        // In the area's own corner, clamped to its origin, not the window's.
+        assert_eq!(go(b(10., 20., 0., 0.)).origin, point(px(10.), px(32.)));
+        // With the viewport as the area it is `place`.
+        let viewport = b(0., 0., 500., 500.);
+        let trigger = b(100., 100., 50., 20.);
+        let box_size = size(px(30.), px(10.));
+        assert_eq!(
+            place_within(trigger, box_size, viewport, Side::Bottom, Align::Center, OFFSET, MARGIN),
+            place(trigger, box_size, viewport.size, Side::Bottom, Align::Center, OFFSET, MARGIN)
+        );
     }
 
     #[test]
