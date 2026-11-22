@@ -76,6 +76,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `src/terminal/{keys,mouse}.rs` | xterm key and mouse encodings |
 | `src/terminal/pointer.rs` | the platform pointer each OSC 22 shape shows as, and which pointer the grid shows (link, selection, program, Brindle's own) |
 | `src/terminal/cmdline.rs` | the Windows default program, the Unix and Windows editor commands, the merged environment, the Unix default program |
+| `src/terminal/feedback.rs` | the label a mouse copy or paste shows at the pointer: its text, whether it shows, fades or is gone at a moment, when it must next be drawn, and that a new one replaces the old |
 | `src/terminal/dir_check.rs` | whether the directory a local program last reported exists, from checks the terminal runs off the UI thread: which directory to check next, one at a time, and which answer still counts |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |

@@ -14,6 +14,7 @@
 pub mod cmdline;
 mod dir_check;
 pub mod events;
+pub mod feedback;
 pub mod keys;
 pub mod links;
 pub mod mouse;
@@ -1281,14 +1282,15 @@ impl Terminal {
     /// Called when a mouse selection is finished: the text goes to the
     /// primary selection, and to the clipboard when `to_clipboard` (the
     /// `copy_on_select` setting in effect now) says so. Both get the same
-    /// text, as a copy would.
-    pub fn finish_selection(&mut self, to_clipboard: bool, cx: &mut Context<Self>) {
-        if let Some(text) = self.selection_copy_text() {
-            crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
-            if to_clipboard {
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
-            }
+    /// text, as a copy would. Returns whether it wrote the clipboard, which
+    /// the view's "Copied" label shows.
+    pub fn finish_selection(&mut self, to_clipboard: bool, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selection_copy_text() else { return false };
+        crate::primary::write_primary(cx, ClipboardItem::new_string(text.clone()));
+        if to_clipboard {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
+        to_clipboard
     }
 
     // ---- process info -------------------------------------------------------

@@ -2284,6 +2284,9 @@ impl Workspace {
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_badges());
             }
+            if let Some(view) = view.as_ref() {
+                out.push_str(&view.read(cx).describe_feedback(std::time::Instant::now()));
+            }
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }

@@ -20,21 +20,21 @@ pub enum RightPress {
     Report,
     /// The clipboard is pasted.
     Paste,
-    /// Nothing happens, and the selection stays.
+    /// Nothing happens, and any selection stays.
     Nothing,
 }
 
-/// Decides a right press. `reports` is [`reports`] for the press, and
-/// `has_selection` says whether text is selected (so a copy would take
-/// something). The press pastes only when the setting says so and nothing is
-/// selected, so a stray right-click can't paste over a selection.
-pub fn right_press(reports: bool, has_selection: bool, setting: RightClick) -> RightPress {
+/// Decides a right press. `reports` is [`reports`] for the press. An
+/// unreported press pastes whenever the setting says so, selected text or
+/// not: the paste itself clears any selection, and with an empty clipboard
+/// nothing is pasted and the selection stays.
+pub fn right_press(reports: bool, setting: RightClick) -> RightPress {
     if reports {
         return RightPress::Report;
     }
-    match (setting, has_selection) {
-        (RightClick::Paste, false) => RightPress::Paste,
-        (RightClick::Paste, true) | (RightClick::Nothing, true | false) => RightPress::Nothing,
+    match setting {
+        RightClick::Paste => RightPress::Paste,
+        RightClick::Nothing => RightPress::Nothing,
     }
 }
 
@@ -267,35 +267,25 @@ mod tests {
 
     #[test]
     fn a_right_press_is_reported_while_the_program_reports() {
-        for selected in [false, true] {
-            for setting in SETTINGS {
-                assert_eq!(right_press(true, selected, setting), RightPress::Report, "{selected} {setting:?}");
-            }
+        for setting in SETTINGS {
+            assert_eq!(right_press(true, setting), RightPress::Report, "{setting:?}");
         }
     }
 
     #[test]
     fn right_click_pastes_only_when_set_to_paste() {
-        assert_eq!(right_press(false, false, RightClick::Paste), RightPress::Paste);
-        assert_eq!(right_press(false, false, RightClick::Nothing), RightPress::Nothing);
+        assert_eq!(right_press(false, RightClick::Paste), RightPress::Paste);
+        assert_eq!(right_press(false, RightClick::Nothing), RightPress::Nothing);
     }
 
     #[test]
-    fn a_right_press_over_a_selection_does_nothing() {
-        for setting in SETTINGS {
-            assert_eq!(right_press(false, true, setting), RightPress::Nothing, "{setting:?}");
-        }
-    }
-
-    #[test]
-    fn shift_right_click_follows_the_selection_rule() {
+    fn shift_right_click_pastes_while_the_program_reports() {
         // Reporting on, shift held: `reports` is false, so the press is an
         // unreported one.
         let mode = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
-        let unreported = reports(mode, true);
-        assert_eq!(right_press(unreported, false, RightClick::Paste), RightPress::Paste);
-        assert_eq!(right_press(unreported, true, RightClick::Paste), RightPress::Nothing);
-        assert_eq!(right_press(reports(mode, false), false, RightClick::Paste), RightPress::Report);
+        assert_eq!(right_press(reports(mode, true), RightClick::Paste), RightPress::Paste);
+        assert_eq!(right_press(reports(mode, true), RightClick::Nothing), RightPress::Nothing);
+        assert_eq!(right_press(reports(mode, false), RightClick::Paste), RightPress::Report);
     }
 
     #[test]
