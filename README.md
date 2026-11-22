@@ -532,9 +532,13 @@ same `-Prefix`) removes it all, as it does a one-command install. Prefer it
 to `cargo install`, which leaves out the Linux helper, so remote profiles
 would upload a stale one or none.
 
-Releases aren't code-signed yet, so SmartScreen may stop the first start of a
-downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
-Run anyway. Uninstalling any of these ways keeps your config in
+Release builds of `brindle.exe` and `brindle-remote.exe` are signed with Azure
+Artifact Signing. Their Properties dialog's Digital Signatures tab, or
+`Get-AuthenticodeSignature FILE` in PowerShell, shows the signature. SmartScreen
+may still stop the first start of a downloaded `brindle.exe` while the
+certificate builds reputation ("Windows protected your PC"): choose More info,
+then Run anyway. Builds from a checkout aren't signed.
+Uninstalling any of these ways keeps your config in
 `%APPDATA%\brindle` and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
 builds the release zip from a release build, and `scripts/winget-manifest.ps1`
 writes its WinGet manifest.
