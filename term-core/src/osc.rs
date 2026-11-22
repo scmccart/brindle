@@ -1,5 +1,6 @@
 //! Finds the sequences Brindle acts on beside alacritty's parser, which
-//! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, OSC 7501
+//! drops OSCs it doesn't know: OSC 9 and OSC 777 notifications, kitty's
+//! OSC 99 notification chunks, OSC 7501
 //! program status reports, ConEmu's `OSC 9 ; 4` progress reports, UAPI.15's
 //! `OSC 3008` context starts and ends, `OSC 22` pointer shapes (xterm's,
 //! with kitty's stack and queries), and the OSC 133 (and VS Code's OSC
@@ -13,6 +14,7 @@
 pub use crate::{Notice, Source};
 
 use crate::context;
+use crate::kitty;
 use crate::pointer;
 use crate::progress::{self, Progress, Report};
 use crate::status::{self, Message};
@@ -21,6 +23,10 @@ use crate::status::{self, Message};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
     Notice(Notice),
+    /// One chunk of kitty's `OSC 99` notification protocol: part of a
+    /// notification, a close, or a query. The client puts the parts
+    /// together; the server's emulator ignores it.
+    Kitty(kitty::Chunk),
     /// An OSC 7501 report, clear or query.
     Status(Message),
     /// An `OSC 9 ; 4` progress report.
@@ -47,12 +53,13 @@ impl Found {
         match self {
             Found::Progress(report) => progress::apply(current, *report),
             Found::PromptStart | Found::Reset => None,
-            Found::Notice(_) | Found::Status(_) | Found::Context(_) | Found::Pointer(_) => current,
+            Found::Notice(_) | Found::Kitty(_) | Found::Status(_) | Found::Context(_) | Found::Pointer(_) => current,
         }
     }
 }
 
-/// Payloads longer than this are ignored.
+/// Payloads longer than this are ignored (OSC 99's may be longer:
+/// [`kitty::MAX_BODY`]).
 pub const MAX_PAYLOAD: usize = 4096;
 /// Longest title and body shown, in characters.
 pub const MAX_TITLE_CHARS: usize = 200;
@@ -157,7 +164,10 @@ impl Scanner {
                 }
                 b';' => {
                     // Written as the number is: `0009` isn't 9.
-                    let wanted = matches!((self.number, self.digits), (9, 1) | (22, 2) | (777, 3) | (133 | 633, 3) | (7501 | 3008, 4));
+                    let wanted = matches!(
+                        (self.number, self.digits),
+                        (9, 1) | (22 | 99, 2) | (777, 3) | (133 | 633, 3) | (7501 | 3008, 4)
+                    );
                     self.payload.clear();
                     self.overflow = false;
                     self.state = State::Payload { collect: wanted };
@@ -192,7 +202,9 @@ impl Scanner {
             _ => {
                 self.state = State::Payload { collect };
                 if collect {
-                    if self.payload.len() < MAX_PAYLOAD {
+                    // OSC 99 limits its payload, not its metadata with it.
+                    let limit = if self.number == 99 { kitty::MAX_BODY } else { MAX_PAYLOAD };
+                    if self.payload.len() < limit {
                         self.payload.push(byte);
                     } else {
                         self.overflow = true;
@@ -213,6 +225,7 @@ impl Scanner {
                 .map(Found::Progress)
                 .or_else(|| parse_osc9(&payload).map(Found::Notice)),
             22 => pointer::parse(&payload).map(Found::Pointer),
+            99 => kitty::parse(&payload).map(Found::Kitty),
             777 => parse_osc777(&payload).map(Found::Notice),
             // `133;A` (or VS Code's `633;A`) may carry options after a `;`.
             133 | 633 => (payload == b"A" || payload.starts_with(b"A;")).then_some(Found::PromptStart),
@@ -510,6 +523,50 @@ mod tests {
         big.push(BEL);
         big.extend_from_slice(b"\x1b]22;>text\x07");
         assert_eq!(scan(&big), [pointer(b">text")]);
+    }
+
+    fn kitty(body: &[u8]) -> Found {
+        Found::Kitty(crate::kitty::parse(body).unwrap())
+    }
+
+    #[test]
+    fn kitty_chunks_with_either_terminator() {
+        assert_eq!(scan(b"\x1b]99;;Hello world\x1b\\"), [kitty(b";Hello world")]);
+        assert_eq!(scan(b"\x1b]99;i=1:d=0;Hello\x07"), [kitty(b"i=1:d=0;Hello")]);
+        // The U+2028 between button labels survives the scanner.
+        assert_eq!(scan("\x1b]99;p=buttons;A\u{2028}B\x07".as_bytes()), [kitty("p=buttons;A\u{2028}B".as_bytes())]);
+        // Ignored ones, and the number not written as is: nothing.
+        assert!(scan(b"\x1b]99;i=a b;x\x07\x1b]99;no second\x07").is_empty());
+        assert!(scan(b"\x1b]099;;x\x07\x1b]9;9;;x\x07\x1b]999;;x\x07").is_empty());
+        assert_eq!(kitty(b";x").progress_after(None), None);
+    }
+
+    #[test]
+    fn a_kitty_chunk_split_at_every_byte_is_found_once() {
+        let input = "x\x1b]99;i=b:d=0:p=buttons;Allow\u{2028}Deny\x1b\\y\x1b]99;i=b:e=1;SGk=\x07".as_bytes();
+        let want = [kitty("i=b:d=0:p=buttons;Allow\u{2028}Deny".as_bytes()), kitty(b"i=b:e=1;SGk=")];
+        for split in 0..=input.len() {
+            let mut scanner = Scanner::new();
+            let mut found = scanner.scan(&input[..split]);
+            found.extend(scanner.scan(&input[split..]));
+            assert_eq!(found, want, "split at {split}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_or_over_long_kitty_chunk_is_ignored() {
+        assert!(scan(b"\x1b]99;;hi\x18").is_empty());
+        assert!(scan(b"\x1b]99;;hi\x1a").is_empty());
+        assert!(scan(b"\x1b]99;;hi\x1b[0m").is_empty());
+        // A whole payload fits beside its metadata...
+        let full = format!("\x1b]99;i=long:d=0:a=report;{}\x07", "a".repeat(crate::kitty::MAX_PAYLOAD));
+        assert_eq!(scan(full.as_bytes()).len(), 1);
+        // ...and one past the scanner's limit is dropped, the next kept.
+        let mut big = b"\x1b]99;;".to_vec();
+        big.extend(std::iter::repeat_n(b'a', crate::kitty::MAX_BODY));
+        big.push(BEL);
+        big.extend_from_slice(b"\x1b]99;;after\x07");
+        assert_eq!(scan(&big), [kitty(b";after")]);
     }
 
     #[test]

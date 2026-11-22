@@ -157,8 +157,9 @@ impl Emulator {
                 }
                 // The pointer shape is the client's alone: the server keeps
                 // no stack, so a replay carries none, and answers no query
-                // (`process R19`).
-                Found::Progress(_) | Found::Notice(_) | Found::Pointer(_) => {}
+                // (`process R19`). Notifications, kitty's OSC 99 chunks
+                // included, are the client's too.
+                Found::Progress(_) | Found::Notice(_) | Found::Kitty(_) | Found::Pointer(_) => {}
             }
         }
         self.parser.advance(&mut self.term, &self.marks, &bytes[fed..]);

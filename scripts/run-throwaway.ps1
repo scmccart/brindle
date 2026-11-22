@@ -18,7 +18,9 @@
 #
 # The binary is $env:BRINDLE_BIN, else target\release\brindle.exe, else
 # target\debug\brindle.exe. BRINDLE_SERVER_HELPER is set to the
-# brindle-remote.exe beside it when there is one.
+# brindle-remote.exe beside it when there is one. A helper built in target\
+# without the packaged ConPTY stops the run: the script fetches it
+# (scripts/fetch-conpty.ps1) and asks for a rebuild.
 #
 # -Config copies a file in, so a copied config's profile that runs tmux would
 # attach to the tmux server it names (a WSL one is yours unless the profile's
@@ -47,7 +49,7 @@ if ($Help) {
     Get-Content -Path $PSCommandPath |
         Where-Object { $_ -match '^#' } |
         ForEach-Object { $_ -replace '^# ?', '' } |
-        Select-Object -First 29
+        Select-Object -First 31
     exit 0
 }
 
@@ -70,6 +72,17 @@ if ($Config -and -not (Test-Path -LiteralPath $Config -PathType Leaf)) {
 
 $helper = Join-Path (Split-Path -Parent $bin) 'brindle-remote.exe'
 $haveHelper = Test-Path -LiteralPath $helper
+
+# A helper built here without the packaged ConPTY (build.rs copies it beside
+# the exe when it embeds it) runs local tabs on the ConPTY built into
+# Windows, which repaints output and drops the OSC replies Brindle writes to
+# programs: not what a release does. Fetch it and stop, since only a rebuild
+# embeds it.
+$built = (Split-Path -Parent $bin).StartsWith((Join-Path $root 'target'), [StringComparison]::OrdinalIgnoreCase)
+if ($haveHelper -and $built -and -not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $bin) 'conpty.dll'))) {
+    & (Join-Path $PSScriptRoot 'fetch-conpty.ps1')
+    Fail "$helper was built without the packaged ConPTY, which is now fetched: build again (cargo build), then rerun" 1
+}
 
 $dir = Join-Path ([System.IO.Path]::GetTempPath()) "brindle-throwaway-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Path (Join-Path $dir 'state') -Force | Out-Null

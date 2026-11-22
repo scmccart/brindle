@@ -134,10 +134,66 @@ pub(crate) fn status_body(rng: &mut XorShift) -> Vec<u8> {
     body
 }
 
+/// One OSC 99 body (after `99;`): a few metadata keys, good and bad, with
+/// a payload of every type, plain or base64 (cut mid-quad, padded or not,
+/// or corrupt), button labels with U+2028, and the odd missing `;`.
+pub(crate) fn kitty_body(rng: &mut XorShift) -> Vec<u8> {
+    let mut parts: Vec<String> = Vec::new();
+    if rng.below(3) != 0 {
+        parts.push(format!("i={}", pick(rng, &["a", "b", "job", "q", "0", "a b", "", "x/y", "é"])));
+    }
+    if rng.below(2) == 0 {
+        parts.push(format!("p={}", pick(rng, &["title", "body", "buttons", "close", "?", "alive", "icon", "bogus"])));
+    }
+    if rng.below(2) == 0 {
+        parts.push(format!("d={}", pick(rng, &["0", "0", "1", "x"])));
+    }
+    let encoded = rng.below(3) == 0;
+    if encoded {
+        parts.push("e=1".to_string());
+    }
+    for (key, values) in [
+        ("a", &["focus", "-focus", "report", "-focus,report", "wiggle"][..]),
+        ("c", &["0", "1"][..]),
+        ("o", &["always", "unfocused", "invisible", "never"][..]),
+        ("u", &["0", "1", "2", "9"][..]),
+        ("w", &["-1", "0", "1500", "-7", "x", "99999999999999999999"][..]),
+        ("s", &["c2lsZW50", "c3lzdGVt", "silent", "!!"][..]),
+        ("f", &["a2l0dHk=", "?"][..]),
+    ] {
+        if rng.below(5) == 0 {
+            parts.push(format!("{key}={}", pick(rng, values)));
+        }
+    }
+    if rng.below(10) == 0 {
+        parts.push(pick(rng, &["novalue", "zz=1", "=x"]).to_string());
+    }
+    let text = match rng.below(5) {
+        0 => String::new(),
+        1 => pick(rng, &["Allow", "Deny", "", "é"]).to_string() + "\u{2028}" + &name(rng, 8),
+        2 => "\u{202e}bidi ✓".to_string(),
+        _ => name(rng, 30),
+    };
+    let payload = if encoded {
+        let mut out = STANDARD.encode(text);
+        match rng.below(6) {
+            0 => out.truncate(rng.below(out.len() + 1)),
+            1 => out.push_str(pick(rng, &["!", "=", "A", " "])),
+            2 => out = out.trim_end_matches('=').to_string(),
+            _ => {}
+        }
+        out
+    } else {
+        text
+    };
+    let separator = if rng.below(20) == 0 { "" } else { ";" };
+    format!("{}{separator}{payload}", parts.join(":")).into_bytes()
+}
+
 /// One OSC body (after `ESC ]`, before the terminator) of the numbers the
 /// parsers act on, or noise.
 pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
-    let text = match rng.below(13) {
+    let text = match rng.below(14) {
         0..=2 => format!("7;file://{}/{}", pick(rng, &["", "host", "localhost", "h:1"]), path(rng)),
         3 => format!("7;{}", path(rng)),
         4 => {
@@ -186,6 +242,7 @@ pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
                 .collect();
             format!("22;{first}{}", names.join(","))
         }
+        13 if rng.below(4) != 0 => return [b"99;".as_slice(), &kitty_body(rng)].concat(),
         _ => {
             let len = rng.below(24);
             return [format!("{};", rng.below(10_000)).into_bytes(), rng.bytes(len)].concat();
@@ -341,6 +398,39 @@ fn pointer_stacks_stay_bounded_and_every_query_gets_a_well_formed_reply() {
         }
     }
     assert!(ops > 100 && replies > 10, "only {ops} pointer ops and {replies} replies");
+}
+
+#[test]
+fn kitty_chunks_hold_only_checked_ids_and_bounded_data() {
+    use crate::kitty::{self, Data, KittyId};
+    let mut rng = XorShift::new(0x7e57_c0de_0000_0005);
+    let mut chunks = 0usize;
+    for _ in 0..3000 {
+        let body = kitty_body(&mut rng);
+        let Some(chunk) = kitty::parse(&body) else { continue };
+        chunks += 1;
+        if let Some(id) = &chunk.id {
+            assert_eq!(KittyId::parse(id.as_str().as_bytes()).as_ref(), Some(id), "body {body:?}");
+        }
+        match &chunk.data {
+            Data::Plain(bytes) => assert!(bytes.len() <= kitty::MAX_PAYLOAD),
+            Data::Base64(bytes) => {
+                assert!(bytes.len() <= kitty::MAX_PAYLOAD);
+                assert!(bytes.iter().all(|b| b.is_ascii_alphanumeric() || b"+/=".contains(b)), "body {body:?}");
+            }
+        }
+        assert!(chunk.payload.is_text() || chunk.data.is_empty());
+    }
+    assert!(chunks > 1000, "only {chunks} bodies parsed as chunks");
+    // And in streams, among everything else.
+    let found = (0..400)
+        .flat_map(|_| {
+            let count = 1 + rng.below(40);
+            osc::Scanner::new().scan(&stream(&mut rng, count))
+        })
+        .filter(|found| matches!(found, Found::Kitty(_)))
+        .count();
+    assert!(found > 20, "only {found} OSC 99 chunks in the streams");
 }
 
 #[test]

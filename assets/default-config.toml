@@ -44,10 +44,14 @@ blink = true
 # Desktop notifications. Programs ask for them with OSC 9 or OSC 777, e.g.
 #   printf '\033]777;notify;Build;finished\a'
 # and a bell (BEL) raises one too. Clicking a notification shows its tab.
+# osc99 is kitty's protocol, whose notifications can be updated, closed,
+# queried, given buttons and silenced, e.g.
+#   printf '\033]99;i=1:d=0;Build\033\\\033]99;i=1:p=body;finished\033\\'
 [notifications]
 bell = true
 osc9 = true
 osc777 = true
+osc99 = true
 # "unfocused": only for a tab that isn't in front of you (a background tab,
 # or any tab while its window isn't focused). "always": every time.
 when = "unfocused"

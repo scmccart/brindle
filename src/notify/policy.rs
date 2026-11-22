@@ -3,19 +3,34 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+use super::kitty::Occasion;
 use super::osc::{MAX_TITLE_CHARS, Source, truncate};
 use crate::config::{NotificationConfig, NotifyWhen};
 
-/// Whether `source` should notify, given its settings and whether its tab
-/// is in front of the user (the window's active tab, in a focused window).
-pub fn wanted(config: &NotificationConfig, source: Source, visible: bool) -> bool {
-    let enabled = match source {
+/// Whether `source` is turned on in the settings.
+pub fn enabled(config: &NotificationConfig, source: Source) -> bool {
+    match source {
         Source::Bell => config.bell,
         Source::Osc9 => config.osc9,
         Source::Osc777 => config.osc777,
+        Source::Osc99 => config.osc99,
         Source::Osc7501 => config.osc7501,
+    }
+}
+
+/// Whether `source` should notify, given its settings, when the program
+/// asked to be shown (`occasion`, OSC 99's `o`; `Always` for the others),
+/// whether its tab is in front of the user (`visible`: the window's active
+/// tab, in a focused window) and whether it is its window's active tab
+/// (`active`). The occasion can only make a notification quieter than the
+/// user's `when`.
+pub fn wanted(config: &NotificationConfig, source: Source, occasion: Occasion, visible: bool, active: bool) -> bool {
+    let program_allows = match occasion {
+        Occasion::Always => true,
+        Occasion::Unfocused => !visible,
+        Occasion::Invisible => !active,
     };
-    enabled && (config.when == NotifyWhen::Always || !visible)
+    enabled(config, source) && (config.when == NotifyWhen::Always || !visible) && program_allows
 }
 
 /// The notification's title and body: a program's own title comes first,
@@ -26,7 +41,7 @@ pub fn layout(source: Source, title: &str, body: &str, tab_title: &str) -> (Stri
     let summary = if title.is_empty() { tab_title.to_string() } else { format!("{title} — {tab_title}") };
     let body = match source {
         Source::Bell => "Bell".to_string(),
-        Source::Osc9 | Source::Osc777 | Source::Osc7501 => body.to_string(),
+        Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 => body.to_string(),
     };
     (truncate(&summary, MAX_TITLE_CHARS), body)
 }
@@ -191,14 +206,19 @@ mod tests {
         NotificationConfig { when, ..Default::default() }
     }
 
+    /// `wanted` for a source that has no occasion of its own.
+    fn plain(config: &NotificationConfig, source: Source, visible: bool) -> bool {
+        wanted(config, source, Occasion::Always, visible, visible)
+    }
+
     #[test]
     fn focus_rule() {
         let unfocused = config(NotifyWhen::Unfocused);
         let always = config(NotifyWhen::Always);
-        for source in [Source::Bell, Source::Osc9, Source::Osc777] {
-            assert!(!wanted(&unfocused, source, true), "{source:?} visible");
-            assert!(wanted(&unfocused, source, false), "{source:?} hidden");
-            assert!(wanted(&always, source, true), "{source:?} always");
+        for source in [Source::Bell, Source::Osc9, Source::Osc777, Source::Osc99] {
+            assert!(!plain(&unfocused, source, true), "{source:?} visible");
+            assert!(plain(&unfocused, source, false), "{source:?} hidden");
+            assert!(plain(&always, source, true), "{source:?} always");
         }
         assert_eq!(NotificationConfig::default().when, NotifyWhen::Unfocused);
     }
@@ -207,12 +227,45 @@ mod tests {
     fn sources_can_be_disabled() {
         let mut c = config(NotifyWhen::Always);
         c.bell = false;
-        assert!(!wanted(&c, Source::Bell, false));
-        assert!(wanted(&c, Source::Osc9, false));
+        assert!(!plain(&c, Source::Bell, false));
+        assert!(plain(&c, Source::Osc9, false));
         c.osc9 = false;
         c.osc777 = false;
-        assert!(!wanted(&c, Source::Osc9, false));
-        assert!(!wanted(&c, Source::Osc777, false));
+        assert!(!plain(&c, Source::Osc9, false));
+        assert!(!plain(&c, Source::Osc777, false));
+        assert!(plain(&c, Source::Osc99, false));
+        c.osc99 = false;
+        assert!(!enabled(&c, Source::Osc99));
+        assert!(!wanted(&c, Source::Osc99, Occasion::Always, false, false));
+    }
+
+    /// Each occasion under both `when` values, for a tab in each place: in
+    /// front of the user (active in a focused window), active in an
+    /// unfocused window, and in the background.
+    #[test]
+    fn occasions_only_make_notifications_quieter() {
+        // (visible, active)
+        let front = (true, true);
+        let unfocused_window = (false, true);
+        let background = (false, false);
+        let table = [
+            (NotifyWhen::Always, Occasion::Always, [true, true, true]),
+            (NotifyWhen::Always, Occasion::Unfocused, [false, true, true]),
+            (NotifyWhen::Always, Occasion::Invisible, [false, false, true]),
+            (NotifyWhen::Unfocused, Occasion::Always, [false, true, true]),
+            (NotifyWhen::Unfocused, Occasion::Unfocused, [false, true, true]),
+            (NotifyWhen::Unfocused, Occasion::Invisible, [false, false, true]),
+        ];
+        for (when, occasion, want) in table {
+            let c = config(when);
+            for ((visible, active), want) in [front, unfocused_window, background].into_iter().zip(want) {
+                assert_eq!(
+                    wanted(&c, Source::Osc99, occasion, visible, active),
+                    want,
+                    "{when:?} {occasion:?} visible={visible} active={active}"
+                );
+            }
+        }
     }
 
     #[test]
