@@ -6,7 +6,7 @@ Five rough edges, collected into one change. On Windows nothing sends OSC 3008, 
 
 ## What Changes
 
-- **Brindle detects elevation on Windows.** A local Windows tab whose foreground program (the process its title names) runs elevated shows the privileged badge, labelled `Administrator`, with the tooltip "Running as Administrator", on the tab face and zone header, as an OSC 3008 `elevate` context does. A context the program announces still wins, since it is more specific. It needs nothing from the program, so it covers an elevated Brindle's tabs, `sudo` in inline mode and a shell started elevated. The lookup runs off the UI thread and is cached per process.
+- **Brindle detects elevation on Windows.** A local Windows tab whose foreground program (the process its title names) runs elevated shows the privileged badge, labelled `Administrator`, with the tooltip "Running as Administrator", on the tab face and zone header, as an OSC 3008 `elevate` context does. An OSC 3008 context a program announces can't replace it, since a program could use one to hide the warning; it decides only in unelevated tabs. It needs nothing from the program, so it covers an elevated Brindle's tabs, `sudo` in inline mode and a shell started elevated. The lookup runs off the UI thread and is cached per process.
 - **Output commands hidden without integration.** Select Last Command Output and Copy Last Command Output join Copy Last Command Line: the palette doesn't list them, and the actions do nothing, until the terminal has received a prompt mark.
 - **One-command installs.** Two new scripts, published as release assets `install.sh` and `install.ps1`:
   - `curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh`
@@ -27,7 +27,7 @@ No breaking changes: both new release assets are additive, and the right-click c
 None.
 
 ### Modified Capabilities
-- `program-contexts`: a local Windows terminal whose foreground program runs elevated has a privileged notable context of its own, which an announced context overrides.
+- `program-contexts`: a local Windows terminal whose foreground program runs elevated has a privileged notable context of its own, which no announced context can replace.
 - `shell-integration`: a new requirement hides Select and Copy Last Command Output, and makes them do nothing, until a prompt mark has arrived.
 - `desktop-integration`: one-command installs and uninstalls from a release, on Linux and Windows.
 - `release-process`: a new requirement adds `install.sh` and `install.ps1` to every release, listed in `SHA256SUMS`.

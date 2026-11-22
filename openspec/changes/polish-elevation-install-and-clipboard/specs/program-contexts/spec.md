@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Detected elevation on Windows
-A local Windows terminal SHALL be detected as elevated while its foreground program, the process its tab title names, runs elevated (high integrity or above), with no OSC 3008 needed. Its notable context SHALL then be privileged, labelled `Administrator`, unless the terminal has a notable context from OSC 3008, which SHALL win. Detection SHALL NOT block the UI thread. While a process's elevation can't be read, it SHALL count as not elevated.
+A local Windows terminal SHALL be detected as elevated while its foreground program, the process its tab title names, runs elevated (high integrity or above), with no OSC 3008 needed. Its notable context SHALL then be privileged, labelled `Administrator`, whatever OSC 3008 context a program announces, which decides only while the terminal isn't elevated. Detection SHALL NOT block the UI thread. While a process's elevation can't be read, it SHALL count as not elevated.
 
 #### Scenario: Elevated Brindle
 - **WHEN** Brindle runs elevated and opens a local PowerShell tab
@@ -13,8 +13,12 @@ A local Windows terminal SHALL be detected as elevated while its foreground prog
 - **WHEN** in an unelevated Brindle a user runs `sudo pwsh` with Windows sudo in inline mode, approves the prompt, and then exits that shell
 - **THEN** the tab shows the privileged badge while the elevated shell runs, and none once it has exited
 
-#### Scenario: Announced context wins
-- **WHEN** an elevated tab's program prints `ESC ] 3008 ; start=c1 ; type=container ; container=web ESC \`
+#### Scenario: Detected elevation can't be hidden
+- **WHEN** an elevated tab's program prints `ESC ] 3008 ; start=c1 ; type=container ; container=web ESC \`, or an `elevate` context with `targetuser=guest`
+- **THEN** the terminal's notable context stays privileged, labelled `Administrator`
+
+#### Scenario: Announced context in an unelevated tab
+- **WHEN** an unelevated tab's program prints `ESC ] 3008 ; start=c1 ; type=container ; container=web ESC \`
 - **THEN** the terminal's notable context is the container, labelled `web`
 
 #### Scenario: Unelevated tab
