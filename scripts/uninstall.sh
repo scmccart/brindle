@@ -1,6 +1,8 @@
 #!/bin/sh
-# Removes what install.sh installed, for the same PREFIX (default ~/.local).
-# Your config in ~/.config/brindle is kept.
+# Removes what install.sh, or a release's one-command install.sh
+# (scripts/get.sh), installed for the same PREFIX (default ~/.local): the
+# launcher entry and icon, brindle and the helper beside it. Your config in
+# ~/.config/brindle is kept.
 set -eu
 
 PREFIX=${PREFIX:-$HOME/.local}
@@ -24,4 +26,6 @@ else
     $sudo rm -f "$PREFIX/share/applications/brindle.desktop" \
         "$PREFIX/share/icons/hicolor/scalable/apps/brindle.svg"
 fi
-$sudo rm -f "$bin" "$PREFIX/bin/brindle-remote"
+# The helper is brindle-remote from install.sh, brindle-remote-linux-x86_64
+# from a release.
+$sudo rm -f "$bin" "$PREFIX/bin/brindle-remote" "$PREFIX/bin/brindle-remote-linux-x86_64"

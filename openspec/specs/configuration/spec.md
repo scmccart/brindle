@@ -81,7 +81,7 @@ The config SHALL control:
 - grid padding;
 - cursor shape and blinking;
 - `copy_on_select`;
-- `right_click`: `"none"` (the default) or `"paste"` (a right-click pastes the clipboard when no text is selected, and does nothing while text is selected, as defined by `terminal-emulation`);
+- `right_click`: `"none"` (the default) or `"paste"` (a right-click clears any selection and pastes the clipboard, as defined by `terminal-emulation`);
 - `osc52_paste` (whether programs may read the clipboard);
 - `mark_failed_commands` (whether failed commands get a gutter mark; on by default).
 
@@ -97,7 +97,7 @@ Brindle has no tmux support. A config that still sets `tmux_session_end` at the 
 
 #### Scenario: Right-click paste enabled
 - **WHEN** the config contains `right_click = "paste"`
-- **THEN** a right-click in a terminal that isn't reporting the mouse and has no text selected pastes the clipboard, and one while text is selected does nothing
+- **THEN** a right-click in a terminal that isn't reporting the mouse clears any selection and pastes the clipboard
 
 #### Scenario: Unknown right-click value
 - **WHEN** the config contains `right_click = "menu"`

@@ -27,7 +27,8 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
 - **Progress bars** from ConEmu's OSC 9;4 (cargo, winget): a thin bar along the
   bottom of the tab, and of each zone's header in a split tab.
 - **Context badges** from systemd's OSC 3008 (`run0`, containers, VMs, remote
-  logins): a yellow warning icon on a tab while it runs as root.
+  logins): a yellow warning icon on a tab while it runs as root. On Windows the
+  same icon marks a tab whose program runs elevated (labelled Administrator).
 - **Pointer shapes** from OSC 22, with kitty's stack and queries: a resize
   pointer over an editor's split border, a hand over a button.
 - **Themes**: five built in, plus your own. The settings dialog (ctrl-shift-,)
@@ -303,8 +304,10 @@ Each case keeps its logs, screen dumps and window captures in
 
 Cases that need a debug-only fault switch are skipped, with the reason, when the binary under test has none (`cargo test --release`, or `BRINDLE_E2E_BIN` naming a release build); `BRINDLE_E2E_SWITCHES_REQUIRED=1`, as CI sets, makes that a failure.
 
+The Linux clipboard cases read and set the clipboard with `xclip`, as another program would, and skip with the reason when it is missing; `BRINDLE_E2E_CLIPBOARD_REQUIRED=1`, as CI sets, makes that a failure.
+
 To run the suite headless, the way CI does, wrap it in `scripts/with-xvfb`
-(after `sudo apt install xvfb x11-utils openbox mesa-vulkan-drivers dbus`):
+(after `sudo apt install xvfb x11-utils xclip openbox mesa-vulkan-drivers dbus`):
 
 ```sh
 BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e
@@ -375,7 +378,38 @@ scripts/lint-commits                      # check the commits not on origin/main
 
 ## Installing
 
-Each [GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
+On Linux x86-64, one command installs the latest release as you: `brindle`
+and its remote helper in `~/.local/bin`, with the launcher entry and icon. It
+works with `sh` or `bash`, checks the download against the release's
+`SHA256SUMS` before installing anything, says so when `brindle` can't run on
+the system (it needs the glibc and libraries named below), and uses `sudo`
+only to write a `PREFIX` you can't:
+
+```sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh
+```
+
+Run it again to update; a Brindle that is already running keeps its old build
+until it quits. `BRINDLE_VERSION` picks another release and `PREFIX` another
+directory, and `--uninstall` removes it all again, keeping your config in
+`~/.config/brindle`:
+
+```sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | env BRINDLE_VERSION=0.4.0 sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | env PREFIX=/usr/local sh
+curl -fsSL https://github.com/scmccart/brindle/releases/latest/download/install.sh | sh -s -- --uninstall
+```
+
+The one-command installers (`install.sh` here, `install.ps1` on Windows) come
+with the releases after 0.3.0. Each release's copy installs that release
+unless told another, and its `SHA256SUMS` lists them. That checksum catches a
+corrupt download, not a compromised release; for provenance, check the
+attestation as below. `BRINDLE_DOWNLOAD_BASE` points either script at a
+directory of built assets instead (`file:///DIR`), which is how CI tests them.
+The scripts are `scripts/get.sh` and `scripts/get.ps1` in a checkout.
+
+To install by hand instead: each
+[GitHub release](https://github.com/scmccart/brindle/releases) has a Linux
 x86-64 archive, `brindle-<version>-x86_64-unknown-linux-gnu.tar.gz`, holding
 `brindle`, the static remote helper `brindle-remote-linux-x86_64` and the
 licences, plus a `SHA256SUMS` file. It's built on Ubuntu 26.04, so it needs a
@@ -428,14 +462,41 @@ The launcher entry runs the binary by its absolute path, so it works even when
 `~/.cargo/bin` isn't on the desktop session's `PATH`. After moving or upgrading
 the binary, run `brindle --install-desktop` again so the entry stays current.
 
-To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), or
-`brindle --uninstall-desktop` followed by `cargo uninstall brindle`. Your config
-in `~/.config/brindle` is kept either way.
+To uninstall, run `scripts/uninstall.sh` (with the same `PREFIX`), which also
+removes a one-command install, or `brindle --uninstall-desktop` followed by
+`cargo uninstall brindle`. Your config in `~/.config/brindle` is kept either
+way.
 
 ### On Windows
 
-There's no installer. The terminal server's helper, `brindle-remote.exe`,
-carries the packaged ConPTY and unpacks it to
+In PowerShell 5.1 or 7, one command installs the latest release for you,
+without elevation: `brindle.exe`, the terminal server's helper
+`brindle-remote.exe` and the Linux remote helper in
+`%LOCALAPPDATA%\Programs\brindle`, that directory on your user `PATH`, and a
+Start Menu shortcut. It checks the zip against the release's `SHA256SUMS`
+before installing anything, and reports a failure as an error, leaving your
+PowerShell open:
+
+```powershell
+irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1 | iex
+```
+
+Run it again to update, even while Brindle runs: the running Brindle keeps its
+old build until it quits, and the next launch reattaches its sessions through
+the new version's terminal server. `iex` can't pass parameters, so the script
+reads `$env:BRINDLE_VERSION` (another release), `$env:BRINDLE_PREFIX` (another
+directory) and `$env:BRINDLE_UNINSTALL` (remove it all again, keeping your
+config and session state). The variables stay set in that PowerShell, so the
+script block form, which takes `-Version`, `-Prefix` and `-Uninstall`, suits a
+one-off:
+
+```powershell
+$env:BRINDLE_UNINSTALL = 1; irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1 | iex
+& ([scriptblock]::Create((irm https://github.com/scmccart/brindle/releases/latest/download/install.ps1))) -Uninstall
+```
+
+To install by hand instead: the terminal server's helper,
+`brindle-remote.exe`, carries the packaged ConPTY and unpacks it to
 `%LOCALAPPDATA%\brindle\conpty\<version>` on first run; it must sit beside
 `brindle.exe`. Each [GitHub release](https://github.com/scmccart/brindle/releases) has a
 zip, `brindle-<version>-x86_64-pc-windows-msvc.zip`, with `brindle.exe`,
@@ -467,13 +528,14 @@ helper you already have, which must be this version), and installs the three
 together in `%LOCALAPPDATA%\Programs\brindle` (`-Prefix DIR` picks another
 directory). It then adds that directory to your user `PATH` and creates the
 Start Menu shortcut. Re-run it to update. `scripts/uninstall.ps1` (with the
-same `-Prefix`) removes it all. Prefer it to `cargo install`, which leaves out
-the Linux helper, so remote profiles would upload a stale one or none.
+same `-Prefix`) removes it all, as it does a one-command install. Prefer it
+to `cargo install`, which leaves out the Linux helper, so remote profiles
+would upload a stale one or none.
 
 Releases aren't code-signed yet, so SmartScreen may stop the first start of a
 downloaded `brindle.exe` ("Windows protected your PC"): choose More info, then
-Run anyway. Uninstalling either way keeps your config in `%APPDATA%\brindle`
-and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
+Run anyway. Uninstalling any of these ways keeps your config in
+`%APPDATA%\brindle` and session state in `%LOCALAPPDATA%\brindle`. `scripts/package-windows.ps1`
 builds the release zip from a release build, and `scripts/winget-manifest.ps1`
 writes its WinGet manifest.
 
@@ -525,7 +587,7 @@ family = ["Inter", "Segoe UI"]
 | the strip's `⌄` | profile menu (see below) |
 | right-click a tab / a zone header | tab menu / zone menu (see below) |
 | ctrl-alt-1 … ctrl-alt-9 | new tab with profile N |
-| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard when nothing is selected and does nothing while text is: shift-right-click where a program uses the mouse) |
+| ctrl-shift-c / ctrl-shift-v | copy / paste (middle click pastes the primary selection; with `right_click = "paste"`, right-click pastes the clipboard over a selection too, clearing it, and a program that reports the mouse gets the click instead; shift-right-click pastes in Brindle there. See [Clipboard](#clipboard)) |
 | shift-pageup/down, shift-home/end | scrollback |
 | ctrl-shift-up / ctrl-shift-down | previous / next prompt ([shell integration](#shell-integration)); one line without it |
 | ctrl-shift-f | find in the scrollback (see below) |
@@ -601,9 +663,32 @@ a chosen family goes to the front of that table's `family` list, keeping the
 others after it as fallbacks, and "Default" removes the list. Cancel, escape
 or another section drop the changes.
 
-The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes only when nothing is selected). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
+The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes over a selection too, clearing it; see [Clipboard](#clipboard)). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
+
+### Clipboard
+
+Ctrl-shift-c copies the selection and ctrl-shift-v pastes the clipboard. With
+`copy_on_select = true`, finishing a drag-selection copies it too. Middle click
+pastes Brindle's own primary selection. With `right_click = "paste"`, a
+right-click pastes the clipboard, over a selection too, which clears the
+selection; with an empty clipboard nothing is pasted and the selection stays.
+
+A program that reports the mouse (htop, or vim with the mouse on) gets the
+clicks, right-clicks included, and copies and pastes in its own way. Shift
+gives the mouse back to Brindle, so shift-drag selects and shift-right-click
+pastes there.
+
+A copy or paste made with the mouse shows a small label beside the pointer:
+"Copied" with a copy icon, "Pasted" with a paste icon, or "Nothing to paste"
+with a ban icon when a right-click found no text on the clipboard. It fades after about a second, and it takes
+no clicks, so a click on it reaches the terminal.
+
+On Windows, copied text has CRLF line ends, as Windows Terminal's copies do:
+some applications, Excel cells among them, read a bare line feed as nothing. Text a program sets with OSC 52 is copied as
+the program sent it. Paste sends each line end as a carriage return, which is
+what terminal programs expect.
 
 ### Links
 
@@ -738,8 +823,10 @@ them ignore them. With a script loaded:
   To keep line scrolling on those keys, bind `"ctrl-shift-up" = "scroll_line_up"`
   and `"ctrl-shift-down" = "scroll_line_down"`.
 - **Select Last Command Output** and **Copy Last Command Output** are in the
-  command palette. They have no default key; bind `select_last_output` or
-  `copy_last_output`. Copy leaves your selection alone.
+  command palette, once the terminal has received a prompt mark, as Copy Last
+  Command Line is (below); a terminal that has received none (a shell without
+  the scripts, say) doesn't list them, and a key bound to them does nothing. They have no default key; bind
+  `select_last_output` or `copy_last_output`. Copy leaves your selection alone.
 - **Copy Last Command Line** (`copy_last_command`, no default key) copies the last
   command as you typed it. It is in the palette only once the terminal has received a
   prompt mark, so a shell with no script loaded doesn't list it, and a key bound to it
@@ -888,6 +975,22 @@ contexts and shows the innermost notable one as a badge after the tab's title
   itself alone: `run0` tints the background red and puts a glyph in the title;
 - a remote host (`remote`), a container or a VM: `user@host`, the host, or the
   container's or VM's name, in the muted foreground.
+
+On Windows the elevation badge comes from the system instead. A local tab whose
+foreground program runs elevated shows the same warning icon, and resting the
+pointer on it shows "Running as Administrator". Brindle reads the token of the
+tab's newest child process, so a program started as administrator from the
+tab's shell shows it, whether Brindle runs elevated or not. Windows `sudo` in
+inline mode doesn't: its elevated shell is no longer a child of the tab's
+process by the time its prompt shows, so the badge shows for about a second at
+most. An elevated Brindle's tabs show it too, since their programs
+are elevated. It takes precedence over any context a program announces, so
+a program can't swap the warning for a muted label. It comes up within about
+a second of the program's start and goes within about a second of its exit,
+as the tab's title does. A program started elevated in its own window
+(`Start-Process -Verb RunAs`) counts too, while it runs as the tab's newest
+child. When Brindle can't read a program's token (a process it isn't allowed
+to open), no badge shows, so an elevated program can go unmarked.
 
 Shell and command contexts, and sessions for any other user, show no badge. Labels are cut to 24
 characters, and a narrow tab cuts its title to 8 characters before it cuts a

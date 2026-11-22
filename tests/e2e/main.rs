@@ -12,11 +12,14 @@
 //!
 //! Cases open Brindle windows under Xwayland (`BRINDLE_E2E_DISPLAY`, default
 //! `:0`; on Windows, on the desktop), so ask before running them on
-//! someone's desktop. They never send synthetic input. `BRINDLE_E2E_BIN` picks the binary (default: this
-//! build's), `BRINDLE_E2E_SLOW` stretches every delay and every wait's limit
-//! (the cases wait through `wait.rs`'s [`Scale`], never a fixed sleep). Each
-//! case leaves its config, dumps, captures and transcripts in
-//! `target/tmp/e2e/<case>/`.
+//! someone's desktop. They never send synthetic input. `BRINDLE_E2E_BIN`
+//! picks the binary (default: this build's; an installed or unpacked
+//! release works too, its helper found beside it as Brindle finds it and
+//! checked for its release rather than against sources:
+//! `common::server::check_helper`), `BRINDLE_E2E_SLOW` stretches every delay
+//! and every wait's limit (the cases wait through `wait.rs`'s [`Scale`],
+//! never a fixed sleep). Each case leaves its config, dumps, captures and
+//! transcripts in `target/tmp/e2e/<case>/`.
 
 mod brindle;
 #[path = "../common/mod.rs"]
@@ -33,7 +36,7 @@ use std::time::Instant;
 
 #[cfg(windows)]
 use common::server::under;
-use common::server::{Suite, check_helper, end_roles, helper, helper_name, private_dir, server_processes};
+use common::server::{Suite, check_helper, end_roles, helper, private_dir, server_processes};
 #[cfg(windows)]
 use common::winproc;
 use common::{Selection, take_shard};
@@ -83,7 +86,9 @@ pub struct Ctx {
     pub dir: PathBuf,
     pub bin: PathBuf,
     /// The terminal server helper Brindle runs (`BRINDLE_REMOTE_AGENT`, on
-    /// Windows `BRINDLE_SERVER_HELPER`, else `brindle-remote` beside `bin`).
+    /// Windows `BRINDLE_SERVER_HELPER`, else beside `bin` by Brindle's names
+    /// for it: on Linux an archive's `brindle-remote-linux-x86_64`, then
+    /// `brindle-remote`).
     pub helper: PathBuf,
     pub display: String,
     /// The case's own terminal server directory (`BRINDLE_SERVER_DIR`), so
@@ -160,12 +165,16 @@ fn main() {
     let helper = helper(&bin);
     // Local tabs run in the terminal server, so every case that runs
     // Brindle needs the helper.
-    if cfg!(any(target_os = "linux", windows)) && has_display && selected.iter().any(|case| case.display) {
-        let default = PathBuf::from(env!("CARGO_BIN_EXE_brindle")).with_file_name(helper_name());
-        if let Err(why) = check_helper(&helper, &default) {
-            eprintln!("e2e: {why}");
-            std::process::exit(1);
-        }
+    if cfg!(any(target_os = "linux", windows))
+        && has_display
+        && selected.iter().any(|case| case.display)
+        && let Err(why) = check_helper(&helper, &bin, Path::new(env!("CARGO_BIN_EXE_brindle")))
+    {
+        eprintln!("e2e: {why}");
+        std::process::exit(1);
+    }
+    if std::env::var_os("BRINDLE_E2E_BIN").is_some() {
+        println!("e2e: {} with {}", bin.display(), helper.display());
     }
 
     let required = std::env::var("BRINDLE_E2E_SWITCHES_REQUIRED").as_deref() == Ok("1");
@@ -340,6 +349,7 @@ fn self_test() -> i32 {
         ("cell rectangles", capture::self_test),
         ("pixel scans", capture::self_test_scan),
         ("remote parsing", cases::self_test_remote),
+        ("clipboard helpers", cases::self_test_clipboard),
         ("server helpers", common::server::self_test),
         ("fault switches", switches::self_test),
         #[cfg(windows)]

@@ -6,9 +6,10 @@
 # CHANGELOG.md. Merging it makes release-please tag vX.Y.Z and create a draft
 # release with that version's notes. This run then builds both platforms at
 # the tag with the same reusable workflows CI uses, attests the binaries'
-# build provenance, attaches the Linux archive, the Windows zip and
-# SHA256SUMS, and publishes the release. A failed build or attestation leaves
-# the draft; rerunning the failed jobs completes it.
+# build provenance, attaches the Linux archive, the Windows zip, the
+# one-command installers (install.sh and install.ps1, stamped with the
+# version) and SHA256SUMS, and publishes the release. A failed build or
+# attestation leaves the draft; rerunning the failed jobs completes it.
 #
 # release-please runs as a GitHub App (secrets RELEASE_APP_ID and
 # RELEASE_APP_PRIVATE_KEY): pull requests opened with GITHUB_TOKEN trigger no
@@ -110,18 +111,36 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ needs.release-please.outputs.tag }}
     steps:
+      # For the installer scripts, at the tag.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
       - uses: actions/download-artifact@v7
         with:
           pattern: brindle-*-x64
           path: dist
           merge-multiple: true
+      # The one-command installers, scripts/get.sh and get.ps1, stamped with
+      # this release's version so each installs its own release (README's
+      # Installing).
+      - name: Installers
+        run: |
+          version=${TAG#v}
+          sed "s/@VERSION@/$version/" scripts/get.sh > dist/install.sh
+          sed "s/@VERSION@/$version/" scripts/get.ps1 > dist/install.ps1
+          for f in dist/install.sh dist/install.ps1; do
+            grep -qF "'$version'" "$f" || { echo "$f isn't stamped with $version" >&2; exit 1; }
+          done
       - name: Checksums
         working-directory: dist
         run: |
           ls -l
-          sha256sum -- *.tar.gz *.zip brindle-ui-tokens.css > SHA256SUMS
+          sha256sum -- *.tar.gz *.zip brindle-ui-tokens.css install.sh install.ps1 > SHA256SUMS
           cat SHA256SUMS
       - name: Attach the assets
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/brindle-ui-tokens.css dist/SHA256SUMS --clobber
+        run: |
+          gh release upload "$TAG" dist/*.tar.gz dist/*.zip dist/brindle-ui-tokens.css \
+            dist/install.sh dist/install.ps1 dist/SHA256SUMS --clobber
       - name: Publish
         run: gh release edit "$TAG" --draft=false

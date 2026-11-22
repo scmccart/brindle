@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::Scroll;
 use alacritty_terminal::index::Side;
@@ -20,6 +20,7 @@ use gpui::{
 use crate::actions::*;
 use crate::find_bar::{FindBar, LastFind};
 use crate::latency::Latency;
+use crate::terminal::feedback::{FeedbackKind, FeedbackSlot, Phase};
 use crate::terminal::mouse::{self, Button};
 use crate::terminal::{Link, Terminal, keys, links, pointer, report_focus};
 use crate::terminal_element::TerminalElement;
@@ -59,6 +60,14 @@ impl GridLayout {
             f32::from(self.line_height),
             scale
         )
+    }
+
+    /// The grid's cells' bounds, in logical window pixels.
+    pub fn bounds(&self) -> Bounds<Pixels> {
+        Bounds {
+            origin: self.origin,
+            size: gpui::size(self.cell_width * self.cols as f32, self.line_height * self.rows as f32),
+        }
     }
 
     /// Whether `position` is over one of the grid's cells.
@@ -193,6 +202,10 @@ pub struct TerminalView {
     mouse: MouseState,
     /// The pointer the grid's last painted frame chose.
     pointer_shown: Cell<pointer::Shown>,
+    /// The label a mouse copy or paste shows at the pointer.
+    feedback: FeedbackSlot,
+    /// Redraws the label's fade, and ends once it is gone.
+    _feedback_frames: Option<Task<()>>,
     window_active: bool,
     /// Cursor blink timer; only runs while this terminal has focus.
     _blink: Option<Task<()>>,
@@ -215,6 +228,9 @@ pub struct LinkFailed(pub String);
 impl EventEmitter<LinkFailed> for TerminalView {}
 
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// How far the mouse clipboard label sits down and right of the pointer.
+const FEEDBACK_OFFSET: Pixels = gpui::px(12.);
 
 impl TerminalView {
     pub fn new(
@@ -271,6 +287,8 @@ impl TerminalView {
             last_find: None,
             mouse: MouseState::default(),
             pointer_shown: Cell::new(pointer::Shown::default()),
+            feedback: FeedbackSlot::default(),
+            _feedback_frames: None,
             window_active: true,
             _blink: None,
             _subscriptions: subscriptions,
@@ -341,7 +359,7 @@ impl TerminalView {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = self.terminal.read(cx).selection_text() {
+        if let Some(text) = self.terminal.read(cx).selection_copy_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -504,12 +522,21 @@ impl TerminalView {
         // A right press that isn't reported pastes, or does nothing. Neither
         // records a button, so its release reports nothing either.
         if e.button == gpui::MouseButton::Right {
-            let has_selection = self.terminal.read(cx).selection_text().is_some();
             let setting = crate::settings::Settings::get(cx).config.right_click;
-            match mouse::right_press(reports, has_selection, setting) {
+            match mouse::right_press(reports, setting) {
                 mouse::RightPress::Report => {}
                 mouse::RightPress::Paste => {
-                    self.paste_clipboard(cx);
+                    // The paste clears any selection; with no text on the
+                    // clipboard nothing is sent and the selection stays.
+                    let text = cx.read_from_clipboard().and_then(|item| item.text()).filter(|text| !text.is_empty());
+                    let kind = match text {
+                        Some(text) => {
+                            self.terminal.update(cx, |t, cx| t.paste(&text, cx));
+                            FeedbackKind::Pasted
+                        }
+                        None => FeedbackKind::NothingToPaste,
+                    };
+                    self.show_feedback(kind, e.position, cx);
                     return;
                 }
                 mouse::RightPress::Nothing => return,
@@ -605,7 +632,9 @@ impl TerminalView {
         if self.mouse.selecting && e.button == gpui::MouseButton::Left {
             self.set_selecting(false, cx);
             let to_clipboard = crate::settings::Settings::get(cx).config.copy_on_select;
-            self.terminal.update(cx, |t, cx| t.finish_selection(to_clipboard, cx));
+            if self.terminal.update(cx, |t, cx| t.finish_selection(to_clipboard, cx)) {
+                self.show_feedback(FeedbackKind::Copied, e.position, cx);
+            }
             return;
         }
         let Some(layout) = self.layout.get() else { return };
@@ -718,6 +747,94 @@ impl TerminalView {
         self.pointer_shown.get().last()
     }
 
+    /// Shows the label for a mouse copy or paste at `at` (window
+    /// coordinates), replacing any label already showing, and starts the
+    /// one task that redraws its fade. The task waits on a timer between
+    /// frames, so the UI thread's queue stays idle (`terminal/pace.rs`), and
+    /// ends once the label is gone.
+    fn show_feedback(&mut self, kind: FeedbackKind, at: Point<Pixels>, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        self.feedback.show(kind, at, now);
+        cx.notify();
+        let Some(first) = self.feedback.next_frame(now) else { return };
+        self._feedback_frames = Some(cx.spawn(async move |this, cx| {
+            let mut wait = first;
+            loop {
+                cx.background_executor().timer(wait).await;
+                let next = this.update(cx, |this, cx| {
+                    let now = Instant::now();
+                    let next = this.feedback.next_frame(now);
+                    this.feedback.sweep(now);
+                    cx.notify();
+                    next
+                });
+                match next {
+                    Ok(Some(next)) => wait = next,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    /// The `--dump-screen-after` line for the label, `--- feedback
+    /// kind=NAME`, while one isn't gone at `now`; empty otherwise.
+    pub fn describe_feedback(&self, now: Instant) -> String {
+        self.feedback.describe(now)
+    }
+
+    /// The label for a mouse copy or paste, while one shows: tooltip-styled,
+    /// 12px down and right of the pointer and kept inside the grid. It has
+    /// no focus handle and no listeners, so it gets no hitbox: keys and
+    /// clicks go where they would without it.
+    fn render_feedback(&self, cx: &App) -> Option<impl IntoElement + use<>> {
+        use brindle_ui::{ActiveFont as _, ActiveTheme as _, Align, Anchored, Icon, Side};
+
+        let (feedback, phase) = self.feedback.visible(Instant::now())?;
+        let layout = self.layout.get()?;
+        let opacity = match phase {
+            Phase::Shown => 1.,
+            Phase::Fading(opacity) => opacity,
+            Phase::Gone => return None,
+        };
+        let icon = match feedback.kind {
+            FeedbackKind::Copied => Icon::Copy,
+            FeedbackKind::Pasted => Icon::ClipboardPaste,
+            FeedbackKind::NothingToPaste => Icon::Ban,
+        };
+        let style = brindle_ui::tooltip_style(cx.ui_theme());
+        // A zero-size trigger 12px right of the pointer, with the box 12px
+        // below it.
+        let trigger = Bounds {
+            origin: feedback.at + gpui::point(FEEDBACK_OFFSET, gpui::px(0.)),
+            size: gpui::Size::default(),
+        };
+        Some(
+            Anchored::new(trigger)
+                .side(Side::Bottom)
+                .align(Align::Start)
+                .offset(FEEDBACK_OFFSET)
+                .margin(gpui::px(0.))
+                .within(layout.bounds())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(style.gap)
+                        .px(style.padding_x)
+                        .py(style.padding_y)
+                        .rounded(style.radius)
+                        .bg(style.background)
+                        .text_color(style.foreground)
+                        .text_size(style.text_size)
+                        .font_family(cx.ui_font())
+                        .whitespace_nowrap()
+                        .opacity(opacity)
+                        .child(icon.size(gpui::rems(0.875)))
+                        .child(feedback.kind.label()),
+                ),
+        )
+    }
+
     /// A selection drag, a reported button press or a press on a link is in
     /// progress.
     pub fn is_dragging(&self) -> bool {
@@ -733,6 +850,7 @@ impl TerminalView {
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let find_bar = self.render_find_bar(window, cx);
+        let feedback = self.render_feedback(cx);
         div()
             .id("terminal")
             .key_context("Terminal")
@@ -765,6 +883,7 @@ impl Render for TerminalView {
             .size_full()
             .child(TerminalElement::new(cx.entity()))
             .children(find_bar)
+            .children(feedback)
     }
 }
 

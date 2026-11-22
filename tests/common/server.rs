@@ -1,8 +1,8 @@
 //! What both GUI suites do around each case's Brindle: the case's own
 //! directories and hermetic environment ([`isolate`]), the terminal server
-//! helper it needs ([`helper`], [`check_helper`]), and the stop step that
-//! ends the case's server and fails a case that left a role running or ran
-//! one in a systemd scope ([`stop`]).
+//! helper it needs, found as Brindle finds it ([`helper`], [`check_helper`]),
+//! and the stop step that ends the case's server and fails a case that left
+//! a role running or ran one in a systemd scope ([`stop`]).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,49 +80,162 @@ pub fn isolate(command: &mut Command, run: &Isolation) {
 /// and Brindle doesn't read it for the local server.
 pub const HELPER_VARIABLE: &str = if cfg!(windows) { "BRINDLE_SERVER_HELPER" } else { "BRINDLE_REMOTE_AGENT" };
 
-/// The helper's file name beside a binary.
+/// The helper's file name as cargo builds it.
 pub fn helper_name() -> String {
     format!("brindle-remote{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// The helper Brindle runs its terminal server with: [`HELPER_VARIABLE`],
-/// else the `brindle-remote` beside the binary, as Brindle looks for it.
-pub fn helper(bin: &Path) -> PathBuf {
-    std::env::var_os(HELPER_VARIABLE).map(PathBuf::from).unwrap_or_else(|| bin.with_file_name(helper_name()))
+/// The names Brindle looks for the Linux helper by beside its binary, in
+/// order (`HELPER_NAMES` in `src/remote/mod.rs`): the archives' name, then
+/// cargo's. Remote tabs deploy it, and on Linux it is the terminal server's
+/// helper too.
+pub const LINUX_HELPER_NAMES: [&str; 2] = ["brindle-remote-linux-x86_64", "brindle-remote"];
+
+/// The names Brindle looks for its terminal server helper by beside its
+/// binary, in order: on Windows only `brindle-remote.exe`, else
+/// [`LINUX_HELPER_NAMES`].
+pub fn server_helper_names() -> &'static [&'static str] {
+    if cfg!(windows) { &["brindle-remote.exe"] } else { &LINUX_HELPER_NAMES }
 }
 
-/// The helper must be there, and when it is the one beside the suite's
-/// default binary (`default`), no older than its sources (a test target
-/// doesn't rebuild it).
-pub fn check_helper(helper: &Path, default: &Path) -> Result {
-    let build = if default.parent().and_then(Path::file_name).is_some_and(|name| name == "release") {
+/// The paths Brindle looks beside: `bin` as given, then the file behind it
+/// when that is elsewhere (a link, such as WinGet's), as `exe_paths` in
+/// `src/remote/mod.rs` does.
+pub fn bin_paths(bin: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![bin.to_path_buf()];
+    if let Ok(resolved) = std::fs::canonicalize(bin)
+        && resolved != bin
+    {
+        paths.push(resolved);
+    }
+    paths
+}
+
+/// The first of `names` that `is_file` accepts beside one of `bins`, every
+/// name beside each path in turn: where Brindle finds a helper.
+pub fn beside(bins: &[PathBuf], names: &[&str], is_file: &dyn Fn(&Path) -> bool) -> Option<PathBuf> {
+    bins.iter().flat_map(|bin| names.iter().map(move |name| bin.with_file_name(name))).find(|path| is_file(path))
+}
+
+/// The helper named by [`HELPER_VARIABLE`], when that is set and not empty
+/// (Brindle takes an empty one for unset).
+fn named_helper() -> Option<PathBuf> {
+    std::env::var_os(HELPER_VARIABLE).filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+/// The helper Brindle runs its terminal server with: [`HELPER_VARIABLE`],
+/// else the first of [`server_helper_names`] beside the binary, as Brindle
+/// looks for it (so an archive's `brindle-remote-linux-x86_64` on Linux);
+/// cargo's name beside it when there is none, for [`check_helper`] to report.
+pub fn helper(bin: &Path) -> PathBuf {
+    named_helper().unwrap_or_else(|| {
+        beside(&bin_paths(bin), server_helper_names(), &|path: &Path| path.is_file())
+            .unwrap_or_else(|| bin.with_file_name(helper_name()))
+    })
+}
+
+/// What [`check_helper`] asks of a helper beyond its being there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    /// This build's own: no older than its sources, since a test target
+    /// doesn't rebuild it.
+    Sources,
+    /// Beside another binary, such as an installed or unpacked release
+    /// (`BRINDLE_E2E_BIN` outside `target/`): it has no sources here to be
+    /// newer than, so it must be that binary's own release, its `--version`
+    /// the binary's.
+    SameRelease,
+    /// Another build [`HELPER_VARIABLE`] chose: taken as it is.
+    Chosen,
+}
+
+/// The rule for `helper`, Brindle's helper when the suite runs `bin`, and
+/// `default_bin`, the suite's own build of Brindle; `named` when
+/// [`HELPER_VARIABLE`] gave it. The default binary's helper (cargo's name
+/// beside it, however it was found) and any helper found beside the default
+/// binary are this build's.
+pub fn freshness(helper: &Path, bin: &Path, default_bin: &Path, named: bool) -> Freshness {
+    if helper == default_bin.with_file_name(helper_name()) || (!named && bin == default_bin) {
+        Freshness::Sources
+    } else if named {
+        Freshness::Chosen
+    } else {
+        Freshness::SameRelease
+    }
+}
+
+/// Whether a binary's `--version` (`brindle X.Y.Z`) and its helper's
+/// (`X.Y.Z`) name one release; `Err` says what each printed.
+pub fn same_release(bin_said: &str, helper_said: &str) -> std::result::Result<(), String> {
+    let (bin_said, helper_said) = (bin_said.trim(), helper_said.trim());
+    match bin_said.strip_prefix("brindle ") {
+        Some(version) if !version.is_empty() && version == helper_said => Ok(()),
+        _ => Err(format!("the binary says {bin_said:?} and the helper {helper_said:?}")),
+    }
+}
+
+/// The helper must be there, and then hold to its [`freshness`] rule. The
+/// suite runs `bin`; `default_bin` is its own build of Brindle (the e2e
+/// suite's `CARGO_BIN_EXE_brindle`, perf's `target/release/brindle`).
+pub fn check_helper(helper: &Path, bin: &Path, default_bin: &Path) -> Result {
+    let build = if default_bin.parent().and_then(Path::file_name).is_some_and(|name| name == "release") {
         "cargo build --release"
     } else {
         "cargo build"
     };
-    let built = std::fs::metadata(helper).and_then(|m| m.modified()).map_err(|_| {
-        format!(
-            "the terminal server helper isn't built ({} is missing): run `{build}`, which builds it, \
-             or set {HELPER_VARIABLE}",
-            helper.display()
-        )
-    })?;
-    if helper != default {
-        return Ok(());
+    let rule = freshness(helper, bin, default_bin, named_helper().is_some());
+    let Ok(built) = std::fs::metadata(helper).and_then(|m| m.modified()) else {
+        return Err(match rule {
+            Freshness::Sources => format!(
+                "the terminal server helper isn't built ({} is missing): run `{build}`, which builds it, \
+                 or set {HELPER_VARIABLE}",
+                helper.display()
+            ),
+            Freshness::SameRelease => format!(
+                "no terminal server helper beside {} (Brindle looks for {}), or set {HELPER_VARIABLE}",
+                bin.display(),
+                server_helper_names().join(", ")
+            ),
+            Freshness::Chosen => format!("{HELPER_VARIABLE} names {}, which is missing", helper.display()),
+        });
+    };
+    match rule {
+        Freshness::Sources => {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let newer = ["remote-agent/src", "remote-protocol/src", "term-core/src"]
+                .iter()
+                .flat_map(|dir| files(&root.join(dir)))
+                .find(|file| std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|time| time > built));
+            match newer {
+                Some(file) => Err(format!(
+                    "{} is older than {}: run `{build}` (the test target doesn't rebuild it)",
+                    helper.display(),
+                    file.display()
+                )),
+                None => Ok(()),
+            }
+        }
+        Freshness::SameRelease => same_release(&version_of(bin)?, &version_of(helper)?).map_err(|why| {
+            format!(
+                "{} isn't the release of {} beside it ({why}): a release's archive carries both, \
+                 or set {HELPER_VARIABLE}",
+                helper.display(),
+                bin.display()
+            )
+        }),
+        Freshness::Chosen => Ok(()),
     }
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let newer = ["remote-agent/src", "remote-protocol/src", "term-core/src"]
-        .iter()
-        .flat_map(|dir| files(&root.join(dir)))
-        .find(|file| std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|time| time > built));
-    match newer {
-        Some(file) => Err(format!(
-            "{} is older than {}: run `{build}` (the test target doesn't rebuild it)",
-            helper.display(),
-            file.display()
-        )),
-        None => Ok(()),
-    }
+}
+
+/// What `binary --version` prints, or why it couldn't say.
+fn version_of(binary: &Path) -> Result<String> {
+    let output = Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("can't run {} --version: {error}", binary.display()))?;
+    ensure!(output.status.success(), "{} --version exited with {}", binary.display(), output.status);
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Every file under `dir`.
@@ -349,6 +462,42 @@ pub fn self_test() -> Result {
         "",
     ] {
         ensure!(unit(other).is_none(), "{other:?} taken for a role's scope: {:?}", unit(other));
+    }
+    self_test_helpers()
+}
+
+/// [`beside`], [`freshness`] and [`same_release`].
+fn self_test_helpers() -> Result {
+    let opt = Path::new("opt");
+    let (bin, link) = (opt.join("brindle"), Path::new("links").join("brindle"));
+    let (archive, cargo) = (opt.join(LINUX_HELPER_NAMES[0]), opt.join(LINUX_HELPER_NAMES[1]));
+    let find = |bins: &[PathBuf], files: &[&PathBuf]| {
+        beside(bins, &LINUX_HELPER_NAMES, &|path| files.iter().any(|file| file.as_path() == path))
+    };
+    ensure!(find(std::slice::from_ref(&bin), &[]).is_none(), "a helper found where there is none");
+    ensure!(find(std::slice::from_ref(&bin), &[&cargo]) == Some(cargo.clone()), "cargo's name alone");
+    ensure!(find(std::slice::from_ref(&bin), &[&cargo, &archive]) == Some(archive.clone()), "the archive's name comes first");
+    // Beside the file a link leads to, after the link's own directory.
+    ensure!(find(&[link.clone(), bin.clone()], &[&archive]) == Some(archive.clone()), "beside the resolved binary");
+    ensure!(find(&[link.clone(), bin.clone()], &[&link.with_file_name("brindle-remote"), &archive]) == Some(link.with_file_name("brindle-remote")), "the link's directory first");
+
+    let target = Path::new("target").join("debug");
+    let default_bin = target.join("brindle");
+    let own = default_bin.with_file_name(helper_name());
+    let rule = |helper: &Path, bin: &Path, named| freshness(helper, bin, &default_bin, named);
+    ensure!(rule(&own, &default_bin, false) == Freshness::Sources, "this build's helper");
+    ensure!(rule(&own, &bin, true) == Freshness::Sources, "this build's helper, named for another binary");
+    ensure!(rule(&target.join(LINUX_HELPER_NAMES[0]), &default_bin, false) == Freshness::Sources, "another name beside this build");
+    ensure!(rule(&archive, &bin, false) == Freshness::SameRelease, "an installed release's helper");
+    ensure!(rule(&opt.join(helper_name()), &bin, false) == Freshness::SameRelease, "cargo's name beside an installed binary");
+    ensure!(rule(&archive, &bin, true) == Freshness::Chosen, "a helper the variable names");
+    ensure!(rule(&archive, &default_bin, true) == Freshness::Chosen, "another helper named for this build");
+
+    ensure!(same_release("brindle 0.4.0\n", "0.4.0\r\n").is_ok(), "one release");
+    for (bin_said, helper_said) in
+        [("brindle 0.4.0", "0.3.0"), ("brindle 0.4.0", "brindle 0.4.0"), ("0.4.0", "0.4.0"), ("brindle ", ""), ("", "")]
+    {
+        ensure!(same_release(bin_said, helper_said).is_err(), "{bin_said:?} and {helper_said:?} taken for one release");
     }
     Ok(())
 }

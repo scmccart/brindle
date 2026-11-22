@@ -1,6 +1,7 @@
 # The Linux release build, called by CI and by releases: brindle, the static
 # x86-64 remote helper (uploaded as brindle-remote-linux-x86_64, which the
-# Windows build packs too) and the release archive (brindle-linux-x64).
+# Windows build packs too) and the release archive (brindle-linux-x64), which
+# it installs and uninstalls through the one-command installer.
 #
 # No concurrency group here: the caller's applies, and a matching one would
 # cancel the caller.
@@ -54,6 +55,41 @@ jobs:
           retention-days: 14
       - name: Release archive
         run: scripts/package-linux.sh
+      # The one-command installer as a release publishes it (release.yml
+      # stamps scripts/get.sh as install.sh), read from stdin as `curl | sh`
+      # runs it, against this archive in a local release directory and into
+      # a private prefix: an install, a tampered SHA256SUMS that must fail and
+      # change nothing, and --uninstall.
+      - name: One-command install and uninstall
+        run: |
+          fail() { echo "one-command install: $*" >&2; exit 1; }
+          state() { cd "$PREFIX" && find . -type f -exec sha256sum {} + | sort && stat -c '%n %i %Y' bin/*; }
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          name=brindle-$version-x86_64-unknown-linux-gnu
+          release=$RUNNER_TEMP/release
+          export PREFIX=$RUNNER_TEMP/prefix XDG_DATA_HOME=$RUNNER_TEMP/data BRINDLE_DOWNLOAD_BASE=file://$RUNNER_TEMP/release
+          mkdir -p "$release"
+          cp "target/dist/$name.tar.gz" "$release/"
+          sed "s/@VERSION@/$version/" scripts/get.sh > "$release/install.sh"
+          (cd "$release" && sha256sum -- "$name.tar.gz" > SHA256SUMS)
+
+          sh < "$release/install.sh"
+          [ "$("$PREFIX/bin/brindle" --version)" = "brindle $version" ] || fail "brindle --version"
+          [ "$("$PREFIX/bin/brindle-remote-linux-x86_64" --version)" = "$version" ] || fail "helper --version"
+          grep -qx "Exec=$PREFIX/bin/brindle" "$PREFIX/share/applications/brindle.desktop" || fail "desktop entry"
+          [ -f "$PREFIX/share/icons/hicolor/scalable/apps/brindle.svg" ] || fail "icon"
+
+          before=$(state)
+          printf '%064d  %s\n' 0 "$name.tar.gz" > "$release/SHA256SUMS"
+          if sh < "$release/install.sh" 2> "$RUNNER_TEMP/tampered.log"; then fail "a tampered SHA256SUMS installed"; fi
+          cat "$RUNNER_TEMP/tampered.log"
+          grep -q 'checksum failed' "$RUNNER_TEMP/tampered.log" || fail "no checksum message"
+          [ "$(state)" = "$before" ] || fail "a tampered SHA256SUMS changed the install"
+
+          sh -s -- --uninstall < "$release/install.sh"
+          [ -z "$(ls -A "$PREFIX/bin")" ] || fail "left in bin: $(ls -A "$PREFIX/bin")"
+          [ ! -e "$PREFIX/share/applications/brindle.desktop" ] || fail "desktop entry left"
+          [ ! -e "$PREFIX/share/icons/hicolor/scalable/apps/brindle.svg" ] || fail "icon left"
       # The built-in themes' UI tokens as CSS, for the website (released
       # beside the archives).
       - name: UI tokens

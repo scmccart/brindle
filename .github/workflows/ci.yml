@@ -2,7 +2,7 @@
 # suite, plus a Windows build, tests and clippy. The e2e jobs are advisory:
 # they go red on failure but aren't required checks. The release and Windows
 # builds are the reusable build-linux.yml and build-windows.yml, which
-# releases run too.
+# releases run too; the archive jobs run e2e cases against what they upload.
 # rust-toolchain.toml pins Rust for every job.
 #
 # Pushes to main and pull requests run it. A pull request that changes only
@@ -191,6 +191,111 @@ jobs:
           path: target/tmp/e2e/
           retention-days: 14
 
+  # The Windows local cases against the zip build-windows.yml uploaded,
+  # unpacked as a user unpacks it: its brindle.exe, with the packaged
+  # brindle-remote.exe (and the ConPTY it embeds) beside it and no
+  # BRINDLE_SERVER_HELPER, so what runs is what the zip carries. A job of
+  # its own after the build, so windows-e2e doesn't wait for both builds.
+  # Advisory, like windows-e2e.
+  windows-e2e-archive:
+    needs: windows
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows
+      - uses: actions/download-artifact@v7
+        with:
+          name: brindle-windows-x64
+          path: ${{ runner.temp }}/zip
+      - name: Unpack the zip
+        shell: pwsh
+        run: |
+          $zip = @(Get-ChildItem "$env:RUNNER_TEMP/zip" -Filter *.zip)
+          if ($zip.Count -ne 1) { throw "expected one zip, found $($zip.Count)" }
+          Expand-Archive $zip[0].FullName "$env:RUNNER_TEMP/unpacked"
+          Get-ChildItem "$env:RUNNER_TEMP/unpacked"
+      - name: Build the suite
+        run: cargo test --locked -p brindle --test e2e --no-run
+      - name: ConPTY and PowerShell cases from the zip
+        run: cargo test --locked -p brindle --test e2e -- windows-conpty windows-pwsh-integration
+        env:
+          BRINDLE_E2E: "1"
+          BRINDLE_E2E_SLOW: "2"
+          BRINDLE_E2E_BIN: ${{ runner.temp }}/unpacked/brindle.exe
+      - name: Upload the suite's output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-windows-archive
+          path: target/tmp/e2e/
+          retention-days: 14
+
+  # The local-server and remote cases (SSH and container, through Docker)
+  # against the Linux archive build-linux.yml uploaded, installed as a user
+  # installs it: the one-command installer, from a local release directory
+  # into a private prefix. The suite runs the installed brindle, with the
+  # helper beside it and no BRINDLE_REMOTE_AGENT or BRINDLE_SERVER_HELPER, so
+  # a missing or mismatched helper in the archive fails. Here rather than in
+  # build-linux.yml, which every release runs on code CI has already passed:
+  # the suite would add its whole run to each release. A release build has
+  # no fault switches, so the cases that need one skip. Advisory, like e2e.
+  e2e-archive:
+    needs: release
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
+            xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less
+      - name: Install Rust
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev
+      - uses: actions/download-artifact@v7
+        with:
+          name: brindle-linux-x64
+          path: ${{ runner.temp }}/release
+      # As build-linux.yml's install step does, without the uninstall: the
+      # installer stamped as a release stamps it, read from stdin as
+      # `curl | sh` runs it.
+      - name: Install the archive with the one-command installer
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          release=$RUNNER_TEMP/release
+          sed "s/@VERSION@/$version/" scripts/get.sh > "$release/install.sh"
+          (cd "$release" && sha256sum -- "brindle-$version-x86_64-unknown-linux-gnu.tar.gz" > SHA256SUMS)
+          PREFIX=$RUNNER_TEMP/prefix XDG_DATA_HOME=$RUNNER_TEMP/data BRINDLE_DOWNLOAD_BASE=file://$release \
+            sh < "$release/install.sh"
+          ls -l "$RUNNER_TEMP/prefix/bin"
+      - name: Build the suite
+        run: cargo test --locked -p brindle --test e2e --no-run
+      - name: Local-server and remote cases from the installed archive
+        run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- local-server remote-
+        env:
+          BRINDLE_E2E: "1"
+          BRINDLE_E2E_SLOW: "2"
+          BRINDLE_E2E_BIN: ${{ runner.temp }}/prefix/bin/brindle
+          BRINDLE_REMOTE_E2E_REQUIRED: "1"
+      - name: Upload the suite's output
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-archive
+          path: target/tmp/e2e/
+          retention-days: 14
+
   e2e:
     name: e2e (${{ matrix.shard }}/3)
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
@@ -208,9 +313,10 @@ jobs:
         run: |
           sudo apt-get update
           # zsh and fish: the shell-script-line cases, which skip without them.
+          # xclip: the clipboard cases' other application.
           # shellcheck disable=SC2086 # a list of packages
           sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
-            xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish
+            xvfb x11-utils xclip openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish
       - name: Install Rust
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -224,6 +330,7 @@ jobs:
         run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- --shard ${{ matrix.shard }}/3
         env:
           BRINDLE_E2E: "1"
+          BRINDLE_E2E_CLIPBOARD_REQUIRED: "1"
           # lavapipe and shared runners are slower than a desktop.
           BRINDLE_E2E_SLOW: "2"
           BRINDLE_E2E_SWITCHES_REQUIRED: "1"

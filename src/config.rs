@@ -222,7 +222,8 @@ pub enum RightClick {
     #[default]
     #[serde(rename = "none")]
     Nothing,
-    /// Paste the clipboard when no text is selected.
+    /// Clear any selection and paste the clipboard; with no text on the
+    /// clipboard, nothing is pasted and the selection stays.
     #[serde(rename = "paste")]
     Paste,
 }

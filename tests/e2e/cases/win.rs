@@ -30,6 +30,12 @@ pub fn all() -> Vec<Case> {
         display("windows-tab-menu-background", tab_menu_background),
         display("windows-zones", zones),
         display("clipboard-right-click-paste", super::clipboard::right_click_paste),
+        display("clipboard-right-click-selection", super::clipboard::right_click_selection),
+        display("clipboard-copy-to-app", super::clipboard::copy_to_app),
+        display("clipboard-paste-from-app", super::clipboard::paste_from_app),
+        display("clipboard-osc52-to-app", super::clipboard::osc52_to_app),
+        display("clipboard-image-pastes-nothing", super::clipboard::image_pastes_nothing),
+        display("clipboard-multiline-line-ends", super::clipboard::multiline_line_ends),
         display("links-refused", super::links::refused),
         display("links-opener-fails", super::links::opener_fails),
         display("links-notice-expires", super::links::notice_expires),
@@ -69,6 +75,7 @@ pub fn all() -> Vec<Case> {
         display("local-server-inbox-host", local_server::inbox_host),
         display("local-server-elevated", local_server::elevated),
         display("windows-elevated-instances", elevated_instances),
+        display("windows-elevation-badge", elevation_badge),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -1047,6 +1054,37 @@ fn elevated_instances(ctx: &Ctx) -> Result<Outcome> {
     let dump = Dump::parse(&std::fs::read_to_string(ctx.dir.join("unelevated.dump")).unwrap_or_default());
     ensure!(screen(&dump).contains("unelevated-tab"), "the unelevated tab: see unelevated.dump");
     ensure!(dump.config.is_none(), "the unelevated window's config line: {:?}", dump.config);
+    ensure!(dump.badges.is_empty(), "the unelevated window shows a badge: {:?}", dump.badges);
+    Ok(Outcome::Pass)
+}
+
+/// A tab whose program runs elevated shows the privileged badge, labelled
+/// `Administrator`, on its face (the dump's `--- badge tab=1 …` line: the
+/// tab lines count from 1), and one that doesn't shows none. This process's
+/// token decides which Brindle's programs get, so an unelevated runner can
+/// check the second half only (and skips, saying so); the unelevated
+/// Brindle beside an elevated one has its dump checked for a badge in
+/// [`elevated_instances`]. The badge is read once a second, so the dump is
+/// taken well after the shell is up.
+fn elevation_badge(ctx: &Ctx) -> Result<Outcome> {
+    let elevated = winproc::elevated().map_err(|e| format!("reading this process's token: {e}"))?;
+    let out = crate::brindle::Run::new(ctx, "run")
+        .prompt()
+        .send("'rea' + 'dy'\r")
+        .wait_for("ready")
+        .dump_at(12.0)
+        .run()?;
+    ensure!(out.dump.wait_timeouts.is_empty(), "a wait gave up: {:?}; screen {:?}", out.dump.wait_timeouts, out.dump.screen);
+    if !elevated {
+        ensure!(out.dump.badges.is_empty(), "an unelevated tab shows a badge: {:?}", out.dump.badges);
+        return Ok(Outcome::Skip(
+            "not elevated: an unelevated tab shows no badge, but the elevated half needs an elevated runner \
+             (elevating here would ask through UAC)"
+                .into(),
+        ));
+    }
+    let want = ["tab=1 kind=privileged label=\"Administrator\" draw=icon"];
+    ensure!(out.dump.badges == want, "an elevated tab's badges: {:?}, want {want:?}", out.dump.badges);
     Ok(Outcome::Pass)
 }
 

@@ -804,6 +804,9 @@ pub struct Dump {
     /// then `--- badge zone=ID …` for the active tab's zones), one line
     /// each without the prefix.
     pub badges: Vec<String>,
+    /// The label a mouse copy or paste shows at the pointer, while one isn't
+    /// gone (`--- feedback kind=copied|pasted|nothing-to-paste`): the kind.
+    pub feedback: Option<String>,
     /// The program's pointer shape on the active terminal's screen
     /// (`--- pointer shape=NAME screen=primary|alternate`), without the
     /// prefix; none while the pointer is Brindle's own.
@@ -902,6 +905,8 @@ impl Dump {
                 dump.contexts.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- badge ") {
                 dump.badges.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- feedback ") {
+                dump.feedback = rest.strip_prefix("kind=").map(str::to_string);
             } else if let Some(rest) = line.strip_prefix("--- pointer ") {
                 dump.pointer = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- grid-pointer ") {
@@ -1151,6 +1156,16 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.screen == ["hi"], "screen after contexts {:?}", dump.screen);
     ensure!(dump.pointer.is_none(), "no pointer line: {:?}", dump.pointer);
+    ensure!(dump.feedback.is_none(), "no feedback line: {:?}", dump.feedback);
+    for kind in ["copied", "pasted", "nothing-to-paste"] {
+        let dump = Dump::parse(&format!(
+            "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- badge tab=1 kind=privileged label=\"root\" draw=icon\n\
+             --- feedback kind={kind}\nhi\n"
+        ));
+        ensure!(dump.feedback.as_deref() == Some(kind), "feedback {:?}", dump.feedback);
+        ensure!(dump.badges.len() == 1, "badges beside the feedback {:?}", dump.badges);
+        ensure!(dump.screen == ["hi"], "screen after the feedback {:?}", dump.screen);
+    }
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR | ALT_SCREEN)\n--- pointer shape=crosshair screen=alternate\n\
          --- grid-pointer text\nhi\n",

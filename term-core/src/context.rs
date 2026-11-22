@@ -10,6 +10,11 @@
 //! active context, and an update or end of a context ends everything after
 //! it, so the stack is a `Vec` (index 0 outermost, the last active).
 //!
+//! Where the caller can read its foreground program's [`Elevation`] (local
+//! Windows sessions, where nothing sends OSC 3008), [`badge`] gives the
+//! badge the two make: a detected elevation first, since a program can
+//! announce any context it likes.
+//!
 //! The lifetime is the callers', the client's `Terminal` and the server's
 //! [`Emulator`](crate::emulator::Emulator): only the program's exit drops
 //! the stack (UAPI's hangup reset). A full or soft reset, a new prompt and
@@ -329,6 +334,39 @@ impl Badge {
             BadgeKind::Elsewhere => "elsewhere",
         };
         format!("kind={kind} label={:?}", self.label)
+    }
+}
+
+/// The label of the badge a program running elevated gets ([`badge`]).
+pub const ELEVATED_LABEL: &str = "Administrator";
+
+/// Whether a terminal's foreground program runs elevated, as the system
+/// says: on Windows, its token's `TokenElevation`. The caller reads it; this
+/// crate only decides what it shows ([`badge`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Elevation {
+    /// Its token was read, and it isn't elevated.
+    Standard,
+    /// Its token was read, and it is elevated.
+    Elevated,
+    /// No token was read: it couldn't be opened or read (a refusal
+    /// included, which is never taken for elevation), or there is none to
+    /// read (a remote session, another platform, no program yet). Kept
+    /// apart from `Standard` so a log can tell the two apart.
+    Unknown,
+}
+
+/// The badge a terminal's tab face and zone header show. While its
+/// foreground program runs elevated it is a privileged badge labelled
+/// [`ELEVATED_LABEL`], whatever context a program announced: the token is
+/// the system's word and OSC 3008 only a program's, so a program in an
+/// elevated shell can't swap the warning for a muted badge or relabel it.
+/// Otherwise (a standard or unread elevation) it is the notable context
+/// ([`Contexts::notable`]), if any.
+pub fn badge(notable: Option<Badge>, elevation: Elevation) -> Option<Badge> {
+    match elevation {
+        Elevation::Elevated => Some(Badge { kind: BadgeKind::Privileged, label: ELEVATED_LABEL.to_owned() }),
+        Elevation::Standard | Elevation::Unknown => notable,
     }
 }
 
@@ -697,6 +735,60 @@ mod tests {
         assert_eq!(back, contexts);
         assert!(Contexts::default().encode().is_empty());
     }
+
+    fn badge_with(payloads: &[&str], elevation: Elevation) -> Option<(BadgeKind, String)> {
+        super::badge(after(payloads).notable(), elevation).map(|badge| (badge.kind(), badge.label().to_owned()))
+    }
+
+    #[test]
+    fn an_elevated_program_alone_gets_a_privileged_administrator_badge() {
+        use BadgeKind::Privileged;
+        assert_eq!(badge_with(&[], Elevation::Elevated), Some((Privileged, "Administrator".into())));
+        // Contexts of no notable kind leave it so.
+        assert_eq!(badge_with(&["start=s;type=shell"], Elevation::Elevated), Some((Privileged, "Administrator".into())));
+        let elevated = super::badge(None, Elevation::Elevated).unwrap();
+        assert_eq!(elevated.describe(), "kind=privileged label=\"Administrator\"");
+    }
+
+    #[test]
+    fn a_standard_or_unread_elevation_gives_no_badge() {
+        for elevation in [Elevation::Standard, Elevation::Unknown] {
+            assert_eq!(badge_with(&[], elevation), None, "{elevation:?}");
+            assert_eq!(badge_with(&["start=s;type=shell"], elevation), None, "{elevation:?}");
+        }
+    }
+
+    /// A program in an elevated shell can't hide the warning behind a muted
+    /// badge, or relabel it, with a context of its own.
+    #[test]
+    fn a_detected_elevation_wins_over_any_announced_context() {
+        use BadgeKind::Privileged;
+        let administrator = Some((Privileged, "Administrator".into()));
+        assert_eq!(badge_with(&["start=c1;type=container;container=web"], Elevation::Elevated), administrator);
+        assert_eq!(badge_with(&["start=e;type=elevate;targetuser=guest"], Elevation::Elevated), administrator);
+        assert_eq!(badge_with(&["start=r;type=remote;targethost=box"], Elevation::Elevated), administrator);
+        assert_eq!(badge_with(&RUN0_SESSION_STACK, Elevation::Elevated), administrator);
+    }
+
+    #[test]
+    fn without_a_detected_elevation_the_announced_context_decides() {
+        use BadgeKind::{Elsewhere, Privileged};
+        for elevation in [Elevation::Standard, Elevation::Unknown] {
+            assert_eq!(
+                badge_with(&["start=c1;type=container;container=web"], elevation),
+                Some((Elsewhere, "web".into())),
+                "{elevation:?}"
+            );
+            assert_eq!(
+                badge_with(&["start=e;type=elevate;targetuser=guest"], elevation),
+                Some((Privileged, "guest".into())),
+                "{elevation:?}"
+            );
+            assert_eq!(badge_with(&RUN0_SESSION_STACK, elevation), Some((Privileged, "root".into())), "{elevation:?}");
+        }
+    }
+
+    const RUN0_SESSION_STACK: [&str; 2] = ["start=sh;type=shell", RUN0_SESSION];
 
     #[test]
     fn describe_prints_one_line_per_context() {

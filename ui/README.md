@@ -47,7 +47,8 @@ rule, not a convenience.
   - `FocusScope` and `FocusStops`: Tab and shift-Tab cycle through the stops a
     view lists, and never leave it.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
-    its start, centre or end, flipping and clamping to stay in the window.
+    its start, centre or end, flipping and clamping to stay in the window,
+    or in a region of it given to `Anchored::within` (`place_within`).
     The trigger may be a zero-size rectangle (a point, for a context menu).
     `available_height` is the tallest a box may be beside its trigger (the
     larger room above or below it, or the window's height for a side
@@ -263,7 +264,7 @@ rule, not a convenience.
   rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
   `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
   `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2`, `Rows2`,
-  `Lock` and `TriangleAlert`. Strokes have butt caps and miter joins, since
+  `Lock`, `TriangleAlert`, `ClipboardPaste` and `Ban`. Strokes have butt caps and miter joins, since
   gpui doesn't expose lucide's round caps (so `TriangleAlert`'s dot is a
   short rule). Lucide's stroke (2 on its 24 grid) scales with the
   icon, which leaves a 16px icon 1.33px thin; `IconElement::min_stroke`
