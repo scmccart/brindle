@@ -10,9 +10,10 @@
 //! active context, and an update or end of a context ends everything after
 //! it, so the stack is a `Vec` (index 0 outermost, the last active).
 //!
-//! Where no program announces a context (local Windows sessions), the
-//! caller reads its foreground program's [`Elevation`], and [`badge`] gives
-//! the badge the two make: an announced context first.
+//! Where the caller can read its foreground program's [`Elevation`] (local
+//! Windows sessions, where nothing sends OSC 3008), [`badge`] gives the
+//! badge the two make: a detected elevation first, since a program can
+//! announce any context it likes.
 //!
 //! The lifetime is the callers', the client's `Terminal` and the server's
 //! [`Emulator`](crate::emulator::Emulator): only the program's exit drops
@@ -355,16 +356,18 @@ pub enum Elevation {
     Unknown,
 }
 
-/// The badge a terminal's tab face and zone header show: its notable
-/// context ([`Contexts::notable`]) when it has one, since the program
-/// announced it; else a privileged badge labelled [`ELEVATED_LABEL`] when
-/// its foreground program runs elevated. A standard or unread elevation
-/// gives none.
+/// The badge a terminal's tab face and zone header show. While its
+/// foreground program runs elevated it is a privileged badge labelled
+/// [`ELEVATED_LABEL`], whatever context a program announced: the token is
+/// the system's word and OSC 3008 only a program's, so a program in an
+/// elevated shell can't swap the warning for a muted badge or relabel it.
+/// Otherwise (a standard or unread elevation) it is the notable context
+/// ([`Contexts::notable`]), if any.
 pub fn badge(notable: Option<Badge>, elevation: Elevation) -> Option<Badge> {
-    notable.or_else(|| match elevation {
+    match elevation {
         Elevation::Elevated => Some(Badge { kind: BadgeKind::Privileged, label: ELEVATED_LABEL.to_owned() }),
-        Elevation::Standard | Elevation::Unknown => None,
-    })
+        Elevation::Standard | Elevation::Unknown => notable,
+    }
 }
 
 /// A terminal's open contexts, outermost first; the last is active.
@@ -755,27 +758,37 @@ mod tests {
         }
     }
 
+    /// A program in an elevated shell can't hide the warning behind a muted
+    /// badge, or relabel it, with a context of its own.
     #[test]
-    fn an_announced_context_wins_over_any_elevation() {
+    fn a_detected_elevation_wins_over_any_announced_context() {
+        use BadgeKind::Privileged;
+        let administrator = Some((Privileged, "Administrator".into()));
+        assert_eq!(badge_with(&["start=c1;type=container;container=web"], Elevation::Elevated), administrator);
+        assert_eq!(badge_with(&["start=e;type=elevate;targetuser=guest"], Elevation::Elevated), administrator);
+        assert_eq!(badge_with(&["start=r;type=remote;targethost=box"], Elevation::Elevated), administrator);
+        assert_eq!(badge_with(&RUN0_SESSION_STACK, Elevation::Elevated), administrator);
+    }
+
+    #[test]
+    fn without_a_detected_elevation_the_announced_context_decides() {
         use BadgeKind::{Elsewhere, Privileged};
-        for elevation in [Elevation::Elevated, Elevation::Standard, Elevation::Unknown] {
+        for elevation in [Elevation::Standard, Elevation::Unknown] {
             assert_eq!(
                 badge_with(&["start=c1;type=container;container=web"], elevation),
                 Some((Elsewhere, "web".into())),
                 "{elevation:?}"
             );
             assert_eq!(
-                badge_with(&["start=e;type=elevate;targetuser=root"], elevation),
-                Some((Privileged, "root".into())),
+                badge_with(&["start=e;type=elevate;targetuser=guest"], elevation),
+                Some((Privileged, "guest".into())),
                 "{elevation:?}"
             );
+            assert_eq!(badge_with(&RUN0_SESSION_STACK, elevation), Some((Privileged, "root".into())), "{elevation:?}");
         }
-        // Once the context ends, the elevation shows again.
-        assert_eq!(
-            badge_with(&["start=c1;type=container;container=web", "end=c1"], Elevation::Elevated),
-            Some((Privileged, "Administrator".into()))
-        );
     }
+
+    const RUN0_SESSION_STACK: [&str; 2] = ["start=sh;type=shell", RUN0_SESSION];
 
     #[test]
     fn describe_prints_one_line_per_context() {
