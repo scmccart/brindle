@@ -597,6 +597,29 @@ pub fn attach_633(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A detached session's progress (OSC 9;4) stays in the server: after a
+/// quit and a plain launch, which attaches the detached session, its tab
+/// shows the bar at 60% again, from the replay. Linux only: the command is
+/// bash's.
+pub fn progress_attach(ctx: &Ctx) -> Result<Outcome> {
+    let first = Run::new(ctx, "first")
+        .keep_detached()
+        .restore()
+        .send("PS1='$ '; HISTFILE=\\r")
+        .send(r"printf '\033]9;4;1;60\033\\'; echo pro''gress-set\r")
+        .wait_for("progress-set")
+        .dump_at(5.0)
+        .run()?;
+    ensure!(first.dump.wait_timeouts.is_empty(), "the report didn't run: {:?}", first.dump.screen);
+    let want = ["tab=1 state=normal percent=60"];
+    ensure!(first.dump.progress == want, "before the quit: {:?}", first.dump.progress);
+    detached_pids(&Server::of(ctx), 10.0, 1)?;
+    let second = Run::new(ctx, "second").keep_detached().restore().wait_for("progress-set").dump_at(6.0).run()?;
+    ensure!(second.dump.tabs.len() == 1, "tabs: {:?}", second.dump.tabs);
+    ensure!(second.dump.progress == want, "after the attach: {:?}; screen {:?}", second.dump.progress, second.dump.screen);
+    Ok(Outcome::Pass)
+}
+
 /// Brindle killed (SIGKILL, on Windows `taskkill /F`) with a split tab: a
 /// plain launch brings back both zones' sessions, and the left one's output.
 pub fn reattach_crash(ctx: &Ctx) -> Result<Outcome> {

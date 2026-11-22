@@ -778,6 +778,10 @@ pub struct Dump {
     /// The active terminal's program status records (`--- status …`), one
     /// line each without the prefix.
     pub status: Vec<String>,
+    /// The progress bars shown (`--- progress tab=N …` for each tab with
+    /// one, then `--- progress zone=ID …` for the active tab's zones), one
+    /// line each without the prefix.
+    pub progress: Vec<String>,
     /// The active tab's zone header (`--- zones …`), when it has 2+ zones.
     pub zones: Option<String>,
     /// The active tab's zone lines (`--- zone …`), one line each without the prefix.
@@ -862,6 +866,8 @@ impl Dump {
                 in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- status ") {
                 dump.status.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- progress ") {
+                dump.progress.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
                 dump.zones = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zone ") {
@@ -1079,6 +1085,17 @@ pub fn self_test_dump() -> Result {
     );
     ensure!(dump.status == ["state=done app=\"brew\"", "state=blocked id=\"b\" kind=auth"], "status {:?}", dump.status);
     ensure!(dump.screen == ["hi"], "screen after status {:?}", dump.screen);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- progress tab=1 state=paused percent=70\n\
+         --- progress zone=2 state=paused percent=70\n--- progress zone=1 state=normal percent=30\nhi\n",
+    );
+    ensure!(
+        dump.progress
+            == ["tab=1 state=paused percent=70", "zone=2 state=paused percent=70", "zone=1 state=normal percent=30"],
+        "progress {:?}",
+        dump.progress
+    );
+    ensure!(dump.screen == ["hi"], "screen after progress {:?}", dump.screen);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
          --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",

@@ -28,7 +28,7 @@ mod server;
 pub const SINK_PANIC: &str = "BRINDLE_TEST_SINK_PANIC";
 // Moved to `brindle-term-core`, which the server core shares.
 pub use brindle_term_core::emulator::MIN_COLS;
-pub use brindle_term_core::{shell_integration, status};
+pub use brindle_term_core::{progress, shell_integration, status};
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -50,6 +50,7 @@ use parking_lot::Mutex;
 
 use self::events::{EventGate, Merge, Recovered};
 use self::pace::Pace;
+use self::progress::Progress;
 use self::shell_integration::{Marks, Parser};
 
 use crate::config::{Config, CursorShapeConfig, Profile};
@@ -304,6 +305,9 @@ pub struct Terminal {
     replaying: bool,
     /// Program status records (OSC 7501).
     status: status::Records,
+    /// The program's progress (OSC 9;4), until a clear report, a new
+    /// prompt, a reset or the program's end.
+    progress: Option<Progress>,
     /// Whether the directory the program reports exists, where that is the
     /// terminal's directory ([`Terminal::follows_reported_dir`]). It is
     /// refreshed when output brings another report, by a check off the UI
@@ -418,8 +422,9 @@ impl Terminal {
     }
 
     /// The gate dropped side events while the UI thread was behind, and is
-    /// back under its marks. A dropped status report leaves the records
-    /// stale, so they start over and the tab's dot is recomputed.
+    /// back under its marks. A dropped status or progress report leaves the
+    /// records or the progress stale, so both start over and the tab's dot
+    /// and bar are recomputed.
     fn recovered(&mut self, recovered: Recovered, cx: &mut Context<Self>) {
         let Recovered { dropped, statuses } = recovered;
         log::warn!(
@@ -428,6 +433,7 @@ impl Terminal {
         );
         if statuses {
             self.status.reset();
+            self.progress = None;
             cx.emit(TerminalEvent::Status(None));
         }
     }
@@ -464,6 +470,7 @@ impl Terminal {
             held_notes: None,
             replaying: false,
             status: status::Records::default(),
+            progress: None,
             dir_check: dir_check::DirCheck::default(),
             theme,
             last_activity: Instant::now(),
@@ -708,13 +715,17 @@ impl Terminal {
     }
 
     /// Moves the terminal's life on by `event`. True when that ended a
-    /// running terminal, whose status activity then ends.
+    /// running terminal, whose status activity and progress then end.
     fn end(&mut self, event: LifeEvent, cx: &mut Context<Self>) -> bool {
         let was = self.life;
         self.life = was.after(event);
         let ended = was == Life::Running;
-        if ended && self.status.end_activity() {
-            cx.emit(TerminalEvent::Status(None));
+        if ended {
+            let activity = self.status.end_activity();
+            let progress = self.progress.take().is_some();
+            if activity || progress {
+                cx.emit(TerminalEvent::Status(None));
+            }
         }
         ended
     }
@@ -722,6 +733,11 @@ impl Terminal {
     /// The program status records (OSC 7501).
     pub fn status(&self) -> &status::Records {
         &self.status
+    }
+
+    /// The program's progress (OSC 9;4), if it reported one.
+    pub fn progress(&self) -> Option<Progress> {
+        self.progress
     }
 
     /// Emits an event the output caused, quietly during a replay.
@@ -734,6 +750,10 @@ impl Terminal {
 
     /// Acts on a sequence the scanner found in the output, in stream order.
     fn handle_found(&mut self, found: Found, cx: &mut Context<Self>) {
+        // The same rule the server's emulator follows, so a replay agrees.
+        let progress = found.progress_after(self.progress);
+        let progress_changed = progress != self.progress;
+        self.progress = progress;
         let changed = match found {
             Found::Notice(notice) => {
                 self.emit_from_output(TerminalEvent::Notify(notice), cx);
@@ -750,10 +770,11 @@ impl Terminal {
                 }
                 return;
             }
+            Found::Progress(_) => false,
             Found::PromptStart => self.status.end_activity(),
             Found::Reset => self.status.reset(),
         };
-        if changed {
+        if changed || progress_changed {
             cx.emit(TerminalEvent::Status(None));
         }
     }

@@ -29,7 +29,7 @@ use gpui::{
     StyleRefinement, Styled, Window, canvas, div, point, prelude::FluentBuilder, px,
 };
 
-use crate::components::FocusRing;
+use crate::components::{EdgeBar, FocusRing};
 use crate::components::tabs::trigger_label;
 use crate::style::{CardColors, CardStyle, card_style};
 use crate::theme::ActiveTheme;
@@ -47,6 +47,7 @@ pub struct CardHeader {
     title: SharedString,
     title_muted: bool,
     actions: Vec<AnyElement>,
+    edge_bar: Option<EdgeBar>,
 }
 
 impl CardHeader {
@@ -58,6 +59,7 @@ impl CardHeader {
             title: SharedString::default(),
             title_muted: false,
             actions: Vec::new(),
+            edge_bar: None,
         }
     }
 
@@ -89,9 +91,16 @@ impl CardHeader {
         self
     }
 
+    /// A bar along the header's bottom edge (a progress bar); the header
+    /// keeps its height ([`EdgeBar`]).
+    pub fn edge_bar(mut self, bar: EdgeBar) -> Self {
+        self.edge_bar = Some(bar);
+        self
+    }
+
     /// The header row in style `s`.
     fn build(self, s: &CardStyle) -> Stateful<Div> {
-        let Self { mut base, leading, title, title_muted, actions } = self;
+        let Self { mut base, leading, title, title_muted, actions, edge_bar } = self;
         // The owner's refinements (a cursor), applied over the header's own.
         let owner = std::mem::take(base.style());
         let mut header = base
@@ -110,7 +119,10 @@ impl CardHeader {
             .child(trigger_label(title))
             .when(!actions.is_empty(), |d| {
                 d.child(div().flex().flex_none().items_center().gap_0p5().text_color(s.muted).children(actions))
-            });
+            })
+            // Over the bottom edge, above the border line; the header's
+            // bottom corners are square.
+            .when_some(edge_bar, |d, bar| d.relative().child(bar.element(px(0.))));
         header.style().refine(&owner);
         header
     }

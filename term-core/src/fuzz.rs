@@ -156,6 +156,13 @@ pub(crate) fn osc_body(rng: &mut XorShift) -> Vec<u8> {
             format!("{number};{mark}")
         }
         8 | 9 => return [b"7501;".as_slice(), &status_body(rng)].concat(),
+        // ConEmu's progress: every state, a known one more often, and
+        // percents in range, over it, negative and not numbers.
+        10 if rng.below(2) == 0 => {
+            let state = pick(rng, &["0", "1", "1", "2", "3", "4", "4", "5", "7", "", "x", "01"]);
+            let percent = pick(rng, &["", ";0", ";30", ";100", ";250", ";-1", ";x", ";99999999999999999999", ";5;extra"]);
+            format!("9;4;{state}{percent}")
+        }
         10 => format!("{};{}", pick(rng, &["9", "777", "777;notify", "0009;x", "9;4"]), name(rng, 20)),
         _ => {
             let len = rng.below(24);
@@ -257,6 +264,8 @@ fn the_emulator_never_panics_on_random_streams() {
         let mut fresh = Emulator::new(cols, rows, scrollback, style);
         fresh.feed(&replay);
         assert!(fresh.records().iter().count() <= status::MAX_RECORDS);
+        // The progress is replayed last, so nothing in the replay drops it.
+        assert_eq!(fresh.progress(), emulator.progress(), "round {round}");
     }
 }
 
