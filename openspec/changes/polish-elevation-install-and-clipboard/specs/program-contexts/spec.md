@@ -9,9 +9,13 @@ A local Windows terminal SHALL be detected as elevated while its foreground prog
 - **WHEN** Brindle runs elevated and opens a local PowerShell tab
 - **THEN** the terminal's notable context is privileged, labelled `Administrator`, and the tab face shows the warning badge with the tooltip "Running as Administrator"
 
-#### Scenario: sudo inline
-- **WHEN** in an unelevated Brindle a user runs `sudo pwsh` with Windows sudo in inline mode, approves the prompt, and then exits that shell
-- **THEN** the tab shows the privileged badge while the elevated shell runs, and none once it has exited
+#### Scenario: Elevated program from the tab's shell
+- **WHEN** in an unelevated Brindle a user runs a program that stays the tab's descendant and runs elevated, and then it exits
+- **THEN** the tab shows the privileged badge while that program runs, and none once it has exited
+
+#### Scenario: sudo inline not detected
+- **WHEN** in an unelevated Brindle a user runs `sudo pwsh` with Windows sudo in inline mode and approves the prompt
+- **THEN** the badge may show for about a second while sudo's elevated helper runs, and none once the elevated shell's prompt shows, since that shell is no longer a descendant of the tab's program
 
 #### Scenario: Detected elevation can't be hidden
 - **WHEN** an elevated tab's program prints `ESC ] 3008 ; start=c1 ; type=container ; container=web ESC \`, or an `elevate` context with `targetuser=guest`

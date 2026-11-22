@@ -979,9 +979,11 @@ contexts and shows the innermost notable one as a badge after the tab's title
 On Windows the elevation badge comes from the system instead. A local tab whose
 foreground program runs elevated shows the same warning icon, and resting the
 pointer on it shows "Running as Administrator". Brindle reads the token of the
-tab's newest child process, so `sudo` in inline mode shows it, and so does a
-program started as administrator from the tab's shell, whether Brindle runs
-elevated or not. An elevated Brindle's tabs show it too, since their programs
+tab's newest child process, so a program started as administrator from the
+tab's shell shows it, whether Brindle runs elevated or not. Windows `sudo` in
+inline mode doesn't: its elevated shell is no longer a child of the tab's
+process by the time its prompt shows, so the badge shows for about a second at
+most. An elevated Brindle's tabs show it too, since their programs
 are elevated. It takes precedence over any context a program announces, so
 a program can't swap the warning for a muted label. It comes up within about
 a second of the program's start and goes within about a second of its exit,

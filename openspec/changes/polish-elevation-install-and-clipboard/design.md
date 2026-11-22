@@ -38,7 +38,7 @@
 - An elevated Brindle needs no special case: its server runs elevated, so every program it starts reads `Elevated`.
 
 Alternatives considered:
-- *Badge every tab when Brindle itself is elevated, from `win::elevated()` alone.* Rejected: it misses `sudo` inline, the case a user most often forgets about.
+- *Badge every tab when Brindle itself is elevated, from `win::elevated()` alone.* Rejected: it misses programs the shell starts elevated in an unelevated Brindle.
 - *Compute it in the terminal server's core and send it with `PROCESS`.* Rejected for now: it would need a new negotiated message (`process R4`, `R5`) for something the client can read itself, since local sessions share its machine.
 - *Ask the console for its attached processes (`GetConsoleProcessList`).* That would be more exact, since it excludes a `Start-Process -Verb RunAs` window, but it needs `AttachConsole` into the pseudoconsole from a process that owns none. See Risks.
 
@@ -109,7 +109,8 @@ Alternatives considered:
 
 - **Token reads across integrity levels.** Task 1.1 found them readable (see decision 1). If a future Windows or a policy denies them, detection reads `Unknown` and shows nothing, which is the behaviour before this change.
 - **Descendant, not console.** A program the shell starts elevated in its own window (`Start-Process -Verb RunAs`) is the tab's newest descendant while it runs, so the badge shows though the tab itself isn't elevated. The tab title already names that process, so the two agree. `GetConsoleProcessList` from the holder would be exact, and is the follow-up if this confuses.
-- **Polling delay.** The badge appears up to a second after `sudo` starts, as titles do.
+- **Windows `sudo` inline isn't detected.** Checked by the user on 2026-11-22: the badge showed for about a second, then went by the elevated shell's first prompt. That shell's parent is sudo's elevated helper, which exits once it has started it, so the shell is orphaned: nothing links it to the tab's process tree, which the descendant walk follows. Recorded as a known limit. The follow-up is the holder listing the processes attached to the tab's console (`AttachConsole`, `GetConsoleProcessList`) and reporting them, which needs a negotiated protocol version and transcript tests (`process R4`–`R6`) and a spike on attaching to a pseudoconsole. It would also fix the next item. Inferring elevation from a running `sudo.exe` by name was rejected, for the same reason a denied token read is never taken as elevated.
+- **Polling delay.** The badge appears up to a second after an elevated program starts, as titles do.
 - **`curl | sh` trust.** The script is only as trustworthy as the release. It checks the archive against `SHA256SUMS` from the same release, which catches corruption but not a compromised release. The README keeps `gh attestation verify` for provenance.
 - **CRLF on Windows copies** changes what a script reading `Get-Clipboard` sees. The PowerShell integration case that reads a single line is unaffected, since one line has no line end.
 - **Right-click over a selection now pastes.** Someone who right-clicks out of habit while text is selected pastes. The setting is opt-in, the label says what happened, and the paste is bracketed where the program asks.
