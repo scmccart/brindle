@@ -41,15 +41,15 @@ are at their defaults unless the row says otherwise.
 | 18 | Windows | Paste a path copied from Explorer (ctrl-c on a file) | Text paths, or nothing if Explorer offered only files; no error | |
 | 19 | Windows | Copy in an elevated Brindle, paste in an unelevated app, and the reverse | Works both ways (the clipboard isn't integrity-bound) | |
 | 20 | all | Paste a 1 MB text (copied from an editor) into `cat > /dev/null` or `$null = [Console]::In.ReadToEnd()` | Arrives whole, window stays responsive | |
-| 21 | Linux and Windows | Select text with the mouse, then watch the copy label beside the pointer; then click on the label | The label shows a copy icon beside the pointer, fades in about a second, and the click reaches the terminal under it, not the label | |
-| 22 | Linux and Windows | `right_click = "paste"`, select text, copy other text in another app, right-click over the selection | The selection clears, the clipboard text is pasted, and a paste icon shows beside the pointer | |
-| 23 | Linux and Windows | `right_click = "paste"`, select text, leave the clipboard empty (or an image only), right-click over the selection | Nothing is pasted, the selection stays, and a ban icon shows beside the pointer | |
+| 21 | Linux and Windows | Select text with the mouse, then watch the copy label beside the pointer; then click on the label | "Copied" shows with a copy icon beside the pointer, fades in about a second, and the click reaches the terminal under it, not the label | |
+| 22 | Linux and Windows | `right_click = "paste"`, select text, copy other text in another app, right-click over the selection | The selection clears, the clipboard text is pasted, and "Pasted" shows with a paste icon beside the pointer | |
+| 23 | Linux and Windows | `right_click = "paste"`, select text, leave the clipboard empty (or an image only), right-click over the selection | Nothing is pasted, the selection stays, and "Nothing to paste" shows with a ban icon beside the pointer | |
 | 24 | Windows | Set sudo to inline mode, then `sudo pwsh` in a tab; accept the prompt; exit that pwsh | The tab shows the Administrator badge (a warning icon, tooltip "Running as Administrator") within about a second of sudo starting; it drops within about a second of the pwsh exiting | |
 | 25 | Windows | On a machine with no Brindle (no earlier install, no `PATH` entry), unpack the release zip, run `brindle.exe`, open a local tab | The window opens and the tab shows a prompt; no error notice | |
 | 26 | Windows | Same machine: open an SSH profile to a host you can reach with `ssh` | The tab connects and shows the remote shell; no error line | |
 | 27 | Windows | Same machine, Docker Desktop running: open a container profile | The tab opens a shell inside the container; no error line | |
 
-Rows 21 to 23 are about the mouse. Row 21's label is an icon only, with no text.
+Rows 21 to 23 are about the mouse. Each label is an icon and its text.
 
 ## Findings
 

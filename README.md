@@ -680,9 +680,9 @@ clicks, right-clicks included, and copies and pastes in its own way. Shift
 gives the mouse back to Brindle, so shift-drag selects and shift-right-click
 pastes there.
 
-A copy or paste made with the mouse shows a small icon beside the pointer: a
-copy icon for a copy, a paste icon for a paste, and a ban icon when a
-right-click found nothing to paste. It fades after about a second, and it takes
+A copy or paste made with the mouse shows a small label beside the pointer:
+"Copied" with a copy icon, "Pasted" with a paste icon, or "Nothing to paste"
+with a ban icon when a right-click found no text on the clipboard. It fades after about a second, and it takes
 no clicks, so a click on it reaches the terminal.
 
 On Windows, copied text has CRLF line ends, as Windows Terminal's copies do:
