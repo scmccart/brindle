@@ -303,8 +303,10 @@ Each case keeps its logs, screen dumps and window captures in
 
 Cases that need a debug-only fault switch are skipped, with the reason, when the binary under test has none (`cargo test --release`, or `BRINDLE_E2E_BIN` naming a release build); `BRINDLE_E2E_SWITCHES_REQUIRED=1`, as CI sets, makes that a failure.
 
+The Linux clipboard cases read and set the clipboard with `xclip`, as another program would, and skip with the reason when it is missing; `BRINDLE_E2E_CLIPBOARD_REQUIRED=1`, as CI sets, makes that a failure.
+
 To run the suite headless, the way CI does, wrap it in `scripts/with-xvfb`
-(after `sudo apt install xvfb x11-utils openbox mesa-vulkan-drivers dbus`):
+(after `sudo apt install xvfb x11-utils xclip openbox mesa-vulkan-drivers dbus`):
 
 ```sh
 BRINDLE_E2E=1 scripts/with-xvfb cargo test --test e2e

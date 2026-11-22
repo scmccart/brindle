@@ -109,6 +109,14 @@ fn unix() -> Vec<Case> {
         display("clipboard-right-click-selection", clipboard::right_click_selection),
         display("clipboard-right-click-mouse-mode", clipboard::right_click_mouse_mode),
         display("clipboard-right-click-reload", clipboard::right_click_reload),
+        display("clipboard-right-click-empty", clipboard::right_click_empty),
+        display("clipboard-select-label", clipboard::select_label),
+        display("clipboard-copy-to-app", clipboard::copy_to_app),
+        display("clipboard-paste-from-app", clipboard::paste_from_app),
+        display("clipboard-osc52-to-app", clipboard::osc52_to_app),
+        display("clipboard-primary-both-ways", clipboard::primary_both_ways),
+        display("clipboard-image-pastes-nothing", clipboard::image_pastes_nothing),
+        display("clipboard-multiline-line-ends", clipboard::multiline_line_ends),
         display("links-local-click", links::local_click),
         display("links-mouse-mode", links::mouse_mode),
         display("links-opener-fails", links::opener_fails),
@@ -134,6 +142,7 @@ fn unix() -> Vec<Case> {
         display("shell-633-copy-line", shell::copy_line_633),
         display("shell-633-cwd", shell::cwd_633),
         display("shell-633-palette", shell::palette_gating_633),
+        display("palette-output-hidden-without-integration", shell::palette_output_hidden_without_integration),
         display("shell-script-line-bash", shell::script_line_bash),
         display("shell-script-line-zsh", shell::script_line_zsh),
         display("shell-script-line-fish", shell::script_line_fish),
@@ -242,6 +251,11 @@ fn unix() -> Vec<Case> {
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),
     ]
+}
+
+/// The clipboard cases' helpers (`--self-test`).
+pub fn self_test_clipboard() -> Result {
+    clipboard::self_test()
 }
 
 /// The remote cases' parsers (`--self-test`).

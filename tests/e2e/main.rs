@@ -340,6 +340,7 @@ fn self_test() -> i32 {
         ("cell rectangles", capture::self_test),
         ("pixel scans", capture::self_test_scan),
         ("remote parsing", cases::self_test_remote),
+        ("clipboard helpers", cases::self_test_clipboard),
         ("server helpers", common::server::self_test),
         ("fault switches", switches::self_test),
         #[cfg(windows)]

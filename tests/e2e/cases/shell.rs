@@ -180,8 +180,13 @@ impl Clip {
     /// Copy Last Command Line, then the paste into the script, until it has
     /// saved it.
     pub(super) fn copy<'a>(&self, run: Run<'a>) -> Run<'a> {
-        run.action("copy_last_command")
-            .send(&format!("bash '{}'\\r", self.script.display()))
+        self.paste(run.action("copy_last_command"))
+    }
+
+    /// The paste into the script, until it has saved what the clipboard
+    /// held.
+    pub(super) fn paste<'a>(&self, run: Run<'a>) -> Run<'a> {
+        run.send(&format!("bash '{}'\\r", self.script.display()))
             .wait_for(&format!("{}-ready", self.name))
             .action("paste")
             .send(&format!("{PASTE_END}\\r"))
@@ -340,42 +345,69 @@ pub fn script_line_fish(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Copy Last Command Line is in the palette only once the terminal has
-/// sent a prompt mark: a bash tab with no integration doesn't list it (its
-/// neighbour, Copy Last Command Output, which the filter also matches, is
-/// there), and the same tab lists it after a printed `A` mark.
+/// The palette's rows (its header first) for the filter `last command`,
+/// after `line` ran in a bash tab that then printed `gate-ready`. The
+/// marker is printed in pieces, so the line that runs it doesn't show it.
+fn last_command_rows(ctx: &Ctx, label: &'static str, line: &str) -> Result<Vec<String>> {
+    let out = Run::new(ctx, label)
+        .profile("Shell")
+        .send(&format!("{line}printf '%s-%s\\012' gate ready\\r"))
+        .wait_for("gate-ready")
+        .action("open_command_palette")
+        .send("last command")
+        .dump_after_last_step(1.0) // one step interval, Brindle's own
+        .run()?;
+    ensure!(
+        out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+        "{label}: waits {:?} {:?}",
+        out.dump.wait_timeouts,
+        out.dump.wait_pending
+    );
+    ensure!(
+        out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"last command\" ")),
+        "{label}: palette {:?}",
+        out.dump.palette
+    );
+    Ok(out.dump.palette)
+}
+
+/// Whether a palette row starts with `title`.
+fn listed(rows: &[String], title: &str) -> bool {
+    rows.iter().any(|row| row.starts_with(title))
+}
+
+/// The three commands on the last command's line and output are in the
+/// palette only once the terminal has sent a prompt mark: a bash tab with no
+/// integration lists none of them, and the same tab lists them after a
+/// printed `A` mark.
 pub fn palette_gating_633(ctx: &Ctx) -> Result<Outcome> {
-    let listed = |label: &'static str, mark: &str| -> Result<(bool, Vec<String>)> {
-        // The marker is printed in pieces, so the line that runs it doesn't show it.
-        let out = Run::new(ctx, label)
-            .profile("Shell")
-            .send(&format!("PS1='$ '; clear; {mark}printf '%s-%s\\n' gate ready\\r"))
-            .wait_for("gate-ready")
-            .action("open_command_palette")
-            .send("last command")
-            .dump_after_last_step(1.0) // one step interval, Brindle's own
-            .run()?;
-        ensure!(
-            out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
-            "{label}: waits {:?} {:?}",
-            out.dump.wait_timeouts,
-            out.dump.wait_pending
-        );
-        ensure!(
-            out.dump.palette.first().is_some_and(|l| l.starts_with("list query=\"last command\" ")),
-            "{label}: palette {:?}",
-            out.dump.palette
-        );
-        ensure!(
-            out.dump.palette.iter().any(|l| l.starts_with("Copy Last Command Output")),
-            "{label}: the filter doesn't list Copy Last Command Output: {:?}",
-            out.dump.palette
-        );
-        Ok((out.dump.palette.iter().any(|l| l.starts_with("Copy Last Command Line")), out.dump.palette))
-    };
-    let (without, rows) = listed("plain", "")?;
-    ensure!(!without, "listed with no prompt mark: {rows:?}");
-    let (with, rows) = listed("marked", r"printf '\033]133;A\007'; ")?;
-    ensure!(with, "not listed after a prompt mark: {rows:?}");
+    const TITLES: [&str; 3] = ["Copy Last Command Line", "Select Last Command Output", "Copy Last Command Output"];
+    let rows = last_command_rows(ctx, "plain", "PS1='$ '; clear; ")?;
+    ensure!(!TITLES.iter().any(|title| listed(&rows, title)), "listed with no prompt mark: {rows:?}");
+    let rows = last_command_rows(ctx, "marked", r"PS1='$ '; clear; printf '\033]133;A\007'; ")?;
+    ensure!(TITLES.iter().all(|title| listed(&rows, title)), "not all listed after a prompt mark: {rows:?}");
+    Ok(Outcome::Pass)
+}
+
+/// Without shell integration the output commands aren't in the palette, and
+/// `copy_last_output` does nothing: a clipboard another program set (OSC 52
+/// here) is as it was, read back by pasting it into a script. With
+/// integration loaded, Select and Copy Last Command Output are listed.
+pub fn palette_output_hidden_without_integration(ctx: &Ctx) -> Result<Outcome> {
+    let rows = last_command_rows(ctx, "plain", "PS1='$ '; clear; ")?;
+    for title in ["Select Last Command Output", "Copy Last Command Output"] {
+        ensure!(!listed(&rows, title), "{title} is listed without integration: {rows:?}");
+    }
+
+    let clip = Clip::new(ctx, "clip")?;
+    let set = r"PS1='$ '; clear; printf '\033]52;c;%s\007' $(printf '%s' unchanged-42 | base64); printf '%s-%s\012' set done\r";
+    let run = Run::new(ctx, "inert").profile("Shell").send(set).wait_for("set-done").action("copy_last_output");
+    let out = clip.paste(run).dump_at(14.0).run()?;
+    clip.expect("unchanged-42", &out)?;
+
+    let rows = last_command_rows(ctx, "integrated", &format!("{}; ", setup(ctx).trim_end_matches("\\r")))?;
+    for title in ["Select Last Command Output", "Copy Last Command Output"] {
+        ensure!(listed(&rows, title), "{title} isn't listed with integration: {rows:?}");
+    }
     Ok(Outcome::Pass)
 }
