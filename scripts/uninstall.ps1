@@ -12,7 +12,10 @@ param(
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $Prefix 'brindle.exe'
 if (Test-Path $exe) {
-    & $exe --uninstall-desktop
+    # brindle.exe is a GUI program, so PowerShell waits for it (before its
+    # file is removed below), and sets $LASTEXITCODE, only when its output
+    # is piped.
+    & $exe --uninstall-desktop | Write-Host
     if ($LASTEXITCODE) { throw 'uninstall: brindle --uninstall-desktop failed' }
 } else {
     # Without the binary, remove the shortcut it would have (see src/desktop.rs).
