@@ -133,11 +133,12 @@ pub fn container_exec(ctx: &Ctx) -> Result<Outcome> {
     )
     .to_string();
     let label = "container-pty";
-    let dump = Run::new(ctx, label)
+    let run = Run::new(ctx, label)
         .profile(CONTAINER_PROFILE)
         .default_profile(CONTAINER_PROFILE)
-        .config(&config)
-        .env("BRINDLE_REMOTE_AGENT", &agent.to_string_lossy())
+        .config(&config);
+    let dump = agent
+        .give(run)
         .env("BRINDLE_NOTIFY_LOG", &notify_log(ctx, label))
         .wait_for("REMOTE_CONTAINER_READY>")
         .send(&set_cwd)
@@ -236,11 +237,12 @@ pub(super) fn in_container_tab(
          remote = {{ type = \"container\", engine = \"docker\", container = {:?}, user = \"remote\" }}\n",
         container.name,
     );
-    let run = Run::new(ctx, label)
-        .profile(CONTAINER_PROFILE)
-        .default_profile(CONTAINER_PROFILE)
-        .config(&config)
-        .env("BRINDLE_REMOTE_AGENT", &agent.to_string_lossy());
+    let run = agent.give(
+        Run::new(ctx, label)
+            .profile(CONTAINER_PROFILE)
+            .default_profile(CONTAINER_PROFILE)
+            .config(&config),
+    );
     let outcome = case(run);
     drop(container);
     outcome
@@ -1195,7 +1197,7 @@ pub fn palette_slow_host(ctx: &Ctx) -> Result<Outcome> {
 /// What a remote case needs from the machine: a Docker daemon, the Linux
 /// helper Brindle deploys, and the fixture image.
 struct Needs {
-    agent: PathBuf,
+    agent: Agent,
     image: String,
 }
 
@@ -1218,9 +1220,7 @@ impl Needs {
     /// A run of Brindle with `config` (profiles) after the test config, that
     /// deploys the helper.
     fn run<'a>(&self, ctx: &'a Ctx, label: &'static str, config: &str) -> Run<'a> {
-        Run::new(ctx, label)
-            .config(config)
-            .env("BRINDLE_REMOTE_AGENT", &self.agent.to_string_lossy())
+        self.agent.give(Run::new(ctx, label).config(config))
     }
 }
 
@@ -1684,21 +1684,54 @@ fn docker_outcome() -> Result<Option<Outcome>> {
     }
 }
 
-fn remote_agent(ctx: &Ctx) -> Result<Option<PathBuf>> {
-    let path = std::env::var_os("BRINDLE_REMOTE_AGENT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| ctx.bin.with_file_name("brindle-remote"));
-    if !path.is_file() {
+/// The Linux helper a remote case's Brindle deploys ([`remote_agent`]).
+enum Agent {
+    /// `BRINDLE_REMOTE_AGENT` named it: passed on resolved, since a run's
+    /// working directory may not be the suite's.
+    Named(PathBuf),
+    /// Beside the binary under test, where Brindle finds it itself, so the
+    /// run names none: an installed or unpacked archive's helper is
+    /// deployed as a user's Brindle finds it.
+    Beside,
+}
+
+impl Agent {
+    /// `run`, told about the helper when Brindle wouldn't find it itself.
+    fn give<'a>(&self, run: Run<'a>) -> Run<'a> {
+        match self {
+            Agent::Named(path) => run.env("BRINDLE_REMOTE_AGENT", &path.to_string_lossy()),
+            Agent::Beside => run,
+        }
+    }
+}
+
+/// The helper Brindle deploys: `BRINDLE_REMOTE_AGENT`, else the first of
+/// its names for the Linux helper beside the binary under test (an
+/// archive's `brindle-remote-linux-x86_64`, then cargo's `brindle-remote`),
+/// as Brindle looks for it. `None` when there is none, which
+/// `BRINDLE_REMOTE_E2E_REQUIRED=1` makes an error.
+fn remote_agent(ctx: &Ctx) -> Result<Option<Agent>> {
+    use crate::common::server::{LINUX_HELPER_NAMES, beside, bin_paths};
+    let named = std::env::var_os("BRINDLE_REMOTE_AGENT").filter(|value| !value.is_empty()).map(PathBuf::from);
+    let found = match &named {
+        Some(path) => path.is_file().then(|| path.clone()),
+        None => beside(&bin_paths(&ctx.bin), &LINUX_HELPER_NAMES, &|path: &Path| path.is_file()),
+    };
+    let Some(path) = found else {
         if std::env::var("BRINDLE_REMOTE_E2E_REQUIRED").as_deref() == Ok("1") {
-            return Err(format!(
-                "Linux remote helper not found at {}; run `cargo build -p brindle-remote-agent`",
-                path.display()
-            ));
+            let looked = named.map_or_else(
+                || format!("beside {} ({})", ctx.bin.display(), LINUX_HELPER_NAMES.join(", ")),
+                |path| format!("at {}", path.display()),
+            );
+            return Err(format!("Linux remote helper not found {looked}; run `cargo build -p brindle-remote-agent`"));
         }
         return Ok(None);
+    };
+    if named.is_none() {
+        return Ok(Some(Agent::Beside));
     }
     fs::canonicalize(&path)
-        .map(Some)
+        .map(|path| Some(Agent::Named(path)))
         .map_err(|error| format!("resolving remote helper {}: {error}", path.display()))
 }
 

@@ -1728,14 +1728,19 @@ fn link_or_copy(from: &Path, to: &Path) -> Result {
 
 /// A copy of the helper with another build id (a byte of its GNU build-id
 /// note flipped) and a newer file time: what an install of a new build
-/// leaves beside Brindle. Returns it and both build ids.
+/// leaves beside Brindle. A helper whose linker wrote no note (the helper
+/// under test may be a release archive's) has a hash of its bytes for its
+/// build id, so bytes appended after its image change it instead, as for a
+/// PE file. Returns it and both build ids.
 fn other_build_elf(ctx: &Ctx) -> Result<(PathBuf, String, String)> {
     use brindle_remote_protocol::build_id;
     let mut bytes = std::fs::read(&ctx.helper).map_err(|e| format!("reading {}: {e}", ctx.helper.display()))?;
     let old = build_id::of_binary(&bytes);
     let id: Vec<u8> = (0..old.len()).step_by(2).filter_map(|at| u8::from_str_radix(&old[at..at + 2], 16).ok()).collect();
-    let at = bytes.windows(id.len()).position(|window| window == id).ok_or("the helper has no GNU build-id note")?;
-    bytes[at] ^= 0xff;
+    match bytes.windows(id.len()).position(|window| window == id) {
+        Some(at) => bytes[at] ^= 0xff,
+        None => bytes.extend_from_slice(b"brindle-e2e: another build"),
+    }
     let new = build_id::of_binary(&bytes);
     ensure!(new != old, "the patched build id is still {old}");
     let dir = ctx.dir.join("upgrade");

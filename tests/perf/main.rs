@@ -42,7 +42,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use common::Selection;
-use common::server::{Suite, helper_name, private_dir};
+use common::server::{Suite, private_dir};
 pub use common::Result;
 use report::{LatencyResult, Summary, ThroughputResult};
 
@@ -155,7 +155,8 @@ fn main() {
     }
     // The case's local tab runs in a terminal server of its own.
     let helper = common::server::helper(&bin);
-    if let Err(why) = common::server::check_helper(&helper, &target_dir.join("release").join(helper_name())) {
+    let default_bin = target_dir.join("release").join(format!("brindle{}", std::env::consts::EXE_SUFFIX));
+    if let Err(why) = common::server::check_helper(&helper, &bin, &default_bin) {
         println!("perf: {why}");
         std::process::exit(1);
     }
