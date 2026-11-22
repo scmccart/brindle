@@ -561,7 +561,7 @@ pub fn multiline_line_ends(ctx: &Ctx) -> Result<Outcome> {
     } else {
         (
             format!("printf 'a\\015\\012b' | {} -selection clipboard; echo set-''ok\\r", xclip(ctx)),
-            "stty -icrnl; echo rea''dy; read -rs -n 3 got; stty icrnl; echo \"ke\"\"ys=[$(printf %s \"$got\" | od -An -tx1)]\"\\r"
+            "stty raw -echo; echo rea''dy; got=$(dd bs=1 count=3 2>/dev/null | od -An -tx1); stty sane; echo \"ke\"\"ys=[$got]\"\\r"
                 .to_string(),
         )
     };
