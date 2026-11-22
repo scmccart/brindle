@@ -959,11 +959,13 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 37] = [
+const PURE_MODULES: [&str; 39] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
+    "term-core/src/pointer.rs",
     "src/terminal/keys.rs",
     "src/terminal/mouse.rs",
+    "src/terminal/pointer.rs",
     "src/terminal/cmdline.rs",
     "src/terminal/dir_check.rs",
     "src/notify/policy.rs",
@@ -1218,6 +1220,8 @@ const SEAMS: &[&str] = &[
     "src/terminal/process.rs",
     // the primary selection
     "src/primary.rs",
+    // showing a frame's pointer at once
+    "src/cursor.rs",
     // desktop notifications and window activation
     "src/notify/dbus.rs",
     "src/notify/toast.rs",

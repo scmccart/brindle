@@ -416,6 +416,20 @@ impl<'a> Run<'a> {
         self
     }
 
+    /// Presses the left button on a cell of the active terminal and holds
+    /// it, e.g. `0,0` (`--press`); a [`Run::hover`] then drags.
+    pub fn press(mut self, pos: &str) -> Self {
+        self.steps.extend(["--press".to_string(), pos.to_string()]);
+        self
+    }
+
+    /// Releases the held left button over a cell of the active terminal,
+    /// with no move first (`--release`).
+    pub fn release(mut self, pos: &str) -> Self {
+        self.steps.extend(["--release".to_string(), pos.to_string()]);
+        self
+    }
+
     /// Adds TOML to the test config, e.g. a `[notifications]` table.
     pub fn config(mut self, text: &str) -> Self {
         self.extra_config.push_str(text);
@@ -790,6 +804,14 @@ pub struct Dump {
     /// then `--- badge zone=ID …` for the active tab's zones), one line
     /// each without the prefix.
     pub badges: Vec<String>,
+    /// The program's pointer shape on the active terminal's screen
+    /// (`--- pointer shape=NAME screen=primary|alternate`), without the
+    /// prefix; none while the pointer is Brindle's own.
+    pub pointer: Option<String>,
+    /// The pointer the active terminal's last painted frame chose for its
+    /// grid (`--- grid-pointer NAME`, a CSS name such as `text`), without
+    /// the prefix.
+    pub grid_pointer: Option<String>,
     /// The active tab's zone header (`--- zones …`), when it has 2+ zones.
     pub zones: Option<String>,
     /// The active tab's zone lines (`--- zone …`), one line each without the prefix.
@@ -880,6 +902,10 @@ impl Dump {
                 dump.contexts.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- badge ") {
                 dump.badges.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- pointer ") {
+                dump.pointer = Some(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- grid-pointer ") {
+                dump.grid_pointer = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
                 dump.zones = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zone ") {
@@ -1124,6 +1150,14 @@ pub fn self_test_dump() -> Result {
         dump.badges
     );
     ensure!(dump.screen == ["hi"], "screen after contexts {:?}", dump.screen);
+    ensure!(dump.pointer.is_none(), "no pointer line: {:?}", dump.pointer);
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR | ALT_SCREEN)\n--- pointer shape=crosshair screen=alternate\n\
+         --- grid-pointer text\nhi\n",
+    );
+    ensure!(dump.pointer.as_deref() == Some("shape=crosshair screen=alternate"), "pointer {:?}", dump.pointer);
+    ensure!(dump.grid_pointer.as_deref() == Some("text"), "grid pointer {:?}", dump.grid_pointer);
+    ensure!(dump.screen == ["hi"], "screen after the pointer {:?}", dump.screen);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
          --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",

@@ -26,7 +26,7 @@ use brindle_term_core::emulator::MIN_COLS;
 
 use crate::latency::Latency;
 use crate::settings::Settings;
-use crate::terminal::search;
+use crate::terminal::{pointer, search};
 use crate::terminal::{DIM_FACTOR, GridSize, resolve_color};
 use crate::terminal_view::{GridLayout, TerminalView};
 use crate::theme::Color;
@@ -113,12 +113,11 @@ pub struct Frame {
     cursor: Option<(Bounds<Pixels>, Hsla, CursorShape)>,
     preedit: Option<(gpui::Point<Pixels>, ShapedLine, Bounds<Pixels>)>,
     line_height: Pixels,
-    arrow_cursor: bool,
+    /// The pointer over the grid ([`pointer::choose`]).
+    pointer: CursorStyle,
     /// The terminal's output generation and its time when the grid was
     /// read, for latency probes.
     output: (u64, std::time::Instant),
-    /// A ctrl-hovered link is under the mouse.
-    pointing_hand: bool,
 }
 
 fn rgb_hsla(c: Rgb) -> Hsla {
@@ -201,6 +200,7 @@ impl Element for TerminalElement {
         let mark_failed = Settings::get(cx).config.mark_failed_commands;
         let layout_cell = view.layout.clone();
         let hovered_link = view.hovered_link.clone();
+        let selecting = view.is_selecting();
 
         terminal_entity.update(cx, |t, _| {
             t.resize(GridSize {
@@ -247,6 +247,8 @@ impl Element for TerminalElement {
         // Matches are in order, like the cells: walk them with an index.
         let mut next_match = 0;
         let mouse_mode = content.mode.intersects(TermMode::MOUSE_MODE);
+        // The program's shape on the screen being drawn: a field read.
+        let program_pointer = terminal.pointer().top(pointer::Screen::of(content.mode.contains(TermMode::ALT_SCREEN)));
 
         // Cursor placement in viewport coordinates.
         let cursor_point = content.cursor.point;
@@ -535,9 +537,8 @@ impl Element for TerminalElement {
             cursor,
             preedit,
             line_height,
-            arrow_cursor: mouse_mode,
+            pointer: pointer::choose(hovered_link.is_some(), selecting, program_pointer, mouse_mode),
             output,
-            pointing_hand: hovered_link.is_some(),
         }
     }
 
@@ -590,14 +591,15 @@ impl Element for TerminalElement {
 
         let focus = self.view.read(cx).focus_handle.clone();
         window.handle_input(&focus, ElementInputHandler::new(bounds, self.view.clone()), cx);
-        let cursor_style = if frame.pointing_hand {
-            CursorStyle::PointingHand
-        } else if frame.arrow_cursor {
-            CursorStyle::Arrow
-        } else {
-            CursorStyle::IBeam
-        };
-        window.set_cursor_style(cursor_style, &frame.hitbox);
+        // Over the grid only: the program's shape never reaches the chrome.
+        window.set_cursor_style(frame.pointer, &frame.hitbox);
+        // A pointer that changed with no mouse move (a drag's press or
+        // release, a ctrl press, a program's OSC 22) is shown now, not at
+        // the next move (`pointer::Shown`).
+        let over_grid = frame.hitbox.is_hovered(window);
+        if self.view.read(cx).pointer_painted(frame.pointer, over_grid) {
+            crate::cursor::show_now(window, cx);
+        }
 
         // Down and wheel only count over this terminal; move and up are
         // global so drags keep tracking outside it.

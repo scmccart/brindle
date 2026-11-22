@@ -13,16 +13,17 @@ use std::sync::Arc;
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener as _};
 use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::Term;
+use alacritty_terminal::term::{Term, TermMode};
 use parking_lot::Mutex;
 
+use super::pointer::Screen;
 use super::shell_integration::{Marks, Parser};
 use super::tab_note::{self, NoteGate};
 #[cfg(debug_assertions)]
 use super::SINK_PANIC;
 use super::{ChannelEvent, GridSize, Listener};
 use alacritty_terminal::grid::Dimensions as _;
-use crate::notify::osc::Scanner;
+use crate::notify::osc::{Found, Scanner};
 use crate::remote::local::SessionSink;
 
 pub struct Sink {
@@ -98,9 +99,21 @@ impl Sink {
     /// through here too, so one that arrives during a replay lands after
     /// the replayed screen; only the program's own output
     /// ([`SessionSink::output`]) lets the next repeat of a notice through.
+    ///
+    /// A pointer shape op acts on the screen active where it sits, so a
+    /// chunk holding one is parsed in pieces, each find sent where it sits
+    /// in the stream and each op tagged with the screen the parse reached
+    /// ([`ChannelEvent::Pointer`]). Other chunks send their finds first and
+    /// parse in one go. A held replay's ops are dropped: the server keeps
+    /// no pointer, so a replay holds none, and its screen isn't parsed yet.
     fn write(&mut self, bytes: &[u8]) {
-        for found in self.scanner.scan(bytes) {
-            self.send(ChannelEvent::Osc(found));
+        let found = self.scanner.scan_positions(bytes);
+        let split = self.replay.is_none() && found.iter().any(|(_, found)| matches!(found, Found::Pointer(_)));
+        let (first, in_stream) = if split { (Vec::new(), found) } else { (found, Vec::new()) };
+        for (_, found) in first {
+            if !matches!(found, Found::Pointer(_)) {
+                self.send(ChannelEvent::Osc(found));
+            }
         }
         if let Some(replay) = &mut self.replay {
             replay.extend_from_slice(bytes);
@@ -111,7 +124,24 @@ impl Sink {
             let mut parser = self.parser.lock();
             let mut term = self.term.lock_unfair();
             inject_fault(bytes);
-            parser.advance(&mut *term, &self.marks, bytes);
+            let mut fed = 0;
+            for (at, found) in in_stream {
+                match found {
+                    Found::Pointer(op) => {
+                        parser.advance(&mut *term, &self.marks, &bytes[fed..at]);
+                        fed = at;
+                        let screen = Screen::of(term.mode().contains(TermMode::ALT_SCREEN));
+                        self.listener.send(ChannelEvent::Pointer(screen, op));
+                    }
+                    Found::Notice(_)
+                    | Found::Status(_)
+                    | Found::Progress(_)
+                    | Found::Context(_)
+                    | Found::PromptStart
+                    | Found::Reset => self.listener.send(ChannelEvent::Osc(found)),
+                }
+            }
+            parser.advance(&mut *term, &self.marks, &bytes[fed..]);
         }
         // Always wake the UI, even when the bytes are held by a
         // synchronized update: it schedules the update's timeout flush.
@@ -248,6 +278,7 @@ mod tests {
                 ChannelEvent::Replay(false) => "replay-end",
                 ChannelEvent::Osc(Found::Notice(_)) => "notice",
                 ChannelEvent::Osc(_) => "osc",
+                ChannelEvent::Pointer(..) => "pointer",
                 ChannelEvent::Alac(AlacEvent::Bell) => "bell",
                 ChannelEvent::Alac(AlacEvent::Exit) => "exit",
                 ChannelEvent::Alac(_) => "alac",
@@ -288,6 +319,56 @@ mod tests {
         sink.output(b"z");
         assert_eq!(kinds(&sink, &mut rx), ["wakeup"]);
         assert_eq!(kinds(&sink, &mut rx), Vec::<&str>::new());
+    }
+
+    /// The pointer ops a chunk holds, each with the screen it was tagged.
+    fn pointer_ops(rx: &mut UnboundedReceiver<ChannelEvent>) -> Vec<(Screen, String)> {
+        std::iter::from_fn(|| rx.try_next().ok().flatten())
+            .filter_map(|event| match event {
+                ChannelEvent::Pointer(screen, op) => Some((screen, format!("{op:?}"))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A push made on the alternate screen is tagged `Alternate`, though
+    /// the same chunk leaves that screen again before anything reads it.
+    #[test]
+    fn a_pointer_op_is_tagged_with_the_screen_active_where_it_sits() {
+        use crate::terminal::pointer::{Op, Shape};
+        let (mut sink, mut rx, _) = sink();
+        sink.output(b"\x1b]22;>pointer\x07\x1b[?1049h\x1b]22;>crosshair\x1b\\\x1b[?1049lb\x1b]22;<\x07");
+        let push = |shape| format!("{:?}", Op::Push(vec![shape]));
+        assert_eq!(pointer_ops(&mut rx), [
+            (Screen::Primary, push(Shape::Pointer)),
+            (Screen::Alternate, push(Shape::Crosshair)),
+            (Screen::Primary, format!("{:?}", Op::Pop)),
+        ]);
+        // The whole chunk was parsed, once.
+        assert!(crate::terminal::screen_text(&sink.term.lock()).starts_with("b\n"));
+    }
+
+    /// Finds keep their stream order around pointer ops (a push then a
+    /// reset must leave the stacks empty), and a chunk without one sends
+    /// its finds before parsing, as before.
+    #[test]
+    fn finds_keep_their_order_around_pointer_ops() {
+        let (mut sink, mut rx, _) = sink();
+        sink.output(b"\x1b]9;one\x07\x1b]22;>grab\x07\x1bc\x07\x1b]22;?__current__\x07");
+        assert_eq!(kinds(&sink, &mut rx), ["notice", "pointer", "osc", "bell", "pointer", "wakeup"]);
+        sink.output(b"\x1b]9;two\x07\x07");
+        assert_eq!(kinds(&sink, &mut rx), ["notice", "bell", "wakeup"]);
+    }
+
+    /// A held replay has no pointer ops (the server keeps none); one in its
+    /// bytes is dropped, and the replay's other finds still arrive.
+    #[test]
+    fn a_held_replays_pointer_ops_are_dropped() {
+        let (mut sink, mut rx, _) = sink();
+        sink.replay(true);
+        sink.output(b"\x1b]22;>pointer\x07\x1b]9;tail\x07");
+        sink.replay(false);
+        assert_eq!(kinds(&sink, &mut rx), ["replay-start", "notice", "wakeup", "replay-end"]);
     }
 
     #[test]
