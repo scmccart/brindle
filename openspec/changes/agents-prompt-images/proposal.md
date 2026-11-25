@@ -30,7 +30,7 @@ Open questions, to answer before a design:
 
 ## What the full changes already say
 
-- `agents-prompt-context`, design decision 1: `Attachment` is an enum that an `Image` kind joins, since protocol 4 is unreleased. Decision 2: a queue slot must fit one frame, which is why its text is bounded at 384 KiB (question 4). Decision 5: `PromptSupport { embedded, images }` is already read from `initialize` and checkpointed (question 7).
+- `agents-prompt-context`, design decision 1: attached text is kept in files beside the log, in a private directory a session, with only a reference in the log, the queue slot and the checkpoint; `Attachment` is an enum an `Image` kind joins. That store answers most of questions 4 and 5 for images too: their bytes would be kept there, bounded by its 16 MiB a session unless this change raises it. Decision 3: `AGENT_ATTACH` carries one text in one frame under a number the client picks, which the upload in pieces would extend (question 1). Decision 6: `PromptSupport { embedded, images }` is already read from `initialize` and checkpointed (question 7).
 - `agents-prompt-context`, `agent-zones` requirement "Dropping files on an agent zone": a file that isn't text is refused for an agent on another host. This change modifies it for images.
 - `agents-sessions`: the log's 16 MiB bound and the 64 MiB checkpoint (questions 4 and 5); the holder's `CHECKPOINT_BEGIN`/`CHUNK`/`END` is the existing example of a payload sent in pieces.
 - `agents-markdown`: images in an agent's message are never fetched or drawn, only named (question 6 is about the user's own images, which are different: the user chose them).
