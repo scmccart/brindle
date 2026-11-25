@@ -193,7 +193,7 @@ jobs:
           path: target/tmp/e2e/
           retention-days: 14
 
-  # The Windows local cases against the zip build-windows.yml uploaded,
+  # The Windows local and agent cases against the zip build-windows.yml uploaded,
   # unpacked as a user unpacks it: its brindle.exe, with the packaged
   # brindle-remote.exe (and the ConPTY it embeds) beside it and no
   # BRINDLE_SERVER_HELPER, so what runs is what the zip carries. A job of
@@ -222,14 +222,19 @@ jobs:
           if ($zip.Count -ne 1) { throw "expected one zip, found $($zip.Count)" }
           Expand-Archive $zip[0].FullName "$env:RUNNER_TEMP/unpacked"
           Get-ChildItem "$env:RUNNER_TEMP/unpacked"
-      - name: Build the suite
-        run: cargo test --locked -p brindle --test e2e --no-run
-      - name: ConPTY and PowerShell cases from the zip
-        run: cargo test --locked -p brindle --test e2e -- windows-conpty windows-pwsh-integration
+      # The zip doesn't carry the fake ACP agent the agent cases run, so it
+      # is built here and named.
+      - name: Build the suite and the fake ACP agent
+        run: |
+          cargo test --locked -p brindle --test e2e --no-run
+          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent
+      - name: ConPTY, PowerShell and agent cases from the zip
+        run: cargo test --locked -p brindle --test e2e -- windows-conpty windows-pwsh-integration windows-agent-
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
           BRINDLE_E2E_BIN: ${{ runner.temp }}/unpacked/brindle.exe
+          BRINDLE_FAKE_ACP_AGENT: ${{ github.workspace }}/target/release/brindle-fake-acp-agent.exe
       - name: Upload the suite's output
         if: failure()
         uses: actions/upload-artifact@v7
@@ -238,8 +243,8 @@ jobs:
           path: target/tmp/e2e/
           retention-days: 14
 
-  # The local-server and remote cases (SSH and container, through Docker)
-  # against the Linux archive build-linux.yml uploaded, installed as a user
+  # The local-server, remote (SSH and container, through Docker) and agent
+  # cases against the Linux archive build-linux.yml uploaded, installed as a user
   # installs it: the one-command installer, from a local release directory
   # into a private prefix. The suite runs the installed brindle, with the
   # helper beside it and no BRINDLE_REMOTE_AGENT or BRINDLE_SERVER_HELPER, so
@@ -258,10 +263,13 @@ jobs:
         run: |
           sudo apt-get update
           # shellcheck disable=SC2086 # a list of packages
-          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES musl-tools \
             xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less
+      # The musl target: the fake ACP agent is built static.
       - name: Install Rust
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: dev
@@ -281,14 +289,22 @@ jobs:
           PREFIX=$RUNNER_TEMP/prefix XDG_DATA_HOME=$RUNNER_TEMP/data BRINDLE_DOWNLOAD_BASE=file://$release \
             sh < "$release/install.sh"
           ls -l "$RUNNER_TEMP/prefix/bin"
-      - name: Build the suite
-        run: cargo test --locked -p brindle --test e2e --no-run
-      - name: Local-server and remote cases from the installed archive
-        run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- local-server remote-
+      # The archive doesn't carry the fake ACP agent the agent cases run, so
+      # it is built here, static: the agent cases run it here (named by
+      # BRINDLE_FAKE_ACP_AGENT) and remote-agent-ssh copies it into its
+      # container (from where README.md's static build puts it).
+      - name: Build the suite and the fake ACP agent
+        run: |
+          cargo test --locked -p brindle --test e2e --no-run
+          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent \
+            --target x86_64-unknown-linux-musl
+      - name: Local-server, remote and agent cases from the installed archive
+        run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- local-server remote- agent-
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
           BRINDLE_E2E_BIN: ${{ runner.temp }}/prefix/bin/brindle
+          BRINDLE_FAKE_ACP_AGENT: ${{ github.workspace }}/target/x86_64-unknown-linux-musl/release/brindle-fake-acp-agent
           BRINDLE_REMOTE_E2E_REQUIRED: "1"
       - name: Upload the suite's output
         if: failure()
