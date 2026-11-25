@@ -58,19 +58,28 @@ const HELP: &str = "\
 Brindle — a GPU-accelerated terminal
 
 USAGE:
-    brindle [OPTIONS] [-e COMMAND [ARGS]...]
+    brindle [OPTIONS]            Open the window (the restored tabs, else the
+                                 default profile)
+    brindle terminal [PROFILE] [-d DIR] [-e COMMAND [ARGS]...] [OPTIONS]
+                                 Open a terminal tab
+    brindle --attach <ID> [OPTIONS]
+                                 Open a tab on a detached session
 
-OPTIONS:
-    -e, --command <CMD> [ARGS]   Run CMD instead of the profile's shell (must be last)
-    -p, --profile <NAME>         Open a tab with this profile (default: config's
+TERMINAL:
+    PROFILE                      A profile's name (default: config's
                                  default_profile)
     -d, --working-directory <DIR>
                                  Start in DIR
+    -e, --command <CMD> [ARGS]   Run CMD instead of the profile's program (must
+                                 be last: it takes every argument after it)
+
+OPTIONS:
         --config <FILE>          Use FILE instead of ~/.config/brindle/config.toml
         --no-restore             Reopen nothing this time: no saved tabs, no
                                  detached sessions
         --attach <ID>            Open a tab attached to the terminal server's
-                                 detached session ID (see brindle-remote list)
+                                 detached session ID (see brindle-remote list);
+                                 not with a subcommand
         --list-actions           Print bindable action names and exit
         --list-themes            Print built-in theme names and exit
         --export-ui-tokens       Print the built-in themes' UI tokens as CSS
@@ -227,11 +236,98 @@ impl WaitLog {
     }
 }
 
+/// The kinds of tab a subcommand opens: the subcommand's word, the profile
+/// check's kind and the hand-off's `kind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabKind {
+    /// `brindle terminal`.
+    Terminal,
+}
+
+impl TabKind {
+    /// The subcommand's word, which is also the hand-off's `kind`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+/// A program and its arguments (`brindle terminal -e`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Command {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl Command {
+    /// The command from an argument list: `None` when it is empty.
+    pub fn from_argv(argv: &[String]) -> Option<Self> {
+        let (program, args) = argv.split_first()?;
+        Some(Self { program: program.clone(), args: args.to_vec() })
+    }
+
+    /// The program followed by its arguments.
+    pub fn argv(&self) -> Vec<String> {
+        std::iter::once(self.program.clone()).chain(self.args.iter().cloned()).collect()
+    }
+}
+
+/// `brindle terminal [PROFILE] [-d DIR] [-e COMMAND…]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TerminalLaunch {
+    pub profile: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub command: Option<Command>,
+}
+
+/// What a launch asks for beyond the window.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum Asked {
+    /// Bare `brindle`: the restored tabs, else one default-profile tab; a
+    /// hand-off only raises the window.
+    #[default]
+    Window,
+    /// `brindle terminal …`: a new terminal tab, even with nothing named.
+    Terminal(TerminalLaunch),
+    /// `--attach ID`.
+    Attach(u32),
+}
+
+/// What the arguments ask for: a run, or text to print before exiting 0
+/// (the parser does no IO).
+#[derive(Debug)]
+enum Parsed {
+    Run(Box<Args>),
+    Print(Info),
+}
+
+/// The informational options' output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Info {
+    Help,
+    Version,
+    Actions,
+    FaultSwitches,
+    Themes,
+    UiTokens,
+    /// `--shell-integration SHELL`: that shell's script.
+    ShellScript(&'static str),
+}
+
+/// What a launch opens as its active tab, after anything restored.
+enum Opening {
+    Tab(LaunchRequest),
+    Attach(u32),
+}
+
 #[derive(Default, Debug)]
 struct Args {
-    command: Option<(String, Vec<String>)>,
-    profile: Option<String>,
-    cwd: Option<PathBuf>,
+    /// The subcommand, or `--attach`.
+    asked: Asked,
+    /// `--config`: the config file, which `main` hands on as
+    /// `BRINDLE_CONFIG` before anything reads it.
+    config: Option<PathBuf>,
     /// `--send` / `--action` / `--find` / `--wait-for` steps, run in order one
     /// second apart.
     steps: Vec<Step>,
@@ -242,15 +338,29 @@ struct Args {
     latency_bench: Option<usize>,
     desktop: Option<desktop::Request>,
     no_restore: bool,
-    /// `--attach`: the terminal server session the window opens with.
-    attach: Option<u32>,
 }
 
 impl Args {
-    /// Whether the launch asks for a tab of its own: a profile, directory or
-    /// command (`--attach` is its own request).
-    fn asks_for_a_tab(&self) -> bool {
-        self.profile.is_some() || self.cwd.is_some() || self.command.is_some()
+    /// `--attach`'s session.
+    fn attach(&self) -> Option<u32> {
+        match &self.asked {
+            Asked::Attach(session) => Some(*session),
+            Asked::Window | Asked::Terminal(_) => None,
+        }
+    }
+
+    /// What the launch opens as its active tab, `profile` being the checked
+    /// profile of a terminal launch: nothing for bare `brindle`.
+    fn opening(&self, profile: usize) -> Option<Opening> {
+        match &self.asked {
+            Asked::Window => None,
+            Asked::Terminal(launch) => Some(Opening::Tab(LaunchRequest {
+                profile,
+                command: launch.command.clone().map(|c| (c.program, c.args)),
+                cwd: launch.cwd.clone(),
+            })),
+            Asked::Attach(session) => Some(Opening::Attach(*session)),
+        }
     }
 
     /// A run driven by debug options, which runs on its own beside a
@@ -259,26 +369,84 @@ impl Args {
         !self.steps.is_empty() || self.dump_after.is_some() || self.latency_log.is_some() || self.latency_bench.is_some()
     }
 
-    /// This launch as a request to the running Brindle.
-    fn instance_request(&self) -> instance::Request {
-        let here = std::env::current_dir().ok();
-        instance::Request {
-            profile: self.profile.clone(),
-            // Relative to where this launch runs, not the instance.
-            cwd: self.cwd.as_ref().map(|d| here.as_ref().map(|h| h.join(d)).unwrap_or_else(|| d.clone())),
-            command: self.command.as_ref().map(|(program, args)| std::iter::once(program.clone()).chain(args.iter().cloned()).collect()),
-            attach: self.attach,
-            launch_dir: here,
-            activation_token: instance::launch_token(
-                std::env::var("XDG_ACTIVATION_TOKEN").ok(),
-                std::env::var("DESKTOP_STARTUP_ID").ok(),
-            ),
+    /// This launch as a request to the running Brindle, made where the
+    /// launch runs (`here`) with the launcher's activation `token`.
+    fn instance_request(&self, here: Option<PathBuf>, token: Option<String>) -> instance::Request {
+        let mut request = instance::Request { launch_dir: here, activation_token: token, ..Default::default() };
+        match &self.asked {
+            Asked::Window => {}
+            Asked::Terminal(launch) => {
+                request.kind = Some(TabKind::Terminal.word().into());
+                request.profile = launch.profile.clone();
+                // Relative to where this launch runs, not the instance.
+                request.cwd = launch.cwd.as_ref().map(|d| match &request.launch_dir {
+                    Some(here) => here.join(d),
+                    None => d.clone(),
+                });
+                request.command = launch.command.as_ref().map(Command::argv);
+            }
+            Asked::Attach(session) => request.attach = Some(*session),
         }
+        request
     }
 }
 
 fn parse_args() -> Args {
-    parse_args_from(std::env::args().skip(1), dirs::home_dir().as_deref()).unwrap_or_else(|message| usage_error(&message))
+    match parse_args_from(std::env::args().skip(1), dirs::home_dir().as_deref()) {
+        Ok(Parsed::Run(args)) => *args,
+        Ok(Parsed::Print(info)) => {
+            console_output();
+            print_info(info);
+            std::process::exit(0);
+        }
+        Err(message) => usage_error(&message),
+    }
+}
+
+/// Prints what an informational option asks for.
+fn print_info(info: Info) {
+    match info {
+        Info::Help => print!("{HELP}"),
+        Info::Version => println!("brindle {}", env!("CARGO_PKG_VERSION")),
+        Info::Actions => {
+            for name in actions::action_names() {
+                println!("{name}");
+            }
+        }
+        Info::FaultSwitches => {
+            for name in fault_switches() {
+                println!("{name}");
+            }
+        }
+        Info::Themes => {
+            for name in theme::BUILTIN_THEMES {
+                println!("{name}");
+            }
+        }
+        Info::UiTokens => print!("{}", theme::ui_tokens_css(env!("CARGO_PKG_VERSION"))),
+        Info::ShellScript(script) => print!("{script}"),
+    }
+}
+
+/// `word` as a shell would need it typed: as it is when it is plain, else
+/// in single quotes.
+fn shell_word(word: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || "_./:=@%+,-~".contains(c);
+    if !word.is_empty() && word.chars().all(plain) {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// `words` as a shell would need them typed, `placeholder` when there are
+/// none.
+fn shell_words(words: &[String], placeholder: &str) -> String {
+    if words.is_empty() {
+        placeholder.to_string()
+    } else {
+        words.iter().map(|w| shell_word(w)).collect::<Vec<_>>().join(" ")
+    }
 }
 
 /// The value `option` takes: the next argument, or a usage error naming
@@ -287,60 +455,38 @@ fn value_of(it: &mut impl Iterator<Item = String>, option: &str, what: &str) -> 
     it.next().ok_or_else(|| format!("{option} needs {what}"))
 }
 
+/// What `agent` says until agent tabs exist (`agents-profiles`).
+const NO_AGENT_TABS: &str = "agent tabs aren't in this version of Brindle (run brindle terminal for a terminal tab)";
+
 /// The arguments, with a leading `~` in a path expanded to `home`, or the
 /// usage error to print: an unknown argument, an option without its value,
-/// or a value it can't use, each naming the option. The debug steps are
-/// checked here, so a run never starts with one it can't take.
-fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) -> Result<Args, String> {
+/// a value it can't use, a removed option, or a subcommand combined with
+/// what it can't take, each naming the option. The debug steps are checked
+/// here, so a run never starts with one it can't take.
+///
+/// One pass, left to right (design.md decision 1): the global options are
+/// taken anywhere; the first bare word is the subcommand, and the first
+/// after it its PROFILE; `-d` and `-e` belong to the subcommand, and `-e`
+/// takes every argument after it.
+fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) -> Result<Parsed, String> {
     let mut args = Args::default();
     let (mut install_desktop, mut uninstall_desktop, mut prefix) = (false, false, None);
+    let mut subcommand: Option<TabKind> = None;
+    let mut terminal = TerminalLaunch::default();
+    let mut attach = None;
     while let Some(arg) = it.next() {
         let it = &mut it;
         match arg.as_str() {
-            "-h" | "--help" => {
-                console_output();
-                print!("{HELP}");
-                std::process::exit(0);
-            }
-            "-V" | "--version" => {
-                console_output();
-                println!("brindle {}", env!("CARGO_PKG_VERSION"));
-                std::process::exit(0);
-            }
-            "--list-actions" => {
-                console_output();
-                for name in actions::action_names() {
-                    println!("{name}");
-                }
-                std::process::exit(0);
-            }
-            "--list-fault-switches" => {
-                console_output();
-                for name in fault_switches() {
-                    println!("{name}");
-                }
-                std::process::exit(0);
-            }
-            "--list-themes" => {
-                console_output();
-                for name in theme::BUILTIN_THEMES {
-                    println!("{name}");
-                }
-                std::process::exit(0);
-            }
-            "--export-ui-tokens" => {
-                console_output();
-                print!("{}", theme::ui_tokens_css(env!("CARGO_PKG_VERSION")));
-                std::process::exit(0);
-            }
+            "-h" | "--help" => return Ok(Parsed::Print(Info::Help)),
+            "-V" | "--version" => return Ok(Parsed::Print(Info::Version)),
+            "--list-actions" => return Ok(Parsed::Print(Info::Actions)),
+            "--list-fault-switches" => return Ok(Parsed::Print(Info::FaultSwitches)),
+            "--list-themes" => return Ok(Parsed::Print(Info::Themes)),
+            "--export-ui-tokens" => return Ok(Parsed::Print(Info::UiTokens)),
             "--shell-integration" => {
                 let shell = it.next().unwrap_or_default();
                 match SHELL_SCRIPTS.iter().find(|(name, _)| *name == shell) {
-                    Some((_, script)) => {
-                        console_output();
-                        print!("{script}");
-                        std::process::exit(0);
-                    }
+                    Some((_, script)) => return Ok(Parsed::Print(Info::ShellScript(script))),
                     None => {
                         let names: Vec<&str> = SHELL_SCRIPTS.iter().map(|(name, _)| *name).collect();
                         return Err(format!(
@@ -350,28 +496,37 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                     }
                 }
             }
+            // The flat launch options, removed (decision 3): each says what
+            // to type instead, with the user's own values.
+            "-p" | "--profile" => {
+                let name = it.next().map_or_else(|| "NAME".to_string(), |name| shell_word(&name));
+                return Err(format!("{arg} was removed: name the profile after the subcommand, as brindle terminal {name}"));
+            }
+            "-d" | "--working-directory" if subcommand.is_none() => {
+                let dir = it.next().map_or_else(|| "DIR".to_string(), |dir| shell_word(&dir));
+                return Err(format!("{arg} belongs to a subcommand now: brindle terminal {arg} {dir}"));
+            }
+            "-e" | "--command" if subcommand.is_none() => {
+                let command = shell_words(&it.collect::<Vec<_>>(), "COMMAND");
+                return Err(format!("{arg} belongs to a subcommand now: brindle terminal {arg} {command}"));
+            }
             "-e" | "--command" => {
                 let rest: Vec<String> = it.collect();
-                let Some((program, rest)) = rest.split_first() else {
+                let Some(command) = Command::from_argv(&rest) else {
                     return Err(format!("{arg} needs a command"));
                 };
-                args.command = Some((program.clone(), rest.to_vec()));
+                terminal.command = Some(command);
             }
-            "-p" | "--profile" => args.profile = Some(value_of(it, &arg, "a profile name")?),
             "-d" | "--working-directory" => {
-                args.cwd = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home));
+                terminal.cwd = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home));
             }
-            "--config" => {
-                let path = value_of(it, &arg, "a file")?;
-                // SAFETY: single-threaded at this point.
-                unsafe { std::env::set_var("BRINDLE_CONFIG", path) };
-            }
+            "--config" => args.config = Some(PathBuf::from(value_of(it, &arg, "a file")?)),
             "--no-restore" => args.no_restore = true,
             "--attach" if cfg!(not(any(target_os = "linux", windows))) => {
                 return Err("--attach needs the terminal server, which runs only on Linux and Windows".into());
             }
             "--attach" => match it.next().and_then(|id| id.parse().ok()) {
-                Some(id) => args.attach = Some(id),
+                Some(id) => attach = Some(id),
                 None => return Err("--attach needs a session id (brindle-remote list prints them)".into()),
             },
             "--send" => args.steps.push(Step::Send(unescape(&value_of(it, &arg, "text to type")?))),
@@ -422,16 +577,47 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
             "--install-desktop" => install_desktop = true,
             "--uninstall-desktop" => uninstall_desktop = true,
             "--prefix" => prefix = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home)),
-            other => return Err(format!("unknown argument {other:?}")),
+            option if option.starts_with('-') => return Err(format!("unknown argument {option:?}")),
+            // A bare word: the subcommand, then its profile.
+            word => match subcommand {
+                None => match word {
+                    "terminal" => subcommand = Some(TabKind::Terminal),
+                    "agent" => return Err(NO_AGENT_TABS.into()),
+                    other => {
+                        return Err(format!(
+                            "unknown argument {other:?}: to open a profile, run brindle terminal {}",
+                            shell_word(other)
+                        ));
+                    }
+                },
+                Some(TabKind::Terminal) if terminal.profile.is_none() => terminal.profile = Some(word.to_string()),
+                Some(TabKind::Terminal) => {
+                    return Err(format!("unexpected argument {word:?}: brindle terminal takes one profile"));
+                }
+            },
         }
     }
+    args.asked = match (subcommand, attach) {
+        (Some(kind), Some(_)) => {
+            return Err(format!(
+                "--attach opens a tab of its own, so it can't be given with brindle {}",
+                kind.word()
+            ));
+        }
+        (Some(TabKind::Terminal), None) => Asked::Terminal(terminal),
+        (None, Some(session)) => Asked::Attach(session),
+        (None, None) => Asked::Window,
+    };
     args.desktop = desktop::request(install_desktop, uninstall_desktop, prefix).map_err(str::to_string)?;
-    Ok(args)
+    Ok(Parsed::Run(Box::new(args)))
 }
 
+/// Prints `message` with the help and exits 2. On Windows a launch with no
+/// console, such as a shortcut's, shows the message in a message box too.
 fn usage_error(message: &str) -> ! {
     console_output();
     eprintln!("brindle: {message}\n\n{HELP}");
+    show_unprinted(&format!("brindle: {message}"));
     std::process::exit(2);
 }
 
@@ -696,7 +882,25 @@ struct Forwarded {
     /// For `--attach`: the server's sessions, listed on the socket's thread;
     /// [`Listing::Skipped`] otherwise.
     listing: Listing,
-    reply: std::sync::mpsc::Sender<Result<(), String>>,
+    reply: std::sync::mpsc::Sender<instance::Answer>,
+}
+
+/// Why a later launch's request opens nothing.
+#[derive(Debug, PartialEq, Eq)]
+enum Refusal {
+    /// Its profile can't open its tab: a usage error for the launch.
+    Usage(workspace::LaunchRefusal),
+    /// It asks for something this Brindle can't open.
+    Other(String),
+}
+
+impl Refusal {
+    fn answer(self) -> instance::Answer {
+        match self {
+            Self::Usage(refusal) => instance::Answer::Usage(refusal.to_string()),
+            Self::Other(why) => instance::Answer::Refused(why),
+        }
+    }
 }
 
 /// Opens later launches' requests in `window` and raises it.
@@ -708,37 +912,67 @@ fn take_launches(
     use futures::StreamExt as _;
     cx.spawn(async move |cx| {
         while let Some(Forwarded { request, listing, reply }) = requests.next().await {
-            let result = window
+            let answer = window
                 .update(cx, |ws, window, cx| {
-                    if let Some(launch) = forwarded_launch(&request, &listing, &Settings::get(cx).config) {
-                        ws.open(launch, window, cx);
+                    let settings = Settings::get(cx);
+                    match forwarded_launch(&request, &listing, &settings.config, settings.has_config_error()) {
+                        Ok(launch) => {
+                            if let Some(launch) = launch {
+                                ws.open(launch, window, cx);
+                            }
+                            notify::activation::raise(window, request.activation_token.as_deref(), cx);
+                            instance::Answer::Accepted
+                        }
+                        Err(refusal) => {
+                            log::warn!("refused a launch: {refusal:?}");
+                            refusal.answer()
+                        }
                     }
-                    notify::activation::raise(window, request.activation_token.as_deref(), cx);
                 })
-                .map_err(|_| "Brindle's window is gone".to_string());
-            reply.send(result).ok();
+                .unwrap_or_else(|_| instance::Answer::Refused("Brindle's window is gone".into()));
+            reply.send(answer).ok();
         }
     })
     .detach();
 }
 
 /// What a later launch's request opens: nothing for a plain launch, which
-/// only raises the window.
-fn forwarded_launch(request: &instance::Request, listing: &Listing, config: &Config) -> Option<Launch> {
-    if let Some(session) = request.attach {
-        return Some(Launch::Attach { session, target: listing.attach_target(session) });
+/// only raises the window. Its profile is checked against `config`, the
+/// one the tab would open with (`config_error`: it failed to load, so the
+/// defaults apply), and a refused one opens nothing.
+fn forwarded_launch(
+    request: &instance::Request,
+    listing: &Listing,
+    config: &Config,
+    config_error: bool,
+) -> Result<Option<Launch>, Refusal> {
+    match request.asked().map_err(Refusal::Other)? {
+        instance::Forward::Raise => Ok(None),
+        instance::Forward::Attach(session) => {
+            Ok(Some(Launch::Attach { session, target: listing.attach_target(session) }))
+        }
+        instance::Forward::Terminal(launch) => {
+            let profile = workspace::profile_for(config, TabKind::Terminal, launch.profile.as_deref(), config_error)
+                .map_err(Refusal::Usage)?;
+            let command = launch.command.map(|c| (c.program, c.args));
+            // A command starts where it was typed, unless `-d` says
+            // otherwise.
+            let cwd = launch.cwd.or_else(|| command.as_ref().and(request.launch_dir.clone()));
+            Ok(Some(Launch::Request(LaunchRequest { profile, command, cwd })))
+        }
     }
-    if request.profile.is_none() && request.cwd.is_none() && request.command.is_none() {
-        return None;
+}
+
+/// The profile a launch that opens its own tab opens with: a terminal
+/// launch's, checked against `config` ([`workspace::profile_for`]), else
+/// the default one.
+fn launch_profile(asked: &Asked, config: &Config, config_error: bool) -> Result<usize, workspace::LaunchRefusal> {
+    match asked {
+        Asked::Terminal(launch) => {
+            workspace::profile_for(config, TabKind::Terminal, launch.profile.as_deref(), config_error)
+        }
+        Asked::Window | Asked::Attach(_) => Ok(config.default_profile_index()),
     }
-    let chosen = workspace::profile_for(config, request.profile.as_deref());
-    if let Some(note) = chosen.note(config) {
-        log::warn!("{note}");
-    }
-    let command = request.command.as_ref().and_then(|c| c.split_first()).map(|(p, rest)| (p.clone(), rest.to_vec()));
-    // A command starts where it was typed, unless `-d` says otherwise.
-    let cwd = request.cwd.clone().or_else(|| command.as_ref().and(request.launch_dir.clone()));
-    Some(Launch::Request(LaunchRequest { profile: chosen.index, command, cwd, note: chosen.note(config) }))
 }
 
 /// What a launch opens ([`startup_launch`]).
@@ -753,25 +987,27 @@ struct Startup {
 }
 
 /// What a launch opens, given this machine's `listing`, the `recorded`
-/// window (the state file's windows merged), whether it `restoring`, its
-/// `--attach` session, the tab it `asked` for (`-p`/`-d`/`-e`) and the
-/// `profile` a default tab opens with (design.md decision 3).
+/// window (the state file's windows merged), whether it `restoring`, the
+/// tab it `asked` for (`brindle terminal`'s, or `--attach`'s session) and
+/// the `profile` a default tab opens with (design.md decision 3).
 ///
 /// When restoring, `detached` is the listed sessions that are detached and
 /// aren't `--attach`'s. The restore is `recorded` without the zones whose
 /// session isn't among them; when the listing failed (or was skipped)
 /// nothing tells a lost zone from a live one, so every zone is kept and
-/// nothing is detached. The asked tab is `--attach`'s, else the request.
-/// It comes after a restore, and without one it is the window's first
-/// content, else a default-profile tab is.
+/// nothing is detached. The asked tab comes after a restore, and without
+/// one it is the window's first content, else a default-profile tab is.
 fn startup_launch(
     listing: &Listing,
     recorded: Option<WindowState>,
     restoring: bool,
-    attach: Option<u32>,
-    asked: Option<LaunchRequest>,
+    asked: Option<Opening>,
     profile: usize,
 ) -> Startup {
+    let attach = match &asked {
+        Some(Opening::Attach(session)) => Some(*session),
+        Some(Opening::Tab(_)) | None => None,
+    };
     let detached: Vec<SessionInfo> = match listing {
         Listing::Listed(sessions) if restoring => {
             sessions.iter().filter(|s| !s.attached && Some(s.session) != attach).cloned().collect()
@@ -790,10 +1026,10 @@ fn startup_launch(
     } else {
         None
     };
-    let asked = match attach {
-        Some(session) => Some(Launch::Attach { session, target: listing.attach_target(session) }),
-        None => asked.map(Launch::Request),
-    };
+    let asked = asked.map(|asked| match asked {
+        Opening::Attach(session) => Launch::Attach { session, target: listing.attach_target(session) },
+        Opening::Tab(request) => Launch::Request(request),
+    });
     match restored {
         Some(window) => Startup { detached, first: Launch::Restore(window), then: asked },
         None => Startup {
@@ -1029,7 +1265,7 @@ fn record_session(state_dir: Option<PathBuf>, cx: &mut App) {
     .detach();
     cx.on_app_quit(move |cx| {
         // The windows still open now are the ones to keep. Each detaches
-        // its tabs' sessions (`-e` ones close) itself, every debug run's
+        // its tabs' sessions (`brindle terminal -e` ones close) itself, every debug run's
         // included, rather than leaving it to the terminals' drops, which
         // on Windows don't run before the exit. A window that closed did
         // so as it closed.
@@ -1055,21 +1291,42 @@ fn session_lock(state_dir: &Path, args: &Args) -> Option<session::Lock> {
     match session::Lock::acquire(state_dir) {
         Ok(lock) => Some(lock),
         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock && !args.is_debug_run() => {
-            match instance::forward(state_dir, &args.instance_request()) {
-                Ok(()) => std::process::exit(0),
-                // The running Brindle may have quit meanwhile.
-                Err(why) => match session::Lock::acquire(state_dir) {
-                    Ok(lock) => {
-                        log::info!("the running Brindle went away ({why}); starting");
-                        Some(lock)
-                    }
-                    Err(_) => {
-                        console_output();
-                        eprintln!("brindle: {why}");
-                        show_unprinted(&why);
-                        std::process::exit(1);
-                    }
-                },
+            let request = args.instance_request(
+                std::env::current_dir().ok(),
+                instance::launch_token(
+                    std::env::var("XDG_ACTIVATION_TOKEN").ok(),
+                    std::env::var("DESKTOP_STARTUP_ID").ok(),
+                ),
+            );
+            let line = request.encode();
+            if let Err(why) = instance::fits(&line) {
+                console_output();
+                eprintln!("brindle: {why}");
+                show_unprinted(&why);
+                std::process::exit(1);
+            }
+            let refused = match instance::forward(state_dir, &request) {
+                Ok(instance::Answer::Accepted) => std::process::exit(0),
+                Ok(instance::Answer::Usage(why)) => {
+                    console_output();
+                    eprintln!("brindle: {why}");
+                    show_unprinted(&why);
+                    std::process::exit(2);
+                }
+                Ok(instance::Answer::Refused(why)) | Err(why) => why,
+            };
+            // The running Brindle may have quit meanwhile.
+            match session::Lock::acquire(state_dir) {
+                Ok(lock) => {
+                    log::info!("the running Brindle went away ({refused}); starting");
+                    Some(lock)
+                }
+                Err(_) => {
+                    console_output();
+                    eprintln!("brindle: {refused}");
+                    show_unprinted(&refused);
+                    std::process::exit(1);
+                }
             }
         }
         Err(err) => {
@@ -1087,6 +1344,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
         .init();
     let args = parse_args();
+    if let Some(path) = &args.config {
+        // SAFETY: single-threaded at this point, before anything reads the
+        // config.
+        unsafe { std::env::set_var("BRINDLE_CONFIG", path) };
+    }
     // Desktop registration needs no display, so it runs before GPUI starts.
     if let Some(request) = &args.desktop {
         console_output();
@@ -1112,6 +1374,13 @@ fn main() {
             None
         }
     };
+    // A plain value, read before any event loop exists. This launch opens
+    // its own tab, so its profile is checked against the config it opens
+    // it with, before any window (a handed-off launch is checked by the
+    // running Brindle).
+    let (config, report) = Config::load_or_default();
+    let profile = launch_profile(&args.asked, &config, report.error.is_some())
+        .unwrap_or_else(|refusal| usage_error(&refusal.to_string()));
     let (forwarded, requests) = futures::channel::mpsc::unbounded::<Forwarded>();
     let mut socket = None;
     if lock.is_some()
@@ -1121,12 +1390,12 @@ fn main() {
             // Listed here, off the UI thread.
             let listing = request.attach.map_or(Listing::Skipped, |_| running_sessions());
             let (reply, answer) = std::sync::mpsc::channel();
-            forwarded
-                .unbounded_send(Forwarded { request, listing, reply })
-                .map_err(|_| "Brindle is quitting".to_string())?;
+            if forwarded.unbounded_send(Forwarded { request, listing, reply }).is_err() {
+                return instance::Answer::Refused("Brindle is quitting".into());
+            }
             answer
                 .recv_timeout(instance::FORWARD_LIMIT)
-                .map_err(|_| "Brindle didn't take the request in time".to_string())?
+                .unwrap_or_else(|_| instance::Answer::Refused("Brindle didn't take the request in time".into()))
         };
         match instance::listen(state_dir, Box::new(handler)) {
             Ok(path) => {
@@ -1143,9 +1412,7 @@ fn main() {
     // the terminal server or the state file (`process R13`).
     let restoring = !args.no_restore && lock.is_some();
     let restore_from = state_dir.clone().filter(|_| restoring);
-    let reads = start_launch_reads(restore_from.as_deref(), args.attach.is_some());
-    // A plain value, read before any event loop exists.
-    let (config, report) = Config::load_or_default();
+    let reads = start_launch_reads(restore_from.as_deref(), args.attach().is_some());
 
     // Before any window: windows, shortcuts and toasts share one identity.
     #[cfg(windows)]
@@ -1157,12 +1424,6 @@ fn main() {
         let since_epoch = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
         let origin: gpui::SharedString = layout::origin_id(std::process::id(), since_epoch).into();
         let settings = Settings::from_platform(config, report, cx).with_notices(notices);
-        let chosen = workspace::profile_for(&settings.config, args.profile.as_deref());
-        if let Some(note) = chosen.note(&settings.config) {
-            log::warn!("{note}");
-        }
-        let note = chosen.note(&settings.config);
-        let profile = chosen.index;
         cx.set_global(settings);
         Settings::apply_ui_theme(cx);
         notify::Notifier::init(cx);
@@ -1223,9 +1484,7 @@ fn main() {
         #[cfg(not(unix))]
         let _ = socket;
         // What the launch asked for opens as the active tab.
-        let asked = args
-            .asks_for_a_tab()
-            .then(|| LaunchRequest { profile, command: args.command.clone(), cwd: args.cwd.clone(), note });
+        let asked = args.opening(profile);
         // Before the wait: the endpoints of profiles that connect at launch
         // start connecting while this machine's listing runs.
         watch_hosts(cx);
@@ -1248,7 +1507,7 @@ fn main() {
             };
             let answered = started.elapsed();
             cx.update(|cx| {
-                let startup = startup_launch(&reads.listing, reads.recorded, restoring, args.attach, asked, profile);
+                let startup = startup_launch(&reads.listing, reads.recorded, restoring, asked, profile);
                 cx.set_global(reattach::Detached::new(startup.detached));
                 if let (Launch::Restore(state), Some(dir)) = (&startup.first, &restore_from) {
                     log::info!("restoring {} tab(s) from {}", state.tabs.len(), session::state_path(dir).display());
@@ -1450,26 +1709,45 @@ async fn latency_bench_run(window: gpui::WindowHandle<Workspace>, samples: usize
 mod tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Args {
+    fn parsed(args: &[&str]) -> Result<Parsed, String> {
         parse_args_from(args.iter().map(|s| s.to_string()), Some(Path::new("/home/u")))
-            .unwrap_or_else(|why| panic!("{args:?}: {why}"))
+    }
+
+    fn parse(args: &[&str]) -> Args {
+        match parsed(args) {
+            Ok(Parsed::Run(parsed)) => *parsed,
+            Ok(Parsed::Print(info)) => panic!("{args:?} prints {info:?}"),
+            Err(why) => panic!("{args:?}: {why}"),
+        }
     }
 
     /// The usage error `args` give.
     fn refused(args: &[&str]) -> String {
-        match parse_args_from(args.iter().map(|s| s.to_string()), Some(Path::new("/home/u"))) {
+        match parsed(args) {
             Ok(parsed) => panic!("{args:?} parsed: {parsed:?}"),
             Err(why) => why,
         }
     }
 
+    /// The terminal launch `args` ask for.
+    fn terminal(args: &[&str]) -> TerminalLaunch {
+        match parse(args).asked {
+            Asked::Terminal(launch) => launch,
+            other => panic!("{args:?} asks for {other:?}"),
+        }
+    }
+
+    fn command(program: &str, args: &[&str]) -> Option<Command> {
+        Some(Command { program: program.into(), args: args.iter().map(|s| s.to_string()).collect() })
+    }
+
     #[test]
     fn an_option_without_its_value_is_a_usage_error() {
+        for option in ["-d", "--working-directory"] {
+            let why = refused(&["terminal", option]);
+            assert!(why.starts_with(&format!("{option} needs ")), "{option}: {why}");
+        }
         for option in [
-            "-p",
-            "--profile",
-            "-d",
-            "--working-directory",
             "--config",
             "--send",
             "--action",
@@ -1495,8 +1773,139 @@ mod tests {
 
     #[test]
     fn dash_e_without_a_command_is_a_usage_error() {
-        assert_eq!(refused(&["-e"]), "-e needs a command");
-        assert_eq!(refused(&["-p", "work", "--command"]), "--command needs a command");
+        assert_eq!(refused(&["terminal", "-e"]), "-e needs a command");
+        assert_eq!(refused(&["terminal", "work", "--command"]), "--command needs a command");
+    }
+
+    #[test]
+    fn a_terminal_launch_takes_a_profile_a_directory_and_a_command() {
+        assert_eq!(terminal(&["terminal"]), TerminalLaunch::default(), "brindle terminal alone asks for a tab");
+        let expected =
+            TerminalLaunch { profile: Some("Work".into()), cwd: Some("/srv".into()), command: command("htop", &[]) };
+        assert_eq!(terminal(&["terminal", "Work", "-d", "/srv", "-e", "htop"]), expected);
+        assert_eq!(terminal(&["terminal", "-d", "/srv", "Work", "-e", "htop"]), expected, "PROFILE and -d in either order");
+        assert_eq!(
+            terminal(&["terminal", "--working-directory", "/srv", "Work", "--command", "htop"]),
+            expected,
+            "the long forms"
+        );
+        assert_eq!(terminal(&["terminal", "-d", "~/src"]).cwd, Some(PathBuf::from("/home/u/src")));
+    }
+
+    /// The position decides: the first bare word after the subcommand is
+    /// its profile, whatever it is called.
+    #[test]
+    fn a_profile_may_be_named_like_a_subcommand() {
+        assert_eq!(terminal(&["terminal", "terminal"]).profile.as_deref(), Some("terminal"));
+        assert_eq!(terminal(&["terminal", "agent"]).profile.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn a_second_profile_is_refused() {
+        assert_eq!(
+            refused(&["terminal", "Work", "Shell"]),
+            "unexpected argument \"Shell\": brindle terminal takes one profile"
+        );
+    }
+
+    /// `-e` takes every argument after it as the command's, debug options
+    /// and `-d` included.
+    #[test]
+    fn dash_e_takes_the_rest() {
+        let args = parse(&["terminal", "-e", "grep", "--send", "x", "-d", "/srv"]);
+        assert!(!args.is_debug_run(), "no step runs");
+        let Asked::Terminal(launch) = args.asked else { panic!("{:?}", args.asked) };
+        assert_eq!(launch.command, command("grep", &["--send", "x", "-d", "/srv"]));
+        assert_eq!(launch.cwd, None);
+    }
+
+    #[test]
+    fn global_options_work_before_and_after_the_subcommand() {
+        let after = parse(&["terminal", "Shell", "--no-restore", "--send", "echo hi\\r", "--dump-screen-after", "3"]);
+        let before = parse(&["--no-restore", "--send", "echo hi\\r", "--dump-screen-after", "3", "terminal", "Shell"]);
+        assert_eq!(format!("{after:?}"), format!("{before:?}"));
+        assert_eq!(after.asked, Asked::Terminal(TerminalLaunch { profile: Some("Shell".into()), ..Default::default() }));
+        assert!(after.no_restore && after.is_debug_run());
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn attach_with_a_subcommand_is_refused() {
+        let why = "--attach opens a tab of its own, so it can't be given with brindle terminal";
+        assert_eq!(refused(&["terminal", "Work", "--attach", "7"]), why);
+        assert_eq!(refused(&["--attach", "7", "terminal"]), why);
+    }
+
+    #[test]
+    fn the_agent_subcommand_is_reserved() {
+        for args in [&["agent"][..], &["agent", "x", "-p", "hi"], &["--no-restore", "agent"]] {
+            assert_eq!(
+                refused(args),
+                "agent tabs aren't in this version of Brindle (run brindle terminal for a terminal tab)",
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn another_bare_word_points_at_the_terminal_subcommand() {
+        assert_eq!(refused(&["work"]), "unknown argument \"work\": to open a profile, run brindle terminal work");
+        assert_eq!(
+            refused(&["Terminal"]),
+            "unknown argument \"Terminal\": to open a profile, run brindle terminal Terminal",
+            "subcommands are matched case-sensitively"
+        );
+        assert_eq!(
+            refused(&["my work"]),
+            "unknown argument \"my work\": to open a profile, run brindle terminal 'my work'"
+        );
+        assert_eq!(refused(&["--frobnicate"]), "unknown argument \"--frobnicate\"");
+    }
+
+    #[test]
+    fn the_flat_launch_options_say_what_to_type_instead() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["-p", "work"], "-p was removed: name the profile after the subcommand, as brindle terminal work"),
+            (&["--profile", "my work"], "--profile was removed: name the profile after the subcommand, as brindle terminal 'my work'"),
+            (&["-p"], "-p was removed: name the profile after the subcommand, as brindle terminal NAME"),
+            (&["terminal", "-p", "work"], "-p was removed: name the profile after the subcommand, as brindle terminal work"),
+            (&["-d", "/srv"], "-d belongs to a subcommand now: brindle terminal -d /srv"),
+            (&["--working-directory", "/srv"], "--working-directory belongs to a subcommand now: brindle terminal --working-directory /srv"),
+            (&["-d"], "-d belongs to a subcommand now: brindle terminal -d DIR"),
+            (&["-e", "htop"], "-e belongs to a subcommand now: brindle terminal -e htop"),
+            (&["--command", "sh", "-c", "echo hi"], "--command belongs to a subcommand now: brindle terminal --command sh -c 'echo hi'"),
+            (&["-e"], "-e belongs to a subcommand now: brindle terminal -e COMMAND"),
+            (&["-d", "/srv", "terminal"], "-d belongs to a subcommand now: brindle terminal -d /srv"),
+        ];
+        for (args, why) in cases {
+            assert_eq!(refused(args), *why, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn informational_options_print_wherever_they_are() {
+        assert!(matches!(parsed(&["terminal", "--version"]), Ok(Parsed::Print(Info::Version))));
+        assert!(matches!(parsed(&["--help"]), Ok(Parsed::Print(Info::Help))));
+        assert!(matches!(parsed(&["terminal", "Work", "--list-actions"]), Ok(Parsed::Print(Info::Actions))));
+        assert!(matches!(parsed(&["--shell-integration", "bash"]), Ok(Parsed::Print(Info::ShellScript(_)))));
+        assert!(refused(&["--shell-integration", "tcsh"]).starts_with("--shell-integration needs a shell: "));
+    }
+
+    /// `--config` is handed back for `main` to set, never set here.
+    #[test]
+    fn the_config_option_is_returned() {
+        let before = std::env::var_os("BRINDLE_CONFIG");
+        assert_eq!(parse(&["--config", "/tmp/x.toml", "terminal"]).config, Some(PathBuf::from("/tmp/x.toml")));
+        assert_eq!(std::env::var_os("BRINDLE_CONFIG"), before);
+        assert_eq!(parse(&[]).config, None);
+    }
+
+    #[test]
+    fn the_help_names_the_subcommand_and_not_the_flat_options() {
+        for named in ["brindle terminal", "-d, --working-directory", "-e, --command", "--attach"] {
+            assert!(HELP.contains(named), "{named}");
+        }
+        assert!(!HELP.contains("-p, --profile"));
     }
 
     #[test]
@@ -1542,25 +1951,35 @@ mod tests {
 
     #[test]
     fn a_tilde_in_a_path_argument_is_the_home_directory() {
-        assert_eq!(parse(&["-d", "~/src"]).cwd, Some(PathBuf::from("/home/u/src")));
-        assert_eq!(parse(&["-d", "~"]).cwd, Some(PathBuf::from("/home/u")));
+        assert_eq!(terminal(&["terminal", "-d", "~/src"]).cwd, Some(PathBuf::from("/home/u/src")));
+        assert_eq!(terminal(&["terminal", "-d", "~"]).cwd, Some(PathBuf::from("/home/u")));
         assert_eq!(parse(&["--latency-log", "~/l.tsv"]).latency_log, Some(PathBuf::from("/home/u/l.tsv")));
-        assert_eq!(parse(&["-d", "/srv"]).cwd, Some(PathBuf::from("/srv")));
+        assert_eq!(terminal(&["terminal", "-d", "/srv"]).cwd, Some(PathBuf::from("/srv")));
     }
 
+    /// Bare `brindle` opens nothing of its own; `brindle terminal`, even
+    /// alone, asks for a tab; `--attach` for its session.
     #[test]
-    fn profile_directory_and_command_ask_for_a_tab() {
+    fn what_a_launch_opens_as_its_active_tab() {
         for args in [&[][..], &["--send", "x", "--dump-screen-after", "3"], &["--no-restore"]] {
-            assert!(!parse(args).asks_for_a_tab(), "{args:?}");
+            assert!(parse(args).opening(0).is_none(), "{args:?}");
         }
-        for args in [&["-p", "work"][..], &["-d", "/tmp"], &["-e", "htop"]] {
-            assert!(parse(args).asks_for_a_tab(), "{args:?}");
-        }
+        let Some(Opening::Tab(tab)) = parse(&["terminal"]).opening(3) else { panic!("brindle terminal opens a tab") };
+        assert_eq!((tab.profile, tab.command, tab.cwd), (3, None, None));
+        let Some(Opening::Tab(tab)) = parse(&["terminal", "-d", "/tmp", "-e", "htop", "-d", "1"]).opening(1) else {
+            panic!("a command opens a tab")
+        };
+        assert_eq!(
+            (tab.profile, tab.command, tab.cwd),
+            (1, Some(("htop".into(), vec!["-d".into(), "1".into()])), Some("/tmp".into()))
+        );
+        #[cfg(any(target_os = "linux", windows))]
+        assert!(matches!(parse(&["--attach", "7"]).opening(0), Some(Opening::Attach(7))));
     }
 
     #[test]
     fn debug_options_make_a_debug_run() {
-        assert!(!parse(&["-p", "work", "-e", "htop"]).is_debug_run());
+        assert!(!parse(&["terminal", "work", "-e", "htop"]).is_debug_run());
         for args in [
             &["--send", "x"][..],
             &["--action", "new_tab"],
@@ -1652,45 +2071,78 @@ mod tests {
 
     #[test]
     fn a_launch_becomes_a_request_for_the_instance() {
-        let request = parse(&["-p", "work", "-d", "rel", "-e", "htop", "-d", "1"]).instance_request();
-        let here = std::env::current_dir().unwrap();
+        let here = PathBuf::from("/home/u/src");
+        let request = parse(&["terminal", "work", "-d", "rel", "-e", "htop", "-d", "1"])
+            .instance_request(Some(here.clone()), Some("tok".into()));
+        assert_eq!(request.kind.as_deref(), Some("terminal"));
         assert_eq!(request.profile.as_deref(), Some("work"));
         assert_eq!(request.cwd, Some(here.join("rel")), "-d is made absolute here");
         assert_eq!(request.command, Some(vec!["htop".into(), "-d".into(), "1".into()]));
-        assert_eq!(request.launch_dir, Some(here));
+        assert_eq!((request.launch_dir, request.activation_token.as_deref()), (Some(here), Some("tok")));
+        // A bare launch stays as older Brindles read it, and `brindle
+        // terminal` alone names only its kind.
+        assert_eq!(parse(&[]).instance_request(None, None).encode(), "{}\n");
+        assert_eq!(parse(&["terminal"]).instance_request(None, None).encode(), "{\"kind\":\"terminal\"}\n");
+        #[cfg(any(target_os = "linux", windows))]
+        assert_eq!(parse(&["--attach", "7"]).instance_request(None, None).encode(), "{\"attach\":7}\n");
+    }
+
+    #[test]
+    fn a_launch_that_opens_its_own_tab_checks_its_profile() {
+        let config = Config::parse("default_profile = \"b\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"b\"\n").unwrap().config;
+        assert_eq!(launch_profile(&parse(&[]).asked, &config, false), Ok(1));
+        assert_eq!(launch_profile(&parse(&["terminal"]).asked, &config, false), Ok(1));
+        assert_eq!(launch_profile(&parse(&["terminal", "A"]).asked, &config, false), Ok(0));
+        let refusal = launch_profile(&parse(&["terminal", "wrk"]).asked, &config, false).unwrap_err();
+        assert_eq!(refusal.to_string(), "no profile is named \"wrk\" (the profiles are: a, b)");
     }
 
     #[test]
     fn forwarded_requests_open_tabs() {
         let config = Config::parse("default_profile = \"a\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"b\"\n").unwrap().config;
-        let request = |r: instance::Request| forwarded_launch(&r, &Listing::Skipped, &config);
-        assert!(request(instance::Request { launch_dir: Some("/x".into()), ..Default::default() }).is_none(), "a plain launch only raises");
-        let Some(Launch::Request(tab)) = request(instance::Request {
-            command: Some(vec!["htop".into()]),
-            launch_dir: Some("/srv".into()),
-            ..Default::default()
-        }) else {
-            panic!("a command opens a tab")
-        };
-        assert_eq!((tab.profile, tab.command, tab.cwd), (0, Some(("htop".into(), vec![])), Some("/srv".into())));
-        let Some(Launch::Request(tab)) =
-            request(instance::Request { profile: Some("b".into()), launch_dir: Some("/srv".into()), ..Default::default() })
-        else {
-            panic!("a profile opens a tab")
-        };
-        assert_eq!((tab.profile, tab.cwd), (1, None), "only a command starts where it was typed");
-        let Some(Launch::Attach { session: 7, target: Err(_) }) =
-            request(instance::Request { attach: Some(7), ..Default::default() })
-        else {
+        let request = |r: instance::Request| forwarded_launch(&r, &Listing::Skipped, &config, false).map(|l| l.map(opens));
+        assert_eq!(request(instance::Request { launch_dir: Some("/x".into()), ..Default::default() }), Ok(None), "a plain launch only raises");
+        assert_eq!(
+            request(instance::Request { command: Some(vec!["htop".into()]), launch_dir: Some("/srv".into()), ..Default::default() }),
+            Ok(Some(Opens::Tab(0, Some(("htop".into(), vec![])), Some("/srv".into())))),
+            "an older launch's command opens a tab where it was typed"
+        );
+        assert_eq!(
+            request(instance::Request { profile: Some("b".into()), launch_dir: Some("/srv".into()), ..Default::default() }),
+            Ok(Some(Opens::Tab(1, None, None))),
+            "only a command starts where it was typed"
+        );
+        assert_eq!(
+            request(instance::Request { kind: Some("terminal".into()), ..Default::default() }),
+            Ok(Some(Opens::Tab(0, None, None))),
+            "brindle terminal alone opens a default-profile tab"
+        );
+        let Ok(Some(Opens::Attach(7, Err(_)))) = request(instance::Request { attach: Some(7), ..Default::default() }) else {
             panic!("--attach without a listing says why")
         };
+    }
+
+    #[test]
+    fn a_forwarded_unknown_profile_or_kind_is_refused() {
+        let config = Config::parse("[[profiles]]\nname = \"Shell\"\n").unwrap().config;
+        let request = |r: instance::Request, error| forwarded_launch(&r, &Listing::Skipped, &config, error).err();
+        let wrk = || instance::Request { kind: Some("terminal".into()), profile: Some("wrk".into()), ..Default::default() };
+        let Some(Refusal::Usage(refusal)) = request(wrk(), false) else { panic!("an unknown profile is a usage error") };
+        assert_eq!(refusal.to_string(), "no profile is named \"wrk\" (the profiles are: Shell)");
+        let Some(Refusal::Usage(refusal)) = request(wrk(), true) else { panic!("an unknown profile is a usage error") };
+        assert!(refusal.to_string().contains("the config has an error"), "{refusal}");
+        let answer = Refusal::Usage(refusal).answer();
+        assert!(matches!(answer, instance::Answer::Usage(_)), "{answer:?}");
+        let agent = instance::Request { kind: Some("agent".into()), ..Default::default() };
+        let Some(Refusal::Other(why)) = request(agent, false) else { panic!("an unknown kind is refused") };
+        assert!(why.contains("can't open agent tabs"), "{why}");
     }
 
     #[test]
     fn forwarded_attach_says_why_listing_failed() {
         let config = Config::parse("[[profiles]]\nname = \"a\"\n").unwrap().config;
         let attach = instance::Request { attach: Some(7), ..Default::default() };
-        let opened = |listing: &Listing| forwarded_launch(&attach, listing, &config).map(opens);
+        let opened = |listing: &Listing| forwarded_launch(&attach, listing, &config, false).ok().flatten().map(opens);
         assert_eq!(
             opened(&Listing::Failed("timed out".into())),
             Some(Opens::Attach(7, Err("Brindle could not list the terminal server's sessions: timed out".into())))
@@ -1716,7 +2168,7 @@ mod tests {
 
     fn opens(launch: Launch) -> Opens {
         match launch {
-            Launch::Request(LaunchRequest { profile, command, cwd, .. }) => Opens::Tab(profile, command, cwd),
+            Launch::Request(LaunchRequest { profile, command, cwd }) => Opens::Tab(profile, command, cwd),
             Launch::Restore(window) => Opens::Restore(window),
             Launch::Attach { session, target } => Opens::Attach(session, target),
         }
@@ -1730,7 +2182,12 @@ mod tests {
         attach: Option<u32>,
         asked: Option<LaunchRequest>,
     ) -> (Vec<u32>, Opens, Option<Opens>) {
-        let startup = startup_launch(listing, recorded, restoring, attach, asked, 2);
+        let asked = match (attach, asked) {
+            (Some(_), Some(_)) => panic!("the parser refuses --attach with a subcommand"),
+            (Some(session), None) => Some(Opening::Attach(session)),
+            (None, asked) => asked.map(Opening::Tab),
+        };
+        let startup = startup_launch(listing, recorded, restoring, asked, 2);
         (startup.detached.iter().map(|s| s.session).collect(), opens(startup.first), startup.then.map(opens))
     }
 
@@ -1755,7 +2212,7 @@ mod tests {
     }
 
     fn htop() -> LaunchRequest {
-        LaunchRequest { profile: 1, command: Some(("htop".into(), vec![])), cwd: None, note: None }
+        LaunchRequest { profile: 1, command: Some(("htop".into(), vec![])), cwd: None }
     }
 
     #[test]
@@ -1809,9 +2266,9 @@ mod tests {
     #[test]
     fn attach_opens_after_the_restored_tabs_and_is_not_swept() {
         let listing = Listing::Listed(vec![listed(1, "a", false), listed(7, "g", false), listed(8, "h", false)]);
-        let (detached, first, then) = startup(&listing, Some(window(vec![tab(1, "a")])), true, Some(7), Some(htop()));
+        let (detached, first, then) = startup(&listing, Some(window(vec![tab(1, "a")])), true, Some(7), None);
         assert_eq!(first, Opens::Restore(window(vec![tab(1, "a")])));
-        assert_eq!(then, Some(Opens::Attach(7, Ok(listed(7, "g", false)))), "--attach wins over -p/-d/-e");
+        assert_eq!(then, Some(Opens::Attach(7, Ok(listed(7, "g", false)))));
         assert_eq!(detached, [1, 8], "--attach's session isn't swept into a tab of its own");
         // `--no-restore --attach 7`: the attached session is the window's.
         let (detached, first, then) = startup(&listing, None, false, Some(7), None);
@@ -1864,8 +2321,8 @@ mod tests {
     #[test]
     fn attach_takes_a_session_id() {
         let args = parse(&["--attach", "7", "--dump-screen-after", "2"]);
-        assert_eq!(args.attach, Some(7));
-        assert!(!args.asks_for_a_tab());
-        assert_eq!(parse(&[]).attach, None);
+        assert_eq!((args.attach(), args.asked), (Some(7), Asked::Attach(7)));
+        assert_eq!(parse(&[]).attach(), None);
+        assert_eq!(parse(&["terminal"]).attach(), None);
     }
 }

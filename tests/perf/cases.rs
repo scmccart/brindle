@@ -67,7 +67,7 @@ pub fn latency_shell(ctx: &Ctx) -> Result<Measured> {
     let child = spawn(
         ctx,
         "brindle",
-        &["-p", "Shell", "--latency-log", log.to_str().expect("utf-8 path"), "--latency-bench", &samples],
+        &["terminal", "Shell", "--latency-log", log.to_str().expect("utf-8 path"), "--latency-bench", &samples],
     )?;
     // Each keystroke waits at most 1 s for its echo, plus a short gap.
     let limit = Duration::from_secs(60) + Duration::from_millis(1050) * (ctx.samples as u32 + 10);
@@ -106,7 +106,7 @@ pub fn throughput_brindle(ctx: &Ctx) -> Result<Measured> {
     // The PTY starts at 80x24 until the window's first layout resizes it.
     let script = r#"sleep 1; stty size > "$0"; exec "$1" -b "$2" --dat "$3""#;
     let args = [
-        "-p",
+        "terminal",
         "Shell",
         "-e",
         "sh",

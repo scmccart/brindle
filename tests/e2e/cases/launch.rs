@@ -1,16 +1,28 @@
 //! What a launch says when it can't open what was asked for: an unknown
-//! `-p` profile, and a profile shortcut past the last profile.
+//! profile under `brindle terminal`, and a profile shortcut past the last
+//! profile.
 
 use crate::brindle::Run;
+use super::cli::usage_refusal;
 use crate::{Ctx, Outcome, Result, ensure};
 
-/// `-p wrk`, which no profile is named: the default profile opens, and its
-/// tab says so on its first line.
+/// `brindle terminal wrk`, which no profile is named: the launch exits 2
+/// before any window opens (it gets no display), naming `wrk` and listing
+/// the profiles; and with a config that doesn't parse, the refusal says the
+/// config has an error and lists the default config's profiles.
 pub fn unknown_profile(ctx: &Ctx) -> Result<Outcome> {
-    let out = Run::new(ctx, "run").profile("wrk").prompt().dump_at(3.0).run()?;
-    ensure!(out.dump.tabs.len() == 1, "tabs: {:?}", out.dump.tabs);
-    let text = out.dump.screen.join("\n");
-    ensure!(text.contains("no profile is named \"wrk\"; using Shell"), "the tab doesn't say so: {text:?}");
+    let config = ctx.dir.join("config.toml");
+    std::fs::write(&config, crate::brindle::config("e2e")).map_err(|e| format!("writing the config: {e}"))?;
+    let said = usage_refusal(ctx, "unknown", &config, &["terminal", "wrk"])?;
+    ensure!(said.contains("no profile is named \"wrk\" (the profiles are: Shell)"), "the refusal says {said:?}");
+
+    let broken = ctx.dir.join("broken.toml");
+    std::fs::write(&broken, "[[profiles]\nname = \"Work\"\n").map_err(|e| format!("writing the config: {e}"))?;
+    let said = usage_refusal(ctx, "broken", &broken, &["terminal", "Work"])?;
+    ensure!(
+        said.contains("no profile is named \"Work\" (the config has an error") && said.ends_with("whose profiles are: Shell)"),
+        "the refusal says {said:?}"
+    );
     Ok(Outcome::Pass)
 }
 
