@@ -164,6 +164,28 @@ pub fn initialized(dir: &Path, name: &str, capabilities: &str) -> (AgentScript, 
     (script, record)
 }
 
+/// Login methods an agent advertises in `initialize` (OpenSpec change
+/// `agents-login`), as its `authMethods`: two `agent` methods, the second
+/// described.
+pub const TWO_LOGINS: &str = r#"[{"id":"oauth-personal","name":"Log in with Google"},{"id":"api-key","name":"API Key","description":"Use an API key"}]"#;
+
+/// An `agent` method and a `terminal` one, `cli-login`, with arguments and
+/// an environment.
+pub const TERMINAL_LOGIN: &str = r#"[{"id":"oauth-personal","name":"Log in with Google"},{"id":"cli-login","name":"Log in from the terminal","type":"terminal","args":["login"],"env":{"LOGIN_MODE":"device"}}]"#;
+
+/// A script whose agent answers `initialize` as `fake` 1.0 offering
+/// `capabilities` (as [`initialized`]) and the login methods `methods` (a
+/// JSON array such as [`TWO_LOGINS`]), its record kept; the test adds the
+/// rest. Gives it and the record's path.
+pub fn offering_logins(dir: &Path, name: &str, capabilities: &str, methods: &str) -> (AgentScript, PathBuf) {
+    let mut script = AgentScript::new(dir, name);
+    let record = script.record();
+    script.step("expect initialize").step(format!(
+        r#"respond {{"protocolVersion":1,"agentInfo":{{"name":"fake","version":"1.0"}},"agentCapabilities":{capabilities},"authMethods":{methods}}}"#
+    ));
+    (script, record)
+}
+
 /// As [`started`], offering `capabilities` in `initialize`: an agent whose
 /// conversation `s1` can be continued, unless it offers [`NEITHER`].
 pub fn continuable(dir: &Path, name: &str, capabilities: &str) -> (AgentScript, PathBuf) {
