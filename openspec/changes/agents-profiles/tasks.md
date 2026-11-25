@@ -84,7 +84,7 @@ Before starting, check that both changes this one depends on are implemented and
 
 ## 10. Integration
 
-- [ ] 10.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e`; verify all pass.
+- [x] 10.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e`; verify all pass.
 - [ ] 10.2 Hand the manual checks from 9.4 to the user with `scripts/run-throwaway.sh` and `scripts/run-throwaway.ps1`; verify the user reports each.
 
 ## Workflow follow-up
