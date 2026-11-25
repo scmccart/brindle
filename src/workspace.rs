@@ -262,8 +262,8 @@ pub fn profile_for(
     };
     let profile = &config.profiles[index];
     match (kind, profile.kind()) {
-        (TabKind::Terminal, ProfileKind::Terminal) => Ok(index),
-        (TabKind::Terminal, ProfileKind::Agent) => {
+        (TabKind::Terminal, ProfileKind::Terminal) | (TabKind::Agent, ProfileKind::Agent) => Ok(index),
+        (TabKind::Terminal, ProfileKind::Agent) | (TabKind::Agent, ProfileKind::Terminal) => {
             Err(LaunchRefusal::KindMismatch { profile: profile.name.clone(), kind: profile.kind() })
         }
     }

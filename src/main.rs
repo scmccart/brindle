@@ -63,16 +63,29 @@ USAGE:
                                  default profile)
     brindle terminal [PROFILE] [-d DIR] [-e COMMAND [ARGS]...] [OPTIONS]
                                  Open a terminal tab
+    brindle agent [PROFILE] [-d DIR] [-p PROMPT] [OPTIONS]
+                                 Open an agent tab
     brindle --attach <ID> [OPTIONS]
                                  Open a tab on a detached session
 
 TERMINAL:
-    PROFILE                      A profile's name (default: config's
-                                 default_profile)
+    PROFILE                      A terminal profile's name (default: config's
+                                 default_profile when it is a terminal profile,
+                                 else the first terminal profile)
     -d, --working-directory <DIR>
                                  Start in DIR
     -e, --command <CMD> [ARGS]   Run CMD instead of the profile's program (must
                                  be last: it takes every argument after it)
+
+AGENT:
+    PROFILE                      An agent profile's name (default: config's
+                                 default_profile when it is an agent profile,
+                                 else the first agent profile)
+    -d, --working-directory <DIR>
+                                 Start in DIR (default: the profile's cwd, else
+                                 the directory brindle agent runs in)
+    -p, --prompt <PROMPT>        A first prompt, sent once the agent is ready;
+                                 - reads it from standard input
 
 OPTIONS:
         --config <FILE>          Use FILE instead of ~/.config/brindle/config.toml
@@ -243,6 +256,8 @@ impl WaitLog {
 pub enum TabKind {
     /// `brindle terminal`.
     Terminal,
+    /// `brindle agent`.
+    Agent,
 }
 
 impl TabKind {
@@ -250,8 +265,104 @@ impl TabKind {
     pub fn word(self) -> &'static str {
         match self {
             Self::Terminal => "terminal",
+            Self::Agent => "agent",
         }
     }
+}
+
+/// The longest first prompt, in bytes of UTF-8: the terminal server's limit
+/// for one prompt (`agents-sessions`), so nothing a launch accepts is
+/// refused by the server for its size.
+pub const PROMPT_LIMIT: usize = 256 * 1024;
+
+/// A launch's first prompt (`brindle agent -p`): UTF-8 that isn't blank, at
+/// most [`PROMPT_LIMIT`] bytes. Built only by [`FirstPrompt::new`] and
+/// [`FirstPrompt::from_stdin`] (`types R6`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FirstPrompt(String);
+
+/// Why a first prompt can't be used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptError {
+    /// `-p -` with no standard input at all (on Windows, a GUI program
+    /// started with nothing redirected).
+    Absent,
+    /// Over [`PROMPT_LIMIT`].
+    TooLong,
+    /// Standard input held bytes that aren't UTF-8.
+    NotUtf8,
+    /// Empty, or only whitespace.
+    Blank,
+}
+
+impl std::fmt::Display for PromptError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Absent => "-p - needs a file or pipe on standard input",
+            Self::TooLong => "the prompt is over the 256 KiB limit",
+            Self::NotUtf8 => "the prompt isn't UTF-8",
+            Self::Blank => "the prompt is blank",
+        })
+    }
+}
+
+impl FirstPrompt {
+    /// `text` as a first prompt: refused when it is blank or over
+    /// [`PROMPT_LIMIT`].
+    pub fn new(text: String) -> Result<Self, PromptError> {
+        if text.len() > PROMPT_LIMIT {
+            Err(PromptError::TooLong)
+        } else if text.trim().is_empty() {
+            Err(PromptError::Blank)
+        } else {
+            Ok(Self(text))
+        }
+    }
+
+    /// The prompt `-p -` read from standard input: `None` when there was no
+    /// standard input, else what was read of it, at most one byte over
+    /// [`PROMPT_LIMIT`] (so more than the limit reads as too long). One trailing
+    /// line ending (`\n` or `\r\n`) is dropped, since files and
+    /// here-strings end with one; nothing else is changed.
+    pub fn from_stdin(bytes: Option<&[u8]>) -> Result<Self, PromptError> {
+        let bytes = bytes.ok_or(PromptError::Absent)?;
+        if bytes.len() > PROMPT_LIMIT {
+            return Err(PromptError::TooLong);
+        }
+        let mut text = String::from_utf8(bytes.to_vec()).map_err(|_| PromptError::NotUtf8)?;
+        if text.ends_with('\n') {
+            text.pop();
+            if text.ends_with('\r') {
+                text.pop();
+            }
+        }
+        Self::new(text)
+    }
+
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_text(self) -> String {
+        self.0
+    }
+}
+
+/// `brindle agent`'s `-p`, as parsed: the text, or `-` for standard input,
+/// which `main` reads and turns into [`PromptArg::Text`] before anything
+/// else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptArg {
+    Text(FirstPrompt),
+    Stdin,
+}
+
+/// `brindle agent [PROFILE] [-d DIR] [-p PROMPT]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AgentLaunch {
+    pub profile: Option<String>,
+    pub cwd: Option<PathBuf>,
+    pub prompt: Option<PromptArg>,
 }
 
 /// A program and its arguments (`brindle terminal -e`).
@@ -291,6 +402,8 @@ enum Asked {
     Window,
     /// `brindle terminal …`: a new terminal tab, even with nothing named.
     Terminal(TerminalLaunch),
+    /// `brindle agent …`: a new agent tab, even with nothing named.
+    Agent(AgentLaunch),
     /// `--attach ID`.
     Attach(u32),
 }
@@ -346,15 +459,17 @@ impl Args {
     fn attach(&self) -> Option<u32> {
         match &self.asked {
             Asked::Attach(session) => Some(*session),
-            Asked::Window | Asked::Terminal(_) => None,
+            Asked::Window | Asked::Terminal(_) | Asked::Agent(_) => None,
         }
     }
 
     /// What the launch opens as its active tab, `profile` being the checked
-    /// profile of a terminal launch: nothing for bare `brindle`.
+    /// profile of a terminal launch: nothing for bare `brindle`. An agent
+    /// launch opens nothing here: `main` refuses it until agent zones are
+    /// in the window (`agents-profiles` task 6.3).
     fn opening(&self, profile: usize) -> Option<Opening> {
         match &self.asked {
-            Asked::Window => None,
+            Asked::Window | Asked::Agent(_) => None,
             Asked::Terminal(launch) => Some(Opening::Tab(LaunchRequest {
                 profile,
                 command: launch.command.clone().map(|c| (c.program, c.args)),
@@ -386,6 +501,7 @@ impl Args {
                 });
                 request.command = launch.command.as_ref().map(Command::argv);
             }
+            Asked::Agent(_) => request.kind = Some(TabKind::Agent.word().into()),
             Asked::Attach(session) => request.attach = Some(*session),
         }
         request
@@ -456,8 +572,18 @@ fn value_of(it: &mut impl Iterator<Item = String>, option: &str, what: &str) -> 
     it.next().ok_or_else(|| format!("{option} needs {what}"))
 }
 
-/// What `agent` says until agent tabs exist (`agents-profiles`).
-const NO_AGENT_TABS: &str = "agent tabs aren't in this version of Brindle (run brindle terminal for a terminal tab)";
+/// What an agent launch says until agent zones are in the window
+/// (`agents-profiles` task 6.3), after its profile was checked.
+const AGENT_TABS_PENDING: &str = "agent tabs aren't connected to the window in this build of Brindle";
+
+/// `brindle agent`'s `-p VALUE`: `-` for standard input, else the prompt,
+/// or the usage error naming `option`.
+fn prompt_arg(option: &str, value: String) -> Result<PromptArg, String> {
+    if value == "-" {
+        return Ok(PromptArg::Stdin);
+    }
+    FirstPrompt::new(value).map(PromptArg::Text).map_err(|why| format!("{option}: {why}"))
+}
 
 /// The arguments, with a leading `~` in a path expanded to `home`, or the
 /// usage error to print: an unknown argument, an option without its value,
@@ -467,13 +593,15 @@ const NO_AGENT_TABS: &str = "agent tabs aren't in this version of Brindle (run b
 ///
 /// One pass, left to right (design.md decision 1): the global options are
 /// taken anywhere; the first bare word is the subcommand, and the first
-/// after it its PROFILE; `-d` and `-e` belong to the subcommand, and `-e`
-/// takes every argument after it.
+/// after it its PROFILE; `-d`, `-e` and `-p` belong to the subcommand: `-e`
+/// to `terminal`, taking every argument after it, and `-p` (a prompt) to
+/// `agent`.
 fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) -> Result<Parsed, String> {
     let mut args = Args::default();
     let (mut install_desktop, mut uninstall_desktop, mut prefix) = (false, false, None);
     let mut subcommand: Option<TabKind> = None;
     let mut terminal = TerminalLaunch::default();
+    let mut agent = AgentLaunch::default();
     let mut attach = None;
     while let Some(arg) = it.next() {
         let it = &mut it;
@@ -497,6 +625,15 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                     }
                 }
             }
+            // A prompt only after `agent`: elsewhere `-p` is the removed
+            // option below.
+            "-p" | "--prompt" if subcommand == Some(TabKind::Agent) => {
+                if agent.prompt.is_some() {
+                    return Err(format!("{arg} was given twice: brindle agent takes one prompt"));
+                }
+                agent.prompt = Some(prompt_arg(&arg, value_of(it, &arg, "a prompt (- reads it from standard input)")?)?);
+            }
+            "--prompt" => return Err("--prompt belongs to brindle agent: brindle agent [PROFILE] --prompt PROMPT".into()),
             // The flat launch options, removed (decision 3): each says what
             // to type instead, with the user's own values.
             "-p" | "--profile" => {
@@ -511,6 +648,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                 let command = shell_words(&it.collect::<Vec<_>>(), "COMMAND");
                 return Err(format!("{arg} belongs to a subcommand now: brindle terminal {arg} {command}"));
             }
+            "-e" | "--command" if subcommand == Some(TabKind::Agent) => {
+                return Err(format!("an agent runs its profile's command; {arg} belongs to brindle terminal"));
+            }
             "-e" | "--command" => {
                 let rest: Vec<String> = it.collect();
                 let Some(command) = Command::from_argv(&rest) else {
@@ -519,7 +659,11 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                 terminal.command = Some(command);
             }
             "-d" | "--working-directory" => {
-                terminal.cwd = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home));
+                let dir = Some(config::expand_tilde(&value_of(it, &arg, "a directory")?, home));
+                match subcommand {
+                    Some(TabKind::Agent) => agent.cwd = dir,
+                    Some(TabKind::Terminal) | None => terminal.cwd = dir,
+                }
             }
             "--config" => args.config = Some(PathBuf::from(value_of(it, &arg, "a file")?)),
             "--no-restore" => args.no_restore = true,
@@ -583,7 +727,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
             word => match subcommand {
                 None => match word {
                     "terminal" => subcommand = Some(TabKind::Terminal),
-                    "agent" => return Err(NO_AGENT_TABS.into()),
+                    "agent" => subcommand = Some(TabKind::Agent),
                     other => {
                         return Err(format!(
                             "unknown argument {other:?}: to open a profile, run brindle terminal {}",
@@ -592,8 +736,9 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                     }
                 },
                 Some(TabKind::Terminal) if terminal.profile.is_none() => terminal.profile = Some(word.to_string()),
-                Some(TabKind::Terminal) => {
-                    return Err(format!("unexpected argument {word:?}: brindle terminal takes one profile"));
+                Some(TabKind::Agent) if agent.profile.is_none() => agent.profile = Some(word.to_string()),
+                Some(kind @ (TabKind::Terminal | TabKind::Agent)) => {
+                    return Err(format!("unexpected argument {word:?}: brindle {} takes one profile", kind.word()));
                 }
             },
         }
@@ -606,6 +751,7 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
             ));
         }
         (Some(TabKind::Terminal), None) => Asked::Terminal(terminal),
+        (Some(TabKind::Agent), None) => Asked::Agent(agent),
         (None, Some(session)) => Asked::Attach(session),
         (None, None) => Asked::Window,
     };
@@ -639,6 +785,47 @@ fn show_unprinted(text: &str) {
     win::show_unprinted(text);
     #[cfg(not(windows))]
     let _ = text;
+}
+
+/// What `-p -` says when standard input is a terminal: it would wait for
+/// typing, so it is refused at once.
+const STDIN_IS_A_TERMINAL: &str =
+    "-p - reads the prompt from standard input, which is a terminal; redirect a file or pipe into it";
+
+/// Reads `-p -`'s prompt from standard input, or the usage error: refused
+/// at once when it is a terminal or absent, else at most
+/// [`PROMPT_LIMIT`] + 1 bytes read and checked by
+/// [`FirstPrompt::from_stdin`]. No window exists yet, so this may block
+/// (on a pipe whose writer is slow).
+fn read_stdin_prompt() -> Result<FirstPrompt, String> {
+    use std::io::{IsTerminal as _, Read as _};
+    if stdin_absent() {
+        return FirstPrompt::from_stdin(None).map_err(|why| why.to_string());
+    }
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err(STDIN_IS_A_TERMINAL.into());
+    }
+    let mut bytes = Vec::new();
+    stdin
+        .lock()
+        .take(PROMPT_LIMIT as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("-p -: reading standard input: {e}"))?;
+    FirstPrompt::from_stdin(Some(&bytes)).map_err(|why| why.to_string())
+}
+
+/// Whether this process has no standard input at all: on Windows a GUI
+/// program started with nothing redirected; never on Linux, where a
+/// closed one reads as empty.
+#[cfg(windows)]
+fn stdin_absent() -> bool {
+    win::stdin_absent()
+}
+
+#[cfg(not(windows))]
+fn stdin_absent() -> bool {
+    false
 }
 
 /// Whether this process runs elevated: from its token on Windows, never on
@@ -972,6 +1159,7 @@ fn launch_profile(asked: &Asked, config: &Config, config_error: bool) -> Result<
         Asked::Terminal(launch) => {
             workspace::profile_for(config, TabKind::Terminal, launch.profile.as_deref(), config_error)
         }
+        Asked::Agent(launch) => workspace::profile_for(config, TabKind::Agent, launch.profile.as_deref(), config_error),
         Asked::Window | Asked::Attach(_) => Ok(config.default_profile_index()),
     }
 }
@@ -1344,7 +1532,15 @@ fn main() {
     let started = Instant::now();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("brindle=info,warn"))
         .init();
-    let args = parse_args();
+    let mut args = parse_args();
+    // `-p -`: the prompt is read here, before the config, the hand-off or
+    // any window, so a refusal opens nothing.
+    if let Asked::Agent(AgentLaunch { prompt: Some(prompt @ PromptArg::Stdin), .. }) = &mut args.asked {
+        match read_stdin_prompt() {
+            Ok(text) => *prompt = PromptArg::Text(text),
+            Err(why) => usage_error(&why),
+        }
+    }
     if let Some(path) = &args.config {
         // SAFETY: single-threaded at this point, before anything reads the
         // config.
@@ -1382,6 +1578,11 @@ fn main() {
     let (config, report) = Config::load_or_default();
     let profile = launch_profile(&args.asked, &config, report.error.is_some())
         .unwrap_or_else(|refusal| usage_error(&refusal.to_string()));
+    if let Asked::Agent(_) = &args.asked {
+        console_output();
+        eprintln!("brindle: {AGENT_TABS_PENDING}");
+        std::process::exit(1);
+    }
     let (forwarded, requests) = futures::channel::mpsc::unbounded::<Forwarded>();
     let mut socket = None;
     if lock.is_some()
@@ -1837,15 +2038,124 @@ mod tests {
         assert_eq!(refused(&["--attach", "7", "terminal"]), why);
     }
 
-    #[test]
-    fn the_agent_subcommand_is_reserved() {
-        for args in [&["agent"][..], &["agent", "x", "-p", "hi"], &["--no-restore", "agent"]] {
-            assert_eq!(
-                refused(args),
-                "agent tabs aren't in this version of Brindle (run brindle terminal for a terminal tab)",
-                "{args:?}"
-            );
+    /// The agent launch `args` ask for.
+    fn agent(args: &[&str]) -> AgentLaunch {
+        match parse(args).asked {
+            Asked::Agent(launch) => launch,
+            other => panic!("{args:?} asks for {other:?}"),
         }
+    }
+
+    fn text(prompt: &str) -> Option<PromptArg> {
+        Some(PromptArg::Text(FirstPrompt::new(prompt.into()).unwrap()))
+    }
+
+    #[test]
+    fn an_agent_launch_takes_a_profile_a_directory_and_a_prompt() {
+        assert_eq!(agent(&["agent"]), AgentLaunch::default(), "brindle agent alone asks for a tab");
+        let expected = AgentLaunch { profile: Some("Fake".into()), cwd: Some("/srv".into()), prompt: text("run the tests") };
+        for args in [
+            &["agent", "Fake", "-d", "/srv", "-p", "run the tests"][..],
+            &["agent", "-p", "run the tests", "Fake", "-d", "/srv"],
+            &["agent", "-d", "/srv", "-p", "run the tests", "Fake"],
+            &["agent", "--working-directory", "/srv", "--prompt", "run the tests", "Fake"],
+            &["--no-restore", "agent", "-d", "/srv", "Fake", "-p", "run the tests"],
+        ] {
+            assert_eq!(agent(args), expected, "{args:?}: in any order, short or long");
+        }
+        assert_eq!(agent(&["agent", "-d", "~/src"]).cwd, Some(PathBuf::from("/home/u/src")));
+        assert_eq!(agent(&["agent", "-p", "-"]).prompt, Some(PromptArg::Stdin), "-p - reads standard input");
+        assert_eq!(agent(&["agent", "-p", " two\nlines "]).prompt, text(" two\nlines "), "a prompt is kept as it is");
+        assert_eq!(agent(&["agent", "agent"]).profile.as_deref(), Some("agent"), "a profile named like a subcommand");
+    }
+
+    #[test]
+    fn an_agent_launch_refuses_what_it_cant_take() {
+        let long = "x".repeat(PROMPT_LIMIT + 1);
+        let cases: &[(&[&str], &str)] = &[
+            (&["agent", "Fake", "-e", "other-acp"], "an agent runs its profile's command; -e belongs to brindle terminal"),
+            (&["agent", "--command", "x"], "an agent runs its profile's command; --command belongs to brindle terminal"),
+            (&["agent", "-p", ""], "-p: the prompt is blank"),
+            (&["agent", "--prompt", " \n\t"], "--prompt: the prompt is blank"),
+            (&["agent", "-p", &long], "-p: the prompt is over the 256 KiB limit"),
+            (&["agent", "Fake", "Other"], "unexpected argument \"Other\": brindle agent takes one profile"),
+            (&["agent", "-p", "a", "-p", "b"], "-p was given twice: brindle agent takes one prompt"),
+            (&["agent", "-p", "-", "-p", "-"], "-p was given twice: brindle agent takes one prompt"),
+            (&["agent", "-p", "-", "--prompt", "b"], "--prompt was given twice: brindle agent takes one prompt"),
+            (&["agent", "-p", "a", "-p", "-"], "-p was given twice: brindle agent takes one prompt"),
+            (&["agent", "-p"], "-p needs a prompt (- reads it from standard input)"),
+        ];
+        for (args, why) in cases {
+            assert_eq!(refused(args), *why, "{args:?}");
+        }
+        assert_eq!(agent(&["agent", "-p", &"x".repeat(PROMPT_LIMIT)]).prompt.map(|_| ()), Some(()), "256 KiB fits");
+    }
+
+    /// `-p` means a prompt only after `agent`: before a subcommand and
+    /// under `terminal` it is the removed flat option, as before.
+    #[test]
+    fn dash_p_outside_agent_keeps_its_removed_option_messages() {
+        let removed = "-p was removed: name the profile after the subcommand, as brindle terminal work";
+        assert_eq!(refused(&["-p", "work", "agent"]), removed);
+        assert_eq!(refused(&["terminal", "-p", "work"]), removed);
+        assert_eq!(
+            refused(&["agent", "--profile", "work"]),
+            "--profile was removed: name the profile after the subcommand, as brindle terminal work"
+        );
+        assert_eq!(refused(&["--prompt", "hi"]), "--prompt belongs to brindle agent: brindle agent [PROFILE] --prompt PROMPT");
+        assert_eq!(
+            refused(&["terminal", "--prompt", "hi"]),
+            "--prompt belongs to brindle agent: brindle agent [PROFILE] --prompt PROMPT"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn attach_with_the_agent_subcommand_is_refused() {
+        assert_eq!(
+            refused(&["agent", "Fake", "--attach", "7"]),
+            "--attach opens a tab of its own, so it can't be given with brindle agent"
+        );
+    }
+
+    #[test]
+    fn a_prompt_from_standard_input_is_checked() {
+        assert_eq!(FirstPrompt::from_stdin(None), Err(PromptError::Absent));
+        assert_eq!(FirstPrompt::from_stdin(Some(b"")), Err(PromptError::Blank));
+        assert_eq!(FirstPrompt::from_stdin(Some(b" \n\t\r\n")), Err(PromptError::Blank));
+        assert_eq!(FirstPrompt::from_stdin(Some(b"\xff\xfe hi")), Err(PromptError::NotUtf8));
+        assert_eq!(FirstPrompt::from_stdin(Some(b"task\n")).map(FirstPrompt::into_text), Ok("task".into()));
+        assert_eq!(FirstPrompt::from_stdin(Some(b"task\r\n")).map(FirstPrompt::into_text), Ok("task".into()));
+        assert_eq!(
+            FirstPrompt::from_stdin(Some(b"two\nlines\n\n")).map(FirstPrompt::into_text),
+            Ok("two\nlines\n".into()),
+            "one line ending is dropped, nothing else"
+        );
+        assert_eq!(FirstPrompt::from_stdin(Some(b" task ")).map(FirstPrompt::into_text), Ok(" task ".into()));
+        let words = [
+            (PromptError::Absent, "-p - needs a file or pipe on standard input"),
+            (PromptError::TooLong, "the prompt is over the 256 KiB limit"),
+            (PromptError::NotUtf8, "the prompt isn't UTF-8"),
+            (PromptError::Blank, "the prompt is blank"),
+        ];
+        for (error, text) in words {
+            assert_eq!(error.to_string(), text);
+        }
+    }
+
+    /// At most 256 KiB + 1 bytes are read: 256 KiB is a prompt, one byte
+    /// more is too long, whatever it is (a line ending included).
+    #[test]
+    fn a_prompt_from_standard_input_is_at_most_256_kib() {
+        let at = "x".repeat(PROMPT_LIMIT);
+        assert_eq!(FirstPrompt::from_stdin(Some(at.as_bytes())).map(|p| p.text().len()), Ok(PROMPT_LIMIT));
+        for over in [format!("{at}x"), format!("{at}\n")] {
+            assert_eq!(FirstPrompt::from_stdin(Some(over.as_bytes())), Err(PromptError::TooLong));
+        }
+        let under = format!("{}\n", "x".repeat(PROMPT_LIMIT - 1));
+        assert_eq!(FirstPrompt::from_stdin(Some(under.as_bytes())).map(|p| p.text().len()), Ok(PROMPT_LIMIT - 1));
+        assert_eq!(FirstPrompt::new(at), Ok(FirstPrompt("x".repeat(PROMPT_LIMIT))));
+        assert_eq!(FirstPrompt::new("x".repeat(PROMPT_LIMIT + 1)), Err(PromptError::TooLong));
     }
 
     #[test]
@@ -1904,6 +2214,9 @@ mod tests {
     #[test]
     fn the_help_names_the_subcommand_and_not_the_flat_options() {
         for named in ["brindle terminal", "-d, --working-directory", "-e, --command", "--attach"] {
+            assert!(HELP.contains(named), "{named}");
+        }
+        for named in ["brindle agent [PROFILE] [-d DIR] [-p PROMPT] [OPTIONS]", "\nAGENT:\n", "-p, --prompt <PROMPT>"] {
             assert!(HELP.contains(named), "{named}");
         }
         assert!(!HELP.contains("-p, --profile"));
