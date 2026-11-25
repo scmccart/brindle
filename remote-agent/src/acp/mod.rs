@@ -14,4 +14,5 @@
 //! Each is a whole pure module (`fcis` R2, R3; `PURE_MODULES`).
 
 pub mod lines;
+pub mod rpc;
 pub mod wire;
