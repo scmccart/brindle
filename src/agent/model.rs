@@ -658,7 +658,6 @@ impl ChatModel {
     }
 
     /// The profile was renamed.
-    #[cfg_attr(not(test), allow(dead_code, reason = "no path renames an open agent tab's profile yet; the title's tests use it"))]
     pub fn set_profile_name(&mut self, profile: impl Into<String>) {
         self.profile = profile.into();
     }

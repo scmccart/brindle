@@ -604,14 +604,19 @@ impl ZoneContent {
         }
     }
 
-    /// Takes the tab's profile's theme and font size.
-    pub fn set_profile(&self, theme: Theme, font_size: Option<f32>, cx: &mut App) {
+    /// Takes the tab's profile's theme and font size, and an agent zone its
+    /// name (a title that is the profile's follows a rename).
+    pub fn set_profile(&self, name: &str, theme: Theme, font_size: Option<f32>, cx: &mut App) {
         match self {
             Self::Terminal(view) => view.update(cx, |view, cx| {
                 view.font_size_override = font_size;
                 view.terminal.update(cx, |t, _| t.theme = theme);
             }),
-            Self::Agent(view) => view.update(cx, |view, cx| view.set_profile(theme, font_size, cx)),
+            Self::Agent(view) => {
+                view.update(cx, |view, cx| view.set_profile(theme, font_size, cx));
+                let agent = view.read(cx).agent().clone();
+                agent.update(cx, |agent, cx| agent.set_profile_name(name, cx));
+            }
         }
     }
 
@@ -1060,7 +1065,7 @@ impl ZoneTreeView {
         self.theme = theme.clone();
         self.font_size_override = font_size;
         for zone in self.zones.values() {
-            zone.content.set_profile(theme.clone(), font_size, cx);
+            zone.content.set_profile(&self.profile.name, theme.clone(), font_size, cx);
         }
         cx.notify();
     }
@@ -2106,6 +2111,22 @@ mod tests {
         tab.cx.update(|_, cx| agent.update(cx, |agent, cx| agent.seen(cx)));
         settle(tab.cx);
         assert_eq!(dot(&tab), (None, None), "seen");
+    }
+
+    /// A renamed profile reaches an agent zone whose agent hasn't named
+    /// itself: its title follows the new name.
+    #[test]
+    fn an_agent_zones_title_follows_its_profiles_rename() {
+        use crate::agent::test_support::{Zone, app, settle};
+        let mut app = app();
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        let renamed = Profile { name: "Renamed".into(), ..Profile::default_shell() };
+        tab.view.update(tab.cx, |view, cx| view.set_profile(renamed, Theme::default(), None, cx));
+        settle(tab.cx);
+        let title = tab.view.read_with(tab.cx, |view, _| view.zones[&view.active].title.clone());
+        assert_eq!(title.as_ref(), "Renamed");
     }
 
     /// An agent zone whose agent exits stays open, its tab with it: the

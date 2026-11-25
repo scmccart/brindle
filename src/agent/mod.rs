@@ -463,6 +463,17 @@ impl Agent {
         self.model.title()
     }
 
+    /// The tab's profile is now called `name` (renamed in the settings
+    /// dialog): a title that is the profile's follows it.
+    pub fn set_profile_name(&mut self, name: &str, cx: &mut Context<Self>) {
+        let before = self.model.title();
+        self.model.set_profile_name(name);
+        if self.model.title() != before {
+            cx.emit(TerminalEvent::TitleChanged);
+            cx.notify();
+        }
+    }
+
     /// Where the session was started: the spawn's directory, or the one
     /// its listing gave.
     pub fn directory(&self) -> Option<&PathBuf> {
