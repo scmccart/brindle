@@ -100,6 +100,10 @@ pub enum ChannelEvent {
     /// much of the tab's earlier input still waits to reach its session.
     #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     InputRefused,
+    /// The server session's program exited, with its status (`None`: ended
+    /// by a signal), which a terminal login's zone reports.
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+    Exited(Option<i32>),
 }
 
 /// Where a terminal's events go: through its [`EventGate`] onto the
@@ -334,6 +338,8 @@ pub struct Terminal {
     /// Whether its program runs, ended, or never started; moved on only by
     /// [`Life::after`].
     life: Life,
+    /// Its program's exit status, once it exited with one.
+    exit_code: Option<i32>,
     /// Whether it started its session or attached a detached one
     /// ([`Terminal::attach`]).
     origin: Origin,
@@ -469,6 +475,10 @@ impl Terminal {
             }
             ChannelEvent::Broken(reason) => self.broken(&reason, cx),
             ChannelEvent::InputRefused => self.show(INPUT_REFUSED, cx),
+            ChannelEvent::Exited(code) => {
+                self.exit_code = code;
+                self.mark_exited(cx);
+            }
         }
     }
 
@@ -539,6 +549,7 @@ impl Terminal {
             size,
             title: None,
             life: Life::Running,
+            exit_code: None,
             origin: Origin::Spawned,
             held_notes: None,
             replaying: false,
@@ -769,6 +780,12 @@ impl Terminal {
             self.title = title;
             cx.emit(TerminalEvent::TitleChanged);
         }
+    }
+
+    /// Its program's exit status, once it exited with one (`None` while it
+    /// runs, or when a signal ended it).
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
     }
 
     /// The program exited: the terminal has ended, which its tab hears once.

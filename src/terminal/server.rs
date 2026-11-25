@@ -217,8 +217,8 @@ impl SessionSink for Sink {
         self.send(ChannelEvent::Replay(false));
     }
 
-    fn exited(&mut self, _code: Option<i32>) {
-        self.listener.send_event(AlacEvent::Exit);
+    fn exited(&mut self, code: Option<i32>) {
+        self.send(ChannelEvent::Exited(code));
     }
 
     fn lost(&mut self, reason: &str) {
@@ -328,7 +328,7 @@ mod tests {
                 ChannelEvent::Osc(_) => "osc",
                 ChannelEvent::Pointer(..) => "pointer",
                 ChannelEvent::Alac(AlacEvent::Bell) => "bell",
-                ChannelEvent::Alac(AlacEvent::Exit) => "exit",
+                ChannelEvent::Alac(AlacEvent::Exit) | ChannelEvent::Exited(_) => "exit",
                 ChannelEvent::Alac(_) => "alac",
                 ChannelEvent::Merged(Merge::Wakeup) => "wakeup",
                 ChannelEvent::Merged(_) => "merged",

@@ -122,7 +122,8 @@ pub fn kind_of(event: &ChannelEvent) -> Kind {
         | ChannelEvent::Lost
         | ChannelEvent::Failed
         | ChannelEvent::Broken(_)
-        | ChannelEvent::InputRefused => Kind::Life,
+        | ChannelEvent::InputRefused
+        | ChannelEvent::Exited(_) => Kind::Life,
     }
 }
 
@@ -199,7 +200,8 @@ impl EventGate {
             | ChannelEvent::Lost
             | ChannelEvent::Failed
             | ChannelEvent::Broken(_)
-            | ChannelEvent::InputRefused => {}
+            | ChannelEvent::InputRefused
+            | ChannelEvent::Exited(_) => {}
         }
     }
 
@@ -482,6 +484,7 @@ mod tests {
             ChannelEvent::Failed,
             ChannelEvent::Broken("why".into()),
             ChannelEvent::InputRefused,
+            ChannelEvent::Exited(Some(1)),
             ChannelEvent::Alac(AlacEvent::Exit),
             ChannelEvent::Alac(AlacEvent::ChildExit(std::process::ExitStatus::default())),
         ] {
@@ -527,6 +530,7 @@ mod tests {
             ChannelEvent::Lost => "Lost".into(),
             ChannelEvent::Failed => "Failed".into(),
             ChannelEvent::InputRefused => "InputRefused".into(),
+            ChannelEvent::Exited(code) => format!("Exited({code:?})"),
             ChannelEvent::Osc(_) | ChannelEvent::Pointer(..) | ChannelEvent::Merged(_) | ChannelEvent::Foreground => {
                 "other".into()
             }
