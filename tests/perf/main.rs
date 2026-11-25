@@ -1,5 +1,6 @@
 //! Opt-in performance suite: keystroke latency (`--latency-bench`) and
-//! vtebench throughput, in a local shell tab. It reports numbers and never
+//! vtebench throughput, in a local shell tab, and a Markdown reply streamed
+//! into an agent zone by the fake ACP agent. It reports numbers and never
 //! fails on them.
 //!
 //! ```sh
@@ -28,10 +29,13 @@
 //! Each run is kept in `target/tmp/perf/<UTC time>/` (`latest` links to the
 //! newest), with `summary.toml` and every case's logs and raw data. Each
 //! case runs in a terminal server of its own (`tests/common/server.rs`),
-//! which needs `brindle-remote` beside the release binary.
+//! which needs `brindle-remote` beside the release binary. The agent case
+//! needs the fake ACP agent (`tests/common/fake_agent.rs`: beside the
+//! release build, or `BRINDLE_FAKE_ACP_AGENT`) and skips without it.
 
 #[path = "../common/mod.rs"]
 mod common;
+mod agent;
 mod cases;
 mod report;
 mod vtebench;
@@ -44,11 +48,12 @@ use std::time::Instant;
 use common::Selection;
 use common::server::{Suite, private_dir};
 pub use common::Result;
-use report::{LatencyResult, Summary, ThroughputResult};
+use report::{LatencyResult, StreamResult, Summary, ThroughputResult};
 
 pub enum Measured {
     Latency(LatencyResult),
     Throughput(ThroughputResult),
+    Stream(StreamResult),
     Skip(String),
 }
 
@@ -62,6 +67,9 @@ pub struct Ctx {
     /// Scratch and artifact directory for this case.
     pub dir: PathBuf,
     pub bin: PathBuf,
+    /// This build's release binary, beside which `cargo build --release`
+    /// puts the fake ACP agent.
+    pub default_bin: PathBuf,
     /// The terminal server helper Brindle runs (`BRINDLE_REMOTE_AGENT`,
     /// else `brindle-remote` beside `bin`).
     pub helper: PathBuf,
@@ -90,6 +98,7 @@ fn cases() -> Vec<Case> {
     vec![
         Case { name: "latency-shell", run: cases::latency_shell },
         Case { name: "throughput-brindle", run: cases::throughput_brindle },
+        Case { name: "agent-markdown-stream", run: agent::markdown_stream },
     ]
 }
 
@@ -206,6 +215,7 @@ fn main() {
             server_dir: private_dir(Suite::Perf, &dir, n),
             dir,
             bin: bin.clone(),
+            default_bin: default_bin.clone(),
             helper: helper.clone(),
             display: display.clone(),
             samples,
@@ -233,6 +243,10 @@ fn main() {
             Ok(Measured::Throughput(result)) => {
                 println!("measured {} ({took:.0}s)", case.name);
                 summary.throughput.insert(case.name.into(), result);
+            }
+            Ok(Measured::Stream(result)) => {
+                println!("measured {} ({took:.0}s)", case.name);
+                summary.stream.insert(case.name.into(), result);
             }
             Ok(Measured::Skip(why)) => println!("skipped  {}: {why}", case.name),
             Err(why) => {
@@ -301,6 +315,8 @@ fn self_test() -> i32 {
         ("report rendering", report::self_test_render),
         ("server helpers", common::server::self_test),
         ("summary write", self_test_summary),
+        ("agent stream", agent::self_test),
+        ("fake agent lookup", common::fake_agent::self_test),
     ];
     let mut failed = 0;
     for (name, test) in tests {

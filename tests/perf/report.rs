@@ -28,12 +28,35 @@ pub struct ThroughputResult {
     pub mean_ms: BTreeMap<String, f64>,
 }
 
+/// A reply streamed into an agent zone, timed in milliseconds from the
+/// gate that lets the agent answer to Brindle's exit on the reply's last
+/// line: once in small chunks and once whole.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StreamResult {
+    /// The reply's length.
+    pub bytes: u64,
+    /// How many `agent_message_chunk`s carried it in the streamed run.
+    pub chunks: u64,
+    /// Gate to exit, streamed in `chunks` chunks.
+    pub streamed_ms: f64,
+    /// Gate to exit, sent as one chunk.
+    pub whole_ms: f64,
+    /// `streamed_ms - whole_ms`: what streaming costs over one parse.
+    pub difference_ms: f64,
+    /// The step interval Brindle waits between seeing the last line and
+    /// quitting, part of both times.
+    pub step_interval_ms: f64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
     /// Environment notes: versions, CPU governor, display.
     pub meta: BTreeMap<String, String>,
     pub latency: BTreeMap<String, LatencyResult>,
     pub throughput: BTreeMap<String, ThroughputResult>,
+    /// Absent from runs made before the stream cases existed.
+    #[serde(default)]
+    pub stream: BTreeMap<String, StreamResult>,
 }
 
 impl Summary {
@@ -176,6 +199,23 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
         }
         out.push_str(&table(&rows));
     }
+    if !summary.stream.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let mut rows = vec![["stream (ms)", "streamed", "one chunk", "difference", "chunks"].map(String::from).to_vec()];
+        for (case, result) in &summary.stream {
+            let base = baseline.and_then(|b| b.stream.get(case));
+            rows.push(vec![
+                case.clone(),
+                cell(result.streamed_ms, base.map(|b| b.streamed_ms), false),
+                cell(result.whole_ms, base.map(|b| b.whole_ms), false),
+                cell(result.difference_ms, base.map(|b| b.difference_ms), false),
+                result.chunks.to_string(),
+            ]);
+        }
+        out.push_str(&table(&rows));
+    }
     out
 }
 
@@ -212,7 +252,15 @@ pub fn self_test_render() -> Result {
     crate::ensure!(text == expected, "rendered:\n{text}\nexpected:\n{expected}");
     // A round trip keeps everything.
     let again: Summary = toml::from_str(&current.to_toml()).map_err(|e| e.to_string())?;
-    crate::ensure!(again.latency == current.latency && again.throughput == current.throughput, "round trip lost data");
+    crate::ensure!(
+        again.latency == current.latency && again.throughput == current.throughput && again.stream == current.stream,
+        "round trip lost data"
+    );
+    // A summary from before the stream cases still loads, with none.
+    let text = std::fs::read_to_string(fixture("base.toml")).map_err(|e| e.to_string())?;
+    let before = text.split("[stream.").next().unwrap_or_default();
+    let old: Summary = toml::from_str(before).map_err(|e| e.to_string())?;
+    crate::ensure!(old.stream.is_empty(), "an old summary has stream results: {:?}", old.stream);
     Ok(())
 }
 

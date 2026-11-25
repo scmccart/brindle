@@ -343,7 +343,8 @@ BRINDLE_PERF_BASELINE=target/tmp/perf/latest BRINDLE_PERF=1 cargo test --test pe
                                                     # show changes against the last run
 ```
 
-The performance suite in `tests/perf/` measures two things, in a local shell tab:
+The performance suite in `tests/perf/` measures two things in a local shell tab,
+and one in an agent zone:
 
 - **Throughput:** how fast Brindle drains output, measured with
   [vtebench](https://github.com/alacritty/vtebench), the same method other
@@ -360,6 +361,11 @@ The performance suite in `tests/perf/` measures two things, in a local shell tab
   This is not key-to-photon latency: GPU, compositor and display time are not
   included. `brindle --latency-log FILE` records the same timings for real
   typing, as JSON lines, and prints a summary on exit.
+- **Markdown streaming** (`agent-markdown-stream`): the time an agent zone
+  takes to show a 64 KiB Markdown reply, from when a test agent starts
+  answering until Brindle sees the reply's last line and quits, streamed in 32-byte chunks and again in one, and the
+  difference. It needs the test agent `brindle-fake-acp-agent`, which
+  `cargo build --release` builds beside Brindle.
 
 The suite reports numbers and never fails on them. Run it on an idle machine and
 compare runs made on the same machine. Each run is kept in

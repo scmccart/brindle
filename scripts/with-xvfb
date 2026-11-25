@@ -4,6 +4,7 @@
 #
 #   scripts/with-xvfb cargo test --test e2e            # with BRINDLE_E2E=1
 #   scripts/with-xvfb cargo test --test e2e -- titles
+#   scripts/with-xvfb cargo test --test perf           # with BRINDLE_PERF=1
 #
 # It starts Xvfb on a free display with openbox (the palette and
 # multi-window cases need a window manager), forces Mesa's lavapipe so a GPU
@@ -78,7 +79,9 @@ until DISPLAY=$display xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -
     sleep 0.1
 done
 
-export DISPLAY="$display" BRINDLE_E2E_DISPLAY="$display" VK_DRIVER_FILES="$lavapipe" LC_ALL=C.UTF-8
+# Both suites name their display themselves (default :0), so each gets it.
+export DISPLAY="$display" BRINDLE_E2E_DISPLAY="$display" BRINDLE_PERF_DISPLAY="$display" \
+    VK_DRIVER_FILES="$lavapipe" LC_ALL=C.UTF-8
 unset WAYLAND_DISPLAY
 status=0
 dbus-run-session -- "$@" || status=$?

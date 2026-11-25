@@ -11,3 +11,11 @@ frame = [5.0, 9.0, 15.0, 16.0, 17.0]
 [throughput.throughput-brindle]
 grid = "118x33"
 mean_ms = { dense_cells = 210.0, unicode = 90.0 }
+
+[stream.agent-markdown-stream]
+bytes = 65536
+chunks = 2048
+streamed_ms = 1450.5
+whole_ms = 1120.0
+difference_ms = 330.5
+step_interval_ms = 1000.0
