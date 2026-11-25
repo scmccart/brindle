@@ -1051,6 +1051,7 @@ pub fn self_test_dump_after_last_step() -> Result {
         helper: std::path::PathBuf::new(),
         display: String::new(),
         server_dir: std::env::temp_dir(),
+        fake_agent: std::path::PathBuf::new(),
         scale: crate::Scale::new(3.0),
     };
     let run = Run::new(&ctx, "self-test").action("new_tab").key("enter").dump_after_last_step(0.7);
