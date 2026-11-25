@@ -1,6 +1,6 @@
 # Tasks
 
-Before starting, check that `agents-prompt-context` is implemented and archived, and that the user has settled design.md's open decisions:
+Before starting, check that `agents-prompt-context` is implemented and archived (the user's decisions are settled; design.md lists them):
 - From it: `Attachment::{Link, Text}`, the store and `store::plan`, `AGENT_ATTACH`, `AGENT_READ_ATTACHMENT`, `ATTACHMENT`, `PromptSupport`, `PromptPart`, the draft, `send_plan`, `drop_plan`, the attachment rows and `TextState`, `PromptInput::set_attachments`, `BRINDLE_CACHE_DIR` in the harnesses.
 - Its spec deltas modify requirements that `agents-prompt-context` adds, so `openspec validate` notes that an archive would refuse them until that change's specs are synced. That is the order of the stack, not a fault.
 - Client protocol 4 and holder protocol H1 3 are still unreleased. If either has shipped, stop and raise design decisions 3 and 4.

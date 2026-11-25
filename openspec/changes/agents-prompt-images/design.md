@@ -136,18 +136,19 @@ As for text: kept images are files and their references are in the checkpoint, s
 - **E2E:** `agent-image-attach` (through `--attach-file`), `agent-image-bounds`, `agent-image-queue`, `agent-image-restore`, `agent-text-large`.
 - **Manual:** pasting an image from the clipboard and dropping image files, on Linux and on Windows, for a local and a remote agent; the preview; opening an image row; a real agent describing a pasted screenshot.
 
-## Open decisions
+## The user's decisions
 
-Each has a recommendation, which the text above follows. They are the user's to settle before implementation.
+None is open. The user settled each on 2026-11-25, one at a time: the holder's input bound for agent sessions rises to 16 MiB, and one image has a hard maximum of its own (decision 4). The numbers are accepted: 5 MiB as one image's hard maximum, 5 MiB a text attachment, 8 MiB of images a prompt, 64 MiB kept a session.
 
-Decided on 2026-11-25: the holder's input bound for agent sessions rises to 16 MiB, and one image has a hard maximum of its own (decision 4).
+An agent that doesn't accept images gets a link to the kept file (decision 5).
 
-1. **The numbers:** 5 MiB as one image's hard maximum, 5 MiB a text attachment, 8 MiB of images a prompt, 64 MiB kept a session (recommended).
-3. **An agent that doesn't accept images** gets a link to the kept file (recommended), or the image is refused when attached.
-4. **A dropped image file is attached as an image for a local agent too** (recommended), or stays a link there, as other local files are.
-5. **A clipboard with both text and an image** pastes the text, with Paste Image for the picture (recommended), or attaches the image as well.
-6. **Kept text is stored exactly as sent** and cleaned where shown or embedded (recommended), which changes `agents-prompt-context`'s cleaning before keeping.
-7. **A hidden `--attach-file` debug step** so e2e cases can attach an image (recommended), or image attachment stays covered by real-role tests and manual checks only.
+A dropped image file is attached as an image for a local agent too (decision 6).
+
+A clipboard with both text and an image pastes the text, with Paste Image for the picture (decision 6).
+
+Kept text is stored exactly as sent and cleaned where it is shown or embedded, which changes `agents-prompt-context`'s cleaning before keeping (decision 3).
+
+A hidden `--attach-file` debug step lets e2e cases attach an image (decision 8).
 
 ## Risks / Trade-offs
 
