@@ -273,16 +273,13 @@ Tool content is in the transcript, so it is checkpointed with it at the existing
 - **E2E** against the fake agent: `agent-tool-diff`, `agent-tool-output`, `agent-tool-raw`, `agent-tool-bounds`, `agent-tool-toggle`, `agent-permission-detail`, `agent-tool-restore`.
 - **Manual:** pointer presses on a row's chevron and the copy buttons; a real agent's edit and command; the diff colours in a light and a dark theme.
 
-## Open decisions
+## The user's decisions
 
-Each has a recommendation, which the text above already follows. They are the user's to settle before implementation.
+None is open. The user settled each on 2026-11-25, one at a time: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6); the diff comes from the `similar` crate, which the user chose over the recommended hand-written one (decision 4); a tool row is open while its call runs and closes when the call finishes (the user chose this over the recommended closed rows, and over closing at the turn's end), with both states configurable in `[agent]` and a minimum visible time left for later if closing at once proves jarring (decisions 10 and 11).
 
-Decided on 2026-11-25: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6); the diff comes from the `similar` crate, which the user chose over the recommended hand-written one (decision 4); a tool row is open while its call runs and closes when the call finishes (the user chose this over the recommended closed rows, and over closing at the turn's end), with both states configurable in `[agent]` and a minimum visible time left for later if closing at once proves jarring (decisions 10 and 11).
+Accepted as recommended: raw input and result are shown only when a tool call has no content items, with no second trigger (decision 10); the bounds of decision 5, 64 KiB an item and 256 KiB a call, so a single-file diff past about 1,000 changed lines shows its first 64 KiB and a count; a call left in progress when its turn ends counts as finished, a pending permission's detail shows once, with the permission row, and the two settings are global (decisions 10 and 11).
 
-Still open:
-
-4. **Raw input and result only when a call has no content** (recommended), or always under a second trigger.
-5. **The bounds** of decision 5, 64 KiB an item and 256 KiB a call: a single-file diff past about 1,000 changed lines shows its first 64 KiB and a count.
+What only the captures of task 1.1 can settle is left to them, by the rule in decision 6.
 
 ## Risks / Trade-offs
 

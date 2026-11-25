@@ -1,6 +1,6 @@
 # Tasks
 
-Before starting, check that the changes this one builds on are implemented and archived, and that the user has settled design.md's open decisions:
+Before starting, check that the changes this one builds on are implemented and archived (the user's decisions are settled; design.md lists them):
 - `agents-profiles` (and through it `agents-sessions`): `remote-agent/src/acp/{wire, rpc, reduce, checkpoint, lines}.rs`, `brindle-transcript` with `Entry::Tool`, `Event::ToolChanged` and `tests/fixtures/v4/`, `src/agent/model.rs` with `Block`/`BlockBody` and `Splice`s, `brindle-ui`'s `Tool` and `Confirmation`, the `--- entry` dump lines, the fake ACP agent.
 - `agents-markdown`: `src/agent/markdown.rs` (`render`), `brindle-ui`'s `Response` and `CodeBlock`, a message's parts as list items.
 - When stacked on `agents-session-recovery`, `agents-login` and `agents-log-paging`: their v1 requests and decoders are in `wire.rs` and `rpc.rs` and move with the rest in group 2; paging's fold ignores events below the floor.
