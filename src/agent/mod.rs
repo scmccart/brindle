@@ -9,3 +9,8 @@
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(unused_imports)]
 pub mod transcript;
+
+// What an agent session's start asks for: group 4's `Start::SpawnAgent`
+// builds it; until then only the tests do.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod spawn;
