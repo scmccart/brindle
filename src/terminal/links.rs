@@ -369,6 +369,25 @@ pub fn open(uri: &str) -> Opened {
     }
 }
 
+/// Opens `uri` now ([`open`]), and answers, once the opener has finished,
+/// what its failure says ([`failure_text`], logged too), or `None` when it
+/// opened or no answer came. Each owner shows the text where the link was
+/// clicked (a terminal, an agent zone, the link confirmation).
+pub fn open_reporting(uri: &str) -> impl Future<Output = Option<String>> + use<> {
+    let opened = open(uri);
+    let uri = uri.to_string();
+    async move {
+        match opened.await {
+            Ok(Err(error)) => {
+                let text = failure_text(&uri, &error);
+                log::warn!("{text}");
+                Some(text)
+            }
+            Ok(Ok(())) | Err(_) => None,
+        }
+    }
+}
+
 /// What [`open`] would do with `uri` on this machine: [`plan`] with this
 /// machine's name and platform, the two facts the opener reads. Owners
 /// that decide before opening (an agent's links ask first) plan with it.

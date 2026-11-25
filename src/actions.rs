@@ -108,6 +108,9 @@ actions!(
         CopyQueuedPrompt,
         /// Copies the agent's latest message.
         CopyLastAgentMessage,
+        /// Copies the last code block of the agent's latest message that
+        /// has one.
+        CopyLastCodeBlock,
         /// Opens every thought when one is closed, else closes them all.
         ToggleAgentThoughts,
         /// Scrolls the conversation to its end, which it then follows.
@@ -193,6 +196,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("agent_resend", Some("Send Held Prompt Again"), || Box::new(AgentResend)),
     ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
     ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
+    ("copy_last_code_block", Some("Copy Last Code Block"), || Box::new(CopyLastCodeBlock)),
     ("toggle_agent_thoughts", Some("Toggle Agent Thoughts"), || Box::new(ToggleAgentThoughts)),
     ("agent_scroll_to_bottom", Some("Scroll Agent to Bottom"), || Box::new(AgentScrollToBottom)),
     // The tab strip as a keyboard stop: unlabelled, for `--action` and user
@@ -888,6 +892,7 @@ mod tests {
             "Send Held Prompt Again",
             "Copy Queued Prompt",
             "Copy Last Agent Message",
+            "Copy Last Code Block",
             "Toggle Agent Thoughts",
             "Scroll Agent to Bottom",
             "Split Zone Right",

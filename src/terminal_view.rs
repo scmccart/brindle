@@ -604,11 +604,9 @@ impl TerminalView {
     /// ([`LinkFailed`]), if the view still exists when the opener has
     /// answered: at once for a refusal, later for an opener that failed.
     fn open_link(&mut self, uri: String, cx: &mut Context<Self>) {
-        let opened = links::open(&uri);
+        let failed = links::open_reporting(&uri);
         cx.spawn(async move |this, cx| {
-            if let Ok(Err(error)) = opened.await {
-                let text = links::failure_text(&uri, &error);
-                log::warn!("{text}");
+            if let Some(text) = failed.await {
                 this.update(cx, |_, cx| cx.emit(LinkFailed(text))).ok();
             }
         })

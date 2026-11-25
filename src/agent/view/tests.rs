@@ -419,3 +419,118 @@ fn the_prompt_state_follows_the_model() {
     assert_eq!(tool_status(ToolStatus::InProgress), UiToolStatus::Running);
     assert_eq!(tool_icon(ToolKind::Execute), Icon::Terminal);
 }
+
+/// The plan of a Linux host called `here`, as the dump's tests use.
+fn linux(uri: &str) -> Plan {
+    links::plan(uri, "here", false)
+}
+
+/// 4.3: a press acts only with the terminal's gesture (ctrl, not alt);
+/// then http and https open, other schemes the terminal opens ask, and
+/// refusals say why on the config line.
+#[test]
+fn a_link_press_acts_only_with_ctrl() {
+    let ctrl = Modifiers::control();
+    let ctrl_alt = Modifiers { control: true, alt: true, ..Modifiers::default() };
+    let shift = Modifiers::shift();
+    assert_eq!(link_press("https://example.com", &Modifiers::none(), linux), None, "a plain click does nothing");
+    assert_eq!(link_press("https://example.com", &ctrl_alt, linux), None);
+    assert_eq!(link_press("https://example.com", &shift, linux), None);
+    assert_eq!(link_press("https://example.com", &ctrl, linux), Some(LinkAction::Open));
+    assert_eq!(link_press("mailto:a@example.com", &ctrl, linux), Some(LinkAction::Confirm));
+    assert_eq!(
+        link_press("javascript:void", &ctrl, linux),
+        Some(LinkAction::Refuse(links::Refusal::Scheme("javascript".into())))
+    );
+    assert_eq!(link_step("https://example.com", LinkAction::Open), LinkStep::Open);
+    assert_eq!(link_step("mailto:a@example.com", LinkAction::Confirm), LinkStep::Confirm);
+    assert_eq!(
+        link_step("javascript:void", LinkAction::Refuse(links::Refusal::Scheme("javascript".into()))),
+        LinkStep::Fail("couldn't open javascript:void: its scheme (javascript) isn't one Brindle opens".into())
+    );
+    assert_eq!(
+        link_step("file://otherhost/share/x", LinkAction::Refuse(links::Refusal::OtherHost("otherhost".into()))),
+        LinkStep::Fail("couldn't open file://otherhost/share/x: it names another host (otherhost)".into())
+    );
+}
+
+/// 4.1: a message's parts are one bubble, so only its outer edges are
+/// padded; every other block is padded on both.
+#[test]
+fn only_a_messages_outer_edges_are_padded() {
+    use crate::agent::markdown::render;
+    let part = |part: usize, last: bool| Block {
+        entry: EntryId(1),
+        part,
+        start: 0,
+        last,
+        body: BlockBody::AgentPart { block: render("a").remove(0).block },
+    };
+    assert_eq!(item_padding(&part(0, true)), (true, true));
+    assert_eq!(item_padding(&part(0, false)), (true, false));
+    assert_eq!(item_padding(&part(1, false)), (false, false));
+    assert_eq!(item_padding(&part(2, true)), (false, true));
+    let user = Block { body: BlockBody::UserText { text: "a".into() }, ..part(1, false) };
+    assert_eq!(item_padding(&user), (false, false));
+    let notice = Block { body: BlockBody::Notice { level: NoticeLevel::Info, text: "n".into() }, ..part(1, false) };
+    assert_eq!(item_padding(&notice), (true, true));
+}
+
+/// 4.1 and 4.2: an agent message's code block is drawn as one, its copy
+/// button writes its text to the clipboard, and Copy Last Code Block
+/// copies the last one; with no code it leaves the clipboard alone.
+#[test]
+fn code_blocks_copy_from_their_button_and_the_palette() {
+    let mut f = Fixture::new();
+    f.feed(&[ready(), added(1, crate::agent::test_support::agent("No code here."))]);
+    f.cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+    f.cx.dispatch_action(CopyLastCodeBlock);
+    assert_eq!(f.cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("before"), "untouched");
+    f.feed(&[added(2, crate::agent::test_support::agent("Try:\n\n```rust\nfn a() {}\n```\n\n```\n  b\n```"))]);
+    assert!(f.cx.debug_bounds("code-block-code").is_some(), "the code is drawn as a code block");
+    f.cx.dispatch_action(CopyLastCodeBlock);
+    assert_eq!(f.cx.read_from_clipboard().and_then(|item| item.text()).as_deref(), Some("  b\n"));
+    let copy = f.cx.debug_bounds("code-block-copy").expect("a copy button");
+    f.cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+    f.cx.simulate_click(copy.center(), Modifiers::none());
+    let copied = f.cx.read_from_clipboard().and_then(|item| item.text());
+    assert!(matches!(copied.as_deref(), Some("fn a() {}\n" | "  b\n")), "a block's text exactly: {copied:?}");
+}
+
+/// 4.3: a link that asks emits `ConfirmLink` with the prompt to give focus
+/// back to, a refused one `LinkFailed` with the terminal's words, and a
+/// press without ctrl neither.
+#[test]
+fn link_presses_ask_or_fail_through_events() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let mut f = Fixture::new();
+    let asked = Rc::new(RefCell::new(Vec::<(String, FocusHandle)>::new()));
+    let failed = Rc::new(RefCell::new(Vec::<String>::new()));
+    let view = f.view.clone();
+    let _subscriptions = f.cx.update(|_, cx| {
+        let (asked, failed) = (asked.clone(), failed.clone());
+        [
+            cx.subscribe(&view, move |_, confirm: &ConfirmLink, _| {
+                asked.borrow_mut().push((confirm.uri.clone(), confirm.back.clone()));
+            }),
+            cx.subscribe(&view, move |_, LinkFailed(text): &LinkFailed, _| failed.borrow_mut().push(text.clone())),
+        ]
+    });
+    let press = |f: &mut Fixture, target: &str, modifiers: Modifiers| {
+        let view = f.view.clone();
+        f.cx.update(|_, cx| view.update(cx, |view, cx| view.press_link(target, modifiers, cx)));
+        f.cx.run_until_parked();
+    };
+    press(&mut f, "mailto:dev@example.com", Modifiers::none());
+    press(&mut f, "javascript:void", Modifiers::none());
+    assert!(asked.borrow().is_empty() && failed.borrow().is_empty(), "a plain click does nothing");
+    press(&mut f, "mailto:dev@example.com", Modifiers::control());
+    let prompt = f.prompt_handle();
+    assert_eq!(asked.borrow().iter().map(|(uri, back)| (uri.as_str(), back == &prompt)).collect::<Vec<_>>(), [(
+        "mailto:dev@example.com",
+        true
+    )]);
+    press(&mut f, "javascript:void", Modifiers::control());
+    assert_eq!(*failed.borrow(), ["couldn't open javascript:void: its scheme (javascript) isn't one Brindle opens"]);
+}

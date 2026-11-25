@@ -16,6 +16,7 @@ mod find_bar;
 mod instance;
 mod latency;
 mod layout;
+mod link_confirm;
 mod notify;
 mod picker;
 mod primary;

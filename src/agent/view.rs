@@ -15,29 +15,86 @@
 //! changes, the stop button when the turn ends, a permission answered),
 //! focus goes back to the prompt.
 
+use std::sync::Arc;
+
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _,
+    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, Modifiers, ParentElement as _, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
 
 use brindle_ui::{
     Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
     ConfirmationState, FocusScope, FocusStops, Icon, ItemKey, Message, MessageFrom, MessageScroller, PageDirection,
-    PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning, Resend as UiResend, TextAreaEvent, Tool,
-    ToolStatus as UiToolStatus, TooltipFor as _,
+    PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning, Resend as UiResend,
+    Response, RichBlock, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
 
 use crate::actions::{
-    AgentCancel, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyQueuedPrompt,
-    ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts,
+    AgentCancel, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
+    CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts,
 };
-use crate::agent::markdown;
+use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{Block, BlockBody, ChatModel, PromptStatus, QueueRow, Resend};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
 use crate::agent::{Agent, AgentUpdate};
 use crate::settings::Settings;
+use crate::terminal::links::{self, OpenError, Plan};
+use crate::terminal_view::LinkFailed;
 use crate::theme::Theme;
+
+/// A link in the conversation asks before it opens (a scheme the terminal
+/// opens, other than http and https): the window shows the link
+/// confirmation for `uri`, and gives focus back to `back` (the zone's
+/// prompt input) when it closes.
+#[derive(Clone, Debug)]
+pub struct ConfirmLink {
+    pub uri: String,
+    pub back: FocusHandle,
+}
+
+/// What a press released on a link with `modifiers` does: nothing without
+/// the terminal's link gesture ([`links::wants_links`]), else what
+/// [`link_action`] says of `target` with its `plan`.
+pub fn link_press(target: &str, modifiers: &Modifiers, plan: impl FnOnce(&str) -> Plan) -> Option<LinkAction> {
+    links::wants_links(modifiers).then(|| link_action(target, plan(target)))
+}
+
+/// What an agent zone does with a link pressed with the gesture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkStep {
+    /// Hand it to the opener now.
+    Open,
+    /// Ask first: the window's link confirmation.
+    Confirm,
+    /// Tell the window why not, on its config line.
+    Fail(String),
+}
+
+/// The step for `action` on `target`: a refusal is the terminal's
+/// failure text (`railway R8`: the action, then the cause).
+pub fn link_step(target: &str, action: LinkAction) -> LinkStep {
+    match action {
+        LinkAction::Open => LinkStep::Open,
+        LinkAction::Confirm => LinkStep::Confirm,
+        LinkAction::Refuse(refusal) => LinkStep::Fail(links::failure_text(target, &OpenError::Refused(refusal))),
+    }
+}
+
+/// The list item's padding above and below a block: a message's parts
+/// draw one bubble, so only its outer edges are padded; every other block
+/// is padded on both.
+pub fn item_padding(block: &Block) -> (bool, bool) {
+    match &block.body {
+        BlockBody::UserText { .. } | BlockBody::AgentPart { .. } => {
+            let edges = bubble_part(block.part, block.last).edges();
+            (edges.top, edges.bottom)
+        }
+        BlockBody::Thought { .. } | BlockBody::Tool { .. } | BlockBody::Permission { .. } | BlockBody::Notice { .. } => {
+            (true, true)
+        }
+    }
+}
 
 /// What the prompt input shows for the model: its status, its queue row
 /// and the line beside its button (why it is disabled, else the last
@@ -124,6 +181,9 @@ pub struct AgentView {
     font_size_override: Option<f32>,
     _subscriptions: Vec<Subscription>,
 }
+
+impl EventEmitter<LinkFailed> for AgentView {}
+impl EventEmitter<ConfirmLink> for AgentView {}
 
 impl Focusable for AgentView {
     /// The prompt input's: focusing the zone puts the caret in the prompt.
@@ -340,6 +400,40 @@ impl AgentView {
         }
     }
 
+    /// `copy_last_code_block`: the clipboard is left alone when no agent
+    /// message has a code block.
+    fn copy_last_code(&mut self, _: &CopyLastCodeBlock, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(text) = self.agent.read(cx).model().last_code_block().map(str::to_string) {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// A press released on a link in the conversation, with `modifiers`:
+    /// with the link gesture it opens, asks first or says why not
+    /// ([`link_press`], [`link_step`]); without it nothing happens.
+    pub fn press_link(&mut self, target: &str, modifiers: Modifiers, cx: &mut Context<Self>) {
+        let Some(action) = link_press(target, &modifiers, links::plan_here) else { return };
+        match link_step(target, action) {
+            LinkStep::Open => {
+                let failed = links::open_reporting(target);
+                cx.spawn(async move |this, cx| {
+                    if let Some(text) = failed.await {
+                        this.update(cx, |_, cx| cx.emit(LinkFailed(text))).ok();
+                    }
+                })
+                .detach();
+            }
+            LinkStep::Confirm => {
+                let back = self.prompt.read(cx).focus_handle(cx);
+                cx.emit(ConfirmLink { uri: target.to_string(), back });
+            }
+            LinkStep::Fail(text) => {
+                log::warn!("{text}");
+                cx.emit(LinkFailed(text));
+            }
+        }
+    }
+
     fn toggle_thoughts(&mut self, _: &ToggleAgentThoughts, _: &mut Window, cx: &mut Context<Self>) {
         self.agent.update(cx, |agent, cx| agent.toggle_thoughts(cx));
     }
@@ -396,8 +490,29 @@ fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::
         .map(|((_, option), handle)| (option.clone(), handle.clone()))
         .collect();
     let colors = (this.theme.ansi[1].hsla(), this.theme.ansi[3].hsla());
-    let body = block_element(view.clone(), &block, &handles, colors);
-    div().px_3().py_1().w_full().child(body).into_any_element()
+    let code_font = Settings::get(cx).font().family;
+    let body = block_element(view.clone(), &block, &handles, colors, code_font);
+    let (top, bottom) = item_padding(&block);
+    div().px_3().when(top, |d| d.pt_1()).when(bottom, |d| d.pb_1()).w_full().child(body).into_any_element()
+}
+
+/// Rich-text `blocks` as a [`Response`] in `code_font`, its links acting
+/// on ctrl ([`AgentView::press_link`]) and its code blocks' copy buttons
+/// writing the clipboard.
+fn response(
+    view: WeakEntity<AgentView>,
+    id: ElementId,
+    blocks: impl IntoIterator<Item = Arc<RichBlock>>,
+    code_font: SharedString,
+) -> Response {
+    Response::new(id, blocks)
+        .code_font(code_font)
+        .link_modifiers(Modifiers::control())
+        .on_link(move |link, modifiers, _, cx| {
+            let target = link.target.clone();
+            view.update(cx, |view, cx| view.press_link(&target, modifiers, cx)).ok();
+        })
+        .on_copy_code(|text, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string())))
 }
 
 fn block_element(
@@ -405,10 +520,13 @@ fn block_element(
     block: &Block,
     handles: &[(SharedString, FocusHandle)],
     (error, warning): (gpui::Hsla, gpui::Hsla),
+    code_font: SharedString,
 ) -> gpui::AnyElement {
     let entry = block.entry;
     let id = |what: &str| ElementId::Name(format!("agent-{what}-{}-{}", entry.0, block.part).into());
-    let message = |view: WeakEntity<AgentView>, from: MessageFrom, text: SharedString| {
+    // One part of a message: a later part is set apart from the one above
+    // it as a response's blocks are (`gap-3`), inside the same bubble.
+    let message = |view: WeakEntity<AgentView>, from: MessageFrom, content: gpui::AnyElement| {
         let copy = Button::icon_only(id("copy"), Icon::Copy)
             .variant(ButtonVariant::Ghost)
             .size(ButtonSize::IconXs)
@@ -420,20 +538,28 @@ fn block_element(
                     cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             });
-        Message::text(id("message"), from, text).part(bubble_part(block.part, block.last)).action(copy).into_any_element()
+        Message::new(id("message"), from)
+            .part(bubble_part(block.part, block.last))
+            .child(div().when(block.part > 0, |d| d.pt_3()).child(content))
+            .action(copy)
+            .into_any_element()
     };
-    // Until agent parts are drawn as rich text (section 4 of
-    // `agents-markdown`), a part and a thought show their plain text.
     match &block.body {
-        BlockBody::UserText { text } => message(view, MessageFrom::User, text.clone()),
-        BlockBody::AgentPart { block } => message(view, MessageFrom::Assistant, markdown::shown_text(block).into()),
-        BlockBody::Thought { blocks, open } => Reasoning::new(id("thought"), *open)
-            .label("Thought")
-            .on_toggle(move |_, _, cx| {
-                view.update(cx, |view, cx| view.agent.update(cx, |agent, cx| agent.toggle_thought(entry, cx))).ok();
-            })
-            .child(blocks.iter().map(|block| markdown::shown_text(block)).collect::<Vec<_>>().join("\n\n"))
-            .into_any_element(),
+        BlockBody::UserText { text } => message(view, MessageFrom::User, text.clone().into_any_element()),
+        BlockBody::AgentPart { block: rich } => {
+            let content = response(view.clone(), id("response"), [rich.clone()], code_font).into_any_element();
+            message(view, MessageFrom::Assistant, content)
+        }
+        BlockBody::Thought { blocks, open } => {
+            let content = response(view.clone(), id("thought-response"), blocks.iter().cloned(), code_font);
+            Reasoning::new(id("thought"), *open)
+                .label("Thought")
+                .on_toggle(move |_, _, cx| {
+                    view.update(cx, |view, cx| view.agent.update(cx, |agent, cx| agent.toggle_thought(entry, cx))).ok();
+                })
+                .child(content)
+                .into_any_element()
+        }
         BlockBody::Tool { kind, title, status } => {
             Tool::new(tool_icon(*kind), title.clone(), tool_status(*status)).into_any_element()
         }
@@ -566,7 +692,13 @@ impl Render for AgentView {
             .on_action(cx.listener(Self::resend))
             .on_action(cx.listener(Self::copy_queued))
             .on_action(cx.listener(Self::copy_last))
+            .on_action(cx.listener(Self::copy_last_code))
             .on_action(cx.listener(Self::toggle_thoughts))
+            // A link shows the pointing hand only while ctrl is held: a
+            // modifiers change with the pointer still reaches only the
+            // focused path (the prompt input, inside this), so the frame is
+            // drawn again here for the links' pointer to follow it.
+            .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             .on_action(cx.listener(|this, _: &AgentScrollToBottom, _, cx| this.scroll_to_end(cx)))
             .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll_to_end(cx)))
             .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| this.page(PageDirection::Up, cx)))

@@ -1271,9 +1271,6 @@ impl ChatModel {
 
     /// `copy_last_code_block`: the last code block's text, at any depth,
     /// of the latest agent message that has one (thoughts don't count).
-    // The action that uses it comes with the agent view's rich text
-    // (`agents-markdown` task 4.2).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn last_code_block(&self) -> Option<&str> {
         self.entries.iter().rev().filter(|(_, entry)| matches!(entry, Entry::Agent { .. })).find_map(|(id, _)| {
             let parts = self.rendered.get(id)?;
