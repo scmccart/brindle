@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Attachments in the prompt input
-An agent zone SHALL show the attachments waiting to go with the next prompt as a row of items above the prompt input's text, each with its kind, its name and, for text, its size and whether it was cut. Sending the prompt SHALL send them with it and clear them once the server accepts it; a refused prompt SHALL keep its attachments with its text. Blank text SHALL NOT be sent, with attachments or without. The items SHALL NOT be keyboard stops.
+An agent zone SHALL show the attachments waiting to go with the next prompt as a row of items above the prompt input's text, each with its kind, its name and, for text, its size. Sending the prompt SHALL send them with it and clear them once the server accepts it; a refused prompt SHALL keep its attachments with its text. Blank text SHALL NOT be sent, with attachments or without. The items SHALL NOT be keyboard stops.
 
 #### Scenario: Sent with the prompt
 - **WHEN** the prompt input holds one text attachment and the user types `why?` and presses enter
@@ -31,15 +31,19 @@ With the cursor at the very start of the prompt input's text and nothing selecte
 - **THEN** the prompt input has none, and its text is unchanged
 
 ### Requirement: Attachment limits are said when attaching
-Adding a ninth attachment SHALL be refused: the window's notice line SHALL say a prompt takes at most 8, and the attachments already there SHALL stay. Text longer than 256 KiB SHALL be attached cut to 256 KiB, the output of a command keeping its end and a file its start, and its item SHALL say it was cut.
+Adding a ninth attachment SHALL be refused: the window's notice line SHALL say a prompt takes at most 8, and the attachments already there SHALL stay. Text longer than 256 KiB SHALL be refused outright, never shortened: the notice line SHALL say how long it is and what the limit is, and nothing SHALL be attached.
 
 #### Scenario: A ninth attachment
 - **WHEN** the prompt input holds 8 attachments and the user attaches a file
 - **THEN** the notice line says a prompt takes at most 8 attachments, and 8 remain
 
-#### Scenario: Long output keeps its end
-- **WHEN** the user sends a command's output of 1 MiB to an agent
-- **THEN** the attachment holds the last 256 KiB of it, and its item says it was cut
+#### Scenario: Output that is too long
+- **WHEN** the user runs Send Last Command Output to Agent for a command that printed 1 MiB
+- **THEN** nothing is attached, the notice line says the output is 1 MiB and an attachment takes at most 256 KiB, and the terminal keeps focus
+
+#### Scenario: A dropped file that is too long
+- **WHEN** the user drops a 300 KiB text file on the zone of an agent on an SSH host
+- **THEN** it isn't attached, and the notice line names the file, its size and the limit
 
 ### Requirement: Attaching a file by path
 The `agent_attach_file` action SHALL ask for a path and attach it as a link, as typed, without checking it; the agent reads the file on its own host, where a relative path is relative to the session's working directory. The command palette SHALL list it as Attach File… while an agent zone is active.
@@ -127,7 +131,7 @@ A user message SHALL list its attachments under its text: a link as its path, an
 - **THEN** the user message shows `why?`, a closed row `cargo test` with its size, and `src/main.rs`
 
 ### Requirement: Opening a text attachment
-A pointer press on a text attachment's row SHALL fetch its text from the server and show it under the row, in the terminal's font family, with which end was cut when it was; until it arrives the row SHALL show that it is loading. A second press SHALL close it. When the server no longer keeps the text, the row SHALL say so. An agent zone SHALL hold the text of open rows only.
+A pointer press on a text attachment's row SHALL fetch its text from the server and show it under the row, in the terminal's font family; until it arrives the row SHALL show that it is loading. A second press SHALL close it. When the server no longer keeps the text, the row SHALL say so. An agent zone SHALL hold the text of open rows only.
 
 #### Scenario: Opened
 - **WHEN** the user presses the `cargo test` row

@@ -16,7 +16,7 @@ A client SHALL be able to send, with a prompt's text, a list of attachments of t
 - **THEN** the agent receives the text alone, as before
 
 ### Requirement: Attached text is kept beside the log
-The server SHALL keep a text attachment's text in a file of its own, in a directory private to the user on the agent's host, and SHALL NOT put the text in the log, the queue slot or a checkpoint: those SHALL hold its name, its size, whether it was cut, and the server's id for it. The file SHALL be named by that id alone, and SHALL NOT be writable once written.
+The server SHALL keep a text attachment's text in a file of its own, in a directory private to the user on the agent's host, and SHALL NOT put the text in the log, the queue slot or a checkpoint: those SHALL hold its name, its size and the server's id for it. The file SHALL be named by that id alone, and SHALL NOT be writable once written.
 
 #### Scenario: The log holds a reference
 - **WHEN** a client sends a prompt with a 100 KiB text attachment
@@ -106,7 +106,7 @@ The server SHALL send a link to the agent as a file URI for the path resolved on
 - **THEN** the prompt is sent with the link, and the session carries on
 
 ### Requirement: Attached text reaches every agent
-The server SHALL send a text attachment of at most 64 KiB as embedded context, named, to an agent that says it accepts embedded context. A larger one, and any text attachment for an agent that doesn't accept embedded context, SHALL be sent as a link to the file that keeps it. An attachment whose text was cut SHALL say so to the agent, with which end was dropped.
+The server SHALL send a text attachment of at most 64 KiB as embedded context, named, to an agent that says it accepts embedded context. A larger one, and any text attachment for an agent that doesn't accept embedded context, SHALL be sent as a link to the file that keeps it. Either way the agent SHALL be given the whole text: the server SHALL NOT shorten an attachment.
 
 #### Scenario: Embedded
 - **WHEN** the agent accepts embedded context and a client sends a prompt with a text attachment `cargo test` holding `error: mismatched types`
@@ -120,9 +120,9 @@ The server SHALL send a text attachment of at most 64 KiB as embedded context, n
 - **WHEN** the agent doesn't accept embedded context and a client sends a prompt with a 1 KiB text attachment
 - **THEN** the agent receives a link to the file that keeps it
 
-#### Scenario: A cut text
-- **WHEN** a client sends a text attachment marked as having lost its start
-- **THEN** what the agent receives for it says its beginning isn't included
+#### Scenario: Whole
+- **WHEN** a client sends a text attachment of exactly 256 KiB
+- **THEN** the file the agent is linked to holds all 256 KiB
 
 ### Requirement: Attachments stay with a queued or held prompt
 A prompt that waits in the queue slot, or is held there, SHALL keep its attachments: in what attached clients are told, in every replay, across detaches, core restarts and upgrades, and when it is sent, by the queue or by a client sending it again.

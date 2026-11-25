@@ -38,7 +38,7 @@ See proposal.md for why. The user split images into their own change on 2026-11-
 | Checks, bounds, embedded or link, resolving a link's path | pure | `acp/reduce.rs` |
 | A path as a `file://` URI | pure | `acp/uri.rs` (new) |
 | ACP v1: `promptCapabilities`; resource links and embedded resources in `session/prompt` | pure | `acp/v1/{decode, encode}.rs` |
-| The draft's attachments, `cut_text`, `drop_plan`, the conversation's attachment rows and their fetched text, dump lines | GPUI-free model | `brindle`, `src/agent/model.rs` |
+| The draft's attachments, `attach` and its refusals, `drop_plan`, the conversation's attachment rows and their fetched text, dump lines | GPUI-free model | `brindle`, `src/agent/model.rs` |
 | Which agent zone takes a command's output (`target_plan`) | pure | `brindle`, `src/workspace.rs` |
 | Reading a dropped file; fetching a kept text | shell (background task, reader thread) | `src/agent/mod.rs` |
 | The terminal action, the drop handler, the attach prompt, drawing | shell (entities) | `src/terminal_view.rs`, `src/workspace.rs`, `src/agent/view.rs`, `src/actions.rs` |
@@ -55,13 +55,12 @@ A text attachment's text is written to a file the terminal server owns, and the 
 ```rust
 pub enum Attachment {
     Link { path: String, name: String },                             // a file on the agent's host
-    Text { id: u64, name: String, bytes: u64, cut: Option<Cut> },    // text kept by the server
+    Text { id: u64, name: String, bytes: u64 },                      // text kept by the server
 }
-pub enum Cut { Start, End }                                          // which end of a longer text was dropped
 ```
 
 - `Entry::User` and both `Slot` variants that hold a prompt gain `attachments: Vec<Attachment>`, defaulted and omitted when empty, so every existing fixture is unchanged. A reference is about a hundred bytes, so a user entry and a slot stay small, and they travel in `Added` and `Queue` as today: no new event kind.
-- **`id`** is the server's, per session, from 1, never reused (`types R3`). **`cut`** is data, not a mark in the text.
+- **`id`** is the server's, per session, from 1, never reused (`types R3`).
 - **Where** (the user's decisions, 2026-11-25: somewhere more durable than the server directory, under `~/.cache` by default, and settable, per remote). `<attachments directory>/<store>/<id>`, on the agent's host. The attachments directory is the one the session was started with when its profile names one, else `<cache directory>/attachments`, where the cache directory is `$BRINDLE_CACHE_DIR`, else `$XDG_CACHE_HOME/brindle`, else `~/.cache/brindle`; on Windows `%LOCALAPPDATA%\brindle\cache`. It is on disk, not in memory as `$XDG_RUNTIME_DIR` usually is, and it outlives a reboot, so a file URI the agent was given, which the agent keeps in its own saved conversation, still leads somewhere when that conversation is taken up again (decision 4).
 - **Settings** (`src/config.rs`, parsed at the boundary, `types R5`):
   - `[agent] attachments_dir`: the attachments directory for agents that run on this machine. Unset means the cache directory's rule.
@@ -86,7 +85,8 @@ pub enum Cut { Start, End }                                          // which en
 | a link's path, a name | bounded as titles are |
 
 - `ATTACHMENT_TEXT` is what one `AGENT_ATTACH` frame holds even if JSON escaping doubles it. Larger payloads need the upload in pieces that `agents-prompt-images` defines.
-- **Brindle cuts before it sends** (`cut_text(text, keep) -> (String, Option<Cut>)`, pure, at a line break where one is near, else a character boundary): command output keeps its end, where the error is; a file keeps its start. The server refuses what is still over a bound, so a client can't exceed them.
+- **Text over the limit is refused outright, never shortened** (the user's decision, 2026-11-25, over cutting it): Brindle refuses it when it is attached (`AttachRefusal::TooLong { bytes, limit }`), naming its size and the limit on the notice line, and the server refuses it too (`TooLong`), so a client can't exceed the bound. What an agent is given is therefore always the whole of what the user attached.
+- **`ATTACHMENT_TEXT` is a transport limit, not a policy.** It is what one frame carries. When `agents-prompt-images` adds an upload in pieces, text uses it too and this limit is raised to whatever that change bounds an upload at; the session's `STORE_LIMIT` stays, since the server must bound what a client can make it write (`process R9`).
 - **A full store refuses the attach** (`StoreFull`), saying how much the conversation's attachments hold. Trimmed log entries free their texts (decision 4), so a long conversation makes room as it goes.
 - Every text, name and path is cleaned by the server as prompt text is.
 
@@ -95,7 +95,7 @@ pub enum Cut { Start, End }                                          // which en
 Three messages are added to client protocol 4, which is unreleased and amended as `agents-tool-content`'s decision 8 says. Their numbers are the next free ones when the stack is assembled.
 
 - **`SPAWN_AGENT`** gains two optional fields, omitted when unset: `attachments_dir` and `attachments_keep_days`. A server that gets neither uses its cache directory and 14 days.
-- **`AGENT_ATTACH { req, session, upload, name, text, cut }`** (client): store this text for the session. `upload` is a number the client picks, unique on its connection. Answered `OK`, or `ERROR` with the refusal (`TooLong`, `StoreFull`, `NotAnAgentSession`, `DirectoryNotPrivate { path, why }`, a write failure in words).
+- **`AGENT_ATTACH { req, session, upload, name, text }`** (client): store this text for the session. `upload` is a number the client picks, unique on its connection. Answered `OK`, or `ERROR` with the refusal (`TooLong`, `StoreFull`, `NotAnAgentSession`, `DirectoryNotPrivate { path, why }`, a write failure in words).
 - **`AGENT_PROMPT`** gains `attachments`, an optional list in order: `{ "kind": "link", "path", "name" }` or `{ "kind": "text", "upload" }`. A prompt naming an upload the connection doesn't hold is refused (`UnknownUpload`).
 - **`AGENT_READ_ATTACHMENT { req, session, id }`** (client), answered by **`ATTACHMENT { req, id, text }`** (server), or `ERROR` (`NoSuchAttachment`, a read failure in words). One text of at most `ATTACHMENT_TEXT`, so one frame.
 - **An upload belongs to its connection until a prompt takes it.** The server removes an upload when the prompt naming it is refused, and all of a connection's untaken uploads when it detaches or closes. So a Brindle that crashes between attaching and sending leaves nothing behind.
@@ -134,7 +134,6 @@ Request::Prompt { session, parts: &[PromptPart] }
 - **Kept text of at most `EMBED_LIMIT`, for an agent that takes embedded context,** is `PromptPart::Embedded`, which the v1 module writes as a `resource` of `text/plain`: the agent has the text at once, with no file to read. Its URI is the kept file's `file://` URI, so the agent can also read it again later.
 - **Kept text over `EMBED_LIMIT`, and any kept text for an agent without embedded context,** is `PromptPart::Link` to the kept file. Every agent must accept a link, and a long log then stays out of the agent's context until it chooses to read it.
 - The choice is made in the reducer from `PromptSupport` and the text's size, which name no ACP version. The core's shell reads the kept texts a prompt needs just before the reducer builds its parts (a queued prompt may be sent long after it was attached, by another core).
-- **A cut text** says so to the agent in its name: `NAME (the first 12 KiB aren't included)`.
 - **Reading a file outside the project.** An agent may ask permission, or refuse, to read the kept file, which is outside its working directory. Task 1.1 captures each agent we can run being sent a link to a kept text. If one balks and advertises additional directories, the session's attachment directory is named to it at `session/new`; what each agent does is written into "As built". Small texts for today's agents never meet this, since they are embedded.
 - **ACP v2** (for `agents-acp-v2`): the same content kinds and the same capability, so `acp/v2/encode.rs` writes the same parts.
 
@@ -158,22 +157,22 @@ The action:
 
 **A file by path:** `agent_attach_file` ("Attach File…") opens a palette prompt for a path on the agent's host; enter attaches it as a link, as typed. Nothing is checked: the agent says if it can't read it.
 
-**Dropped files** (`drop_plan(paths, host) -> Vec<DropStep>`, pure): for a profile whose agent runs on this machine, each path is a link. For SSH and container profiles each file is `Read(path)`: a background task reads at most `ATTACHMENT_TEXT` + 1 bytes (`process R13`), and the pure `dropped_text(name, bytes) -> Result<Draft, DropRefusal>` makes a text attachment of valid UTF-8 (cut at its end if longer) or refuses (`NotText`, `Unreadable(reason)`). A directory is refused in both cases. Each refusal names the file on the notice line; the others are still attached.
+**Dropped files** (`drop_plan(paths, host) -> Vec<DropStep>`, pure): for a profile whose agent runs on this machine, each path is a link. For SSH and container profiles each file is `Read(path)`: a background task reads at most `ATTACHMENT_TEXT` + 1 bytes (`process R13`), and the pure `dropped_text(name, bytes) -> Result<Draft, DropRefusal>` makes a text attachment of valid UTF-8 or refuses (`NotText`, `TooLong`, `Unreadable(reason)`). A directory is refused in both cases. Each refusal names the file on the notice line; the others are still attached.
 
 ### 9. The zone and `brindle-ui` (`ports R2`)
 
-- **`PromptInput`** gains `set_attachments(Vec<AttachmentItem>)` (an icon for the kind, a name, a detail such as `2.1 KiB` or `cut`, and a key), drawn as a wrapping row above the textarea and below the queue row; a press on an item's remove mark asks the owner with its key. Not keyboard stops.
+- **`PromptInput`** gains `set_attachments(Vec<AttachmentItem>)` (an icon for the kind, a name, a detail such as `2.1 KiB`, and a key), drawn as a wrapping row above the textarea and below the queue row; a press on an item's remove mark asks the owner with its key. Not keyboard stops.
 - **The queue row** says how many attachments a waiting or held prompt has (`next · 2 attachments`); they go with it when it is sent again and are removed with it when it is discarded.
-- **In the conversation** a user message lists its attachments under its text: a link as its path; a text attachment as a row with its name and size. A pointer press on the row opens it: the model asks the server for the text (`AGENT_READ_ATTACHMENT`), the row shows that it is loading, then the text in a `CodeBlock` with a line saying which end was cut, or that the text is no longer kept. `TextState::{ Closed, Loading, Shown(text), Gone(reason) }` per row (`types R1`); closing a row drops its text, so the zone holds only what is open. No keyboard stop.
+- **In the conversation** a user message lists its attachments under its text: a link as its path; a text attachment as a row with its name and size. A pointer press on the row opens it: the model asks the server for the text (`AGENT_READ_ATTACHMENT`), the row shows that it is loading, then the text in a `CodeBlock`, or a line saying the text is no longer kept. `TextState::{ Closed, Loading, Shown(text), Gone(reason) }` per row (`types R1`); closing a row drops its text, so the zone holds only what is open. No keyboard stop.
 - **Dropping** on an agent zone highlights its prompt input while files hover.
 
 ### 10. The dump (`testing R2`)
 
 ```
 --- entry 3 user attachments=2 "why does this fail?"
---- attached entry=3 index=0 kind=text id=5 name="cargo test" cut=start bytes=262144 state=closed
+--- attached entry=3 index=0 kind=text id=5 name="cargo test" bytes=262144 state=closed
 --- attached entry=3 index=1 kind=link path="src/main.rs" name="main.rs"
---- draft index=0 kind=text name="output from zsh" cut=none bytes=412 "…"
+--- draft index=0 kind=text name="output from zsh" bytes=412 "…"
 --- queued waiting attachments=1 "next"
 ```
 
@@ -205,7 +204,7 @@ From their designs, as the stack's session described them on 2026-11-25:
 
 ### 14. Tests
 
-- **Unit:** the transcript forms and their fold and replay; `store::plan` over attach, send, discard, trim, the session's end, adoption with orphans, and a missing file; `uri::file` for both path kinds and awkward bytes; the reducer's checks, path resolution, order of parts, embedded or link by support and size, and the cut note; `v1::encode` for each part and `v1::decode` for `promptCapabilities`; `cut_text`, `attach`, `send_plan`, `backspace_at_start`, `drop_plan`, `dropped_text`, `target_plan`, the row's `TextState`; the dump lines.
+- **Unit:** the transcript forms and their fold and replay; `store::plan` over attach, send, discard, trim, the session's end, adoption with orphans, and a missing file; `uri::file` for both path kinds and awkward bytes; the reducer's checks, path resolution, order of parts, and embedded or link by support and size; `v1::encode` for each part and `v1::decode` for `promptCapabilities`; `attach` with its refusals, `send_plan`, `backspace_at_start`, `drop_plan`, `dropped_text`, `target_plan`, the row's `TextState`; the dump lines.
 - **Protocol:** fixtures and fuzzing for the three messages and `AGENT_PROMPT`'s list.
 - **Real roles** (the fake ACP agent): a small text reaches the agent embedded and a large one as a link to a file that holds it; an agent without embedded context gets a link; the file is private and read-only; a read returns the text; a refused prompt, a discard, a trim and the session's end each remove what they should; a waiting prompt keeps its attachment across a core restart; untaken uploads go when the connection closes.
 - **Captures:** task 1.1.
@@ -225,9 +224,11 @@ Decided on 2026-11-25:
 - Kept text stays 14 days after its session ends, for some room over the recommended 7 (decision 4).
 - Both are settings: `[agent] attachments_keep_days`, `[agent] attachments_dir` for this machine, and `attachments_dir` in a profile's `remote` table for that host, since a path belongs to one machine (decision 1).
 
+- Text over the limit is refused outright, which the user chose over the recommended cutting; the limit itself is raised when uploads in pieces arrive (decision 2).
+- The remote's `attachments_dir` on the profile's `remote` table is fine for now; the user expects remotes to become first-class entries of the config later, when it would move there.
+
 Still open, each with a recommendation the text above follows:
 
-2. **Longer text is cut** (command output keeps its end, a file its start; recommended), or refused.
 3. **A file dropped on a remote agent's zone** is attached as text when it is text (recommended), or every such drop is refused.
 4. **Several agent zones open:** a palette asks which (recommended), or the most recently focused one takes it.
 
