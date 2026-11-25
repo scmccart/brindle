@@ -49,9 +49,9 @@ Each module below in `remote-agent/src/acp/` joins `PURE_MODULES` and `fcis`'s p
 
 ## 6. The fake ACP agent binary (design decision 16)
 
-- [ ] 6.1 Add `[[bin]] name = "brindle-fake-acp-agent"`, `path = "src/fake_acp/main.rs"` to `remote-agent/Cargo.toml`: a thin loop reading stdin lines and running 4.8's steps, writing recorded messages to the script's file. Switch `remote-agent/build.rs` to embed `brindle-remote.rc` into `brindle-remote` only (`embed_resource::compile_for`, or the pinned version's equivalent). Verify `cargo build --locked` puts it in `target/debug/`, and CI's `windows` job's version-resource check on `brindle-remote.exe` still passes.
-- [ ] 6.2 `remote-agent/tests/support/mod.rs` gains `FAKE_AGENT = env!("CARGO_BIN_EXE_brindle-fake-acp-agent")` and a script helper with file gates; a test runs the binary on a short script and checks its recorded messages. Verify with `cargo test -p brindle-remote-agent --test agents fake_agent`.
-- [ ] 6.3 Keep it out of every package: `build-linux.yml` and `build-windows.yml` gain a step after packaging that lists the archive and fails on any file not in its expected list (so the fake agent, or anything else, can't slip in); the packaging scripts and the WinGet manifest stay unchanged. Verify by the jobs' output on the branch.
+- [x] 6.1 Add `[[bin]] name = "brindle-fake-acp-agent"`, `path = "src/fake_acp/main.rs"` to `remote-agent/Cargo.toml`: a thin loop reading stdin lines and running 4.8's steps, writing recorded messages to the script's file. Switch `remote-agent/build.rs` to embed `brindle-remote.rc` into `brindle-remote` only (`embed_resource::compile_for`, or the pinned version's equivalent). Verify `cargo build --locked` puts it in `target/debug/`, and CI's `windows` job's version-resource check on `brindle-remote.exe` still passes.
+- [x] 6.2 `remote-agent/tests/support/mod.rs` gains `FAKE_AGENT = env!("CARGO_BIN_EXE_brindle-fake-acp-agent")` and a script helper with file gates; a test runs the binary on a short script and checks its recorded messages. Verify with `cargo test -p brindle-remote-agent --test agents fake_agent`.
+- [x] 6.3 Keep it out of every package: `build-linux.yml` and `build-windows.yml` gain a step after packaging that lists the archive and fails on any file not in its expected list (so the fake agent, or anything else, can't slip in); the packaging scripts and the WinGet manifest stay unchanged. Verify by the jobs' output on the branch.
 
 ## 7. The core's agent sessions (shell)
 
