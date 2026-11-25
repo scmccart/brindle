@@ -350,7 +350,10 @@ rule, not a convenience.
     small button per `ConfirmationAction` (keyed by `ItemKey`, a focus stop
     through the owner's handle), `on_action(key)`; once `Accepted`,
     `Rejected` or `Cancelled`, the outcome (`check` or `x` and the label,
-    `ConfirmationState::outcome`) and no buttons.
+    `ConfirmationState::outcome`) and no buttons. An action may have a
+    `description` (plain text under its button; any description stacks
+    the actions, `actions_stack`) and be `disabled` (muted, no stop,
+    asking nothing).
   - `Alert`: shadcn's alert (`AlertVariant::{Default, Destructive}`,
     `alert_style`), lucide `circle-alert` by default, with the children as
     the description.
@@ -879,7 +882,10 @@ code comes from there.
 - **Tool is one row** with no collapsible input and output, and takes no
   focus; its badge says pending, running, done or failed.
 - **Confirmation's outcome shows the chosen action's label**, and
-  `Cancelled` shows "Cancelled"; the actions are keyed (`ItemKey`).
+  `Cancelled` shows "Cancelled"; the actions are keyed (`ItemKey`). An
+  action can carry a description under its button (AI Elements' has
+  none), which stacks the actions: an agent's login methods are chosen
+  by what each does.
 - **Alert's title wraps** (shadcn clamps it to one line): an app's titles
   name a failure and its cause and are read whole.
 - **Response reads no markup** (AI Elements' renders Markdown through
