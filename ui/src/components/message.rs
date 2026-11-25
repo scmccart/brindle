@@ -279,13 +279,17 @@ mod tests {
         assert!((agent.size.height - user.size.height * 2.).abs() <= px(0.5), "{agent:?} {user:?}");
     }
 
-    struct WithAction;
+    /// A message whose action records each time it is drawn.
+    struct WithAction {
+        drawn: std::rc::Rc<std::cell::Cell<bool>>,
+    }
 
     impl Render for WithAction {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let drawn = self.drawn.clone();
             div().w(px(400.)).child(
                 Message::text("a", From::Assistant, "hello")
-                    .action(div().debug_selector(|| "copy".into()).size(px(12.))),
+                    .action(gpui::canvas(|_, _, _| {}, move |_, _, _, _| drawn.set(true)).size(px(12.))),
             )
         }
     }
@@ -294,16 +298,18 @@ mod tests {
     #[test]
     fn actions_show_on_hover() {
         let mut app: TestAppContext = test_support::app();
-        let (_, cx) = app.add_window_view(|_, _| WithAction);
-        // The pointer starts at the window's origin, over the message.
-        cx.simulate_mouse_move(gpui::point(px(20.), px(300.)), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert_eq!(cx.debug_bounds("copy"), None);
-        cx.simulate_mouse_move(gpui::point(px(20.), px(20.)), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("copy").is_some());
-        cx.simulate_mouse_move(gpui::point(px(20.), px(300.)), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        assert_eq!(cx.debug_bounds("copy"), None);
+        let drawn = std::rc::Rc::new(std::cell::Cell::new(false));
+        let flag = drawn.clone();
+        let (_, cx) = app.add_window_view(move |_, _| WithAction { drawn: flag });
+        let shown_at =|y: f32, cx: &mut gpui::VisualTestContext| {
+            drawn.set(false);
+            cx.simulate_mouse_move(gpui::point(px(20.), px(y)), None, gpui::Modifiers::none());
+            cx.update(|window, _| window.refresh());
+            cx.run_until_parked();
+            drawn.get()
+        };
+        assert!(!shown_at(300., cx));
+        assert!(shown_at(20., cx));
+        assert!(!shown_at(300., cx));
     }
 }

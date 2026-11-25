@@ -52,6 +52,10 @@ actions!(
         // Enter in a text area: kept from the owner while an input method
         // is composing, passed on to the owner's own enter otherwise.
         TextAreaEnter,
+        // A prompt input: enter asks the owner to submit, escape to stop
+        // (each only when the input's status allows it).
+        PromptSubmit,
+        PromptStop,
     ]
 );
 
@@ -94,6 +98,7 @@ fn editing_bindings(context: Option<&str>) -> Vec<KeyBinding> {
 pub fn default_bindings() -> Vec<KeyBinding> {
     let i = Some("TextInput");
     let a = Some("TextArea");
+    let p = Some("PromptInput");
     let l = Some("UiLayer");
     let f = Some("UiFocusScope");
     let s = Some("UiList");
@@ -150,6 +155,10 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         // Enter goes on to the owner's binding, unless an input method is
         // composing.
         KeyBinding::new("enter", TextAreaEnter, a),
+        // Around a prompt input's text area: the enter it passed on, and
+        // escape while a turn streams.
+        KeyBinding::new("enter", PromptSubmit, p),
+        KeyBinding::new("escape", PromptStop, p),
     ];
     bindings.extend(editing_bindings(i));
     bindings.extend(editing_bindings(a));
@@ -222,10 +231,13 @@ mod tests {
         for owners in ["escape", "tab", "shift-tab"] {
             assert_eq!(named(owners), None, "{owners}");
         }
+        let prompt = in_context(&bindings, "PromptInput");
+        let prompt: Vec<&str> = prompt.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(prompt, ["brindle_ui::PromptSubmit", "brindle_ui::PromptStop"]);
         // Every binding is in one of the crate's contexts.
         assert_eq!(
             bindings.len(),
-            text_input.len() + text_area.len() + layer.len() + command.len() + scope.len() + list.len()
+            text_input.len() + text_area.len() + layer.len() + command.len() + scope.len() + list.len() + prompt.len()
         );
     }
 }

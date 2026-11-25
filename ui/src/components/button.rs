@@ -35,6 +35,8 @@ pub struct Button {
     /// The icon's side and minimum stroke instead of the size's.
     icon_size: Option<Rems>,
     icon_min_stroke: Option<Pixels>,
+    /// The icon turned clockwise by this much (1 a whole turn): a spinner.
+    icon_turn: f32,
     variant: ButtonVariant,
     size: ButtonSize,
     disabled: bool,
@@ -54,6 +56,7 @@ impl Button {
             icon: None,
             icon_size: None,
             icon_min_stroke: None,
+            icon_turn: 0.,
             variant: ButtonVariant::default(),
             size: ButtonSize::default(),
             disabled: false,
@@ -86,6 +89,14 @@ impl Button {
     /// ([`IconElement::min_stroke`](crate::icon::IconElement::min_stroke)).
     pub fn icon_min_stroke(mut self, width: Pixels) -> Self {
         self.icon_min_stroke = Some(width);
+        self
+    }
+
+    /// The icon turned clockwise by `turns` (1 is a whole turn), for a
+    /// spinner animated with gpui's `with_animation`
+    /// ([`IconElement::turn`](crate::icon::IconElement::turn)).
+    pub fn icon_turn(mut self, turns: f32) -> Self {
+        self.icon_turn = turns;
         self
     }
 
@@ -184,7 +195,7 @@ impl RenderOnce for Button {
             })
             .when_some(on_click, |d, on_click| activates(d, &ACTIVATION_KEYS, on_click))
             .children(self.icon.map(|icon| {
-                let icon = icon.size(self.icon_size.unwrap_or(style.icon_size));
+                let icon = icon.size(self.icon_size.unwrap_or(style.icon_size)).turn(self.icon_turn);
                 match self.icon_min_stroke {
                     Some(width) => icon.min_stroke(width),
                     None => icon,
