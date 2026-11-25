@@ -83,6 +83,12 @@ pub fn all() -> Vec<Case> {
         display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
         display("windows-agent-markdown", agent_markdown).needs_fake_agent(),
         display("windows-agent-continue", agent_continue).needs_fake_agent(),
+        display("windows-agent-login", agent_login).needs_fake_agent(),
+        display("windows-agent-login-withheld", agent_login_withheld).needs_fake_agent(),
+        // A login program's exit status through the holder's ConPTY: 0
+        // starts the agent again, 1 shows the methods with the status.
+        display("windows-agent-login-terminal", super::agent::login_terminal).needs_fake_agent(),
+        display("windows-agent-login-terminal-fails", super::agent::login_terminal_fails).needs_fake_agent(),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -1364,6 +1370,95 @@ fn agent_continue(ctx: &Ctx) -> Result<Outcome> {
         "no session/resume of s1: {resumed}"
     );
     ensure!(!recorded(&second, "session/new"), "a new conversation was started: {resumed}");
+    Ok(Outcome::Pass)
+}
+
+/// An agent login on Windows: an agent needing a login at the start offers
+/// its two methods in order; the first, chosen with tab and enter, shows
+/// logging in until Cancel login (tab, enter) sends `$/cancel_request`,
+/// the agent's late answer to the cancelled `authenticate` starts nothing,
+/// and the second (tab, tab, enter) logs in. The `-p` prompt, shown
+/// read-only through both logins, is then sent once and answered. The
+/// agent answers only the second `authenticate`, so the case needs no gate
+/// (the Linux cases open theirs from a Shell tab).
+fn agent_login(ctx: &Ctx) -> Result<Outcome> {
+    use super::agent::{LOGGING_IN, NEEDS_LOGIN, Script, TWO_CHOICES, TWO_LOGINS, logins_sent, recorded, recorded_count};
+    let received = ctx.dir.join("received.jsonl");
+    std::fs::remove_file(&received).ok();
+    let profile = Script::login_at_start(&received, TWO_LOGINS)
+        .step("expect authenticate")
+        .step("expect $/cancel_request")
+        .step("respond-to 3 {}")
+        .step("expect authenticate")
+        .step("respond {}")
+        .then_hello()
+        .profile(ctx, "agent")?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for(NEEDS_LOGIN)
+        .wait_for("prompt status=disabled first=\"hi\"")
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("enter")
+        .wait_for(LOGGING_IN)
+        .wait_for("--- login running method=\"oauth-personal\" \"Log in with Google\"")
+        .key("tab")
+        .key("enter")
+        .wait_for(NEEDS_LOGIN)
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("tab")
+        .key("enter")
+        .wait_for(&super::agent::answered())
+        .dump_at(16.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    ensure!(out.dump.agent_logins().is_empty(), "the row went: {:?}", out.dump.agent);
+    ensure!(super::agent::messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(!out.dump.agent.iter().any(|l| l.contains(" first=")), "still waiting: {:?}", out.dump.agent);
+    ensure!(recorded(&received, "$/cancel_request"), "no $/cancel_request was sent");
+    let logins = logins_sent(&received)?;
+    ensure!(logins == ["oauth-personal", "api-key"], "logins: {logins:?}");
+    ensure!(recorded_count(&received, "session/new") == 2, "the late answer started a session");
+    let sent = super::agent::prompts_sent(&received)?;
+    ensure!(sent == ["hi"], "sent: {sent:?}");
+    Ok(Outcome::Pass)
+}
+
+/// An agent profile run through `cmd /c`, as Windows runs `npx` agents:
+/// its terminal method is shown withheld, saying why, with no command line
+/// or environment, and isn't a stop (tab from the prompt doesn't reach
+/// it); the prompt input stays disabled, no login zone opens and nothing
+/// is sent to the agent.
+fn agent_login_withheld(ctx: &Ctx) -> Result<Outcome> {
+    use super::agent::{NEEDS_LOGIN, Script, TERMINAL_LOGIN, recorded};
+    let received = ctx.dir.join("received.jsonl");
+    std::fs::remove_file(&received).ok();
+    let script = Script::login_at_start(&received, TERMINAL_LOGIN).write(ctx, "agent")?;
+    let (fake, script) = (ctx.fake_agent.display().to_string(), script.display().to_string());
+    // TOML literal strings take the paths as they are, backslashes included.
+    ensure!(!fake.contains('\'') && !script.contains('\''), "a quote in {fake} or {script}");
+    let profile =
+        format!("\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"cmd\"\nargs = ['/c', '{fake}', '{script}']\n");
+    let choice = "--- login choice method=\"cli-login\" kind=terminal \"Log in from the terminal\" \
+                  withheld=\"the login can't be run through `cmd /c`\"";
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .wait_for(NEEDS_LOGIN)
+        .wait_for(choice)
+        .key("tab")
+        .dump_at(8.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    let logins = out.dump.agent_logins();
+    ensure!(logins.len() == 1 && !logins[0].contains(" args="), "the row: {logins:?}");
+    ensure!(out.dump.focus_stop.as_deref() != Some("login:cli-login"), "a withheld method took focus: {:?}", out.dump.focus_stop);
+    super::agent::agent_has(&out, "prompt status=disabled")?;
+    ensure!(out.dump.zones.is_none(), "a login zone opened: {:?}", out.dump.zones);
+    ensure!(!recorded(&received, "authenticate"), "a terminal method was sent to the agent");
     Ok(Outcome::Pass)
 }
 

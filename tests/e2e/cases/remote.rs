@@ -380,6 +380,94 @@ pub fn agent_ssh(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A terminal login over SSH: an agent profile on the container (an SSH
+/// host profile, so its terminal method isn't withheld) whose agent needs
+/// a login at the start offers the method; enter opens the login zone,
+/// whose program (the profile's command with `login`) runs in the
+/// container, gets the method's `LOGIN_MODE` and not its `PATH`, and exits
+/// 0. The agent is then started again in the container with the profile's
+/// command, takes a new conversation (it had none) and answers the `-p`
+/// prompt, which waited through the login and is sent once. After the
+/// quit, root's server lists the agent's session alone, detached: the
+/// login program's ended with it. Skips as [`agent_ssh`] does.
+pub fn agent_login_terminal(ctx: &Ctx) -> Result<Outcome> {
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let Some(fake) = static_fake_agent()? else {
+        return Ok(Outcome::Skip(format!(
+            "the static fake ACP agent isn't built ({} is missing): run {}",
+            crate::common::fake_agent::STATIC_LINUX,
+            crate::common::fake_agent::STATIC_LINUX_BUILD
+        )));
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    use super::agent::{NEEDS_LOGIN, NEITHER, Script, TERMINAL_CHOICE, TERMINAL_LOGIN};
+    let agent = "/usr/local/bin/brindle-fake-acp-agent";
+    let (script, next, env, gate) = ("/root/agent.script", "/root/next.script", "/root/login.env", "/root/login-done");
+    let (first, second) = ("/root/first.jsonl", "/root/second.jsonl");
+    ssh.container.copy_to(&fake, agent)?;
+    ssh.container.exec(&["chmod", "755", agent])?;
+    // The login program records its environment, then exits 0 once the
+    // case opens `gate`; the agent started again after it runs the
+    // profile's command, so the case first puts the second agent's script
+    // in the first's place in the container.
+    let login = [format!("wait-file {gate}"), "exit 0".to_string()];
+    let first_agent = Script::login_at_start(Path::new(first), TERMINAL_LOGIN);
+    let first_agent = super::agent::with_terminal_login(first_agent, Path::new(env), &login).write(ctx, "agent")?;
+    let second_agent = Script::initialized(Path::new(second), NEITHER).then_hello().write(ctx, "next")?;
+    ssh.container.copy_to(&first_agent, script)?;
+    ssh.container.copy_to(&second_agent, next)?;
+
+    let config = ssh.agent_profile(AGENT_PROFILE, agent, script);
+    let (docker, scale) = (ssh.container.docker.clone(), ctx.scale());
+    let out = needs
+        .run(ctx, "agent", &config)
+        .agent(AGENT_PROFILE)
+        .first_prompt("hi")
+        .keep_detached()
+        // Once the login program runs in the container (its environment is
+        // recorded), the second agent's script takes the first's place and
+        // the gate opens.
+        .call_at(1.0, move |_| {
+            scale.eventually(60.0, "the login program's environment in the container", || {
+                docker.exec(&["test", "-s", env]).is_ok()
+            })?;
+            docker.exec(&["sh", "-c", &format!("cp {next} {script} && touch {gate}")])?;
+            Ok(())
+        })
+        .wait_for(NEEDS_LOGIN)
+        .wait_for("prompt status=disabled first=\"hi\"")
+        .wait_for(TERMINAL_CHOICE)
+        .key("tab")
+        .key("enter")
+        // The login zone is active until its program exits.
+        .wait_for(&super::agent::answered())
+        .dump_at(25.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    ensure!(out.dump.zones.is_none(), "the login zone closed: {:?}", out.dump.zones);
+    ensure!(super::agent::messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(
+        super::agent::has_notice(&out, "the agent is started again after its login"),
+        "no restart notice: {:?}",
+        out.dump.agent
+    );
+    let recorded = ssh.container.exec(&["cat", env])?;
+    ensure!(recorded.lines().any(|l| l == "LOGIN_MODE=device"), "LOGIN_MODE not applied: {recorded}");
+    ensure!(!recorded.lines().any(|l| l == "PATH=/nowhere"), "PATH applied: {recorded}");
+    let sent = ssh.container.exec(&["cat", first])?;
+    ensure!(!sent.contains("\"authenticate\"") && !sent.contains("\"session/prompt\""), "the first agent was sent: {sent}");
+    let sent = ssh.container.exec(&["cat", second])?;
+    let prompts = sent.lines().filter(|line| line.contains("\"session/prompt\"")).count();
+    ensure!(prompts == 1 && sent.contains("\"text\":\"hi\""), "the agent started again was sent `hi` once: {sent}");
+    ensure!(sent.contains("\"session/new\""), "no new conversation: {sent}");
+    let listed = parse_list(&ssh.container.helper(&["list"])?);
+    ensure!(listed.len() == 1 && !listed[0].attached, "root's server lists {listed:?}");
+    Ok(Outcome::Pass)
+}
+
 /// The static fake ACP agent ([`crate::common::fake_agent::STATIC_LINUX`])
 /// when it is built and no older than its sources; `None` when it is
 /// missing, an error then with `BRINDLE_REMOTE_E2E_REQUIRED=1`.

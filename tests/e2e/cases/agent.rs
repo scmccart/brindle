@@ -1642,7 +1642,7 @@ pub(super) const RESUME: &str = r#"{"sessionCapabilities":{"resume":{}}}"#;
 /// `agentCapabilities` offering `session/load` alone (as Copilot does).
 const LOAD: &str = r#"{"loadSession":true}"#;
 /// `agentCapabilities` offering neither.
-const NEITHER: &str = "{}";
+pub(super) const NEITHER: &str = "{}";
 
 /// What `--wait-for` waits for until the first agent has exited.
 pub(super) const EXITED: &str = "state=exited:1";
@@ -1714,7 +1714,7 @@ pub(super) fn has_notice(out: &crate::brindle::Output, text: &str) -> bool {
 }
 
 /// How many messages with `method` the agent's record holds.
-fn recorded_count(received: &Path, method: &str) -> usize {
+pub(super) fn recorded_count(received: &Path, method: &str) -> usize {
     let text = std::fs::read_to_string(received).unwrap_or_default();
     text.lines().filter(|line| line.contains(&format!("\"method\":\"{method}\""))).count()
 }
@@ -2075,28 +2075,28 @@ pub fn continue_not_restored(ctx: &Ctx) -> Result<Outcome> {
 // `authenticate` for an agent method and Brindle runs a terminal one.
 
 /// Two agent methods, in this order.
-const TWO_LOGINS: &str =
+pub(super) const TWO_LOGINS: &str =
     r#"[{"id":"oauth-personal","name":"Log in with Google"},{"id":"api-key","name":"API Key","description":"Use an API key"}]"#;
 
 /// One terminal method: the profile's command with `login`, setting
 /// `LOGIN_MODE` and asking for `PATH`, which Brindle leaves out.
-const TERMINAL_LOGIN: &str = r#"[{"id":"cli-login","name":"Log in from the terminal","type":"terminal","args":["login"],"env":{"LOGIN_MODE":"device","PATH":"/nowhere"}}]"#;
+pub(super) const TERMINAL_LOGIN: &str = r#"[{"id":"cli-login","name":"Log in from the terminal","type":"terminal","args":["login"],"env":{"LOGIN_MODE":"device","PATH":"/nowhere"}}]"#;
 
 /// What `--wait-for` waits for while the agent needs a login.
-const NEEDS_LOGIN: &str = "state=login-required";
+pub(super) const NEEDS_LOGIN: &str = "state=login-required";
 
 /// What `--wait-for` waits for while the agent logs in.
-const LOGGING_IN: &str = "state=logging-in";
+pub(super) const LOGGING_IN: &str = "state=logging-in";
 
 /// The two agent methods' choices, in order, as `--wait-for` sees them.
-const TWO_CHOICES: &str = "--- login choice method=\"oauth-personal\" kind=agent \"Log in with Google\"\n\
+pub(super) const TWO_CHOICES: &str = "--- login choice method=\"oauth-personal\" kind=agent \"Log in with Google\"\n\
                            --- login choice method=\"api-key\" kind=agent \"API Key\" description=\"Use an API key\"";
 
 impl Script {
     /// An agent that records what it is sent in `received` and answers
     /// `initialize` offering `capabilities` and the login `methods` (a
     /// JSON array such as [`TWO_LOGINS`]).
-    fn offering_logins(received: &Path, capabilities: &str, methods: &str) -> Self {
+    pub(super) fn offering_logins(received: &Path, capabilities: &str, methods: &str) -> Self {
         Script(vec![
             format!("record {}", received.display()),
             "expect initialize".into(),
@@ -2107,14 +2107,14 @@ impl Script {
     }
 
     /// As [`Script::offering_logins`], whose `session/new` needs a login.
-    fn login_at_start(received: &Path, methods: &str) -> Self {
+    pub(super) fn login_at_start(received: &Path, methods: &str) -> Self {
         Script::offering_logins(received, NEITHER, methods)
             .step("expect session/new")
             .step(r#"respond-error -32000 "run fake login""#)
     }
 
     /// The login's `session/new`, then a turn answering [`HELLO`].
-    fn then_hello(self) -> Self {
+    pub(super) fn then_hello(self) -> Self {
         self.step("expect session/new")
             .step(r#"respond {"sessionId":"s1"}"#)
             .step("expect session/prompt")
@@ -2124,7 +2124,7 @@ impl Script {
 }
 
 /// The `authenticate` requests' method ids, in order, from a record.
-fn logins_sent(received: &Path) -> Result<Vec<String>> {
+pub(super) fn logins_sent(received: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(received).map_err(|e| format!("reading {}: {e}", received.display()))?;
     let mut methods = Vec::new();
     for line in text.lines() {
@@ -2357,7 +2357,7 @@ pub fn login_close(ctx: &Ctx) -> Result<Outcome> {
 /// `agent` (the steps with no arguments), then the login program's
 /// section (`args login`): it records its environment in `env`, then
 /// plays `login`.
-fn with_terminal_login(agent: Script, env: &Path, login: &[String]) -> Script {
+pub(super) fn with_terminal_login(agent: Script, env: &Path, login: &[String]) -> Script {
     let mut script = agent.step("args login").step(format!("record-env {}", env.display()));
     for step in login {
         script = script.step(step.clone());
@@ -2366,7 +2366,7 @@ fn with_terminal_login(agent: Script, env: &Path, login: &[String]) -> Script {
 }
 
 /// The terminal method's choice line, as `--wait-for` sees it.
-const TERMINAL_CHOICE: &str = "--- login choice method=\"cli-login\" kind=terminal \"Log in from the terminal\" \
+pub(super) const TERMINAL_CHOICE: &str = "--- login choice method=\"cli-login\" kind=terminal \"Log in from the terminal\" \
                                args=\"login\" env=\"LOGIN_MODE=device\" dropped=\"PATH\"";
 
 /// A terminal login after a prompt's demand: the choice says what it runs
