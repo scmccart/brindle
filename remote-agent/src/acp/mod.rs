@@ -13,9 +13,13 @@
 //! - [`reduce`]: the reducer ([`reduce::step`] over a [`reduce::AgentSession`]),
 //!   which turns the agent's stdout, the client's commands and the holder's
 //!   events into transcript events, stdin bytes, replies and checkpoints.
+//! - [`checkpoint`]: an [`reduce::AgentSession`] encoded for its holder and
+//!   decoded by the next core ([`checkpoint::adopt`]), or adopted as a
+//!   conversation that could not be restored.
 //!
 //! Each is a whole pure module (`fcis` R2, R3; `PURE_MODULES`).
 
+pub mod checkpoint;
 pub mod lines;
 pub mod reduce;
 pub mod rpc;
