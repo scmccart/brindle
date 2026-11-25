@@ -1,0 +1,1 @@
+{"entry":{"call":"call_1","options":[{"id":"allow-once","kind":"allow_once","name":"Allow"},{"id":"allow-always","kind":"allow_always","name":"Always allow"},{"id":"reject-once","kind":"reject_once","name":"Reject"},{"id":"reject-always","kind":"reject_always","name":"Always reject"}],"title":"Write notes.md","type":"permission"},"event":"added","id":5}
