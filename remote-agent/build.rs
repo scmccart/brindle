@@ -1,7 +1,8 @@
 //! Windows builds embed the packaged ConPTY that `scripts/fetch-conpty.ps1`
 //! fetches into `.conpty/<version>/`, and copy it next to the built exe so
 //! a helper run from the build directory loads it from there. They also
-//! compile the version resource into the exe. Other targets do nothing here.
+//! compile the version resource into the helper's exe (not the fake ACP
+//! agent's). Other targets do nothing here.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,9 @@ fn main() {
     }
 }
 
-/// Compiles `brindle-remote.rc` into the exe, with the crate's version.
+/// Compiles `brindle-remote.rc` into the helper's exe, with the crate's
+/// version. Only `brindle-remote` links it: the package's other binary, the
+/// tests' fake ACP agent, is not the helper and carries no version resource.
 #[cfg(windows)]
 fn resources() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -29,7 +32,7 @@ fn resources() {
         format!("BRINDLE_MINOR={}", number("CARGO_PKG_VERSION_MINOR")),
         format!("BRINDLE_PATCH={}", number("CARGO_PKG_VERSION_PATCH")),
     ];
-    embed_resource::compile(&rc, &macros)
+    embed_resource::compile_for(&rc, ["brindle-remote"], &macros)
         .manifest_optional()
         .expect("compiling remote-agent/brindle-remote.rc");
 }
