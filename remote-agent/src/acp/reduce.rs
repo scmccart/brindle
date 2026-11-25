@@ -307,6 +307,7 @@ impl AgentSession {
             AgentState::Starting
             | AgentState::Ready { .. }
             | AgentState::LoginRequired { .. }
+            | AgentState::LoggingIn { .. }
             | AgentState::Failed { .. } => false,
         };
         ended
@@ -693,6 +694,7 @@ impl Step<'_> {
             AgentState::Starting
             | AgentState::Ready { .. }
             | AgentState::LoginRequired { .. }
+            | AgentState::LoggingIn { .. }
             | AgentState::Exited { .. }
             | AgentState::Lost { .. } => "ACP handling failed".to_owned(),
         }
@@ -848,6 +850,7 @@ impl Step<'_> {
                 | AgentState::Starting
                 | AgentState::Ready { .. }
                 | AgentState::LoginRequired { .. }
+                | AgentState::LoggingIn { .. }
                 | AgentState::Failed { .. } => {}
             }
         } else {
@@ -1523,6 +1526,7 @@ impl Step<'_> {
         self.s.phase = Phase::LoginRequired;
         self.agent(AgentState::LoginRequired {
             message: bound(clean(&error.message)),
+            methods: Vec::new(),
         });
         self.mark(Moment::Started);
     }
@@ -1546,7 +1550,10 @@ impl Step<'_> {
                 self.turn(TurnState::Failed {
                     message: message.clone(),
                 });
-                self.agent(AgentState::LoginRequired { message });
+                self.agent(AgentState::LoginRequired {
+                    message,
+                    methods: Vec::new(),
+                });
                 self.mark(Moment::TurnEnded);
             }
             Err(error) => self.end_turn(Ending::Failed(bound(clean(&error.message)))),
@@ -2149,6 +2156,7 @@ mod tests {
             AgentState::Starting => "starting",
             AgentState::Ready { .. } => "ready",
             AgentState::LoginRequired { .. } => "login required",
+            AgentState::LoggingIn { .. } => "logging in",
             AgentState::Failed { .. } => "failed",
             AgentState::Exited { .. } => "exited",
             AgentState::Lost { .. } => "lost",
@@ -2360,7 +2368,8 @@ mod tests {
         assert_eq!(
             *agent.agent_state(),
             AgentState::LoginRequired {
-                message: "run agent login".into()
+                message: "run agent login".into(),
+                methods: Vec::new(),
             }
         );
         assert!(!out.hang_up);
@@ -2525,7 +2534,8 @@ mod tests {
         assert_eq!(
             *agent.agent_state(),
             AgentState::LoginRequired {
-                message: "Authentication required".into()
+                message: "Authentication required".into(),
+                methods: Vec::new(),
             }
         );
         assert_eq!(
@@ -4497,7 +4507,8 @@ mod tests {
             assert_eq!(
                 *agent.agent_state(),
                 AgentState::LoginRequired {
-                    message: "log in first".into()
+                    message: "log in first".into(),
+                    methods: Vec::new(),
                 }
             );
             assert_eq!(*agent.s.phase(), Phase::LoginRequired);

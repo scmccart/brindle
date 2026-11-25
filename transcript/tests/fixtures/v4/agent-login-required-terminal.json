@@ -1,0 +1,1 @@
+{"event":"agent","state":{"agent":"login_required","message":"Authentication required","methods":[{"args":["login"],"description":"Paste a code from your browser","env":{"LOGIN_MODE":"device","NO_BROWSER":"1"},"id":"cli-login","kind":"terminal","name":"Log in from the terminal"}]}}

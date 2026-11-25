@@ -347,6 +347,8 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
         SessionLife::Open => match phase {
             AgentPhase::Live(AgentState::Ready { .. }) => return Resend::Available,
             AgentPhase::Live(AgentState::Starting) => "the agent is starting",
+            // Stopgap until agents-login task 6.1.
+            AgentPhase::Live(AgentState::LoggingIn { .. }) => "the agent is logging in",
             AgentPhase::Live(AgentState::LoginRequired { .. }) => {
                 "the agent needs a login; open the profile again after logging in"
             }
@@ -427,13 +429,14 @@ pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>) -> 
             ..alert(format!("Brindle could not start the agent {command}: {cause}"), true, None)
         }),
         AgentPhase::NotStarted(StartFailure::TooOld { endpoint }) => Some(alert(too_old_text(endpoint), true, None)),
-        AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. }) => match life {
+        // `LoggingIn`: a stopgap until agents-login task 6.1.
+        AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match life {
             SessionLife::Open => None,
             SessionLife::Ended => {
                 Some(alert(format!("the agent session on {} has ended", names.endpoint), true, None))
             }
         },
-        AgentPhase::Live(AgentState::LoginRequired { message }) => Some(alert(
+        AgentPhase::Live(AgentState::LoginRequired { message, .. }) => Some(alert(
             format!(
                 "{agent} needs you to log in. Log in through the agent's own command line, then open the profile again."
             ),
@@ -598,6 +601,7 @@ pub fn continue_offer(
                 AgentState::Starting
                 | AgentState::Ready { .. }
                 | AgentState::LoginRequired { .. }
+                | AgentState::LoggingIn { .. }
                 | AgentState::Failed { .. },
             ),
             SessionLife::Open | SessionLife::Ended,
@@ -1228,7 +1232,10 @@ impl ChatModel {
                 (false, Link::Up) => Some(First::Send(first.text().to_string())),
                 (false, Link::Reconnecting) => None,
             },
-            (AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting), SessionLife::Open) => None,
+            (
+                AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. }),
+                SessionLife::Open,
+            ) => None,
             (
                 AgentPhase::NotStarted(_)
                 | AgentPhase::Live(
@@ -1257,6 +1264,8 @@ impl ChatModel {
             AgentPhase::Lost { .. } => disabled(DisabledWhy::Lost),
             AgentPhase::Broken { .. } => disabled(DisabledWhy::Broken),
             AgentPhase::Live(AgentState::Starting) => disabled(DisabledWhy::Starting),
+            // Stopgap until agents-login task 6.1's `DisabledWhy::LoggingIn`.
+            AgentPhase::Live(AgentState::LoggingIn { .. }) => disabled(DisabledWhy::Starting),
             AgentPhase::Live(AgentState::LoginRequired { .. }) => disabled(DisabledWhy::LoginRequired),
             AgentPhase::Live(AgentState::Failed { .. }) => disabled(DisabledWhy::Failed),
             AgentPhase::Live(AgentState::Exited { .. }) => disabled(DisabledWhy::Exited),
@@ -1349,6 +1358,7 @@ impl ChatModel {
                 AgentState::Starting
                 | AgentState::Ready { .. }
                 | AgentState::LoginRequired { .. }
+                | AgentState::LoggingIn { .. }
                 | AgentState::Failed { .. },
             ) => true,
             AgentPhase::Live(AgentState::Exited { .. } | AgentState::Lost { .. })
@@ -1523,11 +1533,15 @@ impl ChatModel {
     fn error_text(&self) -> String {
         match &self.phase {
             AgentPhase::Live(
-                AgentState::LoginRequired { message } | AgentState::Failed { message } | AgentState::Lost { message },
+                AgentState::LoginRequired { message, .. }
+                | AgentState::Failed { message }
+                | AgentState::Lost { message },
             ) => message.clone(),
             AgentPhase::Live(AgentState::Exited { code: Some(code), .. }) => format!("exited with status {code}"),
             AgentPhase::Live(AgentState::Exited { code: None, .. }) => "ended by a signal".into(),
-            AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. }) => match &self.turn {
+            AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match &self
+                .turn
+            {
                 TurnState::Failed { message } => message.clone(),
                 TurnState::Ended { stop } => format!("the turn ended: {}", stop_word(stop)),
                 TurnState::Idle | TurnState::Working | TurnState::Blocked | TurnState::Cancelling => "error".into(),
@@ -1609,14 +1623,18 @@ impl ChatModel {
         }
         out.push_str(&format!(" state={}", state_word(&self.phase)));
         match &self.phase {
-            AgentPhase::Live(AgentState::LoginRequired { message } | AgentState::Failed { message }) => {
+            AgentPhase::Live(AgentState::LoginRequired { message, .. } | AgentState::Failed { message }) => {
                 out.push_str(&format!(" message={message:?}"));
             }
             // The failure as logged, the server's cause verbatim (on
             // Windows a batch file's `cmd /c` form included).
             AgentPhase::NotStarted(failure) => out.push_str(&format!(" message={:?}", failure.to_string())),
             AgentPhase::Live(
-                AgentState::Starting | AgentState::Ready { .. } | AgentState::Exited { .. } | AgentState::Lost { .. },
+                AgentState::Starting
+                | AgentState::Ready { .. }
+                | AgentState::LoggingIn { .. }
+                | AgentState::Exited { .. }
+                | AgentState::Lost { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::Lost { .. }
@@ -1709,6 +1727,7 @@ fn state_word(phase: &AgentPhase) -> String {
         AgentPhase::Live(AgentState::Starting) => "starting".into(),
         AgentPhase::Live(AgentState::Ready { .. }) => "ready".into(),
         AgentPhase::Live(AgentState::LoginRequired { .. }) => "login-required".into(),
+        AgentPhase::Live(AgentState::LoggingIn { .. }) => "logging-in".into(),
         AgentPhase::Live(AgentState::Failed { .. }) => "failed".into(),
         AgentPhase::Live(AgentState::Exited { code: Some(code), .. }) => format!("exited:{code}"),
         AgentPhase::Live(AgentState::Exited { code: None, .. }) => "exited:signal".into(),
@@ -1906,7 +1925,7 @@ mod tests {
             AgentPhase::NotStarted(StartFailure::Refused { command: "fake".into(), cause: "not found".into() }),
             AgentPhase::Live(AgentState::Starting),
             AgentPhase::Live(AgentState::Ready { name: None, version: None }),
-            AgentPhase::Live(AgentState::LoginRequired { message: "log in".into() }),
+            AgentPhase::Live(AgentState::LoginRequired { message: "log in".into(), methods: Vec::new() }),
             AgentPhase::Live(AgentState::Failed { message: "bad".into() }),
             AgentPhase::Live(AgentState::Exited { code: Some(1), stderr: "boom".into() }),
             AgentPhase::Live(AgentState::Lost { message: "its holder ended".into() }),
@@ -2036,7 +2055,7 @@ mod tests {
         assert_eq!(zone.replay(&[ready()]).first, draft, "never sent from a replay");
 
         let failed = [
-            AgentState::LoginRequired { message: "log in".into() },
+            AgentState::LoginRequired { message: "log in".into(), methods: Vec::new() },
             AgentState::Failed { message: "bad".into() },
             AgentState::Exited { code: Some(1), stderr: String::new() },
         ];
@@ -2103,7 +2122,7 @@ mod tests {
                 }
             }
         }
-        let login = AgentPhase::Live(AgentState::LoginRequired { message: "log in".into() });
+        let login = AgentPhase::Live(AgentState::LoginRequired { message: "log in".into(), methods: Vec::new() });
         assert_eq!(
             resend_of(&login, SessionLife::Open),
             Resend::Unavailable("the agent needs a login; open the profile again after logging in".into())
@@ -2209,7 +2228,7 @@ mod tests {
         let absorbed = zone.feed(&[
             queue(held(HoldReason::LoginRequired)),
             turn(TurnState::Failed { message: message.into() }),
-            agent_state(AgentState::LoginRequired { message: message.into() }),
+            agent_state(AgentState::LoginRequired { message: message.into(), methods: Vec::new() }),
         ]);
         assert_eq!(absorbed.status, Some(Some(State::Error)));
         assert_eq!(zone.model.turn(), &TurnState::Failed { message: message.into() });
@@ -2865,6 +2884,7 @@ mod tests {
                                 AgentState::Starting
                                 | AgentState::Ready { .. }
                                 | AgentState::LoginRequired { .. }
+                                | AgentState::LoggingIn { .. }
                                 | AgentState::Failed { .. },
                             ) => false,
                         };

@@ -182,6 +182,7 @@ impl Agent {
                     AgentState::Ready { name, .. } => name.clone(),
                     AgentState::Starting
                     | AgentState::LoginRequired { .. }
+                    | AgentState::LoggingIn { .. }
                     | AgentState::Failed { .. }
                     | AgentState::Exited { .. }
                     | AgentState::Lost { .. } => None,

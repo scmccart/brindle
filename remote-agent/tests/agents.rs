@@ -1499,7 +1499,7 @@ fn login_required_by_session_new_refuses_prompts() {
         .step("expect session/new")
         .step(r#"respond-error -32000 "run agent login""#);
     let (id, pid) = spawned(&mut client, &mut dir, client_agent(&script.write()));
-    let needs_login = AgentState::LoginRequired { message: "run agent login".into() };
+    let needs_login = AgentState::LoginRequired { message: "run agent login".into(), methods: Vec::new() };
     client.transcript_until(id, "needs a login", |log| *log.agent() == needs_login);
 
     let refusal = client.prompt(id, "hi").unwrap_err();
@@ -1519,7 +1519,7 @@ fn login_demanded_by_a_prompt_holds_the_waiting_one() {
     client.prompt(id, "two").unwrap();
     gate.open();
 
-    let needs_login = AgentState::LoginRequired { message: "session expired".into() };
+    let needs_login = AgentState::LoginRequired { message: "session expired".into(), methods: Vec::new() };
     let log = client.transcript_until(id, "needs a login", |log| *log.agent() == needs_login);
     assert!(matches!(log.turn(), TurnState::Failed { .. }), "{:?}", log.turn());
     assert_eq!(*log.slot(), held("two", HoldReason::LoginRequired));
