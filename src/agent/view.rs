@@ -35,8 +35,11 @@ use crate::actions::{
     AgentCancel, AgentContinue, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
     CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts,
 };
+use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
-use crate::agent::model::{AgentPhase, Block, BlockBody, ChatModel, NoOffer, Offer, PromptStatus, QueueRow, Resend};
+use crate::agent::model::{
+    AgentPhase, Block, BlockBody, ChatModel, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow, Resend,
+};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
 use crate::agent::{Agent, AgentUpdate};
 use crate::settings::Settings;
@@ -99,6 +102,31 @@ pub fn item_padding(block: &Block) -> (bool, bool) {
 
 /// The Continue conversation button's label.
 pub const CONTINUE: &str = "Continue conversation";
+
+/// The login row's Cancel login button's label.
+pub const CANCEL_LOGIN: &str = "Cancel login";
+
+/// The login row's title (OpenSpec change `agents-login`, decision 6).
+pub fn login_title(row: &LoginRow) -> Option<SharedString> {
+    match row {
+        LoginRow::None => None,
+        LoginRow::Choose { .. } => Some("Log in to continue".into()),
+        LoginRow::Running { name, .. } => Some(format!("Logging in with {name}…").into()),
+    }
+}
+
+/// What a method's button says under its name: the agent's description
+/// as plain text (backticks kept), then what a terminal login runs and
+/// sets, or why it is withheld.
+pub fn method_description(choice: &MethodChoice) -> Option<SharedString> {
+    let extra = match &choice.offer {
+        MethodOffer::Agent => None,
+        MethodOffer::Terminal(plan) => Some(plan.shown()).filter(|shown| !shown.is_empty()),
+        MethodOffer::Withheld(withheld) => Some(withheld.why.clone()),
+    };
+    let parts: Vec<&str> = choice.description.as_ref().map(|d| d.as_ref()).into_iter().chain(extra.as_deref()).collect();
+    (!parts.is_empty()).then(|| parts.join(" · ").into())
+}
 
 /// What the prompt input shows: its status and queue row, and its reason
 /// line, `reason` then the `action` button's label.
@@ -203,6 +231,13 @@ pub struct AgentView {
     /// The pending permission requests' buttons, in the conversation's
     /// order, keyed by entry and option (`types R3`).
     permissions: Vec<((EntryId, SharedString), FocusHandle)>,
+    /// The login row as the model last gave it.
+    login: LoginRow,
+    /// The login row's enabled method buttons, keyed by method id
+    /// (`types R3`).
+    logins: Vec<(SharedString, FocusHandle)>,
+    /// Cancel login's handle, a stop while a login runs.
+    cancel_login: FocusHandle,
     theme: Theme,
     /// The profile's font size, else the terminal size in effect.
     font_size_override: Option<f32>,
@@ -221,13 +256,15 @@ impl Focusable for AgentView {
 
 impl FocusStops for AgentView {
     /// The prompt, the Continue conversation button while it shows, the
-    /// queue row's buttons, the pending permissions' buttons, then the
-    /// stop button while a turn runs.
+    /// queue row's buttons, the login row's method buttons or its Cancel
+    /// login, the pending permissions' buttons, then the stop button while
+    /// a turn runs.
     fn stops(&self, cx: &App) -> Vec<FocusHandle> {
         let prompt = self.prompt.read(cx);
         let mut stops = vec![prompt.focus_handle(cx)];
         stops.extend(prompt.action_stop());
         stops.extend(prompt.row_stops());
+        stops.extend(self.login_stops());
         stops.extend(self.permissions.iter().map(|(_, handle)| handle.clone()));
         stops.extend(prompt.stop_button());
         stops
@@ -267,6 +304,9 @@ impl AgentView {
             scroller,
             prompt,
             permissions: Vec::new(),
+            login: LoginRow::None,
+            logins: Vec::new(),
+            cancel_login: cx.focus_handle(),
             theme,
             font_size_override,
             _subscriptions: subscriptions,
@@ -301,10 +341,38 @@ impl AgentView {
                 .to_string(),
             );
         }
+        if let Some((id, _)) = self.logins.iter().find(|(_, handle)| handle.is_focused(window)) {
+            return Some(format!("login:{id}"));
+        }
+        if self.cancel_login.is_focused(window) {
+            return Some("login:cancel".into());
+        }
         self.permissions
             .iter()
             .find(|(_, handle)| handle.is_focused(window))
             .map(|((entry, option), _)| format!("permission:{}:{option}", entry.0))
+    }
+
+    /// The login row's stops: its enabled method buttons in order, or
+    /// Cancel login while a login runs.
+    fn login_stops(&self) -> Vec<FocusHandle> {
+        match &self.login {
+            LoginRow::None => Vec::new(),
+            LoginRow::Choose { .. } => self.logins.iter().map(|(_, handle)| handle.clone()).collect(),
+            LoginRow::Running { .. } => vec![self.cancel_login.clone()],
+        }
+    }
+
+    /// The login row's method `id`'s focus handle, while it is a stop.
+    #[cfg(test)]
+    pub fn login_handle(&self, id: &str) -> Option<&FocusHandle> {
+        self.logins.iter().find(|(own, _)| own.as_ref() == id).map(|(_, handle)| handle)
+    }
+
+    /// Cancel login's handle.
+    #[cfg(test)]
+    pub fn cancel_login_handle(&self) -> &FocusHandle {
+        &self.cancel_login
     }
 
     pub fn scroller(&self) -> &Entity<MessageScroller> {
@@ -344,6 +412,11 @@ impl AgentView {
             }),
             AgentUpdate::ClearDraft => self.prompt.update(cx, |prompt, cx| prompt.set_text("", cx)),
             AgentUpdate::SetDraft(text) => self.prompt.update(cx, |prompt, cx| prompt.set_text(text, cx)),
+            AgentUpdate::SendFirstIfUnchanged(text) => {
+                if self.prompt.read(cx).area().read(cx).text() == text.as_str() {
+                    self.agent.update(cx, |agent, cx| agent.send_first(text, cx));
+                }
+            }
         }
     }
 
@@ -380,6 +453,18 @@ impl AgentView {
         let agent = self.agent.read(cx);
         let state = prompt_state(agent.model(), &agent.offer(cx));
         let pending = agent.model().pending_permissions();
+        let login = agent.model().login_row();
+        let mut kept = std::mem::take(&mut self.logins);
+        if let LoginRow::Choose { methods, .. } = &login {
+            for choice in methods.iter().filter(|choice| choice.offer.usable()) {
+                let handle = match kept.iter().position(|(own, _)| *own == choice.id) {
+                    Some(at) => kept.swap_remove(at).1,
+                    None => cx.focus_handle(),
+                };
+                self.logins.push((choice.id.clone(), handle));
+            }
+        }
+        self.login = login;
         self.prompt.update(cx, |prompt, cx| {
             prompt.set_status(state.status, cx);
             prompt.set_queued(state.queued, cx);
@@ -486,6 +571,50 @@ impl AgentView {
 
     fn page(&mut self, dir: PageDirection, cx: &mut Context<Self>) {
         self.scroller.update(cx, |scroller, cx| scroller.scroll_page(dir, cx));
+    }
+
+    /// The login row (decision 6): `brindle-ui`'s confirmation, one plain
+    /// action per method in the agent's order with its description,
+    /// withheld ones disabled, none focused; Cancel login while one runs.
+    /// A note (a refused login, a login program's exit) under the title.
+    fn login_row(&self, cx: &App) -> Option<impl IntoElement + use<>> {
+        let title = login_title(&self.login)?;
+        let note = self.agent.read(cx).model().login_note().map(str::to_string);
+        let error = self.theme.ansi[1].hsla();
+        let mut row = Confirmation::new("agent-login", title, ConfirmationState::Requested);
+        match &self.login {
+            LoginRow::None => return None,
+            LoginRow::Choose { methods, .. } => {
+                for choice in methods {
+                    let mut action = ConfirmationAction::new(choice.name.clone())
+                        .key(ItemKey::new(choice.id.clone()))
+                        .disabled(!choice.offer.usable());
+                    if let Some(description) = method_description(choice) {
+                        action = action.description(description);
+                    }
+                    if let Some((_, handle)) = self.logins.iter().find(|(id, _)| *id == choice.id) {
+                        action = action.focus(handle);
+                    }
+                    row = row.action(action);
+                }
+                let agent = self.agent.downgrade();
+                row = row.on_action(move |key: &ItemKey, _, cx| {
+                    let method = key.as_str().to_string();
+                    agent.update(cx, |agent, cx| agent.choose_login(&method, cx)).ok();
+                });
+            }
+            LoginRow::Running { .. } => {
+                row = row.action(ConfirmationAction::new(CANCEL_LOGIN).key("cancel").focus(&self.cancel_login));
+                let agent = self.agent.downgrade();
+                row = row.on_action(move |_: &ItemKey, _, cx| {
+                    agent.update(cx, |agent, cx| agent.cancel_login(cx)).ok();
+                });
+            }
+        }
+        let row = row.children(note.map(|note| {
+            div().debug_selector(|| "agent-login-note".into()).text_color(error).whitespace_normal().child(note)
+        }));
+        Some(div().debug_selector(|| "agent-login".into()).child(row))
     }
 
     /// The alert for the zone's phase: its text, the agent's own words in
@@ -723,6 +852,7 @@ impl Render for AgentView {
         let banner = model.banner(&endpoint);
         let note = model.note().map(str::to_string);
         let alert = self.alert(cx);
+        let login = self.login_row(cx);
         let settings = Settings::get(cx);
         let (size, family) = (self.text_size(cx), settings.ui_font_family());
         let (bg, fg) = (self.theme.background.hsla(), self.theme.foreground.hsla());
@@ -789,6 +919,7 @@ impl Render for AgentView {
                             .pt_1()
                             .pb_3()
                             .children(alert)
+                            .children(login)
                             .child(self.prompt.clone()),
                     ),
             );

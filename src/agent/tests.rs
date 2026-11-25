@@ -347,3 +347,105 @@ fn a_closed_zone_continues_nothing() {
     });
     assert_eq!(zone.take_calls(), [Call::Close]);
 }
+
+// OpenSpec change `agents-login`, task 7.1.
+
+fn methods() -> Vec<crate::agent::transcript::LoginMethod> {
+    use crate::agent::transcript::{LoginKind, LoginMethod};
+    vec![
+        LoginMethod { id: "google".into(), name: "Log in with Google".into(), description: None, kind: LoginKind::Agent },
+        LoginMethod {
+            id: "cli".into(),
+            name: "Log in from the terminal".into(),
+            description: None,
+            kind: LoginKind::Terminal { args: vec!["--login".into()], env: [("LOGIN_MODE".to_string(), "device".to_string())].into() },
+        },
+    ]
+}
+
+fn login_required() -> Event {
+    Event::Agent { state: AgentState::LoginRequired { message: "Authentication required".into(), methods: methods() } }
+}
+
+/// An agent method's choice sends `AGENT_LOGIN` once; its refusal shows
+/// beside the row; Cancel login while logging in sends `AGENT_CANCEL`.
+#[test]
+fn a_login_choice_sends_agent_login_and_cancel_login_cancels() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    zone.feed(&[login_required()]);
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| {
+        agent.choose_login("google", cx);
+        agent.choose_login("google", cx);
+    });
+    assert_eq!(zone.take_calls(), [Call::Login("google".into())], "once while it is on its way");
+    zone.sink.reply(1, Err("session 7: a login is already running".into()));
+    settle(&cx);
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().login_note(), Some("session 7: a login is already running")));
+
+    zone.agent.update(&mut cx, |agent, cx| agent.choose_login("google", cx));
+    assert_eq!(zone.take_calls(), [Call::Login("google".into())]);
+    zone.sink.reply(2, Ok(()));
+    zone.feed(&[Event::Agent { state: AgentState::LoggingIn { method: "google".into(), name: "Log in with Google".into() } }]);
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.cancel_login(cx));
+    assert_eq!(zone.take_calls(), [Call::Cancel]);
+    zone.down.set(true);
+    zone.agent.update(&mut cx, |agent, cx| agent.cancel_login(cx));
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), Some(UNSENT)));
+}
+
+/// A terminal method's choice asks the tree for a login zone; Cancel
+/// login asks it to close; the zone's status 0 restarts the agent
+/// (`AGENT_RESTART` with the profile's command), another status sends
+/// nothing.
+#[test]
+fn a_terminal_login_opens_a_zone_and_its_success_restarts_the_agent() {
+    let mut cx = app();
+    set_config(FAKE_PROFILE, &mut cx);
+    let mut zone = Zone::new(None, &mut cx);
+    let mut login_zones = cx.events::<LoginZone, _>(&zone.agent);
+    zone.feed(&[login_required()]);
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.choose_login("cli", cx));
+    let opened = drained(&mut login_zones);
+    let [LoginZone::Open(plan)] = opened.as_slice() else { panic!("a login zone: {opened:?}") };
+    assert_eq!(plan.appended, ["--login"]);
+    assert_eq!(plan.env.get("LOGIN_MODE").map(String::as_str), Some("device"));
+    assert!(zone.take_calls().is_empty(), "nothing goes to the server");
+    zone.agent.update(&mut cx, |agent, cx| agent.cancel_login(cx));
+    assert!(matches!(drained(&mut login_zones).as_slice(), [LoginZone::Close]));
+    zone.agent.update(&mut cx, |agent, cx| agent.login_zone_ended(model::LoginZoneEnd::Closed, cx));
+
+    zone.agent.update(&mut cx, |agent, cx| agent.choose_login("cli", cx));
+    drained(&mut login_zones);
+    zone.agent.update(&mut cx, |agent, cx| agent.login_zone_ended(model::LoginZoneEnd::Exited { code: Some(2) }, cx));
+    assert!(zone.take_calls().is_empty());
+    zone.agent.update(&mut cx, |agent, cx| {
+        agent.choose_login("cli", cx);
+        agent.login_zone_ended(model::LoginZoneEnd::Exited { code: Some(0) }, cx);
+    });
+    let calls = zone.take_calls();
+    let [Call::Restart(request)] = calls.as_slice() else { panic!("one restart: {calls:?}") };
+    assert_eq!((request.command.as_str(), request.args.as_slice()), ("fake-acp", &["--acp".to_string()][..]));
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().phase(), &AgentPhase::Live(AgentState::Starting)));
+}
+
+/// The first prompt shown while the agent needs a login goes once the
+/// agent is ready, through the view's check that it is unchanged.
+#[test]
+fn a_first_prompt_after_a_login_is_sent_if_unchanged() {
+    let mut cx = app();
+    let mut zone = Zone::new(Some("hello there"), &mut cx);
+    let mut updates = cx.events::<AgentUpdate, _>(&zone.agent);
+    zone.feed(&[Event::Agent { state: AgentState::Starting }, login_required()]);
+    settle(&cx);
+    assert!(drained(&mut updates).contains(&AgentUpdate::SetDraft("hello there".into())));
+    zone.feed(&[Event::Agent { state: AgentState::Starting }, ready()]);
+    settle(&cx);
+    assert!(drained(&mut updates).contains(&AgentUpdate::SendFirstIfUnchanged("hello there".into())));
+    assert!(zone.take_calls().is_empty(), "the view decides");
+    zone.agent.update(&mut cx, |agent, cx| agent.send_first("hello there", cx));
+    assert_eq!(zone.take_calls(), [Call::Prompt("hello there".into())]);
+}

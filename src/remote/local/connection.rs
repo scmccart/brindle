@@ -2910,6 +2910,14 @@ impl Running {
         self.agent_request(|req| ToCore::AgentRestart(AgentRestart { req, session, command, args, env }))
     }
 
+    /// Logs the agent in with its login method `method` (`AGENT_LOGIN`):
+    /// `OK` once the agent was asked, then the login's states as
+    /// transcript events. `AGENT_CANCEL` cancels it ([`Running::cancel`]).
+    pub fn login(&self, method: &str) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentLogin(client::AgentLogin { req, session, method: method.to_string() }))
+    }
+
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`).
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {

@@ -17,6 +17,8 @@ use brindle_ui::{Inline, RichBlock};
 use gpui::SharedString;
 
 use crate::FirstPrompt;
+use crate::agent::close::AgentBusy;
+use crate::agent::login::{self, AgentCommand, MethodOffer, TerminalLogin};
 use crate::agent::markdown::{self, Part};
 use crate::agent::shared::{Changes, Dirty};
 use crate::agent::transcript::{
@@ -338,6 +340,8 @@ fn hold_word(reason: &HoldReason) -> String {
 }
 
 const EXITED: &str = "the agent has exited";
+const NEEDS_LOGIN: &str = "the agent needs a login";
+const LOGGING_IN: &str = "the agent is logging in";
 
 /// Whether a held prompt can be sent again, for the phase and the
 /// session's life: only to a ready agent whose session is open.
@@ -347,11 +351,8 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
         SessionLife::Open => match phase {
             AgentPhase::Live(AgentState::Ready { .. }) => return Resend::Available,
             AgentPhase::Live(AgentState::Starting) => "the agent is starting",
-            // Stopgap until agents-login task 6.1.
-            AgentPhase::Live(AgentState::LoggingIn { .. }) => "the agent is logging in",
-            AgentPhase::Live(AgentState::LoginRequired { .. }) => {
-                "the agent needs a login; open the profile again after logging in"
-            }
+            AgentPhase::Live(AgentState::LoggingIn { .. }) => LOGGING_IN,
+            AgentPhase::Live(AgentState::LoginRequired { .. }) => NEEDS_LOGIN,
             AgentPhase::Live(AgentState::Failed { .. }) => "the agent failed",
             AgentPhase::Live(AgentState::Exited { .. }) => EXITED,
             AgentPhase::Live(AgentState::Lost { .. }) => HOLDER_LOST,
@@ -410,8 +411,10 @@ fn batch_form(cause: &str) -> Option<String> {
 /// The alert for `phase` and the session's `life`, or none while the zone
 /// works (design.md decision 13): the action, then the cause. The two
 /// `Failed` rows differ only by `life`: ended, it is a version mismatch's,
-/// never worded as an exit.
-pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>) -> Option<Alert> {
+/// never worded as an exit. A login is done from the zone when `logins`
+/// (a method Brindle can run is offered, OpenSpec change `agents-login`
+/// decision 6), else through the agent's own command line.
+pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>, logins: bool) -> Option<Alert> {
     let alert = |text: String, destructive, detail: Option<&str>| Alert {
         text,
         destructive,
@@ -429,13 +432,16 @@ pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>) -> 
             ..alert(format!("Brindle could not start the agent {command}: {cause}"), true, None)
         }),
         AgentPhase::NotStarted(StartFailure::TooOld { endpoint }) => Some(alert(too_old_text(endpoint), true, None)),
-        // `LoggingIn`: a stopgap until agents-login task 6.1.
+        // A login running says so on its row, not in an alert.
         AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match life {
             SessionLife::Open => None,
             SessionLife::Ended => {
                 Some(alert(format!("the agent session on {} has ended", names.endpoint), true, None))
             }
         },
+        AgentPhase::Live(AgentState::LoginRequired { message, .. }) if logins => {
+            Some(alert(format!("{agent} needs you to log in."), false, Some(message)))
+        }
         AgentPhase::Live(AgentState::LoginRequired { message, .. }) => Some(alert(
             format!(
                 "{agent} needs you to log in. Log in through the agent's own command line, then open the profile again."
@@ -476,7 +482,12 @@ pub enum DisabledWhy {
     Connecting,
     NotStarted,
     Starting,
+    /// The agent needs a login, which the zone's login row offers.
     LoginRequired,
+    /// The agent needs a login the zone can't run: it offers no method
+    /// Brindle can (OpenSpec change `agents-login` decision 6).
+    LoginElsewhere,
+    LoggingIn,
     Failed,
     Exited,
     /// The agent was lost with the holder that ran it (`AgentState::Lost`).
@@ -493,7 +504,11 @@ impl DisabledWhy {
             Self::Connecting => "connecting to the terminal server",
             Self::NotStarted => "the agent didn't start",
             Self::Starting => "the agent is starting",
-            Self::LoginRequired => "the agent needs a login; log in through its own command line, then open the profile again",
+            Self::LoginRequired => NEEDS_LOGIN,
+            Self::LoginElsewhere => {
+                "the agent needs a login; log in through its own command line, then open the profile again"
+            }
+            Self::LoggingIn => LOGGING_IN,
             Self::Failed => "the agent can't be used",
             Self::Exited => EXITED,
             Self::HolderLost => HOLDER_LOST,
@@ -682,6 +697,8 @@ pub enum Sent {
     /// `AGENT_RESTART`, sent while the agent was `was`: a refusal shows it
     /// again.
     Restart { was: AgentState },
+    /// `AGENT_LOGIN`: a refusal is shown beside the login row.
+    Login,
 }
 
 /// What a reply does to the prompt input.
@@ -712,8 +729,75 @@ pub enum Unqueue {
 pub enum First {
     /// The agent is ready: send it, once.
     Send(String),
+    /// The agent needs a login the zone can run: the read-only prompt
+    /// input shows it while it waits (OpenSpec change `agents-login`
+    /// decision 10).
+    Show(String),
+    /// The agent is ready after it was shown: send it, once, only if the
+    /// prompt input still holds exactly it.
+    SendIfUnchanged(String),
     /// It can't be sent: it becomes the prompt input's draft, unsent.
     Draft(String),
+}
+
+/// The login row above the prompt input (OpenSpec change `agents-login`,
+/// design decision 6), from the agent's phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginRow {
+    None,
+    /// The agent's message, then one choice per method, in its order.
+    Choose { message: SharedString, methods: Vec<MethodChoice> },
+    /// A login runs: the agent's (`AgentState::LoggingIn`), or a terminal
+    /// login's program in the zone beside (`terminal`).
+    Running { method: SharedString, name: SharedString, terminal: bool },
+}
+
+/// One of the login row's choices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodChoice {
+    pub id: SharedString,
+    pub name: SharedString,
+    pub description: Option<SharedString>,
+    pub offer: MethodOffer,
+}
+
+/// What choosing a login method does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginChoice {
+    /// Send `AGENT_LOGIN` for this method.
+    Agent(String),
+    /// Open a terminal zone running this beside the agent zone.
+    Terminal(TerminalLogin),
+    /// Nothing: no such usable method, a login request on its way, or
+    /// nothing can be sent now.
+    Nothing,
+}
+
+/// What Cancel login does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelLogin {
+    /// Send `AGENT_CANCEL`: the agent's login stops.
+    Send,
+    /// Close the terminal login's zone.
+    CloseZone,
+    Nothing,
+}
+
+/// How a terminal login's zone went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginZoneEnd {
+    /// Its program exited, with its status (`None`: ended by a signal).
+    Exited { code: Option<i32> },
+    /// The user closed it: a cancel.
+    Closed,
+}
+
+/// What a terminal login's end asks of the zone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterLogin {
+    /// It succeeded: start the agent again (`AGENT_RESTART`).
+    Restart,
+    Nothing,
 }
 
 /// A desktop notification an agent zone raises (decision 10).
@@ -782,6 +866,17 @@ pub struct ChatModel {
     /// The agent's conversation as the zone last knew it: the transcript's,
     /// kept while a new session's transcript has none yet.
     conversation: Option<Conversation>,
+    /// The agent profile's command, which a terminal login runs again.
+    command: AgentCommand,
+    /// What the zone says beside the login row: a refused `AGENT_LOGIN`,
+    /// or how a terminal login's program ended.
+    login_note: Option<String>,
+    /// A terminal login running in the zone beside: its method's id and
+    /// name.
+    terminal_login: Option<(String, String)>,
+    /// The first prompt is shown in the read-only input, waiting for a
+    /// login ([`First::Show`]).
+    first_shown: bool,
 }
 
 fn running(turn: &TurnState) -> bool {
@@ -817,7 +912,16 @@ impl ChatModel {
             seen: false,
             note: None,
             conversation: None,
+            command: AgentCommand::default(),
+            login_note: None,
+            terminal_login: None,
+            first_shown: false,
         }
+    }
+
+    /// The agent profile's command, as the session was started with it.
+    pub fn set_command(&mut self, command: AgentCommand) {
+        self.command = command;
     }
 
     /// A restore's note (a recorded profile gone from the config).
@@ -1207,6 +1311,12 @@ impl ChatModel {
 
     fn finish(&mut self, before: Before, splices: Vec<Splice>, from_replay: bool) -> Absorbed {
         self.queue = queue_row(&self.slot, &self.phase, self.life);
+        // The note beside the login row goes with it; a terminal login
+        // whose agent moved on (it exited, the session ended) is forgotten.
+        if !self.needs_login() {
+            self.login_note = None;
+            self.terminal_login = None;
+        }
         let status = self.shown_status();
         let changed = status != before.status;
         Absorbed {
@@ -1221,21 +1331,33 @@ impl ChatModel {
 
     /// The launch's first prompt: sent on the first live `Ready`, never
     /// from a replay; left as the draft on a failure, or when a replay is
-    /// what shows the agent ready.
+    /// what shows the agent ready. While the agent needs a login the zone
+    /// can run, it is shown in the read-only input and kept, through the
+    /// login, a failed or cancelled one included, and sent once the agent
+    /// is ready if the input still holds it (OpenSpec change
+    /// `agents-login` decision 10).
     fn settle_first(&mut self, from_replay: bool) -> Option<First> {
         let first = self.first.as_ref()?;
-        let draft = || Some(First::Draft(first.text().to_string()));
+        let text = first.text().to_string();
         let now = match (&self.phase, self.life) {
-            (_, SessionLife::Ended) => draft(),
+            (_, SessionLife::Ended) => First::Draft(text),
             (AgentPhase::Live(AgentState::Ready { .. }), SessionLife::Open) => match (from_replay, self.link) {
-                (true, Link::Up | Link::Reconnecting) => draft(),
-                (false, Link::Up) => Some(First::Send(first.text().to_string())),
-                (false, Link::Reconnecting) => None,
+                (true, Link::Up | Link::Reconnecting) => First::Draft(text),
+                (false, Link::Up) if self.first_shown => First::SendIfUnchanged(text),
+                (false, Link::Up) => First::Send(text),
+                (false, Link::Reconnecting) => return None,
             },
             (
                 AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. }),
                 SessionLife::Open,
-            ) => None,
+            ) => return None,
+            (AgentPhase::Live(AgentState::LoginRequired { .. }), SessionLife::Open) if self.logins_usable() => {
+                if self.first_shown {
+                    return None;
+                }
+                self.first_shown = true;
+                return Some(First::Show(text));
+            }
             (
                 AgentPhase::NotStarted(_)
                 | AgentPhase::Live(
@@ -1247,12 +1369,179 @@ impl ChatModel {
                 | AgentPhase::Lost { .. }
                 | AgentPhase::Broken { .. },
                 SessionLife::Open,
-            ) => draft(),
+            ) => First::Draft(text),
         };
-        if now.is_some() {
-            self.first = None;
+        self.first = None;
+        self.first_shown = false;
+        Some(now)
+    }
+
+    /// The launch's first prompt while the read-only input shows it,
+    /// waiting for a login (the dump's `first=`).
+    pub fn first_shown(&self) -> Option<&str> {
+        self.first.as_ref().filter(|_| self.first_shown).map(FirstPrompt::text)
+    }
+
+    /// Whether the agent needs a login, or is logging in, on an open
+    /// session.
+    fn needs_login(&self) -> bool {
+        let phase = match &self.phase {
+            AgentPhase::Live(AgentState::LoginRequired { .. } | AgentState::LoggingIn { .. }) => true,
+            AgentPhase::Live(
+                AgentState::Starting
+                | AgentState::Ready { .. }
+                | AgentState::Failed { .. }
+                | AgentState::Exited { .. }
+                | AgentState::Lost { .. },
+            )
+            | AgentPhase::Connecting
+            | AgentPhase::NotStarted(_)
+            | AgentPhase::Lost { .. }
+            | AgentPhase::Broken { .. } => false,
+        };
+        phase && self.life == SessionLife::Open
+    }
+
+    /// The login row for the agent's phase (decision 6): the methods in
+    /// the agent's order while it needs a login and offers some, a running
+    /// login's method while one runs.
+    pub fn login_row(&self) -> LoginRow {
+        if !self.needs_login() {
+            return LoginRow::None;
         }
-        now
+        if let Some((id, name)) = &self.terminal_login {
+            return LoginRow::Running { method: id.clone().into(), name: name.clone().into(), terminal: true };
+        }
+        match &self.phase {
+            AgentPhase::Live(AgentState::LoggingIn { method, name }) => {
+                LoginRow::Running { method: method.clone().into(), name: name.clone().into(), terminal: false }
+            }
+            AgentPhase::Live(AgentState::LoginRequired { message, methods }) if !methods.is_empty() => LoginRow::Choose {
+                message: message.clone().into(),
+                methods: methods
+                    .iter()
+                    .map(|method| MethodChoice {
+                        id: method.id.clone().into(),
+                        name: method.name.clone().into(),
+                        description: method.description.clone().map(SharedString::from),
+                        offer: login::offer(&self.command, method),
+                    })
+                    .collect(),
+            },
+            AgentPhase::Live(
+                AgentState::LoginRequired { .. }
+                | AgentState::Starting
+                | AgentState::Ready { .. }
+                | AgentState::Failed { .. }
+                | AgentState::Exited { .. }
+                | AgentState::Lost { .. },
+            )
+            | AgentPhase::Connecting
+            | AgentPhase::NotStarted(_)
+            | AgentPhase::Lost { .. }
+            | AgentPhase::Broken { .. } => LoginRow::None,
+        }
+    }
+
+    /// Whether the agent needs a login it offers a method for that Brindle
+    /// can run.
+    fn logins_usable(&self) -> bool {
+        match &self.phase {
+            AgentPhase::Live(AgentState::LoginRequired { methods, .. }) => {
+                methods.iter().any(|method| login::offer(&self.command, method).usable())
+            }
+            AgentPhase::Live(
+                AgentState::LoggingIn { .. }
+                | AgentState::Starting
+                | AgentState::Ready { .. }
+                | AgentState::Failed { .. }
+                | AgentState::Exited { .. }
+                | AgentState::Lost { .. },
+            )
+            | AgentPhase::Connecting
+            | AgentPhase::NotStarted(_)
+            | AgentPhase::Lost { .. }
+            | AgentPhase::Broken { .. } => false,
+        }
+    }
+
+    /// Whether a login runs: the agent's, or a terminal login's program.
+    fn logging_in(&self) -> bool {
+        self.terminal_login.is_some() || matches!(self.phase, AgentPhase::Live(AgentState::LoggingIn { .. }))
+    }
+
+    /// What beside the login row says: a refused `AGENT_LOGIN`, or how a
+    /// terminal login's program ended.
+    pub fn login_note(&self) -> Option<&str> {
+        self.login_note.as_deref()
+    }
+
+    /// The login row's method `id` was chosen: what to do, decided once (a
+    /// press while a login request is on its way does nothing).
+    pub fn choose_login(&mut self, id: &str) -> LoginChoice {
+        let LoginRow::Choose { methods, .. } = self.login_row() else { return LoginChoice::Nothing };
+        let Some(choice) = methods.into_iter().find(|choice| choice.id.as_ref() == id) else {
+            return LoginChoice::Nothing;
+        };
+        let asked = self.pending.values().any(|sent| *sent == Sent::Login);
+        if asked || !self.can_send() {
+            return LoginChoice::Nothing;
+        }
+        match choice.offer {
+            MethodOffer::Agent => {
+                self.login_note = None;
+                LoginChoice::Agent(id.to_string())
+            }
+            MethodOffer::Terminal(plan) => {
+                self.login_note = None;
+                self.terminal_login = Some((id.to_string(), choice.name.to_string()));
+                LoginChoice::Terminal(plan)
+            }
+            MethodOffer::Withheld(_) => LoginChoice::Nothing,
+        }
+    }
+
+    /// Cancel login: the agent's login is cancelled, a terminal login's
+    /// zone closed.
+    pub fn cancel_login(&mut self) -> CancelLogin {
+        if self.terminal_login.take().is_some() {
+            return CancelLogin::CloseZone;
+        }
+        match &self.phase {
+            AgentPhase::Live(AgentState::LoggingIn { .. }) if self.can_send() => CancelLogin::Send,
+            AgentPhase::Live(_)
+            | AgentPhase::Connecting
+            | AgentPhase::NotStarted(_)
+            | AgentPhase::Lost { .. }
+            | AgentPhase::Broken { .. } => CancelLogin::Nothing,
+        }
+    }
+
+    /// The terminal login's zone ended as `end`: its program's status 0
+    /// starts the agent again; another status, or a signal, shows the
+    /// methods again saying so; a close is a cancel.
+    pub fn login_zone_ended(&mut self, end: LoginZoneEnd) -> AfterLogin {
+        if self.terminal_login.take().is_none() || !self.needs_login() {
+            return AfterLogin::Nothing;
+        }
+        match end {
+            LoginZoneEnd::Exited { code: Some(0) } => return AfterLogin::Restart,
+            LoginZoneEnd::Exited { code: Some(code) } => {
+                self.login_note = Some(format!("the login program exited with status {code}"));
+            }
+            LoginZoneEnd::Exited { code: None } => {
+                self.login_note = Some("the login program was ended by a signal".into());
+            }
+            LoginZoneEnd::Closed => {}
+        }
+        AfterLogin::Nothing
+    }
+
+    /// Whether closing the zone asks first ([`crate::agent::close`]): a
+    /// busy agent does, but a login running doesn't count, since choosing
+    /// again redoes all it holds (decision 7).
+    pub fn close_busy(&self) -> Option<AgentBusy> {
+        if self.logging_in() { None } else { AgentBusy::of(self.shown_status()) }
     }
 
     /// What the prompt input's button is, and whether it takes prompts.
@@ -1264,9 +1553,14 @@ impl ChatModel {
             AgentPhase::Lost { .. } => disabled(DisabledWhy::Lost),
             AgentPhase::Broken { .. } => disabled(DisabledWhy::Broken),
             AgentPhase::Live(AgentState::Starting) => disabled(DisabledWhy::Starting),
-            // Stopgap until agents-login task 6.1's `DisabledWhy::LoggingIn`.
-            AgentPhase::Live(AgentState::LoggingIn { .. }) => disabled(DisabledWhy::Starting),
-            AgentPhase::Live(AgentState::LoginRequired { .. }) => disabled(DisabledWhy::LoginRequired),
+            AgentPhase::Live(AgentState::LoggingIn { .. }) => disabled(DisabledWhy::LoggingIn),
+            AgentPhase::Live(AgentState::LoginRequired { .. }) if self.terminal_login.is_some() => {
+                disabled(DisabledWhy::LoggingIn)
+            }
+            AgentPhase::Live(AgentState::LoginRequired { .. }) if self.logins_usable() => {
+                disabled(DisabledWhy::LoginRequired)
+            }
+            AgentPhase::Live(AgentState::LoginRequired { .. }) => disabled(DisabledWhy::LoginElsewhere),
             AgentPhase::Live(AgentState::Failed { .. }) => disabled(DisabledWhy::Failed),
             AgentPhase::Live(AgentState::Exited { .. }) => disabled(DisabledWhy::Exited),
             AgentPhase::Live(AgentState::Lost { .. }) => disabled(DisabledWhy::HolderLost),
@@ -1375,7 +1669,12 @@ impl ChatModel {
                 self.refusal = None;
                 Replied::ClearDraft
             }
-            (Sent::FirstPrompt(_) | Sent::Resend | Sent::Unqueue | Sent::Answer(_) | Sent::Restart { .. }, Ok(())) => {
+            (
+                Sent::FirstPrompt(_) | Sent::Resend | Sent::Unqueue | Sent::Answer(_) | Sent::Restart { .. } | Sent::Login,
+                Ok(()),
+            ) => Replied::Nothing,
+            (Sent::Login, Err(why)) => {
+                self.login_note = Some(why);
                 Replied::Nothing
             }
             (Sent::FirstPrompt(text), Err(why)) => {
@@ -1526,7 +1825,7 @@ impl ChatModel {
     /// The alert for the zone's phase, if any ([`failure_text`]).
     pub fn alert(&self, command: &str, endpoint: &str) -> Option<Alert> {
         let agent = self.title();
-        failure_text(&self.phase, self.life, Names { agent: &agent, command, endpoint })
+        failure_text(&self.phase, self.life, Names { agent: &agent, command, endpoint }, self.logins_usable())
     }
 
     /// The words an `error` notification gives.
@@ -1659,6 +1958,7 @@ impl ChatModel {
             turn_word(&self.turn),
             offer.word()
         ));
+        out.push_str(&self.login_lines());
         if let Some(note) = &self.note {
             out.push_str(&format!("--- note {note:?}\n"));
         }
@@ -1682,11 +1982,55 @@ impl ChatModel {
             out.push_str(if at_end { " at=end" } else { " at=away" });
         }
         out.push_str(&format!("\n--- prompt status={}", self.prompt_status().word()));
+        if let Some(first) = self.first_shown() {
+            out.push_str(&format!(" first={first:?}"));
+        }
         if let Some(refusal) = &self.refusal {
             out.push_str(&format!(" refusal={refusal:?}"));
         }
         out.push('\n');
         out
+    }
+
+    /// The login row's dump lines (decision 11): one `--- login choice`
+    /// per method, or `--- login running`; a note beside the row ends the
+    /// last one as ` refusal="…"`.
+    fn login_lines(&self) -> String {
+        let mut lines: Vec<String> = match self.login_row() {
+            LoginRow::None => return String::new(),
+            LoginRow::Running { method, name, terminal: _ } => {
+                vec![format!("--- login running method={:?} {:?}", method.as_ref(), name.as_ref())]
+            }
+            LoginRow::Choose { methods, .. } => methods
+                .iter()
+                .map(|choice| {
+                    let kind = match choice.offer {
+                        MethodOffer::Agent => "agent",
+                        MethodOffer::Terminal(_) | MethodOffer::Withheld(_) => "terminal",
+                    };
+                    let mut line =
+                        format!("--- login choice method={:?} kind={kind} {:?}", choice.id.as_ref(), choice.name.as_ref());
+                    if let Some(description) = &choice.description {
+                        line.push_str(&format!(" description={:?}", description.as_ref()));
+                    }
+                    match &choice.offer {
+                        MethodOffer::Agent => {}
+                        MethodOffer::Terminal(plan) => {
+                            line.push_str(&format!(" args={:?} env={:?}", plan.appended.join(" "), plan.env_text()));
+                            if !plan.dropped.is_empty() {
+                                line.push_str(&format!(" dropped={:?}", plan.dropped.join(",")));
+                            }
+                        }
+                        MethodOffer::Withheld(withheld) => line.push_str(&format!(" withheld={:?}", withheld.why)),
+                    }
+                    line
+                })
+                .collect(),
+        };
+        if let (Some(note), Some(last)) = (&self.login_note, lines.last_mut()) {
+            last.push_str(&format!(" refusal={note:?}"));
+        }
+        lines.into_iter().map(|line| line + "\n").collect()
     }
 
     fn entry_line(&self, id: EntryId, entry: &Entry) -> String {
@@ -2123,10 +2467,9 @@ mod tests {
             }
         }
         let login = AgentPhase::Live(AgentState::LoginRequired { message: "log in".into(), methods: Vec::new() });
-        assert_eq!(
-            resend_of(&login, SessionLife::Open),
-            Resend::Unavailable("the agent needs a login; open the profile again after logging in".into())
-        );
+        assert_eq!(resend_of(&login, SessionLife::Open), Resend::Unavailable("the agent needs a login".into()));
+        let logging_in = AgentPhase::Live(AgentState::LoggingIn { method: "g".into(), name: "Google".into() });
+        assert_eq!(resend_of(&logging_in, SessionLife::Open), Resend::Unavailable("the agent is logging in".into()));
         assert_eq!(resend_of(&AgentPhase::Live(AgentState::Starting), SessionLife::Open), Resend::Unavailable("the agent is starting".into()));
         assert_eq!(
             resend_of(&AgentPhase::Live(AgentState::Failed { message: "x".into() }), SessionLife::Open),
@@ -2234,17 +2577,18 @@ mod tests {
         assert_eq!(zone.model.turn(), &TurnState::Failed { message: message.into() });
         let QueueRow::Held { why, resend, .. } = zone.model.queue() else { panic!("{:?}", zone.model.queue()) };
         assert_eq!(why.as_ref(), "the agent needs a login");
-        assert_eq!(
-            resend,
-            &Resend::Unavailable("the agent needs a login; open the profile again after logging in".into())
-        );
+        assert_eq!(resend, &Resend::Unavailable("the agent needs a login".into()));
         assert!(!zone.model.resend());
         assert_eq!(zone.model.unqueue(), Unqueue::Send, "discard still works");
-        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::LoginRequired));
+        // No method offered: the login is the agent's own command line's.
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::LoginElsewhere));
         assert_eq!(
-            DisabledWhy::LoginRequired.text(),
+            DisabledWhy::LoginElsewhere.text(),
             "the agent needs a login; log in through its own command line, then open the profile again"
         );
+        assert_eq!(DisabledWhy::LoginRequired.text(), "the agent needs a login");
+        assert_eq!(DisabledWhy::LoggingIn.text(), "the agent is logging in");
+        assert_eq!(zone.model.login_row(), LoginRow::None);
         assert_eq!(texts(&zone.model), ["hi", "Sure"], "earlier entries kept");
         let alert = zone.model.alert("fake-acp", "this machine").unwrap();
         assert_eq!(
@@ -2281,7 +2625,7 @@ mod tests {
     #[test]
     fn each_failure_has_its_alert() {
         let names = Names { agent: "Fake Agent", command: "fake-acp", endpoint: "A8" };
-        let text = |phase: AgentPhase, life| failure_text(&phase, life, names).map(|alert| alert.text);
+        let text = |phase: AgentPhase, life| failure_text(&phase, life, names, false).map(|alert| alert.text);
         assert_eq!(text(AgentPhase::Connecting, SessionLife::Open), None);
         assert_eq!(text(AgentPhase::Live(AgentState::Ready { name: None, version: None }), SessionLife::Open), None);
         assert_eq!(text(AgentPhase::Live(AgentState::Starting), SessionLife::Open), None);
@@ -2301,6 +2645,7 @@ mod tests {
             &AgentPhase::Live(AgentState::Exited { code: Some(3), stderr: "boom".into() }),
             SessionLife::Ended,
             names,
+            false,
         )
         .unwrap();
         assert_eq!((exited.text.as_str(), exited.detail.as_deref()), ("Fake Agent exited with status 3", Some("boom")));
@@ -2323,12 +2668,26 @@ mod tests {
 
         let cause = "npx is a batch file (C:/npx.cmd); run it as `cmd /c npx acp`";
         let refused = StartFailure::Refused { command: "npx".into(), cause: cause.into() };
-        let alert = failure_text(&AgentPhase::NotStarted(refused), SessionLife::Open, names).unwrap();
+        let alert = failure_text(&AgentPhase::NotStarted(refused), SessionLife::Open, names, false).unwrap();
         assert_eq!(alert.text, format!("Brindle could not start the agent npx: {cause}"));
         assert_eq!(alert.mono.as_deref(), Some("cmd /c npx acp"));
         assert!(alert.destructive);
         let plain = StartFailure::Refused { command: "fake".into(), cause: "not found".into() };
-        assert_eq!(failure_text(&AgentPhase::NotStarted(plain), SessionLife::Open, names).unwrap().mono, None);
+        assert_eq!(failure_text(&AgentPhase::NotStarted(plain), SessionLife::Open, names, false).unwrap().mono, None);
+
+        // `agents-login` decision 6: the two login texts.
+        let login = AgentPhase::Live(AgentState::LoginRequired { message: "run agent login".into(), methods: Vec::new() });
+        let elsewhere = failure_text(&login, SessionLife::Open, names, false).unwrap();
+        assert_eq!(
+            elsewhere.text,
+            "Fake Agent needs you to log in. Log in through the agent's own command line, then open the profile again."
+        );
+        assert_eq!(elsewhere.detail.as_deref(), Some("run agent login"));
+        assert!(!elsewhere.destructive);
+        let here = failure_text(&login, SessionLife::Open, names, true).unwrap();
+        assert_eq!((here.text.as_str(), here.detail.as_deref()), ("Fake Agent needs you to log in.", Some("run agent login")));
+        let logging_in = AgentPhase::Live(AgentState::LoggingIn { method: "g".into(), name: "Google".into() });
+        assert_eq!(failure_text(&logging_in, SessionLife::Open, names, true), None);
     }
 
     /// Decision 8: a thought is open while it is the latest entry and the
@@ -3093,5 +3452,243 @@ mod tests {
         assert_eq!(texts(&zone.model).len(), 3);
         assert_eq!(zone.model.conversation().map(|c| c.continuation), Some(Continuation::Resume), "the new one's");
         assert_eq!(zone.model.prompt_status(), PromptStatus::Ready);
+    }
+
+    // OpenSpec change `agents-login`, sections 6.1–6.3.
+
+    fn agent_method(id: &str, name: &str, description: Option<&str>) -> crate::agent::transcript::LoginMethod {
+        crate::agent::transcript::LoginMethod {
+            id: id.into(),
+            name: name.into(),
+            description: description.map(str::to_string),
+            kind: crate::agent::transcript::LoginKind::Agent,
+        }
+    }
+
+    fn terminal_method(id: &str, name: &str, env: &[(&str, &str)]) -> crate::agent::transcript::LoginMethod {
+        crate::agent::transcript::LoginMethod {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            kind: crate::agent::transcript::LoginKind::Terminal {
+                args: vec!["login".into()],
+                env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            },
+        }
+    }
+
+    fn two_methods() -> Vec<crate::agent::transcript::LoginMethod> {
+        vec![agent_method("google", "Log in with Google", None), agent_method("api-key", "API Key", Some("Use an API key"))]
+    }
+
+    fn login_required(methods: Vec<crate::agent::transcript::LoginMethod>) -> Event {
+        agent_state(AgentState::LoginRequired { message: "run agent login".into(), methods })
+    }
+
+    fn logging_in(method: &str, name: &str) -> Event {
+        agent_state(AgentState::LoggingIn { method: method.into(), name: name.into() })
+    }
+
+    /// Decision 6: one choice per method in the agent's order, with its
+    /// description, nothing chosen; a choice sends `AGENT_LOGIN` once, and
+    /// a press while it is on its way does nothing; a refusal is noted
+    /// beside the row; Cancel login sends `AGENT_CANCEL` while logging in.
+    #[test]
+    fn the_login_row_offers_the_methods_in_order_and_chooses_once() {
+        let mut zone = Zone::new(None);
+        let absorbed = zone.feed(&[agent_state(AgentState::Starting), login_required(two_methods())]);
+        assert_eq!(absorbed.status, Some(Some(State::Error)));
+        let LoginRow::Choose { message, methods } = zone.model.login_row() else { panic!("{:?}", zone.model.login_row()) };
+        assert_eq!(message.as_ref(), "run agent login");
+        let shown: Vec<_> =
+            methods.iter().map(|c| (c.id.to_string(), c.name.to_string(), c.description.as_ref().map(|d| d.to_string()))).collect();
+        assert_eq!(
+            shown,
+            [
+                ("google".to_string(), "Log in with Google".to_string(), None),
+                ("api-key".to_string(), "API Key".to_string(), Some("Use an API key".to_string())),
+            ]
+        );
+        assert!(methods.iter().all(|c| c.offer == MethodOffer::Agent));
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::LoginRequired));
+        assert_eq!(zone.model.alert("fake-acp", "here").unwrap().text, "Fake needs you to log in.");
+        assert_eq!(zone.model.close_busy(), None, "an error doesn't ask");
+
+        assert_eq!(zone.model.choose_login("nope"), LoginChoice::Nothing);
+        assert_eq!(zone.model.choose_login("google"), LoginChoice::Agent("google".into()));
+        zone.model.sent(4, Sent::Login);
+        assert_eq!(zone.model.choose_login("api-key"), LoginChoice::Nothing, "a login request is on its way");
+        assert_eq!(zone.model.replied(4, Err("the agent offers no login method \"google\"".into())), Replied::Nothing);
+        assert_eq!(zone.model.login_note(), Some("the agent offers no login method \"google\""));
+        let dump = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(
+            dump.contains(
+                "--- login choice method=\"google\" kind=agent \"Log in with Google\"\n--- login choice method=\"api-key\" kind=agent \"API Key\" description=\"Use an API key\" refusal=\"the agent offers no login method \\\"google\\\"\"\n"
+            ),
+            "{dump}"
+        );
+        assert_eq!(zone.model.choose_login("google"), LoginChoice::Agent("google".into()), "chosen again");
+        assert_eq!(zone.model.login_note(), None, "a new choice clears the note");
+        zone.model.sent(5, Sent::Login);
+        zone.model.replied(5, Ok(()));
+
+        let absorbed = zone.feed(&[logging_in("google", "Log in with Google")]);
+        assert_eq!(absorbed.status, Some(Some(State::Working)), "logging in is working");
+        assert_eq!(
+            zone.model.login_row(),
+            LoginRow::Running { method: "google".into(), name: "Log in with Google".into(), terminal: false }
+        );
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::LoggingIn));
+        assert_eq!(zone.model.alert("fake-acp", "here"), None);
+        assert_eq!(zone.model.close_busy(), None, "a login running never asks");
+        assert!(!zone.model.cancel(), "the turn's stop has no turn to stop");
+        let dump = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(dump.contains("state=logging-in "), "{dump}");
+        assert!(dump.contains("--- login running method=\"google\" \"Log in with Google\"\n"), "{dump}");
+        assert_eq!(zone.model.cancel_login(), CancelLogin::Send);
+        zone.model.set_link(Link::Reconnecting);
+        assert_eq!(zone.model.cancel_login(), CancelLogin::Nothing, "nothing is sent while reconnecting");
+        zone.model.set_link(Link::Up);
+
+        zone.feed(&[agent_state(AgentState::Starting), ready()]);
+        assert_eq!(zone.model.login_row(), LoginRow::None);
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Ready);
+        assert_eq!(zone.model.cancel_login(), CancelLogin::Nothing);
+        assert_eq!(zone.model.choose_login("google"), LoginChoice::Nothing);
+        assert!(!zone.model.wait_text(&found(&zone.model), &linux).contains("--- login"));
+    }
+
+    /// Decision 7: a busy agent still asks before closing, a logging-in
+    /// one doesn't.
+    #[test]
+    fn closing_asks_only_for_a_busy_agent_that_isnt_logging_in() {
+        let mut zone = Zone::ready();
+        zone.feed(&[turn(TurnState::Working)]);
+        assert_eq!(zone.model.close_busy(), Some(AgentBusy::Working));
+        zone.feed(&[turn(TurnState::Blocked)]);
+        assert_eq!(zone.model.close_busy(), Some(AgentBusy::Blocked));
+        let mut zone = Zone::new(None);
+        zone.feed(&[agent_state(AgentState::Starting)]);
+        assert_eq!(zone.model.close_busy(), Some(AgentBusy::Working), "starting is working");
+        zone.feed(&[login_required(two_methods()), logging_in("google", "Log in with Google")]);
+        assert_eq!(zone.model.shown_status(), Some(State::Working));
+        assert_eq!(zone.model.close_busy(), None);
+    }
+
+    /// Decision 9: a terminal method's choice shows what it runs and
+    /// leaves out; choosing it runs the plan beside, Cancel login closes
+    /// its zone, its status 0 asks for the restart, another status shows
+    /// the methods again with it.
+    #[test]
+    fn a_terminal_login_runs_beside_and_its_exit_decides() {
+        let mut zone = Zone::new(None);
+        zone.model.set_command(AgentCommand { program: "fake-acp".into(), args: vec!["--acp".into()], ignore_case: false });
+        let methods = vec![terminal_method("cli", "Log in from the terminal", &[("LOGIN_MODE", "device"), ("PATH", "/tmp/evil")])];
+        zone.feed(&[login_required(methods.clone())]);
+        let dump = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(
+            dump.contains("--- login choice method=\"cli\" kind=terminal \"Log in from the terminal\" args=\"login\" env=\"LOGIN_MODE=device\" dropped=\"PATH\"\n"),
+            "{dump}"
+        );
+        let LoginChoice::Terminal(plan) = zone.model.choose_login("cli") else { panic!("a terminal login") };
+        assert_eq!((plan.command.as_str(), plan.args.as_slice()), ("fake-acp", &["--acp".to_string(), "login".to_string()][..]));
+        assert_eq!(zone.model.login_row(), LoginRow::Running { method: "cli".into(), name: "Log in from the terminal".into(), terminal: true });
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::LoggingIn));
+        assert_eq!(zone.model.close_busy(), None);
+        assert_eq!(zone.model.choose_login("cli"), LoginChoice::Nothing, "one login at a time");
+
+        assert_eq!(zone.model.cancel_login(), CancelLogin::CloseZone);
+        assert!(matches!(zone.model.login_row(), LoginRow::Choose { .. }), "the methods again");
+        assert_eq!(zone.model.login_zone_ended(LoginZoneEnd::Closed), AfterLogin::Nothing, "the close it asked for");
+
+        assert!(matches!(zone.model.choose_login("cli"), LoginChoice::Terminal(_)));
+        assert_eq!(zone.model.login_zone_ended(LoginZoneEnd::Exited { code: Some(1) }), AfterLogin::Nothing);
+        assert_eq!(zone.model.login_note(), Some("the login program exited with status 1"));
+        assert!(zone.model.wait_text(&found(&zone.model), &linux).contains(" refusal=\"the login program exited with status 1\"\n"));
+        assert!(matches!(zone.model.choose_login("cli"), LoginChoice::Terminal(_)));
+        assert_eq!(zone.model.login_zone_ended(LoginZoneEnd::Exited { code: None }), AfterLogin::Nothing);
+        assert_eq!(zone.model.login_note(), Some("the login program was ended by a signal"));
+        assert!(matches!(zone.model.choose_login("cli"), LoginChoice::Terminal(_)));
+        assert_eq!(zone.model.login_zone_ended(LoginZoneEnd::Exited { code: Some(0) }), AfterLogin::Restart);
+        assert_eq!(zone.model.login_zone_ended(LoginZoneEnd::Exited { code: Some(0) }), AfterLogin::Nothing, "once");
+
+        // The restart shows the agent starting; the agent moving on drops
+        // a login zone the zone still thought ran.
+        zone.model.restarting(9);
+        assert_eq!(zone.model.phase(), &AgentPhase::Live(AgentState::Starting));
+        zone.feed(&[login_required(methods)]);
+        assert!(matches!(zone.model.choose_login("cli"), LoginChoice::Terminal(_)));
+        zone.feed(&[agent_state(AgentState::Exited { code: Some(1), stderr: String::new() })]);
+        assert_eq!(zone.model.login_row(), LoginRow::None);
+        assert_eq!(zone.model.login_zone_ended(LoginZoneEnd::Exited { code: Some(0) }), AfterLogin::Nothing);
+    }
+
+    /// Decision 9: a profile whose command re-parses its arguments shows
+    /// its terminal method withheld, which can't be chosen, and the zone
+    /// says the login is the agent's own command line's.
+    #[test]
+    fn a_withheld_method_is_shown_but_not_offered() {
+        let mut zone = Zone::new(Some("hi"));
+        zone.model.set_command(AgentCommand { program: "cmd".into(), args: vec!["/c".into(), "npx".into()], ignore_case: true });
+        let absorbed = zone.feed(&[login_required(vec![terminal_method("cli", "Log in from the terminal", &[])])]);
+        assert_eq!(absorbed.first, Some(First::Draft("hi".into())), "no usable method: a draft");
+        let LoginRow::Choose { methods, .. } = zone.model.login_row() else { panic!("a row") };
+        assert!(matches!(&methods[0].offer, MethodOffer::Withheld(w) if w.why == "the login can't be run through `cmd /c`"));
+        assert_eq!(zone.model.choose_login("cli"), LoginChoice::Nothing);
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::LoginElsewhere));
+        let dump = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(dump.contains(" withheld=\"the login can't be run through `cmd /c`\"\n"), "{dump}");
+    }
+
+    /// Decision 10: the first prompt is shown while the agent needs a
+    /// login it can run, kept through a failed and a cancelled login and
+    /// while logging in, and sent once, if unchanged, on the first live
+    /// `Ready`; never from a replay.
+    #[test]
+    fn the_first_prompt_waits_for_a_login_and_goes_once() {
+        let mut zone = Zone::new(Some("hi"));
+        let absorbed = zone.feed(&[agent_state(AgentState::Starting), login_required(two_methods())]);
+        assert_eq!(absorbed.first, Some(First::Show("hi".into())));
+        assert_eq!(zone.model.first_shown(), Some("hi"));
+        assert!(zone.model.wait_text(&found(&zone.model), &linux).contains("--- prompt status=disabled first=\"hi\"\n"));
+        // A failed login: back to the methods, still waiting, not shown again.
+        assert_eq!(zone.feed(&[logging_in("google", "Google")]).first, None);
+        let failed = AgentState::LoginRequired { message: "browser login timed out".into(), methods: two_methods() };
+        assert_eq!(zone.feed(&[agent_state(failed)]).first, None);
+        // A cancelled one, the same.
+        assert_eq!(zone.feed(&[logging_in("google", "Google"), login_required(two_methods())]).first, None);
+        assert_eq!(zone.model.first_shown(), Some("hi"));
+        // Logged in: starting keeps it, ready sends it if unchanged.
+        assert_eq!(zone.feed(&[logging_in("google", "Google"), agent_state(AgentState::Starting)]).first, None);
+        assert_eq!(zone.feed(&[ready()]).first, Some(First::SendIfUnchanged("hi".into())));
+        assert_eq!(zone.model.first_shown(), None);
+        assert_eq!(zone.feed(&[login_required(two_methods()), ready()]).first, None, "sent once");
+
+        // A login at start shown, then the agent fails: a plain draft.
+        for end in [
+            AgentState::Failed { message: "x".into() },
+            AgentState::Exited { code: Some(1), stderr: String::new() },
+            AgentState::Lost { message: "its holder ended".into() },
+        ] {
+            let mut zone = Zone::new(Some("hi"));
+            assert_eq!(zone.feed(&[login_required(two_methods())]).first, Some(First::Show("hi".into())));
+            assert_eq!(zone.feed(&[agent_state(end.clone())]).first, Some(First::Draft("hi".into())), "{end:?}");
+        }
+        let mut zone = Zone::new(Some("hi"));
+        zone.feed(&[login_required(two_methods())]);
+        assert_eq!(zone.model.lost("gone").first, Some(First::Draft("hi".into())));
+        let mut zone = Zone::new(Some("hi"));
+        zone.feed(&[login_required(two_methods())]);
+        assert_eq!(zone.model.ended().first, Some(First::Draft("hi".into())));
+        // Ready from a replay never sends it.
+        let mut zone = Zone::new(Some("hi"));
+        zone.feed(&[login_required(two_methods())]);
+        assert_eq!(zone.replay(&[ready()]).first, Some(First::Draft("hi".into())));
+        // No method at all: a draft, as before.
+        let mut zone = Zone::new(Some("hi"));
+        assert_eq!(zone.feed(&[login_required(Vec::new())]).first, Some(First::Draft("hi".into())));
+        // No login: sent as ever.
+        let mut zone = Zone::new(Some("hi"));
+        assert_eq!(zone.feed(&[ready()]).first, Some(First::Send("hi".into())));
     }
 }

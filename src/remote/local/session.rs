@@ -363,6 +363,12 @@ impl Session {
         self.running(|running| running.restart(request))
     }
 
+    /// Logs the agent in with its login method `method` (`AGENT_LOGIN`), as
+    /// [`Session::prompt`]; [`Session::cancel`] cancels the login.
+    pub fn login(&self, method: &str) -> Option<RequestId> {
+        self.running(|running| running.login(method))
+    }
+
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`), as [`Session::prompt`].
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
@@ -1762,6 +1768,42 @@ mod tests {
         assert_eq!(shows(&mut agent.feed, "the continued agent ready", ready), [reply(req)]);
         let again = agent.session.restart(request).unwrap();
         let refused = AgentEvent::Reply { request: again, outcome: Err("session 7: the agent hasn't ended".into()) };
+        assert_eq!(next_life(&mut agent.feed), refused);
+    }
+
+    /// `agents-login` 7.1: a login choice goes out as `AGENT_LOGIN` on the
+    /// session, naming the method; its `OK` and a refusal come back under
+    /// its id, and the login's events are folded into the same log.
+    #[test]
+    fn a_login_goes_out_as_agent_login_and_its_answers_come_back() {
+        let mut logins = 0;
+        let mut agent = agent_session_with("agent-login", None, move |message, stream| match message {
+            ToCore::SpawnAgent(spawn) => {
+                // The scripted core takes the login whatever the agent's
+                // state; the fold of `LoginRequired` is the transcript's.
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: AGENT, pid: 4242, key: "k7".into() }));
+                let ready = AgentState::Ready { name: Some("fake".into()), version: None };
+                transcript(stream, &[Event::Agent { state: ready }]);
+            }
+            ToCore::AgentLogin(login) if logins == 0 => {
+                logins += 1;
+                ok(stream, login.req);
+                let logging_in = AgentState::LoggingIn { method: login.method.clone(), name: "Log in with Google".into() };
+                transcript(stream, &[Event::Agent { state: logging_in }]);
+            }
+            ToCore::AgentLogin(login) => refuse(stream, login.req, "session 7: the agent isn't waiting for a login"),
+            _ => {}
+        });
+        let req = agent.session.login("google").unwrap();
+        assert_eq!(
+            recv(&agent.core),
+            ToCore::AgentLogin(client::AgentLogin { req, session: AGENT, method: "google".into() })
+        );
+        let logging_in = |log: &Transcript| matches!(log.agent(), AgentState::LoggingIn { method, .. } if method == "google");
+        assert_eq!(shows(&mut agent.feed, "the agent logging in", logging_in), [reply(req)]);
+        let again = agent.session.login("google").unwrap();
+        let refused =
+            AgentEvent::Reply { request: again, outcome: Err("session 7: the agent isn't waiting for a login".into()) };
         assert_eq!(next_life(&mut agent.feed), refused);
     }
 

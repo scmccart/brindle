@@ -28,6 +28,9 @@ pub mod markdown;
 // The chat model and the protocol gate.
 pub mod model;
 
+// What a login method offers, and what a terminal login runs.
+pub mod login;
+
 // The sink the connection's reader folds an agent session's transcript
 // through, and its zone's end, which the `Agent` entity drains.
 pub mod sink;
@@ -43,8 +46,10 @@ use gpui::{App, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
 use crate::FirstPrompt;
+use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, ChatModel, First, Link, Offer, ProfileFound, Replied, Sent, Splice, Submit, Unqueue,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, First, Link, LoginChoice, LoginZoneEnd, Offer, ProfileFound, Replied,
+    Sent, Splice, Submit, Unqueue,
 };
 use crate::agent::shared::AgentShared;
 use crate::agent::sink::{AgentEvent, Feed, Sink, Taker};
@@ -76,6 +81,8 @@ pub trait Requests {
     fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)>;
     /// Runs the session's ended agent again (`AGENT_RESTART`).
     fn restart(&self, request: AgentRestartRequest) -> Option<RequestId>;
+    /// Logs the agent in with its login method `method` (`AGENT_LOGIN`).
+    fn login(&self, method: &str) -> Option<RequestId>;
 }
 
 /// Opens an agent zone's session on a host (`remote::agent_link`), or a
@@ -130,6 +137,10 @@ impl Requests for crate::remote::AgentLink {
     fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
         crate::remote::AgentLink::restart(self, request)
     }
+
+    fn login(&self, method: &str) -> Option<RequestId> {
+        crate::remote::AgentLink::login(self, method)
+    }
 }
 
 /// What an [`Agent`] asks of its view, beside the status and title events
@@ -142,8 +153,33 @@ pub enum AgentUpdate {
     /// A prompt was taken: the input empties.
     ClearDraft,
     /// Text the user didn't type goes into the input: a first prompt that
-    /// wasn't sent (design.md decision 3). Never anything from the slot.
+    /// wasn't sent (design.md decision 3), or one shown while the agent
+    /// needs a login. Never anything from the slot.
     SetDraft(String),
+    /// The first prompt shown while the agent needed a login can go now:
+    /// the view sends it ([`Agent::send_first`]) only if the input still
+    /// holds exactly this (OpenSpec change `agents-login` decision 10).
+    SendFirstIfUnchanged(String),
+}
+
+/// What an agent zone asks of its tab for a terminal login (OpenSpec
+/// change `agents-login`, design decision 9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginZone {
+    /// Open a terminal zone beside the agent zone running this.
+    Open(TerminalLogin),
+    /// Close the login zone (Cancel login).
+    Close,
+}
+
+/// `profile`'s command on `host`, which a terminal login runs again: its
+/// variable names ignore case where this machine's do, on this machine.
+fn agent_command(profile: &Profile, host: &Host) -> AgentCommand {
+    AgentCommand {
+        program: profile.command.clone().unwrap_or_default(),
+        args: profile.args.clone(),
+        ignore_case: host.is_local() && crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
+    }
 }
 
 /// Whether the zone has let its session go (closed it or detached it on a
@@ -177,6 +213,7 @@ pub struct Agent {
 
 impl EventEmitter<TerminalEvent> for Agent {}
 impl EventEmitter<AgentUpdate> for Agent {}
+impl EventEmitter<LoginZone> for Agent {}
 
 impl Agent {
     /// Starts an agent of `profile` in a new session of `host`'s terminal
@@ -261,6 +298,7 @@ impl Agent {
                 None
             }
         };
+        model.set_command(agent_command(profile, host));
         let command = profile.command.clone().unwrap_or_default();
         Self::from_parts(model, feed, requests, command, host.clone(), directory, connect, cx)
     }
@@ -390,6 +428,7 @@ impl Agent {
         };
         let link = (self.connect)(self.host.clone(), AgentStart::Spawn(request), sink);
         self.command = profile.command.clone().unwrap_or_default();
+        self.model.set_command(agent_command(profile, &self.host));
         self.directory = Some(PathBuf::from(&conversation.cwd));
         let (shared, taker, events) = feed.split();
         self.shared = shared;
@@ -499,9 +538,63 @@ impl Agent {
                     self.apply_replied(replied, cx);
                 }
             },
-            Some(First::Draft(text)) => cx.emit(AgentUpdate::SetDraft(text)),
+            Some(First::Draft(text) | First::Show(text)) => cx.emit(AgentUpdate::SetDraft(text)),
+            Some(First::SendIfUnchanged(text)) => cx.emit(AgentUpdate::SendFirstIfUnchanged(text)),
             None => {}
         }
+    }
+
+    /// Sends the launch's first prompt, which waited for a login: the view
+    /// found its input still holding exactly `text`.
+    pub fn send_first(&mut self, text: &str, cx: &mut Context<Self>) {
+        let text = text.to_string();
+        self.send(Sent::FirstPrompt(text.clone()), |requests| requests.prompt(&text), cx);
+    }
+
+    /// The login row's method `method` was chosen: `AGENT_LOGIN` for an
+    /// agent method, a login zone beside for a terminal one; nothing when
+    /// the model says so.
+    pub fn choose_login(&mut self, method: &str, cx: &mut Context<Self>) {
+        match self.model.choose_login(method) {
+            LoginChoice::Agent(method) => self.send(Sent::Login, |requests| requests.login(&method), cx),
+            LoginChoice::Terminal(plan) => {
+                cx.emit(LoginZone::Open(plan));
+                cx.notify();
+            }
+            LoginChoice::Nothing => {}
+        }
+    }
+
+    /// Cancel login: `AGENT_CANCEL` for the agent's login, the login
+    /// zone's close for a terminal login.
+    pub fn cancel_login(&mut self, cx: &mut Context<Self>) {
+        match self.model.cancel_login() {
+            CancelLogin::Send => {
+                if !self.requests.as_ref().is_some_and(|requests| requests.cancel()) {
+                    self.model.server_note(model::UNSENT);
+                }
+            }
+            CancelLogin::CloseZone => cx.emit(LoginZone::Close),
+            CancelLogin::Nothing => return,
+        }
+        cx.notify();
+    }
+
+    /// The terminal login's zone ended as `end`: a login that succeeded
+    /// starts the agent again with the profile's command, arguments and
+    /// environment (`AGENT_RESTART`), keeping its conversation.
+    pub fn login_zone_ended(&mut self, end: LoginZoneEnd, cx: &mut Context<Self>) {
+        match self.model.login_zone_ended(end) {
+            AfterLogin::Restart => match self.profile_found(&Settings::get(cx).config) {
+                (_, Some(profile)) => self.restart(&profile, cx),
+                (ProfileFound::Gone { name }, None) => {
+                    self.model.server_note(model::NoOffer::ProfileGone { name }.text());
+                }
+                (ProfileFound::Agent, None) => {}
+            },
+            AfterLogin::Nothing => {}
+        }
+        cx.notify();
     }
 
     fn apply_replied(&mut self, replied: Replied, cx: &mut Context<Self>) {
