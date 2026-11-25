@@ -322,7 +322,7 @@ fn answered(result: Result<(), OpenError>) -> Opened {
 /// (on Windows, the shell's handler for it). A Windows file is shown in
 /// Explorer whatever the opener: it is never opened.
 pub fn open(uri: &str) -> Opened {
-    match plan(uri, this_host(), cfg!(windows)) {
+    match plan_here(uri) {
         Plan::Refuse(refusal) => answered(Err(OpenError::Refused(refusal))),
         Plan::Reveal(path) => reveal(path),
         Plan::Open(link) => match std::env::var(OPENER_ENV).ok().filter(|p| !p.is_empty()) {
@@ -330,6 +330,20 @@ pub fn open(uri: &str) -> Opened {
             None => open_default(link),
         },
     }
+}
+
+/// What [`open`] would do with `uri` on this machine: [`plan`] with this
+/// machine's name and platform, the two facts the opener reads. Owners
+/// that decide before opening (an agent's links ask first) plan with it.
+pub fn plan_here(uri: &str) -> Plan {
+    plan(uri, this_host(), cfg!(windows))
+}
+
+/// Whether a pointer press with `modifiers` acts on links: ctrl without
+/// alt, whatever shift does (ctrl-alt-drag is a terminal's block
+/// selection). Terminals and agent zones share the gesture.
+pub fn wants_links(modifiers: &gpui::Modifiers) -> bool {
+    modifiers.control && !modifiers.alt
 }
 
 /// This machine's name, which a `file:` link may give as its host. Read
@@ -1002,5 +1016,37 @@ mod tests {
         assert!(matches!(error, OpenError::Failed { code: Some(4), .. }), "{error:?}");
         let error = run_opener(&dir.join("missing").display().to_string(), "https://example.com").unwrap_err();
         assert!(matches!(error, OpenError::NotStarted { .. }), "{error:?}");
+    }
+
+    /// Links take ctrl without alt, whatever shift does: ctrl-alt is a
+    /// block selection, and alt alone or no modifier leaves links alone.
+    #[test]
+    fn links_take_ctrl_without_alt() {
+        let held =
+            |control: bool, alt: bool, shift: bool| gpui::Modifiers { control, alt, shift, ..Default::default() };
+        for shift in [false, true] {
+            assert!(!wants_links(&held(false, false, shift)), "none, shift {shift}");
+            assert!(wants_links(&held(true, false, shift)), "ctrl, shift {shift}");
+            assert!(!wants_links(&held(false, true, shift)), "alt, shift {shift}");
+            assert!(!wants_links(&held(true, true, shift)), "ctrl-alt, shift {shift}");
+        }
+    }
+
+    /// `plan_here` plans for this machine: the platform's rules and its own
+    /// name, so a link `plan` treats the same everywhere comes out the same,
+    /// and a file link is this platform's kind.
+    #[test]
+    fn plan_here_plans_for_this_machine() {
+        let windows = cfg!(windows);
+        for link in ["https://example.com/a", "mailto:dev@example.com", "javascript:void", "file://otherhost/x"] {
+            assert_eq!(plan_here(link), plan(link, this_host(), windows), "{link}");
+        }
+        assert_eq!(plan_here("https://example.com/a"), Plan::Open("https://example.com/a".into()));
+        assert_eq!(plan_here("javascript:void"), Plan::Refuse(Refusal::Scheme("javascript".into())));
+        let local = plan_here("file:///etc/hosts");
+        match windows {
+            true => assert_eq!(local, Plan::Refuse(Refusal::NoDrive)),
+            false => assert_eq!(local, Plan::Open("file:///etc/hosts".into())),
+        }
     }
 }

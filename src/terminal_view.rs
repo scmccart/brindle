@@ -181,11 +181,6 @@ struct MouseState {
     debug_held: bool,
 }
 
-/// Link activation takes ctrl without alt (alt-drag stays a block selection).
-fn wants_links(modifiers: &Modifiers) -> bool {
-    modifiers.control && !modifiers.alt
-}
-
 pub struct TerminalView {
     pub terminal: Entity<Terminal>,
     pub focus_handle: FocusHandle,
@@ -427,7 +422,7 @@ impl TerminalView {
         // No link feedback in the middle of a (block) selection or a drag
         // the program is receiving.
         let dragging = self.mouse.selecting || self.mouse.reported_button.is_some();
-        if !wants_links(&modifiers) || dragging {
+        if !links::wants_links(&modifiers) || dragging {
             self.mouse.hover_cell = None;
             self.set_hovered(None, cx);
             return;
@@ -510,7 +505,7 @@ impl TerminalView {
         // A ctrl-click on a link is ours, even when the program reports the
         // mouse (as shift is for selection). It opens on release.
         if e.button == gpui::MouseButton::Left
-            && wants_links(&e.modifiers)
+            && links::wants_links(&e.modifiers)
             && let Some(link) = self.link_under(e.position, cx)
         {
             self.mouse.pending_link = Some(link);
@@ -982,18 +977,6 @@ mod tests {
         assert_eq!(grid.describe(2.0), "--- grid origin=6,51 cell=8.4x18 scale=2\n");
     }
 
-    /// Links take ctrl without alt, whatever shift does: ctrl-alt is a
-    /// block selection, and alt alone or no modifier leaves links alone.
-    #[test]
-    fn links_take_ctrl_without_alt() {
-        let held = |control: bool, alt: bool, shift: bool| Modifiers { control, alt, shift, ..Modifiers::default() };
-        for shift in [false, true] {
-            assert!(!wants_links(&held(false, false, shift)), "none, shift {shift}");
-            assert!(wants_links(&held(true, false, shift)), "ctrl, shift {shift}");
-            assert!(!wants_links(&held(false, true, shift)), "alt, shift {shift}");
-            assert!(!wants_links(&held(true, true, shift)), "ctrl-alt, shift {shift}");
-        }
-    }
     use gpui::{point, px};
 
     #[test]
