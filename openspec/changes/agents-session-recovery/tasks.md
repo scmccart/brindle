@@ -43,14 +43,14 @@ Before starting, check that `agents-profiles` (and with it `agents-sessions` and
 
 ## 6. Windows, remote and manual checks
 
-- [ ] 6.1 Add `windows-agent-continue` to `tests/e2e/cases/win.rs` (an exit and a resume continue through the pipe session's job); verify it passes on the `windows-e2e` job.
+- [x] 6.1 Add `windows-agent-continue` to `tests/e2e/cases/win.rs` (an exit and a resume continue through the pipe session's job); verify it passes on the `windows-e2e` job.
 - [x] 6.2 Extend `remote-agent-ssh` in `tests/e2e/cases/remote.rs` with an exit and a continue over SSH; verify it passes with `BRINDLE_REMOTE_E2E_REQUIRED=1` under `scripts/with-xvfb`.
-- [ ] 6.3 Add the `agent-continue-*` cases to the `e2e-archive` filter and `windows-agent-continue` to `windows-e2e-archive`'s; verify both jobs run them on the pull request's CI.
+- [x] 6.3 Add the `agent-continue-*` cases to the `e2e-archive` filter and `windows-agent-continue` to `windows-e2e-archive`'s; verify both jobs run them on the pull request's CI.
 - [x] 6.4 Add to `CLAUDE.md`'s manual checks: a pointer press on Continue conversation, and a real agent killed mid-conversation and continued (Codex by resume, Copilot by load with its notice, on Linux and on Windows through `cmd /c npx …`), a held prompt sent again afterwards, and a holder killed under a real agent; verify the list reads as the other entries.
 
 ## 7. Integration
 
-- [ ] 7.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e`; verify all pass.
+- [x] 7.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e`; verify all pass.
 - [ ] 7.2 Hand the user the manual checks from 6.4 with `scripts/run-throwaway.sh` and `scripts/run-throwaway.ps1`: open Codex and Copilot agent profiles, run a turn, kill the agent's process mid-conversation (`kill` on Linux, Task Manager on Windows), press Continue conversation, and check the earlier turns, the notices and a new turn; verify the user reports each.
 
 ## Workflow follow-up
