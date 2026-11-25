@@ -3,7 +3,7 @@
 **Depends on:** `agents-profiles` (the agent zone and its login message, and through it `agents-sessions`' login-required agent state and client protocol 4), implemented and archived; and `agents-session-recovery`, whose `AGENT_RESTART` a terminal login reuses. It lands after recovery.
 **Next:** `agents-log-paging`.
 
-**Status: designed.** design.md, the delta specs and tasks.md are written (2026-11-25). Task 1.1, a capture spike, decides whether terminal logins are in this change.
+**Status: designed.** design.md, the delta specs and tasks.md are written (2026-11-25). Task 1.1, a capture spike, decides whether terminal logins are in this change; it found one (Antigravity's `terminal-login`, offered only when `auth.terminal` is advertised), so they are (design.md decision 1).
 
 ## Why
 
