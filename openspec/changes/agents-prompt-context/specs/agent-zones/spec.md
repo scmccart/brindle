@@ -79,7 +79,7 @@ In a terminal zone, the `send_selection_to_agent` action SHALL attach the select
 - **THEN** the agent zone's prompt input has a text attachment holding those two lines
 
 ### Requirement: What text a terminal sends
-The text sent from a terminal SHALL be the text the matching copy command would copy: for the selection, what Copy copies, and for the last command's output, what Copy Last Command Output copies, with lines joined by a line feed on every platform. It SHALL hold no escape sequences, colours or trailing blanks, a wrapped line SHALL be one line, and the output SHALL NOT include the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached and the terminal SHALL keep focus.
+The text sent from a terminal SHALL be the text the matching copy command would copy: for the selection, what Copy copies, and for the last command's output, what Copy Last Command Output copies, with lines joined by a line feed on every platform. The output SHALL NOT include the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached and the terminal SHALL keep focus.
 
 #### Scenario: The same text as copying
 - **WHEN** the user ran `printf 'one\ntwo\n'` and runs Send Last Command Output to Agent
