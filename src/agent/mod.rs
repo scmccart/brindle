@@ -39,19 +39,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-use gpui::{Context, EventEmitter, Task};
+use gpui::{App, Context, EventEmitter, Task};
 use parking_lot::Mutex;
 
 use crate::FirstPrompt;
-use crate::agent::model::{Absorbed, ChatModel, First, Link, Replied, Sent, Splice, Submit, Unqueue};
+use crate::agent::model::{
+    Absorbed, ChatModel, First, Link, Offer, ProfileFound, Replied, Sent, Splice, Submit, Unqueue,
+};
 use crate::agent::shared::AgentShared;
 use crate::agent::sink::{AgentEvent, Feed, Sink, Taker};
-use crate::agent::spawn::{OpenedBy, agent_spawn_request};
-use crate::agent::transcript::EntryId;
-use crate::config::Profile;
+use crate::agent::spawn::{AgentRestartRequest, OpenedBy, agent_spawn_request, continuing_profile};
+use crate::agent::transcript::{Conversation, EntryId};
+use crate::config::{Config, Profile};
 use crate::notify::osc::{Notice, Source};
 use crate::remote::protocol::{RequestId, SessionId};
-use crate::remote::{AgentStart, Host, SessionKey};
+use crate::remote::{AgentStart, Host, SessionKey, Unsupported};
+use crate::settings::Settings;
 use crate::terminal::TerminalEvent;
 use crate::terminal::pace::{self, Pace};
 use crate::terminal::status::State;
@@ -71,6 +74,20 @@ pub trait Requests {
     fn detach_with(&self, layout: Option<serde_json::Value>);
     fn set_layout(&self, layout: Option<serde_json::Value>);
     fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)>;
+    /// Runs the session's ended agent again (`AGENT_RESTART`).
+    fn restart(&self, request: AgentRestartRequest) -> Option<RequestId>;
+}
+
+/// Opens an agent zone's session on a host (`remote::agent_link`), or a
+/// test's fake: how a zone starts, attaches, and continues its conversation
+/// in a new session.
+pub(crate) type Connect = Box<dyn Fn(Host, AgentStart, Sink) -> Result<Box<dyn Requests>, Unsupported>>;
+
+/// The terminal server's [`Connect`].
+fn server_connect() -> Connect {
+    Box::new(|host, start, sink| {
+        crate::remote::agent_link(host, start, sink).map(|link| Box::new(link) as Box<dyn Requests>)
+    })
 }
 
 impl Requests for crate::remote::AgentLink {
@@ -109,6 +126,10 @@ impl Requests for crate::remote::AgentLink {
     fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)> {
         crate::remote::AgentLink::id_and_key(self)
     }
+
+    fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+        crate::remote::AgentLink::restart(self, request)
+    }
 }
 
 /// What an [`Agent`] asks of its view, beside the status and title events
@@ -146,6 +167,11 @@ pub struct Agent {
     host: Host,
     directory: Option<PathBuf>,
     held: Held,
+    /// The profile the session was started with, when it isn't the zone's
+    /// (a zone attached under a substitute profile): a continue looks this
+    /// one up. `None`: the zone's own, following a rename.
+    session_profile: Option<String>,
+    connect: Connect,
     _events: Task<()>,
 }
 
@@ -185,15 +211,18 @@ impl Agent {
                 )
             })
         };
-        let link = crate::remote::agent_link(host.clone(), AgentStart::Spawn(request), sink);
+        let connect = server_connect();
+        let link = connect(host.clone(), AgentStart::Spawn(request), sink);
         let model = ChatModel::new(profile.name.clone(), first);
-        Self::linked(model, feed, link, profile, host, directory, cx)
+        Self::linked(model, feed, link, profile, host, directory, connect, cx)
     }
 
     /// Attaches the detached agent session `session` (with `key`) of
-    /// `host`'s terminal server, started in `directory`: listed now
-    /// (`recorded: false`) or recorded by a restored zone (`true`). Its
-    /// replay shows the conversation; an attached zone has no first prompt.
+    /// `host`'s terminal server, started in `directory` with the profile
+    /// `started_with` (as its listing says; `None`: unknown, taken as
+    /// `profile`): listed now (`recorded: false`) or recorded by a restored
+    /// zone (`true`). Its replay shows the conversation; an attached zone
+    /// has no first prompt.
     #[allow(clippy::too_many_arguments, reason = "the session's identity and where it was listed, each a value the caller holds")]
     pub fn attach(
         profile: &Profile,
@@ -202,37 +231,45 @@ impl Agent {
         key: Option<SessionKey>,
         recorded: bool,
         directory: Option<PathBuf>,
+        started_with: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (sink, feed) = Sink::new();
-        let link = crate::remote::agent_link(host.clone(), AgentStart::Attach { session, key, recorded }, sink);
+        let connect = server_connect();
+        let link = connect(host.clone(), AgentStart::Attach { session, key, recorded }, sink);
         let model = ChatModel::new(profile.name.clone(), None);
-        Self::linked(model, feed, link, profile, host, directory, cx)
+        let mut agent = Self::linked(model, feed, link, profile, host, directory, connect, cx);
+        agent.session_profile = started_with.filter(|name| !name.eq_ignore_ascii_case(&profile.name));
+        agent
     }
 
+    #[allow(clippy::too_many_arguments, reason = "what spawn and attach each hold, handed on once")]
     fn linked(
         mut model: ChatModel,
         feed: Feed,
-        link: Result<crate::remote::AgentLink, crate::remote::Unsupported>,
+        link: Result<Box<dyn Requests>, Unsupported>,
         profile: &Profile,
         host: &Host,
         directory: Option<PathBuf>,
+        connect: Connect,
         cx: &mut Context<Self>,
     ) -> Self {
-        let requests: Option<Box<dyn Requests>> = match link {
-            Ok(link) => Some(Box::new(link)),
+        let requests = match link {
+            Ok(link) => Some(link),
             Err(unsupported) => {
                 model.not_started(model::StartFailure::NoServer(unsupported.to_string()));
                 None
             }
         };
         let command = profile.command.clone().unwrap_or_default();
-        Self::from_parts(model, feed, requests, command, host.clone(), directory, cx)
+        Self::from_parts(model, feed, requests, command, host.clone(), directory, connect, cx)
     }
 
-    /// An agent over `feed` and `requests` as they are: what [`Self::spawn`]
-    /// and [`Self::attach`] build on, and what a test gives a fake sink and
-    /// fake requests.
+    /// An agent over `feed` and `requests` as they are, continuing in new
+    /// sessions through `connect`: what [`Self::spawn`] and
+    /// [`Self::attach`] build on, and what a test gives a fake sink, fake
+    /// requests and a fake connect.
+    #[allow(clippy::too_many_arguments, reason = "the zone's parts, each a value the caller holds")]
     pub(crate) fn from_parts(
         model: ChatModel,
         feed: Feed,
@@ -240,6 +277,7 @@ impl Agent {
         command: String,
         host: Host,
         directory: Option<PathBuf>,
+        connect: Connect,
         cx: &mut Context<Self>,
     ) -> Self {
         let (shared, taker, events) = feed.split();
@@ -251,8 +289,130 @@ impl Agent {
             host,
             directory,
             held: Held::Holding,
+            session_profile: None,
+            connect,
             _events: Self::drain(events, taker, cx),
         }
+    }
+
+    /// As [`Self::attach`] records a session started with another profile.
+    #[cfg(test)]
+    pub(crate) fn set_started_with(&mut self, name: &str) {
+        self.session_profile = Some(name.to_string());
+    }
+
+    /// The name of the profile a continue runs: the one the session was
+    /// started with.
+    fn session_profile_name(&self) -> String {
+        self.session_profile.clone().unwrap_or_else(|| self.model.profile_name().to_string())
+    }
+
+    /// What continuing the conversation would do now, with the config's
+    /// profiles as they are (`agent_continue`, the Continue conversation
+    /// button, the dump).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "agents-session-recovery task 5.1 draws the button and 5.2 dumps the offer")
+    )]
+    pub fn offer(&self, cx: &App) -> Offer {
+        self.model.offer(&self.profile_found(&Settings::get(cx).config).0)
+    }
+
+    /// Whether the session's agent profile is in `config`, and the profile.
+    fn profile_found(&self, config: &Config) -> (ProfileFound, Option<Profile>) {
+        let name = self.session_profile_name();
+        match continuing_profile(&name, config) {
+            Some(profile) => (ProfileFound::Agent, Some(profile.clone())),
+            None => (ProfileFound::Gone { name }, None),
+        }
+    }
+
+    /// Continues the conversation as [`Self::offer`] says: restarts the
+    /// agent on the session, or starts a new session continuing it.
+    /// Nothing when there is no offer, or once the zone let its session go.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "agents-session-recovery task 5.1 calls it from the button and agent_continue")
+    )]
+    pub fn continue_conversation(&mut self, cx: &mut Context<Self>) {
+        if self.held == Held::Left {
+            return;
+        }
+        let (found, profile) = self.profile_found(&Settings::get(cx).config);
+        let (offer, Some(profile)) = (self.model.offer(&found), profile) else { return };
+        match offer {
+            Offer::Restart => self.restart(&profile, cx),
+            Offer::Respawn { conversation } => self.respawn(&profile, &conversation, cx),
+            Offer::None(_) => {}
+        }
+    }
+
+    /// `AGENT_RESTART` with `profile`'s command, arguments and environment,
+    /// built as a new zone's are; the zone says the agent is starting.
+    fn restart(&mut self, profile: &Profile, cx: &mut Context<Self>) {
+        let home = dirs::home_dir();
+        let request = agent_spawn_request(
+            profile,
+            &self.host,
+            None,
+            &OpenedBy::Window,
+            std::env::vars_os(),
+            home.as_deref(),
+            crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
+        )
+        .restart();
+        self.command = request.command.clone();
+        match self.requests.as_ref().and_then(|requests| requests.restart(request)) {
+            Some(req) => {
+                let absorbed = self.model.restarting(req);
+                self.apply_absorbed(absorbed, cx);
+            }
+            None => self.model.server_note(model::UNSENT),
+        }
+        cx.notify();
+    }
+
+    /// A new session of `profile`'s agent continuing `conversation`, in its
+    /// directory: the zone keeps its place and shows the old conversation
+    /// until the new session's first events replace it, as an attach's
+    /// replay does.
+    fn respawn(&mut self, profile: &Profile, conversation: &Conversation, cx: &mut Context<Self>) {
+        let (sink, feed) = Sink::new();
+        feed.shared.lock().start_over();
+        let request = {
+            let (profile, host, conversation) = (profile.clone(), self.host.clone(), conversation.clone());
+            // On the session's thread, as a new zone's start.
+            Box::new(move || {
+                let home = dirs::home_dir();
+                agent_spawn_request(
+                    &profile,
+                    &host,
+                    None,
+                    &OpenedBy::Window,
+                    std::env::vars_os(),
+                    home.as_deref(),
+                    crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
+                )
+                .continuing(&conversation)
+            })
+        };
+        let link = (self.connect)(self.host.clone(), AgentStart::Spawn(request), sink);
+        self.command = profile.command.clone().unwrap_or_default();
+        self.directory = Some(PathBuf::from(&conversation.cwd));
+        let (shared, taker, events) = feed.split();
+        self.shared = shared;
+        self._events = Self::drain(events, taker, cx);
+        let absorbed = self.model.respawning();
+        self.apply_absorbed(absorbed, cx);
+        self.requests = match link {
+            Ok(requests) => Some(requests),
+            Err(unsupported) => {
+                let absorbed = self.model.not_started(model::StartFailure::NoServer(unsupported.to_string()));
+                self.apply_absorbed(absorbed, cx);
+                None
+            }
+        };
+        cx.notify();
     }
 
     /// Drains the sink's events in chunks, paced ([`pace`]), and applies

@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use super::connection::{Abandon, Budget, Running, Sink};
 use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
 use crate::agent::model::StartFailure;
-use crate::agent::spawn::AgentSpawnRequest;
+use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::remote::SessionKey;
 use crate::remote::budget::{Delivery, Offer};
 use crate::remote::protocol::{RequestId, SessionId};
@@ -355,6 +355,12 @@ impl Session {
     /// [`Session::prompt`].
     pub fn unqueue(&self) -> Option<RequestId> {
         self.running(Running::unqueue)
+    }
+
+    /// Runs the session's ended agent again to continue its conversation
+    /// (`AGENT_RESTART`), as [`Session::prompt`].
+    pub fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+        self.running(|running| running.restart(request))
     }
 
     /// Answers the permission request in entry `entry` with `option`, or
@@ -1465,6 +1471,7 @@ mod tests {
             cwd: Some("/work".into()),
             env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
             profile: "Claude".into(),
+            conversation: None,
         }
     }
 
@@ -1693,6 +1700,101 @@ mod tests {
         assert_eq!(recv(&agent.core), ToCore::Close(client::SessionRef { session: AGENT }));
     }
 
+    /// `agents-session-recovery` 4.2: an ended agent's restart goes out as
+    /// `AGENT_RESTART` on its session, with the restart's command,
+    /// arguments and environment; its `OK` and a refusal come back under
+    /// its id, and the continue's events are folded into the same log.
+    #[test]
+    fn a_restart_goes_out_as_agent_restart_and_its_answers_come_back() {
+        let mut restarts = 0;
+        let mut agent = agent_session_with("agent-restart", None, move |message, stream| match message {
+            ToCore::SpawnAgent(spawn) => {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: AGENT, pid: 4242, key: "k7".into() }));
+                let ready = AgentState::Ready { name: Some("fake".into()), version: None };
+                transcript(stream, &[Event::Agent { state: ready }]);
+            }
+            // The agent exits on its first prompt; the core keeps the
+            // session for a continue (no `EXIT`).
+            ToCore::AgentPrompt(prompt) => {
+                ok(stream, prompt.req);
+                let exited = AgentState::Exited { code: Some(1), stderr: "boom".into() };
+                transcript(stream, &[Event::Agent { state: exited }]);
+            }
+            ToCore::AgentRestart(restart) if restarts == 0 => {
+                restarts += 1;
+                ok(stream, restart.req);
+                let notice = Entry::Notice {
+                    level: crate::agent::transcript::NoticeLevel::Info,
+                    text: "the agent was started again to continue the conversation".into(),
+                };
+                let ready = AgentState::Ready { name: Some("fake".into()), version: None };
+                transcript(
+                    stream,
+                    &[
+                        Event::Added { id: EntryId(1), entry: notice },
+                        Event::Agent { state: AgentState::Starting },
+                        Event::Agent { state: ready },
+                    ],
+                );
+            }
+            ToCore::AgentRestart(restart) => refuse(stream, restart.req, "session 7: the agent hasn't ended"),
+            _ => {}
+        });
+        let prompt = agent.session.prompt("crash").unwrap();
+        recv(&agent.core);
+        let exited = |log: &Transcript| matches!(log.agent(), AgentState::Exited { .. });
+        assert_eq!(shows(&mut agent.feed, "the agent exited", exited), [reply(prompt)]);
+        let request = AgentRestartRequest {
+            command: "fake-agent".into(),
+            args: vec!["--second".into()],
+            env: BTreeMap::from([("AGENT_KEY".to_string(), "2".to_string())]),
+        };
+        let req = agent.session.restart(request.clone()).unwrap();
+        let sent = client::AgentRestart {
+            req,
+            session: AGENT,
+            command: "fake-agent".into(),
+            args: vec!["--second".into()],
+            env: BTreeMap::from([("AGENT_KEY".to_string(), "2".to_string())]),
+        };
+        assert_eq!(recv(&agent.core), ToCore::AgentRestart(sent));
+        let ready = |log: &Transcript| matches!(log.agent(), AgentState::Ready { .. }) && log.entries().count() == 1;
+        assert_eq!(shows(&mut agent.feed, "the continued agent ready", ready), [reply(req)]);
+        let again = agent.session.restart(request).unwrap();
+        let refused = AgentEvent::Reply { request: again, outcome: Err("session 7: the agent hasn't ended".into()) };
+        assert_eq!(next_life(&mut agent.feed), refused);
+    }
+
+    /// `agents-session-recovery` 4.2: a continue in a new session is a
+    /// `SPAWN_AGENT` naming the conversation, in its directory.
+    #[test]
+    fn a_continuing_start_sends_the_conversation() {
+        let dir = temp_dir("agent-continuing");
+        let core = scripted_core_at(&dir, 4, |message, stream| {
+            if let ToCore::SpawnAgent(spawn) = message {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: AGENT, pid: 4242, key: "k7".into() }));
+            }
+        });
+        let connection = connected(&dir);
+        let starting = connection.clone();
+        let conversation = crate::agent::transcript::Conversation {
+            id: "sess-1".into(),
+            cwd: "/home/u/src".into(),
+            continuation: crate::agent::transcript::Continuation::Load,
+        };
+        let request = agent_request().continuing(&conversation);
+        let (sink, _feed) = AgentSink::with_fault(None);
+        let session = Session::start_agent_with(move || Ok(starting), request, Box::new(sink));
+        let ToCore::SpawnAgent(spawn) = recv(&core) else { panic!("not SPAWN_AGENT") };
+        assert_eq!(spawn.cwd.as_deref(), Some("/home/u/src"));
+        assert_eq!(
+            spawn.conversation,
+            Some(client::AgentConversation { id: "sess-1".into(), cwd: "/home/u/src".into() })
+        );
+        assert_eq!((spawn.command.as_str(), spawn.profile.as_deref()), ("fake-agent", Some("Claude")));
+        eventually(|| session.id_and_key() == Some((AGENT, SessionKey::from_wire("k7"))));
+    }
+
     /// 4.2: a prompt during a turn waits in the slot and can be removed;
     /// one more while it waits is refused, the refusal coming back under
     /// that prompt's id.
@@ -1856,6 +1958,7 @@ mod tests {
             cwd: None,
             env: BTreeMap::new(),
             profile: "Fake".into(),
+            conversation: None,
         };
         let (sink, mut feed) = AgentSink::with_fault(Some(b"BRINDLE-FAULT-REAL".to_vec()));
         let session = Session::start_agent_with(move || Ok(starting), request, Box::new(sink));

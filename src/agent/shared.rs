@@ -120,6 +120,13 @@ impl AgentShared {
         self.changes = Changes { reset: true, from_replay: true, ..Changes::default() };
     }
 
+    /// A fold for a new session that takes the zone's place (a continue in
+    /// a new session): its first change starts the zone over from it, as a
+    /// replay's does, but its events are live.
+    pub fn start_over(&mut self) {
+        self.changes.reset = true;
+    }
+
     /// `REPLAY_END`: events from here on are live.
     pub fn replay_end(&mut self) {
         self.replaying = false;

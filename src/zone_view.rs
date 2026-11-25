@@ -548,7 +548,9 @@ impl ZoneContent {
 
     /// Whether session restore leaves the zone out: a terminal that only
     /// shows a message (a failed attach), or an agent zone whose session
-    /// isn't open any more (ended, never started, lost or broken).
+    /// isn't open any more (ended, never started, lost or broken) or whose
+    /// agent exited or was lost with its holder, though the server keeps
+    /// that session for a continue ([`crate::agent::model::ChatModel::keeps_session`]).
     pub fn unrecorded(&self, cx: &App) -> bool {
         match self {
             Self::Terminal(view) => view.read(cx).terminal.read(cx).shows_only_message(),

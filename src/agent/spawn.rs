@@ -9,8 +9,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::config::Profile;
+use crate::agent::transcript::Conversation;
+use crate::config::{Config, Profile, ProfileKind};
 use crate::remote::Host;
+use crate::remote::protocol::client::AgentConversation;
 
 /// The variables that describe a terminal, which an agent (on plain pipes,
 /// with no grid) doesn't get from Brindle: those Brindle sets for its
@@ -45,6 +47,46 @@ pub struct AgentSpawnRequest {
     pub env: BTreeMap<String, String>,
     /// The profile's name, which the session's listing carries.
     pub profile: String,
+    /// A conversation for the agent to continue instead of starting one
+    /// (`SPAWN_AGENT`'s `conversation`): a continue in a new session.
+    pub conversation: Option<AgentConversation>,
+}
+
+impl AgentSpawnRequest {
+    /// This start continuing `conversation` (an `Offer::Respawn`), in the
+    /// conversation's directory, which ACP ties it to (the server runs it
+    /// there whatever `cwd` says).
+    pub fn continuing(self, conversation: &Conversation) -> Self {
+        Self {
+            cwd: Some(conversation.cwd.clone()),
+            conversation: Some(AgentConversation { id: conversation.id.clone(), cwd: conversation.cwd.clone() }),
+            ..self
+        }
+    }
+
+    /// What `AGENT_RESTART` sends for this start (an `Offer::Restart`): the
+    /// command, its arguments and its environment. The session keeps its
+    /// directory, the conversation's.
+    pub fn restart(self) -> AgentRestartRequest {
+        AgentRestartRequest { command: self.command, args: self.args, env: self.env }
+    }
+}
+
+/// An ended agent's restart, as `AGENT_RESTART` sends it: built from the
+/// profile as a new zone's start is ([`agent_spawn_request`], then
+/// [`AgentSpawnRequest::restart`]), so the environment rules are one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRestartRequest {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+}
+
+/// The agent profile a continue runs: the one named `name` (the profile
+/// the zone's session was started with), while it is still an agent
+/// profile. `None` when it is gone or is a terminal profile now.
+pub fn continuing_profile<'a>(name: &str, config: &'a Config) -> Option<&'a Profile> {
+    config.profile(name).filter(|profile| profile.kind() == ProfileKind::Agent)
 }
 
 /// Where an agent of `profile` starts on `host`: `asked` (`-d`) wins, then
@@ -107,6 +149,7 @@ pub fn agent_spawn_request(
         cwd: directory(profile, host, asked, opened, home).map(|dir| dir.to_string_lossy().into_owned()),
         env: environment(profile, host, vars, ignore_case),
         profile: profile.name.clone(),
+        conversation: None,
     }
 }
 
@@ -242,5 +285,57 @@ mod tests {
         assert_eq!(request(&remote, &ssh(), None, &here).cwd, None);
         assert_eq!(request(&remote, &ssh(), None, &OpenedBy::Window).cwd, None);
         assert_eq!(request(&remote, &ssh(), Some("/srv"), &here).cwd.as_deref(), Some("/srv"), "-d is sent as given");
+    }
+
+    fn conversation() -> Conversation {
+        Conversation {
+            id: "sess-1".into(),
+            cwd: "/home/u/src".into(),
+            continuation: crate::agent::transcript::Continuation::Resume,
+        }
+    }
+
+    /// A restart is a new zone's start without its directory: the same
+    /// command, arguments and environment, terminal variables dropped and
+    /// the profile's over Brindle's, here and on a remote endpoint.
+    #[test]
+    fn a_restart_takes_a_new_zones_command_arguments_and_environment() {
+        let own = vars(&[("PATH", "/usr/bin"), ("TERM", "xterm-256color"), ("MODEL", "big")]);
+        let profile = agent("env = { MODEL = \"small\" }\ncwd = \"/srv\"\n");
+        for host in [Host::Local, ssh()] {
+            let start = agent_spawn_request(&profile, &host, None, &OpenedBy::Window, own.clone(), None, false);
+            let restart = start.clone().restart();
+            assert_eq!(restart, AgentRestartRequest { command: start.command, args: start.args, env: start.env.clone() });
+            assert_eq!(restart.env.get("TERM"), None, "{host:?}");
+            assert_eq!(restart.env.get("MODEL").map(String::as_str), Some("small"), "{host:?}");
+        }
+    }
+
+    /// A continue in a new session names the conversation and runs in its
+    /// directory, whatever the profile's says.
+    #[test]
+    fn a_continuing_start_names_the_conversation_and_runs_in_its_directory() {
+        let profile = agent("cwd = \"/srv\"\n");
+        let start = request(&profile, &Host::Local, None, &OpenedBy::Window);
+        assert_eq!(start.conversation, None, "a new zone's start continues nothing");
+        let continuing = start.clone().continuing(&conversation());
+        assert_eq!(continuing.cwd.as_deref(), Some("/home/u/src"));
+        assert_eq!(continuing.conversation, Some(AgentConversation { id: "sess-1".into(), cwd: "/home/u/src".into() }));
+        assert_eq!((continuing.command, continuing.args, continuing.env), (start.command, start.args, start.env));
+    }
+
+    /// The profile a continue runs is found by the session's profile name,
+    /// ignoring case as lookups do, and only while it is an agent profile.
+    #[test]
+    fn a_continue_runs_the_sessions_agent_profile_only() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake-acp\"\n",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(continuing_profile("Fake", &config).map(|p| p.name.as_str()), Some("Fake"));
+        assert_eq!(continuing_profile("fake", &config).map(|p| p.name.as_str()), Some("Fake"));
+        assert!(continuing_profile("Gone", &config).is_none(), "deleted");
+        assert!(continuing_profile("Shell", &config).is_none(), "a terminal profile now");
     }
 }
