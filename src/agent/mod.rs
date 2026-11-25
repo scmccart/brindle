@@ -11,40 +11,26 @@
 //! model decides, to the [`view::AgentView`], which draws the model and
 //! never takes the fold's lock (`process R14`).
 
-// The later groups of `agents-profiles` use these; until then only the
-// tests use the mappings, and nothing the re-exports.
-#[cfg_attr(not(test), allow(dead_code))]
-#[allow(unused_imports)]
 pub mod transcript;
 
-// Nothing opens an agent zone until group 6 of `agents-profiles` puts
-// `AgentView` in `ZoneContent::Agent`: until then the entity, its view and
-// what they use are reached only from the tests, and these allows go with
-// group 6.
-
 // What an agent session's start asks for.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod spawn;
 
-// Whether a close asks first: group 6's close paths call it.
-#[cfg_attr(not(test), allow(dead_code))]
+// Whether a close asks first: the close paths call it from task 6.6 on.
+#[cfg_attr(not(test), allow(dead_code, reason = "agents-profiles task 6.6 routes the close paths through close_plan"))]
 pub mod close;
 
 // The fold the reader thread and the zone share.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod shared;
 
 // The chat model and the protocol gate.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod model;
 
 // The sink the connection's reader folds an agent session's transcript
 // through, and its zone's end, which the `Agent` entity drains.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod sink;
 
 // The zone's view.
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod view;
 
 use std::path::PathBuf;
@@ -72,7 +58,6 @@ use crate::terminal::status::State;
 /// [`crate::remote::AgentLink`], or a test's fake. Each returns the
 /// request's id, which its answer comes back under, or `None` when
 /// nothing was sent.
-#[cfg_attr(not(test), allow(dead_code))]
 pub trait Requests {
     fn prompt(&self, text: &str) -> Option<RequestId>;
     fn resend(&self) -> Option<RequestId>;
@@ -128,7 +113,6 @@ impl Requests for crate::remote::AgentLink {
 /// it shares with terminals ([`TerminalEvent`]); everything else the view
 /// reads from the model when the agent notifies.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum AgentUpdate {
     /// The conversation's blocks changed, in order (`MessageScroller::splice`).
     Splices(Vec<Splice>),
@@ -142,7 +126,6 @@ pub enum AgentUpdate {
 /// Whether the zone has let its session go (closed it or detached it on a
 /// quit): once is enough.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum Held {
     Holding,
     Left,
@@ -150,7 +133,6 @@ enum Held {
 
 /// An agent zone's session and its model: the entity that drains the
 /// sink, decides through [`ChatModel`] and sends the requests.
-#[allow(dead_code, reason = "group 6 opens agent zones; the tests use the entity without spawning or attaching")]
 pub struct Agent {
     model: ChatModel,
     /// The fold the reader thread writes, read only while absorbing a
@@ -168,7 +150,6 @@ pub struct Agent {
 impl EventEmitter<TerminalEvent> for Agent {}
 impl EventEmitter<AgentUpdate> for Agent {}
 
-#[allow(dead_code, reason = "group 6 opens agent zones; the tests use the entity without spawning or attaching")]
 impl Agent {
     /// Starts an agent of `profile` in a new session of `host`'s terminal
     /// server, in `cwd` (`-d`) or the profile's directory, else as

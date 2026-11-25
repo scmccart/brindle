@@ -268,6 +268,15 @@ impl TabKind {
             Self::Agent => "agent",
         }
     }
+
+    /// The kind of tab a profile of `kind` opens (a restored tab's, from
+    /// its profile).
+    pub fn of(kind: config::ProfileKind) -> Self {
+        match kind {
+            config::ProfileKind::Terminal => Self::Terminal,
+            config::ProfileKind::Agent => Self::Agent,
+        }
+    }
 }
 
 /// The longest first prompt, in bytes of UTF-8: the terminal server's limit

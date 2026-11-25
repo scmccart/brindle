@@ -144,7 +144,6 @@ impl FocusStops for AgentView {
     }
 }
 
-#[allow(dead_code, reason = "group 6 puts the view in `ZoneContent::Agent` and reads it through these accessors")]
 impl AgentView {
     pub fn new(
         agent: Entity<Agent>,
@@ -187,6 +186,7 @@ impl AgentView {
         &self.agent
     }
 
+    #[allow(dead_code, reason = "agents-profiles task 6.7 types `--send` into the prompt")]
     pub fn prompt(&self) -> &Entity<PromptInput> {
         &self.prompt
     }
@@ -283,6 +283,7 @@ impl AgentView {
 
     /// The focus handle of permission request `entry`'s button `option`,
     /// while it is pending.
+    #[cfg_attr(not(test), allow(dead_code, reason = "agents-profiles task 6.7's focus line names the permission stops"))]
     pub fn permission_handle(&self, entry: EntryId, option: &str) -> Option<&FocusHandle> {
         self.permissions.iter().find(|((own, id), _)| *own == entry && id == option).map(|(_, handle)| handle)
     }

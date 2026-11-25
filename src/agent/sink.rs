@@ -82,6 +82,7 @@ pub struct Feed {
 impl Feed {
     /// The zone took `taken` off [`Feed::events`]: they no longer wait. A
     /// merged `Changed` can be queued again.
+    #[cfg(test)]
     pub fn took<'a>(&self, taken: impl IntoIterator<Item = &'a AgentEvent>) -> Option<Recovered> {
         self.gate.lock().took(taken.into_iter().map(kind_of))
     }

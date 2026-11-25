@@ -386,18 +386,24 @@ fn inert(label: String, detail: Option<String>) -> PaletteRow {
     PaletteRow { label: label.into(), detail: detail.map(Into::into), shortcut: None, disabled: true }
 }
 
-/// A session's row: its title (else its program), with its directory and
-/// age at `now` (unix seconds).
+/// A session's row: a terminal's title (else its program), with its
+/// directory and age at `now` (unix seconds); an agent session marked as
+/// one, with its listed status in place of a title, and its command before
+/// its directory and age.
 fn session_row(s: &SessionInfo, now: u64) -> PaletteRow {
     let age = crate::reattach::age(s.started, now);
-    let detail = match (&s.cwd, age) {
-        (Some(cwd), Some(age)) => format!("{cwd} · {age} ago"),
-        (Some(cwd), None) => cwd.clone(),
-        (None, Some(age)) => format!("{age} ago"),
-        (None, None) => String::new(),
+    let (label, command) = match &s.agent {
+        None => (crate::reattach::label(s), None),
+        Some(agent) => {
+            let status = crate::agent::transcript::listed_status(agent.activity).name();
+            (format!("agent · {status}"), Some(s.command.as_str()).filter(|command| !command.is_empty()))
+        }
     };
+    let detail: Vec<String> =
+        command.map(str::to_string).into_iter().chain(s.cwd.clone()).chain(age.map(|age| format!("{age} ago"))).collect();
+    let detail = detail.join(" · ");
     PaletteRow {
-        label: crate::reattach::label(s).into(),
+        label: label.into(),
         detail: (!detail.is_empty()).then(|| detail.into()),
         shortcut: None,
         disabled: false,
@@ -670,6 +676,28 @@ mod tests {
             assert!(model.answer(0, &host, Listing::Sessions(Vec::new()), None));
         }
         assert!(model.complete());
+    }
+
+    /// Task 6.4: a listing holding both kinds lists both, with the
+    /// terminals; an agent's row is marked as one with its listed status in
+    /// place of a title, and its command, directory and age, and names its
+    /// session for enter and `picker_kill` as a terminal's does.
+    #[test]
+    fn agent_sessions_are_listed_with_their_status() {
+        use crate::remote::protocol::client::{AgentActivity, AgentInfo};
+        let agent = SessionInfo {
+            command: "claude-code-acp".into(),
+            cwd: Some("/src".into()),
+            agent: Some(AgentInfo { activity: AgentActivity::Blocked, name: Some("Claude".into()) }),
+            ..info(5, "ignored", 140)
+        };
+        let listed = [(Host::Local, Listing::Sessions(vec![info(4, "shell", 100), agent]))];
+        let palette = session_palette(&listed, &[], &[], &config(), 200);
+        assert_eq!(labels(&palette), [(None, vec!["agent · blocked", "shell"])]);
+        let detail = palette.groups[0].rows[0].detail.as_ref().map(|d| d.to_string());
+        assert_eq!(detail.as_deref(), Some("claude-code-acp · /src · 1m ago"));
+        let targets: Vec<Option<u32>> = palette.rows.iter().map(|row| row.target().map(|t| t.session)).collect();
+        assert_eq!(targets, [Some(5), Some(4)]);
     }
 
     /// A session's row names the session its kill ends, key decoded; the

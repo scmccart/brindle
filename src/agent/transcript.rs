@@ -7,7 +7,7 @@
 //! Pure: values in, values out.
 
 pub use brindle_transcript::{
-    Activity, AgentState, DecodeError, Entry, EntryId, Event, FoldError, HoldReason, NoticeLevel, PermissionKind,
+    Activity, AgentState, Entry, EntryId, Event, HoldReason, NoticeLevel, PermissionKind,
     PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState,
 };
 

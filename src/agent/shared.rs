@@ -108,6 +108,7 @@ impl AgentShared {
         &self.transcript
     }
 
+    #[cfg(test)]
     pub fn replaying(&self) -> bool {
         self.replaying
     }

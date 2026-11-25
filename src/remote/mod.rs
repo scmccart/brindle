@@ -37,13 +37,7 @@ use crate::agent::sink::Sink as AgentSink;
 use crate::agent::spawn::AgentSpawnRequest;
 use crate::config::RemoteTarget;
 
-// The agent seam's items are for the `Agent` entity (`src/agent/mod.rs`),
-// which nothing opens until `agents-profiles` group 6 puts agent zones in
-// the workspace: until then the client's own tests and the entity's cover
-// them, and these allows go with group 6.
-
 /// What an agent zone's session starts from ([`agent_link`]).
-#[allow(dead_code)]
 pub enum AgentStart {
     /// A new agent session: what it runs, said on the session's own
     /// thread, as a terminal spawn's request is.
@@ -58,16 +52,13 @@ pub enum AgentStart {
 /// it: on Linux and Windows the session in `remote::local`, which its
 /// requests go through. Elsewhere none is ever made.
 #[cfg(any(target_os = "linux", windows))]
-#[allow(dead_code)]
 pub struct AgentLink(local::Session);
 
 /// Where there is no terminal server, no agent session is ever made.
 #[cfg(not(any(target_os = "linux", windows)))]
-#[allow(dead_code)]
 pub enum AgentLink {}
 
 #[cfg(any(target_os = "linux", windows))]
-#[allow(dead_code)]
 impl AgentLink {
     /// Sends a prompt while the session runs; the request's id, which its
     /// answer comes back under (`AgentEvent::Reply`), or `None`.
@@ -119,7 +110,6 @@ impl AgentLink {
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-#[allow(dead_code)]
 impl AgentLink {
     pub fn prompt(&self, _text: &str) -> Option<protocol::RequestId> {
         match *self {}
@@ -160,7 +150,6 @@ impl AgentLink {
 
 /// Why [`agent_link`] can't start an agent session here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub struct Unsupported {
     reason: &'static str,
 }
@@ -186,7 +175,6 @@ const NEEDS_THE_SERVER: Unsupported =
 /// the spawn or attach happen on the session's own thread, and a failure
 /// reaches the sink (`AgentEvent::Failed`).
 #[cfg(any(target_os = "linux", windows))]
-#[allow(dead_code)]
 pub fn agent_link(host: Host, start: AgentStart, sink: AgentSink) -> Result<AgentLink, Unsupported> {
     let sink: Box<dyn local::SessionSink> = Box::new(sink);
     let session = match start {
@@ -203,7 +191,6 @@ pub fn agent_link(host: Host, start: AgentStart, sink: AgentSink) -> Result<Agen
 
 /// [`agent_link`] where there is no terminal server: always refused.
 #[cfg(not(any(target_os = "linux", windows)))]
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn agent_link(host: Host, start: AgentStart, sink: AgentSink) -> Result<AgentLink, Unsupported> {
     let _ = (host, start, sink);
     Err(NEEDS_THE_SERVER)

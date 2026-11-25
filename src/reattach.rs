@@ -189,6 +189,18 @@ pub fn endpoints_without_tabs(before: &[Host], after: &[Host], eager: &[Host]) -
     left
 }
 
+/// What [`Detached::take_of_kind`] found for a restored zone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Taken {
+    /// Its session, of the tab's kind: the zone attaches it.
+    Session(Box<SessionInfo>),
+    /// Its session is listed but of the other kind: the zone isn't
+    /// restored, and the session opens as a tab of its own.
+    OtherKind,
+    /// Not listed as detached (or no listing): the zone starts anew.
+    Missing,
+}
+
 /// A GPUI global: what is left to attach. Empty for `--no-restore`
 /// launches, for a Brindle that doesn't own the session state, and where
 /// no terminal server runs (macOS).
@@ -204,11 +216,17 @@ impl Detached {
         Self { sessions }
     }
 
-    /// The listed session a restored zone recorded: same id and same key
-    /// (an empty key never matches, so a reused id is never taken for it).
-    pub fn take(&mut self, recorded: &ServerSession) -> Option<SessionInfo> {
-        let ix = self.position(recorded)?;
-        Some(self.sessions.remove(ix))
+    /// The listed session a restored zone of a tab of `kind` recorded: same
+    /// id and same key (an empty key never matches, so a reused id is never
+    /// taken for it), when it is of that kind ([`session_kind`]). One of
+    /// the other kind isn't taken: it is left for the launch to attach as a
+    /// tab of its own.
+    pub fn take_of_kind(&mut self, recorded: &ServerSession, kind: TabKind) -> Taken {
+        let Some(ix) = self.position(recorded) else { return Taken::Missing };
+        if session_kind(&self.sessions[ix]) != kind {
+            return Taken::OtherKind;
+        }
+        Taken::Session(Box::new(self.sessions.remove(ix)))
     }
 
     /// Whether [`Detached::take`] would find `recorded`.
@@ -315,15 +333,24 @@ mod tests {
         SessionInfo { session, key: key.into(), started, ..Default::default() }
     }
 
+    /// What a restored zone of a tab of `kind` takes for `id` and `key`.
+    fn take(detached: &mut Detached, id: u32, key: &str, kind: TabKind) -> Taken {
+        detached.take_of_kind(&ServerSession { id, key: key.into() }, kind)
+    }
+
+    fn taken(session: SessionInfo) -> Taken {
+        Taken::Session(Box::new(session))
+    }
+
     #[test]
     fn a_zone_takes_only_its_own_session_and_the_rest_come_oldest_first() {
         let mut detached = Detached::new(vec![info(3, "c", 30), info(1, "a", 10), info(2, "", 5), info(4, "d", 10)]);
         // Same id, another key: a session that reused the id.
-        assert!(detached.take(&ServerSession { id: 1, key: "old".into() }).is_none());
+        assert_eq!(take(&mut detached, 1, "old", TabKind::Terminal), Taken::Missing);
         // A core that predates keys: never matched.
-        assert!(detached.take(&ServerSession { id: 2, key: String::new() }).is_none());
-        assert_eq!(detached.take(&ServerSession { id: 3, key: "c".into() }).map(|s| s.session), Some(3));
-        assert!(detached.take(&ServerSession { id: 3, key: "c".into() }).is_none(), "taken once");
+        assert_eq!(take(&mut detached, 2, "", TabKind::Terminal), Taken::Missing);
+        assert_eq!(take(&mut detached, 3, "c", TabKind::Terminal), taken(info(3, "c", 30)));
+        assert_eq!(take(&mut detached, 3, "c", TabKind::Terminal), Taken::Missing, "taken once");
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [2, 1, 4]);
         assert!(detached.take_rest().is_empty());
@@ -345,9 +372,38 @@ mod tests {
             owned(4, "d", 1, OWNER_GRACE_SECS),
             owned(5, "e", 2, 30),
         ]);
-        assert_eq!(detached.take(&ServerSession { id: 5, key: "e".into() }).map(|s| s.session), Some(5));
+        assert_eq!(take(&mut detached, 5, "e", TabKind::Terminal), taken(owned(5, "e", 2, 30)));
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [3, 2]);
+    }
+
+    fn agent_info(session: u32, key: &str, started: u64) -> SessionInfo {
+        let agent = crate::remote::protocol::client::AgentInfo {
+            activity: crate::remote::protocol::client::AgentActivity::Idle,
+            name: None,
+        };
+        SessionInfo { agent: Some(agent), ..info(session, key, started) }
+    }
+
+    /// Task 6.4: over a listing holding both kinds, a restored zone takes
+    /// only a session of its tab's kind. One of the other kind stays, and
+    /// the launch attaches it with the rest, as a tab of its kind.
+    #[test]
+    fn a_restored_zone_takes_only_a_session_of_its_tabs_kind() {
+        let listing = || Detached::new(vec![info(1, "t", 10), agent_info(2, "a", 20)]);
+        let mut detached = listing();
+        assert_eq!(take(&mut detached, 2, "a", TabKind::Agent), taken(agent_info(2, "a", 20)));
+        assert_eq!(take(&mut detached, 1, "t", TabKind::Agent), Taken::OtherKind);
+        let rest = detached.take_rest();
+        assert_eq!(rest, [info(1, "t", 10)], "left for the launch");
+        assert_eq!(session_kind(&rest[0]), TabKind::Terminal);
+
+        let mut detached = listing();
+        assert_eq!(take(&mut detached, 2, "a", TabKind::Terminal), Taken::OtherKind);
+        assert_eq!(take(&mut detached, 1, "t", TabKind::Terminal), taken(info(1, "t", 10)));
+        let rest = detached.take_rest();
+        assert_eq!(rest, [agent_info(2, "a", 20)]);
+        assert_eq!(session_kind(&rest[0]), TabKind::Agent);
     }
 
     /// 7.2: a remote endpoint's first listing attaches its detached
