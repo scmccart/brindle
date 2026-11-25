@@ -70,7 +70,8 @@ Client protocol 4 is unreleased and amended (`agents-tool-content`, decision 8).
 
 | Bound | Was | Now |
 | --- | --- | --- |
-| `UPLOAD_LIMIT`: one attachment, text or image | 256 KiB (`ATTACHMENT_TEXT`) | 5 MiB |
+| `UPLOAD_LIMIT`: one text attachment | 256 KiB (`ATTACHMENT_TEXT`) | 5 MiB |
+| `IMAGE_LIMIT`: one image, a hard maximum | — | 5 MiB |
 | `PROMPT_IMAGES`: a prompt's images together | — | 8 MiB |
 | `STORE_LIMIT`: kept a session | 16 MiB | 64 MiB |
 | `MAX_ATTACHMENTS`, `EMBED_LIMIT` | 8, 64 KiB | unchanged |
@@ -78,7 +79,7 @@ Client protocol 4 is unreleased and amended (`agents-tool-content`, decision 8).
 
 - **Why a prompt's images are bounded together.** The agent gets a prompt as one line. With 8 MiB of images (10.7 MiB as base64), eight embedded texts and the prompt's own text at their worst-case escaping, a line is under 13 MiB.
 - **Why the holder's bound moves.** That line goes through the holder's input queue, which refuses what passes 4 MiB and would cut a prompt in two. Pipe sessions get their own bound, `PIPE_INPUT_QUEUE_LIMIT` = 16 MiB; a terminal's stays at 4 MiB. It is a number, not a feature (`process R1`): the holder still parses nothing. Only one prompt is in flight for a session at a time (a second waits in the slot), so a line never shares the queue with another. H1 3 is unreleased, so no holder with the smaller bound for pipe sessions is in use; if one is released first, the core must keep a prompt's line under 4 MiB for such a holder, and this decision is reopened.
-- **5 MiB an image** is what the model APIs behind these agents commonly accept for one image; a larger one would be kept and then refused by the agent.
+- **One image has a hard maximum of its own** (the user, 2026-11-25), `IMAGE_LIMIT`, separate from text's `UPLOAD_LIMIT` so the two can move apart. It is checked three times: by Brindle when the image is attached, by the server at `AGENT_UPLOAD_BEGIN` before any byte is sent, and by the server again as pieces arrive. Nothing shrinks an image to fit. 5 MiB is what the model APIs behind these agents commonly accept for one image; a larger one would be kept and then refused by the agent.
 - Over any bound an attachment is refused outright, with its size and the limit, as text already is.
 
 ### 5. How an image is sent (`acp/forms.rs`, each version's module)
@@ -139,8 +140,9 @@ As for text: kept images are files and their references are in the checkpoint, s
 
 Each has a recommendation, which the text above follows. They are the user's to settle before implementation.
 
-1. **The bounds:** 5 MiB an attachment, 8 MiB of images a prompt, 64 MiB kept a session (recommended).
-2. **The holder's input bound for agent sessions rises to 16 MiB** so a prompt with images fits (recommended), or it stays at 4 MiB and images are held to about 2 MiB a prompt.
+Decided on 2026-11-25: the holder's input bound for agent sessions rises to 16 MiB, and one image has a hard maximum of its own (decision 4).
+
+1. **The numbers:** 5 MiB as one image's hard maximum, 5 MiB a text attachment, 8 MiB of images a prompt, 64 MiB kept a session (recommended).
 3. **An agent that doesn't accept images** gets a link to the kept file (recommended), or the image is refused when attached.
 4. **A dropped image file is attached as an image for a local agent too** (recommended), or stays a link there, as other local files are.
 5. **A clipboard with both text and an image** pastes the text, with Paste Image for the picture (recommended), or attaches the image as well.
