@@ -11,6 +11,10 @@ In an agent zone's dump, after the `--- agent` line and the lines for the sessio
 - **WHEN** Brindle runs with `--wait-for 'done=2 total=2'` against a fake ACP agent that completes both items after a delay
 - **THEN** the later steps run once both are completed
 
+#### Scenario: Dismissed by an action
+- **WHEN** Brindle runs `--action agent_dismiss_plan --dump-screen-after 2` while a plan shows
+- **THEN** the dump has no `--- plan` line
+
 #### Scenario: Opened by an action
 - **WHEN** Brindle runs `--action toggle_agent_plan --dump-screen-after 2` while a plan shows
 - **THEN** the plan's line has `open=yes`

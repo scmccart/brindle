@@ -65,21 +65,43 @@ At most 8 plans SHALL be kept for a session, each with at most 256 items, and at
 - **WHEN** the session holds 8 plans and the agent sends one with a new id
 - **THEN** it isn't kept, and a notice says a session keeps at most 8 plans
 
-### Requirement: A finished plan is cleared when the next turn starts
-When a prompt is sent to the agent, the server SHALL first remove every checklist plan whose items are all completed or cancelled, and tell attached clients. A plan with an item still pending or in progress, and a Markdown plan, SHALL stay. A turn's end SHALL NOT remove a plan.
+### Requirement: The server never clears a plan on its own
+A plan SHALL stay as the agent last reported it until the agent replaces or removes it, or a client dismisses it. A turn's end, every item being completed, and a new prompt SHALL NOT remove a plan.
 
-#### Scenario: Finished, then a new prompt
+#### Scenario: Finished and kept
 - **WHEN** the agent's plan has every item completed, the turn ends, and the user sends another prompt
-- **THEN** the plan is removed before the agent receives the prompt
-
-#### Scenario: Still on view between turns
-- **WHEN** the agent's plan has every item completed and the turn ends
 - **THEN** the session still holds the plan
 
-#### Scenario: Unfinished
-- **WHEN** the agent's plan has one item pending, the turn ends, and the user sends another prompt
-- **THEN** the plan stays
+#### Scenario: Stale and kept
+- **WHEN** the agent's plan has an item in progress, the agent ends the turn without updating it, and a day passes
+- **THEN** the session still holds the plan, with that item in progress
 
-#### Scenario: A queued prompt
-- **WHEN** a prompt waits in the queue, the agent's plan becomes all completed, and the turn ends with `end_turn`
-- **THEN** the plan is removed when the queued prompt is sent
+### Requirement: A client dismisses a plan
+A client attached to an agent session SHALL be able to dismiss one plan, by its id, or every plan the session holds. The server SHALL remove it from the session and tell every attached client, and SHALL NOT tell the agent. Dismissing a plan the session doesn't hold SHALL be refused with an error.
+
+#### Scenario: Dismissed
+- **WHEN** a client dismisses the session's plan
+- **THEN** every attached client is told the plan is gone, a later replay holds no plan, and the agent receives nothing
+
+#### Scenario: Dismiss all
+- **WHEN** the session holds two plans and a client dismisses every plan
+- **THEN** both are removed
+
+#### Scenario: Nothing to dismiss
+- **WHEN** a client dismisses a plan with an id the session doesn't hold
+- **THEN** it gets an error saying there is no such plan
+
+### Requirement: A dismissed plan stays away until the agent changes it
+After a plan is dismissed, the same plan sent again by the agent, unchanged, SHALL NOT bring it back. A plan the agent sends under that id that differs from the dismissed one SHALL be kept and shown again. This SHALL hold across detaches, core restarts and upgrades.
+
+#### Scenario: The agent repeats itself
+- **WHEN** a client dismisses a plan, and the agent then sends that plan again with the same items and statuses
+- **THEN** the session still holds no plan
+
+#### Scenario: The agent makes progress
+- **WHEN** a client dismisses a plan, and the agent then sends it with another item completed
+- **THEN** the session holds the plan again, as the agent now reports it
+
+#### Scenario: Across a restart
+- **WHEN** a client dismisses a plan, the core restarts, and the agent sends the same plan again
+- **THEN** the session still holds no plan

@@ -11,6 +11,17 @@ A plan block SHALL show a trigger line with a chevron, a label, a progress count
 - **WHEN** the current step's text is wider than the block
 - **THEN** it is cut with an ellipsis, and the progress count stays whole
 
+### Requirement: Plan block dismiss mark
+When the owner asks for one, a plan block's trigger line SHALL end with a small dismiss mark. A primary press on it SHALL ask the owner to dismiss the block and SHALL NOT flip it open or closed. The mark SHALL take no focus.
+
+#### Scenario: Dismiss doesn't open
+- **WHEN** the dismiss mark of a closed plan block is pressed
+- **THEN** the owner is asked to dismiss, and isn't asked to open it
+
+#### Scenario: No mark
+- **WHEN** the owner asks for no dismiss mark
+- **THEN** the trigger line shows none
+
 ### Requirement: Plan items
 A plan block's item SHALL show a mark for its status (pending, in progress, completed or cancelled, each a different shape), then its content, with the text of a completed or cancelled item muted and a high-priority item marked before its text.
 

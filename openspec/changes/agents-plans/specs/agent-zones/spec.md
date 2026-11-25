@@ -19,6 +19,25 @@ While its session has a plan, an agent zone SHALL show it between the conversati
 - **WHEN** the session has no plan
 - **THEN** nothing shows between the conversation and the prompt input for one
 
+### Requirement: Dismissing the plan
+Each plan's line SHALL have a dismiss mark, operated with the pointer, which asks the server to dismiss that plan. The `agent_dismiss_plan` action SHALL ask it to dismiss every plan the zone shows, and the command palette SHALL list it as Dismiss Agent Plan only while the session has a plan. A plan SHALL go from the zone when the server says it is removed, and SHALL come back if the agent later changes it. A refused request SHALL show its reason on the window's notice line.
+
+#### Scenario: Dismissed from the palette
+- **WHEN** a plan shows `5 of 7` after the agent has finished its work, and the user runs Dismiss Agent Plan
+- **THEN** the plan goes from above the prompt input
+
+#### Scenario: Dismissed with the pointer
+- **WHEN** two plans show and the user presses the dismiss mark of the second
+- **THEN** the second goes and the first stays
+
+#### Scenario: It comes back when the agent moves on
+- **WHEN** the user dismissed a plan and the agent later reports it with another item completed
+- **THEN** the plan shows again, with the new count
+
+#### Scenario: After a relaunch
+- **WHEN** the user dismissed a plan, quits Brindle and launches it again
+- **THEN** the restored zone shows no plan
+
 ### Requirement: The open plan
 An open plan SHALL list its items in the agent's order, each with a mark for its status and its text rendered as agent messages are, completed and cancelled items muted and high-priority items marked. A Markdown plan SHALL show its text rendered, and its file's path when it has one. The list SHALL be no taller than a part of the zone and SHALL scroll within itself. Status SHALL never be shown by colour alone.
 

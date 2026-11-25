@@ -17,19 +17,20 @@ See proposal.md for why. Facts this design rests on, from the code on `feat/agen
 - A user sees, at a glance and without scrolling, how far a task of several steps has got.
 - One form of Brindle's own for both ACP forms of a plan, filled inside each version's module.
 - The server keeps plans, so a restored or reattached zone has them.
-- A plan from a finished task doesn't linger over the next one.
+- A plan the agent has stopped keeping up can be put away by the user, and stays away.
 - No new keyboard stop, and no change to a requirement another stacked change modifies.
 
-**Non-Goals:** editing a plan or steering the agent through it; a plan as a conversation entry, and a history of its states; opening a Markdown plan's file; notifications for steps; plans in the sessions palette or a tab's title; a setting per profile. No client message and no state file.
+**Non-Goals:** editing a plan or steering the agent through it; a plan as a conversation entry, and a history of its states; opening a Markdown plan's file; notifications for steps; plans in the sessions palette or a tab's title; a setting per profile; bringing a dismissed plan back by hand; clearing a plan automatically. No state file.
 
 ## Layer map
 
 | Part | Kind | Crate and module |
 | --- | --- | --- |
 | `Plan`, `PlanBody`, `PlanItem`, `ItemStatus`, `Priority`; `Event::Plan`, `Event::PlanRemoved`; the transcript's state and replay | pure, shared contract | `brindle-transcript`, `transcript/src/lib.rs` |
+| `AGENT_DISMISS_PLAN` | wire | `brindle-remote-protocol`, `remote-protocol/src/client.rs` |
 | The forms: `PlanChange::{ Set(Plan), Removed { id } }` | pure, plain data | `brindle-remote-agent`, `acp/forms.rs` |
 | ACP v1: `plan`, `plan_update`, `plan_removed`; the plan capability | pure | `acp/v1/{decode, encode}.rs` |
-| Keeping, bounding and clearing plans | pure | `acp/reduce.rs` |
+| Keeping, bounding and dismissing plans | pure | `acp/reduce.rs` |
 | `plan_summary`, the block's parts, open state, dump lines | GPUI-free model | `brindle`, `src/agent/model.rs` |
 | `[agent] plan_details` | pure (boundary parse) | `brindle`, `src/config.rs` |
 | The block above the prompt input, the action | shell (entity) | `src/agent/view.rs`, `src/agent/mod.rs`, `src/actions.rs` |
@@ -84,12 +85,16 @@ Event::PlanRemoved { id: String }    // nothing when no plan has the id
 - **Bounds** (`railway R5`), applied by the reducer before the event: at most `MAX_PLANS` = 8 plans (a ninth id is refused with a notice); `MAX_PLAN_ITEMS` = 256 items a plan, later ones dropped and counted; an item's text bounded at 1 KiB; `PLAN_TEXT` = 64 KiB of Markdown, its end dropped with a mark; a path bounded as titles are; ids bounded as tool call ids are; every text cleaned. One plan therefore fits one event under `TEXT_CHUNK`'s frame.
 - **Versions.** Client protocol 4 is unreleased and amended, as `agents-tool-content`'s decision 8 says: two event kinds, new `tests/fixtures/v4/` files and none edited. The checkpoint keeps format 1 with the plans in its state; one from before this change decodes with none.
 
-### 4. When a plan is cleared (`acp/reduce.rs`)
+### 4. When a plan goes (`acp/reduce.rs`; the user's decision, 2026-11-25)
 
-- **By the agent:** a `Removed`, or v1's `plan` with no entries.
-- **By the next turn:** when a prompt is sent to the agent, every plan that is finished is removed first. A checklist is finished when it has items and each is `Completed` or `Cancelled`. A Markdown plan has no statuses and is never finished, so only the agent removes it. A plan with a step still pending or in progress stays: the agent may carry it into the next turn.
-- **Not by a turn's end:** a plan stays on view after its task ends, finished or not, so the user can read what was done.
-- Each clearing emits `PlanRemoved`.
+Brindle never clears a plan on its own: not when a turn ends, not when every item is done, not when the next prompt is sent. A plan goes in two ways.
+
+- **The agent removes it:** a `Removed`, or v1's `plan` with no entries.
+- **The user dismisses it.** Agents often stop updating a plan, leaving steps unchecked that were done, and v1's unnamed plan can't be withdrawn at all, so the user needs a way to put one away.
+  - **`AGENT_DISMISS_PLAN { req, session, plan }`**, a new client message of protocol 4 (amended; the next free number when the stack is assembled), `plan` being an id, or absent for every plan the session holds. Answered `OK`, or `ERROR` (`NoSuchPlan`, `NotAnAgentSession`). Fixtures pin it and it joins the protocol's fuzzing.
+  - **The server removes the plan** from the session's state and tells attached clients (`PlanRemoved`), so it is gone for every client and after a restart. The agent isn't told: ACP has no message for it.
+  - **Dismissed until the agent changes it.** The server remembers each dismissed plan beside the session's state (`dismissed: id → Plan`, at most `MAX_PLANS`, in the checkpoint). A plan the agent sends that equals the one dismissed under its id is ignored; one that differs is kept and shown again, and the record is dropped. So a stale plan an agent keeps resending stays away, and real progress brings it back. A removal by the agent drops the record too.
+- This is also what keeps `agents-session-recovery`'s replay quiet: an agent replaying its conversation resends the plans it had, and one the user dismissed is equal to its record.
 
 ### 5. The chat model (`src/agent/model.rs`, GPUI-free; `fcis R1`, `R5`)
 
@@ -103,6 +108,7 @@ Event::PlanRemoved { id: String }    // nothing when no plan has the id
 - **Where.** Between the conversation and the prompt input, above the queue row, shown only while the session has a plan. It doesn't scroll away with the conversation.
 - **`Plan`** (new, plain data in): a trigger line with a chevron, a label, a progress count (`3 of 7`) and a current step cut to one line; when open, its items below, each a status mark (an empty circle for pending, a spinner-style mark for in progress, a check for completed, a struck dash for cancelled), the text, and an accent mark before a high-priority item. A completed or cancelled item's text is muted. Status is never colour alone. The open list is at most 12 rem tall and scrolls within itself. A press on the trigger asks the owner to flip it. It takes no focus.
 - **`toggle_agent_plan`** ("Toggle Agent Plan", no default key), handled only by `AgentView`, listed only while the session has a plan.
+- **Dismissing.** Each plan's trigger line has a small dismiss mark at its end, pressed with the pointer, which asks the server to dismiss that plan. `agent_dismiss_plan` ("Dismiss Agent Plan", no default key) dismisses every plan the zone shows, and is listed only while the session has one. The plan goes from the zone when the server says it is removed, not before; a refusal shows on the window's notice line.
 - **`[agent] plan_details`**: `"closed"` (the default) or `"open"`, decoded into `Shown` beside `tool_details`; another value is an invalid config.
 - No keyboard stop is added: "Keyboard path through an agent zone" is unchanged.
 
@@ -130,17 +136,16 @@ Plans are in the session's checkpoint, so a core restart and an upgrade keep the
 
 - **Unit:** the fold and replay over both events, twice-applied events, and `fold(replay(t)) == t`; `v1::decode` over each form, an unreadable entry, an empty `planId`, an unknown type, and the captures of task 1.1; `v1::encode`'s capability; the reducer's bounds, equal plans emitting nothing, clearing finished plans when a prompt is sent and keeping unfinished and Markdown ones; `plan_summary` for each case; the dump lines; the config key.
 - **Captures:** task 1.1, and the replay test asserting each agent's plans.
-- **Real roles** (the fake ACP agent): a plan reaches an attached client and each update replaces it; a restart keeps it; a new prompt clears a finished one.
-- **E2E:** `agent-plan-progress`, `agent-plan-markdown`, `agent-plan-cleared`, `agent-plan-restore`, `agent-plan-settings`.
+- **Real roles** (the fake ACP agent): a plan reaches an attached client and each update replaces it; a restart keeps it; a finished plan survives a new prompt; a dismissal reaches every client, stays after an unchanged resend and a restart, and ends when the agent changes the plan.
+- **E2E:** `agent-plan-progress`, `agent-plan-markdown`, `agent-plan-dismiss`, `agent-plan-restore`, `agent-plan-settings`.
 - **Manual:** a pointer press on the trigger; scrolling a long open plan; a real agent's plan on a task of several steps.
 
 ## Open decisions
 
 Each has a recommendation, which the text above follows. They are the user's to settle before implementation.
 
-1. **Where the plan shows:** above the prompt input, staying in view (recommended), or as an entry in the conversation where it first appeared, updated in place.
-2. **How it starts:** closed, as one line with the count and the current step, with `[agent] plan_details` to open it by default (recommended), or always open.
-3. **A finished plan is cleared when the next turn starts** (recommended), or stays until the agent replaces or removes it.
+Decided on 2026-11-25: the plan shows above the prompt input, staying in view (decision 6). It starts closed, as one line with the count and the current step, and `[agent] plan_details` opens it by default (decisions 5 and 6). A plan stays until the agent replaces or removes it, which the user chose over clearing a finished one at the next turn, and the user can dismiss one, since agents often forget to check items off (decision 4).
+
 4. **Priority:** only high-priority items are marked (recommended), or every item shows its priority.
 5. **Brindle tells v1 agents it takes the newer form**, so they may send named and Markdown plans (recommended), or only v1's one checklist is read until `agents-acp-v2`.
 6. **The bounds:** 8 plans, 256 items a plan, 64 KiB of Markdown (recommended).
@@ -149,7 +154,9 @@ Each has a recommendation, which the text above follows. They are the user's to 
 
 - No capture shows what agents really send → the first task captures it, and the mapping follows ACP's types, which are small and fixed.
 - A plan above the prompt input takes room from the conversation → one line when closed, at most 12 rem when open.
-- Clearing a finished plan at the next prompt removes something the user may still want to read → it stays through the whole pause between turns, and the tool rows record what was done.
+- A plan stays until someone removes it, so a stale one sits above the prompt → it is one line when closed, and Dismiss Agent Plan puts it away for good unless the agent changes it.
+- A dismissed plan can't be brought back by hand → the agent's next change to it brings it back, and the tool rows record what was done.
+- The agent isn't told of a dismissal → it is only about what Brindle shows; the agent's own view of its plan is unchanged.
 - An agent that never marks its last step done leaves its plan on view → it is closed by default, and the agent's next plan replaces it.
 - One open state for all of a session's plans → several plans at once are rare, and one action stays enough.
 

@@ -13,11 +13,11 @@ ACP has two forms. Version 1's `plan` is one unnamed checklist. A newer form, `p
 
 - **The server keeps the agent's plans** as session state beside the conversation: each plan a checklist of items with a status and a priority, or Markdown text with an optional file path. A plan the agent sends again replaces the one with its id. Plans are in every replay and survive a detach, a quit, a core restart and an upgrade.
 - **Both ACP forms fill it.** The v1 module reads the unnamed `plan` as one plan and, since it now tells the agent it can take them, `plan_update` and `plan_removed` too.
-- **A finished plan is cleared when the next turn starts**, so a checklist from the last task doesn't sit over a new one.
+- **Brindle never clears a plan on its own, and the user can dismiss one.** A plan stays until the agent replaces or removes it. Since agents often stop keeping a plan up to date, a dismiss mark on the plan and the `agent_dismiss_plan` action put it away, on the server, so it is gone for every client and after a restart. The same plan sent again unchanged doesn't bring it back; a changed one does.
 - **The zone shows the plan above the prompt input**, where it stays in view while the conversation scrolls: one line with how many items are done and the step in progress, which opens to the whole checklist. Items' text is rendered as agent messages are.
 - **`toggle_agent_plan`** opens and closes it from the keyboard and the palette; `[agent] plan_details` (`"closed"` by default, or `"open"`) sets how it starts.
 - **Bounds on what an agent sends:** 8 plans, 256 items a plan, 64 KiB of Markdown.
-- **Client protocol 4 is amended**, as for the rest of the series: two transcript event kinds. No client message is added.
+- **Client protocol 4 is amended**, as for the rest of the series: two transcript event kinds and one client message, to dismiss a plan.
 
 Not in this change: editing a plan, or telling the agent to skip or reorder a step; a plan as an entry in the conversation, or a history of its earlier states; opening a Markdown plan's file; notifications when a step finishes; plans in the sessions palette or a tab's title.
 
@@ -29,7 +29,7 @@ None.
 
 ### Modified Capabilities
 
-- `agent-sessions`: new requirements for the agent's plans, their two forms, their bounds and when a finished one is cleared.
+- `agent-sessions`: new requirements for the agent's plans, their two forms, their bounds, and dismissing one.
 - `agent-zones`: new requirements for the plan above the prompt input and its action.
 - `ui-components`: a plan block.
 - `command-line`: the dump's lines for plans.
