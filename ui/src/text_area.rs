@@ -246,6 +246,11 @@ impl TextArea {
         self.painted.as_ref().map(|p| (p.first_row, p.visible))
     }
 
+    /// Where the text was painted last, in the window.
+    pub fn text_bounds(&self) -> Option<Bounds<Pixels>> {
+        self.painted.as_ref().map(|p| p.bounds)
+    }
+
     /// How many rows the text took at the last paint.
     pub fn rows(&self) -> Option<usize> {
         self.painted.as_ref().map(|p| p.wrap.rows().len())
@@ -263,6 +268,15 @@ impl TextArea {
 
     pub fn select_all(&mut self, cx: &mut Context<Self>) {
         self.state.select_all();
+        cx.notify();
+    }
+
+    /// Selects `range` (the cursor at its end; an empty range puts the
+    /// cursor there).
+    pub fn select(&mut self, range: Range<usize>, cx: &mut Context<Self>) {
+        self.state.select(range, false);
+        self.goal_x = None;
+        self.follow_cursor = true;
         cx.notify();
     }
 

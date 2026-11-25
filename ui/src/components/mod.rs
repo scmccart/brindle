@@ -53,6 +53,7 @@ pub mod select;
 pub mod separator;
 pub mod switch;
 pub mod tabs;
+pub mod textarea;
 pub mod toggle;
 pub mod tooltip;
 
@@ -96,6 +97,7 @@ pub use tabs::{
     drop_side, drop_target,
     tab_key, tab_target, trigger_label, trigger_press,
 };
+pub use textarea::Textarea;
 pub use toggle::Toggle;
 pub use tooltip::{Tooltip, TooltipFor, TooltipView};
 
