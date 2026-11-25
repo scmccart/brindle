@@ -845,7 +845,8 @@ impl<L: EventLoop> Holder<L> {
                 }
             }
             // Pipe sessions come with section 5 of `agents-sessions` (the
-            // platform seam is declared, `platform::piped`, and refuses).
+            // platform seam is declared, `platform::spawn_piped`, and
+            // refuses; `platform::piped` decides its flags and hang-up).
             ToHolder::SpawnPipes(spawn) => self.send(ToCore::SpawnFailed(SpawnFailed {
                 session: spawn.session,
                 message: "this holder can't run programs on pipes yet".into(),
