@@ -258,10 +258,6 @@ impl AgentSession {
     /// A new session whose agent is spawned to continue `conversation`,
     /// in the conversation's own directory, into a fresh log (a
     /// `SPAWN_AGENT` naming a conversation the server no longer had).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the core's continuing SPAWN_AGENT (task 3.3)")
-    )]
     pub fn continuing(conversation: Conversation, version: String) -> Self {
         let cwd = conversation.cwd.clone();
         let start = Start::Continue {
@@ -360,18 +356,10 @@ pub enum Input<'a> {
     Exited { code: Option<i32>, stderr: &'a [u8] },
     /// The agent's holder ended while the core ran, and the agent with it:
     /// as [`Input::Exited`], but the agent is `Lost` with `message`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the core's session_lost (task 3.2)")
-    )]
     Lost { message: &'a str },
     /// `AGENT_RESTART`: the agent ended and is spawned again to continue
     /// its conversation in this log. Refused unless
     /// [`AgentSession::continuable`].
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the core's AGENT_RESTART (task 3.3)")
-    )]
     Restart,
     /// A command from the client that has the session attached.
     Command(Command),

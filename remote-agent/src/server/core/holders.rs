@@ -636,10 +636,14 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// The waiting spawns fail with `message`: to their clients, or, for a
+    /// restart, as its agent's end ([`Core::restart_failed`]).
     pub(super) fn fail_waiting(&mut self, message: &str) {
         for waiting in std::mem::take(&mut self.waiting) {
-            let req = waiting.spawn.req();
-            self.send_client(waiting.client, error(Some(req), None, message));
+            match waiting.spawn.answers() {
+                Some(req) => self.send_client(waiting.client, error(Some(req), None, message)),
+                None => self.restart_failed(waiting.id, message),
+            }
         }
     }
 

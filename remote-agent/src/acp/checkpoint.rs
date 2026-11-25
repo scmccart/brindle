@@ -698,7 +698,10 @@ pub struct Adopted {
 /// - A checkpoint that reads: the session as it was. After a truncated
 ///   tail, [`Input::OutputLost`] is stepped: a prompt awaiting its response
 ///   is forgotten and its turn `Failed`, a waiting prompt is held
-///   (`OutputLost`), a held one stays as it was.
+///   (`OutputLost`), a held one stays as it was. One still spawning (the
+///   core stores a continue's state with its spawn, change
+///   `agents-session-recovery`) is started ([`Input::Spawned`]), so its
+///   agent continues the conversation rather than start another.
 /// - An empty one: the core never checkpointed the session, which it does
 ///   before it first writes to the agent, so the agent was sent nothing.
 ///   It is adopted as a new session in `cwd` by `version`, and started
@@ -728,7 +731,7 @@ pub fn adopt(
     }
     match decode(checkpoint, now) {
         Ok(mut session) => {
-            let output = if truncated {
+            let mut output = if truncated {
                 reduce::step(&mut session, Input::OutputLost, now)
             } else {
                 Output {
@@ -736,6 +739,11 @@ pub fn adopt(
                     ..Output::default()
                 }
             };
+            // Stored with a continue's spawn, before its `SPAWNED`: the
+            // agent was sent nothing, so it starts now, continuing.
+            if let Phase::Spawning { .. } = session.phase {
+                merge(&mut output, reduce::step(&mut session, Input::Spawned, now));
+            }
             Adopted {
                 session,
                 output,
@@ -1635,6 +1643,58 @@ mod tests {
             Some(reduce::Moment::BeforeRequest)
         );
         assert_eq!(adopted.session.cwd, "/home/u/src");
+    }
+
+    /// A continue's state, stored with its spawn before the core saw its
+    /// `SPAWNED` (agents-session-recovery 3.3): the adopted agent is sent
+    /// `initialize` and then continues the conversation, never
+    /// `session/new`.
+    #[test]
+    fn a_continue_stored_before_its_spawned_is_started_and_continues() {
+        let mut agent = Agent::ready();
+        agent.prompt("first");
+        agent.feed(&result(3, json!({"stopReason": "end_turn"})));
+        agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"",
+        });
+        assert_eq!(agent.step(Input::Restart).reply, Some(Ok(())));
+        let entries = agent.s.transcript.entries().count();
+        let bytes = encode(&agent.s).expect("it fits");
+        let mut adopted = adopt(&bytes, false, "/elsewhere", "0.3.0", agent.now);
+        assert_eq!(adopted.restored, Ok(()));
+        assert!(matches!(adopted.session.phase, Phase::Initializing { .. }));
+        assert_eq!(sent(&adopted.output.stdin)[0]["method"], "initialize");
+        assert_eq!(adopted.output.checkpoint, Some(reduce::Moment::BeforeRequest));
+        assert_eq!(adopted.session.transcript.entries().count(), entries, "the log is kept");
+        let out = step(
+            &mut adopted.session,
+            Input::Stdout(&result(
+                4,
+                json!({"protocolVersion": 1, "agentCapabilities": {
+                    "loadSession": true, "sessionCapabilities": {"resume": {}}}}),
+            )),
+            agent.now,
+        );
+        assert_eq!(sent(&out.stdin)[0]["method"], "session/resume");
+
+        // A fresh continue's likewise.
+        let conversation = Conversation {
+            id: "s1".into(),
+            cwd: "/w".into(),
+            continuation: Continuation::Neither,
+        };
+        let fresh = AgentSession::continuing(conversation, "0.3.0".into());
+        let bytes = encode(&fresh).expect("it fits");
+        let mut adopted = adopt(&bytes, false, "/elsewhere", "0.3.0", agent.now);
+        assert_eq!(sent(&adopted.output.stdin)[0]["method"], "initialize");
+        let out = step(
+            &mut adopted.session,
+            Input::Stdout(&result(1, json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}))),
+            agent.now,
+        );
+        let load = &sent(&out.stdin)[0];
+        assert_eq!((load["method"].as_str(), load["params"]["cwd"].as_str()), (Some("session/load"), Some("/w")));
     }
 
     #[test]

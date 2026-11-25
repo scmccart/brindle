@@ -21,7 +21,11 @@
 //!   holder that negotiated H1 3 ([`placement`] with
 //!   [`SpawnMode::Pipes`]), and what a client below protocol 4 is refused
 //!   ([`shown`], [`agent_request_refusal`], and [`attach_refusal`] and
-//!   [`returning`] by the session's [`SessionKind`]).
+//!   [`returning`] by the session's [`SessionKind`]). With change
+//!   `agents-session-recovery`: what an agent's end does ([`end_fate`]),
+//!   what a client's leaving and a `DETACH` do to an ended one
+//!   ([`ended_gone_fate`], [`detach_ends`]), and which `AGENT_RESTART`s are
+//!   refused ([`restart_refusal`]).
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -397,9 +401,105 @@ pub(super) enum GraceFate {
     LeaveDetached,
 }
 
+/// What an agent session's agent ending (exiting, or lost with its holder)
+/// does (OpenSpec change `agents-session-recovery`, decision 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EndFate {
+    /// The session stays, ended ([`Life::AgentEnded`]), for its client to
+    /// continue the conversation, or for its owner to come back to.
+    Keep,
+    /// As [`ExitFate::KeepForOwner`]: only the exit is kept, for the owner.
+    KeepForOwner,
+    /// As [`ExitFate::Report`].
+    Report,
+}
+
+/// What an agent session's end does: one that can be `continuable` and
+/// isn't being hung up is kept while a client has it attached or its owner
+/// may come back; any other ends as [`exit_fate`] says.
+pub(super) fn end_fate(ownership: &Ownership, life: &Life, continuable: bool) -> EndFate {
+    let wanted = ownership.client().is_some() || ownership.owner_may_return();
+    if continuable && wanted && !life.is_hung_up() {
+        return EndFate::Keep;
+    }
+    match exit_fate(ownership, life) {
+        ExitFate::KeepForOwner => EndFate::KeepForOwner,
+        ExitFate::Report => EndFate::Report,
+    }
+}
+
+/// What a client's connection ending does to an ended agent session
+/// ([`Life::AgentEnded`]): it waits for a lingering client, as a running
+/// `kill` session does, and otherwise ends ([`Fate::HangUp`]), since only
+/// an owner that may come back keeps one (decision 3).
+pub(super) fn ended_gone_fate(policy: Policy, linger: Duration) -> Fate {
+    match gone_fate(policy, false, linger) {
+        Fate::Linger(linger) => Fate::Linger(linger),
+        Fate::HangUp | Fate::Keep => Fate::HangUp,
+    }
+}
+
+/// Whether a client's `DETACH` ends the session rather than leaving it
+/// detached: an ended agent session's does (decision 3), since no one is
+/// left to continue it.
+pub(super) fn detach_ends(life: &Life) -> bool {
+    match life {
+        Life::AgentEnded { .. } => true,
+        Life::Starting { .. }
+        | Life::Running { .. }
+        | Life::HungUp { .. }
+        | Life::ExitedAwaitingOwner { .. } => false,
+    }
+}
+
+/// Why an `AGENT_RESTART` is refused once the client and its protocol are
+/// vetted; its text is the `ERROR`'s, after the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RestartRefusal {
+    /// The agent runs, or is starting.
+    NotEnded,
+    /// The conversation can't be continued (unreachable while [`end_fate`]
+    /// ends such sessions).
+    CannotContinue,
+    NoCommand,
+}
+
+impl fmt::Display for RestartRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotEnded => f.write_str("the agent hasn't ended"),
+            Self::CannotContinue => f.write_str("the agent can't continue this conversation"),
+            Self::NoCommand => f.write_str("AGENT_RESTART needs a command"),
+        }
+    }
+}
+
+/// Why an `AGENT_RESTART` of `command` for a session in `life` is refused:
+/// only an ended agent whose conversation is `continuable` is started
+/// again, and it needs a command.
+pub(super) fn restart_refusal(life: &Life, continuable: bool, command: &str) -> Option<RestartRefusal> {
+    match life {
+        Life::AgentEnded { .. } => {}
+        Life::Starting { .. }
+        | Life::Running { .. }
+        | Life::HungUp { .. }
+        | Life::ExitedAwaitingOwner { .. } => return Some(RestartRefusal::NotEnded),
+    }
+    if !continuable {
+        return Some(RestartRefusal::CannotContinue);
+    }
+    command
+        .trim()
+        .is_empty()
+        .then_some(RestartRefusal::NoCommand)
+}
+
 pub(super) fn grace_fate(policy: Policy, life: &Life) -> GraceFate {
     match (life, policy) {
-        (Life::ExitedAwaitingOwner { .. }, Policy::Kill | Policy::Detach) => GraceFate::Forget,
+        (
+            Life::ExitedAwaitingOwner { .. } | Life::AgentEnded { .. },
+            Policy::Kill | Policy::Detach,
+        ) => GraceFate::Forget,
         (Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. }, Policy::Kill) => {
             GraceFate::HangUp
         }
@@ -485,6 +585,7 @@ pub(super) enum AgentRequest {
     Permission,
     Unqueue,
     Resend,
+    Restart,
 }
 
 impl AgentRequest {
@@ -496,6 +597,7 @@ impl AgentRequest {
             Self::Permission => "AGENT_PERMISSION",
             Self::Unqueue => "AGENT_UNQUEUE",
             Self::Resend => "AGENT_RESEND",
+            Self::Restart => "AGENT_RESTART",
         }
     }
 }
@@ -944,14 +1046,115 @@ mod tests {
     }
 
     /// One of each kind of life.
-    fn lives() -> [Life; 5] {
+    fn lives() -> [Life; 6] {
         [
             Life::Starting { spawn: spawn(), hung_up: false },
             Life::Starting { spawn: spawn(), hung_up: true },
             Life::Running { pid: pid(9) },
             Life::HungUp { pid: pid(9) },
             Life::ExitedAwaitingOwner { code: Some(0), pid: Some(pid(9)) },
+            Life::AgentEnded { code: Some(1) },
         ]
+    }
+
+    /// One of each kind of ownership, and whether its owner may come back.
+    fn ownerships(t0: Instant) -> [Ownership; 4] {
+        [
+            Ownership::Attached(3),
+            Ownership::Lingering { until: t0, since: t0 },
+            Ownership::AwaitingOwner { since: t0 },
+            Ownership::Detached { since: t0 },
+        ]
+    }
+
+    // agents-session-recovery 3.1.
+
+    #[test]
+    fn a_continuable_end_is_kept_while_attached_or_owned_unless_hung_up() {
+        let t0 = Instant::now();
+        for ownership in ownerships(t0) {
+            for life in lives() {
+                for continuable in [false, true] {
+                    let wanted = match ownership {
+                        Ownership::Attached(_)
+                        | Ownership::Lingering { .. }
+                        | Ownership::AwaitingOwner { .. } => true,
+                        Ownership::Detached { .. } => false,
+                    };
+                    let expected = if continuable && wanted && !life.is_hung_up() {
+                        EndFate::Keep
+                    } else {
+                        match exit_fate(&ownership, &life) {
+                            ExitFate::KeepForOwner => EndFate::KeepForOwner,
+                            ExitFate::Report => EndFate::Report,
+                        }
+                    };
+                    assert_eq!(
+                        end_fate(&ownership, &life, continuable),
+                        expected,
+                        "{ownership:?} {life:?} {continuable}"
+                    );
+                }
+            }
+        }
+        // Spelled out for a running agent.
+        let running = Life::Running { pid: pid(9) };
+        let hung_up = Life::HungUp { pid: pid(9) };
+        let [attached, lingering, awaiting, detached] = ownerships(t0);
+        assert_eq!(end_fate(&attached, &running, true), EndFate::Keep);
+        assert_eq!(end_fate(&lingering, &running, true), EndFate::Keep);
+        assert_eq!(end_fate(&awaiting, &running, true), EndFate::Keep);
+        assert_eq!(end_fate(&detached, &running, true), EndFate::Report);
+        assert_eq!(end_fate(&attached, &hung_up, true), EndFate::Report);
+        assert_eq!(end_fate(&attached, &running, false), EndFate::Report);
+        assert_eq!(end_fate(&lingering, &running, false), EndFate::KeepForOwner);
+        assert_eq!(end_fate(&lingering, &hung_up, true), EndFate::Report);
+    }
+
+    #[test]
+    fn an_ended_agent_waits_only_for_a_lingering_client_and_a_detach_ends_it() {
+        let cases = [
+            (Policy::Kill, secs(0), Fate::HangUp),
+            (Policy::Kill, secs(300), Fate::Linger(secs(300))),
+            (Policy::Detach, secs(0), Fate::HangUp),
+            (Policy::Detach, secs(300), Fate::HangUp),
+        ];
+        for (policy, linger, fate) in cases {
+            assert_eq!(ended_gone_fate(policy, linger), fate, "{policy:?} {linger:?}");
+        }
+        for life in lives() {
+            let ends = matches!(life, Life::AgentEnded { .. });
+            assert_eq!(detach_ends(&life), ends, "{life:?}");
+        }
+    }
+
+    #[test]
+    fn a_restart_is_refused_unless_the_agent_ended_continuably_with_a_command() {
+        for life in lives() {
+            for continuable in [false, true] {
+                for command in ["", " ", "fake-agent"] {
+                    let expected = match (&life, continuable, command.trim().is_empty()) {
+                        (Life::AgentEnded { .. }, true, false) => None,
+                        (Life::AgentEnded { .. }, true, true) => {
+                            Some("AGENT_RESTART needs a command")
+                        }
+                        (Life::AgentEnded { .. }, false, _) => {
+                            Some("the agent can't continue this conversation")
+                        }
+                        (
+                            Life::Starting { .. }
+                            | Life::Running { .. }
+                            | Life::HungUp { .. }
+                            | Life::ExitedAwaitingOwner { .. },
+                            _,
+                            _,
+                        ) => Some("the agent hasn't ended"),
+                    };
+                    let refusal = restart_refusal(&life, continuable, command).map(|r| r.to_string());
+                    assert_eq!(refusal.as_deref(), expected, "{life:?} {continuable} {command:?}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -996,7 +1199,9 @@ mod tests {
     fn at_the_grace_periods_end_exits_are_forgotten_and_kill_sessions_hung_up() {
         for life in lives() {
             let (kill, detach) = match life {
-                Life::ExitedAwaitingOwner { .. } => (GraceFate::Forget, GraceFate::Forget),
+                Life::ExitedAwaitingOwner { .. } | Life::AgentEnded { .. } => {
+                    (GraceFate::Forget, GraceFate::Forget)
+                }
                 Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => {
                     (GraceFate::HangUp, GraceFate::LeaveDetached)
                 }
@@ -1120,6 +1325,7 @@ mod tests {
             (AgentRequest::Permission, "AGENT_PERMISSION needs client protocol 4"),
             (AgentRequest::Unqueue, "AGENT_UNQUEUE needs client protocol 4"),
             (AgentRequest::Resend, "AGENT_RESEND needs client protocol 4"),
+            (AgentRequest::Restart, "AGENT_RESTART needs client protocol 4"),
         ];
         for (request, text) in cases {
             for protocol in 1..AGENT_PROTOCOL {
@@ -1179,6 +1385,7 @@ mod tests {
         let exited = Life::ExitedAwaitingOwner { code: None, pid: Some(pid(9)) };
         let hung_up = Life::HungUp { pid: pid(9) };
         let starting = Life::Starting { spawn: spawn(), hung_up: false };
+        let ended = Life::AgentEnded { code: Some(1) };
         let awaiting = Ownership::AwaitingOwner { since: t0 };
         let lingering = Ownership::Lingering { until: t0, since: t0 };
         let detached = Ownership::Detached { since: t0 };
@@ -1198,9 +1405,12 @@ mod tests {
             (6, view(&starting, &detached, Some(&token))),
             (7, view(&running, &detached, Some(&other))),
             (8, view(&running, &detached, None)),
+            // An ended agent kept for its owner is given back, for its
+            // replay.
+            (9, view(&ended, &lingering, Some(&token))),
         ];
         for protocol in 1..=AGENT_PROTOCOL {
-            assert_eq!(returning(&sessions, &token, protocol), [1, 2, 3]);
+            assert_eq!(returning(&sessions, &token, protocol), [1, 2, 3, 9]);
             assert_eq!(returning(&sessions, &other, protocol), [7]);
         }
     }

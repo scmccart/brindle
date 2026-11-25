@@ -60,7 +60,7 @@ use super::agents::Agent;
 use super::clients::{ClientToken, error};
 use super::holders::WaitingSpawn;
 use super::policy::{
-    self, AgentCheckpoint, ExitFate, Fate, GraceFate, SessionKind, SessionView,
+    self, AgentCheckpoint, EndFate, ExitFate, Fate, GraceFate, SessionKind, SessionView,
 };
 use super::screen::Screen;
 use super::{Core, log};
@@ -92,9 +92,12 @@ fn is_due(since: u64, behind: bool) -> bool {
     since > after
 }
 
-/// What a client asked to start: a terminal (`SPAWN`) or an agent
+/// What a client asked to start: a terminal (`SPAWN`), an agent
 /// (`SPAWN_AGENT`, protocol 4, with the absolute directory the core
-/// resolved for it, which its `session/new` gets and `LIST` shows).
+/// resolved for it, which its `session/new` gets and `LIST` shows; or the
+/// conversation's own, for one that continues a conversation), or an
+/// ended agent again in its session (`AGENT_RESTART`, in the directory of
+/// the conversation it continues).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SpawnRequest {
     Terminal(client::Spawn),
@@ -102,14 +105,20 @@ pub(super) enum SpawnRequest {
         spawn: client::SpawnAgent,
         cwd: String,
     },
+    Restart {
+        restart: client::AgentRestart,
+        cwd: String,
+    },
 }
 
 impl SpawnRequest {
-    /// The request its `SPAWNED` or `ERROR` answers.
-    pub(super) fn req(&self) -> RequestId {
+    /// The request its `SPAWNED` or `ERROR` answers; a restart's was
+    /// answered `OK` when it was queued.
+    pub(super) fn answers(&self) -> Option<RequestId> {
         match self {
-            Self::Terminal(spawn) => spawn.req,
-            Self::Agent { spawn, .. } => spawn.req,
+            Self::Terminal(spawn) => Some(spawn.req),
+            Self::Agent { spawn, .. } => Some(spawn.req),
+            Self::Restart { .. } => None,
         }
     }
 
@@ -118,7 +127,26 @@ impl SpawnRequest {
     pub(super) fn mode(&self) -> h1::SpawnMode {
         match self {
             Self::Terminal(_) => h1::SpawnMode::Pty,
-            Self::Agent { .. } => h1::SpawnMode::Pipes,
+            Self::Agent { .. } | Self::Restart { .. } => h1::SpawnMode::Pipes,
+        }
+    }
+
+    /// Whether it starts an ended agent again, in its existing session.
+    pub(super) fn is_restart(&self) -> bool {
+        match self {
+            Self::Restart { .. } => true,
+            Self::Terminal(_) | Self::Agent { .. } => false,
+        }
+    }
+
+    /// Whether its agent continues a conversation, so the core stores the
+    /// session's state with its spawn: a new core that adopts the agent
+    /// before its `SPAWNED` continues it rather than start another.
+    fn continues(&self) -> bool {
+        match self {
+            Self::Terminal(_) => false,
+            Self::Agent { spawn, .. } => spawn.conversation.is_some(),
+            Self::Restart { .. } => true,
         }
     }
 }
@@ -153,6 +181,12 @@ pub(super) enum Life {
         code: Option<i32>,
         pid: Option<NonZeroU32>,
     },
+    /// An agent session whose agent exited with `code` (`None` for a
+    /// signal or a lost holder), kept for its conversation
+    /// ([`policy::end_fate`]): listed, given back to its owner with its
+    /// replay, continued by `AGENT_RESTART`. Its holder has forgotten it,
+    /// so it lives only in this core.
+    AgentEnded { code: Option<i32> },
 }
 
 impl Life {
@@ -167,7 +201,7 @@ impl Life {
     /// Its program's pid, once the holder reported it.
     pub(super) fn pid(&self) -> Option<NonZeroU32> {
         match self {
-            Self::Starting { .. } => None,
+            Self::Starting { .. } | Self::AgentEnded { .. } => None,
             Self::Running { pid } | Self::HungUp { pid } => Some(*pid),
             Self::ExitedAwaitingOwner { pid, .. } => *pid,
         }
@@ -176,15 +210,18 @@ impl Life {
     pub(super) fn is_starting(&self) -> bool {
         match self {
             Self::Starting { .. } => true,
-            Self::Running { .. } | Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } => false,
+            Self::Running { .. }
+            | Self::HungUp { .. }
+            | Self::ExitedAwaitingOwner { .. }
+            | Self::AgentEnded { .. } => false,
         }
     }
 
-    /// Its program runs (hung up or not): it started, and hasn't exited.
-    /// `LIST` shows these.
-    pub(super) fn is_running(&self) -> bool {
+    /// `LIST` shows it: its program runs (hung up or not: it started, and
+    /// hasn't exited), or it is an agent session kept for its conversation.
+    pub(super) fn is_listed(&self) -> bool {
         match self {
-            Self::Running { .. } | Self::HungUp { .. } => true,
+            Self::Running { .. } | Self::HungUp { .. } | Self::AgentEnded { .. } => true,
             Self::Starting { .. } | Self::ExitedAwaitingOwner { .. } => false,
         }
     }
@@ -194,7 +231,9 @@ impl Life {
         match self {
             Self::Starting { hung_up, .. } => *hung_up,
             Self::HungUp { .. } => true,
-            Self::Running { .. } | Self::ExitedAwaitingOwner { .. } => false,
+            Self::Running { .. } | Self::ExitedAwaitingOwner { .. } | Self::AgentEnded { .. } => {
+                false
+            }
         }
     }
 
@@ -203,7 +242,22 @@ impl Life {
     pub(super) fn is_live(&self) -> bool {
         match self {
             Self::Running { .. } => true,
-            Self::Starting { .. } | Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } => false,
+            Self::Starting { .. }
+            | Self::HungUp { .. }
+            | Self::ExitedAwaitingOwner { .. }
+            | Self::AgentEnded { .. } => false,
+        }
+    }
+
+    /// `STATUS` counts it among its holder's sessions: anything but an
+    /// ended agent session, which lives on in the core alone.
+    pub(super) fn is_held(&self) -> bool {
+        match self {
+            Self::AgentEnded { .. } => false,
+            Self::Starting { .. }
+            | Self::Running { .. }
+            | Self::HungUp { .. }
+            | Self::ExitedAwaitingOwner { .. } => true,
         }
     }
 
@@ -224,7 +278,7 @@ impl Life {
                 *self = Self::HungUp { pid: *pid };
                 true
             }
-            Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } => false,
+            Self::HungUp { .. } | Self::ExitedAwaitingOwner { .. } | Self::AgentEnded { .. } => false,
         }
     }
 }
@@ -513,14 +567,15 @@ impl Session {
 
     /// A session the core sends its holder a `SPAWN` for at `now`, for
     /// `client`, which owns it (if its `HELLO` named a token). The spawn's
-    /// answer goes to that client.
+    /// answer goes to that client. `None` for a restart, whose session
+    /// exists already.
     fn spawning(
         holder: Token,
         client: Token,
         owner: Option<ClientToken>,
         spawn: SpawnRequest,
         now: Instant,
-    ) -> Self {
+    ) -> Option<Self> {
         let (meta, content, cols, rows) = match &spawn {
             SpawnRequest::Terminal(spawn) => (
                 SessionMeta {
@@ -551,12 +606,16 @@ impl Session {
                     scrollback: 0,
                     started: unix_now(),
                 },
-                Content::Agent(Agent::new(cwd.clone())),
+                Content::Agent(match &spawn.conversation {
+                    None => Agent::new(cwd.clone()),
+                    Some(conversation) => Agent::continuing(conversation),
+                }),
                 0,
                 0,
             ),
+            SpawnRequest::Restart { .. } => return None,
         };
-        Self {
+        Some(Self {
             holder,
             content,
             meta,
@@ -572,7 +631,7 @@ impl Session {
             active: false,
             active_at: now,
             foreground: None,
-        }
+        })
     }
 }
 
@@ -666,6 +725,29 @@ fn command_line(command: Option<&str>, args: &[String]) -> String {
     }
 }
 
+/// Why a session whose holder ended is lost: its `EXIT`'s `lost`, and an
+/// agent's `Lost` state.
+const LOST: &str = "its holder ended";
+
+/// Whether the session is an ended agent started again (`AGENT_RESTART`)
+/// that hasn't started yet.
+fn restarting(life: &Life) -> bool {
+    match life {
+        Life::Starting {
+            spawn: SpawnRequest::Restart { .. },
+            ..
+        } => true,
+        Life::Starting {
+            spawn: SpawnRequest::Terminal(_) | SpawnRequest::Agent { .. },
+            ..
+        }
+        | Life::Running { .. }
+        | Life::HungUp { .. }
+        | Life::ExitedAwaitingOwner { .. }
+        | Life::AgentEnded { .. } => false,
+    }
+}
+
 /// The first free session id from `next` on, and the `next` after it: ids
 /// wrap past `u32::MAX` to 1, and skip 0 (never an id) and those `taken`.
 fn free_id(mut next: SessionId, taken: impl Fn(SessionId) -> bool) -> (SessionId, SessionId) {
@@ -700,7 +782,7 @@ impl<L: EventLoop> Core<L> {
             None
         };
         if let Some(refusal) = refusal {
-            return self.send_client(client, error(Some(spawn.req()), None, refusal));
+            return self.send_client(client, error(spawn.answers(), None, refusal));
         }
         let id = self.allocate_id();
         self.waiting.push(WaitingSpawn { client, id, spawn });
@@ -717,8 +799,12 @@ impl<L: EventLoop> Core<L> {
 
     pub(super) fn send_spawn(&mut self, holder: Token, waiting: WaitingSpawn) {
         let WaitingSpawn { client, id, spawn } = waiting;
+        let continues = spawn.continues();
         let owner = self.client_token(client).cloned();
-        let session = Session::spawning(holder, client, owner, spawn.clone(), Instant::now());
+        let Some(session) = Session::spawning(holder, client, owner, spawn.clone(), Instant::now())
+        else {
+            return self.send_restart(holder, id, spawn);
+        };
         let meta = session.stored_meta().to_value();
         let message = match spawn {
             SpawnRequest::Terminal(spawn) => ToHolder::Spawn(h1::Spawn {
@@ -742,11 +828,46 @@ impl<L: EventLoop> Core<L> {
                 env: spawn.env,
                 meta,
             }),
+            SpawnRequest::Restart { .. } => return,
         };
         // The session first: a `SPAWN` that can't be sent fails it, to its
         // client, as the holder's `SPAWN_FAILED` would.
         self.sessions.insert(id, session);
-        self.send_holder(holder, message);
+        if self.send_holder(holder, message) && continues {
+            self.agent_checkpoint(id);
+        }
+    }
+
+    /// Places an `AGENT_RESTART` on `holder`: the ended session, still
+    /// starting, runs its new agent there under its own id, with its meta
+    /// (the new command in it) in the `SPAWN_PIPES`. Its state is stored
+    /// right after, so a core that adopts the agent before its `SPAWNED`
+    /// continues the conversation ([`checkpoint::adopt`](crate::acp::checkpoint::adopt)).
+    /// Nothing for a session that ended meanwhile.
+    fn send_restart(&mut self, holder: Token, id: SessionId, spawn: SpawnRequest) {
+        let SpawnRequest::Restart { restart, cwd } = spawn else {
+            return;
+        };
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return log!("session {id}: ended before its restart was placed");
+        };
+        if !session.life.is_starting() {
+            return log!("session {id}: ended before its restart was placed");
+        }
+        session.holder = holder;
+        session.paused = false;
+        let meta = session.stored_meta().to_value();
+        let message = ToHolder::SpawnPipes(h1::SpawnPipes {
+            session: id,
+            command: restart.command,
+            args: restart.args,
+            cwd: Some(cwd),
+            env: restart.env,
+            meta,
+        });
+        if self.send_holder(holder, message) {
+            self.agent_checkpoint(id);
+        }
     }
 
     /// The session if it runs under `holder`; anything else is a stale or
@@ -776,36 +897,44 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         session.tell_foreground(now);
-        let (life, req) = match &session.life {
+        // Whether it started now, and the request its `SPAWNED` answers (a
+        // restart's has its `OK` already).
+        let (life, started, req) = match &session.life {
             Life::Starting {
                 spawn,
                 hung_up: false,
-            } => (Life::Running { pid: reported }, Some(spawn.req())),
+            } => (Life::Running { pid: reported }, true, spawn.answers()),
             Life::Starting {
                 spawn,
                 hung_up: true,
-            } => (Life::HungUp { pid: reported }, Some(spawn.req())),
-            Life::Running { .. } => (Life::Running { pid: reported }, None),
-            Life::HungUp { .. } => (Life::HungUp { pid: reported }, None),
-            exited @ Life::ExitedAwaitingOwner { .. } => (exited.clone(), None),
+            } => (Life::HungUp { pid: reported }, true, spawn.answers()),
+            Life::Running { .. } => (Life::Running { pid: reported }, false, None),
+            Life::HungUp { .. } => (Life::HungUp { pid: reported }, false, None),
+            ended @ (Life::ExitedAwaitingOwner { .. } | Life::AgentEnded { .. }) => {
+                (ended.clone(), false, None)
+            }
         };
         session.life = life;
         // An agent that starts now (not one hung up before it started) is
         // sent `initialize`, after its client has its `SPAWNED`.
-        let agent_started = req.is_some() && session.life.is_live() && session.agent().is_some();
+        let agent_started = started && session.life.is_live() && session.agent().is_some();
         let client = session.ownership.client();
         let key = session.meta.key.clone();
         log!("session {id}: pid {pid} ({:?})", session.meta.command);
-        if let (Some(client), Some(req)) = (client, req) {
-            self.send_client(
-                client,
-                ToClient::Spawned(Spawned {
-                    req,
-                    session: id,
-                    pid,
-                    key,
-                }),
-            );
+        if let Some(client) = client
+            && started
+        {
+            if let Some(req) = req {
+                self.send_client(
+                    client,
+                    ToClient::Spawned(Spawned {
+                        req,
+                        session: id,
+                        pid,
+                        key,
+                    }),
+                );
+            }
             if self.client_is_over(client) {
                 self.set_paused(id, true);
             }
@@ -815,25 +944,114 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// The holder couldn't start the session's program: the session is
+    /// gone, and its client's `SPAWN` is answered with why. A restart's
+    /// agent ends again instead, with why as its standard error, so the
+    /// client can try once more ([`Core::agent_ended`]).
     pub(super) fn session_spawn_failed(&mut self, holder: Token, id: SessionId, message: String) {
-        if self.holder_session(holder, id).is_none() {
+        let Some(session) = self.holder_session(holder, id) else {
             return;
+        };
+        log!("session {id}: {message}");
+        if restarting(&session.life) {
+            return self.restart_failed(id, &message);
         }
         let Some(session) = self.sessions.remove(&id) else {
             return;
         };
-        log!("session {id}: {message}");
         if let (Some(client), Life::Starting { spawn, .. }) = (session.ownership.client(), session.life)
         {
-            self.send_client(client, error(Some(spawn.req()), None, message));
+            self.send_client(client, error(spawn.answers(), None, message));
         }
     }
 
-    /// A session whose holder went away: one still starting goes to another
-    /// holder; the rest have ended.
-    pub(super) fn session_lost(&mut self, holder: Token, id: SessionId) {
-        if self.holder_session(holder, id).is_none() {
+    /// An ended agent session starts again from `spawn` (an
+    /// `AGENT_RESTART`'s): starting, listed with its new `command` and
+    /// `args`, which its holder gets in the spawn's meta.
+    pub(super) fn start_again(
+        &mut self,
+        id: SessionId,
+        command: &str,
+        args: &[String],
+        spawn: SpawnRequest,
+    ) {
+        let Some(session) = self.sessions.get_mut(&id) else {
             return;
+        };
+        session.meta.command = command_line(Some(command), args);
+        session.paused = false;
+        session.life = Life::starting(spawn);
+        if let Some(agent) = session.agent() {
+            agent.restarted();
+        }
+    }
+
+    /// A restart that couldn't start (`SPAWN_FAILED`, or no holder for it):
+    /// its agent ends as an exit with no code whose standard error is
+    /// `message`, which keeps the session ended for another try.
+    pub(super) fn restart_failed(&mut self, id: SessionId, message: &str) {
+        self.agent_ended(
+            id,
+            None,
+            Input::Exited {
+                code: None,
+                stderr: message.as_bytes(),
+            },
+        );
+    }
+
+    /// A restart still waiting for a holder is hung up (`CLOSE`, `KILL`,
+    /// `STOP`, its client gone): it never starts, and the session ends.
+    fn abandon_restart(&mut self, id: SessionId) {
+        self.waiting.retain(|waiting| waiting.id != id);
+        if let Some(session) = self.sessions.get_mut(&id) {
+            session.life.hang_up();
+        }
+        self.restart_failed(id, "");
+    }
+
+    /// A session whose holder went away: one still starting goes to another
+    /// holder; the rest have ended. An ended agent session's holder had
+    /// forgotten it already, as has a restart's that waits for a holder; a
+    /// restart placed but not yet started goes to another holder too while
+    /// its client has it, and ends again, lost, otherwise. An agent that
+    /// can continue its conversation is kept ([`Core::agent_ended`]).
+    pub(super) fn session_lost(&mut self, holder: Token, id: SessionId) {
+        let Some(session) = self.holder_session(holder, id) else {
+            return;
+        };
+        if !session.life.is_held() || self.waiting.iter().any(|waiting| waiting.id == id) {
+            return;
+        }
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        // A restart goes to another holder, as any spawn still starting
+        // does (an empty holder exits, and may not have read it), unless
+        // it was hung up or its client is gone.
+        if let (Some(client), Life::Starting { spawn, hung_up: false }) =
+            (session.ownership.client(), &session.life)
+            && spawn.is_restart()
+        {
+            let spawn = spawn.clone();
+            self.waiting.push(WaitingSpawn { client, id, spawn });
+            return;
+        }
+        if restarting(&session.life) {
+            log!("session {id}: its holder ended before its restart started");
+            return self.agent_ended(id, None, Input::Lost { message: LOST });
+        }
+        if session.kind() == SessionKind::Agent && !session.life.is_starting() {
+            // An agent's log says it is lost, before the session's end.
+            self.agent_step(id, Input::Lost { message: LOST });
+            let Some(session) = self.sessions.get_mut(&id) else {
+                return;
+            };
+            let continuable = session.agent().is_some_and(|agent| agent.continuable());
+            match policy::end_fate(&session.ownership, &session.life, continuable) {
+                EndFate::Keep => return session.life = Life::AgentEnded { code: None },
+                EndFate::KeepForOwner | EndFate::Report => {}
+            }
         }
         let Some(session) = self.sessions.get(&id) else {
             return;
@@ -855,8 +1073,6 @@ impl<L: EventLoop> Core<L> {
         // `ATTACH`), and an `EXIT` kept for it ends the session there.
         if let Some(client) = session.ownership.client() {
             log!("session {id}: lost with its holder");
-            // An agent's log says it is gone, before the session's end.
-            self.agent_exited(id, None);
             self.send_waiting_replay(id);
             if self.sessions.remove(&id).is_none() {
                 return;
@@ -866,7 +1082,7 @@ impl<L: EventLoop> Core<L> {
                 ToClient::Exit(Exit {
                     session: id,
                     code: None,
-                    lost: Some("its holder ended".into()),
+                    lost: Some(LOST.into()),
                 }),
             );
         }
@@ -1020,7 +1236,8 @@ impl<L: EventLoop> Core<L> {
     /// The program exited (`code` is `None` for a signal, or a lost holder):
     /// the client gets `EXIT` and the session is gone. An adopted or
     /// lingering session whose owner may still come back keeps its exit for
-    /// the owner.
+    /// the owner. An agent session whose conversation can be continued is
+    /// kept ([`policy::end_fate`]).
     pub(super) fn session_exited(&mut self, holder: Token, id: SessionId, code: Option<i32>) {
         if self.holder_session(holder, id).is_none() {
             return;
@@ -1030,6 +1247,21 @@ impl<L: EventLoop> Core<L> {
         // before it) first, so its client, or a replay, has it before the
         // session's `EXIT`.
         self.agent_exited(id, code);
+        self.ended(id, code);
+    }
+
+    /// An agent session's agent ended as `input` says (an exit with no
+    /// code, or a loss), outside of its holder's `EXITED`: stepped, then
+    /// kept or ended as [`policy::end_fate`] says.
+    pub(super) fn agent_ended(&mut self, id: SessionId, code: Option<i32>, input: Input<'_>) {
+        self.agent_step(id, input);
+        self.ended(id, code);
+    }
+
+    /// The session's program ended with `code`, its agent's log already
+    /// told: what becomes of the session ([`policy::exit_fate`], or for an
+    /// agent [`policy::end_fate`]).
+    fn ended(&mut self, id: SessionId, code: Option<i32>) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
@@ -1039,9 +1271,20 @@ impl<L: EventLoop> Core<L> {
         if let Some(screen) = session.screen() {
             screen.process_exited(id);
         }
-        match policy::exit_fate(&session.ownership, &session.life) {
-            ExitFate::KeepForOwner => return session.life.exited(code),
-            ExitFate::Report => {}
+        let fate = match session.agent().map(|agent| agent.continuable()) {
+            Some(continuable) => policy::end_fate(&session.ownership, &session.life, continuable),
+            None => match policy::exit_fate(&session.ownership, &session.life) {
+                ExitFate::KeepForOwner => EndFate::KeepForOwner,
+                ExitFate::Report => EndFate::Report,
+            },
+        };
+        match fate {
+            EndFate::Keep => {
+                log!("session {id}: kept for its agent's conversation");
+                return session.life = Life::AgentEnded { code };
+            }
+            EndFate::KeepForOwner => return session.life.exited(code),
+            EndFate::Report => {}
         }
         // A client still waiting for its replay gets it now, then the
         // `EXIT`: the replay answers its `ATTACH`.
@@ -1089,7 +1332,12 @@ impl<L: EventLoop> Core<L> {
                     self.sessions.remove(&id);
                     self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
                 }
-                Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => {
+                // An ended agent's replay ends with its exit, and the
+                // session stays for its conversation.
+                Life::Starting { .. }
+                | Life::Running { .. }
+                | Life::HungUp { .. }
+                | Life::AgentEnded { .. } => {
                     self.replay(client, id, None, None);
                 }
             }
@@ -1138,7 +1386,16 @@ impl<L: EventLoop> Core<L> {
             let Some(session) = self.sessions.get_mut(&id) else {
                 continue;
             };
-            match policy::gone_fate(session.meta.policy, session.life.is_starting(), linger) {
+            let fate = match session.life {
+                Life::AgentEnded { .. } => policy::ended_gone_fate(session.meta.policy, linger),
+                Life::Starting { .. }
+                | Life::Running { .. }
+                | Life::HungUp { .. }
+                | Life::ExitedAwaitingOwner { .. } => {
+                    policy::gone_fate(session.meta.policy, session.life.is_starting(), linger)
+                }
+            };
+            match fate {
                 Fate::HangUp => self.hang_up(id),
                 Fate::Linger(linger) => {
                     log!(
@@ -1198,7 +1455,7 @@ impl<L: EventLoop> Core<L> {
             };
             session.ownership.stop_waiting();
             match session.life {
-                Life::ExitedAwaitingOwner { .. } => {
+                Life::ExitedAwaitingOwner { .. } | Life::AgentEnded { .. } => {
                     self.sessions.remove(&id);
                 }
                 Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => {
@@ -1232,11 +1489,17 @@ impl<L: EventLoop> Core<L> {
     pub(super) fn client_stop(&mut self, client: Token, req: RequestId) {
         log!("stopping: hanging up {} session(s)", self.sessions.len());
         self.stopping = Some(super::Answer { client, req });
-        for waiting in std::mem::take(&mut self.waiting) {
-            let req = waiting.spawn.req();
+        // A restart's session ends below, as any session, which takes it
+        // from the waiting spawns.
+        let (restarts, refused): (Vec<WaitingSpawn>, Vec<WaitingSpawn>) =
+            std::mem::take(&mut self.waiting)
+                .into_iter()
+                .partition(|waiting| waiting.spawn.is_restart());
+        self.waiting = restarts;
+        for waiting in refused {
             self.send_client(
                 waiting.client,
-                error(Some(req), None, "the server is stopping"),
+                error(waiting.spawn.answers(), None, "the server is stopping"),
             );
         }
         let all: Vec<SessionId> = self.sessions.keys().copied().collect();
@@ -1254,21 +1517,47 @@ impl<L: EventLoop> Core<L> {
             Life::ExitedAwaitingOwner { .. } => {
                 self.sessions.remove(&id);
             }
-            Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => self.hang_up(id),
+            Life::Starting { .. }
+            | Life::Running { .. }
+            | Life::HungUp { .. }
+            | Life::AgentEnded { .. } => self.hang_up(id),
         }
     }
 
     /// Asks the holder to hang the session up, once; its `EXITED` follows.
-    /// A session whose program exited has nothing to hang up.
+    /// A session whose program exited has nothing to hang up. An ended
+    /// agent session has no program either: it ends now, its client told
+    /// with `EXIT`. A restart still waiting for a holder ends without
+    /// starting.
     pub(super) fn hang_up(&mut self, id: SessionId) {
+        let waiting = self.waiting.iter().any(|waiting| waiting.id == id);
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        if let Life::AgentEnded { code } = session.life {
+            return self.end_ended(id, code);
+        }
+        if waiting && restarting(&session.life) {
+            return self.abandon_restart(id);
+        }
         if !session.life.hang_up() {
             return;
         }
         let holder = session.holder;
         self.send_holder(holder, ToHolder::Hangup(h1::SessionRef { session: id }));
+    }
+
+    /// Ends an ended agent session: it is gone, and a client that has it
+    /// gets its `EXIT` (after a replay it still waits for).
+    fn end_ended(&mut self, id: SessionId, code: Option<i32>) {
+        log!("session {id}: its ended agent's session ends");
+        self.send_waiting_replay(id);
+        let Some(session) = self.sessions.remove(&id) else {
+            return;
+        };
+        if let Some(client) = session.ownership.client() {
+            self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
+        }
     }
 
     /// The session loses its client at `now`, and isn't paused for it any
@@ -1293,7 +1582,8 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        if session.paused == paused {
+        // An ended agent session's holder has nothing of it to pause.
+        if session.paused == paused || !session.life.is_held() {
             return;
         }
         session.paused = paused;
@@ -1485,6 +1775,10 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        // An ended agent session ends: nothing would continue it.
+        if policy::detach_ends(&session.life) {
+            return self.hang_up(id);
+        }
         session.owner = None;
         session.meta.policy = Policy::Detach;
         session.meta.layout = kept_layout(id, detach.layout);
@@ -1613,9 +1907,13 @@ impl<L: EventLoop> Core<L> {
             return;
         }
         let pid = session.life.pid().map_or(0, NonZeroU32::get);
+        // An ended agent session stays: its replay ends with the exit.
         let exited = match session.life {
             Life::ExitedAwaitingOwner { code, .. } => Some(code),
-            Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => None,
+            Life::Starting { .. }
+            | Life::Running { .. }
+            | Life::HungUp { .. }
+            | Life::AgentEnded { .. } => None,
         };
         // Rendered whole, in this turn of the loop: output read after it
         // is fed and forwarded after it, so nothing is lost or reordered.
@@ -1820,7 +2118,7 @@ mod tests {
         assert!(!session.active);
         assert_eq!(session.active_at, now);
         assert_eq!(session.rebuild, Rebuild::Pending { truncated: true });
-        assert!(session.life.is_running());
+        assert!(session.life.is_listed());
     }
 
     /// A holder may hold a session at any size a `u16` has: the core takes
@@ -1849,7 +2147,7 @@ mod tests {
             session.life,
             Life::ExitedAwaitingOwner { code: Some(3), pid: Some(pid(42)) }
         );
-        assert!(!session.life.is_running());
+        assert!(!session.life.is_listed());
 
         let refused = Session::adopted(7, HeldSession { pid: 0, ..held(false) }, now);
         assert_eq!(
@@ -1893,9 +2191,9 @@ mod tests {
 
     #[test]
     fn each_life_answers_its_questions() {
-        // (life, pid, starting, running, hung up, live)
+        // (life, pid, starting, listed, hung up, live, held)
         let cases = [
-            (Life::starting(terminal(Policy::Kill)), None, true, false, false, false),
+            (Life::starting(terminal(Policy::Kill)), None, true, false, false, false, true),
             (
                 Life::Starting { spawn: terminal(Policy::Kill), hung_up: true },
                 None,
@@ -1903,9 +2201,10 @@ mod tests {
                 false,
                 true,
                 false,
+                true,
             ),
-            (Life::Running { pid: pid(9) }, Some(pid(9)), false, true, false, true),
-            (Life::HungUp { pid: pid(9) }, Some(pid(9)), false, true, true, false),
+            (Life::Running { pid: pid(9) }, Some(pid(9)), false, true, false, true, true),
+            (Life::HungUp { pid: pid(9) }, Some(pid(9)), false, true, true, false, true),
             (
                 Life::ExitedAwaitingOwner { code: Some(0), pid: Some(pid(9)) },
                 Some(pid(9)),
@@ -1913,18 +2212,49 @@ mod tests {
                 false,
                 false,
                 false,
+                true,
             ),
+            // Kept for its conversation: listed, with no program.
+            (Life::AgentEnded { code: Some(1) }, None, false, true, false, false, false),
         ];
-        for (life, pid, starting, running, hung_up, live) in cases {
+        for (life, pid, starting, listed, hung_up, live, held) in cases {
             let answers = (
                 life.pid(),
                 life.is_starting(),
-                life.is_running(),
+                life.is_listed(),
                 life.is_hung_up(),
                 life.is_live(),
+                life.is_held(),
             );
-            assert_eq!(answers, (pid, starting, running, hung_up, live), "{life:?}");
+            assert_eq!(answers, (pid, starting, listed, hung_up, live, held), "{life:?}");
         }
+    }
+
+    #[test]
+    fn only_a_restart_not_yet_started_is_restarting() {
+        let restart = SpawnRequest::Restart {
+            restart: client::AgentRestart {
+                req: 1,
+                session: 2,
+                command: "agent".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            cwd: "/w".into(),
+        };
+        assert!(restart.is_restart() && restart.continues());
+        assert_eq!((restart.answers(), restart.mode()), (None, h1::SpawnMode::Pipes));
+        assert!(restarting(&Life::starting(restart.clone())));
+        assert!(restarting(&Life::Starting { spawn: restart, hung_up: true }));
+        for life in [
+            Life::starting(terminal(Policy::Kill)),
+            Life::Running { pid: pid(9) },
+            Life::AgentEnded { code: None },
+        ] {
+            assert!(!restarting(&life), "{life:?}");
+        }
+        assert!(!terminal(Policy::Kill).is_restart() && !terminal(Policy::Kill).continues());
+        assert_eq!(terminal(Policy::Kill).answers(), Some(1));
     }
 
     #[test]
