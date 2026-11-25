@@ -44,9 +44,9 @@ Before starting, check that `agents-profiles` (and with it `agents-sessions` and
 ## 6. Windows, remote and manual checks
 
 - [ ] 6.1 Add `windows-agent-continue` to `tests/e2e/cases/win.rs` (an exit and a resume continue through the pipe session's job); verify it passes on the `windows-e2e` job.
-- [ ] 6.2 Extend `remote-agent-ssh` in `tests/e2e/cases/remote.rs` with an exit and a continue over SSH; verify it passes with `BRINDLE_REMOTE_E2E_REQUIRED=1` under `scripts/with-xvfb`.
+- [x] 6.2 Extend `remote-agent-ssh` in `tests/e2e/cases/remote.rs` with an exit and a continue over SSH; verify it passes with `BRINDLE_REMOTE_E2E_REQUIRED=1` under `scripts/with-xvfb`.
 - [ ] 6.3 Add the `agent-continue-*` cases to the `e2e-archive` filter and `windows-agent-continue` to `windows-e2e-archive`'s; verify both jobs run them on the pull request's CI.
-- [ ] 6.4 Add to `CLAUDE.md`'s manual checks: a pointer press on Continue conversation, and a real agent killed mid-conversation and continued (Codex by resume, Copilot by load with its notice, on Linux and on Windows through `cmd /c npx …`), a held prompt sent again afterwards, and a holder killed under a real agent; verify the list reads as the other entries.
+- [x] 6.4 Add to `CLAUDE.md`'s manual checks: a pointer press on Continue conversation, and a real agent killed mid-conversation and continued (Codex by resume, Copilot by load with its notice, on Linux and on Windows through `cmd /c npx …`), a held prompt sent again afterwards, and a holder killed under a real agent; verify the list reads as the other entries.
 
 ## 7. Integration
 
