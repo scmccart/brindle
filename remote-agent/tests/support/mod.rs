@@ -16,6 +16,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+pub mod fake_agent;
 pub mod programs;
 #[cfg(unix)]
 pub mod relay;
@@ -47,6 +48,9 @@ pub use brindle_term_core::emulator::Emulator;
 use brindle_term_core::shell_integration::PathStyle;
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_brindle-remote");
+/// The fake ACP agent (`src/fake_acp/main.rs`), which cargo builds with the
+/// helper for these tests; [`fake_agent::AgentScript`] writes what it plays.
+pub const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_brindle-fake-acp-agent");
 /// Long enough for a loaded CI machine; tests poll, so passing ones are fast.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
