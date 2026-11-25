@@ -71,7 +71,7 @@ Before starting, check that both changes this one depends on are implemented and
 
 ## 8. Settings dialog
 
-- [ ] 8.1 Mark agent profiles in `ProfilesState::rows` (`agent: bool`, agent description), disable Edit and Duplicate for them with the config-file note, and refuse a profile save onto a table whose `type` is `agent` in `ConfigEdit::apply`; verify with unit tests for the rows, the enabled buttons and the refused save.
+- [x] 8.1 Mark agent profiles in `ProfilesState::rows` (`agent: bool`, agent description), disable Edit and Duplicate for them with the config-file note, and refuse a profile save onto a table whose `type` is `agent` in `ConfigEdit::apply`; verify with unit tests for the rows, the enabled buttons and the refused save.
 - [ ] 8.2 Run every `ConfigEdit` variant over a fixture holding a commented agent table and check that table byte for byte (moved whole by a reorder); verify the test passes.
 - [ ] 8.3 Add `agent` to the settings dump's profile rows and the e2e case `agent-settings-profiles`; update the settings dialog entry in `docs/code-map.md`; verify the case passes under `scripts/with-xvfb`.
 

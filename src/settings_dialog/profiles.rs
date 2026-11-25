@@ -9,8 +9,8 @@
 
 use std::path::Path;
 
-use crate::config::{Profile, ProfileKey, RemoteTarget};
-use crate::config_edit::{self, ConfigEdit, DefaultChange, FileText, IMPLICIT_PROFILE, ProfileRef};
+use crate::config::{Profile, ProfileKey, ProfileKind, RemoteTarget};
+use crate::config_edit::{self, AGENT_PROFILES_IN_FILE, ConfigEdit, DefaultChange, FileText, IMPLICIT_PROFILE, ProfileRef};
 
 use super::{ListMode, Step};
 
@@ -26,6 +26,20 @@ pub struct ProfileEntry {
     pub profile: Result<Profile, String>,
 }
 
+impl ProfileEntry {
+    /// A readable agent profile: listed, deleted and moved, never edited
+    /// or duplicated here.
+    pub fn is_agent(&self) -> bool {
+        match &self.profile {
+            Ok(profile) => match profile.kind() {
+                ProfileKind::Agent => true,
+                ProfileKind::Terminal => false,
+            },
+            Err(_) => false,
+        }
+    }
+}
+
 /// A row of the profile list, as the view draws it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileRow {
@@ -33,6 +47,9 @@ pub struct ProfileRow {
     /// The profile's description, or why it can't be read.
     pub detail: String,
     pub readable: bool,
+    /// An agent profile (`type = "agent"`): marked, and edited in the
+    /// config file only.
+    pub agent: bool,
     /// The digit of its ctrl-alt-N shortcut, for the first nine.
     pub hint: Option<String>,
     pub selected: bool,
@@ -801,6 +818,7 @@ impl ProfilesState {
                     Err(e) => e.clone(),
                 },
                 readable: entry.profile.is_ok(),
+                agent: entry.is_agent(),
                 hint: (ix < 9).then(|| (ix + 1).to_string()),
                 selected: selected == Some(ix),
                 default: ix == default,
@@ -865,10 +883,25 @@ impl ProfilesState {
         self.mode = Mode::Editor(ProfileEditor::new(profile, target, default, self.selected.clone(), themes));
     }
 
+    /// The selected profile, unless it is an agent profile, which the
+    /// dialog doesn't edit or duplicate.
+    fn selected_terminal_entry(&self) -> Result<ProfileEntry, String> {
+        let entry = self.selected_entry().ok_or("no profile selected")?;
+        if entry.is_agent() {
+            return Err(AGENT_PROFILES_IN_FILE.into());
+        }
+        Ok(entry.clone())
+    }
+
+    /// The note under the list while an agent profile is selected.
+    pub fn note(&self) -> Option<&'static str> {
+        self.selected_entry().filter(|entry| entry.is_agent()).map(|_| AGENT_PROFILES_IN_FILE)
+    }
+
     /// Edit: the selected profile.
     pub fn start_edit(&mut self, themes: &[String]) -> Result<(), String> {
         self.editable()?;
-        let entry = self.selected_entry().ok_or("no profile selected")?.clone();
+        let entry = self.selected_terminal_entry()?;
         let key = self.selected.clone().ok_or("no profile selected")?;
         let profile = entry.profile.map_err(|e| format!("{:?} can't be read: {e}", entry.name))?;
         let default = self.selected_index() == Some(self.default_index());
@@ -891,7 +924,7 @@ impl ProfilesState {
     /// Duplicate: the selected profile's settings as `<name> copy`.
     pub fn start_duplicate(&mut self, themes: &[String]) -> Result<(), String> {
         self.editable()?;
-        let entry = self.selected_entry().ok_or("no profile selected")?.clone();
+        let entry = self.selected_terminal_entry()?;
         let mut profile = entry.profile.map_err(|e| format!("{:?} can't be read: {e}", entry.name))?;
         let taken = self.names_except(None);
         let free = |n: &String| !taken.iter().any(|t| t.eq_ignore_ascii_case(n));
@@ -1053,10 +1086,11 @@ impl ProfilesState {
         use super::Btn;
         let editable = self.read_only.is_none();
         let readable = self.selected_entry().is_some_and(|e| e.profile.is_ok());
+        let agent = self.selected_entry().is_some_and(ProfileEntry::is_agent);
         let (ix, len) = (self.selected_index().unwrap_or(0), self.entries.len());
         match b {
             Btn::New => editable,
-            Btn::Duplicate | Btn::Edit => editable && readable,
+            Btn::Duplicate | Btn::Edit => editable && readable && !agent,
             Btn::Delete => editable && len > 1,
             Btn::Up => editable && ix > 0,
             Btn::Down => editable && ix + 1 < len,
@@ -1331,6 +1365,20 @@ impl SettingsDialog {
                             .child(div().text_color(if row.readable { fg } else { muted }).child(SharedString::from(row.name)))
                             .child(div().text_xs().text_color(muted).child(SharedString::from(row.detail))),
                     )
+                    // A muted outlined `agent` mark, as shadcn's outline Badge.
+                    .when(row.agent, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .px_1p5()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(t.border)
+                                .text_xs()
+                                .text_color(muted)
+                                .child("agent"),
+                        )
+                    })
                     .when(row.default, |d| d.child(div().flex_none().text_xs().text_color(t.primary).child("● default")))
             })
             .collect::<Vec<_>>();
@@ -1396,6 +1444,7 @@ impl SettingsDialog {
                 window,
                 cx,
             ))
+            .when_some(state.note(), |d, note| d.child(div().text_xs().text_color(muted).child(note)))
             .child(footer)
             .into_any_element()
     }
@@ -2350,5 +2399,69 @@ theme = "gone"
         assert!(state.enabled(Btn::Delete) && state.enabled(Btn::Up) && !state.enabled(Btn::Down));
         let single = Fixture::new("[[profiles]]\nname = \"Only\"\n").state();
         assert!(!single.enabled(Btn::Delete));
+    }
+
+    /// `Shell`, then an agent profile `Agent` running `agent-acp`.
+    const AGENT_CONFIG: &str = r#"[[profiles]]
+name = "Shell"
+
+# my agent
+[[profiles]]
+name = "Agent"
+type = "agent"
+command = "agent-acp"
+args = ["--acp"]
+"#;
+
+    /// agents-profiles 8.1: an agent profile is listed with its agent
+    /// description and marked; the others aren't.
+    #[test]
+    fn rows_mark_agent_profiles() {
+        let mut state = Fixture::new(AGENT_CONFIG).state();
+        state.select(1);
+        let rows = state.rows();
+        let shown: Vec<_> = rows.iter().map(|r| (r.name.as_str(), r.detail.as_str(), r.agent, r.readable)).collect();
+        assert_eq!(shown[1], ("Agent", "agent · agent-acp", true, true));
+        assert!(!rows[0].agent);
+        assert_eq!(rows[1].hint.as_deref(), Some("2"));
+        assert!(rows[1].selected);
+        // The default marker, when `default_profile` names it.
+        let state = Fixture::new(&format!("default_profile = \"Agent\"\n{AGENT_CONFIG}")).state();
+        assert_eq!(state.rows().iter().map(|r| r.default).collect::<Vec<_>>(), [false, true]);
+        // An unreadable profile isn't marked.
+        let state = Fixture::new("[[profiles]]\nname = \"A\"\ntype = \"agent\"\nfont_size = \"big\"\n").state();
+        assert!(!state.rows()[0].agent && !state.rows()[0].readable);
+    }
+
+    /// agents-profiles 8.1: Edit and Duplicate are unavailable for an agent
+    /// profile, which the note under the list explains, and refused from
+    /// their keys too; New, Delete and the moves work.
+    #[test]
+    fn agent_profiles_are_not_edited_or_duplicated() {
+        let mut f = Fixture::new(AGENT_CONFIG);
+        let mut state = f.state();
+        state.select(0);
+        assert!(state.enabled(Btn::Edit) && state.enabled(Btn::Duplicate));
+        assert_eq!(state.note(), None);
+        state.select(1);
+        assert!(!state.enabled(Btn::Edit) && !state.enabled(Btn::Duplicate));
+        assert!(state.enabled(Btn::New) && state.enabled(Btn::Delete) && state.enabled(Btn::Up));
+        assert_eq!(state.note(), Some(AGENT_PROFILES_IN_FILE));
+        assert_eq!(state.start_edit(&themes()), Err(AGENT_PROFILES_IN_FILE.to_string()));
+        assert_eq!(state.start_duplicate(&themes()), Err(AGENT_PROFILES_IN_FILE.to_string()));
+        assert_eq!(state.list_mode(), ListMode::List);
+        // New makes a terminal profile.
+        state.start_new(&themes()).unwrap();
+        assert_eq!(state.editor_result().unwrap().unwrap().kind(), ProfileKind::Terminal);
+        state.discard();
+        // Moved whole, then deleted.
+        state.select(1);
+        assert_eq!(f.move_selected(&mut state, true), Ok(true));
+        assert_eq!(names(&state), ["Agent", "Shell"]);
+        let moved = "# my agent\n[[profiles]]\nname = \"Agent\"\ntype = \"agent\"\ncommand = \"agent-acp\"\nargs = [\"--acp\"]\n";
+        assert!(f.text().trim_start().starts_with(moved), "{}", f.text());
+        assert_eq!(f.config().profiles[0].kind(), ProfileKind::Agent);
+        assert_eq!(f.delete(&mut state), Ok(true));
+        assert_eq!(names(&state), ["Shell"]);
     }
 }
