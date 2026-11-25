@@ -241,3 +241,10 @@ Each is called out so review can overturn it:
 ## Migration Plan
 
 Nothing to migrate: no config key, state file or protocol changes, and the server and transcript are untouched, so any Brindle meets any server as before (`process R4`–`R6`, `R15` not engaged); a core restart, a Brindle crash or an upgrade only re-renders from the replayed log. Rolling back is reverting the change, `Cargo.lock` included.
+
+## As built
+
+**Section 1, shared contracts (2026-11-25).**
+- The lock moved as decision 2 says: one `[[package]]` (`pulldown-cmark` 0.13.6 on `bitflags` 2.9.4, `memchr` 2.7.6, `unicase` 2.8.1) and its name in `brindle`'s list.
+- **The table's alignment is `ColumnAlign`,** not `Align`: `brindle-ui` already exports `primitives::placement::Align` (a box against its trigger, `Center` by default) at its root, and two `Align`s would make the root's glob re-exports ambiguous. Same variants as decision 3 (`Start`, the default, `Center`, `End`).
+- **`Inline` has two more ways in, both valid by construction:** `Default` (the empty text, no runs, no links; `Table::new` pads short rows with it) and `Inline::plain(text)` (one unstyled run, no links; for the renderer's fallback paragraph). `Inline::new` keeps its links sorted by start, so `links()` is in document order. An `InlineError` carries the offending values (`RunsDontCoverText { runs, text }`, `NotCharBoundary { at }`, `LinkOutOfRange { range, text }`, `LinksOverlap { first, second }`) and implements `Display` and `Error`. `Table` reads through `width()`, `columns()`, `head()` and `rows()`, and `Table::new` also fits `columns` to the header's width (missing alignments are `Start`).

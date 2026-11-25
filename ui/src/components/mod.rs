@@ -55,6 +55,7 @@ pub mod message_scroller;
 pub mod popover;
 pub mod prompt_input;
 pub mod reasoning;
+pub mod response;
 pub mod select;
 pub mod separator;
 pub mod switch;
@@ -78,6 +79,9 @@ pub use alert::{Alert, AlertStyle, AlertVariant, alert_style};
 pub use badge::{Badge, BadgeContent, TITLE_KEEPS, kept_title};
 pub use confirmation::{Confirmation, ConfirmationAction, ConfirmationState};
 pub use reasoning::Reasoning;
+pub use response::{
+    Code, ColumnAlign, HeadingLevel, Inline, InlineError, InlineLink, ListItem, ListKind, RichBlock, RunStyle, Table, Task,
+};
 pub use tool::{Tool, ToolStatus, tool_status_colors};
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
