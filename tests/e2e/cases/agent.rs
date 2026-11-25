@@ -963,6 +963,10 @@ pub fn first_prompt_login(ctx: &Ctx) -> Result<Outcome> {
     waited(&out)?;
     ensure!(out.dump.input.as_ref().map(|i| i.text.as_str()) == Some("hi"), "the draft: {:?}", out.dump.input);
     ensure!(prompts_sent(&received)?.is_empty(), "a prompt was sent: {:?}", prompts_sent(&received)?);
+    // `agents-login`: an agent offering no method has no login row, and
+    // its first prompt is a plain draft, not one waiting for a login.
+    ensure!(out.dump.agent_logins().is_empty(), "a login row: {:?}", out.dump.agent);
+    ensure!(!out.dump.agent.iter().any(|l| l.contains(" first=")), "a waiting first prompt: {:?}", out.dump.agent);
     Ok(Outcome::Pass)
 }
 
@@ -986,6 +990,7 @@ pub fn login(ctx: &Ctx) -> Result<Outcome> {
     waited(&out)?;
     ensure!(out.dump.agent.iter().any(|l| l.contains("run fake login")), "the agent's message: {:?}", out.dump.agent);
     agent_has(&out, "prompt status=disabled")?;
+    ensure!(out.dump.agent_logins().is_empty(), "no method, no login row: {:?}", out.dump.agent);
 
     let go = gate(ctx, "expire");
     let later = Script::ready(&received)
@@ -2062,5 +2067,434 @@ pub fn continue_not_restored(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "relaunch").config(&profile).restore().dump_at(4.0).run()?;
     ensure!(out.dump.agent.is_empty(), "an agent zone came back: {:?}", out.dump.agent);
     ensure!(!out.dump.tabs.iter().any(|(title, _)| title == "Fake Agent"), "tabs: {:?}", out.dump.tabs);
+    Ok(Outcome::Pass)
+}
+
+// OpenSpec change `agents-login`, tasks 7.3 and 7.4: logging in from the
+// zone. Methods are the agent's `initialize` `authMethods`; the core sends
+// `authenticate` for an agent method and Brindle runs a terminal one.
+
+/// Two agent methods, in this order.
+const TWO_LOGINS: &str =
+    r#"[{"id":"oauth-personal","name":"Log in with Google"},{"id":"api-key","name":"API Key","description":"Use an API key"}]"#;
+
+/// One terminal method: the profile's command with `login`, setting
+/// `LOGIN_MODE` and asking for `PATH`, which Brindle leaves out.
+const TERMINAL_LOGIN: &str = r#"[{"id":"cli-login","name":"Log in from the terminal","type":"terminal","args":["login"],"env":{"LOGIN_MODE":"device","PATH":"/nowhere"}}]"#;
+
+/// What `--wait-for` waits for while the agent needs a login.
+const NEEDS_LOGIN: &str = "state=login-required";
+
+/// What `--wait-for` waits for while the agent logs in.
+const LOGGING_IN: &str = "state=logging-in";
+
+/// The two agent methods' choices, in order, as `--wait-for` sees them.
+const TWO_CHOICES: &str = "--- login choice method=\"oauth-personal\" kind=agent \"Log in with Google\"\n\
+                           --- login choice method=\"api-key\" kind=agent \"API Key\" description=\"Use an API key\"";
+
+impl Script {
+    /// An agent that records what it is sent in `received` and answers
+    /// `initialize` offering `capabilities` and the login `methods` (a
+    /// JSON array such as [`TWO_LOGINS`]).
+    fn offering_logins(received: &Path, capabilities: &str, methods: &str) -> Self {
+        Script(vec![
+            format!("record {}", received.display()),
+            "expect initialize".into(),
+            format!(
+                r#"respond {{"protocolVersion":1,"agentInfo":{{"name":"Fake Agent","version":"1.0"}},"agentCapabilities":{capabilities},"authMethods":{methods}}}"#
+            ),
+        ])
+    }
+
+    /// As [`Script::offering_logins`], whose `session/new` needs a login.
+    fn login_at_start(received: &Path, methods: &str) -> Self {
+        Script::offering_logins(received, NEITHER, methods)
+            .step("expect session/new")
+            .step(r#"respond-error -32000 "run fake login""#)
+    }
+
+    /// The login's `session/new`, then a turn answering [`HELLO`].
+    fn then_hello(self) -> Self {
+        self.step("expect session/new")
+            .step(r#"respond {"sessionId":"s1"}"#)
+            .step("expect session/prompt")
+            .step(says(HELLO))
+            .step(stop("end_turn"))
+    }
+}
+
+/// The `authenticate` requests' method ids, in order, from a record.
+fn logins_sent(received: &Path) -> Result<Vec<String>> {
+    let text = std::fs::read_to_string(received).map_err(|e| format!("reading {}: {e}", received.display()))?;
+    let mut methods = Vec::new();
+    for line in text.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).map_err(|e| format!("{line}: {e}"))?;
+        if value["method"] == "authenticate" {
+            methods.push(value["params"]["methodId"].as_str().unwrap_or_default().to_string());
+        }
+    }
+    Ok(methods)
+}
+
+/// An agent needing a login at the start offers its two methods in order,
+/// nothing chosen; tab then enter chooses the first, the zone shows it
+/// logging in until the agent answers `authenticate` (a gate), then the
+/// agent is ready and a prompt is answered.
+pub fn login_methods(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let go = gate(ctx, "logged-in");
+    let profile = Script::login_at_start(&received, TWO_LOGINS)
+        .step("expect authenticate")
+        .step(format!("wait-file {}", go.display()))
+        .step("respond {}")
+        .then_hello()
+        .profile(ctx, "methods")?;
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .wait_for(NEEDS_LOGIN)
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("enter")
+        .wait_for(LOGGING_IN)
+        .wait_for("--- login running method=\"oauth-personal\" \"Log in with Google\"");
+    let out = touch_from_shell(run, &go, true)
+        .wait_for(READY)
+        .send("hi")
+        .key("enter")
+        .wait_for(&answered())
+        .dump_at(16.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_logins().is_empty(), "the row went: {:?}", out.dump.agent);
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(logins_sent(&received)? == ["oauth-personal"], "logins: {:?}", logins_sent(&received)?);
+    Ok(Outcome::Pass)
+}
+
+/// A login the agent fails offers the methods again with its words;
+/// choosing the other (tab, tab, enter) logs in.
+pub fn login_fails(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let go = gate(ctx, "fail");
+    // The failure waits for the case, so the zone shows the login running
+    // (its methods' stops gone, focus back in the prompt input) first.
+    let profile = Script::login_at_start(&received, TWO_LOGINS)
+        .step("expect authenticate")
+        .step(format!("wait-file {}", go.display()))
+        .step(r#"respond-error -32603 "browser login timed out""#)
+        .step("expect authenticate")
+        .step("respond {}")
+        .then_hello()
+        .profile(ctx, "fails")?;
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("enter")
+        .wait_for(LOGGING_IN);
+    let out = touch_from_shell(run, &go, true)
+        .wait_for("browser login timed out")
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("tab")
+        .key("enter")
+        .wait_for(READY)
+        .dump_at(14.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(logins_sent(&received)? == ["oauth-personal", "api-key"], "logins: {:?}", logins_sent(&received)?);
+    ensure!(out.dump.agent_logins().is_empty(), "the row went: {:?}", out.dump.agent);
+    Ok(Outcome::Pass)
+}
+
+/// Cancel login (the one stop while logging in, `login:cancel`) sends
+/// `$/cancel_request`, the methods come back, the agent's late answer to
+/// the cancelled `authenticate` starts nothing, and choosing again logs
+/// in.
+pub fn login_cancel(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let profile = Script::login_at_start(&received, TWO_LOGINS)
+        .step("expect authenticate")
+        .step("expect $/cancel_request")
+        .step("respond-to 3 {}")
+        .step("expect authenticate")
+        .step("respond {}")
+        .then_hello()
+        .profile(ctx, "cancel")?;
+    let started = |label| {
+        Run::new(ctx, label).config(&profile).agent("Fake").wait_for(TWO_CHOICES).key("tab").key("enter").wait_for(LOGGING_IN)
+    };
+    let out = started("focus").key("tab").dump_at(6.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.focus_stop.as_deref() == Some("login:cancel"), "Cancel login: {:?}", out.dump.focus_stop);
+
+    std::fs::remove_file(&received).ok();
+    let out = started("cancel")
+        .key("tab")
+        .key("enter")
+        .wait_for(NEEDS_LOGIN)
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("enter")
+        .wait_for(READY)
+        .dump_at(12.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(recorded(&received, "$/cancel_request"), "no $/cancel_request was sent");
+    ensure!(logins_sent(&received)? == ["oauth-personal", "oauth-personal"], "logins: {:?}", logins_sent(&received)?);
+    ensure!(recorded_count(&received, "session/new") == 2, "the late answer started a session");
+    Ok(Outcome::Pass)
+}
+
+/// A login demanded by a prompt while another waits: the turn fails and
+/// the waiting prompt is held; after the login (shift-tab reaches the last
+/// method from the prompt) the failed turn is kept, nothing is sent on its
+/// own, and `agent_resend` sends the held prompt to the same session.
+pub fn login_prompt(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let go = gate(ctx, "expire");
+    let profile = Script::offering_logins(&received, NEITHER, TWO_LOGINS)
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(format!("wait-file {}", go.display()))
+        .step(r#"respond-error -32000 "session expired""#)
+        .step("expect authenticate")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(says("sent again"))
+        .step(stop("end_turn"))
+        .profile(ctx, "prompt")?;
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("one")
+        .wait_for(WORKING)
+        .send("two")
+        .key("enter")
+        .wait_for("queued waiting \"two\"");
+    let out = touch_from_shell(run, &go, true)
+        .wait_for(NEEDS_LOGIN)
+        .wait_for("queued held reason=login-required resend=no \"two\"")
+        .key("shift-tab")
+        .key("shift-tab")
+        .key("enter")
+        .wait_for(READY)
+        .wait_for("queued held reason=login-required resend=yes \"two\"")
+        .action("agent_resend")
+        .wait_for("agent \"sent again\"")
+        .dump_at(18.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(logins_sent(&received)? == ["oauth-personal"], "logins: {:?}", logins_sent(&received)?);
+    ensure!(prompts_sent(&received)? == ["one", "two"], "sent: {:?}", prompts_sent(&received)?);
+    ensure!(recorded_count(&received, "session/new") == 1, "the same session");
+    ensure!(messages(&out).starts_with(&["user \"one\""]), "the failed turn kept: {:?}", out.dump.agent);
+    Ok(Outcome::Pass)
+}
+
+/// `-p hi` to an agent needing a login: the prompt input shows `hi`
+/// read-only (`first="hi"`) through the login, and `hi` is sent once when
+/// the agent is ready.
+pub fn first_prompt_after_login(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let go = gate(ctx, "logged-in");
+    let profile = Script::login_at_start(&received, TWO_LOGINS)
+        .step("expect authenticate")
+        .step(format!("wait-file {}", go.display()))
+        .step("respond {}")
+        .then_hello()
+        .profile(ctx, "first")?;
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("prompt status=disabled first=\"hi\"")
+        .key("tab")
+        .key("enter")
+        .wait_for(LOGGING_IN)
+        .wait_for("first=\"hi\"");
+    let out = touch_from_shell(run, &go, true).wait_for(&answered()).dump_at(14.0).run()?;
+    waited(&out)?;
+    ensure!(prompts_sent(&received)? == ["hi"], "sent: {:?}", prompts_sent(&received)?);
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(!out.dump.agent.iter().any(|l| l.contains(" first=")), "still waiting: {:?}", out.dump.agent);
+    Ok(Outcome::Pass)
+}
+
+/// Closing a zone whose agent logs in asks nothing (a login is no turn),
+/// and its agent ends.
+pub fn login_close(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let profile = Script::login_at_start(&received, TWO_LOGINS)
+        .step("expect authenticate")
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, "close")?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .keep_detached()
+        .wait_for(TWO_CHOICES)
+        .key("tab")
+        .key("enter")
+        .wait_for(LOGGING_IN)
+        .action("new_tab")
+        .action("prev_tab")
+        .action("close_zone")
+        .dump_at(9.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.confirm.is_none(), "nothing asked: {:?}", out.dump.confirm);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "the agent tab closed: {:?}", out.dump.tabs);
+    sessions_listed(ctx, 1)?;
+    crate::brindle::hang_up_detached(ctx)?;
+    Ok(Outcome::Pass)
+}
+
+/// The fake agent's script for a terminal login: the agent part as
+/// `agent` (the steps with no arguments), then the login program's
+/// section (`args login`): it records its environment in `env`, then
+/// plays `login`.
+fn with_terminal_login(agent: Script, env: &Path, login: &[String]) -> Script {
+    let mut script = agent.step("args login").step(format!("record-env {}", env.display()));
+    for step in login {
+        script = script.step(step.clone());
+    }
+    script
+}
+
+/// The terminal method's choice line, as `--wait-for` sees it.
+const TERMINAL_CHOICE: &str = "--- login choice method=\"cli-login\" kind=terminal \"Log in from the terminal\" \
+                               args=\"login\" env=\"LOGIN_MODE=device\" dropped=\"PATH\"";
+
+/// A terminal login after a prompt's demand: the choice says what it runs
+/// and leaves out; enter opens a terminal zone beside the agent zone
+/// running the profile's command with `login`; its exit 0 starts the agent
+/// again (the core's notice), which resumes the same conversation, and a
+/// prompt is answered there, the earlier turn kept.
+pub fn login_terminal(ctx: &Ctx) -> Result<Outcome> {
+    let (first, second) = records(ctx);
+    let env = ctx.dir.join("login.env");
+    std::fs::remove_file(&env).ok();
+    let go = gate(ctx, "login-done");
+    std::fs::remove_file(&go).ok();
+    let agent = Script::offering_logins(&first, RESUME, TERMINAL_LOGIN)
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(says(HELLO))
+        .step(stop("end_turn"))
+        .step("expect session/prompt")
+        .step(r#"respond-error -32000 "session expired""#);
+    let login = [format!("wait-file {}", go.display()), "exit 0".to_string()];
+    let profile = with_terminal_login(agent, &env, &login).profile(ctx, "agent")?;
+    let next = Script::offering_logins(&second, RESUME, TERMINAL_LOGIN)
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(says("Again"))
+        .step(stop("end_turn"))
+        .write(ctx, "next")?;
+    let current = ctx.dir.join("agent.script");
+    let scale = ctx.scale();
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("one")
+        // Once the login program has read its script (its environment is
+        // recorded), the agent started again reads the next one; then the
+        // login program exits 0.
+        .call_at(1.0, move |_| {
+            scale.eventually(60.0, "the login program's environment", || env.exists())?;
+            std::fs::copy(&next, &current).map_err(|e| format!("swapping the script: {e}"))?;
+            std::fs::write(&go, "").map_err(|e| format!("opening the gate: {e}"))
+        })
+        .wait_for(&answered())
+        .send("two")
+        .key("enter")
+        .wait_for(NEEDS_LOGIN)
+        .wait_for(TERMINAL_CHOICE)
+        .key("tab")
+        .key("enter")
+        // The login zone is active until its program exits.
+        .wait_for(READY)
+        .send("three")
+        .key("enter")
+        .wait_for("agent \"Again\"")
+        .dump_at(22.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.is_none(), "the login zone closed: {:?}", out.dump.zones);
+    ensure!(has_notice(&out, "the agent is started again after its login"), "no restart notice: {:?}", out.dump.agent);
+    let entries = messages(&out);
+    ensure!(
+        entries.starts_with(&["user \"one\"", "agent \"Hello!\"", "user \"two\""]) && entries.ends_with(&["user \"three\"", "agent \"Again\""]),
+        "the conversation kept: {entries:?}"
+    );
+    ensure!(recorded(&second, "session/resume"), "the same conversation wasn't resumed");
+    ensure!(prompts_sent(&second)? == ["three"], "sent after the login: {:?}", prompts_sent(&second)?);
+    Ok(Outcome::Pass)
+}
+
+/// A terminal login whose program exits 1: its zone closes, the methods
+/// show again with the status, and the agent still needs a login.
+pub fn login_terminal_fails(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let env = ctx.dir.join("login.env");
+    let agent = Script::login_at_start(&received, TERMINAL_LOGIN);
+    let profile = with_terminal_login(agent, &env, &["exit 1".to_string()]).profile(ctx, "fails")?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .wait_for(TERMINAL_CHOICE)
+        .key("tab")
+        .key("enter")
+        .wait_for("refusal=\"the login program exited with status 1\"")
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.is_none(), "the login zone closed: {:?}", out.dump.zones);
+    ensure!(out.dump.agent_field("state") == Some("login-required"), "agent: {:?}", out.dump.agent);
+    ensure!(
+        out.dump.agent_logins().iter().any(|l| l.starts_with("choice method=\"cli-login\"")),
+        "the methods again: {:?}",
+        out.dump.agent
+    );
+    ensure!(!recorded(&received, "authenticate"), "a terminal method was sent to the agent");
+    Ok(Outcome::Pass)
+}
+
+/// A running terminal login: its zone sits right of the agent zone, the
+/// agent zone shows it running, and the login program got the method's
+/// `LOGIN_MODE` but not its `PATH`.
+pub fn login_terminal_env(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let env = ctx.dir.join("login.env");
+    std::fs::remove_file(&env).ok();
+    let agent = Script::login_at_start(&received, TERMINAL_LOGIN);
+    let login = [format!("wait-file {}", gate(ctx, "never").display())];
+    let profile = with_terminal_login(agent, &env, &login).profile(ctx, "env")?;
+    let scale = ctx.scale();
+    let recorded_env = env.clone();
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .call_at(1.0, move |_| scale.eventually(60.0, "the login program's environment", || recorded_env.exists()))
+        .wait_for(TERMINAL_CHOICE)
+        .key("tab")
+        .key("enter")
+        .action("focus_zone_left")
+        .wait_for("--- login running method=\"cli-login\" \"Log in from the terminal\"")
+        .dump_at(9.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=1"), "zones: {:?}", out.dump.zones);
+    ensure!(out.dump.agent_field("state") == Some("login-required"), "agent: {:?}", out.dump.agent);
+    agent_has(&out, "prompt status=disabled")?;
+    let text = std::fs::read_to_string(&env).map_err(|e| format!("reading {}: {e}", env.display()))?;
+    ensure!(text.lines().any(|l| l == "LOGIN_MODE=device"), "LOGIN_MODE not applied: {text}");
+    ensure!(text.lines().any(|l| l.starts_with("PATH=")) && !text.lines().any(|l| l == "PATH=/nowhere"), "PATH applied: {text}");
     Ok(Outcome::Pass)
 }
