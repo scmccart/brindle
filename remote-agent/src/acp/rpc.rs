@@ -33,6 +33,10 @@ pub enum Purpose {
     Initialize,
     NewSession,
     Prompt,
+    /// `session/resume`: continue a conversation with no replay.
+    Resume,
+    /// `session/load`: continue a conversation, replayed first.
+    Load,
 }
 
 /// The JSON-RPC errors the core answers an agent's request with.
@@ -160,6 +164,18 @@ impl Rpc {
         self.request(Purpose::NewSession, "session/new", &params)
     }
 
+    /// `session/resume` of conversation `session` in `cwd` (its own
+    /// directory), with no MCP servers.
+    pub fn resume(&mut self, session: &str, cwd: &str) -> Vec<u8> {
+        self.request(Purpose::Resume, "session/resume", &continuing(session, cwd))
+    }
+
+    /// `session/load` of conversation `session` in `cwd`, as
+    /// [`resume`](Self::resume).
+    pub fn load(&mut self, session: &str, cwd: &str) -> Vec<u8> {
+        self.request(Purpose::Load, "session/load", &continuing(session, cwd))
+    }
+
     /// `session/prompt` with one text block.
     pub fn prompt(&mut self, session: &str, text: &str) -> Vec<u8> {
         let params = format!(
@@ -257,6 +273,15 @@ pub fn error(id: Option<&Id>, refusal: Refusal) -> Vec<u8> {
     ))
 }
 
+/// The params of `session/resume` and `session/load`.
+fn continuing(session: &str, cwd: &str) -> String {
+    format!(
+        r#"{{"sessionId":{},"cwd":{},"mcpServers":[]}}"#,
+        quote(session),
+        quote(cwd)
+    )
+}
+
 /// `text` as a JSON string.
 fn quote(text: &str) -> String {
     Value::from(text).to_string()
@@ -313,6 +338,29 @@ mod tests {
         assert_eq!(
             text(&rpc.new_session("/home/user/scratch")),
             captured(CLAUDE, r#"{"jsonrpc":"2.0","id":2,"method":"session/new""#)
+        );
+    }
+
+    #[test]
+    fn resume_and_load_name_the_conversation_its_directory_and_no_mcp_servers() {
+        let mut rpc = Rpc::from_parts(7, BTreeMap::new(), BTreeMap::new())
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(
+            text(&rpc.resume("sess-1", "/home/u/src")),
+            "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"session/resume\",\"params\":\
+             {\"sessionId\":\"sess-1\",\"cwd\":\"/home/u/src\",\"mcpServers\":[]}}\n"
+        );
+        assert_eq!(
+            text(&rpc.load("sess-1", "C:\\Users\\u \"x\"")),
+            "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"session/load\",\"params\":\
+             {\"sessionId\":\"sess-1\",\"cwd\":\"C:\\\\Users\\\\u \\\"x\\\"\",\"mcpServers\":[]}}\n"
+        );
+        assert_eq!(
+            rpc.outgoing()
+                .iter()
+                .map(|(id, p)| (*id, *p))
+                .collect::<Vec<_>>(),
+            [(7, Purpose::Resume), (8, Purpose::Load)]
         );
     }
 
@@ -403,6 +451,8 @@ mod tests {
         for bytes in [
             rpc.initialize("0.3.0"),
             rpc.new_session("/"),
+            rpc.resume("s\n", "/"),
+            rpc.load("s", "/\n"),
             rpc.prompt("s", "hi"),
             cancel("s"),
             permission_answer(&id, Some("a")),

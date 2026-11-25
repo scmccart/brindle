@@ -220,6 +220,8 @@ fn purpose_name(purpose: Purpose) -> &'static str {
         Purpose::Initialize => "initialize",
         Purpose::NewSession => "new_session",
         Purpose::Prompt => "prompt",
+        Purpose::Resume => "resume",
+        Purpose::Load => "load",
     }
 }
 
@@ -450,6 +452,8 @@ fn restore_rpc(parts: &Map<String, Value>) -> Result<Rpc, Unreadable> {
             Some("initialize") => Purpose::Initialize,
             Some("new_session") => Purpose::NewSession,
             Some("prompt") => Purpose::Prompt,
+            Some("resume") => Purpose::Resume,
+            Some("load") => Purpose::Load,
             Some(_) | None => return Err(Unreadable::Field { name }),
         };
         outgoing.insert(id, purpose);

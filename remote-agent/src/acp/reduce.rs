@@ -992,6 +992,8 @@ impl Step<'_> {
             Purpose::Initialize => self.initialized(result),
             Purpose::NewSession => self.created(result),
             Purpose::Prompt => self.prompted(result),
+            // Not sent yet: the reducer's continue (section 2) sends them.
+            Purpose::Resume | Purpose::Load => {}
         }
     }
 
