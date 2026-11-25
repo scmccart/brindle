@@ -48,6 +48,7 @@ pub mod edge_bar;
 pub mod input;
 pub mod kbd;
 pub mod menu;
+pub mod message;
 pub mod message_scroller;
 pub mod popover;
 pub mod select;
@@ -86,6 +87,7 @@ pub use menu::{
     Menu, MenuAnchor, MenuEntry, MenuEvent, MenuItem, MenuJump, MenuNav, MenuPress, chosen, entry_keyed, menu_item_release,
     menu_overlay, page_key, release_over, render_menu,
 };
+pub use message::{Bubble, BubbleEdges, BubblePart, BubbleStyle, From as MessageFrom, Message, bubble_style};
 pub use message_scroller::{Follow, MessageScroller, PageDirection, PageScroll, page_scroll};
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
