@@ -1111,10 +1111,11 @@ impl ProfilesState {
         let section = "Profiles";
         match &self.mode {
             Mode::List => format!(
-                "--- settings section={section} mode=list selected={:?} default={:?} profiles={:?} error={:?}\n",
+                "--- settings section={section} mode=list selected={:?} default={:?} profiles={:?} agent={:?} error={:?}\n",
                 self.selected_entry().map(|e| e.name.as_str()).unwrap_or(""),
                 self.entries.get(self.default_index()).map(|e| e.name.as_str()).unwrap_or(""),
                 self.names().collect::<Vec<_>>(),
+                self.entries.iter().filter(|e| e.is_agent()).map(|e| e.name.as_str()).collect::<Vec<_>>(),
                 error
             ),
             Mode::Editor(editor) => {
@@ -2425,6 +2426,8 @@ args = ["--acp"]
         assert!(!rows[0].agent);
         assert_eq!(rows[1].hint.as_deref(), Some("2"));
         assert!(rows[1].selected);
+        let line = state.describe(&None, "");
+        assert!(line.contains(" profiles=[\"Shell\", \"Agent\"] agent=[\"Agent\"] error=None"), "{line}");
         // The default marker, when `default_profile` names it.
         let state = Fixture::new(&format!("default_profile = \"Agent\"\n{AGENT_CONFIG}")).state();
         assert_eq!(state.rows().iter().map(|r| r.default).collect::<Vec<_>>(), [false, true]);

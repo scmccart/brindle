@@ -1279,6 +1279,79 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// An agent profile's table as a user writes it, after the test config's
+/// profiles; the agent never runs.
+const AGENT_TABLE: &str = r#"# my agent, kept as written
+[[profiles]]
+name = "Agent" # the menu's name
+type = "agent"
+command = "agent-acp"
+args = ["--acp"] # its ACP mode
+env = { AGENT_LOG = "debug" }
+"#;
+
+/// The case's config file as the last run left it.
+fn config_file(ctx: &Ctx) -> Result<String> {
+    std::fs::read_to_string(ctx.dir.join("config.toml")).map_err(|e| format!("reading the config: {e}"))
+}
+
+/// The settings dialog's Profiles section with an agent profile:
+/// - it is listed last, marked (`agent=["Agent"]`), and Edit and Duplicate
+///   are refused with the config-file note, writing nothing;
+/// - saving another profile (`Shell` renamed `Login`) leaves its table byte
+///   for byte;
+/// - alt-up moves it above `Shell`, whole, still selected.
+pub fn settings_profiles(ctx: &Ctx) -> Result<Outcome> {
+    use super::step_time;
+    let extra = format!("\n{AGENT_TABLE}");
+    let written = crate::brindle::config("e2e") + &extra;
+    let settings = |out: &crate::brindle::Output| out.dump.settings.clone().unwrap_or_default();
+
+    let out = Run::new(ctx, "list")
+        .config(&extra)
+        .action("open_settings")
+        .action("settings_last")
+        .action("settings_edit")
+        .action("settings_duplicate")
+        .dump_at(step_time(4) + 0.8)
+        .run()?;
+    let line = settings(&out);
+    ensure!(line.starts_with("section=Profiles mode=list selected=\"Agent\""), "the dialog: {line:?}");
+    ensure!(line.contains("agent=[\"Agent\"]"), "Agent isn't marked: {line:?}");
+    ensure!(line.ends_with("error=Some(\"Agent profiles are edited in the config file\")"), "the refusal: {line:?}");
+    ensure!(config_file(ctx)? == written, "the refused edits wrote:\n{}", config_file(ctx)?);
+
+    let out = Run::new(ctx, "save")
+        .config(&extra)
+        .action("open_settings")
+        .action("settings_edit")
+        .action("text_input_select_home")
+        .send("Login")
+        .action("settings_confirm")
+        .dump_at(step_time(5) + 0.8)
+        .run()?;
+    let line = settings(&out);
+    ensure!(line.starts_with("section=Profiles mode=list selected=\"Login\""), "after the save: {line:?}");
+    let config = config_file(ctx)?;
+    ensure!(config.contains("name = \"Login\"") && !config.contains("name = \"Shell\""), "Shell wasn't saved:\n{config}");
+    ensure!(config.matches(AGENT_TABLE).count() == 1, "the agent's table changed:\n{config}");
+
+    let out = Run::new(ctx, "move")
+        .config(&extra)
+        .action("open_settings")
+        .action("settings_last")
+        .action("settings_move_up")
+        .dump_at(step_time(3) + 0.8)
+        .run()?;
+    let line = settings(&out);
+    ensure!(line.starts_with("section=Profiles mode=list selected=\"Agent\""), "after the move: {line:?}");
+    let config = config_file(ctx)?;
+    ensure!(config.matches(AGENT_TABLE).count() == 1, "the agent's table changed:\n{config}");
+    let at = |name: &str| config.find(&format!("name = \"{name}\""));
+    ensure!(at("Agent") < at("Shell") && at("Shell").is_some(), "Agent isn't above Shell:\n{config}");
+    Ok(Outcome::Pass)
+}
+
 /// What the case sets `BRINDLE_TEST_SINK_PANIC` to, and the agent says.
 const SINK_PANIC: &str = "brindle-test-agent-panic";
 
