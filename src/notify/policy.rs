@@ -294,6 +294,29 @@ mod tests {
         assert_eq!(layout(Source::Osc9, "", "x", " "), ("Brindle".into(), "x".into()));
     }
 
+    /// An agent's notice (`ChatModel::notice`): the agent's name, then the
+    /// tab's title; the body as the model worded it.
+    #[test]
+    fn agent_notices_name_the_agent_then_the_tab() {
+        let permission = layout(Source::Agent, "Fake Agent", "Run cargo test?", "Fake Agent");
+        assert_eq!(permission, ("Fake Agent — Fake Agent".into(), "Run cargo test?".into()));
+        assert_eq!(layout(Source::Agent, "Fake Agent", "Done", "review"), ("Fake Agent — review".into(), "Done".into()));
+        assert_eq!(layout(Source::Agent, "Fake", "bad", ""), ("Fake — Brindle".into(), "bad".into()));
+        let long = "a".repeat(MAX_TITLE_CHARS * 2);
+        let (summary, _) = layout(Source::Agent, &long, "Done", "tab");
+        assert!(summary.chars().count() <= MAX_TITLE_CHARS, "{summary}");
+    }
+
+    /// Agent notices share the programs' per-tab bucket, not the bell's.
+    #[test]
+    fn agent_notices_take_the_program_rate_limit() {
+        let mut limiter = RateLimiter::new();
+        let t0 = Instant::now();
+        let allowed = (0..5).filter(|_| limiter.allow(1, Source::Agent, t0)).count();
+        assert_eq!(allowed, OSC_PER_TAB.capacity as usize);
+        assert!(limiter.allow(1, Source::Bell, t0), "the bell's bucket is apart");
+    }
+
     #[test]
     fn bell_storm_gives_one_per_five_seconds() {
         let mut limiter = RateLimiter::new();

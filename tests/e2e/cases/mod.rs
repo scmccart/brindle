@@ -279,6 +279,7 @@ fn unix() -> Vec<Case> {
         display("agent-quit-restore", agent::quit_restore).needs_fake_agent(),
         display("agent-sweep", agent::sweep).needs_fake_agent(),
         display("agent-sessions-palette", agent::sessions_palette).needs_fake_agent(),
+        display("agent-notify", agent::notify).needs_fake_agent(),
         needing("agent-broken", &[TestSwitch::SinkPanic], agent::broken).needs_fake_agent(),
     ]
 }

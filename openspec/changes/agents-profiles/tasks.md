@@ -66,7 +66,7 @@ Before starting, check that both changes this one depends on are implemented and
 
 ## 7. Agent notifications
 
-- [ ] 7.1 Raise `ChatModel::notice` results through `Workspace::on_attention` with `Source::Agent`, laid out with the tab title, the focus rule and the rate limits; verify with a unit test of the layout and the e2e case `agent-notify` (`BRINDLE_NOTIFY_LOG` shows source `agent` for a permission and `Done`, nothing with `notifications.agent = false`, nothing on a replay).
+- [x] 7.1 Raise `ChatModel::notice` results through `Workspace::on_attention` with `Source::Agent`, laid out with the tab title, the focus rule and the rate limits; verify with a unit test of the layout and the e2e case `agent-notify` (`BRINDLE_NOTIFY_LOG` shows source `agent` for a permission and `Done`, nothing with `notifications.agent = false`, nothing on a replay).
 - [ ] 7.2 Document `notifications.agent` in `README.md` and the `notify/` entry in `docs/code-map.md`; verify the README's `[notifications]` list names all six keys.
 
 ## 8. Settings dialog

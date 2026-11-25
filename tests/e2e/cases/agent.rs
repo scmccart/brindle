@@ -442,8 +442,13 @@ fn update(update: &str) -> String {
 /// A `send` step of a permission request with the JSON-RPC id `id` about
 /// tool call `call_1`, offering `allow-once` and `reject-once`.
 fn ask(id: &str) -> String {
+    ask_about(id, "Write a file")
+}
+
+/// [`ask`] with the tool call titled `title`.
+fn ask_about(id: &str, title: &str) -> String {
     format!(
-        r#"send {{"jsonrpc":"2.0","id":"{id}","method":"session/request_permission","params":{{"sessionId":"s1","toolCall":{{"toolCallId":"call_1","title":"Write a file"}},"options":[{{"optionId":"allow-once","name":"Allow","kind":"allow_once"}},{{"optionId":"reject-once","name":"Reject","kind":"reject_once"}}]}}}}"#
+        r#"send {{"jsonrpc":"2.0","id":"{id}","method":"session/request_permission","params":{{"sessionId":"s1","toolCall":{{"toolCallId":"call_1","title":"{title}"}},"options":[{{"optionId":"allow-once","name":"Allow","kind":"allow_once"}},{{"optionId":"reject-once","name":"Reject","kind":"reject_once"}}]}}}}"#
     )
 }
 
@@ -1144,6 +1149,134 @@ fn agent_listed(ctx: &Ctx) -> Result<bool> {
         .map_err(|e| format!("running {}: {e}", ctx.helper.display()))?;
     ensure!(out.status.success(), "`brindle-remote list` failed: {}", String::from_utf8_lossy(&out.stderr));
     Ok(String::from_utf8_lossy(&out.stdout).contains("brindle-fake-acp-agent"))
+}
+
+/// The permission an agent asks for in `agent-notify`.
+const ASKED: &str = "Run cargo test?";
+
+/// The notification log's lines for an agent's notice (`source<TAB>title
+/// <TAB>body`): the agent's name, then the tab's title.
+fn agent_notice(body: &str) -> String {
+    format!("agent\tFake Agent — Fake Agent\t{body}")
+}
+
+/// The lines of a run's notification log; none when it wasn't written.
+fn notices(log: &Path) -> Vec<String> {
+    std::fs::read_to_string(log).unwrap_or_default().lines().map(str::to_string).collect()
+}
+
+/// A Shell tab's command that waits until `log` holds `text`, then prints
+/// `label`, spelt apart on the command line so `--wait-for label` waits
+/// for the output rather than the typed command.
+fn until_logged(log: &Path, text: &str, label: &str) -> String {
+    let (head, tail) = label.split_at(label.len() / 2);
+    format!("until grep -qF '{text}' '{}'; do sleep 0.1; done; echo {head}\"\"{tail}\r", log.display())
+}
+
+/// An agent's notifications (`BRINDLE_NOTIFY_LOG`, source `agent`):
+/// - in a background tab, with the default `when`, a permission request
+///   notifies with its title and a turn that ends normally with `Done`,
+///   each titled `Fake Agent — Fake Agent`; answering the permission in
+///   front raises nothing;
+/// - with `when = "always"` the same turn in the active tab notifies both,
+///   and with `notifications.agent = false` it notifies nothing;
+/// - a replay after a quit and relaunch notifies nothing, though it shows
+///   the pending permission again.
+pub fn notify(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let (asked, answered) = (gate(ctx, "asked"), gate(ctx, "answered"));
+    let background = Script::ready(&received)
+        .step("expect session/prompt")
+        .step(format!("wait-file {}", asked.display()))
+        .step(ask_about("p1", ASKED))
+        .step(r#"expect-response "p1""#)
+        .step(format!("wait-file {}", answered.display()))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "background")?;
+    let log = ctx.dir.join("background.notify");
+    let out = Run::new(ctx, "background")
+        .config(&background)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for(WORKING)
+        .action("new_tab")
+        .send(&format!("touch '{}'; {}", asked.display(), until_logged(&log, ASKED, "notice-1")))
+        .wait_for("notice-1")
+        .action("activate_tab_1")
+        .wait_for("outcome=pending")
+        .key("tab")
+        .key("enter")
+        .wait_for("outcome=selected:allow-once")
+        .action("activate_tab_2")
+        .send(&format!("touch '{}'; {}", answered.display(), until_logged(&log, "Done", "notice-2")))
+        .wait_for("notice-2")
+        .dump_at(12.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "the Shell tab in front: {:?}", out.dump.tabs);
+    let want = [agent_notice(ASKED), agent_notice("Done")];
+    ensure!(notices(&log) == want, "background: notices {:?}, expected {want:?}", notices(&log));
+
+    let in_front = Script::ready(&received)
+        .step("expect session/prompt")
+        .step(ask_about("p1", ASKED))
+        .step(r#"expect-response "p1""#)
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "front")?;
+    for (label, agent, want) in [("always", true, want.to_vec()), ("off", false, Vec::new())] {
+        let log = ctx.dir.join(format!("{label}.notify"));
+        let out = Run::new(ctx, label)
+            .config(&in_front)
+            .config(&format!("\n[notifications]\nwhen = \"always\"\nagent = {agent}\n"))
+            .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+            .agent("Fake")
+            .first_prompt("hi")
+            .wait_for("outcome=pending")
+            .key("tab")
+            .key("enter")
+            .wait_for("agent \"done\"")
+            .wait_for("status=done")
+            .dump_at(7.0)
+            .run()?;
+        waited(&out)?;
+        ensure!(notices(&log) == want, "{label}: notices {:?}, expected {want:?}", notices(&log));
+    }
+
+    let pending = Script::ready(&received)
+        .step("expect session/prompt")
+        .step(ask_about("p1", ASKED))
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, "replay")?;
+    let notifications = "\n[notifications]\nwhen = \"always\"\n";
+    let (live, replay) = (ctx.dir.join("live.notify"), ctx.dir.join("replay.notify"));
+    Run::new(ctx, "live")
+        .config(&pending)
+        .config(notifications)
+        .env("BRINDLE_NOTIFY_LOG", live.to_str().unwrap())
+        .agent("Fake")
+        .first_prompt("hi")
+        .keep_detached()
+        .wait_for("outcome=pending")
+        .action("quit")
+        .expect_exit()
+        .dump_at(12.0)
+        .run()?;
+    ensure!(notices(&live) == [agent_notice(ASKED)], "live: notices {:?}", notices(&live));
+    let out = Run::new(ctx, "replayed")
+        .config(&pending)
+        .config(notifications)
+        .env("BRINDLE_NOTIFY_LOG", replay.to_str().unwrap())
+        .restore()
+        .wait_for("outcome=pending")
+        .dump_at(5.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_field("status") == Some("blocked"), "replayed: agent {:?}", out.dump.agent);
+    ensure!(notices(&replay).is_empty(), "the replay notified: {:?}", notices(&replay));
+    Ok(Outcome::Pass)
 }
 
 /// What the case sets `BRINDLE_TEST_SINK_PANIC` to, and the agent says.
