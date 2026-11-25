@@ -504,6 +504,10 @@ pub enum Why {
 /// The words for a prompt kept because one is already queued.
 pub const ALREADY_QUEUED: &str = "a prompt is already queued";
 
+/// The refusal shown when a request couldn't be sent at all
+/// ([`ChatModel::unsent`]).
+pub const UNSENT: &str = "the agent session isn't connected; nothing was sent";
+
 /// What enter does with the prompt input's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Submit {
@@ -1044,6 +1048,35 @@ impl ChatModel {
     /// the draft.
     pub fn replied(&mut self, request: RequestId, outcome: Result<(), String>) -> Replied {
         let Some(sent) = self.pending.remove(&request) else { return Replied::Nothing };
+        self.answered(sent, outcome)
+    }
+
+    /// A request [`Self::submit`] or the queue's or a permission's
+    /// decision asked for couldn't go (the session isn't connected, or the
+    /// link fell between the decision and the send): answered as a refusal
+    /// with [`UNSENT`], so a first prompt becomes the draft.
+    pub fn unsent(&mut self, sent: Sent) -> Replied {
+        self.answered(sent, Err(UNSENT.into()))
+    }
+
+    /// The terminal server's word about the session that answers no request
+    /// (a refused cancel): shown beside the prompt input, as a refusal.
+    pub fn server_note(&mut self, text: impl Into<String>) {
+        self.refusal = Some(text.into());
+    }
+
+    /// Whether the zone's session is one a quit leaves for the next launch
+    /// to attach (design.md decision 5's `zone_records`): not once it has
+    /// ended, nor when it never started, was lost or can't be followed.
+    pub fn keeps_session(&self) -> bool {
+        let phase = match &self.phase {
+            AgentPhase::Connecting | AgentPhase::Live(_) => true,
+            AgentPhase::NotStarted(_) | AgentPhase::Lost { .. } | AgentPhase::Broken { .. } => false,
+        };
+        phase && self.life == SessionLife::Open
+    }
+
+    fn answered(&mut self, sent: Sent, outcome: Result<(), String>) -> Replied {
         match (sent, outcome) {
             (Sent::Prompt, Ok(())) => {
                 self.refusal = None;
@@ -2104,5 +2137,41 @@ mod tests {
         assert!(zone.model.cancel());
         zone.feed(&[turn(TurnState::Cancelling)]);
         assert!(!zone.model.cancel(), "already cancelling");
+    }
+
+    /// A request that couldn't go is answered as a refusal: a prompt's
+    /// draft stays, a first prompt becomes the draft; a server's note is
+    /// shown the same way.
+    #[test]
+    fn an_unsent_request_is_refused_and_a_first_prompt_becomes_the_draft() {
+        let mut zone = Zone::ready();
+        assert_eq!(zone.model.unsent(Sent::Prompt), Replied::Nothing);
+        assert_eq!(zone.model.refusal(), Some(UNSENT));
+        assert_eq!(zone.model.unsent(Sent::FirstPrompt("go".into())), Replied::SetDraft("go".into()));
+        assert_eq!(zone.model.unsent(Sent::Resend), Replied::Nothing);
+        zone.model.server_note("the terminal server: no turn is running");
+        assert_eq!(zone.model.refusal(), Some("the terminal server: no turn is running"));
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Ready, "nothing is in flight");
+    }
+
+    /// Only a session that is open (or still connecting) is left for the
+    /// next launch.
+    #[test]
+    fn a_zone_keeps_its_session_only_while_it_is_open() {
+        let mut zone = Zone::new(None);
+        assert!(zone.model.keeps_session(), "connecting");
+        zone.feed(&[ready()]);
+        assert!(zone.model.keeps_session());
+        zone.model.ended();
+        assert!(!zone.model.keeps_session(), "ended");
+        let mut lost = Zone::ready();
+        lost.model.lost("gone");
+        assert!(!lost.model.keeps_session());
+        let mut broken = Zone::ready();
+        broken.model.broken("bad event");
+        assert!(!broken.model.keeps_session());
+        let mut never = Zone::new(None);
+        never.model.not_started(StartFailure::NoServer("no helper".into()));
+        assert!(!never.model.keeps_session());
     }
 }

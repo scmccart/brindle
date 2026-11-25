@@ -85,6 +85,24 @@ impl Feed {
     pub fn took<'a>(&self, taken: impl IntoIterator<Item = &'a AgentEvent>) -> Option<Recovered> {
         self.gate.lock().took(taken.into_iter().map(kind_of))
     }
+
+    /// The shared fold, the gate's end and the events apart, so the zone's
+    /// loop can own the receiver while it tells the gate what it took.
+    pub fn split(self) -> (Arc<Mutex<AgentShared>>, Taker, UnboundedReceiver<AgentEvent>) {
+        (self.shared, Taker { gate: self.gate }, self.events)
+    }
+}
+
+/// The gate's end of a [`Feed`] split from its events ([`Feed::split`]).
+pub struct Taker {
+    gate: Arc<Mutex<EventGate>>,
+}
+
+impl Taker {
+    /// As [`Feed::took`].
+    pub fn took<'a>(&self, taken: impl IntoIterator<Item = &'a AgentEvent>) -> Option<Recovered> {
+        self.gate.lock().took(taken.into_iter().map(kind_of))
+    }
 }
 
 /// An agent session's sink, which the connection's reader thread calls.
@@ -100,9 +118,8 @@ pub struct Sink {
 
 impl Sink {
     /// A sink and the zone's end of it, with the fault switch as the
-    /// environment sets it (only in a debug build). Group 5's `Agent`
-    /// entity makes its sink here; the tests give the marker instead.
-    #[allow(dead_code)]
+    /// environment sets it (only in a debug build). The `Agent` entity
+    /// makes its sink here; the tests give the marker instead.
     pub fn new() -> (Self, Feed) {
         Self::with_fault(fault_marker())
     }

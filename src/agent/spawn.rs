@@ -54,7 +54,7 @@ pub struct AgentSpawnRequest {
 /// endpoint the launching command's directory and this machine's home mean
 /// nothing, so with neither `-d` nor a `cwd` the server starts the agent in
 /// the home directory there.
-fn directory(profile: &Profile, host: &Host, asked: Option<PathBuf>, opened: &OpenedBy, home: Option<&Path>) -> Option<PathBuf> {
+pub fn directory(profile: &Profile, host: &Host, asked: Option<PathBuf>, opened: &OpenedBy, home: Option<&Path>) -> Option<PathBuf> {
     let profile_dir =
         profile.cwd.as_deref().filter(|dir| !dir.is_empty()).and_then(|_| profile.working_directory(home));
     let fallback = || match (host.is_local(), opened) {

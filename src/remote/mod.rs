@@ -37,9 +37,10 @@ use crate::agent::sink::Sink as AgentSink;
 use crate::agent::spawn::AgentSpawnRequest;
 use crate::config::RemoteTarget;
 
-// The agent seam's items are for `agents-profiles` group 5's `Agent`
-// entity, which is not in this build yet: the client's own tests cover the
-// sessions behind them.
+// The agent seam's items are for the `Agent` entity (`src/agent/mod.rs`),
+// which nothing opens until `agents-profiles` group 6 puts agent zones in
+// the workspace: until then the client's own tests and the entity's cover
+// them, and these allows go with group 6.
 
 /// What an agent zone's session starts from ([`agent_link`]).
 #[allow(dead_code)]

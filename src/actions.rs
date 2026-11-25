@@ -94,6 +94,24 @@ actions!(
         SettingsDuplicate,
         SettingsMoveUp,
         SettingsMoveDown,
+        // An agent zone's (`AgentView`), available only while one has
+        // focus.
+        /// Sends the prompt input's text, as enter does.
+        AgentSubmit,
+        /// Stops the agent's running turn, as escape does.
+        AgentCancel,
+        /// Removes the queued prompt, or discards a held one.
+        AgentUnqueue,
+        /// Sends the held prompt again.
+        AgentResend,
+        /// Copies the queued prompt's text, waiting or held.
+        CopyQueuedPrompt,
+        /// Copies the agent's latest message.
+        CopyLastAgentMessage,
+        /// Opens every thought when one is closed, else closes them all.
+        ToggleAgentThoughts,
+        /// Scrolls the conversation to its end, which it then follows.
+        AgentScrollToBottom,
     ]
 );
 
@@ -168,6 +186,15 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("focus_zone_down", Some("Focus Zone Down"), || Box::new(FocusZoneDown)),
     ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
+    // An agent zone's: the palette lists them only while one has focus.
+    ("agent_submit", Some("Send Prompt"), || Box::new(AgentSubmit)),
+    ("agent_cancel", Some("Stop Agent Turn"), || Box::new(AgentCancel)),
+    ("agent_unqueue", Some("Remove Queued Prompt"), || Box::new(AgentUnqueue)),
+    ("agent_resend", Some("Send Held Prompt Again"), || Box::new(AgentResend)),
+    ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
+    ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
+    ("toggle_agent_thoughts", Some("Toggle Agent Thoughts"), || Box::new(ToggleAgentThoughts)),
+    ("agent_scroll_to_bottom", Some("Scroll Conversation to Bottom"), || Box::new(AgentScrollToBottom)),
     // The tab strip as a keyboard stop: unlabelled, for `--action` and user
     // bindings (its keys are the tab list's own).
     ("focus_tab_strip", None, || Box::new(FocusTabStrip)),
@@ -384,6 +411,7 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let l = Some("SettingsList");
     let sl = Some("SettingsSections");
     let f = Some("FindBar");
+    let a = Some("AgentZone");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -436,6 +464,13 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-right", FocusZoneRight, z),
         KeyBinding::new("alt-up", FocusZoneUp, z),
         KeyBinding::new("alt-down", FocusZoneDown, z),
+        // An agent zone: escape stops the turn (the prompt input's own
+        // escape does while it shows the stop button, and passes it on
+        // otherwise), and the page keys scroll the conversation. Enter and
+        // shift-enter are the prompt input's and its text area's.
+        KeyBinding::new("escape", AgentCancel, a),
+        KeyBinding::new("shift-pageup", ScrollPageUp, a),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, a),
         // A palette's list keys and escape come from its command list
         // (`UiList`, `UiCommand`) and overlay (`UiLayer`). The host adds
         // the sessions palette's kill, and enter for a prompt, which submits
