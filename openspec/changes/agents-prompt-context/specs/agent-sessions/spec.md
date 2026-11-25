@@ -31,7 +31,7 @@ The server SHALL keep a text attachment's text in a file of its own, in a direct
 - **THEN** its directory is accessible to the user alone, and its file can't be written
 
 ### Requirement: Where attached text is kept
-The directory that keeps attached text SHALL be under the user's cache directory on the agent's host: `$BRINDLE_CACHE_DIR` when set, else `$XDG_CACHE_HOME/brindle`, else `~/.cache/brindle`, and on Windows `%LOCALAPPDATA%\brindle\cache`. It SHALL NOT be the terminal server's own directory, so kept text is on disk and is still there after a reboot.
+The directory that keeps attached text SHALL be the attachments directory the session was started with, when it was given one, else `attachments` under the user's cache directory on the agent's host: `$BRINDLE_CACHE_DIR` when set, else `$XDG_CACHE_HOME/brindle`, else `~/.cache/brindle`, and on Windows `%LOCALAPPDATA%\brindle\cache`. It SHALL NOT be the terminal server's own directory, so kept text is on disk and is still there after a reboot.
 
 #### Scenario: The default place
 - **WHEN** neither `BRINDLE_CACHE_DIR` nor `XDG_CACHE_HOME` is set and a text attachment is kept for a user whose home is `/home/u`
@@ -40,6 +40,21 @@ The directory that keeps attached text SHALL be under the user's cache directory
 #### Scenario: Named by the environment
 - **WHEN** the terminal server was started with `BRINDLE_CACHE_DIR=/tmp/case-7`
 - **THEN** kept text is written under `/tmp/case-7/attachments/`, and nothing is written under the user's own cache directory
+
+#### Scenario: Named when the session started
+- **WHEN** a client starts an agent session with the attachments directory `/data/brindle` and attaches a text
+- **THEN** its file is under `/data/brindle/`, whatever `BRINDLE_CACHE_DIR` says
+
+### Requirement: An attachments directory must be private
+The server SHALL make a missing attachments directory, accessible to the user alone, and SHALL check an existing one as it checks its own directory: not a link, the user's own, and writable by no one else. It SHALL NOT keep text in a directory that fails, or in a path that isn't absolute: each attach SHALL be refused with an error naming the path and what is wrong with it.
+
+#### Scenario: Made when missing
+- **WHEN** a session's attachments directory doesn't exist and a client attaches a text
+- **THEN** the directory is made, accessible to the user alone, and the text is kept in it
+
+#### Scenario: Open to others
+- **WHEN** a session was started with an attachments directory that other users can write to, and a client attaches a text
+- **THEN** it gets an error naming the directory and saying others can write to it, and nothing is written
 
 ### Requirement: A client can read an attachment's text
 A client attached to an agent session SHALL be able to ask for a kept attachment's text by its id, and SHALL receive that text. A request for an id the session doesn't hold, or whose text is no longer kept, SHALL be refused with an error saying so.
@@ -135,16 +150,24 @@ While its session lives, the server SHALL remove a kept text when its queued or 
 - **WHEN** a held prompt's kept text has been deleted from the directory, and a client sends the prompt again
 - **THEN** the agent receives the prompt without that attachment, and the conversation gets a notice naming it
 
-### Requirement: Kept text outlasts its session by a week
-When an agent session ends, the text kept for it SHALL stay for 7 days, so that a link the agent was given still leads to its file if the conversation is taken up again, and SHALL then be removed. The server SHALL remove such directories when it starts and whenever a session ends, and SHALL NOT remove the directory of a session that is still live, however old its files.
+### Requirement: Kept text outlasts its session
+When an agent session ends, the text kept for it SHALL stay for the number of days the session was started with, 14 when it was given none, so that a link the agent was given still leads to its file if the conversation is taken up again, and SHALL then be removed. A session started with 0 days SHALL have its kept text removed when it ends. The server SHALL NOT remove the directory of a session that is still live, however old its files.
 
 #### Scenario: Still there after the session
 - **WHEN** an agent session with a kept attachment is closed, and its directory is looked at an hour later
 - **THEN** the attachment's file is still there
 
-#### Scenario: Gone after a week
-- **WHEN** a session ended 8 days ago, and the terminal server starts
+#### Scenario: Gone after its time
+- **WHEN** a session started with no keep time ended 15 days ago, and the terminal server starts
 - **THEN** that session's attachment directory is removed
+
+#### Scenario: A shorter time
+- **WHEN** a session started with a keep time of 2 days ended 3 days ago, and another session using the same attachments directory ends
+- **THEN** the first session's attachment directory is removed
+
+#### Scenario: Zero days
+- **WHEN** a session started with a keep time of 0 days is closed
+- **THEN** its attachment directory is gone at once
 
 #### Scenario: A long-lived session
 - **WHEN** a live session's kept text is 30 days old and another session ends

@@ -16,7 +16,8 @@ In step 1 a prompt is plain text. To show an agent a compiler error the user cop
 - **Attached text is kept beside the conversation, not in it.** The terminal server writes each text attachment to a file under the user's cache directory (`~/.cache/brindle`), private to the user, on the agent's host, so it is on disk and outlives a reboot. The log, a queued prompt and the checkpoint hold only a reference (a name, a size, an id), so attachments never grow them. Brindle reads a text back when the user opens its row.
 - **The server sends them as ACP content.** A link becomes a resource link, which every agent must accept. Kept text of at most 64 KiB is embedded in the prompt for an agent that takes embedded context, so it is seen at once; larger text, and any text for an agent that doesn't, is sent as a link to the kept file. So no agent is left out.
 - **Attachments stay with their prompt:** in the queue slot while it waits or is held, across a quit, a core restart and an upgrade, and in the conversation, where the user's message lists them.
-- **Kept text goes when nothing refers to it:** with a discarded prompt and with a log entry the log's bound drops. After its session ends it stays 7 days, so a link the agent saved still works if the conversation is taken up again, and is then removed.
+- **Kept text goes when nothing refers to it:** with a discarded prompt and with a log entry the log's bound drops. After its session ends it stays 14 days by default, so a link the agent saved still works if the conversation is taken up again, and is then removed.
+- **Where and how long are settings.** `[agent] attachments_keep_days` sets the time, for every host. `[agent] attachments_dir` sets the directory for agents on this machine, and `attachments_dir` in a profile's `remote` table sets it for that host, since a path belongs to one machine.
 - **Bounds:** 8 attachments a prompt; 256 KiB a text attachment; 16 MiB kept a session. Longer command output keeps its end; a longer file keeps its start; the item says it was cut.
 - **Client protocol 4 is amended**, as for the rest of the series: two client messages (attach a text, read one back) and one server message are added, and `AGENT_PROMPT`, the user entry and the queue slot gain an optional list.
 
@@ -34,6 +35,8 @@ None.
 - `agent-zones`: new requirements for attachments in the prompt input and the conversation, attaching a file, dropping files, and sending a command's output to an agent.
 - `ui-components`: the prompt input's attachment row.
 - `command-line`: the dump's lines for attachments, and driving them.
+- `configuration`: `[agent]`'s `attachments_dir` and `attachments_keep_days`.
+- `profiles`: `attachments_dir` on a profile's remote.
 
 ## Impact
 
