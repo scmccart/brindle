@@ -757,7 +757,7 @@ fn a_new_core_gets_the_sessions_checkpoints_and_tails() {
 #[test]
 fn set_meta_replaces_what_the_next_core_gets() {
     let (dir, mut first, _) = holder("set-meta");
-    assert_eq!(h1::PROTOCOLS.max, 2, "SET_META is H1 version 2");
+    const { assert!(h1::PROTOCOLS.max >= 2, "SET_META is H1 version 2") };
     let mut request = programs::exits_after_a_line(1, 0);
     request.meta = meta().meta;
     first.spawn(request);
@@ -781,7 +781,7 @@ fn set_meta_replaces_what_the_next_core_gets() {
     let mut second = TestCore::connect_to(&dir);
     let adopted = second.hello(2);
     let welcome = adopted.welcome();
-    assert_eq!(welcome.protocol, 2);
+    assert_eq!(welcome.protocol, h1::PROTOCOLS.max);
     assert_eq!(welcome.sessions[0].meta, updated);
     second.input(1, programs::ENTER);
 }

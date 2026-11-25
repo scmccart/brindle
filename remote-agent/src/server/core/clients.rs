@@ -325,7 +325,27 @@ impl<L: EventLoop> Core<L> {
             ToCore::Status(request) => self.client_status(client, request.req),
             ToCore::Stop(request) => self.client_stop(client, request.req),
             ToCore::StepDown(request) => self.client_step_down(client, request.req),
+            // Agent sessions come with section 7 of `agents-sessions`; until
+            // then a client that sends one is told so.
+            ToCore::SpawnAgent(spawn) => self.no_agents(client, Some(spawn.req), None),
+            ToCore::AgentPrompt(prompt) => {
+                self.no_agents(client, Some(prompt.req), Some(prompt.session))
+            }
+            ToCore::AgentCancel(target) => self.no_agents(client, None, Some(target.session)),
+            ToCore::AgentPermission(answer) => {
+                self.no_agents(client, Some(answer.req), Some(answer.session))
+            }
+            ToCore::AgentUnqueue(request) | ToCore::AgentResend(request) => {
+                self.no_agents(client, Some(request.req), Some(request.session))
+            }
         }
+    }
+
+    fn no_agents(&mut self, client: Token, req: Option<u64>, session: Option<SessionId>) {
+        self.send_client(
+            client,
+            error(req, session, "this terminal server can't run agent sessions yet"),
+        );
     }
 
     /// Queues a message for a client. Past
@@ -469,6 +489,7 @@ pub(super) fn unsendable(message: &ToClient, failure: &io::Error) -> ToClient {
         ToClient::ServerStatus(m) => (Some(m.req), None),
         ToClient::Ok(m) => (Some(m.req), None),
         ToClient::Process(m) => (None, Some(m.session)),
+        ToClient::Transcript(m) => (None, Some(m.session)),
     };
     error(req, session, unsendable_text(message, failure))
 }
@@ -486,6 +507,7 @@ fn unsendable_text(message: &ToClient, failure: &io::Error) -> String {
         ToClient::ServerStatus(_) => "status",
         ToClient::Ok(_) => "answer",
         ToClient::Process(_) => "process info",
+        ToClient::Transcript(_) => "transcript",
     };
     format!("the terminal server couldn't send its {what}: {failure}")
 }

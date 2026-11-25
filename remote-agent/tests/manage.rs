@@ -335,8 +335,8 @@ fn status_shows_the_core_and_each_holder() {
     assert_eq!(status["running"], true);
     assert_eq!(status["core_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(status["core_build"], welcome.core_build.as_str());
-    assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 3 }));
-    assert_eq!(status["holder_protocols"], serde_json::json!({ "min": 1, "max": 2 }));
+    assert_eq!(status["protocols"], serde_json::json!({ "min": 1, "max": 4 }));
+    assert_eq!(status["holder_protocols"], serde_json::json!({ "min": 1, "max": 3 }));
     assert_eq!(status["pid"], client.core_pid());
     assert!(status["uptime_secs"].is_u64());
     // The test client and the command's own connection.
@@ -347,7 +347,7 @@ fn status_shows_the_core_and_each_holder() {
         serde_json::json!([{
             "pid": holder,
             "build": welcome.core_build,
-            "protocol": 2,
+            "protocol": 3,
             "sessions": 1,
             "draining": false,
         }])

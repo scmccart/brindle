@@ -841,6 +841,7 @@ mod tests {
                             exit: None,
                             meta: meta.to_value(),
                             truncated: false,
+                            mode: h1::SpawnMode::Pty,
                         }],
                     })
                     .encode(),

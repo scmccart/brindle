@@ -339,6 +339,7 @@ impl Session {
                 .detached_since()
                 .map_or(0, |since| now.saturating_duration_since(since).as_secs()),
             layout: self.meta.layout.clone().filter(|_| detached),
+            agent: None,
         }
     }
 
@@ -1487,7 +1488,7 @@ mod tests {
             ..SessionMeta::default()
         };
         let meta = meta.to_value();
-        HeldSession { session: 3, pid: 42, cols: 80, rows: 24, exit: None, meta, truncated }
+        HeldSession { session: 3, pid: 42, cols: 80, rows: 24, exit: None, meta, truncated, mode: h1::SpawnMode::Pty }
     }
 
     #[test]
@@ -1771,6 +1772,7 @@ mod tests {
                 owned: true,
                 detached_secs: 5,
                 layout: Some(layout),
+                agent: None,
             }
         );
 

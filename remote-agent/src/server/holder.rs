@@ -844,6 +844,12 @@ impl<L: EventLoop> Holder<L> {
                     session.held.meta = update.meta;
                 }
             }
+            // Pipe sessions come with section 5 of `agents-sessions` (the
+            // platform seam is declared, `platform::piped`, and refuses).
+            ToHolder::SpawnPipes(spawn) => self.send(ToCore::SpawnFailed(SpawnFailed {
+                session: spawn.session,
+                message: "this holder can't run programs on pipes yet".into(),
+            })),
         }
     }
 
@@ -921,6 +927,7 @@ impl<L: EventLoop> Holder<L> {
                     exit: None,
                     meta: spawn.meta,
                     truncated: false,
+                    mode: h1::SpawnMode::Pty,
                 },
                 program,
                 pty: Some(pty),
@@ -1373,6 +1380,7 @@ fn unit_of(message: &ToHolder) -> Unit {
         }
         ToHolder::Reparent(reparent) => Unit::Session(reparent.session),
         ToHolder::SetMeta(update) => Unit::Session(update.session),
+        ToHolder::SpawnPipes(spawn) => Unit::Spawn(spawn.session),
         ToHolder::CheckpointBegin(begin) => Unit::Checkpoint(begin.session),
         ToHolder::CheckpointChunk(chunk) => Unit::Checkpoint(chunk.session),
         ToHolder::CheckpointEnd(end) => Unit::Checkpoint(end.session),
@@ -1397,6 +1405,7 @@ fn name_of(message: &ToHolder) -> &'static str {
         ToHolder::Pause(_) => "PAUSE",
         ToHolder::Resume(_) => "RESUME",
         ToHolder::SetMeta(_) => "SET_META",
+        ToHolder::SpawnPipes(_) => "SPAWN_PIPES",
     }
 }
 

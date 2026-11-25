@@ -310,9 +310,9 @@ fn a_failing_check_leaves_the_core_running_with_the_reason_in_its_log() {
         .welcome
         .unwrap()
         .holder_protocols;
-    assert_eq!(in_use, [2]);
+    assert_eq!(in_use, [3]);
 
-    let passed = cli(&dir.path, &["check", "--holder-protocols", "1,2"]);
+    let passed = cli(&dir.path, &["check", "--holder-protocols", "1,2,3"]);
     assert!(passed.status.success(), "{passed:?}");
     assert!(passed.stdout.is_empty() && passed.stderr.is_empty());
 

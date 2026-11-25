@@ -1,6 +1,6 @@
 //! The terminal server's client protocol, between a client (Brindle, or the
 //! `brindle-remote` management commands) and the core. This is protocols 1
-//! to 3.
+//! to 4.
 //!
 //! Frames use the crate's header (`type: u8`, `len: u32 BE`). `DATA` is
 //! binary: a `u32` BE session id, then the bytes (input from the client,
@@ -25,16 +25,23 @@
 //! |   12 | `STEP_DOWN`     | client → core | `req`                                                          |
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
 //! |   14 | `SET_LAYOUT`    | client → core | `session, layout?` (protocol 3 only)                           |
+//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?` (protocol 4)  |
+//! |   16 | `AGENT_PROMPT`  | client → core | `req, session, text` (protocol 4)                              |
+//! |   17 | `AGENT_CANCEL`  | client → core | `session` (protocol 4)                                         |
+//! |   18 | `AGENT_PERMISSION` | client → core | `req, session, entry, option?` (protocol 4)                 |
+//! |   19 | `AGENT_UNQUEUE` | client → core | `req, session` (protocol 4)                                    |
+//! |   20 | `AGENT_RESEND`  | client → core | `req, session` (protocol 4)                                    |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
 //! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
 //! |   35 | `EXIT`          | core → client | `session, code?`                                               |
 //! |   36 | `REPLAY_START`  | core → client | `req?, session, pid`                                           |
 //! |   37 | `REPLAY_END`    | core → client | `session`                                                      |
-//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?, layout?}]` |
+//! |   38 | `SESSIONS`      | core → client | `req, sessions: [{session, pid, attached, command, cwd, policy, cols, rows, key?, title?, started?, profile?, owned?, detached_secs?, layout?, agent?}]` |
 //! |   39 | `SERVER_STATUS` | core → client | `req, core_version, core_build, protocols, holder_protocols, pid, uptime_secs, clients, holders` |
 //! |   40 | `OK`            | core → client | `req`                                                          |
 //! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
+//! |   42 | `TRANSCRIPT`    | core → client | `session, events: [object]` (protocol 4)                       |
 //!
 //! Exchanges:
 //! - `HELLO` → `WELCOME`, or `ERROR` naming both ranges ([`negotiate`]).
@@ -78,6 +85,33 @@
 //! leaves its last one. The core refuses it with an `ERROR` naming the session
 //! on a connection below 3, from a client without the session attached, or for
 //! a session it doesn't have. Nothing else differs from protocol 2.
+//!
+//! Protocol 4 adds agent sessions: an ACP agent the core runs on plain pipes
+//! and speaks ACP to, whose conversation clients see as transcript events.
+//! The new messages are sent only on connections that negotiated 4:
+//! - `SPAWN_AGENT` → `SPAWNED` or `ERROR` starts one; `command` is required
+//!   to be non-empty (the core refuses an empty one), there is no grid.
+//! - `AGENT_PROMPT`, `AGENT_PERMISSION` (`entry` is the permission request's
+//!   entry id; no `option` answers it cancelled), `AGENT_UNQUEUE` (discards
+//!   the queue slot's prompt) and `AGENT_RESEND` (sends a held prompt again)
+//!   → `OK` or `ERROR`; `AGENT_CANCEL` has no reply, and a refused one gets
+//!   an `ERROR` with its `session`. Only the client that has the session
+//!   attached may send them. Whether a prompt was sent or queued, the client
+//!   learns from the events, not the reply.
+//! - `TRANSCRIPT` carries a session's transcript events, each a JSON object
+//!   this crate doesn't read: `brindle-transcript` encodes and decodes them
+//!   on both sides. It is checked only to be an array of objects, and a
+//!   frame holds whole events ([`pack_transcript`]). `ATTACH` of an agent
+//!   session is answered with `REPLAY_START`, `TRANSCRIPT`…, `REPLAY_END`,
+//!   then live `TRANSCRIPT`s; its `cols` and `rows` are ignored.
+//! - `SessionInfo.agent` (`activity`, `name?`) is set for agent sessions,
+//!   which only protocol 4 lists, with size 0×0; it is left out otherwise.
+//!   [`AgentActivity`] is this crate's own closed enum, in program status's
+//!   names.
+//!
+//! A client below 4 isn't shown agent sessions, and is refused an `ATTACH`
+//! of one with an `ERROR` naming the session. Nothing else differs from
+//! protocol 3.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -90,7 +124,7 @@ use crate::wire::{self, RequestId, SessionId};
 pub use crate::version::{NegotiationError, VersionRange, negotiate};
 
 /// The client protocol versions this build speaks.
-pub const PROTOCOLS: VersionRange = VersionRange::new(1, 3);
+pub const PROTOCOLS: VersionRange = VersionRange::new(1, 4);
 
 pub const MSG_DATA: u8 = 1;
 pub const MSG_HELLO: u8 = 2;
@@ -107,6 +141,18 @@ pub const MSG_STEP_DOWN: u8 = 12;
 pub const MSG_REPARENT: u8 = 13;
 /// Protocol 3.
 pub const MSG_SET_LAYOUT: u8 = 14;
+/// Protocol 4.
+pub const MSG_SPAWN_AGENT: u8 = 15;
+/// Protocol 4.
+pub const MSG_AGENT_PROMPT: u8 = 16;
+/// Protocol 4.
+pub const MSG_AGENT_CANCEL: u8 = 17;
+/// Protocol 4.
+pub const MSG_AGENT_PERMISSION: u8 = 18;
+/// Protocol 4.
+pub const MSG_AGENT_UNQUEUE: u8 = 19;
+/// Protocol 4.
+pub const MSG_AGENT_RESEND: u8 = 20;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_ERROR: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -118,6 +164,8 @@ pub const MSG_SERVER_STATUS: u8 = 39;
 pub const MSG_OK: u8 = 40;
 /// Protocol 2.
 pub const MSG_PROCESS: u8 = 41;
+/// Protocol 4.
+pub const MSG_TRANSCRIPT: u8 = 42;
 
 /// Bytes for one session: input from the client, output from the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,6 +404,153 @@ pub struct SessionInfo {
     /// none while attached.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<serde_json::Value>,
+    /// Set for an agent session (protocol 4), which is listed with size 0×0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentInfo>,
+}
+
+/// What the session list says about an agent session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub activity: AgentActivity,
+    /// The name the agent gave in `initialize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// What an agent session is doing, in program status's names: `working`
+/// while starting or in a turn, `blocked` on a permission request, `done`
+/// after a turn that ended with `end_turn`, `idle` with no turn or after a
+/// cancelled one, `error` when the agent or its turn stopped otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentActivity {
+    Idle,
+    Working,
+    Blocked,
+    Done,
+    Error,
+}
+
+/// `SPAWN_AGENT` (protocol 4): an ACP agent run on plain pipes, with no
+/// grid. The core refuses an empty `command`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnAgent {
+    pub req: RequestId,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The agent's complete environment; the server adds nothing.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub policy: Policy,
+    /// The client's name for what started the session (a profile).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+/// `AGENT_PROMPT` (protocol 4): plain text for the agent, sent now or
+/// queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPrompt {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub text: String,
+}
+
+/// `AGENT_PERMISSION` (protocol 4): the answer to the permission request in
+/// entry `entry`, the option chosen, or none to answer it cancelled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPermission {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub entry: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<String>,
+}
+
+/// A request about an agent session with nothing but its ids:
+/// `AGENT_UNQUEUE` and `AGENT_RESEND` (protocol 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRequest {
+    pub req: RequestId,
+    pub session: SessionId,
+}
+
+/// `TRANSCRIPT` (protocol 4): a session's transcript events, each a JSON
+/// object `brindle-transcript` gives meaning to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Transcript {
+    pub session: SessionId,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+}
+
+impl Transcript {
+    /// Refuses events that aren't JSON objects.
+    fn check(&self) -> io::Result<()> {
+        match self.events.iter().position(|event| !event.is_object()) {
+            None => Ok(()),
+            Some(index) => Err(wire::invalid(format!(
+                "TRANSCRIPT event {index} of session {} isn't a JSON object",
+                self.session
+            ))),
+        }
+    }
+}
+
+/// The `TRANSCRIPT` messages that carry `events` for `session` in order,
+/// each holding whole events and fitting one frame. An event that can't fit
+/// a frame on its own is an `InvalidInput` error, as is one that isn't a
+/// JSON object.
+pub fn pack_transcript(
+    session: SessionId,
+    events: Vec<serde_json::Value>,
+) -> io::Result<Vec<Transcript>> {
+    // `{"session":4294967295,"events":[]}`, the longest session id's; each
+    // event after the first adds a comma.
+    const ENVELOPE: usize = 34;
+    let mut messages = Vec::new();
+    let mut current = Vec::new();
+    let mut size = ENVELOPE;
+    for (index, event) in events.into_iter().enumerate() {
+        if !event.is_object() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("transcript event {index} of session {session} isn't a JSON object"),
+            ));
+        }
+        let len = serde_json::to_vec(&event).map_or(usize::MAX, |bytes| bytes.len());
+        if ENVELOPE.saturating_add(len) > crate::MAX_FRAME_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "transcript event {index} of session {session} is {len} bytes, past a frame's {}",
+                    crate::MAX_FRAME_PAYLOAD_SIZE
+                ),
+            ));
+        }
+        if !current.is_empty() && size + 1 + len > crate::MAX_FRAME_PAYLOAD_SIZE {
+            messages.push(Transcript {
+                session,
+                events: std::mem::take(&mut current),
+            });
+            size = ENVELOPE;
+        }
+        size += len + usize::from(!current.is_empty());
+        current.push(event);
+    }
+    if !current.is_empty() {
+        messages.push(Transcript {
+            session,
+            events: current,
+        });
+    }
+    Ok(messages)
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -441,6 +636,18 @@ pub enum ToCore {
     Reparent(Reparent),
     /// Protocol 3.
     SetLayout(SetLayout),
+    /// Protocol 4.
+    SpawnAgent(SpawnAgent),
+    /// Protocol 4.
+    AgentPrompt(AgentPrompt),
+    /// Protocol 4: cancel the running turn.
+    AgentCancel(SessionRef),
+    /// Protocol 4.
+    AgentPermission(AgentPermission),
+    /// Protocol 4: discard the queue slot's prompt.
+    AgentUnqueue(AgentRequest),
+    /// Protocol 4: send a held prompt again.
+    AgentResend(AgentRequest),
 }
 
 impl ToCore {
@@ -460,6 +667,12 @@ impl ToCore {
             Self::StepDown(m) => wire::json(MSG_STEP_DOWN, m),
             Self::Reparent(m) => wire::json(MSG_REPARENT, m),
             Self::SetLayout(m) => wire::json(MSG_SET_LAYOUT, m),
+            Self::SpawnAgent(m) => wire::json(MSG_SPAWN_AGENT, m),
+            Self::AgentPrompt(m) => wire::json(MSG_AGENT_PROMPT, m),
+            Self::AgentCancel(m) => wire::json(MSG_AGENT_CANCEL, m),
+            Self::AgentPermission(m) => wire::json(MSG_AGENT_PERMISSION, m),
+            Self::AgentUnqueue(m) => wire::json(MSG_AGENT_UNQUEUE, m),
+            Self::AgentResend(m) => wire::json(MSG_AGENT_RESEND, m),
         }
     }
 
@@ -479,6 +692,14 @@ impl ToCore {
             MSG_STEP_DOWN => Self::StepDown(wire::from_json("STEP_DOWN", frame)?),
             MSG_REPARENT => Self::Reparent(wire::from_json("REPARENT", frame)?),
             MSG_SET_LAYOUT => Self::SetLayout(wire::from_json("SET_LAYOUT", frame)?),
+            MSG_SPAWN_AGENT => Self::SpawnAgent(wire::from_json("SPAWN_AGENT", frame)?),
+            MSG_AGENT_PROMPT => Self::AgentPrompt(wire::from_json("AGENT_PROMPT", frame)?),
+            MSG_AGENT_CANCEL => Self::AgentCancel(wire::from_json("AGENT_CANCEL", frame)?),
+            MSG_AGENT_PERMISSION => {
+                Self::AgentPermission(wire::from_json("AGENT_PERMISSION", frame)?)
+            }
+            MSG_AGENT_UNQUEUE => Self::AgentUnqueue(wire::from_json("AGENT_UNQUEUE", frame)?),
+            MSG_AGENT_RESEND => Self::AgentResend(wire::from_json("AGENT_RESEND", frame)?),
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -500,6 +721,9 @@ pub enum ToClient {
     Ok(Request),
     /// Protocol 2, and only when the client's `HELLO` asked for it.
     Process(Process),
+    /// Protocol 4: an agent session's transcript events, live or within a
+    /// replay.
+    Transcript(Transcript),
 }
 
 impl ToClient {
@@ -516,6 +740,11 @@ impl ToClient {
             Self::ServerStatus(m) => wire::json(MSG_SERVER_STATUS, m),
             Self::Ok(m) => wire::json(MSG_OK, m),
             Self::Process(m) => wire::json(MSG_PROCESS, m),
+            Self::Transcript(m) => {
+                m.check()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                wire::json(MSG_TRANSCRIPT, m)
+            }
         }
     }
 
@@ -532,6 +761,11 @@ impl ToClient {
             MSG_SERVER_STATUS => Self::ServerStatus(wire::from_json("SERVER_STATUS", frame)?),
             MSG_OK => Self::Ok(wire::from_json("OK", frame)?),
             MSG_PROCESS => Self::Process(wire::from_json("PROCESS", frame)?),
+            MSG_TRANSCRIPT => {
+                let transcript: Transcript = wire::from_json("TRANSCRIPT", frame)?;
+                transcript.check()?;
+                Self::Transcript(transcript)
+            }
             other => return Err(wire::unknown_type("core-to-client", other)),
         })
     }
@@ -644,6 +878,41 @@ pub(crate) mod samples {
                 session: 8,
                 layout: None,
             }),
+            ToCore::SpawnAgent(SpawnAgent {
+                req: 9,
+                command: "npx".into(),
+                args: vec!["@agentclientprotocol/claude-agent-acp".into()],
+                cwd: Some("~/src".into()),
+                env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                policy: Policy::Detach,
+                profile: Some("Claude".into()),
+            }),
+            ToCore::AgentPrompt(AgentPrompt {
+                req: 10,
+                session: 9,
+                text: "Write notes.md\n".into(),
+            }),
+            ToCore::AgentCancel(SessionRef { session: 9 }),
+            ToCore::AgentPermission(AgentPermission {
+                req: 11,
+                session: 9,
+                entry: 4,
+                option: Some("allow-once".into()),
+            }),
+            ToCore::AgentPermission(AgentPermission {
+                req: 12,
+                session: 9,
+                entry: 5,
+                option: None,
+            }),
+            ToCore::AgentUnqueue(AgentRequest {
+                req: 13,
+                session: 9,
+            }),
+            ToCore::AgentResend(AgentRequest {
+                req: 14,
+                session: 9,
+            }),
         ]
     }
 
@@ -715,7 +984,34 @@ pub(crate) mod samples {
                     owned: true,
                     detached_secs: 42,
                     layout: Some(serde_json::json!({"v": 1, "zones": {"key": "k3"}})),
+                    agent: None,
                 }],
+            }),
+            ToClient::Sessions(Sessions {
+                req: 4,
+                sessions: vec![SessionInfo {
+                    session: 9,
+                    pid: 5009,
+                    command: "npx @agentclientprotocol/claude-agent-acp".into(),
+                    cwd: Some("/home/u/src".into()),
+                    policy: Policy::Detach,
+                    agent: Some(AgentInfo {
+                        activity: AgentActivity::Blocked,
+                        name: Some("claude-agent-acp".into()),
+                    }),
+                    ..Default::default()
+                }],
+            }),
+            ToClient::Transcript(Transcript {
+                session: 9,
+                events: vec![
+                    serde_json::json!({"event": "added", "id": 1, "entry": {"type": "user", "text": "hi"}}),
+                    serde_json::json!({"event": "turn", "state": {"turn": "working"}}),
+                ],
+            }),
+            ToClient::Transcript(Transcript {
+                session: 9,
+                events: Vec::new(),
             }),
             ToClient::ServerStatus(ServerStatus {
                 req: 6,
@@ -770,7 +1066,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_DATA..=MSG_SET_LAYOUT {
+        for expected in MSG_DATA..=MSG_AGENT_RESEND {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -784,7 +1080,7 @@ mod tests {
             assert_eq!(&ToClient::decode(&frame).unwrap(), message);
         }
         assert!(types.contains(&MSG_DATA));
-        for expected in MSG_WELCOME..=MSG_PROCESS {
+        for expected in MSG_WELCOME..=MSG_TRANSCRIPT {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -911,12 +1207,12 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, 14, 31, MSG_WELCOME, MSG_OK, MSG_PROCESS, 42, 255] {
+        for msg_type in [0, 21, 31, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             let error = ToCore::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-        for msg_type in [0, MSG_HELLO, MSG_REPARENT, 31, 42, 255] {
+        for msg_type in [0, MSG_HELLO, MSG_REPARENT, MSG_SPAWN_AGENT, MSG_AGENT_RESEND, 31, 43, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             assert!(ToClient::decode(&frame).is_err());
         }
@@ -934,9 +1230,10 @@ mod tests {
         assert_eq!(answer_hello(&hello(1, 2), PROTOCOLS), Ok(2));
         assert_eq!(answer_hello(&hello(1, 4), VersionRange::new(1, 3)), Ok(3));
         assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(3));
-        let error = answer_hello(&hello(4, 5), PROTOCOLS).unwrap_err();
-        assert!(error.message.contains("4–5"), "{}", error.message);
-        assert!(error.message.contains("supported 1–3"), "{}", error.message);
+        assert_eq!(answer_hello(&hello(1, 4), PROTOCOLS), Ok(4));
+        let error = answer_hello(&hello(5, 6), PROTOCOLS).unwrap_err();
+        assert!(error.message.contains("5–6"), "{}", error.message);
+        assert!(error.message.contains("supported 1–4"), "{}", error.message);
         assert_eq!(error.req, None);
         // A core that still speaks only protocol 1 refuses a client that
         // speaks only 2.
@@ -949,13 +1246,161 @@ mod tests {
     #[test]
     fn a_protocol_3_client_and_a_protocol_2_core_agree_on_2() {
         let client = Hello {
-            min: PROTOCOLS.min,
-            max: PROTOCOLS.max,
+            min: 1,
+            max: 3,
             client_token: "t".into(),
             ..Default::default()
         };
         assert_eq!(answer_hello(&client, VersionRange::new(1, 2)), Ok(2));
         assert_eq!(answer_hello(&client, PROTOCOLS), Ok(3));
+    }
+
+    /// A client that speaks 1–4 and a core of the previous release (1–3)
+    /// agree on 3: the client then starts no agent session.
+    #[test]
+    fn a_protocol_4_client_and_a_protocol_3_core_agree_on_3() {
+        let client = Hello {
+            min: PROTOCOLS.min,
+            max: PROTOCOLS.max,
+            client_token: "t".into(),
+            ..Default::default()
+        };
+        assert_eq!(answer_hello(&client, VersionRange::new(1, 3)), Ok(3));
+        assert_eq!(answer_hello(&client, PROTOCOLS), Ok(4));
+    }
+
+    #[test]
+    fn agent_messages_use_the_documented_field_names() {
+        let frame = ToCore::AgentPermission(AgentPermission {
+            req: 3,
+            session: 2,
+            entry: 7,
+            option: None,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.payload, br#"{"req":3,"session":2,"entry":7}"#);
+        let frame = ToCore::SpawnAgent(SpawnAgent {
+            req: 1,
+            command: "agent".into(),
+            ..Default::default()
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame.payload,
+            br#"{"req":1,"command":"agent","args":[],"cwd":null,"env":{},"policy":"kill"}"#
+        );
+        // A SPAWN_AGENT without a command decodes, for the core to refuse
+        // with a reason.
+        let frame = Frame::new(MSG_SPAWN_AGENT, br#"{"req":1}"#.to_vec()).unwrap();
+        let ToCore::SpawnAgent(spawn) = ToCore::decode(&frame).unwrap() else {
+            panic!("not SPAWN_AGENT");
+        };
+        assert_eq!(spawn.command, "");
+        for (activity, name) in [
+            (AgentActivity::Idle, "idle"),
+            (AgentActivity::Working, "working"),
+            (AgentActivity::Blocked, "blocked"),
+            (AgentActivity::Done, "done"),
+            (AgentActivity::Error, "error"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&activity).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_list_without_agents_encodes_as_before() {
+        let info = SessionInfo {
+            session: 1,
+            pid: 2,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("agent"), "{json}");
+        let info = SessionInfo {
+            agent: Some(AgentInfo {
+                activity: AgentActivity::Done,
+                name: None,
+            }),
+            ..info
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.ends_with(r#""agent":{"activity":"done"}}"#), "{json}");
+        let frame = Frame::new(
+            MSG_SESSIONS,
+            br#"{"req":1,"sessions":[{"session":1,"pid":2,"agent":{"activity":"asleep"}}]}"#.to_vec(),
+        )
+        .unwrap();
+        assert!(ToClient::decode(&frame).is_err(), "an unknown activity");
+    }
+
+    #[test]
+    fn transcript_events_must_be_objects() {
+        for payload in [
+            &br#"{"session":1,"events":[{"event":"turn"},7]}"#[..],
+            br#"{"session":1,"events":["added"]}"#,
+            br#"{"session":1,"events":[null]}"#,
+            br#"{"session":1,"events":{"event":"turn"}}"#,
+            br#"{"events":[]}"#,
+        ] {
+            let frame = Frame::new(MSG_TRANSCRIPT, payload.to_vec()).unwrap();
+            let error = ToClient::decode(&frame).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        }
+        let error = ToClient::Transcript(Transcript {
+            session: 1,
+            events: vec![serde_json::json!([1])],
+        })
+        .encode()
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        // What the crate doesn't read it keeps as sent.
+        let frame = Frame::new(
+            MSG_TRANSCRIPT,
+            br#"{"session":1,"events":[{"later":{"x":[1]}}]}"#.to_vec(),
+        )
+        .unwrap();
+        let ToClient::Transcript(transcript) = ToClient::decode(&frame).unwrap() else {
+            panic!("not TRANSCRIPT");
+        };
+        assert_eq!(transcript.events, [serde_json::json!({"later": {"x": [1]}})]);
+    }
+
+    #[test]
+    fn transcripts_are_packed_into_frames_of_whole_events() {
+        let event = |n: usize| serde_json::json!({"event": "appended", "id": n, "text": "x".repeat(200 * 1024)});
+        let events: Vec<serde_json::Value> = (0..12).map(event).collect();
+        let packed = pack_transcript(4, events.clone()).unwrap();
+        assert!(packed.len() > 1, "12 × 200 KiB needs several frames");
+        let mut unpacked = Vec::new();
+        for message in packed {
+            assert_eq!(message.session, 4);
+            assert!(!message.events.is_empty());
+            let frame = ToClient::Transcript(message.clone()).encode().unwrap();
+            assert!(frame.payload.len() <= crate::MAX_FRAME_PAYLOAD_SIZE);
+            unpacked.extend(message.events);
+        }
+        assert_eq!(unpacked, events);
+        assert!(pack_transcript(4, Vec::new()).unwrap().is_empty());
+        // An event as large as a frame, or not an object, can't be sent.
+        let huge = serde_json::json!({"text": "x".repeat(crate::MAX_FRAME_PAYLOAD_SIZE)});
+        assert_eq!(
+            pack_transcript(4, vec![huge]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            pack_transcript(4, vec![serde_json::json!("turn")]).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // The largest event that fits a frame on its own does.
+        let fill = crate::MAX_FRAME_PAYLOAD_SIZE - br#"{"session":4294967295,"events":[{"t":""}]}"#.len();
+        let largest = serde_json::json!({"t": "x".repeat(fill)});
+        let packed = pack_transcript(u32::MAX, vec![largest]).unwrap();
+        assert!(ToClient::Transcript(packed[0].clone()).encode().is_ok());
     }
 
     #[test]

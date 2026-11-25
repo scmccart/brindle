@@ -1790,6 +1790,11 @@ impl Connection {
                 }
             }
             ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
+            // Only a protocol 4 core sends one, and Brindle offers 1 to 3
+            // (`BRINDLE_PROTOCOLS`).
+            ToClient::Transcript(transcript) => {
+                log::debug!("terminal server: a transcript for session {} dropped", transcript.session);
+            }
         }
     }
 
@@ -2447,7 +2452,13 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         ToCore::Detach(detach) => Some((detach.session, "detach")),
         ToCore::Reparent(reparent) => Some((reparent.session, "window")),
         ToCore::SetLayout(layout) => Some((layout.session, "layout")),
-        ToCore::Hello(_)
+        ToCore::AgentCancel(cancel) => Some((cancel.session, "cancel")),
+        ToCore::SpawnAgent(_)
+        | ToCore::AgentPrompt(_)
+        | ToCore::AgentPermission(_)
+        | ToCore::AgentUnqueue(_)
+        | ToCore::AgentResend(_)
+        | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
         | ToCore::List(_)

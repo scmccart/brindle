@@ -420,6 +420,13 @@ impl<L: EventLoop> Core<L> {
             ToCore::TailEnd(end) => self.blob(token, Blob::Tail, |assembler| {
                 assembler.end(end).map(|bytes| Some((end.session, bytes)))
             }),
+            // Only a pipe session has one, and this core starts none yet
+            // (section 7 of `agents-sessions`).
+            ToCore::StderrTail(tail) => log!(
+                "holder {token}: session {}'s stderr tail ({} bytes) ignored",
+                tail.session,
+                tail.bytes.len()
+            ),
         }
     }
 
@@ -741,6 +748,10 @@ pub(super) fn unsent(message: &ToHolder, error: &io::Error) -> Unsent {
     };
     match message {
         ToHolder::Spawn(spawn) => Unsent::Spawn {
+            session: spawn.session,
+            why: format!("the terminal server couldn't pass the request to its holder: {error}"),
+        },
+        ToHolder::SpawnPipes(spawn) => Unsent::Spawn {
             session: spawn.session,
             why: format!("the terminal server couldn't pass the request to its holder: {error}"),
         },
