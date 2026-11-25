@@ -10,8 +10,10 @@
 //! - `daemon`: starting a role detached, and its ready signal;
 //! - `pty`: a session's PTY and program (spawn, I/O, resize, hang up, exit),
 //!   and for the core its foreground program (none on Windows);
-//! - `piped`: a session's program on plain pipes (`Piped`, its three
-//!   streams, and `spawn_piped`), sharing `pty`'s `Program` and `Group`;
+//! - `{unix,windows}/piped.rs`: a session's program on plain pipes
+//!   (`Piped`, its three streams, `PipeCommand` and `spawn_piped`,
+//!   re-exported at this module's top, since `piped` here names the
+//!   neutral module below), sharing `pty`'s `Program` and `Group`;
 //!   declared, and refusing, until `agents-sessions` section 5;
 //! - `dir`: finding and securing the server directory;
 //! - `sys`: the running binary and random numbers.
@@ -30,7 +32,11 @@
 //! - `pipe_state`: the Windows pipes' read and write buffers and their
 //!   readiness (`pipe`);
 //! - `wait`: a wait's timeout in whole milliseconds, never `INFINITE`
-//!   (the Windows `event_loop`, `pipe` and `listen`).
+//!   (the Windows `event_loop`, `pipe` and `listen`);
+//! - `piped`: a pipe session's Windows creation flags, handle list and job
+//!   limit, its program, command line and environment (through
+//!   `conpty::cmdline`) with the batch-file hint, and its hang-up steps
+//!   (both `piped`s).
 
 #[cfg_attr(
     windows,
@@ -59,6 +65,15 @@ mod pipe_state;
     allow(dead_code, reason = "only the Windows waits take milliseconds")
 )]
 mod wait;
+
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the pipe sessions that use it come with agents-sessions section 5"
+    )
+)]
+pub mod piped;
 
 #[cfg(unix)]
 mod unix;

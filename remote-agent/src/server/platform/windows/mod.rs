@@ -11,8 +11,12 @@ pub mod dir;
 pub mod event_loop;
 pub mod listen;
 pub mod lock;
+// Its items are the platform's (`platform::spawn_piped`); `platform::piped`
+// is the neutral module of what they decide.
 #[allow(dead_code, reason = "the pipe sessions that use it come with agents-sessions section 5")]
-pub mod piped;
+mod piped;
+#[allow(unused_imports, reason = "the pipe sessions that use it come with agents-sessions section 5")]
+pub use piped::{PipeCommand, Piped, spawn_piped};
 mod pipe;
 pub mod pty;
 pub mod sys;
