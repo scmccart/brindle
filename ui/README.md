@@ -320,12 +320,13 @@ rule, not a convenience.
     message or its last part, drawn only while the pointer is over the
     message.
   - `PromptInput` (an entity owning its `TextArea`): a queue row, the
-    `Textarea`, and a toolbar with a reason line (`set_reason`) and the
-    submit button, which reads the owner's `PromptStatus`: `Ready` an
+    `Textarea`, and a toolbar with a reason line (`set_reason`, then an
+    optional small outline action button, `set_action(Some(label))`) and
+    the submit button, which reads the owner's `PromptStatus`: `Ready` an
     `arrow-up` (disabled while the text is blank), `Submitted` a turning
     `loader-circle` (disabled), `Streaming` a `square` that asks to stop,
     `Disabled` the arrow disabled and the text read-only. It emits
-    `PromptInputEvent::{Submit(text), Stop, RemoveQueued, ResendQueued}`
+    `PromptInputEvent::{Submit(text), Stop, RemoveQueued, ResendQueued, Action}`
     and never changes its own text: the owner clears it
     (`set_text("")`) once a prompt is taken. The pure rules are
     `button_request`, `enter_submits`, `escape_stops` and `is_blank`. The
@@ -335,7 +336,8 @@ rule, not a convenience.
     destructive by default) with ghost `send` (send again, disabled with its
     `Resend::Unavailable` reason as the tooltip) and `x` (discard) for
     `Queued::Held`. Its focus stops for the owner's scope: the text area
-    (`Focusable`), the row's enabled buttons (`row_stops()`), and the stop
+    (`Focusable`), the reason line's action while it shows
+    (`action_stop()`), the row's enabled buttons (`row_stops()`), and the stop
     button while streaming (`stop_button()`); `focused(window, cx)` says
     which of them has focus (`PromptFocus`), for an owner that reports it.
   - `Reasoning`: a trigger (lucide `brain`, the owner's label, a chevron
@@ -867,6 +869,10 @@ code comes from there.
   tokens have no warning colour; it defaults to destructive.
 - **The queue row** has no AI Elements counterpart (an addition): a text
   queued apart from the draft, which none of its buttons touch.
+- **The reason line's action** has no AI Elements counterpart (an
+  addition): one labelled button after the reason, for what to do while
+  the input can't send (an agent zone's Continue conversation). It is a
+  focus stop right after the text area, so it is one Tab away.
 - **Reasoning's trigger is pointer-only** (AI Elements' is a button): a
   conversation holds many, and Tab through each would bury the prompt. The
   owner holds `open`; no auto-close timer.

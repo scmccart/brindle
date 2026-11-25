@@ -674,6 +674,7 @@ impl Gallery {
                     PromptInputEvent::Stop => "stop".to_string(),
                     PromptInputEvent::RemoveQueued => "remove".to_string(),
                     PromptInputEvent::ResendQueued => "resend".to_string(),
+                    PromptInputEvent::Action => "action".to_string(),
                 };
                 this.prompt_log.push(entry);
                 cx.notify();
@@ -1645,6 +1646,7 @@ impl Gallery {
             prompt.set_status(PromptStatus::Ready, cx);
             prompt.set_queued(None, cx);
             prompt.set_reason(None, cx);
+            prompt.set_action(None, cx);
         });
         let count = {
             let mut items = self.conversation_items.borrow_mut();
@@ -1803,11 +1805,13 @@ impl FocusStops for Gallery {
         stops.push(self.name.focus_handle(cx));
         stops.push(self.email.focus_handle(cx));
         stops.extend(named(&["checkbox", "switch", "toggle", "tabs-default", "tabs-plain", "tabs-strip"]));
-        // The AI elements, as an agent's zone orders them: the prompt, its
-        // queue row's buttons, the permission's while requested, and the
-        // stop button while streaming.
+        // The AI elements, as an agent's zone orders them: the prompt, the
+        // reason line's action while it shows, its queue row's buttons, the
+        // permission's while requested, and the stop button while
+        // streaming.
         let prompt = self.prompt.read(cx);
         stops.push(prompt.focus_handle(cx));
+        stops.extend(prompt.action_stop());
         stops.extend(prompt.row_stops());
         if self.permission == ConfirmationState::Requested {
             stops.extend(named(&["confirm-allow", "confirm-reject"]));
@@ -3016,6 +3020,8 @@ mod check {
         c.run_check("prompt-input-escape-and-the-stop-button-stop-while-streaming", check).await;
         let check = prompt_queue_row(&mut c).await;
         c.run_check("prompt-input-queue-row-buttons-are-stops-asking-the-owner", check).await;
+        let check = prompt_reason_action(&mut c).await;
+        c.run_check("prompt-input-reason-action-is-a-stop-asking-the-owner", check).await;
         let check = confirmation_space_on_reject(&mut c).await;
         c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
         let check = scroller_keeps_the_view_while_away(&mut c).await;
@@ -5542,6 +5548,37 @@ mod check {
         let (text, _, log) = prompt_state(c)?;
         ensure!(log == ["resend", "remove", "remove"], "the row's buttons asked {log:?}");
         ensure!(text == "draft", "the row changed the draft to {text:?}");
+        Ok(())
+    }
+
+    /// The spec's "Action after the reason", by keys: disabled with a reason
+    /// and an action, Tab from the text area reaches the action, enter and
+    /// space on it ask the owner, and the draft is untouched; taken away,
+    /// it is no stop.
+    async fn prompt_reason_action(c: &mut Checker) -> Check {
+        focus_prompt(c).await?;
+        type_text(c, "draft").await?;
+        c.with(|gallery, _, cx| {
+            gallery.prompt.update(cx, |prompt, cx| {
+                prompt.set_status(PromptStatus::Disabled, cx);
+                prompt.set_reason(Some("the agent has exited".into()), cx);
+                prompt.set_action(Some("Continue conversation".into()), cx);
+            })
+        })?;
+        c.tick().await;
+        let stop = c.with(|gallery, _, cx| gallery.prompt.read(cx).action_stop())?;
+        let Some(stop) = stop else { fail!("with an action, the prompt input has no action stop") };
+        c.key("tab").await?;
+        ensure!(c.focused(&stop)?, "Tab from the text area didn't reach the action");
+        c.key("enter").await?;
+        c.key("space").await?;
+        let (text, _, log) = prompt_state(c)?;
+        ensure!(log == ["action", "action"], "enter and space on the action asked {log:?}");
+        ensure!(text == "draft", "the action changed the draft to {text:?}");
+        c.with(|gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_action(None, cx)))?;
+        c.tick().await;
+        let stop = c.with(|gallery, _, cx| gallery.prompt.read(cx).action_stop())?;
+        ensure!(stop.is_none(), "the action taken away is still a stop");
         Ok(())
     }
 
