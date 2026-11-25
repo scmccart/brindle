@@ -22,8 +22,8 @@ Lands after `agents-session-recovery` (its `AGENT_RESTART` is used by the termin
 
 ## 4. The fake ACP agent
 
-- [ ] 4.1 `fake_acp/script.rs` and `main.rs`: `respond-to <id> <json>` and `respond-error-to <id> <code> <message> [<data>]`, answering an earlier request by its id (an `authenticate` after a `$/cancel_request` and a second `authenticate` were matched), with parser tests and a scripts-for-login test that parses a script using `authMethods`, `expect authenticate`, `expect $/cancel_request` and both new steps. Verify with `cargo test -p brindle-remote-agent --bin brindle-fake-acp-agent`.
-- [ ] 4.2 (terminal) `args <word…>` sections (the steps played when the agent's arguments after the script are exactly those words; steps before the first section play with none) and `record-env <path>` (writes the agent's environment, sorted, one `KEY=value` per line), with parser tests and a test of the section choice. Verify with `cargo test -p brindle-remote-agent --bin brindle-fake-acp-agent`.
+- [x] 4.1 `fake_acp/script.rs` and `main.rs`: `respond-to <id> <json>` and `respond-error-to <id> <code> <message> [<data>]`, answering an earlier request by its id (an `authenticate` after a `$/cancel_request` and a second `authenticate` were matched), with parser tests and a scripts-for-login test that parses a script using `authMethods`, `expect authenticate`, `expect $/cancel_request` and both new steps. Verify with `cargo test -p brindle-remote-agent --bin brindle-fake-acp-agent`.
+- [x] 4.2 (terminal) `args <word…>` sections (the steps played when the agent's arguments after the script are exactly those words; steps before the first section play with none) and `record-env <path>` (writes the agent's environment, sorted, one `KEY=value` per line), with parser tests and a test of the section choice. Verify with `cargo test -p brindle-remote-agent --bin brindle-fake-acp-agent`.
 
 ## 5. The terminal server
 

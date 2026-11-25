@@ -54,8 +54,16 @@ fn lines(reader: impl Read + Send + 'static) -> Receiver<String> {
 
 impl Agent {
     fn start(script: &Path) -> Self {
+        Self::start_with(script, &[], &[])
+    }
+
+    /// Started with `args` after the script and `env` added to its
+    /// environment.
+    fn start_with(script: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(FAKE_AGENT)
             .arg(script)
+            .args(args)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -219,6 +227,48 @@ fn fake_agent_refuses_a_bad_script_naming_its_line() {
     assert_eq!(
         agent.err(),
         format!("brindle-fake-acp-agent: {}: line 2: \"sleep\" isn't a step", path.display())
+    );
+}
+
+/// OpenSpec change `agents-login`, tasks 4.1 and 4.2: the arguments after
+/// the script choose its `args` section, `record-env` writes the agent's
+/// environment, and `respond-to` answers a request by its id.
+#[test]
+fn fake_agent_plays_the_section_its_arguments_name() {
+    let dir = TempDir::new("fake-agent-args");
+    let env_file = dir.path.join("env.txt");
+    let mut script = AgentScript::new(&dir.path, "args");
+    script
+        .step("exit 5")
+        .step("args login --device")
+        .step(format!("record-env {}", env_file.display()))
+        .step(r#"respond-to 3 {"loggedIn":true}"#)
+        .step(r#"respond-error-to "a" -32000 "not yet""#)
+        .step("exit 0");
+    let path = script.write();
+
+    let mut login = Agent::start_with(&path, &["login", "--device"], &[("LOGIN_MODE", "device")]);
+    assert_eq!(parsed(&login.out()), json!({"jsonrpc": "2.0", "id": 3, "result": {"loggedIn": true}}));
+    assert_eq!(
+        parsed(&login.out()),
+        json!({"jsonrpc": "2.0", "id": "a", "error": {"code": -32000, "message": "not yet"}})
+    );
+    assert_eq!(login.status(), Some(0));
+    let text = std::fs::read_to_string(&env_file).expect("the recorded environment");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.contains(&"LOGIN_MODE=device"), "{text}");
+    let mut sorted = lines.clone();
+    sorted.sort();
+    assert_eq!(lines, sorted);
+
+    // With no arguments, the steps before the first section.
+    assert_eq!(Agent::start(&path).status(), Some(5));
+    // Arguments no section is for are a usage error.
+    let mut other = Agent::start_with(&path, &["logout"], &[]);
+    assert_eq!(other.status(), Some(2));
+    assert_eq!(
+        other.err(),
+        format!("brindle-fake-acp-agent: {} has no args section for \"logout\"", path.display())
     );
 }
 

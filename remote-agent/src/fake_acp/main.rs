@@ -1,13 +1,18 @@
-//! `brindle-fake-acp-agent SCRIPT`: an ACP agent played from a script, for
-//! the terminal server's tests (OpenSpec change `agents-sessions`, design
-//! decision 16). It is built with the helper and never packaged.
+//! `brindle-fake-acp-agent SCRIPT [ARG…]`: an ACP agent played from a
+//! script, for the terminal server's tests (OpenSpec change
+//! `agents-sessions`, design decision 16). It is built with the helper and
+//! never packaged.
 //!
 //! The script's steps are [`script`]'s, read and checked whole before the
-//! first one runs. This is the thin loop that plays them: it reads JSON-RPC
-//! lines from stdin, writes lines to stdout and stderr, appends the messages
-//! an `expect` or `expect-response` matched to the `record` file, and waits
-//! for `wait-file` gates. A `respond` answers the last request an `expect`
-//! matched: a notification matched since doesn't change which.
+//! first one runs; the `ARG`s after the script choose its `args` section
+//! (none: the steps before the first section), and an `ARG` list no
+//! section is for is a usage error. This is the thin loop that plays them:
+//! it reads JSON-RPC lines from stdin, writes lines to stdout and stderr,
+//! appends the messages an `expect` or `expect-response` matched to the
+//! `record` file, writes its environment for `record-env`, and waits for
+//! `wait-file` gates. A `respond` answers the last request an `expect`
+//! matched: a notification matched since doesn't change which; a
+//! `respond-to` answers the request its id names.
 //!
 //! - **When the script runs out** without an `exit`, the agent idles as a
 //!   real one would: it reads (and drops) stdin until it closes, then exits
@@ -81,10 +86,12 @@ enum End {
 }
 
 fn main() -> ExitCode {
-    let Some(path) = std::env::args_os().nth(1) else {
-        eprintln!("usage: brindle-fake-acp-agent SCRIPT");
+    let mut args = std::env::args_os().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!("usage: brindle-fake-acp-agent SCRIPT [ARG…]");
         return ExitCode::from(2);
     };
+    let words: Vec<String> = args.map(|arg| arg.to_string_lossy().into_owned()).collect();
     let path = Path::new(&path);
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
@@ -96,14 +103,22 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let steps = match script::parse(&text) {
-        Ok(steps) => steps,
+    let script = match script::parse(&text) {
+        Ok(script) => script,
         Err(bad) => {
             eprintln!("brindle-fake-acp-agent: {}: {bad}", path.display());
             return ExitCode::from(2);
         }
     };
-    match play(&steps) {
+    let Some(steps) = script.steps_for(&words) else {
+        eprintln!(
+            "brindle-fake-acp-agent: {} has no args section for {:?}",
+            path.display(),
+            words.join(" ")
+        );
+        return ExitCode::from(2);
+    };
+    match play(steps) {
         Ok(End::Exit(code)) => std::process::exit(code),
         Ok(End::Idled) => ExitCode::SUCCESS,
         Err(fault) => {
@@ -167,6 +182,19 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
                 let text = script::error_line(id, *code, message, data.as_ref());
                 write_text(&mut output, &text)?;
             }
+            Step::RespondTo { id, result } => {
+                write_text(&mut output, &script::result_line(id, result))?;
+            }
+            Step::RespondErrorTo {
+                id,
+                code,
+                message,
+                data,
+            } => {
+                let text = script::error_line(id, *code, message, data.as_ref());
+                write_text(&mut output, &text)?;
+            }
+            Step::RecordEnv { path } => record_env(path)?,
             Step::Stderr { text } => {
                 let mut error = io::stderr().lock();
                 writeln!(error, "{text}")
@@ -240,6 +268,22 @@ fn answering(last: Option<&Last>) -> Result<&Value, Fault> {
     last.id.as_ref().ok_or_else(|| Fault::NoId {
         method: last.method.clone(),
     })
+}
+
+/// Writes the agent's environment to `path` ([`script::env_text`]), whole:
+/// through a file beside it renamed into place, so a reader never sees a
+/// part.
+fn record_env(path: &str) -> Result<(), Fault> {
+    let vars = std::env::vars_os().map(|(key, value)| {
+        (
+            key.to_string_lossy().into_owned(),
+            value.to_string_lossy().into_owned(),
+        )
+    });
+    let partial = format!("{path}.partial");
+    fs::write(&partial, script::env_text(vars))
+        .and_then(|()| fs::rename(&partial, path))
+        .map_err(Fault::io(format!("writing the environment to {path}")))
 }
 
 fn write_line(output: &mut impl Write, text: &str) -> Result<(), Fault> {

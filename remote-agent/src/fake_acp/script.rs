@@ -36,10 +36,24 @@
 //!   the message is one word, or a JSON string for one with spaces, and the
 //!   optional JSON after it is the error's `data` (a `-32022`'s
 //!   `{ requested, supported }`).
+//! - `respond-to <id> <json>`: answer the agent's earlier request `id` (a
+//!   JSON value: `3`, `"p1"`) with that `result`, whichever request an
+//!   `expect` matched last (OpenSpec change `agents-login`: a late answer
+//!   to an `authenticate` the client cancelled).
+//! - `respond-error-to <id> <code> <message> [<data>]`: answer request
+//!   `id` with an error, its arguments after the id as `respond-error`'s.
 //! - `stderr <text>`: write the text as a line to stderr.
 //! - `wait-file <path>`: wait until the file exists, a gate the test
 //!   creates (never a sleep).
+//! - `record-env <path>`: write the agent's environment to the file, one
+//!   `KEY=value` line per variable, sorted by name ([`env_text`]).
 //! - `exit <code>`: exit with that status.
+//! - `args <word…>`: the steps after it, up to the next `args`, are a
+//!   section played when the agent's arguments after the script are
+//!   exactly those words; the steps before the first `args` are played
+//!   when there are none ([`Script::steps_for`]). A terminal login runs
+//!   the agent's command with the login method's arguments, so one script
+//!   plays both the agent and its login program.
 //!
 //! [`parse`] reads a script whole, or says which line is wrong and why,
 //! and never panics; [`Received::parse`], [`result_line`] and
@@ -78,15 +92,56 @@ pub enum Step {
         message: String,
         data: Option<Value>,
     },
+    /// The answer to the agent's earlier request `id`.
+    RespondTo {
+        id: Value,
+        result: Value,
+    },
+    /// An error answering the agent's earlier request `id`.
+    RespondErrorTo {
+        id: Value,
+        code: i64,
+        message: String,
+        data: Option<Value>,
+    },
     Stderr {
         text: String,
     },
     WaitFile {
         path: String,
     },
+    RecordEnv {
+        path: String,
+    },
     Exit {
         code: i32,
     },
+}
+
+/// A parsed script: its sections, the first one (played with no
+/// arguments) always there, maybe empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Script {
+    sections: Vec<Section>,
+}
+
+/// The steps played when the agent's arguments after the script are
+/// exactly `args`.
+#[derive(Debug, Clone, PartialEq)]
+struct Section {
+    args: Vec<String>,
+    steps: Vec<Step>,
+}
+
+impl Script {
+    /// The steps to play for the agent's arguments after the script, or
+    /// `None` when no section is for them.
+    pub fn steps_for(&self, args: &[String]) -> Option<&[Step]> {
+        self.sections
+            .iter()
+            .find(|section| section.args == args)
+            .map(|section| section.steps.as_slice())
+    }
 }
 
 /// What is wrong with a script's line.
@@ -103,9 +158,11 @@ pub enum Problem {
     BadJson { step: &'static str, error: String },
     /// A code that isn't an integer of its range.
     BadCode { step: &'static str, text: String },
-    /// A `respond` or `respond-error` before any `expect`: there is no
-    /// request to answer.
+    /// A `respond` or `respond-error` before any `expect` of its section:
+    /// there is no request to answer.
     NoRequest { step: &'static str },
+    /// A second `args` section for the same words.
+    RepeatedSection { words: Vec<String> },
 }
 
 /// A script that doesn't parse: the line (from 1) and its problem.
@@ -129,13 +186,20 @@ impl fmt::Display for BadScript {
                     "{step} comes before any expect, so there is no request to answer"
                 )
             }
+            Problem::RepeatedSection { words } => {
+                write!(f, "a second args section for {:?}", words.join(" "))
+            }
         }
     }
 }
 
-/// The steps of `text`, in order.
-pub fn parse(text: &str) -> Result<Vec<Step>, BadScript> {
-    let mut steps = Vec::new();
+/// The script `text`: its steps in order, in their sections.
+pub fn parse(text: &str) -> Result<Script, BadScript> {
+    let mut sections = vec![Section {
+        args: Vec::new(),
+        steps: Vec::new(),
+    }];
+    // Whether the section so far has an `expect` a response can answer.
     let mut expected = false;
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim_start();
@@ -150,6 +214,24 @@ pub fn parse(text: &str) -> Result<Vec<Step>, BadScript> {
             Some((word, rest)) => (word, rest.trim()),
             None => (line.trim_end(), ""),
         };
+        if word == "args" {
+            let words: Vec<String> = rest.split_whitespace().map(str::to_owned).collect();
+            if words.is_empty() {
+                return Err(bad(Problem::Missing {
+                    step: "args",
+                    what: "a word",
+                }));
+            }
+            if sections.iter().any(|section| section.args == words) {
+                return Err(bad(Problem::RepeatedSection { words }));
+            }
+            sections.push(Section {
+                args: words,
+                steps: Vec::new(),
+            });
+            expected = false;
+            continue;
+        }
         let step = step(word, rest).map_err(bad)?;
         match &step {
             Step::Expect { .. } => expected = true,
@@ -167,13 +249,18 @@ pub fn parse(text: &str) -> Result<Vec<Step>, BadScript> {
             | Step::SendRaw { .. }
             | Step::Respond { .. }
             | Step::RespondError { .. }
+            | Step::RespondTo { .. }
+            | Step::RespondErrorTo { .. }
             | Step::Stderr { .. }
             | Step::WaitFile { .. }
+            | Step::RecordEnv { .. }
             | Step::Exit { .. } => {}
         }
-        steps.push(step);
+        if let Some(section) = sections.last_mut() {
+            section.steps.push(step);
+        }
     }
-    Ok(steps)
+    Ok(Script { sections })
 }
 
 /// The step `word` with its argument `rest` (trimmed).
@@ -209,12 +296,45 @@ fn step(word: &str, rest: &str) -> Result<Step, Problem> {
         "respond" => Step::Respond {
             result: json_value("respond", &needed("respond", "a JSON result")?)?,
         },
-        "respond-error" => respond_error(rest)?,
+        "respond-error" => {
+            let (code, message, data) = error_parts("respond-error", rest)?;
+            Step::RespondError {
+                code,
+                message,
+                data,
+            }
+        }
+        "respond-to" => {
+            let (id, rest) = request_id("respond-to", rest)?;
+            if rest.is_empty() {
+                return Err(Problem::Missing {
+                    step: "respond-to",
+                    what: "a JSON result",
+                });
+            }
+            Step::RespondTo {
+                id,
+                result: json_value("respond-to", rest)?,
+            }
+        }
+        "respond-error-to" => {
+            let (id, rest) = request_id("respond-error-to", rest)?;
+            let (code, message, data) = error_parts("respond-error-to", rest)?;
+            Step::RespondErrorTo {
+                id,
+                code,
+                message,
+                data,
+            }
+        }
         "stderr" => Step::Stderr {
             text: rest.to_owned(),
         },
         "wait-file" => Step::WaitFile {
             path: needed("wait-file", "a file")?,
+        },
+        "record-env" => Step::RecordEnv {
+            path: needed("record-env", "a file")?,
         },
         "exit" => {
             let text = needed("exit", "a status")?;
@@ -239,9 +359,31 @@ fn json_value(step: &'static str, text: &str) -> Result<Value, Problem> {
     })
 }
 
-/// `respond-error <code> <message> [<data>]`.
-fn respond_error(rest: &str) -> Result<Step, Problem> {
-    let step = "respond-error";
+/// The request id a `respond-to` or `respond-error-to` starts with (one
+/// JSON value), and the text after it.
+fn request_id<'a>(step: &'static str, rest: &'a str) -> Result<(Value, &'a str), Problem> {
+    let mut values = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+    let id = match values.next() {
+        Some(Ok(id)) => id,
+        Some(Err(error)) => {
+            return Err(Problem::BadJson {
+                step,
+                error: error.to_string(),
+            });
+        }
+        None => {
+            return Err(Problem::Missing {
+                step,
+                what: "a request id",
+            });
+        }
+    };
+    let after = rest.get(values.byte_offset()..).unwrap_or_default();
+    Ok((id, after.trim()))
+}
+
+/// An error answer's `<code> <message> [<data>]`, for `step`.
+fn error_parts(step: &'static str, rest: &str) -> Result<(i64, String, Option<Value>), Problem> {
     let (code, rest) = rest
         .split_once(char::is_whitespace)
         .map_or((rest, ""), |(code, rest)| (code, rest.trim_start()));
@@ -292,11 +434,18 @@ fn respond_error(rest: &str) -> Result<Step, Problem> {
     } else {
         Some(json_value(step, rest)?)
     };
-    Ok(Step::RespondError {
-        code,
-        message,
-        data,
-    })
+    Ok((code, message, data))
+}
+
+/// What `record-env` writes of the environment `vars`: one `KEY=value`
+/// line per variable, sorted by name (a value's own line breaks are
+/// written as they are).
+pub fn env_text(vars: impl IntoIterator<Item = (String, String)>) -> String {
+    let mut vars: Vec<(String, String)> = vars.into_iter().collect();
+    vars.sort();
+    vars.iter()
+        .map(|(key, value)| format!("{key}={value}\n"))
+        .collect()
 }
 
 /// What the player reads of a line from stdin.
@@ -351,15 +500,20 @@ pub fn error_line(id: &Value, code: i64, message: &str, data: Option<&Value>) ->
 mod tests {
     use super::*;
 
+    /// The steps `text` plays with no arguments.
+    fn steps(text: &str) -> Result<Vec<Step>, BadScript> {
+        parse(text).map(|script| script.steps_for(&[]).unwrap_or_default().to_vec())
+    }
+
     fn one(text: &str) -> Step {
-        let steps = parse(text).unwrap_or_else(|bad| panic!("{text:?}: {bad}"));
+        let steps = steps(text).unwrap_or_else(|bad| panic!("{text:?}: {bad}"));
         assert_eq!(steps.len(), 1, "{steps:?}");
         steps.into_iter().next().expect("one step")
     }
 
     /// `text`'s last step, after an `expect` so a response may follow.
     fn answer(text: &str) -> Step {
-        let steps = parse(&format!("expect session/new\n{text}"))
+        let steps = steps(&format!("expect session/new\n{text}"))
             .unwrap_or_else(|bad| panic!("{text:?}: {bad}"));
         steps.last().cloned().expect("a step")
     }
@@ -528,11 +682,286 @@ mod tests {
     }
 
     #[test]
+    fn respond_to_answers_a_request_named_by_its_json_id_with_no_expect_needed() {
+        assert_eq!(
+            one("respond-to 3 {}"),
+            Step::RespondTo {
+                id: json!(3),
+                result: json!({})
+            }
+        );
+        assert_eq!(
+            one(r#"respond-to "auth-1" {"ok":true}"#),
+            Step::RespondTo {
+                id: json!("auth-1"),
+                result: json!({"ok": true})
+            }
+        );
+        let missing = |text: &str| problem(text).problem;
+        assert_eq!(
+            missing("respond-to"),
+            Problem::Missing {
+                step: "respond-to",
+                what: "a request id"
+            }
+        );
+        assert_eq!(
+            missing("respond-to 3"),
+            Problem::Missing {
+                step: "respond-to",
+                what: "a JSON result"
+            }
+        );
+        assert!(matches!(
+            missing("respond-to auth-1 {}"),
+            Problem::BadJson {
+                step: "respond-to",
+                ..
+            }
+        ));
+        assert!(matches!(
+            missing("respond-to 3 {} {}"),
+            Problem::BadJson {
+                step: "respond-to",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn respond_error_to_takes_an_id_then_respond_errors_arguments() {
+        assert_eq!(
+            one(r#"respond-error-to 3 -32000 "browser login timed out""#),
+            Step::RespondErrorTo {
+                id: json!(3),
+                code: -32000,
+                message: "browser login timed out".into(),
+                data: None
+            }
+        );
+        assert_eq!(
+            one(r#"respond-error-to "a" -32800 cancelled {"why":"user"}"#),
+            Step::RespondErrorTo {
+                id: json!("a"),
+                code: -32800,
+                message: "cancelled".into(),
+                data: Some(json!({"why": "user"}))
+            }
+        );
+        let missing = |text: &str| problem(text).problem;
+        assert_eq!(
+            missing("respond-error-to 3"),
+            Problem::Missing {
+                step: "respond-error-to",
+                what: "a code"
+            }
+        );
+        assert_eq!(
+            missing("respond-error-to 3 -32000"),
+            Problem::Missing {
+                step: "respond-error-to",
+                what: "a message"
+            }
+        );
+        assert_eq!(
+            missing("respond-error-to 3 x y"),
+            Problem::BadCode {
+                step: "respond-error-to",
+                text: "x".into()
+            }
+        );
+    }
+
+    #[test]
+    fn record_env_names_its_file() {
+        assert_eq!(
+            one("record-env /tmp/case/env.txt"),
+            Step::RecordEnv {
+                path: "/tmp/case/env.txt".into()
+            }
+        );
+        assert_eq!(
+            problem("record-env").problem,
+            Problem::Missing {
+                step: "record-env",
+                what: "a file"
+            }
+        );
+    }
+
+    #[test]
+    fn the_environment_is_written_sorted_one_variable_a_line() {
+        let vars = [
+            ("PATH", "/usr/bin"),
+            ("LOGIN_MODE", "device"),
+            ("A", ""),
+            ("EQ", "a=b"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned()));
+        assert_eq!(
+            env_text(vars),
+            "A=\nEQ=a=b\nLOGIN_MODE=device\nPATH=/usr/bin\n"
+        );
+        assert_eq!(env_text([]), "");
+    }
+
+    #[test]
+    fn args_sections_are_chosen_by_the_agents_exact_arguments() {
+        let script = parse(
+            "expect initialize\nrespond {}\n\
+             args login\nexit 0\n\
+             args login --device\n  stderr device\nexit 1\n",
+        )
+        .expect("a script");
+        let words = |words: &[&str]| words.iter().map(|word| word.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            script.steps_for(&[]),
+            Some(
+                &[
+                    Step::Expect {
+                        method: "initialize".into()
+                    },
+                    Step::Respond { result: json!({}) },
+                ][..]
+            )
+        );
+        assert_eq!(
+            script.steps_for(&words(&["login"])),
+            Some(&[Step::Exit { code: 0 }][..])
+        );
+        assert_eq!(
+            script.steps_for(&words(&["login", "--device"])),
+            Some(
+                &[
+                    Step::Stderr {
+                        text: "device".into()
+                    },
+                    Step::Exit { code: 1 },
+                ][..]
+            )
+        );
+        // Exactly those words, in that order.
+        assert_eq!(script.steps_for(&words(&["--device", "login"])), None);
+        assert_eq!(script.steps_for(&words(&["logout"])), None);
+        // A script with no sections plays only without arguments.
+        let plain = parse("exit 0").expect("a script");
+        assert_eq!(plain.steps_for(&words(&["login"])), None);
+        assert_eq!(plain.steps_for(&[]), Some(&[Step::Exit { code: 0 }][..]));
+    }
+
+    #[test]
+    fn an_args_section_needs_words_of_its_own_and_its_own_expect() {
+        assert_eq!(
+            problem("exit 0\nargs").problem,
+            Problem::Missing {
+                step: "args",
+                what: "a word"
+            }
+        );
+        let repeated = problem("args login\nexit 0\nargs  login \nexit 1");
+        assert_eq!(
+            repeated,
+            BadScript {
+                line: 3,
+                problem: Problem::RepeatedSection {
+                    words: vec!["login".into()]
+                }
+            }
+        );
+        assert_eq!(
+            repeated.to_string(),
+            "line 3: a second args section for \"login\""
+        );
+        // An `expect` in an earlier section answers nothing in this one.
+        assert_eq!(
+            problem("expect initialize\nargs login\nrespond {}").problem,
+            Problem::NoRequest { step: "respond" }
+        );
+    }
+
+    /// Task 4.1 of `agents-login`: a script playing an agent that offers
+    /// login methods, has a login cancelled, answers the cancelled
+    /// `authenticate` late and the next one on time; and its login
+    /// program's section.
+    #[test]
+    fn a_login_script_parses() {
+        let initialize = json!({
+            "protocolVersion": 1,
+            "authMethods": [
+                {"id": "oauth", "name": "Log in with a browser"},
+                {"id": "cli-login", "name": "Log in from the terminal", "type": "terminal",
+                 "args": ["login"], "env": {"LOGIN_MODE": "device"}},
+            ],
+        });
+        let text = format!(
+            "record got.jsonl\n\
+             expect initialize\n\
+             respond {initialize}\n\
+             expect session/new\n\
+             respond-error -32000 \"log in first\"\n\
+             expect authenticate\n\
+             expect $/cancel_request\n\
+             respond-to 3 {{}}\n\
+             expect authenticate\n\
+             respond-error-to 4 -32000 \"browser login timed out\"\n\
+             expect authenticate\n\
+             respond {{}}\n\
+             expect session/new\n\
+             respond {{\"sessionId\":\"s1\"}}\n\
+             args login\n\
+             record-env env.txt\n\
+             exit 0\n"
+        );
+        let script = parse(&text).unwrap_or_else(|bad| panic!("{bad}"));
+        let steps = script.steps_for(&[]).expect("the agent's steps");
+        assert_eq!(steps.len(), 14, "{steps:?}");
+        assert_eq!(
+            steps[2],
+            Step::Respond {
+                result: initialize
+            }
+        );
+        assert_eq!(
+            steps[6],
+            Step::Expect {
+                method: "$/cancel_request".into()
+            }
+        );
+        assert_eq!(
+            steps[7],
+            Step::RespondTo {
+                id: json!(3),
+                result: json!({})
+            }
+        );
+        assert_eq!(
+            steps[9],
+            Step::RespondErrorTo {
+                id: json!(4),
+                code: -32000,
+                message: "browser login timed out".into(),
+                data: None
+            }
+        );
+        assert_eq!(
+            script.steps_for(&["login".to_owned()]),
+            Some(
+                &[
+                    Step::RecordEnv {
+                        path: "env.txt".into()
+                    },
+                    Step::Exit { code: 0 },
+                ][..]
+            )
+        );
+    }
+
+    #[test]
     fn comments_and_blank_lines_are_skipped_and_steps_keep_their_order() {
         let script = "# a fake agent\n\nrecord got.jsonl\n  expect initialize\n\
                       respond {\"protocolVersion\":1}\r\nexit 0\n";
         assert_eq!(
-            parse(script),
+            steps(script),
             Ok(vec![
                 Step::Record {
                     path: "got.jsonl".into()
@@ -697,8 +1126,12 @@ mod tests {
             "send-raw",
             "respond",
             "respond-error",
+            "respond-to",
+            "respond-error-to",
             "stderr",
             "wait-file",
+            "record-env",
+            "args",
             "exit",
             "\"",
             "{",
