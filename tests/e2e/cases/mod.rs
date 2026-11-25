@@ -6,6 +6,7 @@
 
 #[cfg(windows)]
 mod win;
+mod agent;
 mod cards;
 mod clipboard;
 mod cli;
@@ -253,6 +254,9 @@ fn unix() -> Vec<Case> {
         display("local-server-no-helper", local_server::no_helper),
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),
+        display("agent-first-prompt", agent::first_prompt).needs_fake_agent(),
+        display("agent-launch-kinds", agent::launch_kinds).needs_fake_agent(),
+        display("agent-handoff", agent::handoff).needs_fake_agent(),
     ]
 }
 

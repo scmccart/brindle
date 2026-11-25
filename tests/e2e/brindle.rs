@@ -197,6 +197,9 @@ pub struct Run<'a> {
     /// Run with no state directory, from the case directory
     /// ([`Run::no_state_dir`]).
     no_state_dir: bool,
+    /// The run opens `brindle agent PROFILE` rather than `brindle
+    /// terminal PROFILE` ([`Run::agent`]).
+    agent: bool,
 }
 
 /// The case server's sessions as `brindle-remote list` prints them
@@ -312,7 +315,23 @@ impl<'a> Run<'a> {
             padding: None,
             interval: None,
             no_state_dir: false,
+            agent: false,
         }
+    }
+
+    /// Starts with `brindle agent PROFILE` (an agent profile from
+    /// [`Run::config`]) instead of `brindle terminal PROFILE`.
+    pub fn agent(mut self, profile: &'static str) -> Self {
+        self.profile = profile;
+        self.agent = true;
+        self
+    }
+
+    /// `brindle agent`'s first prompt (`-p TEXT`), for a run started with
+    /// [`Run::agent`]. Not `prompt`: that name waits for a shell's prompt.
+    pub fn first_prompt(mut self, text: &str) -> Self {
+        self.args.extend(["-p".to_string(), text.to_string()]);
+        self
     }
 
     /// Runs with no state directory: without the `BRINDLE_STATE_DIR` every
@@ -611,7 +630,8 @@ impl<'a> Run<'a> {
             if self.args.iter().any(|arg| arg == "--attach") {
                 command.arg("--no-restore");
             } else {
-                command.args(["terminal", self.profile, "--no-restore"]);
+                let subcommand = if self.agent { "agent" } else { "terminal" };
+                command.args([subcommand, self.profile, "--no-restore"]);
             }
         }
         // A restoring run with a command still needs the subcommand, which
@@ -723,7 +743,7 @@ impl<'a> Run<'a> {
             ensure!(status.success(), "Brindle exited with {status}; see {}.log", self.label);
             return Ok(Output { dump, image });
         }
-        ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
+        ensure!(dump.size.is_some() || !dump.agent.is_empty(), "no screen or agent zone in the dump; see {}.log", self.label);
         Ok(Output { dump, image })
     }
 }
@@ -770,6 +790,9 @@ pub struct Grid {
     pub line_height: f32,
     pub scale: f32,
 }
+
+/// The first words of an agent zone's dump lines ([`Dump::agent`]).
+const AGENT_LINES: [&str; 6] = ["agent ", "note ", "entry ", "queued ", "conversation ", "prompt "];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -844,6 +867,10 @@ pub struct Dump {
     pub wait_timeouts: Vec<String>,
     /// The `--wait-for` texts still waiting at the dump (`--- wait-for pending "TEXT"`).
     pub wait_pending: Vec<String>,
+    /// An active agent zone's block (`--- agent …`, `--- note …`, `--- entry …`,
+    /// `--- queued …`, `--- conversation …`, `--- prompt …`), in place of a
+    /// screen: one line each without the `--- `.
+    pub agent: Vec<String>,
 }
 
 /// `--- fonts terminal="DejaVu Sans Mono" ui="Inter"`
@@ -921,6 +948,11 @@ impl Dump {
                 dump.pointer = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- grid-pointer ") {
                 dump.grid_pointer = Some(rest.to_string());
+            } else if let Some(rest) =
+                line.strip_prefix("--- ").filter(|rest| AGENT_LINES.iter().any(|word| rest.starts_with(word)))
+            {
+                dump.agent.push(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
                 dump.zones = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zone ") {
@@ -957,6 +989,22 @@ impl Dump {
         }
         dump.screen = trim_screen(screen.into_iter());
         dump
+    }
+
+    /// A `key=value` field of the agent zone's `--- agent` line (values
+    /// without spaces: `state`, `turn`, `session`, …).
+    pub fn agent_field(&self, key: &str) -> Option<&str> {
+        let line = self.agent.iter().find_map(|line| line.strip_prefix("agent "))?;
+        line.split(' ').find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// The agent zone's entries (`--- entry N KIND …`), each as `KIND …`
+    /// without its id: `user "hi"`, `agent "Hello!"`.
+    pub fn agent_entries(&self) -> Vec<&str> {
+        self.agent
+            .iter()
+            .filter_map(|line| line.strip_prefix("entry ")?.split_once(' ').map(|(_, rest)| rest))
+            .collect()
     }
 
     /// A `key=value` field of the find line (values without spaces).
@@ -1184,6 +1232,21 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.pointer.as_deref() == Some("shape=crosshair screen=alternate"), "pointer {:?}", dump.pointer);
     ensure!(dump.grid_pointer.as_deref() == Some("text"), "grid pointer {:?}", dump.grid_pointer);
     ensure!(dump.screen == ["hi"], "screen after the pointer {:?}", dump.screen);
+    // An agent zone's block, in place of a screen, before the palette and
+    // focus lines.
+    let dump = Dump::parse(
+        "--- tab 1 \"Fake Agent\" (active)\n--- fonts terminal=\"A\" ui=\"B\"\n\
+         --- agent zone=1 state=ready name=\"Fake Agent\" turn=ended:end_turn activity=done status=done link=up session=open\n\
+         --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n--- queued waiting \"next\"\n\
+         --- conversation entries=2 at=end\n--- prompt status=ready\n--- focus other modality=keyboard\n",
+    );
+    ensure!(dump.agent.len() == 7, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent_field("state") == Some("ready") && dump.agent_field("session") == Some("open"), "{:?}", dump.agent);
+    ensure!(dump.agent_field("zone") == Some("1") && dump.agent_field("missing").is_none(), "{:?}", dump.agent);
+    ensure!(dump.agent_entries() == ["user \"hi there\"", "agent \"Hello!\""], "entries {:?}", dump.agent_entries());
+    ensure!(dump.size.is_none() && dump.screen.is_empty(), "no screen {:?}", dump.screen);
+    ensure!(dump.focus.as_deref() == Some("other"), "focus after the agent block {:?}", dump.focus);
+    ensure!(Dump::parse("--- palette prompt \"Name\" text=\"\"\n").agent.is_empty(), "a palette prompt isn't an agent line");
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
          --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",
