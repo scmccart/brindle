@@ -217,9 +217,7 @@ pub enum LaunchRefusal {
     /// the default config's.
     UnknownProfile { name: String, known: Vec<String>, config_error: bool },
     /// The profile is of another kind than the subcommand's: `kind` is the
-    /// profile's. Nothing builds it until `agents-profiles` adds a second
-    /// kind.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// profile's.
     KindMismatch { profile: String, kind: ProfileKind },
 }
 
@@ -237,9 +235,10 @@ impl std::fmt::Display for LaunchRefusal {
             ),
             Self::KindMismatch { profile, kind } => {
                 let (kind, subcommand) = match kind {
-                    ProfileKind::Terminal => ("terminal", "terminal"),
+                    ProfileKind::Terminal => ("a terminal", "terminal"),
+                    ProfileKind::Agent => ("an agent", "agent"),
                 };
-                write!(f, "{profile:?} is a {kind} profile: open it with brindle {subcommand} {profile}")
+                write!(f, "{profile:?} is {kind} profile: open it with brindle {subcommand} {profile}")
             }
         }
     }
@@ -261,8 +260,12 @@ pub fn profile_for(
         let known = config.profiles.iter().map(|profile| profile.name.clone()).collect();
         return Err(LaunchRefusal::UnknownProfile { name: name.to_string(), known, config_error });
     };
-    match (kind, config.profiles[index].kind()) {
+    let profile = &config.profiles[index];
+    match (kind, profile.kind()) {
         (TabKind::Terminal, ProfileKind::Terminal) => Ok(index),
+        (TabKind::Terminal, ProfileKind::Agent) => {
+            Err(LaunchRefusal::KindMismatch { profile: profile.name.clone(), kind: profile.kind() })
+        }
     }
 }
 
@@ -3333,11 +3336,26 @@ mod tests {
         assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(1));
     }
 
-    /// No profile can be of another kind yet, so the refusal is built here.
     #[test]
     fn a_kind_mismatch_names_the_profile_its_kind_and_its_subcommand() {
         let refusal = LaunchRefusal::KindMismatch { profile: "Work".into(), kind: ProfileKind::Terminal };
         assert_eq!(refusal.to_string(), "\"Work\" is a terminal profile: open it with brindle terminal Work");
+        let refusal = LaunchRefusal::KindMismatch { profile: "Fake".into(), kind: ProfileKind::Agent };
+        assert_eq!(refusal.to_string(), "\"Fake\" is an agent profile: open it with brindle agent Fake");
+    }
+
+    /// `brindle terminal NAME` naming an agent profile is refused.
+    #[test]
+    fn a_terminal_launch_naming_an_agent_profile_is_refused() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(
+            profile_for(&config, TabKind::Terminal, Some("fake"), false),
+            Err(LaunchRefusal::KindMismatch { profile: "Fake".into(), kind: ProfileKind::Agent })
+        );
     }
 
     #[test]
