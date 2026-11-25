@@ -16,8 +16,11 @@ pub mod filter;
 pub mod icon;
 pub mod primitives;
 pub mod style;
+pub mod text_area;
 pub mod text_input;
 pub mod theme;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use actions::*;
 pub use components::*;
@@ -31,6 +34,7 @@ pub use style::{
     card_style, focus_ring, input_style, menu_style, popover_style, select_style, switch_style, switch_thumb_offset,
     tab_drag_style, tab_list_style, tab_style, toggle_style, tooltip_style,
 };
+pub use text_area::{DEFAULT_MAX_LINES, TextArea, TextAreaEvent};
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveFont, ActiveTheme, Tokens, UiFont, UiTheme};
 
