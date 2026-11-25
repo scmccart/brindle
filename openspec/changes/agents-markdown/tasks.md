@@ -53,8 +53,8 @@ Before starting, check that `agents-profiles` is archived (its specs synced into
 
 ## 7. Integration
 
-- [ ] 7.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo run -p brindle-ui --example gallery -- --check` under `scripts/with-xvfb`, and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e` (outside Brindle's scope, through `systemd-run --user --scope`); verify all pass and that `git diff origin/main -- Cargo.lock` holds only the `pulldown-cmark` package and its name in `brindle`'s list.
-- [ ] 7.2 Run `cargo build --release` and `scripts/with-xvfb env BRINDLE_PERF=1 cargo test --test perf -- agent-markdown-stream`; verify it writes its `summary.toml` and put the streamed and one-chunk times in the PR body.
+- [x] 7.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo run -p brindle-ui --example gallery -- --check` under `scripts/with-xvfb`, and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e` (outside Brindle's scope, through `systemd-run --user --scope`); verify all pass and that `git diff origin/main -- Cargo.lock` holds only the `pulldown-cmark` package and its name in `brindle`'s list.
+- [x] 7.2 Run `cargo build --release` and `scripts/with-xvfb env BRINDLE_PERF=1 cargo test --test perf -- agent-markdown-stream`; verify it writes its `summary.toml` and put the streamed and one-chunk times in the PR body.
 - [ ] 7.3 Hand the manual checks from 6.2 to the user with `scripts/run-throwaway.sh` and `scripts/run-throwaway.ps1`; verify the user reports each.
 
 ## Workflow follow-up
