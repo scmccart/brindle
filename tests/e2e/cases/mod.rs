@@ -63,6 +63,7 @@ fn unix() -> Vec<Case> {
         display("dump-wait-for-clean", dump::wait_for_clean),
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
+        display("remote-agent-ssh", remote::agent_ssh),
         display("remote-ssh-quit", remote::ssh_quit),
         display("remote-ssh-reattach-size", remote::ssh_reattach_size),
         display("remote-ssh-reattach-background", remote::ssh_reattach_background),

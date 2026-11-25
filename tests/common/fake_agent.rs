@@ -103,11 +103,25 @@ fn newest_file(dir: &Path) -> Option<(PathBuf, SystemTime)> {
 /// [`verdict`] for `agent` as it is on disk, against [`SOURCES`] under the
 /// repository; `default_bin` is the suite's own build of Brindle.
 pub fn check(agent: &FakeAgent, default_bin: &Path) -> Result {
+    check_built_by(agent, &build_command(default_bin))
+}
+
+/// [`check`] with `build` as the command that builds `agent`.
+pub fn check_built_by(agent: &FakeAgent, build: &str) -> Result {
     let built = std::fs::metadata(&agent.path).and_then(|m| m.modified()).ok();
     let sources = Path::new(env!("CARGO_MANIFEST_DIR")).join(SOURCES);
     let newest = newest_file(&sources);
-    verdict(agent, built, newest.as_ref().map(|(path, changed)| (path.as_path(), *changed)), &build_command(default_bin))
+    verdict(agent, built, newest.as_ref().map(|(path, changed)| (path.as_path(), *changed)), build)
 }
+
+/// The static Linux build the remote agent case copies into its container,
+/// relative to the repository: README.md's static helper build, which
+/// builds every binary of `brindle-remote-agent`, puts it there.
+pub const STATIC_LINUX: &str = "target/x86_64-unknown-linux-musl/release/brindle-fake-acp-agent";
+
+/// What builds [`STATIC_LINUX`], for the messages.
+pub const STATIC_LINUX_BUILD: &str =
+    "cargo build --locked --release -p brindle-remote-agent --target x86_64-unknown-linux-musl (README.md's Docker command)";
 
 /// The lookup's own checks (`--self-test`): found, missing, stale and the
 /// variable.

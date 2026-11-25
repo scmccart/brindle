@@ -284,6 +284,99 @@ pub fn ssh_container(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The agent profile [`agent_ssh`] opens.
+const AGENT_PROFILE: &str = "Remote Agent";
+
+/// An agent profile over SSH: the agent session runs in root's terminal
+/// server in the container, which the first connection deploys, with the
+/// static fake ACP agent copied in to play the agent. `brindle agent
+/// "Remote Agent" -p hi` sends `hi` once the agent is ready and shows its
+/// answer; the agent recorded one prompt, and root's server lists the
+/// session. Skips like the other remote cases, and also when the static
+/// fake agent isn't built (an error with `BRINDLE_REMOTE_E2E_REQUIRED=1`).
+pub fn agent_ssh(ctx: &Ctx) -> Result<Outcome> {
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let Some(fake) = static_fake_agent()? else {
+        return Ok(Outcome::Skip(format!(
+            "the static fake ACP agent isn't built ({} is missing): run {}",
+            crate::common::fake_agent::STATIC_LINUX,
+            crate::common::fake_agent::STATIC_LINUX_BUILD
+        )));
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let (agent, script, received) = ("/usr/local/bin/brindle-fake-acp-agent", "/root/agent.script", "/root/received.jsonl");
+    ssh.container.copy_to(&fake, agent)?;
+    ssh.container.exec(&["chmod", "755", agent])?;
+    let local_script = ctx.dir.join("agent.script");
+    let steps = [
+        format!("record {received}"),
+        "expect initialize".into(),
+        r#"respond {"protocolVersion":1,"agentInfo":{"name":"Fake Agent","version":"1.0"}}"#.into(),
+        "expect session/new".into(),
+        r#"respond {"sessionId":"s1"}"#.into(),
+        "expect session/prompt".into(),
+        r#"send {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello from the container"}}}}"#.into(),
+        r#"respond {"stopReason":"end_turn"}"#.into(),
+    ];
+    fs::write(&local_script, steps.join("\n") + "\n").map_err(|e| format!("writing {}: {e}", local_script.display()))?;
+    ssh.container.copy_to(&local_script, script)?;
+
+    let config = ssh.agent_profile(AGENT_PROFILE, agent, script);
+    let out = needs
+        .run(ctx, "agent", &config)
+        .agent(AGENT_PROFILE)
+        .first_prompt("hi")
+        .keep_detached()
+        .wait_for("agent \"Hello from the container\"")
+        .dump_at(12.0)
+        .run()?;
+    ensure!(
+        out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
+        "waits that gave up: {:?}, still waiting: {:?}; agent {:?}",
+        out.dump.wait_timeouts,
+        out.dump.wait_pending,
+        out.dump.agent
+    );
+    ensure!(
+        out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello from the container\""],
+        "entries: {:?}",
+        out.dump.agent
+    );
+    ensure!(out.dump.agent_field("turn") == Some("ended:end_turn"), "agent: {:?}", out.dump.agent);
+    let sent = ssh.container.exec(&["cat", received])?;
+    ensure!(
+        sent.lines().filter(|line| line.contains("\"session/prompt\"")).count() == 1,
+        "the agent was sent one prompt: {sent}"
+    );
+    ssh.container.assert_cached_agent("/root/.cache/brindle")?;
+    // Quitting left the agent session detached in root's server.
+    let listed = parse_list(&ssh.container.helper(&["list"])?);
+    ensure!(listed.len() == 1 && !listed[0].attached, "root's server lists {listed:?}");
+    Ok(Outcome::Pass)
+}
+
+/// The static fake ACP agent ([`crate::common::fake_agent::STATIC_LINUX`])
+/// when it is built and no older than its sources; `None` when it is
+/// missing, an error then with `BRINDLE_REMOTE_E2E_REQUIRED=1`.
+fn static_fake_agent() -> Result<Option<PathBuf>> {
+    use crate::common::fake_agent::{self, FakeAgent, STATIC_LINUX, STATIC_LINUX_BUILD};
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(STATIC_LINUX);
+    if !path.is_file() {
+        if std::env::var("BRINDLE_REMOTE_E2E_REQUIRED").as_deref() == Ok("1") {
+            return Err(format!(
+                "the static fake ACP agent isn't built ({} is missing): run {STATIC_LINUX_BUILD}",
+                path.display()
+            ));
+        }
+        return Ok(None);
+    }
+    fake_agent::check_built_by(&FakeAgent { path: path.clone(), named: false }, STATIC_LINUX_BUILD)?;
+    Ok(Some(path))
+}
+
 /// Quitting leaves an SSH tab's program running, detached in the
 /// container's server, and the next launch restores the tab attached to the
 /// same session: the same program (same pid) and its scrollback.
@@ -1299,6 +1392,23 @@ impl Ssh {
              args = [\"--norc\", \"--noprofile\", \"-i\"]\n\
              env = {{ SHELL = \"/bin/bash\", PS1 = \"{SSH_PROMPT} \", BRINDLE_E2E_MARKER = {marker:?} }}\n\
              remote = {{ type = \"ssh\", host = {host:?}, user = \"root\", port = {port}, identity_file = {identity:?}, ssh_args = {SSH_ARGS}{eager} }}\n",
+            host = self.host,
+            port = self.port,
+            identity = self.key.private.to_string_lossy(),
+        )
+    }
+
+    /// An agent profile named `name` running `command` with the fake
+    /// agent's `script` as root on the fixture, as TOML to append to the
+    /// test config.
+    fn agent_profile(&self, name: &str, command: &str, script: &str) -> String {
+        format!(
+            "\n[[profiles]]\n\
+             name = {name:?}\n\
+             type = \"agent\"\n\
+             command = {command:?}\n\
+             args = [{script:?}]\n\
+             remote = {{ type = \"ssh\", host = {host:?}, user = \"root\", port = {port}, identity_file = {identity:?}, ssh_args = {SSH_ARGS} }}\n",
             host = self.host,
             port = self.port,
             identity = self.key.private.to_string_lossy(),
