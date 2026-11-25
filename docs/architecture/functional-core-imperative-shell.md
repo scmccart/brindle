@@ -80,6 +80,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `src/terminal/feedback.rs` | the label a mouse copy or paste shows at the pointer: its text, whether it shows, fades or is gone at a moment, when it must next be drawn, and that a new one replaces the old |
 | `src/terminal/dir_check.rs` | whether the directory a local program last reported exists, from checks the terminal runs off the UI thread: which directory to check next, one at a time, and which answer still counts |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
+| `src/agent/transcript.rs` | the app's one door to `brindle-transcript` (its re-exports), and the status a live or listed agent session's activity shows |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
 | `src/workspace/{tabs,launch,overlays,previews,notices}.rs` | which tab is active once one is added, removed, switched to or moved, and where a new one goes; the directory a new tab starts in; what asking for an overlay does while another shows; the theme and profile a tab shows while the settings dialog previews them; which transient notices the config line shows, and when the next one goes |

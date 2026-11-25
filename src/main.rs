@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
 mod actions;
+mod agent;
 mod config;
 mod config_edit;
 mod cursor;

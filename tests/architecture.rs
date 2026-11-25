@@ -716,6 +716,22 @@ fn only_the_acp_modules_name_the_schema_crate() {
     );
 }
 
+/// The transcript crate's one door in the app: no file in `src/` but
+/// `src/agent/transcript.rs` names `brindle_transcript`, so the app reaches
+/// the transcript's types through `crate::agent::transcript` (ports R3).
+#[test]
+fn only_the_agent_transcript_module_names_the_transcript_crate() {
+    let door = Path::new("src/agent/transcript.rs");
+    let mut files = sources("src");
+    assert!(files.iter().any(|file| file == door), "{} is missing", door.display());
+    files.retain(|file| file != door);
+    assert_none(
+        offenders(&files, Scope::All, &["brindle_transcript"]),
+        "the app names brindle_transcript only in src/agent/transcript.rs; use \
+         crate::agent::transcript (docs/architecture/ports-and-adapters.md R3)",
+    );
+}
+
 /// ports R2: components reach the system only through gpui.
 #[test]
 fn brindle_ui_does_no_io_of_its_own() {
@@ -1013,7 +1029,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 49] = [
+const PURE_MODULES: [&str; 50] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1026,6 +1042,7 @@ const PURE_MODULES: [&str; 49] = [
     "src/terminal/dir_check.rs",
     "src/terminal/feedback.rs",
     "src/notify/policy.rs",
+    "src/agent/transcript.rs",
     "src/layout.rs",
     "src/reattach.rs",
     "src/workspace/tabs.rs",
