@@ -183,9 +183,10 @@ Decided on 2026-11-25: options show as small labels under the prompt input, with
 
 Also decided on 2026-11-25: every mode change leaves a notice in the conversation (decision 5); whitespace before a slash command makes no difference (decision 6).
 
+Starting values per profile are left out of this change, as the proposal-only `agents-option-defaults`.
+
 Still open:
 
-3. **Starting values per profile** (for example always start one agent in its plan mode): left out of this change (recommended, as a follow-up), or included.
 4. **Completion matching:** fuzzy, with names that start with the typed word first (recommended), or prefix only.
 5. **The unstable `models` list:** not read (recommended), so the deprecated claude-code-acp adapter's model can't be changed from Brindle.
 

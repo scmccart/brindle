@@ -20,7 +20,7 @@ ACP v1 has two ways to offer options: session modes (`session/set_mode`), which 
 - **Options show under the prompt input** as their current values (`auto · opus · medium`), and each opens a list of its choices on a pointer press. From the keyboard, the new `agent_options` action opens the same choices in a palette, and `agent_next_mode` steps the mode option to its next choice.
 - **Bounds on everything an agent sends:** 256 commands, 32 options, 256 choices an option, with names and descriptions cut as titles are.
 
-Not in this change: per-profile starting values for options; remembering a choice across sessions; ACP's unstable model list (`session/set_model`); command input kinds other than free text; ACP v2's unstable skills; the conversation's title and context usage (`agents-session-info`); option controls as keyboard focus stops.
+Not in this change: per-profile starting values for options and remembering a choice across sessions (the proposal-only change `agents-option-defaults`); ACP's unstable model list (`session/set_model`); command input kinds other than free text; ACP v2's unstable skills; the conversation's title and context usage (`agents-session-info`); option controls as keyboard focus stops.
 
 ## Capabilities
 
