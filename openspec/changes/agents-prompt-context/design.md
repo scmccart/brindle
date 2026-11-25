@@ -227,9 +227,10 @@ Decided on 2026-11-25:
 - Text over the limit is refused outright, which the user chose over the recommended cutting; the limit itself is raised when uploads in pieces arrive (decision 2).
 - The remote's `attachments_dir` on the profile's `remote` table is fine for now; the user expects remotes to become first-class entries of the config later, when it would move there.
 
-Still open, each with a recommendation the text above follows:
+- A text file dropped on a remote agent's zone is attached as its contents (decision 8). The user noted this is where the upload comes in: files that aren't text, and ones over the limit, wait for `agents-prompt-images`' upload in pieces.
 
-3. **A file dropped on a remote agent's zone** is attached as text when it is text (recommended), or every such drop is refused.
+Still open, with a recommendation the text above follows:
+
 4. **Several agent zones open:** a palette asks which (recommended), or the most recently focused one takes it.
 
 ## Risks / Trade-offs
