@@ -90,11 +90,12 @@ const BUSY_LIMIT: Duration = HELLO_LIMIT;
 /// after a relay link drops, for the reconnect to get them back.
 const RELAY_LINGER_SECS: u32 = 300;
 
-/// The client protocols Brindle offers: 1 to 3. Protocol 4 adds agent
-/// sessions, which Brindle doesn't show yet (`agents-sessions` section 8
-/// lifts this), so it never negotiates a version whose sessions it would
-/// list or attach without being able to show them.
-const BRINDLE_PROTOCOLS: client::VersionRange = client::VersionRange::new(1, 3);
+/// The client protocols Brindle offers: every one the codec knows, 1 to 4.
+/// Protocol 4 adds agent sessions, which restore, the sweep, `--attach`
+/// and the sessions palette tell apart from terminals (`agents-profiles`
+/// design.md decision 6). With a core that can't go past 3, agent zones
+/// say the server is too old (`agent_start`).
+const BRINDLE_PROTOCOLS: client::VersionRange = client::PROTOCOLS;
 /// How long an exiting Brindle waits, at most, for its connections to write
 /// what its closing tabs sent ([`flush`]). Writing to a link that is up
 /// takes far less.
@@ -1093,14 +1094,14 @@ mod tests {
             let frame = Frame::read_from(&mut stream).unwrap();
             let ToCore::Hello(hello) = ToCore::decode(&frame).unwrap() else { panic!("not HELLO") };
             assert_eq!(hello.client_token, "tok");
-            let refusal = client::answer_hello(&hello, client::VersionRange::new(4, 5)).unwrap_err();
+            let refusal = client::answer_hello(&hello, client::VersionRange::new(5, 6)).unwrap_err();
             ToClient::Error(refusal).encode().unwrap().write_to(&mut stream).unwrap();
         });
         let endpoint = Endpoint::at(temp.0.join("unused"), dir);
         let error = connect(&endpoint, "tok").unwrap_err().to_string();
         core.join().unwrap();
         assert!(error.contains("refused Brindle"), "{error}");
-        assert!(error.contains("offered 1–3, supported 4–5"), "{error}");
+        assert!(error.contains("offered 1–4, supported 5–6"), "{error}");
         assert!(error.contains("brindle-remote stop"), "{error}");
     }
 
@@ -1340,17 +1341,17 @@ mod tests {
         assert_eq!(relay.client_token, "tok");
     }
 
-    /// Brindle's own offer stays below protocol 4 until the app tells agent
-    /// sessions apart (`agents-profiles` task 6.5); a connection made with
-    /// another offer (the client tests' 1 to 4) says that one.
+    /// Brindle offers every protocol the codec knows, agent sessions' 4
+    /// included (`agents-profiles` task 6.5), down to 1 for the oldest
+    /// cores; a connection made with another offer says that one.
     #[test]
-    fn brindle_offers_no_protocol_with_agent_sessions_yet() {
-        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (1, 3));
-        const { assert!(BRINDLE_PROTOCOLS.max < client::PROTOCOLS.max, "the codec knows protocol 4") };
+    fn brindle_offers_every_protocol_up_to_agent_sessions() {
+        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (1, 4));
+        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (client::PROTOCOLS.min, client::PROTOCOLS.max));
         let hello = hello_message("tok", false, BRINDLE_PROTOCOLS);
-        assert_eq!(hello.max, 3);
-        let offered = hello_message("tok", true, client::PROTOCOLS);
-        assert_eq!((offered.min, offered.max), (1, 4));
+        assert_eq!((hello.min, hello.max), (1, 4));
+        let older = hello_message("tok", true, client::VersionRange::new(1, 3));
+        assert_eq!((older.min, older.max), (1, 3));
     }
 
     #[test]

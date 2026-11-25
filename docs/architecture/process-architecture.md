@@ -62,7 +62,7 @@ let Some(lock) = Lock::acquire(&dir.join("core.lock"))? else {
 | Brindle's UI thread | entities, painting | R13, R14, R16 |
 | the instance (`src/instance.rs`) | `session.lock`, the launch socket | R11 |
 
-Protocols: client protocol versions 1–4 (4 adds agent sessions: `SPAWN_AGENT`, the `AGENT_*` commands and `TRANSCRIPT`, whose events are frozen per version; Brindle still offers 1–3) and core↔holder H1 at versions 1–3 (3 adds pipe sessions: `SPAWN_PIPES`, `STDERR_TAIL`, `HeldSession.mode`), both in `remote-protocol/src/{client,holder,wire,version}.rs`; the relay's frames in `relay.rs`. Files read across versions: `config.toml`, `session.toml`, the layout blob stored in a session's meta, and an agent session's checkpoint (`acp::checkpoint`, the `BACP` header with format 1; a format a core can't read is adopted as a conversation that could not be restored).
+Protocols: client protocol versions 1–4 (4 adds agent sessions: `SPAWN_AGENT`, the `AGENT_*` commands and `TRANSCRIPT`, whose events are frozen per version; Brindle offers 1–4) and core↔holder H1 at versions 1–3 (3 adds pipe sessions: `SPAWN_PIPES`, `STDERR_TAIL`, `HeldSession.mode`), both in `remote-protocol/src/{client,holder,wire,version}.rs`; the relay's frames in `relay.rs`. Files read across versions: `config.toml`, `session.toml`, the layout blob stored in a session's meta, and an agent session's checkpoint (`acp::checkpoint`, the `BACP` header with format 1; a format a core can't read is adopted as a conversation that could not be restored).
 
 ## Rules
 
