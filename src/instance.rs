@@ -11,30 +11,41 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::{Command, TabKind, TerminalLaunch};
+
 /// How long a launch waits for the instance to take its request.
 pub const FORWARD_LIMIT: Duration = Duration::from_secs(5);
 
-/// The longest request line read; anything longer is refused.
+/// The longest request line read, its line end included; anything longer
+/// is refused.
 const MAX_REQUEST: u64 = 1 << 20;
 
-/// What a launch asks the instance for.
+/// What a launch asks the instance for: one JSON line, never versioned or
+/// negotiated, so fields are only ever added, each omitted when unset, and
+/// unknown ones are ignored (the `process R4` exception in
+/// `docs/architecture/README.md`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Request {
-    /// `-p`: a profile name.
+    /// The subcommand's kind of tab (`terminal`), omitted by a bare launch
+    /// and by launches from before subcommands. A string on the wire, so a
+    /// kind this Brindle doesn't know reaches [`Request::asked`] by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// `brindle terminal PROFILE`: a profile name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// `-d`, made absolute by the launch.
+    /// `brindle terminal -d`, made absolute by the launch.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
-    /// `-e`: the program and its arguments.
+    /// `brindle terminal -e`: the program and its arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
     /// `--attach`: a terminal server session id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach: Option<u32>,
-    /// The launching process's working directory, where `-e` starts
-    /// without `-d`.
+    /// The launching process's working directory, where a `-e` command
+    /// starts without `-d`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_dir: Option<PathBuf>,
     /// The launcher's activation token (`XDG_ACTIVATION_TOKEN`, else
@@ -52,6 +63,79 @@ impl Request {
 
     pub fn decode(line: &str) -> Result<Self, String> {
         serde_json::from_str(line.trim_end()).map_err(|e| format!("bad request: {e}"))
+    }
+
+    /// What the request asks for, from this version's launches and older
+    /// and newer ones: `attach` wins (an older launch may send it with a
+    /// profile); the `terminal` kind, or no kind with a profile, directory
+    /// or command (an older launch), is a terminal tab; no kind and none of
+    /// those only raises; any other kind is refused by name.
+    pub fn asked(&self) -> Result<Forward, String> {
+        if let Some(session) = self.attach {
+            return Ok(Forward::Attach(session));
+        }
+        let terminal = || {
+            Forward::Terminal(TerminalLaunch {
+                profile: self.profile.clone(),
+                cwd: self.cwd.clone(),
+                command: self.command.as_deref().and_then(Command::from_argv),
+            })
+        };
+        match self.kind.as_deref() {
+            Some(kind) if kind == TabKind::Terminal.word() => Ok(terminal()),
+            Some(kind) => Err(format!(
+                "this Brindle ({}) can't open {kind} tabs; quit it and launch again",
+                env!("CARGO_PKG_VERSION")
+            )),
+            None if self.profile.is_some() || self.cwd.is_some() || self.command.is_some() => Ok(terminal()),
+            None => Ok(Forward::Raise),
+        }
+    }
+}
+
+/// What a later launch's request opens ([`Request::asked`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Forward {
+    /// Nothing: a plain launch raises the window.
+    Raise,
+    /// A terminal tab.
+    Terminal(TerminalLaunch),
+    /// `--attach`: a tab on that detached session.
+    Attach(u32),
+}
+
+/// The instance's answer to one request, one line: `ok`, `error: TEXT` or
+/// `usage: TEXT`. A launch before `usage:` existed reads that line as an
+/// error, prints it and exits 1.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// The instance took the request.
+    Accepted,
+    /// It didn't, for this reason; the launch exits 1.
+    Refused(String),
+    /// The launch's arguments are wrong for this instance (an unknown
+    /// profile); the launch exits 2, as for any usage error.
+    Usage(String),
+}
+
+impl Answer {
+    /// The answer's line.
+    fn line(&self) -> String {
+        match self {
+            Self::Accepted => "ok\n".to_string(),
+            Self::Refused(why) => format!("error: {}\n", why.replace('\n', " ")),
+            Self::Usage(why) => format!("usage: {}\n", why.replace('\n', " ")),
+        }
+    }
+}
+
+/// Whether the encoded request `line`, its line end included, is within
+/// what a running Brindle reads; else why not.
+pub fn fits(line: &str) -> Result<(), String> {
+    if line.len() as u64 <= MAX_REQUEST {
+        Ok(())
+    } else {
+        Err(format!("the launch is {} bytes, over the 1 MiB a running Brindle takes", line.len()))
     }
 }
 
@@ -100,39 +184,44 @@ pub fn pipe_name_for(user: Option<String>, state_dir: &Path) -> String {
     format!(r"\\.\pipe\{}-{user}", name(state_dir))
 }
 
-/// Writes `reply` (`ok`, or `error: …`) as the answer to one request.
-fn answer(mut stream: impl Write, reply: &Result<(), String>) -> io::Result<()> {
-    let line = match reply {
-        Ok(()) => "ok\n".to_string(),
-        Err(why) => format!("error: {}\n", why.replace('\n', " ")),
-    };
-    stream.write_all(line.as_bytes())?;
+/// Writes `reply` as the answer to one request.
+fn answer(mut stream: impl Write, reply: &Answer) -> io::Result<()> {
+    stream.write_all(reply.line().as_bytes())?;
     stream.flush()
 }
 
-/// Reads one request line from `stream`.
+/// Reads one request line from `stream`: a line cut off at
+/// [`MAX_REQUEST`] is refused as over the limit, not as malformed.
 fn read_request(stream: impl Read) -> Result<Request, String> {
-    let mut line = String::new();
+    let mut line = Vec::new();
     BufReader::new(stream.take(MAX_REQUEST))
-        .read_line(&mut line)
+        .read_until(b'\n', &mut line)
         .map_err(|e| format!("reading the request: {e}"))?;
+    if line.len() as u64 == MAX_REQUEST && line.last() != Some(&b'\n') {
+        return Err("the request is over the 1 MiB limit".into());
+    }
+    let line = String::from_utf8(line).map_err(|e| format!("bad request: {e}"))?;
     Request::decode(&line)
 }
 
-/// Sends `request` over `stream` and reads the answer.
-fn exchange(mut stream: impl Read + Write, request: &Request) -> Result<(), String> {
+/// Sends `request` over `stream` and reads the answer; `Err` when the
+/// exchange itself failed.
+fn exchange(mut stream: impl Read + Write, request: &Request) -> Result<Answer, String> {
     stream.write_all(request.encode().as_bytes()).map_err(|e| format!("sending the request: {e}"))?;
     stream.flush().map_err(|e| format!("sending the request: {e}"))?;
     let mut line = String::new();
     BufReader::new(stream.take(MAX_REQUEST)).read_line(&mut line).map_err(|e| format!("waiting for an answer: {e}"))?;
-    parse_answer(&line)
+    Ok(parse_answer(&line))
 }
 
-fn parse_answer(line: &str) -> Result<(), String> {
+fn parse_answer(line: &str) -> Answer {
     match line.trim_end() {
-        "ok" => Ok(()),
-        "" => Err("the running Brindle closed the connection without answering".into()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+        "ok" => Answer::Accepted,
+        "" => Answer::Refused("the running Brindle closed the connection without answering".into()),
+        other => match other.strip_prefix("usage: ") {
+            Some(why) => Answer::Usage(why.to_string()),
+            None => Answer::Refused(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+        },
     }
 }
 
@@ -159,7 +248,19 @@ fn same_user(own: u32, peer: io::Result<u32>) -> Result<(), String> {
 
 /// Handles one request on the listener's thread, returning once the
 /// instance has taken it (or refused it).
-pub type Handler = Box<dyn Fn(Request) -> Result<(), String> + Send + 'static>;
+pub type Handler = Box<dyn Fn(Request) -> Answer + Send + 'static>;
+
+/// The answer to one request read from a stream: the handler's, or a
+/// refusal of a request that couldn't be read.
+fn reply_to(read: Result<Request, String>, handler: &Handler) -> Answer {
+    match read {
+        Ok(request) => {
+            log::info!("a launch asked for {request:?}");
+            handler(request)
+        }
+        Err(why) => Answer::Refused(why),
+    }
+}
 
 #[cfg(unix)]
 mod imp {
@@ -217,10 +318,7 @@ mod imp {
         }
         stream.set_read_timeout(Some(FORWARD_LIMIT)).ok();
         stream.set_write_timeout(Some(FORWARD_LIMIT)).ok();
-        let reply = read_request(&stream).and_then(|request| {
-            log::info!("a launch asked for {request:?}");
-            handler(request)
-        });
+        let reply = reply_to(read_request(&stream), handler);
         if let Err(e) = answer(&stream, &reply) {
             log::warn!("answering a launch: {e}");
         }
@@ -259,14 +357,16 @@ mod imp {
         }
     }
 
-    pub fn forward(state_dir: &Path, request: &Request) -> Result<(), String> {
+    /// Sends `request` to the instance and returns its answer; `Err` when it
+    /// couldn't be reached or the exchange failed.
+    pub fn forward(state_dir: &Path, request: &Request) -> Result<Answer, String> {
         forward_to(&socket_path(state_dir), request)
     }
 
     /// [`forward`] to the socket at `path`. Before anything is sent, the
     /// socket must be served by this user ([`same_user`]): the instance
     /// checks who connects, and the launch checks who it connected to.
-    pub(super) fn forward_to(path: &Path, request: &Request) -> Result<(), String> {
+    pub(super) fn forward_to(path: &Path, request: &Request) -> Result<Answer, String> {
         let deadline = Instant::now() + FORWARD_LIMIT;
         let stream = loop {
             match UnixStream::connect(path) {
@@ -363,10 +463,7 @@ mod imp {
                         continue;
                     }
                 }
-                let reply = read_request(&pipe).and_then(|request| {
-                    log::info!("a launch asked for {request:?}");
-                    handler(request)
-                });
+                let reply = reply_to(read_request(&pipe), &handler);
                 // Closing a pipe drops what the client hasn't read yet, so
                 // wait until it has (FlushFileBuffers).
                 if let Err(e) = answer(&pipe, &reply).and_then(|()| pipe.sync_all()) {
@@ -383,7 +480,8 @@ mod imp {
     /// must run as this user at this integrity level
     /// ([`win::check_server`]): a pipe of that name made by another
     /// process, or by this user's Brindle at another level, gets nothing.
-    pub fn forward(state_dir: &Path, request: &Request) -> Result<(), String> {
+    /// `Err` when it couldn't be reached or the exchange failed.
+    pub fn forward(state_dir: &Path, request: &Request) -> Result<Answer, String> {
         let name = pipe_name(state_dir);
         let deadline = Instant::now() + FORWARD_LIMIT;
         let pipe = loop {
@@ -426,6 +524,7 @@ mod tests {
     #[test]
     fn requests_round_trip_as_one_line() {
         let request = Request {
+            kind: Some("terminal".into()),
             profile: Some("work".into()),
             cwd: Some("/srv".into()),
             command: Some(vec!["htop".into(), "-d".into(), "10".into()]),
@@ -454,14 +553,94 @@ mod tests {
         assert_eq!(launch_token(None, None), None);
     }
 
+    /// `process R6`: this version's request lines, byte for byte.
     #[test]
-    fn answers_parse() {
-        assert_eq!(parse_answer("ok\n"), Ok(()));
-        assert_eq!(parse_answer("error: no window\n"), Err("no window".into()));
-        assert!(parse_answer("").is_err());
-        let mut out = Vec::new();
-        answer(&mut out, &Err("two\nlines".into())).unwrap();
-        assert_eq!(out, b"error: two lines\n");
+    fn this_versions_requests_are_pinned() {
+        assert_eq!(Request::default().encode(), "{}\n", "a bare launch");
+        assert_eq!(Request { kind: Some("terminal".into()), ..Default::default() }.encode(), "{\"kind\":\"terminal\"}\n");
+        let launch = Request {
+            kind: Some("terminal".into()),
+            profile: Some("Work".into()),
+            cwd: Some("/srv".into()),
+            command: Some(vec!["htop".into()]),
+            launch_dir: Some("/srv".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            launch.encode(),
+            "{\"kind\":\"terminal\",\"profile\":\"Work\",\"cwd\":\"/srv\",\"command\":[\"htop\"],\"launch_dir\":\"/srv\"}\n",
+            "brindle terminal Work -d /srv -e htop, launched in /srv"
+        );
+    }
+
+    /// `process R6`: the lines launches from before subcommands send keep
+    /// opening what they asked for.
+    #[test]
+    fn older_requests_keep_decoding() {
+        let asked = |line: &str| Request::decode(line).and_then(|request| request.asked());
+        let terminal = |profile: Option<&str>, cwd: Option<&str>, command: Option<&str>| {
+            Ok(Forward::Terminal(TerminalLaunch {
+                profile: profile.map(Into::into),
+                cwd: cwd.map(Into::into),
+                command: command.map(|program| Command { program: program.into(), args: Vec::new() }),
+            }))
+        };
+        assert_eq!(asked("{\"profile\":\"work\"}\n"), terminal(Some("work"), None, None));
+        assert_eq!(
+            asked("{\"cwd\":\"/srv\",\"command\":[\"htop\"],\"launch_dir\":\"/srv\"}\n"),
+            terminal(None, Some("/srv"), Some("htop"))
+        );
+        assert_eq!(asked("{\"attach\":7,\"profile\":\"x\"}\n"), Ok(Forward::Attach(7)), "attach wins");
+        assert_eq!(asked("{}\n"), Ok(Forward::Raise));
+        assert_eq!(asked("{\"launch_dir\":\"/home/u\"}\n"), Ok(Forward::Raise));
+        assert_eq!(asked("{\"kind\":\"terminal\"}\n"), terminal(None, None, None), "brindle terminal alone");
+        assert_eq!(asked("{\"future\":1,\"profile\":\"w\"}\n"), terminal(Some("w"), None, None), "unknown fields are ignored");
+    }
+
+    #[test]
+    fn a_kind_this_brindle_cant_open_is_refused_by_name() {
+        let refused = Request::decode("{\"kind\":\"agent\",\"agent\":{}}\n").and_then(|request| request.asked());
+        let why = refused.unwrap_err();
+        assert!(why.contains("agent") && why.contains(env!("CARGO_PKG_VERSION")), "{why}");
+    }
+
+    /// `process R6`: the three answer lines, written and read back.
+    #[test]
+    fn answers_round_trip() {
+        let written = |reply: &Answer| {
+            let mut out = Vec::new();
+            answer(&mut out, reply).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(written(&Answer::Accepted), "ok\n");
+        assert_eq!(written(&Answer::Refused("x".into())), "error: x\n");
+        assert_eq!(written(&Answer::Usage("x".into())), "usage: x\n");
+        assert_eq!(written(&Answer::Refused("two\nlines".into())), "error: two lines\n");
+        for reply in [Answer::Accepted, Answer::Refused("no window".into()), Answer::Usage("no profile".into())] {
+            assert_eq!(parse_answer(&written(&reply)), reply);
+        }
+        assert!(matches!(parse_answer(""), Answer::Refused(_)), "a closed connection");
+        assert_eq!(parse_answer("something else\n"), Answer::Refused("something else".into()));
+    }
+
+    #[test]
+    fn a_request_fits_up_to_one_mib() {
+        let limit = MAX_REQUEST as usize;
+        assert_eq!(fits(&"x".repeat(limit)), Ok(()));
+        let why = fits(&"x".repeat(limit + 1)).unwrap_err();
+        assert!(why.contains("1 MiB") && why.contains(&(limit + 1).to_string()), "{why}");
+    }
+
+    #[test]
+    fn a_request_over_the_limit_is_refused_as_such() {
+        let line = "x".repeat(2 << 20);
+        assert_eq!(read_request(line.as_bytes()), Err("the request is over the 1 MiB limit".into()));
+        // Exactly at the limit, line end included, is read.
+        let mut at_limit = format!("{{\"profile\":\"{}\"}}", "p".repeat(MAX_REQUEST as usize - 15));
+        at_limit.push('\n');
+        assert_eq!(at_limit.len() as u64, MAX_REQUEST);
+        assert!(read_request(at_limit.as_bytes()).is_ok());
+        assert!(read_request("nope\n".as_bytes()).unwrap_err().starts_with("bad request: "));
     }
 
     #[test]
@@ -581,14 +760,17 @@ mod tests {
             Box::new(move |request: Request| {
                 let refuse = request.attach == Some(0);
                 tx.send(request).unwrap();
-                if refuse { Err("no such session".into()) } else { Ok(()) }
+                if refuse { Answer::Refused("no such session".into()) } else { Answer::Accepted }
             }),
         )
         .unwrap();
         let request = Request { profile: Some("p".into()), ..Default::default() };
-        assert_eq!(forward(&state, &request), Ok(()));
+        assert_eq!(forward(&state, &request), Ok(Answer::Accepted));
         assert_eq!(rx.recv().unwrap(), request);
-        assert_eq!(forward(&state, &Request { attach: Some(0), ..Default::default() }), Err("no such session".into()));
+        assert_eq!(
+            forward(&state, &Request { attach: Some(0), ..Default::default() }),
+            Ok(Answer::Refused("no such session".into()))
+        );
     }
 
     #[cfg(unix)]
@@ -603,16 +785,27 @@ mod tests {
         imp::listen_at(
             socket.clone(),
             Box::new(move |request: Request| {
-                let refuse = request.attach == Some(0);
+                let reply = match (request.attach, request.profile.as_deref()) {
+                    (Some(0), _) => Answer::Refused("no such session".into()),
+                    (_, Some("wrk")) => Answer::Usage("no profile is named \"wrk\"".into()),
+                    _ => Answer::Accepted,
+                };
                 tx.send(request).unwrap();
-                if refuse { Err("no such session".into()) } else { Ok(()) }
+                reply
             }),
         )
         .unwrap();
         let request = Request { profile: Some("p".into()), ..Default::default() };
-        assert_eq!(imp::forward_to(&socket, &request), Ok(()));
+        assert_eq!(imp::forward_to(&socket, &request), Ok(Answer::Accepted));
         assert_eq!(rx.recv().unwrap(), request);
-        assert_eq!(imp::forward_to(&socket, &Request { attach: Some(0), ..Default::default() }), Err("no such session".into()));
+        assert_eq!(
+            imp::forward_to(&socket, &Request { attach: Some(0), ..Default::default() }),
+            Ok(Answer::Refused("no such session".into()))
+        );
+        assert_eq!(
+            imp::forward_to(&socket, &Request { profile: Some("wrk".into()), ..Default::default() }),
+            Ok(Answer::Usage("no profile is named \"wrk\"".into()))
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

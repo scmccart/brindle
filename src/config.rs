@@ -438,9 +438,23 @@ pub struct Profile {
     pub(crate) removed_tmux_args: Option<toml::Value>,
 }
 
+/// What kind of tab a profile opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProfileKind {
+    /// A terminal tab, running the profile's program.
+    Terminal,
+}
+
 impl Profile {
     pub fn default_shell() -> Self {
         Self { name: "Shell".into(), ..Default::default() }
+    }
+
+    /// The kind of tab the profile opens. Every profile is a terminal
+    /// profile for now: `agents-profiles` adds the profile's `type` key and
+    /// makes this read it.
+    pub fn kind(&self) -> ProfileKind {
+        ProfileKind::Terminal
     }
 
     /// A short description of what the profile runs.

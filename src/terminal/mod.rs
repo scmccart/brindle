@@ -294,7 +294,8 @@ enum Backend {
 pub enum Closing {
     /// It keeps running, detached, and the next launch attaches it.
     Keeps,
-    /// It ends: a command given instead of the profile's program (`-e`),
+    /// It ends: a command given instead of the profile's program
+    /// (`brindle terminal -e`),
     /// which is never restored or reattached.
     Ends,
 }
@@ -569,8 +570,8 @@ impl Terminal {
         let theme = config.profile_theme(profile);
         #[cfg(any(target_os = "linux", windows))]
         {
-            // A command given instead of the profile's program (`-e`) is
-            // never restored or reattached, so it ends with its tab and with
+            // A command given instead of the profile's program (`brindle
+            // terminal -e`) is never restored or reattached, so it ends with its tab and with
             // Brindle. Everything else keeps running when Brindle goes away
             // without closing it.
             let closing = Closing::new(command_override.is_some());

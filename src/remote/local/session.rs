@@ -895,7 +895,7 @@ mod tests {
 
     /// What quitting does to a window's tabs: each terminal leaves its
     /// session explicitly (`Terminal::quit_with`: a profile tab's is detached,
-    /// an `-e` one's closed), then the drop, when GPUI runs it, leaves it
+    /// a `brindle terminal -e` one's closed), then the drop, when GPUI runs it, leaves it
     /// again, which sends nothing more. The flush before the exit returns
     /// once both are written.
     #[test]

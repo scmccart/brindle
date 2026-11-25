@@ -5,7 +5,7 @@
 #   scripts/run-throwaway.sh                   # a default config
 #   scripts/run-throwaway.sh --config FILE     # start from a copy of FILE
 #   scripts/run-throwaway.sh --keep            # keep the directory afterwards
-#   scripts/run-throwaway.sh -- -d /tmp        # arguments after -- go to brindle
+#   scripts/run-throwaway.sh -- terminal -d /tmp   # arguments after -- go to brindle
 #
 # On Windows use scripts/run-throwaway.ps1.
 #

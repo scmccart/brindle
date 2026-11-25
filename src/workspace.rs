@@ -28,7 +28,8 @@ use self::overlays::{Opens, OverlayKind, PaletteRole, Toggle, toggle};
 use self::previews::Previews;
 use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
-use crate::config::{Config, Profile, ProfileKey};
+use crate::config::{Config, Profile, ProfileKey, ProfileKind};
+use crate::TabKind;
 use crate::config_edit;
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
@@ -199,45 +200,69 @@ pub struct LaunchRequest {
     pub profile: usize,
     pub command: Option<(String, Vec<String>)>,
     pub cwd: Option<PathBuf>,
-    /// What the new tab says on its first line: why it isn't what was
-    /// asked for (`-p` named no profile).
-    pub note: Option<String>,
 }
 
 impl LaunchRequest {
     pub fn profile(profile: usize) -> Self {
-        Self { profile, command: None, cwd: None, note: None }
+        Self { profile, command: None, cwd: None }
     }
 }
 
-/// The profile a launch opens: the one `-p` names, else the default one.
-#[derive(Debug, PartialEq, Eq)]
-pub struct Chosen {
-    pub index: usize,
-    /// The name `-p` gave that no profile has; the default one was used.
-    pub missing: Option<String>,
+/// Why a launch's profile can't open its tab: a usage error, refused before
+/// anything opens (`brindle terminal NAME`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchRefusal {
+    /// No profile has the name. `known` is every profile's name, in config
+    /// order; `config_error` says the config failed to load, so they are
+    /// the default config's.
+    UnknownProfile { name: String, known: Vec<String>, config_error: bool },
+    /// The profile is of another kind than the subcommand's: `kind` is the
+    /// profile's. Nothing builds it until `agents-profiles` adds a second
+    /// kind.
+    #[cfg_attr(not(test), allow(dead_code))]
+    KindMismatch { profile: String, kind: ProfileKind },
 }
 
-impl Chosen {
-    /// What the new tab says when `-p` named no profile.
-    pub fn note(&self, config: &Config) -> Option<String> {
-        let name = self.missing.as_deref()?;
-        let used = config.profiles.get(self.index).map_or("the default profile", |profile| profile.name.as_str());
-        Some(format!("no profile is named \"{name}\"; using {used}"))
+impl std::fmt::Display for LaunchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownProfile { name, known, config_error: false } => {
+                write!(f, "no profile is named {name:?} (the profiles are: {})", known.join(", "))
+            }
+            Self::UnknownProfile { name, known, config_error: true } => write!(
+                f,
+                "no profile is named {name:?} (the config has an error, so Brindle is using the default config, \
+                 whose profiles are: {})",
+                known.join(", ")
+            ),
+            Self::KindMismatch { profile, kind } => {
+                let (kind, subcommand) = match kind {
+                    ProfileKind::Terminal => ("terminal", "terminal"),
+                };
+                write!(f, "{profile:?} is a {kind} profile: open it with brindle {subcommand} {profile}")
+            }
+        }
     }
 }
 
-/// The profile for `-p name` (matched without regard to case), or the
-/// default one when there is no name or no profile has it: the one rule for
+/// The profile a `kind` launch opens: the one `name` names (matched without
+/// regard to case), else the default one when there is no name. A name no
+/// profile has, or a profile of another kind, is refused: the one rule for
 /// a launch's first window and a later launch forwarded to it.
-pub fn profile_for(config: &Config, name: Option<&str>) -> Chosen {
-    let default = config.default_profile_index();
-    match name {
-        None => Chosen { index: default, missing: None },
-        Some(name) => match config.profile_index(name) {
-            Some(index) => Chosen { index, missing: None },
-            None => Chosen { index: default, missing: Some(name.to_string()) },
-        },
+/// `config_error` says the config failed to load, for the refusal's words.
+pub fn profile_for(
+    config: &Config,
+    kind: TabKind,
+    name: Option<&str>,
+    config_error: bool,
+) -> Result<usize, LaunchRefusal> {
+    let Some(name) = name else { return Ok(config.default_profile_index()) };
+    let Some(index) = config.profile_index(name) else {
+        let known = config.profiles.iter().map(|profile| profile.name.clone()).collect();
+        return Err(LaunchRefusal::UnknownProfile { name: name.to_string(), known, config_error });
+    };
+    match (kind, config.profiles[index].kind()) {
+        (TabKind::Terminal, ProfileKind::Terminal) => Ok(index),
     }
 }
 
@@ -685,7 +710,7 @@ impl Workspace {
                         }
                         // No record: the tab follows its profile.
                         (None, None) => {
-                            self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd), note: None }, window, cx)
+                            self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx)
                         }
                     }
                     let Some(tab) = self.active_ix().and_then(|ix| self.tabs.get_mut(ix)) else { continue };
@@ -908,9 +933,6 @@ impl Workspace {
         };
 
         let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
-        if let Some(note) = &request.note {
-            terminal.update(cx, |terminal, cx| terminal.note(note, cx));
-        }
         let font_size = profile.font_size;
         let theme = self.previews.theme_for(&profile, &config);
         let p_clone = profile.clone();
@@ -2744,7 +2766,7 @@ fn config_editor_launch(config: &Config, editor: (String, Vec<String>)) -> (Laun
     let default = config.default_profile_index();
     let local = |index: &usize| config.profiles.get(*index).is_some_and(|profile| Host::of(profile).is_local());
     let profile = Some(default).filter(local).or_else(|| (0..config.profiles.len()).find(local)).unwrap_or(default);
-    (LaunchRequest { profile, command: Some(editor), cwd: None, note: None }, Host::Local)
+    (LaunchRequest { profile, command: Some(editor), cwd: None }, Host::Local)
 }
 
 /// A tab's profile once the config is reloaded: the config's profile of
@@ -3273,25 +3295,49 @@ mod tests {
 
     #[test]
     fn a_name_matches_case_insensitively() {
-        let chosen = profile_for(&shell_and_work(), Some("wORK"));
-        assert_eq!(chosen, Chosen { index: 1, missing: None });
-        assert_eq!(chosen.note(&shell_and_work()), None);
+        assert_eq!(profile_for(&shell_and_work(), TabKind::Terminal, Some("Work"), false), Ok(1));
+        assert_eq!(profile_for(&shell_and_work(), TabKind::Terminal, Some("wORK"), false), Ok(1));
     }
 
     #[test]
-    fn an_unknown_name_gives_the_default_and_names_it() {
-        let config = shell_and_work();
-        let chosen = profile_for(&config, Some("wrk"));
-        assert_eq!(chosen, Chosen { index: 0, missing: Some("wrk".into()) });
-        assert_eq!(chosen.note(&config).as_deref(), Some("no profile is named \"wrk\"; using Shell"));
+    fn an_unknown_name_is_refused_listing_the_profiles() {
+        let refusal = profile_for(&shell_and_work(), TabKind::Terminal, Some("wrk"), false).unwrap_err();
+        assert_eq!(
+            refusal,
+            LaunchRefusal::UnknownProfile {
+                name: "wrk".into(),
+                known: vec!["Shell".into(), "Work".into()],
+                config_error: false
+            }
+        );
+        assert_eq!(refusal.to_string(), "no profile is named \"wrk\" (the profiles are: Shell, Work)");
     }
 
     #[test]
-    fn no_name_is_the_default_without_a_notice() {
-        let config = shell_and_work();
-        let chosen = profile_for(&config, None);
-        assert_eq!(chosen, Chosen { index: 0, missing: None });
-        assert_eq!(chosen.note(&config), None);
+    fn an_unknown_name_with_a_config_error_says_the_defaults_are_in_use() {
+        // The defaults a failed load falls back to: one `Shell` profile.
+        let defaults = Config::parse("").unwrap().config;
+        let refusal = profile_for(&defaults, TabKind::Terminal, Some("Work"), true).unwrap_err();
+        assert_eq!(
+            refusal.to_string(),
+            "no profile is named \"Work\" (the config has an error, so Brindle is using the default config, \
+             whose profiles are: Shell)"
+        );
+    }
+
+    #[test]
+    fn no_name_is_the_default_profile() {
+        let mut config = shell_and_work();
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(0));
+        config.default_profile = Some("work".into());
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(1));
+    }
+
+    /// No profile can be of another kind yet, so the refusal is built here.
+    #[test]
+    fn a_kind_mismatch_names_the_profile_its_kind_and_its_subcommand() {
+        let refusal = LaunchRefusal::KindMismatch { profile: "Work".into(), kind: ProfileKind::Terminal };
+        assert_eq!(refusal.to_string(), "\"Work\" is a terminal profile: open it with brindle terminal Work");
     }
 
     #[test]

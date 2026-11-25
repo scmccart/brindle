@@ -11,7 +11,7 @@ Try a build without touching your config, saved session or terminal server:
 - Linux: `scripts/run-throwaway.sh`, with `--config FILE`, `--keep` and
   `-- <brindle args>`.
 - Windows: `scripts/run-throwaway.ps1`, with `-Config FILE`, `-Keep` and
-  `-BrindleArgs '-d','C:/Temp'`.
+  `-BrindleArgs 'terminal','-d','C:/Temp'`.
 
 Record each row in the Result column as Pass, Fail or Not run, with the app
 you used. Rows that name a setting assume `right_click` and `copy_on_select`

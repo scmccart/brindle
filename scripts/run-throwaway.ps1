@@ -5,7 +5,7 @@
 #   scripts/run-throwaway.ps1                      # a default config
 #   scripts/run-throwaway.ps1 -Config FILE         # start from a copy of FILE
 #   scripts/run-throwaway.ps1 -Keep                # keep the directory afterwards
-#   scripts/run-throwaway.ps1 -BrindleArgs '-d','C:/Temp'   # arguments for brindle
+#   scripts/run-throwaway.ps1 -BrindleArgs 'terminal','-d','C:/Temp'   # arguments for brindle
 #
 # It makes a private directory under %TEMP% and points BRINDLE_CONFIG,
 # BRINDLE_STATE_DIR and BRINDLE_SERVER_DIR into it. So the settings dialog

@@ -300,7 +300,7 @@ Local tabs SHALL always run in the terminal server; Brindle SHALL NOT run their 
 - **THEN** the new tab runs in the server
 
 ### Requirement: Local terminals run in the terminal server
-On Linux and Windows, each local tab and zone SHALL run its program in a session of the terminal server (`terminal-server`), with the close rule of `tabs`: closing it ends the program, quitting or a crash leaves it detached, and `-e` command terminals end with Brindle. Brindle SHALL start the server when none is running. Every other requirement here, and titles, directories, shell integration, status and notifications, SHALL behave as with a PTY owned by Brindle.
+On Linux and Windows, each local tab and zone SHALL run its program in a session of the terminal server (`terminal-server`), with the close rule of `tabs`: closing it ends the program, quitting or a crash leaves it detached, and `-e` command terminals (`brindle terminal -e`) end with Brindle. Brindle SHALL start the server when none is running. Every other requirement here, and titles, directories, shell integration, status and notifications, SHALL behave as with a PTY owned by Brindle.
 
 #### Scenario: Tab program runs under the server
 - **WHEN** a local Linux tab starts the user's shell
@@ -319,7 +319,7 @@ On Linux and Windows, each local tab and zone SHALL run its program in a session
 - **THEN** their programs keep running and their sessions are listed as detached
 
 #### Scenario: Command tab ends with Brindle
-- **WHEN** Brindle is killed while a `brindle -e sleep 1000` tab is open
+- **WHEN** Brindle is killed while a `brindle terminal -e sleep 1000` tab is open
 - **THEN** that `sleep` is gone within a few seconds
 
 #### Scenario: Titles and directories

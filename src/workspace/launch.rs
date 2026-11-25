@@ -8,7 +8,8 @@ use crate::remote::Host;
 /// The directory a new tab on some host starts in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NewTabCwd {
-    /// The one the launch asked for (`-d`, a restored tab's, the forwarded
+    /// The one the launch asked for (`brindle terminal -d`, a restored
+    /// tab's, the forwarded
     /// working directory).
     Given(PathBuf),
     /// The active tab's current directory, which the window looks up only

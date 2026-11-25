@@ -139,6 +139,11 @@ impl Settings {
 
     /// [`Settings::new`] with the families the platform has installed
     /// ([`installed_families`]), logging the two it resolved.
+    /// Whether the last config load failed, so the default config applies.
+    pub fn has_config_error(&self) -> bool {
+        self.config_error.is_some()
+    }
+
     pub fn from_platform(config: Config, report: ConfigReport, cx: &App) -> Self {
         let settings = Self::new(config, report, installed_families(cx));
         let (font_family, ui_font_family): (&str, &str) = (&settings.font.family, &settings.ui_font_family);

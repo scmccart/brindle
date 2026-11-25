@@ -180,7 +180,7 @@ pub struct Run<'a> {
     /// `dump_at` ([`Run::dump_after_last_step`]).
     dump_after_last_step: Option<f64>,
     capture_at: Option<f64>,
-    /// Session restore: a plain launch (no `-p` or `--no-restore`), with the state in
+    /// Session restore: a plain launch (no `terminal PROFILE` or `--no-restore`), with the state in
     /// `<case dir>/state` as for every run.
     restore: bool,
     default_profile: &'static str,
@@ -605,9 +605,18 @@ impl<'a> Run<'a> {
             &Isolation { config: &config_path, state_dir: &state, server_dir: &ctx.server_dir, display: &ctx.display },
         );
         if !self.restore {
-            // `-p` alone restores too; these runs start clean.
-            command.args(["-p", self.profile, "--no-restore"]);
+            // `brindle terminal PROFILE` alone restores too; these runs
+            // start clean. `--attach` opens a tab of its own and can't be
+            // given with a subcommand, so an attaching run names none.
+            if self.args.iter().any(|arg| arg == "--attach") {
+                command.arg("--no-restore");
+            } else {
+                command.args(["terminal", self.profile, "--no-restore"]);
+            }
         }
+        // A restoring run with a command still needs the subcommand, which
+        // `-e` belongs to.
+        let subcommand = if self.restore && !self.command.is_empty() { &["terminal"][..] } else { &[][..] };
         for key in &self.env_remove {
             command.env_remove(key);
         }
@@ -622,6 +631,7 @@ impl<'a> Run<'a> {
                 None => ctx.step_interval(),
             })
             .args(["--dump-screen-after", &dump_secs.to_string()])
+            .args(subcommand)
             .args(if self.command.is_empty() { &[][..] } else { &["-e"][..] })
             .args(&self.command)
             .envs(self.env.iter().map(|(k, v)| (k, v)))

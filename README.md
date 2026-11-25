@@ -104,7 +104,7 @@ its program on the host. Quitting Brindle, a crash or a dropped network leaves
 it running in the host's terminal server, detached, and the next launch
 attaches it again with its screen: a restored remote zone takes back its own
 session, once Brindle has connected to its host. A tab opened with
-`brindle -e` ends at quit, as a local one does. `brindle-remote list` on the host shows
+`brindle terminal -e` ends at quit, as a local one does. `brindle-remote list` on the host shows
 the sessions.
 
 Brindle notices a connection that has gone silent within about half a minute.
@@ -185,7 +185,7 @@ starts one.
 Closing a zone or a tab ends its programs. Quitting Brindle (ctrl-shift-q,
 closing its window, a crash, or the desktop stopping it at logout) leaves
 every local tab's programs running in the server, detached, and the next
-launch attaches them again. A command run with `brindle -e` ends at quit instead. A session
+launch attaches them again. A command run with `brindle terminal -e` ends at quit instead. A session
 also ends when its program exits, and if Brindle's connection drops (say the
 core crashes) the tabs reconnect and get their screens back; a session the
 server no longer has shows a red "session lost" line and the tab stays open.
@@ -542,20 +542,48 @@ writes its WinGet manifest.
 ## Usage
 
 ```
-brindle [-p PROFILE] [-d DIR] [--no-restore] [-e COMMAND ARGS...]
-brindle --attach ID                 # Linux: a detached terminal server session
-brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish
+brindle [--no-restore]              # the window: the restored tabs, else the default profile
+brindle terminal [PROFILE] [-d DIR] [-e COMMAND ARGS...]   # a terminal tab
+brindle --attach ID                 # a detached terminal server session
+brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish|pwsh
 brindle --export-ui-tokens          # the built-in themes' UI tokens as CSS
 brindle --install-desktop | --uninstall-desktop [--prefix DIR]
 ```
 
+`brindle terminal` opens a terminal tab of PROFILE (matched without regard to
+case; the default profile when it names none), in DIR, running COMMAND instead
+of the profile's program. PROFILE and `-d` may come in either order, and `-e`
+comes last: it takes every argument after it. `--config FILE`, `--no-restore`
+and the debug options go before or after the subcommand. A PROFILE no profile
+has is refused (status 2, listing the profiles) rather than opening another.
+
 Brindle has one window. Launching it again while it runs (from the desktop or
 a shell) hands the launch to the running Brindle and exits: the window comes
-to the front, and `-p`, `-d`, `-e` or `--attach` open their tab there as the
-active one, with `-e` starting in the directory it was typed in. A launch with
-the debug options (`--send`, `--action`, `--dump-screen-after`, …) runs on its
-own instead, restoring nothing and recording nothing. Brindles with different
-`BRINDLE_STATE_DIR`s are separate.
+to the front, and `brindle terminal` or `--attach` open their tab there as the
+active one, with `-e` starting in the directory it was typed in.
+`brindle terminal` alone opens a new default-profile tab (a running Brindle
+from before the subcommand only comes to the front). The running Brindle
+checks the profile against its own config, so a profile added to the config
+is found once it has reloaded the file, and an unknown one is refused with
+the profiles it has. A launch with the debug options (`--send`, `--action`,
+`--dump-screen-after`, …) runs on its own instead, restoring nothing and
+recording nothing. Brindles with different `BRINDLE_STATE_DIR`s are separate.
+
+### Upgrading from the flat options
+
+The flat launch options are gone, with no deprecation period: each is now a
+usage error that says what to type instead. Desktop launchers, shortcuts and
+scripts that pass them need changing:
+
+| Before | Now |
+| --- | --- |
+| `brindle -p NAME` | `brindle terminal NAME` |
+| `brindle -d DIR` | `brindle terminal -d DIR` |
+| `brindle -e COMMAND …` | `brindle terminal -e COMMAND …` |
+
+A profile name that no profile has used to open the default profile with a
+dim line saying so; it is now refused with status 2, before any window opens.
+`brindle agent` is reserved for agent tabs and refused for now.
 
 On first launch Brindle writes a commented config to
 `~/.config/brindle/config.toml`. The file is reloaded automatically when it changes.
@@ -755,7 +783,7 @@ opens the profile menu instead); to get the old key back, bind
 
 Every launch reopens the tabs you had when Brindle last quit (the old
 `restore_session` setting is ignored; restoring is always on), then opens
-what it asked for (`-p`, `-d`, `-e` or `--attach`) as the active tab:
+what it asked for (`brindle terminal`'s tab or `--attach`'s session) as the active tab:
 
 - the window's size, its tabs in order, and its active tab;
 - each tab's profile and zone split tree, with each zone in its shell's last directory and the active zone focused;

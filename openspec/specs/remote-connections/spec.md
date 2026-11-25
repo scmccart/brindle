@@ -206,7 +206,7 @@ A relay that hears nothing from Brindle for a bounded idle limit (60 s) SHALL en
 A remote `-e` command terminal's session SHALL NOT end when its connection drops, if Brindle reconnects within 5 minutes of the host noticing the drop. It SHALL end if Brindle doesn't reconnect in that time.
 
 #### Scenario: Short drop
-- **WHEN** a tab opened with `brindle -p A8 -e htop` loses its connection for one minute
+- **WHEN** a tab opened with `brindle terminal A8 -e htop` loses its connection for one minute
 - **THEN** after the reconnect the tab shows the same `htop` process
 
 #### Scenario: Brindle crashed

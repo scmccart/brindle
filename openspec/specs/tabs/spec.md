@@ -164,7 +164,7 @@ Brindle SHALL show a single window. No command SHALL open another window; openin
 - **THEN** "Close Window" is listed and "New Window" is not
 
 ### Requirement: Quitting keeps programs running
-Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every open local or remote terminal's program running detached, on Linux and on Windows, so the next launch brings it back (see `session-restore`), except `-e` command terminals, which end. Brindle SHALL NOT ask. When Brindle ends without quitting (a crash, a signal, the desktop stopping it), the same terminals SHALL keep running.
+Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every open local or remote terminal's program running detached, on Linux and on Windows, so the next launch brings it back (see `session-restore`), except `-e` command terminals (`brindle terminal -e`), which end. Brindle SHALL NOT ask. When Brindle ends without quitting (a crash, a signal, the desktop stopping it), the same terminals SHALL keep running.
 
 #### Scenario: Quit
 - **WHEN** the window holds three local tabs and the user presses ctrl-shift-q
@@ -179,7 +179,7 @@ Quitting Brindle (`Quit`, ctrl-shift-q, closing the window) SHALL leave every op
 - **THEN** the `ping` keeps running, detached
 
 #### Scenario: Command tab
-- **WHEN** a tab runs `brindle -e sleep 1000`'s command and the user quits
+- **WHEN** a tab runs `brindle terminal -e sleep 1000`'s command and the user quits
 - **THEN** that `sleep` is gone within a few seconds and no session is listed for it
 
 #### Scenario: Remote tab

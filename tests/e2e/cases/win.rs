@@ -213,8 +213,8 @@ fn right_click(pid: u32, scale: f32, x: f32, y: f32) -> String {
 /// the second's place depends on the first's title (on an elevated runner
 /// the console host's title makes the first tab wider).
 fn tab_menu_background(ctx: &Ctx) -> Result<Outcome> {
-    let args = ["-p", "cmd", "--action", "new_tab"];
-    let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
+    let args = ["terminal", "cmd", "--action", "new_tab"];
+    let first = run(ctx, "scale", &["terminal", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
     // The first tab's face, 40 in from its left edge; the list's 36px
     // start 6 down.
@@ -261,7 +261,7 @@ fn caption(ctx: &Ctx) -> Result<Outcome> {
         ("new-tab", 6.0 + 80.0 + 3.0 + 4.0 + 16.0, middle),
     ];
     // The scale comes from a first run's dump.
-    let first = run(ctx, "scale", &["-p", "cmd"], &[], 2.0, None)?;
+    let first = run(ctx, "scale", &["terminal", "cmd"], &[], 2.0, None)?;
     let scale = first.dump.grid.as_ref().map(|g| g.scale).ok_or("no grid in the dump")?;
     // HTCLOSE, HTMAXBUTTON, HTMINBUTTON, HTCAPTION, HTCLIENT, HTCLIENT.
     let hits = "close=20 max=9 min=8 strip=2 tab=1 new-tab=1";
@@ -270,7 +270,7 @@ fn caption(ctx: &Ctx) -> Result<Outcome> {
     let probe = move |pid| caption_probe(pid, scale, &points, hits, waits);
     // Done once it has clicked: that happens once only.
     let clicked = |seen: &str| seen.contains("double-click=");
-    let ran = run(ctx, "caption", &["-p", "cmd"], &[], 7.0, Some(Probe { run: &probe, done: &clicked }))?;
+    let ran = run(ctx, "caption", &["terminal", "cmd"], &[], 7.0, Some(Probe { run: &probe, done: &clicked }))?;
     ensure!(ran.during == expected, "caption at scale {scale}: {} (want {expected})", ran.during);
     Ok(Outcome::Pass)
 }
@@ -358,8 +358,9 @@ fn run_keeping(
     std::fs::write(&config, config_text).map_err(|e| e.to_string())?;
     let log_path = ctx.dir.join(format!("{label}.log"));
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-    // `-p` alone restores the previous run's tabs too; such runs start clean.
-    let no_restore: &[&str] = if args.contains(&"-p") { &["--no-restore"] } else { &[] };
+    // `brindle terminal PROFILE` alone restores the previous run's tabs
+    // too; such runs start clean.
+    let no_restore: &[&str] = if args.contains(&"terminal") { &["--no-restore"] } else { &[] };
     let mut command = Command::new(&ctx.bin);
     let state = crate::brindle::state_dir(ctx);
     isolate(
@@ -469,7 +470,7 @@ fn conpty_host(ctx: &Ctx) -> Result<Outcome> {
         count(holder, "OpenConsole.exe") > 0 && count(holder, "cmd.exe") > 0
     };
     let probe = Probe { run: &hosts, done: &started };
-    let ran = run(ctx, "host", &["-p", "cmd", "--send", "echo hello-host\r"], &[], 4.0, Some(probe))?;
+    let ran = run(ctx, "host", &["terminal", "cmd", "--send", "echo hello-host\r"], &[], 4.0, Some(probe))?;
     let logs = holder_logs(ctx);
     let (holder, brindle) = ran.during.split_once(';').unwrap_or_default();
     ensure!(count(holder, "OpenConsole.exe") > 0, "under the holder: {holder}");
@@ -499,7 +500,7 @@ fn conpty_fallback(ctx: &Ctx) -> Result<Outcome> {
     let ran = run(
         ctx,
         "fallback",
-        &["-p", "cmd", "--send", "echo hello-inbox\r", "--action", "new_tab"],
+        &["terminal", "cmd", "--send", "echo hello-inbox\r", "--action", "new_tab"],
         &[("BRINDLE_CONPTY", "inbox")],
         6.5,
         // One host per tab: done once the second tab's is there.
@@ -541,7 +542,7 @@ while (-not ($reply.EndsWith($b) -or $reply.EndsWith("$e\")) -and (Get-Date) -lt
         ),
     )?;
     let notes_env = notes.display().to_string();
-    let ran = run(ctx, "passthrough", &["-p", "pwsh", "--send", &send], &[("BRINDLE_NOTIFY_LOG", &notes_env)], 6.0, None)?;
+    let ran = run(ctx, "passthrough", &["terminal", "pwsh", "--send", &send], &[("BRINDLE_NOTIFY_LOG", &notes_env)], 6.0, None)?;
     let text = screen(&ran.dump);
     ensure!(text.contains("building") && text.contains("done"), "screen:\n{text}");
     // Brindle answers OSC 11 with the e2e theme's background (#101418).
@@ -561,7 +562,7 @@ fn glyph_width(ctx: &Ctx) -> Result<Outcome> {
          [Console]::Write(\"`re$([char]0x301)\"); $accent = [Console]::CursorLeft\n\
          \"`nwidths=$heart,$accent\"\n",
     )?;
-    let ran = run(ctx, "width", &["-p", "pwsh", "--send", &send], &[], 5.0, None)?;
+    let ran = run(ctx, "width", &["terminal", "pwsh", "--send", &send], &[], 5.0, None)?;
     let text = screen(&ran.dump);
     ensure!(text.contains("widths=1,1"), "screen:\n{text}");
     Ok(Outcome::Pass)
@@ -577,15 +578,15 @@ fn title_child(ctx: &Ctx) -> Result<Outcome> {
     // `ping -n N` runs for N - 1 s: past the dump (4 s, stretched), with 4 s
     // to spare.
     let lasting = ctx.secs(4.0).ceil() as u32 + 4;
-    let during = run(ctx, "during", &["-p", "pwsh", "--send", &ping(lasting)], &[], 4.0, None)?;
+    let during = run(ctx, "during", &["terminal", "pwsh", "--send", &ping(lasting)], &[], 4.0, None)?;
     ensure!(title(&during.dump) == "PING", "title while ping runs: {:?}", title(&during.dump));
-    let after = run(ctx, "after", &["-p", "pwsh", "--send", &ping(1)], &[], 5.0, None)?;
+    let after = run(ctx, "after", &["terminal", "pwsh", "--send", &ping(1)], &[], 5.0, None)?;
     ensure!(title(&after.dump) == "pwsh", "title after ping: {:?}", title(&after.dump));
     let renamed = run(
         ctx,
         "rename",
         &[
-            "-p",
+            "terminal",
             "pwsh",
             "--action",
             "rename_tab",
@@ -605,7 +606,7 @@ fn title_child(ctx: &Ctx) -> Result<Outcome> {
         ctx,
         "clear-rename",
         &[
-            "-p",
+            "terminal",
             "pwsh",
             "--send",
             "[Console]::Write(\"`e]2;auto-title`a\")\r",
@@ -661,7 +662,7 @@ fn pwsh_integration(ctx: &Ctx) -> Result<Outcome> {
             &config,
             &format!("{label}-marks"),
             &[
-                "-p",
+                "terminal",
                 "si",
                 "--wait-for",
                 "MYPROMPT>",
@@ -772,7 +773,7 @@ fn pwsh_line(ctx: &Ctx) -> Result<Outcome> {
             &config,
             &label,
             &[
-                "-p",
+                "terminal",
                 "si",
                 "--wait-for",
                 "MYPROMPT>",
@@ -836,7 +837,7 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
         ctx,
         "close",
         &[
-            "-p",
+            "terminal",
             "cmd",
             "--send",
             "for /L %i in (1,0,2) do @echo flood %i\r",
@@ -864,7 +865,7 @@ fn close_mid_output(ctx: &Ctx) -> Result<Outcome> {
 /// and the run's own limit fails the case. (A slow but unfrozen window
 /// isn't caught; the bug this guards was a freeze.)
 fn flood_responsive(ctx: &Ctx) -> Result<Outcome> {
-    let ran = run(ctx, "flood", &["-p", "cmd", "--send", "for /L %i in (1,0,2) do @echo flood %i\r"], &[], 6.0, None)?;
+    let ran = run(ctx, "flood", &["terminal", "cmd", "--send", "for /L %i in (1,0,2) do @echo flood %i\r"], &[], 6.0, None)?;
     ensure!(ran.dump.screen.iter().any(|line| line.starts_with("flood ")), "screen {:?}", ran.dump.screen);
     Ok(Outcome::Pass)
 }
@@ -877,7 +878,7 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
         &restore_config,
         "zones-split",
         &[
-            "-p",
+            "terminal",
             "cmd",
             "--send",
             "echo zone1-left\r",
@@ -946,7 +947,7 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
         ctx,
         "zones-close",
         &[
-            "-p",
+            "terminal",
             "cmd",
             "--send",
             "echo zone1-kept\r",
