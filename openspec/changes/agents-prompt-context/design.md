@@ -229,9 +229,9 @@ Decided on 2026-11-25:
 
 - A text file dropped on a remote agent's zone is attached as its contents (decision 8). The user noted this is where the upload comes in: files that aren't text, and ones over the limit, wait for `agents-prompt-images`' upload in pieces.
 
-Still open, with a recommendation the text above follows:
+- With several agent zones open, a palette asks which takes a command's output (decision 8).
 
-4. **Several agent zones open:** a palette asks which (recommended), or the most recently focused one takes it.
+None is open.
 
 ## Risks / Trade-offs
 

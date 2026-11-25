@@ -1,6 +1,6 @@
 # Tasks
 
-Before starting, check that the changes this one builds on are implemented and archived, and that the user has settled design.md's open decisions:
+Before starting, check that the changes this one builds on are implemented and archived (the user's decisions are settled; design.md lists them):
 - `agents-profiles` (and through it `agents-sessions`): `AGENT_PROMPT`, `Entry::User`, `Slot`, the reducer's prompt and queue handling, `src/agent/model.rs`, `brindle-ui`'s `PromptInput`, the dump's agent lines, the fake ACP agent.
 - `agents-markdown`: `CodeBlock`. `agents-tool-content`: `acp/forms.rs`, `acp/dialect.rs`, `acp/v1/`, `Request`.
 - When stacked on `agents-commands`: option commands and completion read the text only and leave the draft alone.
