@@ -18,3 +18,7 @@ pub mod spawn;
 // Whether a close asks first: group 6's close paths call it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod close;
+
+// The chat model and the protocol gate: groups 4 and 5 use them.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod model;
