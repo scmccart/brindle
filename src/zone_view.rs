@@ -587,16 +587,20 @@ impl ZoneContent {
         }
     }
 
-    /// The status the zone shows, its progress and its context badge: a
-    /// terminal's program status, or the agent zone's shown status with no
-    /// progress or badge.
+    /// The status the zone's dot shows, its progress and its context badge:
+    /// a terminal's program status, or the agent zone's shown status with
+    /// no progress or badge. `idle` shows no dot, as a program's `idle`
+    /// record shows none.
     pub fn status(&self, cx: &App) -> (Option<State>, Option<Progress>, Option<Badge>) {
         match self {
             Self::Terminal(view) => {
                 let terminal = view.read(cx).terminal.read(cx);
                 (terminal.status().summary(), terminal.progress(), terminal.badge().cloned())
             }
-            Self::Agent(view) => (view.read(cx).agent().read(cx).status(), None, None),
+            Self::Agent(view) => {
+                let status = view.read(cx).agent().read(cx).status().filter(|&state| state != State::Idle);
+                (status, None, None)
+            }
         }
     }
 
@@ -2074,6 +2078,34 @@ mod tests {
         });
         let closing = shell.view.read_with(shell.cx, |view, cx| view.closing(cx));
         assert_eq!(close_plan(&closing), ClosePlan::Now);
+    }
+
+    /// An agent zone's dot follows its activity, drops `done` once the
+    /// user types into the prompt input, and shows nothing while idle: what
+    /// the zone header draws and the tab's dot summarises.
+    #[test]
+    fn an_agent_zones_dot_follows_its_status_and_the_seen_rule() {
+        use crate::agent::test_support::{Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, StopReason, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent.clone()));
+        let dot = |tab: &Tab| {
+            tab.view.read_with(tab.cx, |view, cx| (view.zones[&view.active].status, view.status_summary(cx)))
+        };
+        zone.feed(&[ready()]);
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (None, None), "idle shows no dot");
+        zone.feed(&[Event::Turn { state: TurnState::Blocked }]);
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (Some(State::Blocked), Some(State::Blocked)));
+        zone.feed(&[Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } }]);
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (Some(State::Done), Some(State::Done)));
+        tab.cx.update(|_, cx| agent.update(cx, |agent, cx| agent.seen(cx)));
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (None, None), "seen");
     }
 
     /// An agent zone whose agent exits stays open, its tab with it: the

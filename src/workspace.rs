@@ -1955,7 +1955,9 @@ impl Workspace {
         let types: std::collections::HashSet<std::any::TypeId> =
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
         // The palette lists what the tab can run: GPUI's answer, applied.
+        let agent = self.active_tab().is_some_and(|t| t.zones.read(cx).active_content().is_some_and(|c| c.agent_view().is_some()));
         let facts = PaletteFacts {
+            zone: if agent { PaletteZone::Agent } else { PaletteZone::Terminal },
             prompt_marks: self
                 .active_tab()
                 .and_then(|t| t.active_terminal(cx))

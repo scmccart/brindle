@@ -199,6 +199,51 @@ pub fn prompt_stdin(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The seen rule on the tab's dot: after a turn that ended normally the
+/// agent tab's face shows the green dot (seen from a Shell tab opened in
+/// front of it, so the strip can be found from its grid); typing a key into
+/// the prompt input first leaves no dot.
+pub fn seen(ctx: &Ctx) -> Result<Outcome> {
+    use super::tabs::{FACE_HEIGHT, FACE_LEFT, FACE_TOP, Strip};
+    use crate::brindle::theme;
+    let (profile, _) = hello_agent(ctx)?;
+    let green = theme::ANSI[2];
+    for (label, typed) in [("done", false), ("seen", true)] {
+        let mut run = Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+        if typed {
+            run = run.send("x");
+        }
+        let out = run.action("new_tab").capture_at(7.0).dump_at(7.5).run()?;
+        ensure!(out.dump.wait_timeouts.is_empty(), "{label}: waits that gave up: {:?}", out.dump.wait_timeouts);
+        ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "{label}: the Shell tab in front: {:?}", out.dump.tabs);
+        let image = out.image.as_ref().ok_or("no capture")?;
+        let strip = Strip::locate(&out, image)?;
+        let scale = out.dump.grid()?.scale;
+        let lead = strip.rect(FACE_LEFT + 8.0, FACE_TOP + 8.0, 14.0, FACE_HEIGHT - 16.0);
+        if typed {
+            image.expect_none("seen: no dot on the agent tab", lead, green)?;
+        } else {
+            image.expect("done: the green dot on the agent tab", lead, green, (10.0 * scale * scale) as usize)?;
+        }
+    }
+    Ok(Outcome::Pass)
+}
+
+/// The command palette in an agent zone lists the agent's commands with the
+/// zone and tab ones, and none that acts on a terminal.
+pub fn palette_commands(ctx: &Ctx) -> Result<Outcome> {
+    let (profile, _) = hello_agent(ctx)?;
+    let out = Run::new(ctx, "palette").config(&profile).agent("Fake").wait_for(READY).action("open_command_palette").dump_at(4.0).run()?;
+    let listed = |label: &str| out.dump.palette.iter().skip(1).any(|row| row.starts_with(&format!("{label}  ")) || row == label);
+    for label in ["Stop Agent Turn", "Copy Last Agent Message", "Scroll Agent to Bottom", "Split Zone Right", "Close Tab"] {
+        ensure!(listed(label), "{label} isn't listed: {:?}", out.dump.palette);
+    }
+    for label in ["Clear Scrollback", "Find", "Scroll to Bottom", "Copy"] {
+        ensure!(!listed(label), "{label} is listed: {:?}", out.dump.palette);
+    }
+    Ok(Outcome::Pass)
+}
+
 /// Closing a working agent asks first (design.md decision 12): Close
 /// Zone opens the confirmation naming the working agent, Cancel focused,
 /// with the turn going on; enter and escape cancel, leaving the zone and
