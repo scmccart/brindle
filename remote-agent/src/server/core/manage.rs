@@ -25,6 +25,7 @@ use brindle_remote_protocol::client::{
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
 
 use super::clients::error;
+use super::policy;
 use super::{Answer, Core, log};
 use crate::server::event_loop::{EventLoop, Token};
 
@@ -34,10 +35,13 @@ impl<L: EventLoop> Core<L> {
     /// away, aren't listed.
     pub(super) fn client_list(&mut self, client: Token, req: RequestId) {
         let now = Instant::now();
+        // A client below protocol 4 isn't shown agent sessions.
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
         let sessions = self
             .sessions
             .iter()
             .filter(|(_, session)| session.life.is_running())
+            .filter(|(_, session)| policy::shown(session.kind(), protocol))
             .map(|(&id, session)| session.info(id, now))
             .collect();
         self.send_client(client, ToClient::Sessions(Sessions { req, sessions }));
