@@ -10,9 +10,13 @@
 //! - [`lines`]: stdout split into bounded lines ([`lines::Lines`]).
 //! - [`rpc`]: the request bookkeeping ([`rpc::Rpc`]) and every line the core
 //!   writes to the agent.
+//! - [`reduce`]: the reducer ([`reduce::step`] over a [`reduce::AgentSession`]),
+//!   which turns the agent's stdout, the client's commands and the holder's
+//!   events into transcript events, stdin bytes, replies and checkpoints.
 //!
 //! Each is a whole pure module (`fcis` R2, R3; `PURE_MODULES`).
 
 pub mod lines;
+pub mod reduce;
 pub mod rpc;
 pub mod wire;
