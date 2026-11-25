@@ -248,6 +248,28 @@ fn after_an_exit_send_again_is_unavailable_and_discard_clears_the_row() {
     assert!(f.cx.debug_bounds("agent-alert").is_some());
 }
 
+/// A refused spawn with a Windows batch file's hint shows its `cmd /c`
+/// form on a monospace line of its own; the reconnecting banner shows
+/// while the link is down.
+#[test]
+fn the_alert_shows_a_batch_files_form_and_the_banner_the_reconnect() {
+    let mut f = Fixture::new();
+    assert!(f.cx.debug_bounds("agent-alert-mono").is_none());
+    let failure = crate::agent::model::StartFailure::Refused {
+        command: "npx".into(),
+        cause: "npx is a batch file: run it as `cmd /c npx agent`".into(),
+    };
+    f.zone.sink.failed(&anyhow::Error::new(failure));
+    f.settle();
+    assert!(f.cx.debug_bounds("agent-alert-mono").is_some());
+
+    let mut g = Fixture::new();
+    g.feed(&[ready()]);
+    g.zone.sink.link_down();
+    g.settle();
+    assert!(g.cx.debug_bounds("agent-banner").is_some());
+}
+
 /// The slot changing never touches the draft.
 #[test]
 fn the_draft_is_unchanged_when_a_prompt_becomes_held() {
