@@ -195,6 +195,23 @@ impl AgentView {
         &self.scroller
     }
 
+    /// Takes the tab's profile's theme (the card's background and text,
+    /// and the held row's warning colour) and font size (`None`: the
+    /// terminal size in effect), as the config now has them or the
+    /// settings dialog previews them.
+    pub fn set_profile(&mut self, theme: Theme, font_size_override: Option<f32>, cx: &mut Context<Self>) {
+        let held = theme.ansi[3].hsla();
+        self.prompt.update(cx, |prompt, cx| prompt.set_held_color(held, cx));
+        self.theme = theme;
+        self.font_size_override = font_size_override;
+        // Every block is measured again at the new size.
+        self.scroller.update(cx, |scroller, cx| {
+            let count = scroller.item_count();
+            scroller.splice(0..count, count, cx);
+        });
+        cx.notify();
+    }
+
     /// The size the conversation and the prompt are drawn at: the
     /// profile's font size, else the terminal size in effect (zoom
     /// included).
@@ -441,6 +458,73 @@ fn block_element(
     }
 }
 
+/// Lays out, prepaints and paints its child with the rem as `size`, so the
+/// components inside, sized in rems, follow the zone's text size (the
+/// profile's font size, else the terminal's) rather than the chrome's.
+struct RemScope {
+    size: Pixels,
+    child: gpui::AnyElement,
+}
+
+impl IntoElement for RemScope {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for RemScope {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        let child = &mut self.child;
+        (window.with_rem_size(Some(self.size), |window| child.request_layout(window, cx)), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        window.with_rem_size(Some(self.size), |window| child.prepaint(window, cx));
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: gpui::Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let child = &mut self.child;
+        window.with_rem_size(Some(self.size), |window| child.paint(window, cx));
+    }
+}
+
 impl Render for AgentView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let model = self.agent.read(cx).model();
@@ -451,7 +535,7 @@ impl Render for AgentView {
         let settings = Settings::get(cx);
         let (size, family) = (self.text_size(cx), settings.ui_font_family());
         let (bg, fg) = (self.theme.background.hsla(), self.theme.foreground.hsla());
-        div()
+        let content = div()
             .key_context("AgentZone")
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
@@ -509,7 +593,8 @@ impl Render for AgentView {
                             .children(alert)
                             .child(self.prompt.clone()),
                     ),
-            )
+            );
+        RemScope { size, child: content.into_any_element() }
     }
 }
 

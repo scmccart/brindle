@@ -331,6 +331,25 @@ fn render_takes_no_lock() {
     assert!(f.cx.debug_bounds("prompt-area").is_some());
 }
 
+/// 5.3: the profile's font size, else the terminal size in effect; the
+/// drawn prompt grows with it.
+#[test]
+fn set_profile_changes_the_text_size() {
+    let f = Fixture::new();
+    let configured = f.cx.update(|_, cx| Settings::get(cx).font_size(None));
+    assert_eq!(f.view.read_with(f.cx, |view, cx| view.text_size(cx)), configured);
+    let before = f.cx.debug_bounds("prompt-area").expect("drawn").size.height;
+    let view = f.view.clone();
+    let big = configured + gpui::px(12.0);
+    f.cx.update(|_, cx| view.update(cx, |view, cx| view.set_profile(Theme::default(), Some(f32::from(big)), cx)));
+    f.cx.run_until_parked();
+    assert_eq!(f.view.read_with(f.cx, |view, cx| view.text_size(cx)), big);
+    let after = f.cx.debug_bounds("prompt-area").expect("drawn").size.height;
+    assert!(after > before, "the prompt is drawn larger: {before:?} then {after:?}");
+    f.cx.update(|_, cx| view.update(cx, |view, cx| view.set_profile(Theme::default(), None, cx)));
+    assert_eq!(f.view.read_with(f.cx, |view, cx| view.text_size(cx)), configured);
+}
+
 #[test]
 fn the_prompt_state_follows_the_model() {
     use crate::agent::model::DisabledWhy;
