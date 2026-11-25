@@ -22,9 +22,5 @@
 pub mod checkpoint;
 pub mod lines;
 pub mod reduce;
-// Until the reducer logs in (agents-login task 3.3), the login lines and
-// `auth_methods` are only tested.
-#[cfg_attr(not(test), expect(dead_code))]
 pub mod rpc;
-#[cfg_attr(not(test), expect(dead_code))]
 pub mod wire;

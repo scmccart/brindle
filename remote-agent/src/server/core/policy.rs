@@ -559,7 +559,8 @@ pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
             | Moment::TurnEnded
             | Moment::QueueChanged
             | Moment::Permission
-            | Moment::Stopped,
+            | Moment::Stopped
+            | Moment::Login,
         ))
         | AgentCheckpoint::StepDown
         | AgentCheckpoint::Detach => true,
@@ -586,6 +587,7 @@ pub(super) enum AgentRequest {
     Unqueue,
     Resend,
     Restart,
+    Login,
 }
 
 impl AgentRequest {
@@ -598,6 +600,7 @@ impl AgentRequest {
             Self::Unqueue => "AGENT_UNQUEUE",
             Self::Resend => "AGENT_RESEND",
             Self::Restart => "AGENT_RESTART",
+            Self::Login => "AGENT_LOGIN",
         }
     }
 }
@@ -1326,6 +1329,7 @@ mod tests {
             (AgentRequest::Unqueue, "AGENT_UNQUEUE needs client protocol 4"),
             (AgentRequest::Resend, "AGENT_RESEND needs client protocol 4"),
             (AgentRequest::Restart, "AGENT_RESTART needs client protocol 4"),
+            (AgentRequest::Login, "AGENT_LOGIN needs client protocol 4"),
         ];
         for (request, text) in cases {
             for protocol in 1..AGENT_PROTOCOL {
@@ -1355,6 +1359,7 @@ mod tests {
             Moment::QueueChanged,
             Moment::Permission,
             Moment::Stopped,
+            Moment::Login,
         ];
         for moment in moments {
             assert!(agent_checkpoint_due(AgentCheckpoint::Stepped(Some(moment)), 0), "{moment:?}");

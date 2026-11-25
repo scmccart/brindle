@@ -313,6 +313,10 @@ pub const MAX_LOGIN_DESCRIPTION: usize = 4 * 1024;
 /// method is left out, since a cut argument would run something else.
 pub const MAX_LOGIN_ARGS: usize = 32;
 pub const MAX_LOGIN_ARG: usize = 4 * 1024;
+/// The most the kept methods may take, encoded as the transcript sends
+/// them: the methods past it are left out, so a `LoginRequired` event,
+/// which carries them all, fits a frame (`pack_transcript`).
+pub const MAX_LOGIN_METHODS_LEN: usize = 256 * 1024;
 
 /// The login methods `initialize` advertised, as [`auth_methods`] read them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -322,7 +326,7 @@ pub struct Methods {
     pub methods: Vec<LoginMethod>,
     /// How many methods were left out: of a type Brindle doesn't run, a
     /// terminal one Brindle didn't advertise, malformed, past a bound, or
-    /// past [`MAX_LOGIN_METHODS`].
+    /// past [`MAX_LOGIN_METHODS`] or [`MAX_LOGIN_METHODS_LEN`].
     pub dropped: usize,
     /// How many kept descriptions were cut to [`MAX_LOGIN_DESCRIPTION`].
     pub cut: usize,
@@ -354,15 +358,20 @@ pub fn auth_methods(result: &Value, terminal_advertised: bool) -> Methods {
             return read;
         }
     };
+    let mut len = 0usize;
     for method in list {
         let Some((method, cut)) = auth_method(method, terminal_advertised) else {
             read.dropped += 1;
             continue;
         };
-        if read.methods.len() == MAX_LOGIN_METHODS {
+        let encoded = serde_json::to_vec(&method).map_or(usize::MAX, |bytes| bytes.len());
+        if read.methods.len() == MAX_LOGIN_METHODS
+            || len.saturating_add(encoded) > MAX_LOGIN_METHODS_LEN
+        {
             read.dropped += 1;
             continue;
         }
+        len += encoded;
         read.cut += usize::from(cut);
         read.methods.push(method);
     }
@@ -1606,6 +1615,31 @@ mod tests {
         assert_eq!(description.len(), MAX_LOGIN_DESCRIPTION);
         assert!(description.chars().all(|c| c == 'é'));
         assert_eq!((read.dropped, read.cut), (2, 1));
+    }
+
+    #[test]
+    fn methods_past_their_total_length_are_left_out_so_their_event_fits_a_frame() {
+        // About 96 KiB each: two fit, the third doesn't.
+        let big = |n: usize| {
+            json!({"id": format!("t{n}"), "name": "T", "type": "terminal",
+                   "args": vec!["a".repeat(MAX_LOGIN_ARG); 24]})
+        };
+        let mut methods: Vec<Value> = (0..MAX_LOGIN_METHODS - 1).map(big).collect();
+        methods.push(json!({"id": "small", "name": "Small"}));
+        let read = auth_methods(&json!({ "authMethods": methods }), true);
+        assert_eq!(ids(&read), ["t0", "t1", "small"]);
+        assert_eq!(read.dropped, MAX_LOGIN_METHODS - 3);
+        let len = serde_json::to_vec(&read.methods).map_or(usize::MAX, |bytes| bytes.len());
+        assert!(len <= MAX_LOGIN_METHODS_LEN + 16, "{len}");
+        // At the most a terminal method can be on its own, it is left out
+        // too: past the total by itself.
+        let env: Map<String, Value> = (0..MAX_LOGIN_ARGS)
+            .map(|k| (format!("K{k}"), json!("v".repeat(MAX_LOGIN_ARG))))
+            .collect();
+        let largest = json!({"id": "x", "name": "X", "type": "terminal",
+                             "args": vec!["a".repeat(MAX_LOGIN_ARG); MAX_LOGIN_ARGS], "env": env});
+        let read = auth_methods(&json!({ "authMethods": [largest] }), true);
+        assert_eq!((read.methods.len(), read.dropped), (0, 1));
     }
 
     #[test]

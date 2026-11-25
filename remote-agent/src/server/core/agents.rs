@@ -257,7 +257,11 @@ fn inject_fault(input: &Input<'_>) {
         | Input::Lost { .. }
         | Input::Restart
         | Input::Command(
-            Command::Unqueue | Command::Resend | Command::Cancel | Command::Answer { .. },
+            Command::Unqueue
+            | Command::Resend
+            | Command::Cancel
+            | Command::Answer { .. }
+            | Command::Login { .. },
         )
         | Input::Fault { .. }
         | Input::Tick => return,
@@ -322,6 +326,18 @@ impl AgentCommand {
             req: Some(request.req),
             session: request.session,
             command: Command::Resend,
+        }
+    }
+
+    /// `AGENT_LOGIN` (OpenSpec change `agents-login`).
+    pub(super) fn login(login: client::AgentLogin) -> Self {
+        Self {
+            request: AgentRequest::Login,
+            req: Some(login.req),
+            session: login.session,
+            command: Command::Login {
+                method: login.method,
+            },
         }
     }
 }

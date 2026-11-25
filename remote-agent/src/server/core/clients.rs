@@ -347,15 +347,9 @@ impl<L: EventLoop> Core<L> {
                 self.client_agent_command(client, AgentCommand::resend(request))
             }
             ToCore::AgentRestart(restart) => self.client_agent_restart(client, restart),
-            // Stopgap until the reducer logs in (agents-login task 3.3).
-            ToCore::AgentLogin(login) => self.send_client(
-                client,
-                error(
-                    Some(login.req),
-                    Some(login.session),
-                    format!("session {}: AGENT_LOGIN isn't handled yet", login.session),
-                ),
-            ),
+            ToCore::AgentLogin(login) => {
+                self.client_agent_command(client, AgentCommand::login(login))
+            }
         }
     }
 

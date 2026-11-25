@@ -1503,7 +1503,7 @@ fn login_required_by_session_new_refuses_prompts() {
     client.transcript_until(id, "needs a login", |log| *log.agent() == needs_login);
 
     let refusal = client.prompt(id, "hi").unwrap_err();
-    assert_eq!(refusal.message, format!("session {id}: the agent needs a login through its own command line"));
+    assert_eq!(refusal.message, format!("session {id}: the agent needs a login"));
     assert_eq!(activity_of(&mut client, id), Some(AgentActivity::Error));
     assert!(alive(pid), "the session stays running");
 }
@@ -1525,7 +1525,7 @@ fn login_demanded_by_a_prompt_holds_the_waiting_one() {
     assert_eq!(*log.slot(), held("two", HoldReason::LoginRequired));
     assert_in_order(&client.events(id), &["queue held two LoginRequired", "turn Failed", "state LoginRequired"]);
     let refusal = client.resend(id).unwrap_err();
-    assert_eq!(refusal.message, format!("session {id}: the agent needs a login through its own command line"));
+    assert_eq!(refusal.message, format!("session {id}: the agent needs a login"));
     assert_eq!(activity_of(&mut client, id), Some(AgentActivity::Error));
     client.unqueue(id).unwrap();
     assert_eq!(prompts(&record), ["one"]);

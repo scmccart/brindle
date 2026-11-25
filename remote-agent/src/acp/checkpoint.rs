@@ -17,7 +17,9 @@
 //! queue slot, the turn and the agent's state among them), the ACP version
 //! (`acp`, always 1 here), the [`Phase`] (with the ACP session id once
 //! ready, what a spawn starts or continues, what `initialize` offered, and
-//! a load's muted count), the [`Rpc`] parts (the next outgoing id, the core's requests
+//! a load's muted count, and a login's message and what follows it), the
+//! login methods the agent advertised (`methods`, left out when there are
+//! none; OpenSpec change `agents-login`), the [`Rpc`] parts (the next outgoing id, the core's requests
 //! awaiting a response and what each was for, the agent's waiting
 //! permission requests by entry with their JSON-RPC ids as sent), the chunk
 //! run, the tool entries by call id, the count of a bad-line run not yet
@@ -45,13 +47,14 @@ use std::time::Instant;
 use brindle_remote_protocol::holder::MAX_CHECKPOINT_LEN;
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 use brindle_transcript::{
-    AgentState, Continuation, Conversation, Entry, EntryId, Event, NoticeLevel, Transcript,
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, LoginMethod, NoticeLevel,
+    Transcript,
 };
 
 use super::lines::{Lines, Partial};
 use super::reduce::{
-    self, AgentSession, BAD_RUN_QUIET, BadRun, Greeting, Input, Log, Output, Phase, Replay, Run,
-    RunKind, Start,
+    self, AfterLogin, AgentSession, BAD_RUN_QUIET, BadRun, Greeting, Input, Log, Login, Output,
+    Phase, Replay, Run, RunKind, Start,
 };
 use super::rpc::{BadParts, PROTOCOL_VERSION, Purpose, Rpc};
 use super::wire::Id;
@@ -177,7 +180,7 @@ fn encode_within(session: &AgentSession, limit: u64) -> Result<Vec<u8>, TooLarge
         .iter()
         .map(Event::to_value)
         .collect();
-    let state = json!({
+    let mut state = json!({
         "acp": PROTOCOL_VERSION,
         "cwd": session.cwd,
         "version": session.version,
@@ -188,8 +191,11 @@ fn encode_within(session: &AgentSession, limit: u64) -> Result<Vec<u8>, TooLarge
         "tools": session.tools.iter().map(|(call, entry)| (call.clone(), Value::from(entry.0))).collect::<Map<String, Value>>(),
         "bad_lines": session.bad.map_or(0, |bad| bad.lines),
         "lines": lines,
-    })
-    .to_string();
+    });
+    if !session.methods.is_empty() {
+        state["methods"] = json!(session.methods);
+    }
+    let state = state.to_string();
     let len = HEADER_LEN as u64 + state.len() as u64 + bytes.len() as u64;
     let state_len = u32::try_from(state.len()).map_err(|_| TooLarge { len })?;
     if len > limit {
@@ -241,7 +247,12 @@ fn phase_value(phase: &Phase) -> Value {
             value
         }
         Phase::Ready { session } => json!({ "phase": "ready", "session": session }),
-        Phase::LoginRequired => json!({ "phase": "login_required" }),
+        Phase::LoginRequired(login) => login_value("login_required", login),
+        Phase::LoggingIn { login, method } => {
+            let mut value = login_value("logging_in", login);
+            value["method"] = json!(method);
+            value
+        }
         Phase::Refused => json!({ "phase": "refused" }),
         Phase::Broken => json!({ "phase": "broken" }),
         Phase::Exited => json!({ "phase": "exited" }),
@@ -260,6 +271,22 @@ fn with_start(mut value: Value, start: &Start) -> Value {
         }
     }
     value
+}
+
+/// A login phase (`agents-login` decision 15): the greeting's fields, the
+/// message, and how it goes on: `session` after a prompt's demand, else
+/// the start sent again (`start` left out for a new conversation, as a
+/// spawning phase's).
+fn login_value(phase: &str, login: &Login) -> Value {
+    let mut value = greeting_value(phase, &login.greeting);
+    value["message"] = json!(login.message);
+    match &login.then {
+        AfterLogin::Start(start) => with_start(value, start),
+        AfterLogin::Ready { session } => {
+            value["session"] = json!(session);
+            value
+        }
+    }
 }
 
 fn greeting_value(phase: &str, greeting: &Greeting) -> Value {
@@ -437,6 +464,11 @@ fn restore(
     }
     let bad_lines = number(state, "bad_lines")?;
     let lines = restore_lines(object(field(state, "lines")?, "lines")?, partial)?;
+    let methods: Vec<LoginMethod> = match state.get("methods") {
+        None => Vec::new(),
+        Some(methods) => serde_json::from_value(methods.clone())
+            .map_err(|_| Unreadable::Field { name: "methods" })?,
+    };
 
     // Each entry the state names is the log's, of the kind it is named as.
     if let Some(run) = run {
@@ -485,6 +517,7 @@ fn restore(
             lines: bad_lines,
             last: now,
         }),
+        methods,
     })
 }
 
@@ -519,7 +552,11 @@ fn restore_phase(phase: &Map<String, Value>) -> Result<Phase, Unreadable> {
         "ready" => Phase::Ready {
             session: text(phase, "session")?.to_owned(),
         },
-        "login_required" => Phase::LoginRequired,
+        "login_required" => Phase::LoginRequired(restore_login(phase)?),
+        "logging_in" => Phase::LoggingIn {
+            login: restore_login(phase)?,
+            method: text(phase, "method")?.to_owned(),
+        },
         "refused" => Phase::Refused,
         "broken" => Phase::Broken,
         "exited" => Phase::Exited,
@@ -543,6 +580,20 @@ fn restore_start(phase: &Map<String, Value>) -> Result<Start, Unreadable> {
             continuation: restore_continuation(Some(field(conversation, "continuation")?))?,
         },
         log: restore_log_kind(text(start, "log")?)?,
+    })
+}
+
+/// A login phase's [`Login`]: with a `session`, ready again in it after the
+/// login; else the start, as a spawning phase's.
+fn restore_login(phase: &Map<String, Value>) -> Result<Login, Unreadable> {
+    let then = match optional_text(phase, "session")? {
+        Some(session) => AfterLogin::Ready { session },
+        None => AfterLogin::Start(restore_start(phase)?),
+    };
+    Ok(Login {
+        greeting: restore_greeting(phase)?,
+        message: text(phase, "message")?.to_owned(),
+        then,
     })
 }
 
@@ -973,6 +1024,14 @@ mod tests {
         }
     }
 
+    fn login(then: AfterLogin) -> Login {
+        Login {
+            greeting: greeting(Some("fake"), Some("1.0"), Continuation::ResumeAndLoad),
+            message: "Authentication required".into(),
+            then,
+        }
+    }
+
     #[test]
     fn every_phase_round_trips() {
         let phases = [
@@ -1013,7 +1072,21 @@ mod tests {
             Phase::Ready {
                 session: "s1".into(),
             },
-            Phase::LoginRequired,
+            Phase::LoginRequired(login(AfterLogin::Start(Start::New))),
+            Phase::LoginRequired(login(AfterLogin::Start(continuing(Log::Kept)))),
+            Phase::LoginRequired(login(AfterLogin::Ready {
+                session: "s1".into(),
+            })),
+            Phase::LoggingIn {
+                login: login(AfterLogin::Start(continuing(Log::Fresh))),
+                method: "oauth-personal".into(),
+            },
+            Phase::LoggingIn {
+                login: login(AfterLogin::Ready {
+                    session: "s1".into(),
+                }),
+                method: "chat-gpt".into(),
+            },
             Phase::Refused,
             Phase::Broken,
             Phase::Exited,
@@ -1085,6 +1158,13 @@ mod tests {
                 "replay",
             ),
             (json!({"phase": "loading", "replay": "shown"}), "conversation"),
+            (json!({"phase": "login_required", "name": "fake"}), "message"),
+            (
+                json!({"phase": "login_required", "message": "m", "session": 3}),
+                "session",
+            ),
+            (json!({"phase": "logging_in", "message": "m"}), "method"),
+            (json!({"phase": "logged_out"}), "phase"),
         ] {
             state["phase"] = phase.clone();
             assert_eq!(
@@ -1093,6 +1173,151 @@ mod tests {
                 "{phase}"
             );
         }
+    }
+
+    // agents-login 3.4: the login methods and phases.
+
+    fn auth_methods() -> Value {
+        json!([{"id": "oauth-personal", "name": "Log in with Google"},
+               {"id": "cli", "name": "CLI", "type": "terminal", "args": ["--login"], "env": {"A": "1"}}])
+    }
+
+    /// Spawned and `initialize` (id 1, offering both ways to continue and
+    /// two login methods) answered; `session/new` (id 2) is out.
+    fn creating() -> Agent {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&result(
+            1,
+            json!({"protocolVersion": 1,
+            "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"resume": {}}},
+            "agentInfo": {"name": "fake", "version": "1.0"},
+            "authMethods": auth_methods()}),
+        ));
+        agent
+    }
+
+    fn auth_error(id: u64, message: &str) -> Vec<u8> {
+        line(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32000, "message": message}}))
+    }
+
+    fn login_cmd(agent: &mut Agent, method: &str) -> Output {
+        agent.step(Input::Command(Command::Login {
+            method: method.into(),
+        }))
+    }
+
+    #[test]
+    fn the_methods_round_trip_and_are_left_out_when_there_are_none() {
+        let agent = creating();
+        assert_eq!(agent.s.methods.len(), 2);
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(state["methods"][1]["kind"], json!("terminal"));
+        assert_eq!(agent.round_trip(), agent.s);
+        let (state, _) = state_of(&encode(&Agent::new().s).expect("it fits"));
+        assert!(state.get("methods").is_none(), "{state}");
+        // Methods that don't read are unreadable.
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        state["methods"] = json!([{"id": "x"}]);
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field { name: "methods" })
+        );
+    }
+
+    #[test]
+    fn a_login_needed_at_the_start_round_trips_and_logs_in_after_restoring() {
+        let mut agent = creating();
+        agent.feed(&auth_error(2, "Authentication required"));
+        assert!(matches!(
+            &agent.s.phase,
+            Phase::LoginRequired(Login {
+                then: AfterLogin::Start(Start::New),
+                ..
+            })
+        ));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(
+            state["phase"],
+            json!({"phase": "login_required", "name": "fake", "version": "1.0",
+                   "continuation": "resume_and_load", "message": "Authentication required"})
+        );
+        let mut restored = Agent {
+            s: agent.round_trip(),
+            now: agent.now,
+        };
+        assert_eq!(restored.s, agent.s);
+        let out = login_cmd(&mut restored, "oauth-personal");
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(sent(&out.stdin)[0]["method"], json!("authenticate"));
+    }
+
+    #[test]
+    fn a_login_demanded_by_a_prompt_round_trips_with_its_session() {
+        let mut agent = Agent::ready();
+        agent.s.methods = creating().s.methods;
+        assert_eq!(agent.prompt("hi").reply, Some(Ok(())));
+        agent.feed(&auth_error(3, "expired"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(state["phase"]["session"], json!("s1"));
+        assert_eq!(state["phase"]["message"], json!("expired"));
+        assert_eq!(agent.round_trip(), agent.s);
+    }
+
+    /// A core restarted while logging in carries the `authenticate` id, so
+    /// the agent's answer to the earlier core's request is applied.
+    #[test]
+    fn a_login_running_round_trips_and_its_answer_is_applied_after_restoring() {
+        let mut agent = creating();
+        agent.feed(&auth_error(2, "Authentication required"));
+        let out = login_cmd(&mut agent, "oauth-personal");
+        let id = sent(&out.stdin)[0]["id"].as_u64().expect("an id");
+        assert_eq!(id, 3);
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(state["phase"]["phase"], json!("logging_in"));
+        assert_eq!(state["phase"]["method"], json!("oauth-personal"));
+        assert_eq!(state["rpc"]["outgoing"], json!([[3, "authenticate"]]));
+        let mut restored = Agent {
+            s: agent.round_trip(),
+            now: agent.now,
+        };
+        assert_eq!(restored.s, agent.s);
+        let out = restored.feed(&result(id, json!({})));
+        assert_eq!(
+            sent(&out.stdin)
+                .iter()
+                .map(|line| line["method"].clone())
+                .collect::<Vec<_>>(),
+            [json!("session/new")]
+        );
+        assert_eq!(*restored.s.transcript.agent(), AgentState::Starting);
+        restored.feed(&result(4, json!({"sessionId": "s9"})));
+        assert_eq!(
+            restored.s.phase,
+            Phase::Ready {
+                session: "s9".into()
+            }
+        );
+    }
+
+    /// A login cancelled before a checkpoint is stored with its id
+    /// forgotten: the late answer, after restoring, matches nothing.
+    #[test]
+    fn a_cancelled_login_round_trips_with_its_id_forgotten() {
+        let mut agent = creating();
+        agent.feed(&auth_error(2, "Authentication required"));
+        login_cmd(&mut agent, "oauth-personal");
+        agent.step(Input::Command(Command::Cancel));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(state["phase"]["phase"], json!("login_required"));
+        assert_eq!(state["rpc"]["outgoing"], json!([]));
+        let mut restored = Agent {
+            s: agent.round_trip(),
+            now: agent.now,
+        };
+        let out = restored.feed(&result(3, json!({})));
+        assert!(out.stdin.is_empty() && out.events.is_empty(), "{out:?}");
+        assert!(matches!(restored.s.phase, Phase::LoginRequired(_)));
     }
 
     /// Mid-load with a muted count, a permission request waiting: the
@@ -1402,6 +1627,18 @@ mod tests {
             "{entries:?}"
         );
         assert_eq!(adopted.output, Output::default());
+    }
+
+    /// A phase this core doesn't know (a later build's) is adopted as a
+    /// conversation that could not be restored, its agent left running.
+    #[test]
+    fn an_unknown_phase_is_adopted_as_not_restored() {
+        let agent = Agent::ready();
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        state["phase"] = json!({"phase": "logging_out", "method": "m"});
+        let adopted = adopt(&rebuild(&state, &partial), false, "/home/u/src", "0.3.0", agent.now);
+        assert_eq!(adopted.restored, Err(Unreadable::Field { name: "phase" }));
+        assert_not_restored(&adopted);
     }
 
     #[test]

@@ -44,8 +44,9 @@ use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::{
-    AgentState, Continuation, Conversation, Entry, EntryId, Event, NoticeLevel, PermissionOption,
-    PermissionOutcome, Slot, StopReason, TEXT_CHUNK, Transcript, TurnState, chunks,
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, LoginKind, LoginMethod,
+    NoticeLevel, PermissionOption, PermissionOutcome, Slot, StopReason, TEXT_CHUNK, Transcript,
+    TurnState, chunks,
 };
 use brindle_transcript::{HoldReason, ToolKind, ToolStatus};
 
@@ -96,8 +97,14 @@ pub enum Phase {
     },
     /// Takes prompts in the ACP session `session`.
     Ready { session: String },
-    /// The agent answered `-32000` (decision 17): nothing more is sent.
-    LoginRequired,
+    /// The agent answered `-32000` (decision 17): it waits for a client to
+    /// choose one of its login methods (OpenSpec change `agents-login`,
+    /// decision 4), and nothing else is sent.
+    LoginRequired(Login),
+    /// `authenticate` with login method `method` is out
+    /// ([`Purpose::Authenticate`] in [`Rpc::outgoing`]), awaited however
+    /// long it takes.
+    LoggingIn { login: Login, method: String },
     /// The start failed (another ACP version, or an error or unreadable
     /// answer to `initialize`, `session/new`, `session/resume` or
     /// `session/load`, or a continue the agent offers no way to make;
@@ -154,6 +161,28 @@ pub struct Greeting {
     pub name: Option<String>,
     pub version: Option<String>,
     pub continuation: Continuation,
+}
+
+/// An agent waiting for a login (`agents-login` decision 4): what its
+/// `initialize` said, for the later ready state and conversation, the
+/// agent's last login message, and how the session goes on once a login
+/// succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Login {
+    pub greeting: Greeting,
+    pub message: String,
+    pub then: AfterLogin,
+}
+
+/// How a session goes on after a login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AfterLogin {
+    /// A start request answered `-32000`: it is sent again (`session/new`,
+    /// or the continue's `session/resume` or `session/load`).
+    Start(Start),
+    /// A prompt answered `-32000`: the agent is ready again in the ACP
+    /// session the prompt was sent in, and nothing is sent on its own.
+    Ready { session: String },
 }
 
 /// How a continue goes on once the new agent has answered `initialize`
@@ -246,6 +275,9 @@ pub struct AgentSession {
     /// The tool entries by the agent's call id; trimmed entries leave it.
     pub(super) tools: BTreeMap<String, EntryId>,
     pub(super) bad: Option<BadRun>,
+    /// The login methods the agent's `initialize` advertised, in its order
+    /// (`agents-login` decision 3), sent with every `LoginRequired`.
+    pub(super) methods: Vec<LoginMethod>,
 }
 
 impl AgentSession {
@@ -278,6 +310,7 @@ impl AgentSession {
             run: None,
             tools: BTreeMap::new(),
             bad: None,
+            methods: Vec::new(),
         }
     }
 
@@ -298,7 +331,8 @@ impl AgentSession {
             | Phase::Resuming { .. }
             | Phase::Loading { .. }
             | Phase::Ready { .. }
-            | Phase::LoginRequired
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. }
             | Phase::Refused
             | Phase::Broken => false,
         };
@@ -387,6 +421,9 @@ pub enum Command {
         entry: EntryId,
         option: Option<String>,
     },
+    /// `AGENT_LOGIN`: log in with the agent's method `method`
+    /// (`agents-login` decision 4).
+    Login { method: String },
 }
 
 /// Why a client's command was refused; its text is the `ERROR`'s, which
@@ -423,15 +460,27 @@ pub enum Refused {
         entry: EntryId,
         option: String,
     },
+    /// An `AGENT_LOGIN` while the agent doesn't need a login.
+    NoLoginNeeded,
+    /// An `AGENT_LOGIN` while a login runs.
+    AlreadyLoggingIn,
+    /// An `AGENT_LOGIN` naming a method the agent didn't advertise.
+    NoSuchMethod {
+        method: String,
+    },
+    /// An `AGENT_LOGIN` naming a terminal method, which the client runs.
+    RunByClient {
+        method: String,
+    },
+    /// A prompt or resend while a login runs.
+    LoggingIn,
 }
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotReady => f.write_str("the agent isn't ready"),
-            Self::LoginRequired => {
-                f.write_str("the agent needs a login through its own command line")
-            }
+            Self::LoginRequired => f.write_str("the agent needs a login"),
             Self::Failed { message } => write!(f, "the agent can't take prompts: {message}"),
             Self::Exited => f.write_str("the agent has exited"),
             Self::Lost => f.write_str("the agent was lost with its holder"),
@@ -457,6 +506,16 @@ impl fmt::Display for Refused {
                     "permission request {entry} doesn't offer option {option:?}"
                 )
             }
+            Self::NoLoginNeeded => f.write_str("the agent isn't waiting for a login"),
+            Self::AlreadyLoggingIn => f.write_str("a login is already running"),
+            Self::NoSuchMethod { method } => {
+                write!(f, "the agent offers no login method {method:?}")
+            }
+            Self::RunByClient { method } => write!(
+                f,
+                "login method {method:?} runs in a terminal, which Brindle opens"
+            ),
+            Self::LoggingIn => f.write_str("the agent is logging in"),
         }
     }
 }
@@ -476,6 +535,9 @@ pub enum Moment {
     Permission,
     /// The agent stopped being usable: it failed or exited.
     Stopped,
+    /// A login's state changed: it succeeded, failed or was cancelled
+    /// (`agents-login` decision 15).
+    Login,
 }
 
 /// What the core does after a step, in this order: send `events` to the
@@ -594,7 +656,8 @@ impl Step<'_> {
                 | Moment::TurnEnded
                 | Moment::QueueChanged
                 | Moment::Permission
-                | Moment::Stopped,
+                | Moment::Stopped
+                | Moment::Login,
             )
             | None => Some(moment),
         };
@@ -679,7 +742,8 @@ impl Step<'_> {
             | Phase::Resuming { .. }
             | Phase::Loading { .. } => Err(Refused::NotReady),
             Phase::Ready { session } => Ok(session.clone()),
-            Phase::LoginRequired => Err(Refused::LoginRequired),
+            Phase::LoginRequired(_) => Err(Refused::LoginRequired),
+            Phase::LoggingIn { .. } => Err(Refused::LoggingIn),
             Phase::Refused | Phase::Broken => Err(Refused::Failed {
                 message: self.failure(),
             }),
@@ -710,7 +774,8 @@ impl Step<'_> {
             | Phase::Resuming { .. }
             | Phase::Loading { .. }
             | Phase::Ready { .. }
-            | Phase::LoginRequired => true,
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. } => true,
             Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost => false,
         }
     }
@@ -775,6 +840,19 @@ impl Step<'_> {
             });
             self.mark(Moment::TurnEnded);
         }
+        // A login's answer lost with the tail: the user chooses again
+        // (`agents-login` decision 4).
+        if let Phase::LoggingIn { login, .. } = &self.s.phase
+            && self.s.rpc.forget(Purpose::Authenticate)
+        {
+            let login = Login {
+                message: "the login's answer was lost while the terminal server restarted"
+                    .to_owned(),
+                ..login.clone()
+            };
+            self.needs_login(login);
+            self.mark(Moment::Login);
+        }
         let starting = match self.s.phase {
             Phase::Initializing { .. } => self.s.rpc.forget(Purpose::Initialize),
             Phase::Creating { .. } => self.s.rpc.forget(Purpose::NewSession),
@@ -782,7 +860,8 @@ impl Step<'_> {
             Phase::Loading { .. } => self.s.rpc.forget(Purpose::Load),
             Phase::Spawning { .. }
             | Phase::Ready { .. }
-            | Phase::LoginRequired
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -797,7 +876,8 @@ impl Step<'_> {
                 | Phase::Initializing { .. }
                 | Phase::Creating { .. }
                 | Phase::Ready { .. }
-                | Phase::LoginRequired
+                | Phase::LoginRequired(_)
+                | Phase::LoggingIn { .. }
                 | Phase::Refused
                 | Phase::Broken
                 | Phase::Exited
@@ -832,6 +912,8 @@ impl Step<'_> {
         }
         let refused = self.s.phase == Phase::Refused;
         self.s.phase = phase;
+        // A login out when the agent ended is never answered.
+        self.s.rpc.forget(Purpose::Authenticate);
         for (entry, _) in self.s.rpc.cancel_permissions() {
             self.emit(Event::Answered {
                 id: entry,
@@ -1051,7 +1133,8 @@ impl Step<'_> {
             | Phase::Creating { .. }
             | Phase::Resuming { .. }
             | Phase::Ready { .. }
-            | Phase::LoginRequired
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1072,7 +1155,8 @@ impl Step<'_> {
             Phase::Spawning { .. }
             | Phase::Initializing { .. }
             | Phase::Creating { .. }
-            | Phase::LoginRequired
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1319,8 +1403,7 @@ impl Step<'_> {
             Purpose::NewSession => self.created(result),
             Purpose::Prompt => self.prompted(result),
             Purpose::Resume | Purpose::Load => self.continued(result),
-            // Stopgap until agents-login task 3.3: nothing sends one yet.
-            Purpose::Authenticate => {}
+            Purpose::Authenticate => self.authenticated(result),
         }
     }
 
@@ -1343,6 +1426,7 @@ impl Step<'_> {
                         version,
                         continuation: initialized.continuation,
                     };
+                    self.keep_methods(wire::auth_methods(result, true));
                     self.start(start, greeting);
                 }
                 Ok(initialized) => self.refuse(format!(
@@ -1371,6 +1455,25 @@ impl Step<'_> {
                 };
                 self.refuse(message);
             }
+        }
+    }
+
+    /// Keeps the login methods `initialize` advertised, their text cleaned,
+    /// with one warning notice when any were left out or cut
+    /// (`agents-login` decision 3). Brindle always advertises
+    /// `auth.terminal`.
+    fn keep_methods(&mut self, read: wire::Methods) {
+        self.s.methods = read
+            .methods
+            .into_iter()
+            .map(|method| LoginMethod {
+                name: clean(&method.name),
+                description: method.description.map(|text| clean(&text)),
+                ..method
+            })
+            .collect();
+        if let Some(text) = methods_notice(read.dropped, read.cut) {
+            self.notice(NoticeLevel::Warning, text);
         }
     }
 
@@ -1429,7 +1532,9 @@ impl Step<'_> {
                     "the agent's answer to session/new isn't one Brindle can read".to_owned(),
                 ),
             },
-            Err(error) if error.code == AUTH_REQUIRED => self.login_required(error),
+            Err(error) if error.code == AUTH_REQUIRED => {
+                self.login_required(error, greeting, AfterLogin::Start(Start::New));
+            }
             Err(error) => self.refuse(format!(
                 "the agent couldn't start a session: {}",
                 clean(&error.message)
@@ -1442,7 +1547,7 @@ impl Step<'_> {
     /// ACP session, with the notice its way calls for; `-32000` needs a
     /// login; any other error, or an answer Brindle can't read, fails it.
     fn continued(&mut self, result: Result<&Value, &RpcError>) {
-        let (greeting, conversation, notice, method) = match &self.s.phase {
+        let (greeting, conversation, log, notice, method) = match &self.s.phase {
             Phase::Resuming {
                 greeting,
                 conversation,
@@ -1452,24 +1557,27 @@ impl Step<'_> {
                     Log::Kept => None,
                     Log::Fresh => Some((NoticeLevel::Warning, NOT_REPLAYED.to_owned())),
                 };
-                (greeting, conversation, notice, "session/resume")
+                (greeting, conversation, *log, notice, "session/resume")
             }
             Phase::Loading {
                 greeting,
                 conversation,
                 replay,
             } => {
-                let notice = match replay {
-                    Replay::Muted { updates } => Some((NoticeLevel::Info, muted_notice(*updates))),
-                    Replay::Shown => None,
+                let (notice, log) = match replay {
+                    Replay::Muted { updates } => {
+                        (Some((NoticeLevel::Info, muted_notice(*updates))), Log::Kept)
+                    }
+                    Replay::Shown => (None, Log::Fresh),
                 };
-                (greeting, conversation, notice, "session/load")
+                (greeting, conversation, log, notice, "session/load")
             }
             Phase::Spawning { .. }
             | Phase::Initializing { .. }
             | Phase::Creating { .. }
             | Phase::Ready { .. }
-            | Phase::LoginRequired
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1479,7 +1587,19 @@ impl Step<'_> {
         let readable = match result {
             Ok(result) if method == "session/load" => wire::load_result(result).is_ok(),
             Ok(result) => wire::resume_result(result).is_ok(),
-            Err(error) if error.code == AUTH_REQUIRED => return self.login_required(error),
+            // After a login the same continue is sent again (the session's
+            // directory is the conversation's).
+            Err(error) if error.code == AUTH_REQUIRED => {
+                let start = Start::Continue {
+                    conversation: Conversation {
+                        id: conversation,
+                        cwd: self.s.cwd.clone(),
+                        continuation: greeting.continuation,
+                    },
+                    log,
+                };
+                return self.login_required(error, greeting, AfterLogin::Start(start));
+            }
             Err(error) => {
                 return self.refuse(format!(
                     "the agent couldn't continue the conversation: {}",
@@ -1523,14 +1643,85 @@ impl Step<'_> {
         self.mark(Moment::Started);
     }
 
-    /// `-32000` to a start request (decision 17): nothing more is sent.
-    fn login_required(&mut self, error: &RpcError) {
-        self.s.phase = Phase::LoginRequired;
-        self.agent(AgentState::LoginRequired {
+    /// `-32000` to a start request (decision 17): the agent waits for a
+    /// login, after which `then` goes on.
+    fn login_required(&mut self, error: &RpcError, greeting: Greeting, then: AfterLogin) {
+        self.needs_login(Login {
+            greeting,
             message: bound(clean(&error.message)),
-            methods: Vec::new(),
+            then,
         });
         self.mark(Moment::Started);
+    }
+
+    /// The agent needs a login: the phase and the agent state, with its
+    /// methods (`agents-login` decision 4). The caller marks the moment.
+    fn needs_login(&mut self, login: Login) {
+        let message = login.message.clone();
+        self.s.phase = Phase::LoginRequired(login);
+        self.agent(AgentState::LoginRequired {
+            message,
+            methods: self.s.methods.clone(),
+        });
+    }
+
+    /// What `initialize` said, as the log has it once the agent is ready:
+    /// its name and version, and what its conversation offers.
+    fn greeting_now(&self) -> Greeting {
+        let (name, version) = match self.s.transcript.agent() {
+            AgentState::Ready { name, version } => (name.clone(), version.clone()),
+            AgentState::Starting
+            | AgentState::LoginRequired { .. }
+            | AgentState::LoggingIn { .. }
+            | AgentState::Failed { .. }
+            | AgentState::Exited { .. }
+            | AgentState::Lost { .. } => (None, None),
+        };
+        let continuation = self
+            .s
+            .transcript
+            .conversation()
+            .map_or(Continuation::Neither, |conversation| {
+                conversation.continuation
+            });
+        Greeting {
+            name,
+            version,
+            continuation,
+        }
+    }
+
+    /// `authenticate`'s answer (`agents-login` decision 4): a result, of
+    /// whatever shape, is a login, and the session goes on (`Starting`
+    /// first); an error needs a login again, with its message.
+    fn authenticated(&mut self, result: Result<&Value, &RpcError>) {
+        let Phase::LoggingIn { login, .. } = &self.s.phase else {
+            return;
+        };
+        let login = login.clone();
+        match result {
+            Ok(_) => {
+                self.agent(AgentState::Starting);
+                self.mark(Moment::Login);
+                match login.then {
+                    AfterLogin::Start(start) => self.start(start, login.greeting),
+                    AfterLogin::Ready { session } => {
+                        self.s.phase = Phase::Ready { session };
+                        self.agent(AgentState::Ready {
+                            name: login.greeting.name,
+                            version: login.greeting.version,
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                self.needs_login(Login {
+                    message: bound(clean(&error.message)),
+                    ..login
+                });
+                self.mark(Moment::Login);
+            }
+        }
     }
 
     fn prompted(&mut self, result: Result<&Value, &RpcError>) {
@@ -1541,25 +1732,34 @@ impl Step<'_> {
                     "the agent's answer to the prompt isn't one Brindle can read".to_owned(),
                 )),
             },
-            // Decision 17: the turn fails, a waiting prompt is held, then
-            // the agent needs a login (the queue's change first, as
-            // decision 10's table says).
-            Err(error) if error.code == AUTH_REQUIRED => {
-                let message = bound(clean(&error.message));
-                self.s.phase = Phase::LoginRequired;
-                self.s.run = None;
-                self.hold_waiting(HoldReason::LoginRequired);
-                self.turn(TurnState::Failed {
-                    message: message.clone(),
-                });
-                self.agent(AgentState::LoginRequired {
-                    message,
-                    methods: Vec::new(),
-                });
-                self.mark(Moment::TurnEnded);
-            }
+            Err(error) if error.code == AUTH_REQUIRED => self.prompt_needs_login(error),
             Err(error) => self.end_turn(Ending::Failed(bound(clean(&error.message)))),
         }
+    }
+
+    /// Decision 17: the turn fails, a waiting prompt is held, then the
+    /// agent needs a login (the queue's change first, as decision 10's
+    /// table says), after which it is ready again in the same ACP session.
+    /// Neither prompt is ever sent again on its own (`agents-login`
+    /// decision 5).
+    fn prompt_needs_login(&mut self, error: &RpcError) {
+        let message = bound(clean(&error.message));
+        // A prompt is out only while ready.
+        let Phase::Ready { session } = &self.s.phase else {
+            return self.end_turn(Ending::Failed(message));
+        };
+        let login = Login {
+            greeting: self.greeting_now(),
+            message: message.clone(),
+            then: AfterLogin::Ready {
+                session: session.clone(),
+            },
+        };
+        self.s.run = None;
+        self.hold_waiting(HoldReason::LoginRequired);
+        self.turn(TurnState::Failed { message });
+        self.needs_login(login);
+        self.mark(Moment::TurnEnded);
     }
 
     /// The prompt's answer ends the turn: a waiting prompt is sent after
@@ -1616,8 +1816,59 @@ impl Step<'_> {
                 return;
             }
             Command::Answer { entry, option } => self.answer(entry, option),
+            Command::Login { method } => self.login(method),
         };
         self.out.reply = Some(reply);
+    }
+
+    /// `AGENT_LOGIN` (`agents-login` decision 4): with the agent waiting
+    /// for a login, `authenticate` with one of its agent methods goes out,
+    /// checkpointed first, and the agent is logging in. A terminal method
+    /// is the client's to run; anything else is refused and changes
+    /// nothing.
+    fn login(&mut self, method: String) -> Result<(), Refused> {
+        let login = match &self.s.phase {
+            Phase::LoginRequired(login) => login.clone(),
+            Phase::LoggingIn { .. } => return Err(Refused::AlreadyLoggingIn),
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
+            | Phase::Ready { .. }
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => return Err(Refused::NoLoginNeeded),
+        };
+        let Some(chosen) = self.s.methods.iter().find(|offered| offered.id == method) else {
+            return Err(Refused::NoSuchMethod { method });
+        };
+        let name = match &chosen.kind {
+            LoginKind::Agent => chosen.name.clone(),
+            LoginKind::Terminal { .. } => return Err(Refused::RunByClient { method }),
+        };
+        let line = self.s.rpc.authenticate(&method);
+        self.s.phase = Phase::LoggingIn {
+            login,
+            method: method.clone(),
+        };
+        self.agent(AgentState::LoggingIn { method, name });
+        self.out.stdin.extend(line);
+        self.mark(Moment::BeforeRequest);
+        Ok(())
+    }
+
+    /// `AGENT_CANCEL` while logging in: `$/cancel_request` for the
+    /// `authenticate`, whose answer is then ignored, and the agent needs a
+    /// login again, with its earlier message.
+    fn cancel_login(&mut self, login: Login) {
+        if let Some(id) = self.s.rpc.awaited(Purpose::Authenticate) {
+            self.s.rpc.forget_id(id);
+            self.out.stdin.extend(rpc::cancel_request(id));
+        }
+        self.needs_login(login);
+        self.mark(Moment::Login);
     }
 
     fn prompt(&mut self, text: &str) -> Result<(), Refused> {
@@ -1676,8 +1927,13 @@ impl Step<'_> {
     /// Decision 8: a waiting prompt is held first, then `session/cancel`,
     /// then `cancelled` for each waiting permission request, and the turn
     /// is cancelling until the prompt's answer ends it. With no prompt out
-    /// (decision 11's known gap) the turn ends here.
+    /// (decision 11's known gap) the turn ends here. While logging in, it
+    /// cancels the login (`agents-login` decision 4).
     fn cancel(&mut self) {
+        if let Phase::LoggingIn { login, .. } = &self.s.phase {
+            let login = login.clone();
+            return self.cancel_login(login);
+        }
         let Phase::Ready { session } = &self.s.phase else {
             return;
         };
@@ -1721,7 +1977,8 @@ impl Step<'_> {
             | Phase::Resuming { .. }
             | Phase::Loading { .. }
             | Phase::Ready { .. }
-            | Phase::LoginRequired => {}
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. } => {}
         }
         let Some(Entry::Permission {
             options, outcome, ..
@@ -1826,6 +2083,26 @@ fn hold_reason(ending: &Ending, cancelling: bool) -> HoldReason {
         Ending::Stop(StopReason::Cancelled) if cancelling => HoldReason::Cancelled,
         Ending::Stop(stop) => HoldReason::Stopped { stop: stop.clone() },
         Ending::Failed(_) => HoldReason::Failed,
+    }
+}
+
+/// The warning when login methods were left out or their descriptions cut
+/// (`agents-login` decision 3), or `None` when neither.
+fn methods_notice(dropped: usize, cut: usize) -> Option<String> {
+    let left_out = match dropped {
+        0 => None,
+        1 => Some("1 login method from the agent was left out".to_owned()),
+        n => Some(format!("{n} login methods from the agent were left out")),
+    };
+    let cut = match cut {
+        0 => None,
+        1 => Some("1 login method's description was cut".to_owned()),
+        n => Some(format!("{n} login methods' descriptions were cut")),
+    };
+    match (left_out, cut) {
+        (Some(left_out), Some(cut)) => Some(format!("{left_out}, and {cut}")),
+        (Some(text), None) | (None, Some(text)) => Some(text),
+        (None, None) => None,
     }
 }
 
@@ -4508,7 +4785,10 @@ mod tests {
 
     #[test]
     fn a_continue_answered_32000_needs_a_login_and_keeps_the_agent() {
-        for capabilities in [both(), load_only()] {
+        for (capabilities, method, continuation) in [
+            (both(), "session/resume", Continuation::ResumeAndLoad),
+            (load_only(), "session/load", Continuation::Load),
+        ] {
             let mut agent = Agent::ended();
             let id = agent.restart();
             agent.feed(&initialized(id, capabilities));
@@ -4521,8 +4801,41 @@ mod tests {
                     methods: Vec::new(),
                 }
             );
-            assert_eq!(*agent.s.phase(), Phase::LoginRequired);
+            // After a login, the same continue of the same conversation
+            // into the kept log.
+            let Phase::LoginRequired(login) = agent.s.phase() else {
+                panic!("{:?}", agent.s.phase());
+            };
+            assert_eq!(
+                login.then,
+                AfterLogin::Start(Start::Continue {
+                    conversation: conversation_s1(continuation),
+                    log: Log::Kept,
+                })
+            );
+            assert_eq!(agent.last(method)["params"]["sessionId"], json!("s1"));
         }
+    }
+
+    #[test]
+    fn after_a_login_a_continue_is_sent_again_and_continues() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        agent.feed(&initialized_with_methods(id, both()));
+        agent.feed(&error(id + 1, AUTH_REQUIRED, "log in first"));
+        assert_eq!(agent.login("oauth-personal").reply, Some(Ok(())));
+        let n = agent.sent.len();
+        agent.feed(&result(id + 2, json!({})));
+        let methods: Vec<&Value> = agent.sent_since(n).iter().map(|l| &l["method"]).collect();
+        assert_eq!(methods, [&json!("session/resume")]);
+        agent.feed(&result(id + 3, json!({})));
+        assert_eq!(
+            *agent.s.phase(),
+            Phase::Ready {
+                session: "s1".into()
+            }
+        );
+        assert_eq!(agent.notices().last().map(String::as_str), Some(RESTARTED));
     }
 
     #[test]
@@ -4819,5 +5132,481 @@ mod tests {
         let id = agent.restart();
         agent.feed(&initialized(id, load_only()));
         assert_eq!(agent.last("session/load")["params"]["sessionId"], "s1");
+    }
+
+    // agents-login 3.3: logging in.
+
+    /// Two agent methods and a terminal one.
+    fn auth_methods() -> Value {
+        json!([
+            {"id": "oauth-personal", "name": "Log in with Google", "description": "Use your\u{1b}[31m Google account"},
+            {"id": "api-key", "name": "API Key"},
+            {"id": "cli", "name": "CLI", "type": "terminal", "args": ["--login"], "env": {"MODE": "device"}},
+        ])
+    }
+
+    fn methods() -> Vec<LoginMethod> {
+        vec![
+            LoginMethod {
+                id: "oauth-personal".into(),
+                name: "Log in with Google".into(),
+                description: Some("Use your\u{FFFD}[31m Google account".into()),
+                kind: LoginKind::Agent,
+            },
+            LoginMethod {
+                id: "api-key".into(),
+                name: "API Key".into(),
+                description: None,
+                kind: LoginKind::Agent,
+            },
+            LoginMethod {
+                id: "cli".into(),
+                name: "CLI".into(),
+                description: None,
+                kind: LoginKind::Terminal {
+                    args: vec!["--login".into()],
+                    env: [("MODE".to_owned(), "device".to_owned())].into(),
+                },
+            },
+        ]
+    }
+
+    fn initialized_with_methods(id: u64, capabilities: Value) -> String {
+        result(
+            id,
+            json!({"protocolVersion": 1, "agentCapabilities": capabilities,
+                   "agentInfo": {"name": "fake", "version": "2.0"}, "authMethods": auth_methods()}),
+        )
+    }
+
+    fn login_required(message: &str) -> AgentState {
+        AgentState::LoginRequired {
+            message: message.into(),
+            methods: methods(),
+        }
+    }
+
+    fn logging_in() -> AgentState {
+        AgentState::LoggingIn {
+            method: "oauth-personal".into(),
+            name: "Log in with Google".into(),
+        }
+    }
+
+    impl Agent {
+        /// `initialize` (id 1) answered with [`auth_methods`] and
+        /// `session/new` (id 2) with `-32000`.
+        fn needing_login() -> Self {
+            let mut agent = Self::new();
+            agent.step(Input::Spawned);
+            agent.feed(&initialized_with_methods(1, both()));
+            agent.feed(&error(2, AUTH_REQUIRED, "Authentication required"));
+            agent
+        }
+
+        /// Ready in `s1`, its agent having advertised [`auth_methods`].
+        fn ready_with_methods() -> Self {
+            let mut agent = Self::new();
+            agent.step(Input::Spawned);
+            agent.feed(&initialized_with_methods(1, both()));
+            agent.feed(&result(2, json!({"sessionId": "s1"})));
+            agent
+        }
+
+        fn login(&mut self, method: &str) -> Output {
+            self.cmd(Command::Login {
+                method: method.into(),
+            })
+        }
+
+        /// The id of the last `authenticate` written.
+        fn authenticate_id(&self) -> u64 {
+            self.last("authenticate")["id"].as_u64().expect("an id")
+        }
+    }
+
+    #[test]
+    fn the_methods_are_kept_from_initialize_cleaned_in_the_agents_order() {
+        let agent = Agent::needing_login();
+        assert_eq!(agent.s.methods, methods());
+        assert!(agent.notices().is_empty(), "{:?}", agent.notices());
+    }
+
+    #[test]
+    fn methods_left_out_or_cut_add_one_warning() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let long = "d".repeat(wire::MAX_LOGIN_DESCRIPTION + 1);
+        let out = agent.feed(&result(
+            1,
+            json!({"protocolVersion": 1, "authMethods": [
+                {"id": "a", "name": "A", "description": long},
+                {"id": "env", "name": "Env", "type": "env_var"},
+                {"name": "no id"},
+            ]}),
+        ));
+        assert_eq!(
+            agent.notices(),
+            ["2 login methods from the agent were left out, and 1 login method's description was cut"]
+        );
+        assert!(matches!(
+            out.events.last(),
+            Some(Event::Added { entry: Entry::Notice { level: NoticeLevel::Warning, .. }, .. })
+        ));
+        assert_eq!(agent.s.methods.len(), 1);
+        assert_eq!(methods_notice(0, 0), None);
+        assert_eq!(
+            methods_notice(1, 0).as_deref(),
+            Some("1 login method from the agent was left out")
+        );
+        assert_eq!(
+            methods_notice(0, 2).as_deref(),
+            Some("2 login methods' descriptions were cut")
+        );
+    }
+
+    #[test]
+    fn session_new_answered_32000_needs_a_login_offering_the_methods() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&initialized_with_methods(1, both()));
+        let out = agent.feed(&error(2, AUTH_REQUIRED, "Authentication required"));
+        assert_eq!(*agent.agent_state(), login_required("Authentication required"));
+        assert_eq!(out.checkpoint, Some(Moment::Started));
+        assert!(!out.hang_up && out.stdin.is_empty());
+        assert_eq!(
+            *agent.s.phase(),
+            Phase::LoginRequired(Login {
+                greeting: Greeting {
+                    name: Some("fake".into()),
+                    version: Some("2.0".into()),
+                    continuation: Continuation::ResumeAndLoad,
+                },
+                message: "Authentication required".into(),
+                then: AfterLogin::Start(Start::New),
+            })
+        );
+    }
+
+    #[test]
+    fn a_prompt_answered_32000_needs_a_login_in_its_session_offering_the_methods() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        let out = agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        assert_eq!(
+            shape(&out.events),
+            ["queue held", "turn failed", "agent login required"]
+        );
+        assert_eq!(*agent.agent_state(), login_required("expired"));
+        assert_eq!(out.checkpoint, Some(Moment::TurnEnded));
+        let Phase::LoginRequired(login) = agent.s.phase() else {
+            panic!("{:?}", agent.s.phase());
+        };
+        assert_eq!(
+            login.then,
+            AfterLogin::Ready {
+                session: "s1".into()
+            }
+        );
+        assert_eq!(login.greeting.name.as_deref(), Some("fake"));
+        assert_eq!(login.greeting.continuation, Continuation::ResumeAndLoad);
+    }
+
+    #[test]
+    fn a_login_with_an_agent_method_sends_authenticate_and_is_logging_in() {
+        let mut agent = Agent::needing_login();
+        let out = agent.login("oauth-personal");
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["agent logging in"]);
+        assert_eq!(*agent.agent_state(), logging_in());
+        assert_eq!(agent.activity(), Activity::Working);
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdin),
+            "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"authenticate\",\"params\":{\"methodId\":\"oauth-personal\"}}\n"
+        );
+        assert!(matches!(
+            agent.s.phase(),
+            Phase::LoggingIn { method, .. } if method == "oauth-personal"
+        ));
+        assert_eq!(agent.s.rpc().awaited(Purpose::Authenticate), Some(3));
+    }
+
+    #[test]
+    fn a_login_with_a_terminal_or_unknown_method_is_refused_and_changes_nothing() {
+        for (method, refused) in [
+            (
+                "cli",
+                Refused::RunByClient {
+                    method: "cli".into(),
+                },
+            ),
+            (
+                "nope",
+                Refused::NoSuchMethod {
+                    method: "nope".into(),
+                },
+            ),
+        ] {
+            let mut agent = Agent::needing_login();
+            let before = agent.s.clone();
+            let out = agent.login(method);
+            assert_eq!(out.reply, Some(Err(refused)));
+            assert!(out.events.is_empty() && out.stdin.is_empty());
+            assert_eq!(out.checkpoint, None);
+            assert_eq!(agent.s, before);
+        }
+    }
+
+    #[test]
+    fn a_login_while_none_is_needed_or_one_runs_is_refused() {
+        let mut ready = Agent::ready_with_methods();
+        assert_eq!(
+            ready.login("oauth-personal").reply,
+            Some(Err(Refused::NoLoginNeeded))
+        );
+        assert!(!ready.sent_methods().contains(&"authenticate"));
+        let mut starting = Agent::new();
+        assert_eq!(
+            starting.login("oauth-personal").reply,
+            Some(Err(Refused::NoLoginNeeded))
+        );
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        let out = agent.login("api-key");
+        assert_eq!(out.reply, Some(Err(Refused::AlreadyLoggingIn)));
+        assert!(out.stdin.is_empty());
+    }
+
+    #[test]
+    fn a_login_at_the_start_answered_starts_the_session() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        let out = agent.feed(&result(3, json!({})));
+        assert_eq!(shape(&out.events), ["agent starting"]);
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+        assert_eq!(agent.last("session/new")["id"], json!(4));
+        assert!(matches!(agent.s.phase(), Phase::Creating { .. }));
+        agent.feed(&result(4, json!({"sessionId": "s1"})));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Ready {
+                name: Some("fake".into()),
+                version: Some("2.0".into())
+            }
+        );
+        assert_eq!(agent.turn("hi"), 5);
+    }
+
+    #[test]
+    fn session_new_answering_32000_again_after_a_login_needs_one_again() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        agent.feed(&result(3, json!(null)));
+        let out = agent.feed(&error(4, AUTH_REQUIRED, "still not"));
+        assert_eq!(*agent.agent_state(), login_required("still not"));
+        assert_eq!(out.checkpoint, Some(Moment::Started));
+        assert!(matches!(
+            agent.s.phase(),
+            Phase::LoginRequired(Login { then: AfterLogin::Start(Start::New), .. })
+        ));
+        assert_eq!(agent.login("api-key").reply, Some(Ok(())));
+    }
+
+    #[test]
+    fn a_login_after_a_prompts_demand_is_ready_in_the_same_session_and_sends_nothing() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        agent.login("api-key");
+        let auth = agent.authenticate_id();
+        let n = agent.sent.len();
+        let out = agent.feed(&result(auth, json!({})));
+        assert_eq!(shape(&out.events), ["agent starting", "agent ready"]);
+        assert_eq!(out.checkpoint, Some(Moment::Login));
+        assert!(out.stdin.is_empty());
+        assert_eq!(agent.sent.len(), n);
+        assert_eq!(
+            *agent.s.phase(),
+            Phase::Ready {
+                session: "s1".into()
+            }
+        );
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Ready {
+                name: Some("fake".into()),
+                version: Some("2.0".into())
+            }
+        );
+        // The next prompt goes to the same session.
+        agent.turn("two");
+        assert_eq!(agent.last("session/prompt")["params"]["sessionId"], json!("s1"));
+    }
+
+    /// `agents-login` decision 5: neither the failed prompt nor the held
+    /// one is sent on its own; the held one goes again only by a resend,
+    /// refused while logging in and taken once ready.
+    #[test]
+    fn a_failed_prompt_is_never_sent_again_and_a_held_one_only_by_a_resend_once_ready() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::LoginRequired))
+        );
+        agent.login("oauth-personal");
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::LoggingIn))
+        );
+        assert_eq!(agent.prompt("three").reply, Some(Err(Refused::LoggingIn)));
+        let auth = agent.authenticate_id();
+        agent.feed(&result(auth, json!({})));
+        let prompts = |agent: &Agent| {
+            agent
+                .sent
+                .iter()
+                .filter(|line| line["method"] == "session/prompt")
+                .map(|line| line["params"]["prompt"][0]["text"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(prompts(&agent), [json!("one")]);
+        assert_eq!(*agent.slot(), held("two", HoldReason::LoginRequired));
+        assert_eq!(agent.cmd(Command::Resend).reply, Some(Ok(())));
+        assert_eq!(prompts(&agent), [json!("one"), json!("two")]);
+    }
+
+    #[test]
+    fn while_a_login_is_needed_or_runs_unqueue_still_discards() {
+        for running in [false, true] {
+            let mut agent = Agent::ready_with_methods();
+            let id = agent.turn("one");
+            agent.prompt("two");
+            agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+            if running {
+                agent.login("oauth-personal");
+            }
+            assert_eq!(agent.cmd(Command::Unqueue).reply, Some(Ok(())));
+            assert_eq!(*agent.slot(), Slot::Empty);
+        }
+    }
+
+    #[test]
+    fn a_failed_login_needs_one_again_with_its_message() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        let out = agent.feed(&error(3, -32603, "the browser was closed"));
+        assert_eq!(*agent.agent_state(), login_required("the browser was closed"));
+        assert_eq!(out.checkpoint, Some(Moment::Login));
+        assert!(out.stdin.is_empty() && !out.hang_up);
+        // `-32000` from authenticate itself is just an error.
+        agent.login("api-key");
+        agent.feed(&error(4, AUTH_REQUIRED, "bad key"));
+        assert_eq!(*agent.agent_state(), login_required("bad key"));
+        assert!(matches!(
+            agent.s.phase(),
+            Phase::LoginRequired(Login { then: AfterLogin::Start(Start::New), .. })
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_login_sends_cancel_request_and_ignores_the_late_answer() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        let out = agent.cmd(Command::Cancel);
+        assert_eq!(out.reply, None);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdin),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{\"requestId\":3}}\n"
+        );
+        assert_eq!(*agent.agent_state(), login_required("Authentication required"));
+        assert_eq!(out.checkpoint, Some(Moment::Login));
+        assert_eq!(agent.s.rpc().awaited(Purpose::Authenticate), None);
+        // The agent's late answer, a success or an error, is ignored.
+        for late in [result(3, json!({})), error(3, -32800, "cancelled")] {
+            let out = agent.feed(&late);
+            assert!(out.events.is_empty() && out.stdin.is_empty(), "{out:?}");
+        }
+        // No session/new beyond the one answered -32000.
+        let news = agent.sent_methods().iter().filter(|m| **m == "session/new").count();
+        assert_eq!(news, 1);
+        // And a new login can be chosen.
+        assert_eq!(agent.login("api-key").reply, Some(Ok(())));
+        assert_eq!(agent.authenticate_id(), 4);
+    }
+
+    #[test]
+    fn a_cancel_while_a_login_is_needed_does_nothing() {
+        let mut agent = Agent::needing_login();
+        let out = agent.cmd(Command::Cancel);
+        assert_eq!(out, Output::default());
+    }
+
+    #[test]
+    fn the_agent_exiting_while_logging_in_exits_and_forgets_the_login() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        let out = agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"",
+        });
+        assert_eq!(shape(&out.events), ["agent exited"]);
+        assert_eq!(*agent.s.phase(), Phase::Exited);
+        assert_eq!(agent.s.rpc().awaited(Purpose::Authenticate), None);
+        assert_eq!(
+            agent.login("oauth-personal").reply,
+            Some(Err(Refused::NoLoginNeeded))
+        );
+    }
+
+    #[test]
+    fn output_lost_while_logging_in_needs_the_login_again() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        let out = agent.step(Input::OutputLost);
+        assert_eq!(
+            *agent.agent_state(),
+            login_required("the login's answer was lost while the terminal server restarted")
+        );
+        assert_eq!(out.checkpoint, Some(Moment::Login));
+        assert_eq!(agent.s.rpc().awaited(Purpose::Authenticate), None);
+        assert!(matches!(
+            agent.s.phase(),
+            Phase::LoginRequired(Login { then: AfterLogin::Start(Start::New), .. })
+        ));
+        // The answer, should it still come, matches nothing.
+        assert!(agent.feed(&result(3, json!({}))).events.is_empty());
+        // Lost output while a login is only needed leaves it needed.
+        let mut needed = Agent::needing_login();
+        needed.step(Input::OutputLost);
+        assert_eq!(*needed.agent_state(), login_required("Authentication required"));
+    }
+
+    #[test]
+    fn the_login_refusals_say_why() {
+        for (refused, text) in [
+            (Refused::LoginRequired, "the agent needs a login"),
+            (Refused::NoLoginNeeded, "the agent isn't waiting for a login"),
+            (Refused::AlreadyLoggingIn, "a login is already running"),
+            (
+                Refused::NoSuchMethod {
+                    method: "x".into(),
+                },
+                "the agent offers no login method \"x\"",
+            ),
+            (
+                Refused::RunByClient {
+                    method: "x".into(),
+                },
+                "login method \"x\" runs in a terminal, which Brindle opens",
+            ),
+            (Refused::LoggingIn, "the agent is logging in"),
+        ] {
+            assert_eq!(refused.to_string(), text);
+        }
     }
 }
