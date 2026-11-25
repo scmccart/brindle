@@ -75,6 +75,21 @@ When an agent offers session modes and no option of category mode, the server SH
 - **WHEN** the agent answers `session/new` with modes and with a config option of category mode
 - **THEN** the session's options hold one mode option, the config option
 
+### Requirement: An agent's model list is an option
+When an agent offers a list of models and no option of category model, the server SHALL present the list as one option of category model whose choices are the models and whose current value is the current model. When the agent offers an option of category model, its model list SHALL NOT add a second one. A model list the server can't read SHALL be left out, and the session's other options kept.
+
+#### Scenario: A model list only
+- **WHEN** the agent answers `session/new` with models `default`, `sonnet` and `haiku`, current `default`, and no config options
+- **THEN** the session's options hold one model option with those three choices and `default` current
+
+#### Scenario: Set from the list
+- **WHEN** a client sets that model option to `sonnet`
+- **THEN** the agent receives `session/set_model` for `sonnet`, and attached clients receive the model option with `sonnet` current
+
+#### Scenario: Both offered
+- **WHEN** the agent answers `session/new` with a model list and with a config option of category model
+- **THEN** the session's options hold one model option, the config option
+
 ### Requirement: A client sets a session option
 A client attached to an agent session SHALL be able to ask for one option to be set to one value. The server SHALL ask the agent only when the agent is ready, the option is one the session holds, and the value is one of its choices or an on/off value for an on/off option; otherwise it SHALL refuse with an error saying why. The agent's answer SHALL become the session's options. A request naming the option's current value SHALL succeed and send nothing.
 

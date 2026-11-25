@@ -30,7 +30,7 @@ See proposal.md for why. Facts this design rests on, from the code on `feat/agen
 - Nothing is set that the agent didn't offer, and a change of mode is on the record.
 - No new keyboard stop in the zone and no change to a requirement another stacked change modifies.
 
-**Non-Goals:** starting values for options in a profile, and remembering a choice across sessions; ACP's unstable `models` list and `session/set_model`; command inputs other than free text, and v2's unstable skills; running a command from the command palette; completing anything but a command's name (arguments, file paths, `@` mentions); option controls as tab stops; the conversation's title and context usage (`agents-session-info`). No config key and no state file.
+**Non-Goals:** starting values for options in a profile, and remembering a choice across sessions; command inputs other than free text, and v2's unstable skills; running a command from the command palette; completing anything but a command's name (arguments, file paths, `@` mentions); option controls as tab stops; the conversation's title and context usage (`agents-session-info`). No config key and no state file.
 
 ## Layer map
 
@@ -92,25 +92,28 @@ Event::Options  { options: Vec<SessionOption> } // the whole list, replacing the
 
 ```rust
 pub struct OfferedOption { pub option: SessionOption, pub key: OptionKey }
-pub enum OptionKey { Config { id: String }, Modes }
+pub enum OptionKey { Config { id: String }, Modes, Models }
 Request::SetOption { session: &str, key: &OptionKey, value: OptionValue }
 ```
 
 - **Config options** (v1 and v2): `session/new`'s `configOptions`, `config_option_update` and the answer to `session/set_config_option` each give the whole list, decoded item by item from the raw JSON so one unreadable option loses only itself. Each gets `OptionKey::Config { id }`. `select` with flat or grouped choices and `boolean` are read; another `type` is left out.
 - **Session modes** (v1 only): when `session/new` gives `modes` and no config option has category `mode`, the v1 module makes one option from them (name "Mode", category `Mode`, a `Select` of the modes) with `OptionKey::Modes`; `current_mode_update` changes its current value. When a config option has category `mode`, the `modes` and `current_mode_update` are ignored: the agent mirrors them in its config options, and one control is enough.
-- **The key is opaque to the reducer** (`ports R4`, `agents-tool-content`'s rule): it stores each offered option's key beside the option and hands it back in `Request::SetOption`; only `acp/v1/encode.rs` reads it, writing `session/set_config_option` (with `type: "boolean"` for a toggle) or `session/set_mode`. `OptionKey::Modes` exists in `forms.rs` because a key must be storable; nothing outside `acp/v1/` constructs or matches it, which `acp_versions_stay_in_their_modules` gains a line for.
+- **The key is opaque to the reducer** (`ports R4`, `agents-tool-content`'s rule): it stores each offered option's key beside the option and hands it back in `Request::SetOption`; only `acp/v1/encode.rs` reads it, writing `session/set_config_option` (with `type: "boolean"` for a toggle), `session/set_mode` or `session/set_model`. `OptionKey::Modes` and `OptionKey::Models` exist in `forms.rs` because a key must be storable; nothing outside `acp/v1/` constructs or matches them, which `acp_versions_stay_in_their_modules` gains a line for.
 - **The boolean capability:** the v1 module's `initialize` advertises `clientCapabilities.session.configOptions.boolean: {}`, since the zone can show a toggle.
-- **The unstable `models` list** is not read: it is outside the pinned crate, and every agent that sends it also sends a `model` config option, except the deprecated claude-code-acp, whose model then can't be changed from Brindle while its mode can.
+- **The unstable `models` list** (v1 only; the user's decision, 2026-11-25, for broad coverage): when `session/new` gives `models` (`{ currentModelId, availableModels: [{ modelId, name, description? }] }`, as the claude-code-acp 0.16.2 capture has it) and no config option has category `model`, the v1 module makes one option from it (name "Model", category `Model`, a `Select` of the models) with `OptionKey::Models`, set with `session/set_model { sessionId, modelId }`. With a `model` config option present the list is ignored, as modes are. Today that makes a difference for one agent: the deprecated claude-code-acp, which offers only modes and this list.
+  - The pinned crate has no type for any of it, so `acp/v1/decode.rs` reads it by hand from the raw JSON, and a list it can't read is left out without a notice (an agent that sends it has done nothing wrong by ACP).
+  - `session/set_model` and its answer aren't in any capture or in the pinned crate. Task 1.5 captures the adapter taking it before anything relies on it. If the adapter refuses the method, the option isn't made, and "As built" says so.
+  - No update for the current model is known, so its value changes only through Brindle's own set, whose empty answer the reducer treats as it does `session/set_mode`'s.
 - **Commands:** `available_commands_update` gives the whole list. v1's only input kind gives the hint.
 
-**What ACP v2 maps to** (for `agents-acp-v2`): config options and `session/set_config_option` as above; no modes, so `OptionKey::Modes` is never produced; a command entry of `type: "command"` is a `Command`, any other type is left out; an input of `type: "text"` gives the hint, any other gives none.
+**What ACP v2 maps to** (for `agents-acp-v2`): config options and `session/set_config_option` as above; no modes and no model list, so `OptionKey::Modes` and `OptionKey::Models` are never produced; a command entry of `type: "command"` is a `Command`, any other type is left out; an input of `type: "text"` gives the hint, any other gives none.
 
 ### 4. Setting an option (`acp/reduce.rs`, the core; `railway R1`, `R6`)
 
 - **The message.** `AGENT_SET_OPTION { session, option, value }` with `OptionValue::{ Choice { value: String }, Toggle { on: bool } }`, a new client message of protocol 4 (amended; its number is the next free one when the stack is assembled, after `AGENT_RESTART`, `AGENT_LOGIN` and `AGENT_FETCH`). Transcript tests pin its encoding, and it joins the protocol's fuzzing.
 - **Checked before anything is sent** (the outcome is `Result<(), SetRefusal>`, answered `OK` or `ERROR` with the reason): `NotReady` (the agent isn't ready), `UnknownOption { id }`, `NotOffered { id, value }` (a choice the option doesn't list, or the wrong kind of value), `Busy` (an earlier set for this session hasn't been answered). A set naming the current value is `OK` and sends nothing.
 - **Any time the agent is ready**, during a turn too: ACP lets an agent take a change mid-turn or refuse it.
-- **The agent's answer is the truth.** Its result carries the whole list, which becomes `Event::Options` if it differs. For `session/set_mode`, whose result is empty, the reducer sets the mode option's current value itself. Brindle shows nothing as changed until the event arrives.
+- **The agent's answer is the truth.** Its result carries the whole list, which becomes `Event::Options` if it differs. For `session/set_mode` and `session/set_model`, whose results are empty, the reducer sets that option's current value itself. Brindle shows nothing as changed until the event arrives.
 - **The agent refuses** (a JSON-RPC error): the options stay, and the log gets a notice, "the agent didn't change NAME to VALUE: MESSAGE". The client's `OK` meant "asked", so the failure is shown where the session's other failures are, in the conversation.
 - **The agent never answers:** `Busy` holds until the agent's exit or the session's end clears it, as for any pending request.
 
@@ -175,20 +178,17 @@ Commands, options and their keys are in the session's checkpoint. A core restart
 - **E2E:** `agent-command-completion`, `agent-option-set`, `agent-option-modes`, `agent-option-refused`, `agent-option-restore`.
 - **Manual:** pointer presses on a suggestion row and a footer item; a real agent's `/compact` and a mode switch.
 
-## Open decisions
+## The user's decisions
 
-Each has a recommendation, which the text above follows. They are the user's to settle before implementation.
-
-Decided on 2026-11-25: options show as small labels under the prompt input, with palette actions, on the user's condition that slash commands change them too, which the option commands of decision 6 do.
+None is open. The user settled each on 2026-11-25, one at a time: options show as small labels under the prompt input, with palette actions, on the user's condition that slash commands change them too, which the option commands of decision 6 do.
 
 Also decided on 2026-11-25: every mode change leaves a notice in the conversation (decision 5); whitespace before a slash command makes no difference (decision 6).
 
 Starting values per profile are left out of this change, as the proposal-only `agents-option-defaults`.
 
-Still open:
+Completion matching is fuzzy, with names that start with the typed word first, for commands and for an option's choices (decision 6).
 
-4. **Completion matching:** fuzzy, with names that start with the typed word first (recommended), or prefix only.
-5. **The unstable `models` list:** not read (recommended), so the deprecated claude-code-acp adapter's model can't be changed from Brindle.
+The unstable `models` list is read as one more option, which the user chose over the recommended skip, for broad coverage (decision 3).
 
 ## Risks / Trade-offs
 
@@ -197,7 +197,8 @@ Still open:
 - An option command is named from what the agent calls the option, so the same setting is `/effort` with one agent and `/reasoning-effort` with another → the list shows the names as the user types `/`, and the labels under the input use the same words.
 - An agent's own command hides Brindle's option command of the same name → the label and the palette still set that option.
 - Fuzzy matching can list a command the user didn't mean → prefix matches come first, and enter takes only the highlighted one.
-- `OptionKey::Modes` puts a v1 idea in the version-free forms → it is opaque outside `acp/v1/`, and the architecture test says so.
+- `OptionKey::Modes` and `OptionKey::Models` put v1 ideas in the version-free forms → they are opaque outside `acp/v1/`, and the architecture test says so.
+- The model list is unstable ACP, read by hand → it is used only when the agent offers no `model` option, lives in `acp/v1/` alone, is pinned by a capture, and a shape that stops decoding only removes that one option.
 
 ## Migration Plan
 

@@ -13,6 +13,7 @@ ACP v1 has two ways to offer options: session modes (`session/set_mode`), which 
 
 - **The server keeps the agent's commands and options** as session state beside the conversation: each command's name, description and input hint; each option's name, category (mode, model, thinking level, or the agent's own), and either its choices with the current one or an on/off value. Both are in every replay and survive a detach, a quit, a core restart and an upgrade.
 - **Session modes become an option.** For a v1 agent that offers modes and no mode option, the server presents its modes as one option of category `mode` and sets it with `session/set_mode`, inside the v1 module. Brindle sees options only.
+- **So does the older model list.** A v1 agent that offers ACP's unstable model list and no model option gets a model option made from it, set with `session/set_model`, also inside the v1 module. Of the agents captured, that is the deprecated claude-code-acp adapter.
 - **A client can set an option.** A new client message asks the server to set one option to one value; the server checks it against what the agent offered, asks the agent, and the agent's answer becomes the new options. Client protocol 4 is amended, as for the rest of the series.
 - **A mode change is recorded in the conversation**, whoever made it, since it changes what the agent may do without asking.
 - **Slash command completion.** Typing `/` at the start of the prompt input lists the agent's commands, filtered as the user types, with each command's description and input hint. Enter or tab takes the highlighted one; the command is then sent as an ordinary prompt, as ACP has it.
@@ -20,7 +21,7 @@ ACP v1 has two ways to offer options: session modes (`session/set_mode`), which 
 - **Options show under the prompt input** as their current values (`auto · opus · medium`), and each opens a list of its choices on a pointer press. From the keyboard, the new `agent_options` action opens the same choices in a palette, and `agent_next_mode` steps the mode option to its next choice.
 - **Bounds on everything an agent sends:** 256 commands, 32 options, 256 choices an option, with names and descriptions cut as titles are.
 
-Not in this change: per-profile starting values for options and remembering a choice across sessions (the proposal-only change `agents-option-defaults`); ACP's unstable model list (`session/set_model`); command input kinds other than free text; ACP v2's unstable skills; the conversation's title and context usage (`agents-session-info`); option controls as keyboard focus stops.
+Not in this change: per-profile starting values for options and remembering a choice across sessions (the proposal-only change `agents-option-defaults`); command input kinds other than free text; ACP v2's unstable skills; the conversation's title and context usage (`agents-session-info`); option controls as keyboard focus stops.
 
 ## Capabilities
 
