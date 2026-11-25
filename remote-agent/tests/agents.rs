@@ -561,6 +561,7 @@ fn shape(event: &Event) -> String {
         },
         Event::Turn { state } => format!("turn {state:?}"),
         Event::Agent { state } => format!("state {state:?}"),
+        Event::Conversation { conversation } => format!("conversation {}", conversation.id),
         Event::Trimmed { dropped, .. } => format!("trimmed {dropped}"),
     }
 }
@@ -1610,6 +1611,7 @@ fn kind(event: &Event) -> &'static str {
         Event::Queue { .. } => "queue",
         Event::Turn { .. } => "turn",
         Event::Agent { .. } => "agent",
+        Event::Conversation { .. } => "conversation",
         Event::Trimmed { .. } => "trimmed",
     }
 }

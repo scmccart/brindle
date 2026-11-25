@@ -271,6 +271,68 @@ pub enum AgentState {
         #[serde(default)]
         stderr: String,
     },
+    /// The agent was lost with the holder that ran it, so neither its exit
+    /// status nor its standard error is known; `message` says so.
+    Lost { message: String },
+}
+
+/// The agent's ACP session (its conversation), once the agent gave one:
+/// its id, the absolute directory it works in, and how it can be taken up
+/// again after the agent ends (OpenSpec change `agents-session-recovery`,
+/// design decision 3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Conversation {
+    /// The `sessionId` the agent gave.
+    pub id: String,
+    pub cwd: String,
+    pub continuation: Continuation,
+}
+
+/// Which of ACP's `session/resume` and `session/load` the agent offered in
+/// `initialize`: one closed value, so "offers load" and "offers resume"
+/// can't disagree (`types R1`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Continuation {
+    ResumeAndLoad,
+    Resume,
+    Load,
+    Neither,
+}
+
+impl Continuation {
+    /// From `initialize`'s `agentCapabilities.loadSession` and whether it
+    /// gave `sessionCapabilities.resume`.
+    pub fn from_offers(load: bool, resume: bool) -> Self {
+        match (load, resume) {
+            (true, true) => Self::ResumeAndLoad,
+            (false, true) => Self::Resume,
+            (true, false) => Self::Load,
+            (false, false) => Self::Neither,
+        }
+    }
+
+    pub fn offers_load(self) -> bool {
+        match self {
+            Self::ResumeAndLoad | Self::Load => true,
+            Self::Resume | Self::Neither => false,
+        }
+    }
+
+    pub fn offers_resume(self) -> bool {
+        match self {
+            Self::ResumeAndLoad | Self::Resume => true,
+            Self::Load | Self::Neither => false,
+        }
+    }
+
+    /// Whether a conversation can be taken up again at all.
+    pub fn continuable(self) -> bool {
+        match self {
+            Self::ResumeAndLoad | Self::Resume | Self::Load => true,
+            Self::Neither => false,
+        }
+    }
 }
 
 /// A transcript event: one change to the log, the slot, the turn or the
@@ -312,6 +374,12 @@ pub enum Event {
     },
     Agent {
         state: AgentState,
+    },
+    /// The agent's conversation: sent when the agent gives or takes up an
+    /// ACP session, before its `Ready`. It stays through the agent's later
+    /// states, and a later one replaces it.
+    Conversation {
+        conversation: Conversation,
     },
     /// The entries up to and including `through` were dropped; `dropped`
     /// counts them, or in a replay every entry dropped so far.
@@ -451,6 +519,8 @@ pub struct Transcript {
     slot: Slot,
     turn: TurnState,
     agent: AgentState,
+    /// Set by [`Event::Conversation`]; `None` until the agent gave one.
+    conversation: Option<Conversation>,
     trimmed: Option<Trim>,
     /// The kept entries' encoded length.
     size: usize,
@@ -464,6 +534,7 @@ impl Default for Transcript {
             slot: Slot::Empty,
             turn: TurnState::Idle,
             agent: AgentState::Starting,
+            conversation: None,
             trimmed: None,
             size: 0,
         }
@@ -551,6 +622,9 @@ impl Transcript {
             Event::Queue { slot } => self.slot = slot.clone(),
             Event::Turn { state } => self.turn = state.clone(),
             Event::Agent { state } => self.agent = state.clone(),
+            Event::Conversation { conversation } => {
+                self.conversation = Some(conversation.clone());
+            }
             Event::Trimmed { through, dropped } => self.trim(*through, *dropped)?,
         }
         Ok(())
@@ -625,6 +699,12 @@ impl Transcript {
         &self.agent
     }
 
+    /// The agent's conversation, once it gave one; it stays after the
+    /// agent ends.
+    pub fn conversation(&self) -> Option<&Conversation> {
+        self.conversation.as_ref()
+    }
+
     /// The kept entries, oldest first.
     pub fn entries(&self) -> impl Iterator<Item = (EntryId, &Entry)> {
         self.entries.iter().map(|kept| (kept.id, &kept.entry))
@@ -654,9 +734,9 @@ impl Transcript {
     /// entries were dropped, each entry's `Added` with its text split into
     /// `Appended`s of at most [`TEXT_CHUNK`] bytes and a permission's
     /// outcome as its `Answered`, the slot's `Queue` when it isn't empty,
-    /// then `Turn` and `Agent`.
+    /// the `Conversation` when there is one, then `Turn` and `Agent`.
     pub fn replay(&self) -> Vec<Event> {
-        let mut events = Vec::with_capacity(self.entries.len() + 4);
+        let mut events = Vec::with_capacity(self.entries.len() + 5);
         if let Some(trim) = self.trimmed {
             events.push(Event::Trimmed {
                 through: trim.through,
@@ -671,6 +751,11 @@ impl Transcript {
             slot @ (Slot::Waiting { .. } | Slot::Held { .. }) => {
                 events.push(Event::Queue { slot: slot.clone() })
             }
+        }
+        if let Some(conversation) = &self.conversation {
+            events.push(Event::Conversation {
+                conversation: conversation.clone(),
+            });
         }
         events.push(Event::Turn {
             state: self.turn.clone(),
@@ -688,7 +773,8 @@ impl Transcript {
             AgentState::Starting => Activity::Working,
             AgentState::LoginRequired { .. }
             | AgentState::Failed { .. }
-            | AgentState::Exited { .. } => Activity::Error,
+            | AgentState::Exited { .. }
+            | AgentState::Lost { .. } => Activity::Error,
             AgentState::Ready { .. } => match &self.turn {
                 TurnState::Working | TurnState::Cancelling => Activity::Working,
                 TurnState::Blocked => Activity::Blocked,
@@ -1105,6 +1191,8 @@ mod tests {
     fn a_replay_folds_back_to_the_same_log() {
         let mut rng = XorShift::new(0x7a5c_0001);
         let mut slots = [0usize; 3];
+        let mut conversations = [0usize; 2];
+        let mut lost = 0usize;
         for _ in 0..400 {
             let transcript = random_transcript(&mut rng);
             slots[match transcript.slot() {
@@ -1112,6 +1200,8 @@ mod tests {
                 Slot::Waiting { .. } => 1,
                 Slot::Held { .. } => 2,
             }] += 1;
+            conversations[usize::from(transcript.conversation().is_some())] += 1;
+            lost += usize::from(matches!(transcript.agent(), AgentState::Lost { .. }));
             let replay = transcript.replay();
             for event in &replay {
                 if let Event::Added { entry, .. } = event
@@ -1133,6 +1223,107 @@ mod tests {
             assert_eq!(decoded, replay);
         }
         assert!(slots.iter().all(|&n| n > 0), "slots generated: {slots:?}");
+        assert!(
+            conversations.iter().all(|&n| n > 0),
+            "logs without and with a conversation: {conversations:?}"
+        );
+        assert!(lost > 0, "no log ended with the agent lost");
+    }
+
+    fn conversation(id: &str, continuation: Continuation) -> Conversation {
+        Conversation {
+            id: id.into(),
+            cwd: "/home/u/src".into(),
+            continuation,
+        }
+    }
+
+    #[test]
+    fn a_conversation_event_sets_the_conversation_and_a_later_one_replaces_it() {
+        let mut transcript = Transcript::new();
+        assert_eq!(transcript.conversation(), None);
+        let first = conversation("s1", Continuation::ResumeAndLoad);
+        transcript
+            .apply(&Event::Conversation {
+                conversation: first.clone(),
+            })
+            .unwrap();
+        assert_eq!(transcript.conversation(), Some(&first));
+        // Any agent state may follow, and the conversation stays.
+        for state in [
+            ready(),
+            AgentState::Exited {
+                code: Some(1),
+                stderr: String::new(),
+            },
+            AgentState::Lost {
+                message: "its holder ended".into(),
+            },
+            AgentState::Starting,
+        ] {
+            transcript.apply(&Event::Agent { state }).unwrap();
+            assert_eq!(transcript.conversation(), Some(&first));
+        }
+        let second = conversation("s1", Continuation::Load);
+        transcript
+            .apply(&Event::Conversation {
+                conversation: second.clone(),
+            })
+            .unwrap();
+        assert_eq!(transcript.conversation(), Some(&second));
+        assert_eq!(transcript.next_id(), EntryId::FIRST, "no entry was added");
+    }
+
+    #[test]
+    fn a_replay_carries_the_conversation_right_before_the_turn_and_the_agent() {
+        let held = Slot::Held {
+            text: "next".into(),
+            reason: HoldReason::AgentStopped,
+        };
+        let kept = conversation("s1", Continuation::Resume);
+        let lost = AgentState::Lost {
+            message: "its holder ended".into(),
+        };
+        let transcript = fold(&[
+            Event::Conversation {
+                conversation: kept.clone(),
+            },
+            added(1, agent("hi")),
+            Event::Queue { slot: held.clone() },
+            Event::Agent {
+                state: lost.clone(),
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            transcript.replay(),
+            [
+                added(1, agent("hi")),
+                Event::Queue { slot: held },
+                Event::Conversation { conversation: kept },
+                Event::Turn {
+                    state: TurnState::Idle
+                },
+                Event::Agent { state: lost },
+            ]
+        );
+        assert_eq!(fold(&transcript.replay()), Ok(transcript));
+    }
+
+    #[test]
+    fn continuation_follows_what_initialize_offered() {
+        let rows = [
+            (true, true, Continuation::ResumeAndLoad),
+            (false, true, Continuation::Resume),
+            (true, false, Continuation::Load),
+            (false, false, Continuation::Neither),
+        ];
+        for (load, resume, continuation) in rows {
+            assert_eq!(Continuation::from_offers(load, resume), continuation);
+            assert_eq!(continuation.offers_load(), load, "{continuation:?}");
+            assert_eq!(continuation.offers_resume(), resume, "{continuation:?}");
+            assert_eq!(continuation.continuable(), load || resume, "{continuation:?}");
+        }
     }
 
     #[test]
@@ -1291,6 +1482,15 @@ mod tests {
                     stderr: String::new(),
                 },
                 ended(StopReason::EndTurn),
+                Activity::Error,
+            ),
+            (
+                AgentState::Lost {
+                    message: "its holder ended".into(),
+                },
+                TurnState::Failed {
+                    message: "the agent exited".into(),
+                },
                 Activity::Error,
             ),
         ];

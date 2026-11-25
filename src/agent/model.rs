@@ -352,6 +352,7 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
             }
             AgentPhase::Live(AgentState::Failed { .. }) => "the agent failed",
             AgentPhase::Live(AgentState::Exited { .. }) => EXITED,
+            AgentPhase::Live(AgentState::Lost { .. }) => "the agent was lost with its holder",
             AgentPhase::Connecting | AgentPhase::NotStarted(_) => "the agent isn't ready",
             AgentPhase::Lost { .. } => "the agent session was lost",
             AgentPhase::Broken { .. } => "Brindle can't show this agent session any more",
@@ -452,6 +453,7 @@ pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>) -> 
             };
             Some(alert(text, true, Some(stderr)))
         }
+        AgentPhase::Live(AgentState::Lost { message }) => Some(alert(format!("{agent} was lost: {message}"), true, None)),
         AgentPhase::Lost { reason } => {
             Some(alert(format!("the agent session on {} was lost: {reason}", names.endpoint), true, None))
         }
@@ -1051,7 +1053,12 @@ impl ChatModel {
             (AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting), SessionLife::Open) => None,
             (
                 AgentPhase::NotStarted(_)
-                | AgentPhase::Live(AgentState::LoginRequired { .. } | AgentState::Failed { .. } | AgentState::Exited { .. })
+                | AgentPhase::Live(
+                    AgentState::LoginRequired { .. }
+                    | AgentState::Failed { .. }
+                    | AgentState::Exited { .. }
+                    | AgentState::Lost { .. },
+                )
                 | AgentPhase::Lost { .. }
                 | AgentPhase::Broken { .. },
                 SessionLife::Open,
@@ -1074,7 +1081,8 @@ impl ChatModel {
             AgentPhase::Live(AgentState::Starting) => disabled(DisabledWhy::Starting),
             AgentPhase::Live(AgentState::LoginRequired { .. }) => disabled(DisabledWhy::LoginRequired),
             AgentPhase::Live(AgentState::Failed { .. }) => disabled(DisabledWhy::Failed),
-            AgentPhase::Live(AgentState::Exited { .. }) => disabled(DisabledWhy::Exited),
+            // `agents-session-recovery` 4.1 gives a lost agent its own reason.
+            AgentPhase::Live(AgentState::Exited { .. } | AgentState::Lost { .. }) => disabled(DisabledWhy::Exited),
             AgentPhase::Live(AgentState::Ready { .. }) => match (self.life, self.link) {
                 (SessionLife::Ended, _) => disabled(DisabledWhy::Exited),
                 (SessionLife::Open, Link::Reconnecting) => disabled(DisabledWhy::Reconnecting),
@@ -1312,7 +1320,9 @@ impl ChatModel {
     /// The words an `error` notification gives.
     fn error_text(&self) -> String {
         match &self.phase {
-            AgentPhase::Live(AgentState::LoginRequired { message } | AgentState::Failed { message }) => message.clone(),
+            AgentPhase::Live(
+                AgentState::LoginRequired { message } | AgentState::Failed { message } | AgentState::Lost { message },
+            ) => message.clone(),
             AgentPhase::Live(AgentState::Exited { code: Some(code), .. }) => format!("exited with status {code}"),
             AgentPhase::Live(AgentState::Exited { code: None, .. }) => "ended by a signal".into(),
             AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. }) => match &self.turn {
@@ -1401,7 +1411,9 @@ impl ChatModel {
             // The failure as logged, the server's cause verbatim (on
             // Windows a batch file's `cmd /c` form included).
             AgentPhase::NotStarted(failure) => out.push_str(&format!(" message={:?}", failure.to_string())),
-            AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::Exited { .. })
+            AgentPhase::Live(
+                AgentState::Starting | AgentState::Ready { .. } | AgentState::Exited { .. } | AgentState::Lost { .. },
+            )
             | AgentPhase::Connecting
             | AgentPhase::Lost { .. }
             | AgentPhase::Broken { .. } => {}
@@ -1495,6 +1507,7 @@ fn state_word(phase: &AgentPhase) -> String {
         AgentPhase::Live(AgentState::Failed { .. }) => "failed".into(),
         AgentPhase::Live(AgentState::Exited { code: Some(code), .. }) => format!("exited:{code}"),
         AgentPhase::Live(AgentState::Exited { code: None, .. }) => "exited:signal".into(),
+        AgentPhase::Live(AgentState::Lost { .. }) => "holder-lost".into(),
         AgentPhase::Lost { .. } => "lost".into(),
         AgentPhase::Broken { .. } => "broken".into(),
     }

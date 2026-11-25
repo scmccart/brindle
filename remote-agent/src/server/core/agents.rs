@@ -128,7 +128,8 @@ impl Agent {
                     AgentState::Starting
                     | AgentState::LoginRequired { .. }
                     | AgentState::Failed { .. }
-                    | AgentState::Exited { .. } => None,
+                    | AgentState::Exited { .. }
+                    | AgentState::Lost { .. } => None,
                 };
                 AgentInfo {
                     activity: activity(transcript.activity()),

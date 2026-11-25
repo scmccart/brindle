@@ -159,7 +159,7 @@ fn turn(rng: &mut XorShift) -> TurnState {
 }
 
 fn agent(rng: &mut XorShift) -> AgentState {
-    match rng.below(5) {
+    match rng.below(6) {
         0 => AgentState::Starting,
         1 => AgentState::Ready {
             name: rng.chance(2).then(|| text(rng)),
@@ -167,6 +167,7 @@ fn agent(rng: &mut XorShift) -> AgentState {
         },
         2 => AgentState::LoginRequired { message: text(rng) },
         3 => AgentState::Failed { message: text(rng) },
+        4 => AgentState::Lost { message: text(rng) },
         _ => AgentState::Exited {
             code: rng.chance(2).then(|| rng.next() as i32),
             stderr: text(rng),
@@ -174,10 +175,25 @@ fn agent(rng: &mut XorShift) -> AgentState {
     }
 }
 
+const CONTINUATIONS: [Continuation; 4] = [
+    Continuation::ResumeAndLoad,
+    Continuation::Resume,
+    Continuation::Load,
+    Continuation::Neither,
+];
+
+fn conversation(rng: &mut XorShift) -> Conversation {
+    Conversation {
+        id: text(rng),
+        cwd: text(rng),
+        continuation: CONTINUATIONS[rng.below(CONTINUATIONS.len())],
+    }
+}
+
 /// Any event, with ids near the log's, valid or not.
 fn event(rng: &mut XorShift, near: u64) -> Event {
     let id = EntryId(near.saturating_sub(3) + rng.below(6) as u64);
-    match rng.below(8) {
+    match rng.below(9) {
         0 => Event::Added {
             id,
             entry: entry(rng),
@@ -203,6 +219,9 @@ fn event(rng: &mut XorShift, near: u64) -> Event {
         4 => Event::Queue { slot: slot(rng) },
         5 => Event::Turn { state: turn(rng) },
         6 => Event::Agent { state: agent(rng) },
+        7 => Event::Conversation {
+            conversation: conversation(rng),
+        },
         _ => Event::Trimmed {
             through: id,
             dropped: rng.below(4) as u64,
@@ -269,13 +288,13 @@ pub(crate) fn random_transcript(rng: &mut XorShift) -> Transcript {
                 }
             }
             6 => Event::Queue { slot: slot(rng) },
-            7 => {
-                if rng.chance(2) {
-                    Event::Turn { state: turn(rng) }
-                } else {
-                    Event::Agent { state: agent(rng) }
-                }
-            }
+            7 => match rng.below(3) {
+                0 => Event::Turn { state: turn(rng) },
+                1 => Event::Agent { state: agent(rng) },
+                _ => Event::Conversation {
+                    conversation: conversation(rng),
+                },
+            },
             _ => {
                 let limit = transcript.encoded_len() / (1 + rng.below(4));
                 transcript.trim_to(limit);
@@ -334,6 +353,14 @@ const WORDS: &[&str] = &[
     "stderr",
     "selected",
     "cancelled",
+    "conversation",
+    "continuation",
+    "cwd",
+    "resume_and_load",
+    "resume",
+    "load",
+    "neither",
+    "lost",
     "option",
     "end_turn",
     "other",

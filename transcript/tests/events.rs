@@ -25,8 +25,9 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use brindle_transcript::{
-    AgentState, Entry, EntryId, Event, HoldReason, NoticeLevel, PermissionKind, PermissionOption,
-    PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, TurnState,
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, HoldReason, NoticeLevel,
+    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus,
+    TurnState,
 };
 use serde_json::Value;
 
@@ -47,7 +48,7 @@ macro_rules! forms {
 }
 
 forms!(event_form, EVENT_FORMS, Event, "Event::":
-    Added, Appended, ToolChanged, Answered, Queue, Turn, Agent, Trimmed);
+    Added, Appended, ToolChanged, Answered, Queue, Turn, Agent, Conversation, Trimmed);
 forms!(entry_form, ENTRY_FORMS, Entry, "Entry::": User, Agent, Thought, Tool, Permission, Notice);
 forms!(tool_kind_form, TOOL_KIND_FORMS, ToolKind, "ToolKind::":
     Read, Edit, Delete, Move, Search, Execute, Think, Fetch, SwitchMode, Other);
@@ -65,7 +66,9 @@ forms!(turn_form, TURN_FORMS, TurnState, "TurnState::":
 forms!(stop_form, STOP_FORMS, StopReason, "StopReason::":
     EndTurn, MaxTokens, MaxTurnRequests, Refusal, Cancelled, Other);
 forms!(agent_form, AGENT_FORMS, AgentState, "AgentState::":
-    Starting, Ready, LoginRequired, Failed, Exited);
+    Starting, Ready, LoginRequired, Failed, Exited, Lost);
+forms!(continuation_form, CONTINUATION_FORMS, Continuation, "Continuation::":
+    ResumeAndLoad, Resume, Load, Neither);
 
 fn expected_forms() -> Vec<&'static str> {
     [
@@ -81,6 +84,7 @@ fn expected_forms() -> Vec<&'static str> {
         TURN_FORMS,
         STOP_FORMS,
         AGENT_FORMS,
+        CONTINUATION_FORMS,
     ]
     .concat()
 }
@@ -137,6 +141,9 @@ fn forms(event: &Event) -> Vec<&'static str> {
             }
         }
         Event::Agent { state } => forms.push(agent_form(state)),
+        Event::Conversation { conversation } => {
+            forms.push(continuation_form(&conversation.continuation));
+        }
         Event::Appended { .. } | Event::Trimmed { .. } => {}
     }
     forms
@@ -458,7 +465,41 @@ fn fixtures() -> Vec<(&'static str, Event)> {
                 dropped: 40,
             },
         ),
+        // Added by `agents-session-recovery`, within protocol 4 before it
+        // shipped (its design decision 9).
+        (
+            "agent-lost",
+            agent(AgentState::Lost {
+                message: "its holder ended".into(),
+            }),
+        ),
+        (
+            "conversation-resume-and-load",
+            conversation("sess-1", Continuation::ResumeAndLoad),
+        ),
+        (
+            "conversation-resume",
+            conversation("sess-2", Continuation::Resume),
+        ),
+        (
+            "conversation-load",
+            conversation("sess-3", Continuation::Load),
+        ),
+        (
+            "conversation-neither",
+            conversation("sess-4", Continuation::Neither),
+        ),
     ]
+}
+
+fn conversation(id: &str, continuation: Continuation) -> Event {
+    Event::Conversation {
+        conversation: Conversation {
+            id: id.into(),
+            cwd: "/home/u/src".into(),
+            continuation,
+        },
+    }
 }
 
 // The fixture files.
@@ -615,11 +656,40 @@ fn an_unknown_field_anywhere_is_ignored() {
     }
 }
 
+#[test]
+fn a_conversation_with_a_field_it_doesnt_know_decodes_the_same() {
+    let value = serde_json::json!({
+        "event": "conversation",
+        "zz_later": 1,
+        "conversation": {"id": "s1", "cwd": "/home/u/src", "continuation": "load", "replay_from": "x"},
+    });
+    assert_eq!(
+        Event::from_value(&value),
+        Ok(conversation("s1", Continuation::Load))
+    );
+    // A conversation without its continuation is no conversation.
+    let missing = serde_json::json!({
+        "event": "conversation",
+        "conversation": {"id": "s1", "cwd": "/home/u/src"},
+    });
+    assert!(Event::from_value(&missing).is_err());
+}
+
 /// The fields whose strings are a closed enum's values: the tags and the
 /// fieldless enums. Every other string is free text.
-const ENUM_FIELDS: [&str; 11] = [
-    "event", "type", "turn", "agent", "slot", "hold", "reason", "outcome", "kind", "status",
+const ENUM_FIELDS: [&str; 12] = [
+    "event",
+    "type",
+    "turn",
+    "agent",
+    "slot",
+    "hold",
+    "reason",
+    "outcome",
+    "kind",
+    "status",
     "level",
+    "continuation",
 ];
 
 /// Each copy of `value` with one enum-valued string replaced by `unknown`.

@@ -197,6 +197,11 @@ Exited zones are not recorded, as today; the state file gains no field. Since an
 
 Nothing to migrate: client protocol 4 and H1 3 have not shipped (decision 9), and no config or state file changes. A Brindle and a helper of this release meet only each other on protocol 4. Rollback is reverting the change before release; after release, protocol 4 is frozen with these messages in it.
 
+## As built
+
+- **2026-11-25, tasks 1.1–1.2: `AgentState::Lost { message }`, not `{ reason }`.** The transcript's fixture test (`an_unknown_kind_or_value_is_a_decode_error`) treats every string field named `reason` as a closed enum's tag (`StopReason`'s), so a free-text `reason` would read as an enum value. `message` also matches `Failed` and `LoginRequired`. The encoding is `{"agent":"lost","message":"its holder ended"}` (`v4/agent-lost.json`). Read decisions 3, 5, 7 and 8's `Lost { reason }` as `Lost { message }`.
+- **2026-11-25, task 1.1: the app compiles against the new variants with stopgap arms** in `src/agent/model.rs` (a lost agent's prompt reason reuses `DisabledWhy::Exited`; its alert says "NAME was lost: MESSAGE"; the dump word is already `holder-lost`) and `src/agent/shared.rs` (`Event::Conversation` marks the turn-or-agent change). Task 4.1 replaces the stopgap reason with its own.
+
 ## Open Questions
 
 None. The proposal's eight questions are answered by the user and recorded in proposal.md; the choices this design adds beyond them are decisions 3 (`Event::Conversation` instead of a field on `Ready`), 3 and 5 (`AgentState::Lost`, `Life::AgentEnded`, the end of an ended session on `DETACH`), 5 (`SPAWN_FAILED` returning to `AgentEnded`), 6 (ended sessions lost on a core restart), 7 (no fallback to `session/new`; a failed continue ends the session), 8 (the offer by the session's profile name) and 11 (no new fake-agent step).

@@ -498,7 +498,8 @@ impl Step<'_> {
             AgentState::Starting
             | AgentState::Ready { .. }
             | AgentState::LoginRequired { .. }
-            | AgentState::Exited { .. } => "ACP handling failed".to_owned(),
+            | AgentState::Exited { .. }
+            | AgentState::Lost { .. } => "ACP handling failed".to_owned(),
         }
     }
 
@@ -1309,7 +1310,8 @@ impl Step<'_> {
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
-            | Event::Agent { .. } => return,
+            | Event::Agent { .. }
+            | Event::Conversation { .. } => return,
         };
         self.out.events.push(event);
         self.s.tools.retain(|_, entry| *entry > through);
@@ -1659,6 +1661,7 @@ mod tests {
                 },
                 Event::Turn { state } => format!("turn {}", turn_name(state)),
                 Event::Agent { state } => format!("agent {}", agent_name(state)),
+                Event::Conversation { .. } => "conversation".into(),
                 Event::Trimmed { .. } => "trimmed".into(),
             })
             .collect()
@@ -1693,6 +1696,7 @@ mod tests {
             AgentState::LoginRequired { .. } => "login required",
             AgentState::Failed { .. } => "failed",
             AgentState::Exited { .. } => "exited",
+            AgentState::Lost { .. } => "lost",
         }
     }
 
@@ -1874,6 +1878,7 @@ mod tests {
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
+            | Event::Conversation { .. }
             | Event::Trimmed { .. } => None,
         });
         assert!(matches!(last_agent, Some(AgentState::Failed { .. })));
@@ -2786,6 +2791,7 @@ mod tests {
                 | Event::Queue { .. }
                 | Event::Turn { .. }
                 | Event::Agent { .. }
+                | Event::Conversation { .. }
                 | Event::Trimmed { .. } => None,
             })
             .collect();
