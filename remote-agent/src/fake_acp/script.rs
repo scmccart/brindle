@@ -21,11 +21,17 @@
 //!   was sent.
 //! - `expect <method>`: read lines from stdin until a message with that
 //!   method comes (lines before it are skipped).
+//! - `expect-response <id>`: read lines from stdin until the response to
+//!   the agent's own request `id` (a JSON value: `"p1"`, `7`) comes, and
+//!   record it as `expect` does, so a test reads what the agent was
+//!   answered (lines before it are skipped).
 //! - `send <json>`: write one JSON value as a line to stdout, exactly as
 //!   written.
 //! - `send-raw <text>`: write the text as a line, whatever it is (lines
 //!   that aren't JSON, unknown variants).
-//! - `respond <json>`: answer the last request read with that `result`.
+//! - `respond <json>`: answer the last request an `expect` matched with
+//!   that `result`; a notification matched since (`session/cancel`)
+//!   doesn't change which.
 //! - `respond-error <code> <message> [<data>]`: answer it with an error;
 //!   the message is one word, or a JSON string for one with spaces, and the
 //!   optional JSON after it is the error's `data` (a `-32022`'s
@@ -52,6 +58,10 @@ pub enum Step {
     },
     Expect {
         method: String,
+    },
+    /// The response to the agent's request `id`.
+    ExpectResponse {
+        id: Value,
     },
     /// `line` is the JSON as written, checked to be one value.
     Send {
@@ -152,6 +162,7 @@ pub fn parse(text: &str) -> Result<Vec<Step>, BadScript> {
                 }));
             }
             Step::Record { .. }
+            | Step::ExpectResponse { .. }
             | Step::Send { .. }
             | Step::SendRaw { .. }
             | Step::Respond { .. }
@@ -180,6 +191,12 @@ fn step(word: &str, rest: &str) -> Result<Step, Problem> {
         },
         "expect" => Step::Expect {
             method: needed("expect", "a method")?,
+        },
+        "expect-response" => Step::ExpectResponse {
+            id: json_value(
+                "expect-response",
+                &needed("expect-response", "a request id")?,
+            )?,
         },
         "send" => {
             let line = needed("send", "a JSON value")?;
@@ -304,6 +321,11 @@ impl Received {
             id: value.get("id").filter(|id| !id.is_null()).cloned(),
         })
     }
+
+    /// Whether it is the response to request `id`: no method, that id.
+    pub fn answers(&self, id: &Value) -> bool {
+        self.method.is_none() && self.id.as_ref() == Some(id)
+    }
 }
 
 /// The line answering request `id` with `result`, ending in `\n`.
@@ -366,6 +388,29 @@ mod tests {
                 method: "session/prompt".into()
             }
         );
+    }
+
+    #[test]
+    fn expect_response_names_the_agents_request_id_as_json() {
+        assert_eq!(
+            one(r#"expect-response "perm-1""#),
+            Step::ExpectResponse { id: json!("perm-1") }
+        );
+        assert_eq!(one("expect-response 7"), Step::ExpectResponse { id: json!(7) });
+        assert_eq!(
+            problem("expect-response").problem,
+            Problem::Missing {
+                step: "expect-response",
+                what: "a request id"
+            }
+        );
+        assert!(matches!(
+            problem("expect-response perm-1").problem,
+            Problem::BadJson {
+                step: "expect-response",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -715,6 +760,19 @@ mod tests {
         );
         assert_eq!(Received::parse(b"not json"), None);
         assert_eq!(Received::parse(b"[1,2]"), None);
+    }
+
+    #[test]
+    fn only_a_response_with_its_id_answers_a_request() {
+        let parsed = |line: &[u8]| Received::parse(line).expect("a message");
+        let answer = parsed(br#"{"jsonrpc":"2.0","id":"p1","result":{}}"#);
+        assert!(answer.answers(&json!("p1")));
+        assert!(!answer.answers(&json!("p2")));
+        assert!(!answer.answers(&json!(1)), "an id's type counts");
+        let error = parsed(br#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"x"}}"#);
+        assert!(error.answers(&json!(4)));
+        let request = parsed(br#"{"jsonrpc":"2.0","id":"p1","method":"session/prompt"}"#);
+        assert!(!request.answers(&json!("p1")), "a request isn't a response");
     }
 
     #[test]

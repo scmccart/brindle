@@ -5,8 +5,9 @@
 //! The script's steps are [`script`]'s, read and checked whole before the
 //! first one runs. This is the thin loop that plays them: it reads JSON-RPC
 //! lines from stdin, writes lines to stdout and stderr, appends the messages
-//! an `expect` matched to the `record` file, and waits for `wait-file`
-//! gates.
+//! an `expect` or `expect-response` matched to the `record` file, and waits
+//! for `wait-file` gates. A `respond` answers the last request an `expect`
+//! matched: a notification matched since doesn't change which.
 //!
 //! - **When the script runs out** without an `exit`, the agent idles as a
 //!   real one would: it reads (and drops) stdin until it closes, then exits
@@ -16,8 +17,9 @@
 //!   still waiting.
 //! - **Exit statuses:** a script's own `exit`, 0 after idling, 2 for a usage
 //!   error or a script that doesn't parse, and 3 when a step can't be played
-//!   (stdin closed before an `expect`'s method came, a response to a
-//!   message with no `id`, or an IO error), said on stderr.
+//!   (stdin closed before an `expect`'s method or an `expect-response`'s
+//!   response came, a response when every `expect` so far matched a
+//!   notification, or an IO error), said on stderr.
 
 // railway R3, types R2: no `_ =>` on one of Brindle's own enums. Non-test
 // code only, as in the helper's root.
@@ -41,9 +43,10 @@ const GATE_POLL: Duration = Duration::from_millis(10);
 
 /// Why a step couldn't be played.
 enum Fault {
-    /// Stdin closed before a message with this method came.
+    /// Stdin closed before a message with this method (or the response
+    /// named so) came.
     Closed { method: String },
-    /// A `respond` or `respond-error` after an `expect` that matched a
+    /// A `respond` or `respond-error` when every `expect` so far matched a
     /// notification, which has no `id` to answer.
     NoId { method: String },
     /// A read or write failed; `what` names it.
@@ -134,11 +137,20 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
                 record = Some(file);
             }
             Step::Expect { method } => {
-                let id = expect(&mut input, &mut line, method, record.as_mut())?;
-                last = Some(Last {
-                    method: method.clone(),
-                    id,
-                });
+                let wanted = |received: &Received| received.method.as_deref() == Some(method);
+                let id = expect(&mut input, &mut line, method, wanted, record.as_mut())?;
+                // A notification leaves the request a response answers.
+                if id.is_some() || last.is_none() {
+                    last = Some(Last {
+                        method: method.clone(),
+                        id,
+                    });
+                }
+            }
+            Step::ExpectResponse { id } => {
+                let what = format!("the response to {id}");
+                let wanted = |received: &Received| received.answers(id);
+                expect(&mut input, &mut line, &what, wanted, record.as_mut())?;
             }
             Step::Send { line } => write_line(&mut output, line)?,
             Step::SendRaw { text } => write_line(&mut output, text)?,
@@ -181,12 +193,14 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
     }
 }
 
-/// Reads lines until a message with `method` comes, appending it to
-/// `record`; gives its `id`. Lines before it are skipped.
+/// Reads lines until a message `wanted` comes (`method` names it for the
+/// fault), appending it to `record`; gives its `id`. Lines before it are
+/// skipped.
 fn expect(
     input: &mut impl BufRead,
     line: &mut Vec<u8>,
     method: &str,
+    wanted: impl Fn(&Received) -> bool,
     record: Option<&mut File>,
 ) -> Result<Option<Value>, Fault> {
     loop {
@@ -202,7 +216,7 @@ fn expect(
         let Some(received) = Received::parse(line) else {
             continue;
         };
-        if received.method.as_deref() != Some(method) {
+        if !wanted(&received) {
             continue;
         }
         if let Some(file) = record {
