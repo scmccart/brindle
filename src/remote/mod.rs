@@ -35,6 +35,61 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::config::RemoteTarget;
 
+/// An agent zone's session in a terminal server, as [`agent_link`] starts
+/// it. It holds nothing yet: `agents-profiles`' group 4 gives it the
+/// session on Linux and Windows (`remote::local`), where the stub below
+/// stands until then. Elsewhere none is ever made.
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum AgentLink {}
+
+/// Why [`agent_link`] can't start an agent session here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub struct Unsupported {
+    reason: &'static str,
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
+/// What [`agent_link`] answers where the terminal server can't run.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+const NEEDS_THE_SERVER: Unsupported =
+    Unsupported { reason: "agent sessions run in the terminal server, which needs Linux or Windows" };
+
+/// What [`agent_link`]'s stub answers on Linux and Windows until
+/// `agents-profiles`' group 4 connects agent sessions through
+/// `remote::local`.
+#[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
+const NOT_CONNECTED_YET: Unsupported =
+    Unsupported { reason: "agent sessions aren't connected to the terminal server in this build" };
+
+/// Starts (or attaches) an agent zone's session on `host`'s terminal
+/// server: the platform-neutral entry point `src/agent/` uses, so it names
+/// no platform itself. `start` says what the session's thread asks the
+/// core for and `sink` gets what the session reports; their types are
+/// group 4's (`Start::SpawnAgent`, `agent::shared::Sink`), so they are
+/// left open here.
+#[cfg(any(target_os = "linux", windows))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn agent_link<Start, Sink>(host: Host, start: Start, sink: Sink) -> Result<AgentLink, Unsupported> {
+    let _ = (host, start, sink);
+    Err(NOT_CONNECTED_YET)
+}
+
+/// [`agent_link`] where there is no terminal server: always refused.
+#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn agent_link<Start, Sink>(host: Host, start: Start, sink: Sink) -> Result<AgentLink, Unsupported> {
+    let _ = (host, start, sink);
+    Err(NEEDS_THE_SERVER)
+}
+
 /// Keeps a process Brindle starts outside a tab from opening a console
 /// window of its own: Brindle has no console to share, so a console program
 /// would otherwise get one. Does nothing off Windows.
@@ -234,6 +289,19 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The seam item answers on every platform: the stub until group 4 on
+    /// Linux and Windows, the server's platforms elsewhere.
+    #[test]
+    fn agent_link_says_why_it_cannot_start() {
+        let refused = agent_link(Host::Local, (), ()).err();
+        let expected = if cfg!(any(target_os = "linux", windows)) { NOT_CONNECTED_YET } else { NEEDS_THE_SERVER };
+        assert_eq!(refused, Some(expected));
+        assert_eq!(
+            NEEDS_THE_SERVER.to_string(),
+            "agent sessions run in the terminal server, which needs Linux or Windows"
+        );
+    }
 
     #[test]
     fn ssh_command_uses_config_alias_and_quotes_remote_argv() {

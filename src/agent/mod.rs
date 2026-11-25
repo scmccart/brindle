@@ -5,6 +5,7 @@
 //! file reaches the transcript's types through it.
 
 // The later groups of `agents-profiles` use these; until then only the
-// tests do.
-#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+// tests use the mappings, and nothing the re-exports.
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(unused_imports)]
 pub mod transcript;
