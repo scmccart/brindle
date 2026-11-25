@@ -352,6 +352,25 @@ fn a_missing_command_fails_naming_the_program() {
     assert_eq!(core.exit_code(5), Some(0));
 }
 
+/// A holder whose only use was a program it couldn't start stays while its
+/// core is connected, and exits once the core has gone, without waiting out
+/// its 10 s `UNUSED_LIMIT` (so `brindle-remote stop` leaves nothing running
+/// after an agent profile whose command doesn't exist).
+#[test]
+fn a_holder_whose_spawn_failed_exits_once_its_core_goes() {
+    #[cfg(unix)]
+    let program = "/nonexistent/brindle-no-such-program";
+    #[cfg(windows)]
+    let program = r"C:\nonexistent\brindle-no-such-program.exe";
+    let (dir, mut core, pid) = holder("failed-gone");
+    core.send(ToHolder::Spawn(spawn(4, program, &[])));
+    assert!(matches!(core.recv(), ToCore::SpawnFailed(_)));
+    assert!(core.quiet_for(Duration::from_millis(200)) && alive(pid), "kept while its core is connected");
+    drop(core);
+    // Well inside the 10 s limit an unused holder waits.
+    assert!(eventually(Duration::from_secs(5), || !alive(pid) && dir.holder_endpoints().is_empty()));
+}
+
 #[test]
 fn exit_statuses_are_reported_and_an_empty_holder_exits() {
     let (dir, mut core, pid) = holder("exit");
