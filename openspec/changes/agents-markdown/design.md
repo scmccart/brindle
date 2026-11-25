@@ -35,6 +35,9 @@ See proposal.md for why. The user answered the proposal's eight questions on 202
 | `Response`, `CodeBlock`, links and tables drawing | components | `brindle-ui`, `ui/src/components/response.rs`, `code_block.rs` |
 | Drawing parts, code copy, link presses, `copy_last_code_block` | shell (entity) | `src/agent/view.rs`, `src/agent/mod.rs`, `src/actions.rs` |
 | The link confirmation | shell (overlay view) | `src/link_confirm.rs` (new), `src/workspace.rs`, `src/zone_view.rs` |
+| The pointer hook's names, targets, event plan and hold check (decision 16) | pure | `brindle`, `src/pointer_hook.rs` (new, joins `PURE_MODULES`) |
+| The hit-target registry and `.hit_target(name)` | primitive | `brindle-ui`, `ui/src/primitives/hit_targets.rs` (new) |
+| Running a plan through `Window::dispatch_event` and frame waits; `--- hit` and miss lines | shell | `src/main.rs` (`run_debug_steps`), `src/workspace.rs` (dump) |
 
 Crate references don't change (`ports R1`): `pulldown-cmark` goes on the app crate, which has no closed list, and `brindle-ui` stays on `gpui` and `log`. The pure renderer names `brindle_ui`'s plain data types, as `model.rs` already names `gpui::SharedString` (`fcis R5`: plain values, no entity or context).
 
@@ -220,11 +223,88 @@ Each is called out so review can overturn it:
 4. **A soft line break reads as a space** (CommonMark), which changes how a plain multi-line reply looks; the `agent-zones` scenario "Multi-line text" changes with it.
 5. **No 4 KiB cut inside one agent block** (decision 5): a long fence or list is one list item. User messages keep step 1's cut.
 6. **Thoughts stay one list item** (decision 5).
-7. **A `--- link` dump line** (decision 11) beside answer 7's `--- block` line, since no e2e case can click a link in an agent zone (there is no pointer hook outside the terminal grid), and a `--- confirm link` line for manual runs.
+7. **A `--- link` dump line** (decision 11) beside answer 7's `--- block` line, since no e2e case can click a link in an agent zone (there is no pointer hook outside the terminal grid), and a `--- confirm link` line for manual runs. (Decision 16, added later, gives e2e a pointer hook; the line stays, as the dump's account of every link and what a press would do.)
 8. **Bounds on agent text:** nesting at 16 levels and tables at 32 columns, and `render` under `catch_unwind` with the source as the fallback (decision 4, `railway R5`).
 9. **Images show their target cut to 120 characters** (a `data:` URI can be megabytes); the link keeps the whole target.
 10. **One door for the parser** (decision 2), mirroring the transcript crate's.
 11. **The gesture function moves** from `terminal_view.rs` to `terminal/links.rs`, so terminals and agent zones share it.
+
+### 16. An in-process pointer hook for window elements (2026-11-25, added at the user's request; `testing R2`, `R13`, `R16`; `fcis R1`; `types R1`, `R11`)
+
+**Why.** `--hover`, `--click`, `--right-click`, `--press` and `--release` reach only a terminal: `Workspace::debug_pointer` hands the step to the active `TerminalView`, whose `debug_pointer` calls its own mouse handlers with a cell's centre. Everything else that takes a press (a code block's copy button, a link, the link and close confirmations, permission options, the stop button, the queue row, a thought's trigger, a message's copy button, zone headers, the settings dialog) is a GPUI element listener, which runs only through the window's input dispatch. So this change's own pointer features (decisions 7, 8) and the agent zone's pointer checks from `agents-profiles` sit on `CLAUDE.md`'s manual list. The user asked (2026-11-25) for a hook that presses real elements anywhere in the window.
+
+**What GPUI offers.** `Window::dispatch_event(PlatformInput, cx)` is public, and it is exactly what the platform layer calls for real input (`Window::new` hands `platform_window.on_input` a closure that calls it): it stores the event's position and modifiers as the window's `mouse_position` and `modifiers`, hit-tests that position against the **last drawn frame** (`rendered_frame.hit_test`), updates the hovered hitbox and the cursor, and runs the frame's mouse listeners, capture then bubble. It is the mouse counterpart of `dispatch_keystroke`, which `--key` uses. Three facts shape a safe use (read from gpui 0.2.2's `window.rs`, `elements/div.rs` and `elements/text.rs`):
+- **It never draws first.** A key event draws a dirty window before dispatching; a mouse event doesn't. A press dispatched right after a change that hasn't drawn hits the old frame.
+- **Some listeners exist only after a frame.** `InteractiveText` (links) registers its mouse-up listener only in a frame painted after its mouse-down set `mouse_down_index`; a down and an up dispatched back to back never click a link. `Div`'s click keeps its pending down in shared state, so it would survive, but a real press has frames between its events too.
+- **`click_count` and `pressed_button` are the caller's.** The platform counts clicks (`x11/client.rs` `current_count`); the hook sets them itself: 1 for a click, 1 then 2 for a double-click, `pressed_button` on moves while it holds a button.
+
+`Window::on_next_frame` callbacks run at the start of the next frame request, before that frame's draw. So "a frame has drawn since now" is two hops: a callback that registers a second callback; the second runs after the first frame's draw. Before waiting, the hook calls `window.refresh()`, so a frame is drawn even when nothing changed (and Wayland, whose frame callbacks follow commits, gets one).
+
+**The dispatch sequence** (pure: `pointer_hook::plan(action, modifiers, held) -> Vec<HookEvent>`, `HookEvent::{Modifiers(Modifiers), Move, Down(button, count), Up(button, count), Frame}`; the shell runs it):
+
+| Step | Events |
+| --- | --- |
+| every step | `Frame` first, so the target is looked up in a frame that includes the previous steps |
+| `--hover` | `Modifiers(m)` when they differ from the held ones, `Move` (with `pressed_button` while a press is held), `Frame` |
+| `--click`, `--right-click` | `Modifiers(m)`, `Move`, `Frame`, `Down(b, 1)`, `Frame`, `Up(b, 1)`, `Frame`, `Modifiers(none)` |
+| `--double-click` (new) | as `--click`, then `Down(left, 2)`, `Frame`, `Up(left, 2)`, `Frame`, `Modifiers(none)` |
+| `--press` | `Modifiers(m)`, `Move`, `Frame`, `Down(left, 1)`, `Frame`; the left button and `m` stay held |
+| `--release` | `Move` (pressed), `Frame`, `Up(left, 1)`, `Frame`, `Modifiers(none)` |
+
+- `Modifiers(m)` is a `PlatformInput::ModifiersChanged`, as a real ctrl-click starts with ctrl going down; it reaches the focused path (so `Response`'s pointing-hand guard and an owner's `on_modifiers_changed` see it). It is sent only when `m` differs from what the hook holds, and released after the gesture, as a hand lifts the key.
+- The target is looked up **once**, after the first `Frame`; the events go to that point. If a hover moves what's under it, the press lands on whatever is there now, as a real one would.
+- A `Frame` that doesn't come within the step interval abandons the rest of the step (nothing more is dispatched against a stale frame) and records the miss `no-frame` (below).
+- The steps run in `run_debug_steps` outside `Workspace::update`, through `cx.update_window(…, |_, window, cx| window.dispatch_event(…))`, as `--key` does, since the listeners update the workspace themselves.
+- **Modality.** The hook writes no modality. A dispatched press sets `Modality::Pointer` exactly where a real one does, through the app's own listeners (`focus_from_pointer`, the agent zone's `capture_any_mouse_down`, menus and the command list); one that doesn't is the same finding a real press would give. `--modality` stays for checks that model a press without naming an element, and for keyboard modality.
+
+**The option form: element names, not pixels.** Two forms were weighed:
+- *Raw window pixels* (`--click-at X,Y`) with `rect=` added to dump lines. The steps are fixed at launch and the dump comes at the end, so a case would need one run to read a rectangle and a second to press it, against an agent conversation, a layout, fonts and a scale that may differ between the runs. Cases would break on every layout change.
+- *Element names* that the app resolves at the step's time to the element's painted bounds (chosen). One run, no layout numbers in a case, and the names come from what the dump already prints (entry and part numbers, focus-stop words, zone ids, tab numbers). It costs a small registry of painted bounds, recorded only in runs that use it.
+
+So the five existing options and a new `--double-click` take `POS` as either form:
+- `[MODS-]COL,ROW`: a terminal cell, unchanged (the terminal's own handlers, `TerminalView::debug_pointer`);
+- `[MODS-]@NAME[+FX,FY]`: the element painted under `NAME` in the last frame, pressed at fractions `FX,FY` of its bounds (each in `[0, 1]`, default `0.5,0.5`, the zone lines' convention), through `Window::dispatch_event`. The `@` makes the two forms unambiguous whatever the modifiers.
+
+```
+brindle agent fake -p 'show me' --step-interval 0.5 \
+  --wait-for 'kind=code:rust' --click @copy-code:2.1.0 --action text_input_paste \
+  --click ctrl-@link:2.2.0 --wait-for 'confirm link' --click @backdrop+0.02,0.02 \
+  --click ctrl-@link:2.2.0 --wait-for 'confirm link' --click @confirm:open --dump-screen-after 2
+```
+
+**Names** (`pointer_hook::HitName`, a closed enum with `FromStr` and `Display`, round-trip tested; `types R1`, `R11`): `KIND[:ARGS]`, numbered as the dump numbers them.
+
+| Name | Element |
+| --- | --- |
+| `tab:N` | the tab face numbered N in the tab lines |
+| `profile-menu` | the strip's `⌄` button |
+| `menu-item:N` | an open menu's entry N, counted from 0 with separators, as `--- menu … highlighted=N` |
+| `zone:ID`, `zone-header:ID`, `zone-split-right:ID`, `zone-split-down:ID` | a zone's body, its header and the header's split buttons |
+| `entry:N` | agent entry N's element (its bubble, row or card) |
+| `copy-message:N` | entry N's copy button (painted while the entry is hovered) |
+| `copy-code:N.P.K` | the copy button of the K-th code block (from 0, document order, nested ones included) of part P of entry N |
+| `link:N.P.K` | the K-th link of part P of entry N, in its `--- link` lines' order: the box of the link's first character, so its centre maps back into the link's range |
+| `thought:N` | thought N's trigger |
+| `permission:N:OPTION`, `stop`, `prompt`, `queued:remove`, `queued:send-again`, `queued:discard`, `scroll-to-bottom` | the agent zone's controls, named as its focus stops are |
+| `confirm:cancel`, `confirm:close`, `confirm:open` | the close and link confirmations' buttons, named as their focus stops |
+| `backdrop`, `dialog-close` | the open modal's backdrop (the whole window, so pressed with `+FX,FY` outside the dialog) and its × |
+| `settings-section:NAME`, `settings-row:NAME`, `settings-edit`, `settings-duplicate` | the settings dialog's section list, a Profiles row and its buttons |
+
+An agent zone's names (`entry:` to `scroll-to-bottom`) can be qualified `ZONE/NAME` (`@2/stop`); unqualified, they resolve in the active zone. Any name resolves to the one element recorded under it in the active zone, else the only one in the window; none is the miss `absent`, more than one `ambiguous`.
+
+**The registry** (`brindle-ui`, `primitives/hit_targets.rs`; `ports R2`: names are plain strings the owner passes, so the UI crate knows no Brindle vocabulary): a window-keyed global, like the focus-visible `Modalities`, that exists only when `main` enables it for a run with an `@` step (as latency probes exist only with their flags), so other runs pay one `has_global` check per target. `.hit_target(name)` on an element adds an absolutely placed, full-size `canvas` whose prepaint records the element's bounds clipped to `window.content_mask()` (a target scrolled out of a list is clipped to nothing, recorded `hidden`, and is the miss `absent` when pressed). Components whose pressable parts the owner can't reach take names from the owner: `CodeBlock::hit_target(name)` for its copy button, `Response::hit_targets(|ResponseTarget| -> SharedString)` with `ResponseTarget::{CopyCode { block, index }, Link { block, index }}` (a link's box from its `TextLayout` in prepaint), and the modal overlay records `backdrop`. `Workspace::render`, which runs on every draw (no view is `cached`), clears the window's entries first, so the registry always describes the last drawn frame.
+
+**The dump.** In a run with an `@` step, `--dump-screen-after` prints one `--- hit NAME rect=X,Y,W,H[ hidden]` line per recorded target (logical window pixels, as `--- grid origin=`, rounded to whole pixels; sorted by name), right before the `--- focus` line, so a failing case shows what was there. Each element step that missed adds `--- pointer-step missed "POS" reason=absent|ambiguous|no-frame` with the `--- wait-for` lines, after the focus line. Runs without an `@` step print neither, so existing cases' dumps don't change.
+
+**Usage errors** (`railway R1`, parsing at the boundary): an `@` step whose name has an unknown kind or malformed arguments, fractions that aren't two numbers in `[0, 1]`, unknown modifiers, a `--release` with no `--press` held before it, a second `--press` while one is held, and a press and release of different forms (a cell pressed, an element released) are refused at launch with status 2, naming the option and value (`pointer_hook::check_holds(&steps)`, pure). Whether a name is painted can only be known while running, hence the miss lines.
+
+**Platforms.** The hook is in-process, so it behaves the same under `scripts/with-xvfb`, on `:0` and on Windows. Two differences, both from what the hook skips:
+- On Windows it never goes through `WM_NCHITTEST`: a press on the caption area reaches GPUI's listeners only, never the system's drag, double-click maximize or caption buttons. The `windows-caption-hit-test` case keeps its message probe; the hook doesn't replace it.
+- On a real display, a real pointer moving over the window between steps overwrites `mouse_position`; under `scripts/with-xvfb` and on CI's Windows desktop nothing moves. Element names make the window's scale irrelevant.
+
+**The terminal's cell form stays on its own path in this change.** Moving `COL,ROW` onto the window dispatch (the cell's window point from `GridLayout`) would make terminal presses meet overlays, zone focusing and the grid's painted pointer as real ones do, but every existing terminal pointer case (selection drags, links, right-click paste, mouse reporting, `--- grid-pointer`) would change underneath, and `TerminalView::debug_pointer`'s `debug_held` would have to move into the hook. That is its own change, proposed (proposal-only, task 5.12) once the element path has proven itself.
+
+**Rejected:** XTest or posted OS messages (`CLAUDE.md`: never on this desktop; Linux can't post into one window); GPUI's `debug_selector` and `VisualTestContext::debug_bounds` (compiled out without `test-support`, so absent from the release builds the archive jobs test); per-name steps such as `--click-copy-code N.P.K` (a dozen options instead of one grammar).
 
 ## Risks / Trade-offs
 

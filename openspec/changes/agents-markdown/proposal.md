@@ -14,6 +14,7 @@ In step 1 an agent zone shows every message as plain text. ACP agents write Mark
 - Agent messages and thoughts in an agent zone are rendered as Markdown: paragraphs, emphasis, inline code, code blocks in the terminal's monospace font with a copy button, lists, headings, quotes, tables and links. The stored text doesn't change: the server keeps plain text and Brindle renders it.
 - Fields ACP defines as plain text stay plain (tool call titles, permission titles, notices, error messages); ACP v2 says clients SHOULD NOT render those as Markdown.
 - Raw HTML is never rendered (ACP: clients SHOULD disable or sanitize it).
+- Added at the user's request on 2026-11-25: an in-process pointer hook, so e2e cases press real elements anywhere in the window (code-block copy buttons, links, the confirmations, the agent zone's buttons, the settings dialog), not just terminal cells. The pointer debug options and a new `--double-click` take `@NAME[+FX,FY]`, an element the dump names, and send the press through GPUI's own `Window::dispatch_event`; the dump lists the targets it painted. The agent zone's pointer checks on `CLAUDE.md`'s manual list become e2e cases (design.md decision 16).
 
 Open questions, answered by the user on 2026-11-25 (design.md decision 1 says where each is worked out):
 1. **Where the parser comes from:** `pulldown-cmark` (`default-features = false`) in the app crate, behind a pure function in `src/agent/` that hands `brindle-ui` plain blocks of styled runs; `brindle-ui`'s list stays `gpui`, `log`; `Cargo.lock` gains one package.
@@ -43,7 +44,7 @@ Open questions, answered by the user on 2026-11-25 (design.md decision 1 says wh
 - `agent-zones`: "The conversation", "Copying from the conversation", "Agent zone appearance" and "Agent commands in the palette" change; Markdown, code blocks, Copy Last Code Block, streaming, tables, images and HTML are added.
 - `ui-components`: responses, their code blocks, links and tables are added beside "Messages".
 - `links`: links in agent messages, their target on hover, and confirming schemes other than http and https.
-- `command-line`: the dump's `--- block`, `--- link` and `--- confirm link` lines.
+- `command-line`: the dump's `--- block`, `--- link` and `--- confirm link` lines; pointer steps on window elements, `--double-click`, the dump's `--- hit` and `--- pointer-step missed` lines, and their usage errors.
 - `ui-theme-tokens`: the `link` token and more legible pairs.
 
 ## Impact
@@ -52,4 +53,5 @@ Open questions, answered by the user on 2026-11-25 (design.md decision 1 says wh
 - `src/agent/`: a pure Markdown renderer, the chat model's parts for agent messages and thoughts, link handling, Copy Last Code Block; `src/link_confirm.rs` and the workspace overlay; `terminal/links.rs` gains `plan_here` and the shared gesture.
 - `Cargo.lock`: one added package, `pulldown-cmark`.
 - The `--dump-screen-after` output for an agent zone, e2e cases against the fake ACP agent, and a perf case.
+- The pointer hook: `src/pointer_hook.rs` (pure), the step runner in `src/main.rs`, a hit-target registry in `brindle-ui` (`primitives/hit_targets.rs`), names on Brindle's pressable elements, harness helpers in `tests/e2e/brindle.rs`, and agent-zone and settings cases that replace manual checks in `CLAUDE.md`.
 - No change to the terminal server, the transcript, the client protocol, config keys or state files.
