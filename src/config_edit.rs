@@ -1842,6 +1842,100 @@ background = "nope"
         assert_eq!(doc.to_string(), "[[profiles]]\nname = \"T\"\ntype = \"terminal\"\n");
     }
 
+    /// Which variant an edit is: the match has no `_ =>` arm, so a new
+    /// variant must join the test below.
+    fn variant(edit: &ConfigEdit) -> &'static str {
+        match edit {
+            ConfigEdit::SetGlobalTheme { .. } => "SetGlobalTheme",
+            ConfigEdit::SaveTheme { .. } => "SaveTheme",
+            ConfigEdit::DeleteTheme { .. } => "DeleteTheme",
+            ConfigEdit::SaveProfile { .. } => "SaveProfile",
+            ConfigEdit::DeleteProfile { .. } => "DeleteProfile",
+            ConfigEdit::MoveProfile { .. } => "MoveProfile",
+            ConfigEdit::SetFonts(_) => "SetFonts",
+            ConfigEdit::SetClipboard(_) => "SetClipboard",
+        }
+    }
+
+    /// Every edit the dialog makes leaves an agent profile's table byte for
+    /// byte as it was, a reorder moving it whole.
+    #[test]
+    fn every_edit_keeps_an_agent_table_byte_for_byte() {
+        let text = agent_sample();
+        let shell = ProfileRef { index: 0, name: Some("Shell".into()) };
+        let theme = builtin_theme("gruvbox-dark").unwrap();
+        let edits = [
+            ConfigEdit::SetGlobalTheme { name: "tokyo-night".into() },
+            ConfigEdit::SaveTheme { original: Some("mine".into()), name: "ours".into(), theme: theme.clone() },
+            ConfigEdit::SaveTheme { original: None, name: "new".into(), theme },
+            ConfigEdit::DeleteTheme { name: "broken".into() },
+            ConfigEdit::SaveProfile {
+                at: Some(shell.clone()),
+                profile: Profile { name: "Login".into(), cwd: Some("~".into()), ..Default::default() },
+                default: DefaultChange::Rename { old: "Shell".into(), new: "Login".into() },
+            },
+            ConfigEdit::SaveProfile {
+                at: Some(work_ref()),
+                profile: Profile { name: "Work".into(), font_size: Some(12.0), ..Default::default() },
+                default: DefaultChange::Set("Work".into()),
+            },
+            ConfigEdit::SaveProfile {
+                at: None,
+                profile: Profile { name: "New".into(), ..Default::default() },
+                default: DefaultChange::Keep,
+            },
+            ConfigEdit::DeleteProfile { at: work_ref(), name: "Work".into() },
+            ConfigEdit::DeleteProfile { at: shell.clone(), name: "Shell".into() },
+            ConfigEdit::MoveProfile { at: agent_ref(), up: true },
+            ConfigEdit::MoveProfile { at: agent_ref(), up: false },
+            ConfigEdit::MoveProfile { at: shell, up: false },
+            ConfigEdit::MoveProfile { at: work_ref(), up: true },
+            ConfigEdit::SetFonts(vec![
+                FontChange::TerminalFamily(Some("Consolas".into())),
+                FontChange::Size(20.0),
+                FontChange::LineHeight(1.3),
+                FontChange::UiFamily(Some("Inter".into())),
+            ]),
+            ConfigEdit::SetClipboard(vec![
+                ClipboardChange::CopyOnSelect(true),
+                ClipboardChange::RightClick(RightClick::Paste),
+            ]),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for edit in &edits {
+            seen.insert(variant(edit));
+            let mut doc = parse(&text).unwrap();
+            assert!(edit.apply(&mut doc).is_ok(), "{edit:?}");
+            let written = doc.to_string();
+            assert_ne!(written, text, "{edit:?} changed nothing");
+            assert_eq!(written.matches(AGENT_TABLE).count(), 1, "{edit:?}:\n{written}");
+            // Read as the dialog reads them (the sample's broken theme
+            // keeps a whole load from reading).
+            let read: Vec<Profile> = profiles(&doc).unwrap().into_iter().map(|(_, p)| p.unwrap()).collect();
+            let agent = read.iter().find(|p| p.name == "Agent").expect("the agent profile");
+            assert_eq!(agent.kind(), ProfileKind::Agent, "{edit:?}");
+            let names: Vec<&str> = read.iter().map(|p| p.name.as_str()).collect();
+            // Shell, Agent, Work: where Agent is after the edit.
+            let want_at = match edit {
+                ConfigEdit::MoveProfile { at, up } => match (at.index, up) {
+                    (0, false) | (1, true) => 0,
+                    (1, false) | (2, true) => 2,
+                    other => panic!("no such move in the list: {other:?}"),
+                },
+                ConfigEdit::DeleteProfile { at, .. } => usize::from(at.index > 1),
+                ConfigEdit::SetGlobalTheme { .. }
+                | ConfigEdit::SaveTheme { .. }
+                | ConfigEdit::DeleteTheme { .. }
+                | ConfigEdit::SaveProfile { .. }
+                | ConfigEdit::SetFonts(_)
+                | ConfigEdit::SetClipboard(_) => 1,
+            };
+            assert_eq!(names.iter().position(|n| *n == "Agent"), Some(want_at), "{edit:?}: {names:?}");
+        }
+        let all = ["DeleteProfile", "DeleteTheme", "MoveProfile", "SaveProfile", "SaveTheme", "SetClipboard", "SetFonts", "SetGlobalTheme"];
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), all);
+    }
+
     #[test]
     fn file_text_reads_a_missing_file_as_none() {
         let path = Path::new("/c/config.toml");
