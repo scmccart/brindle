@@ -58,7 +58,7 @@ use brindle_term_core::emulator;
 
 use super::clients::{ClientToken, error};
 use super::holders::WaitingSpawn;
-use super::policy::{self, ExitFate, Fate, GraceFate, SessionView};
+use super::policy::{self, ExitFate, Fate, GraceFate, SessionKind, SessionView};
 use super::screen::Screen;
 use super::{Core, log};
 use crate::pty::Foreground;
@@ -349,6 +349,8 @@ impl Session {
             life: &self.life,
             ownership: &self.ownership,
             owner: self.owner.as_ref(),
+            // Agent sessions come with task group 7 of `agents-sessions`.
+            kind: SessionKind::Terminal,
         }
     }
 
@@ -878,12 +880,15 @@ impl<L: EventLoop> Core<L> {
         let Some(token) = self.client_token(client) else {
             return;
         };
+        let Some(protocol) = self.clients.get(&client).map(|entry| entry.protocol) else {
+            return;
+        };
         let sessions: Vec<(SessionId, SessionView<'_>)> = self
             .sessions
             .iter()
             .map(|(&id, session)| (id, session.view()))
             .collect();
-        let returning = policy::returning(&sessions, token);
+        let returning = policy::returning(&sessions, token, protocol);
         if !returning.is_empty() {
             log!(
                 "client {client} is back for {} session(s): {returning:?}",
@@ -1218,7 +1223,8 @@ impl<L: EventLoop> Core<L> {
     pub(super) fn client_attach(&mut self, client: Token, attach: client::Attach) {
         let id = attach.session;
         let session = self.sessions.get(&id).map(Session::view);
-        if let Some(refusal) = policy::attach_refusal(id, session, client) {
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+        if let Some(refusal) = policy::attach_refusal(id, session, client, protocol) {
             let message = refusal.to_string();
             return self.send_client(client, error(Some(attach.req), Some(id), message));
         }

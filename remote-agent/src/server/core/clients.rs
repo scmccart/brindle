@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
 use brindle_remote_protocol::{RequestId, SessionId};
 
-use super::policy::{self, ClientOptions, Mark};
+use super::policy::{self, AgentRequest, ClientOptions, Mark};
 use super::{Core, DEAD_CLIENT_READ_LIMIT, Source, log};
 use crate::server::conn::Conn;
 use crate::server::event_loop::{EventLoop, Interest, Token};
@@ -327,25 +327,54 @@ impl<L: EventLoop> Core<L> {
             ToCore::StepDown(request) => self.client_step_down(client, request.req),
             // Agent sessions come with section 7 of `agents-sessions`; until
             // then a client that sends one is told so.
-            ToCore::SpawnAgent(spawn) => self.no_agents(client, Some(spawn.req), None),
-            ToCore::AgentPrompt(prompt) => {
-                self.no_agents(client, Some(prompt.req), Some(prompt.session))
+            ToCore::SpawnAgent(spawn) => {
+                self.no_agents(client, AgentRequest::Spawn, Some(spawn.req), None)
             }
-            ToCore::AgentCancel(target) => self.no_agents(client, None, Some(target.session)),
-            ToCore::AgentPermission(answer) => {
-                self.no_agents(client, Some(answer.req), Some(answer.session))
+            ToCore::AgentPrompt(prompt) => self.no_agents(
+                client,
+                AgentRequest::Prompt,
+                Some(prompt.req),
+                Some(prompt.session),
+            ),
+            ToCore::AgentCancel(target) => {
+                self.no_agents(client, AgentRequest::Cancel, None, Some(target.session))
             }
-            ToCore::AgentUnqueue(request) | ToCore::AgentResend(request) => {
-                self.no_agents(client, Some(request.req), Some(request.session))
-            }
+            ToCore::AgentPermission(answer) => self.no_agents(
+                client,
+                AgentRequest::Permission,
+                Some(answer.req),
+                Some(answer.session),
+            ),
+            ToCore::AgentUnqueue(request) => self.no_agents(
+                client,
+                AgentRequest::Unqueue,
+                Some(request.req),
+                Some(request.session),
+            ),
+            ToCore::AgentResend(request) => self.no_agents(
+                client,
+                AgentRequest::Resend,
+                Some(request.req),
+                Some(request.session),
+            ),
         }
     }
 
-    fn no_agents(&mut self, client: Token, req: Option<u64>, session: Option<SessionId>) {
-        self.send_client(
-            client,
-            error(req, session, "this terminal server can't run agent sessions yet"),
-        );
+    /// An agent message: refused below client protocol 4
+    /// ([`policy::agent_request_refusal`]), and for now on every connection.
+    fn no_agents(
+        &mut self,
+        client: Token,
+        request: AgentRequest,
+        req: Option<u64>,
+        session: Option<SessionId>,
+    ) {
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+        let message = match policy::agent_request_refusal(protocol, request) {
+            Some(refusal) => refusal.to_string(),
+            None => "this terminal server can't run agent sessions yet".to_owned(),
+        };
+        self.send_client(client, error(req, session, message));
     }
 
     /// Queues a message for a client. Past

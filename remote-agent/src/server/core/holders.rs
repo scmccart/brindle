@@ -111,6 +111,7 @@ impl Holder {
         HolderView {
             named: self.place.build.as_deref(),
             stage,
+            protocol: self.protocol(),
         }
     }
 }
@@ -610,7 +611,14 @@ impl<L: EventLoop> Core<L> {
             return;
         }
         let (tokens, views) = self.holder_views();
-        let placement = policy::placement(&views, &self.build, self.holder_start.is_some());
+        // Every waiting spawn is a terminal's until agent sessions come
+        // (task group 7 of `agents-sessions`).
+        let placement = policy::placement(
+            &views,
+            &self.build,
+            self.holder_start.is_some(),
+            h1::SpawnMode::Pty,
+        );
         match placement {
             Placement::Spawn(index) => {
                 let Some(&holder) = tokens.get(index) else {
