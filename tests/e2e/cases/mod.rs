@@ -257,6 +257,8 @@ fn unix() -> Vec<Case> {
         display("agent-first-prompt", agent::first_prompt).needs_fake_agent(),
         display("agent-launch-kinds", agent::launch_kinds).needs_fake_agent(),
         display("agent-handoff", agent::handoff).needs_fake_agent(),
+        display("agent-close-confirm", agent::close_confirm).needs_fake_agent(),
+        display("agent-close-idle", agent::close_idle).needs_fake_agent(),
     ]
 }
 

@@ -16,9 +16,6 @@ const HELLO: &str = "Hello!";
 /// answers its first prompt with [`HELLO`], recording what it was sent in
 /// `received.jsonl`, then idles until its session ends.
 fn hello_script(received: &Path) -> String {
-    let chunk = format!(
-        r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{HELLO}"}}}}}}}}"#
-    );
     [
         format!("record {}", received.display()),
         "expect initialize".into(),
@@ -26,7 +23,7 @@ fn hello_script(received: &Path) -> String {
         "expect session/new".into(),
         r#"respond {"sessionId":"s1"}"#.into(),
         "expect session/prompt".into(),
-        format!("send {chunk}"),
+        says(HELLO),
         r#"respond {"stopReason":"end_turn"}"#.into(),
     ]
     .join("\n")
@@ -54,6 +51,147 @@ fn hello_agent(ctx: &Ctx) -> Result<(String, PathBuf)> {
 /// The waits for the answer to the first prompt.
 fn answered() -> String {
     format!("agent {HELLO:?}")
+}
+
+/// A `send` step streaming `text` into the agent's message.
+fn says(text: &str) -> String {
+    let text = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\t', "\\t");
+    format!(
+        r#"send {{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}}}}}}"#
+    )
+}
+
+/// A fake agent's script, built step by step and written into the case
+/// directory.
+struct Script(Vec<String>);
+
+impl Script {
+    /// An agent that records what it is sent in `received`, names itself
+    /// `Fake Agent` and is ready at once.
+    fn ready(received: &Path) -> Self {
+        Script(vec![
+            format!("record {}", received.display()),
+            "expect initialize".into(),
+            r#"respond {"protocolVersion":1,"agentInfo":{"name":"Fake Agent","version":"1.0"}}"#.into(),
+            "expect session/new".into(),
+            r#"respond {"sessionId":"s1"}"#.into(),
+        ])
+    }
+
+    fn step(mut self, step: impl Into<String>) -> Self {
+        self.0.push(step.into());
+        self
+    }
+
+    /// Waits for a prompt, then holds its turn until `gate` exists.
+    fn prompt_held(self, gate: &Path) -> Self {
+        self.step("expect session/prompt").step(format!("wait-file {}", gate.display()))
+    }
+
+    /// Writes the script as `NAME.script` in the case directory and
+    /// returns the `Fake` profile running it.
+    fn profile(self, ctx: &Ctx, name: &str) -> Result<String> {
+        let path = ctx.dir.join(format!("{name}.script"));
+        std::fs::write(&path, self.0.join("\n") + "\n").map_err(|e| format!("writing {}: {e}", path.display()))?;
+        Ok(fake_profile(ctx, &path))
+    }
+}
+
+/// A file in the case directory a fake agent's `wait-file` waits for,
+/// which the case creates; it is never created when it holds a turn for
+/// the whole run.
+fn gate(ctx: &Ctx, name: &str) -> PathBuf {
+    ctx.dir.join(name)
+}
+
+/// What the agent zone's `--wait-for` text shows while a turn runs.
+const WORKING: &str = "turn=working";
+
+/// Waits until the case server lists `count` sessions, which shows that
+/// closed agents ended rather than being left detached.
+fn sessions_listed(ctx: &Ctx, count: usize) -> Result {
+    ctx.scale().eventually(10.0, &format!("{count} listed sessions"), || {
+        crate::brindle::listed_sessions(ctx).is_ok_and(|listed| listed.len() == count)
+    })
+}
+
+/// Closing a working agent asks first (design.md decision 12): Close
+/// Zone opens the confirmation naming the working agent, Cancel focused,
+/// with the turn going on; enter and escape cancel, leaving the zone and
+/// its turn; on a tab with a working and an idle agent zone, Close Tab
+/// names only the working one, and tab then enter closes the tab, ending
+/// both agents (only the other tab's shell is left to detach at quit).
+pub fn close_confirm(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let profile = Script::ready(&received).prompt_held(&gate(ctx, "never")).profile(ctx, "held")?;
+    let started = |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for(WORKING);
+
+    let out = started("asks").action("close_zone").dump_at(5.0).run()?;
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
+    ensure!(out.dump.confirm.as_deref() == Some("close target=zone:1 busy=1:working"), "confirm: {:?}", out.dump.confirm);
+    ensure!(
+        out.dump.focus.as_deref() == Some("confirm") && out.dump.focus_stop.as_deref() == Some("cancel"),
+        "Cancel has focus: {:?} {:?}",
+        out.dump.focus,
+        out.dump.focus_stop
+    );
+    ensure!(out.dump.agent_field("turn") == Some("working"), "the turn goes on: {:?}", out.dump.agent);
+
+    for (label, key) in [("enter", "enter"), ("escape", "escape")] {
+        let out = started(label).action("close_zone").key(key).dump_at(6.0).run()?;
+        ensure!(out.dump.confirm.is_none(), "{key} closed the confirmation: {:?}", out.dump.confirm);
+        ensure!(out.dump.tabs.len() == 1, "{key}: the tab stays: {:?}", out.dump.tabs);
+        ensure!(out.dump.agent_field("turn") == Some("working"), "{key}: the turn goes on: {:?}", out.dump.agent);
+    }
+
+    // A tab of two agent zones, the first working and the second idle, and
+    // a shell tab beside it.
+    let out = started("tab")
+        .action("split_zone_right")
+        .action("new_tab")
+        .action("prev_tab")
+        .action("close_tab")
+        .dump_at(8.0)
+        .run()?;
+    ensure!(out.dump.confirm.as_deref() == Some("close target=tab:1 busy=1:working"), "confirm: {:?}", out.dump.confirm);
+    let out = started("tab-closed")
+        .keep_detached()
+        .action("split_zone_right")
+        .action("new_tab")
+        .action("prev_tab")
+        .action("close_tab")
+        .key("tab")
+        .key("enter")
+        .dump_at(10.0)
+        .run()?;
+    ensure!(out.dump.confirm.is_none(), "the confirmation closed: {:?}", out.dump.confirm);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "only the shell tab is left: {:?}", out.dump.tabs);
+    sessions_listed(ctx, 1)?;
+    crate::brindle::hang_up_detached(ctx)?;
+    Ok(Outcome::Pass)
+}
+
+/// Closing an agent zone whose turn has ended asks nothing: the zone (and
+/// its tab, the last zone) closes at once, and its agent ends.
+pub fn close_idle(ctx: &Ctx) -> Result<Outcome> {
+    let (profile, _) = hello_agent(ctx)?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .keep_detached()
+        .wait_for(&answered())
+        .action("new_tab")
+        .action("prev_tab")
+        .action("close_zone")
+        .dump_at(7.0)
+        .run()?;
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
+    ensure!(out.dump.confirm.is_none(), "nothing asked: {:?}", out.dump.confirm);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "the agent tab closed: {:?}", out.dump.tabs);
+    sessions_listed(ctx, 1)?;
+    crate::brindle::hang_up_detached(ctx)?;
+    Ok(Outcome::Pass)
 }
 
 /// `brindle agent Fake -p hi` opens an agent tab that sends `hi` once the

@@ -16,8 +16,7 @@ pub mod transcript;
 // What an agent session's start asks for.
 pub mod spawn;
 
-// Whether a close asks first: the close paths call it from task 6.6 on.
-#[cfg_attr(not(test), allow(dead_code, reason = "agents-profiles task 6.6 routes the close paths through close_plan"))]
+// Whether a close asks first, and what the confirmation says.
 pub mod close;
 
 // The fold the reader thread and the zone share.

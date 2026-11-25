@@ -7,6 +7,7 @@
 
 mod actions;
 mod agent;
+mod close_confirm;
 mod config;
 mod config_edit;
 mod cursor;

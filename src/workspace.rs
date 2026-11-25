@@ -59,7 +59,11 @@ use crate::terminal::status::State;
 use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
-use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneStart, ZoneTreeView, describe_badge, ui_badge};
+use crate::zone_view::{
+    CloseZoneAsk, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneStart, ZoneTreeView, describe_badge, ui_badge,
+};
+use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
+use crate::close_confirm::{CloseConfirm, Confirmed};
 
 /// The tab strip's height in logical pixels: the pill tab list's
 /// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default rem,
@@ -380,6 +384,18 @@ enum Overlay {
     /// A tab's or a zone header's menu: its entries and what its items
     /// run, and what it was opened on.
     ContextMenu { menu: ActionMenu, on: MenuFor },
+    /// The close confirmation: what a Close closes, and the busy agents it
+    /// names.
+    CloseConfirm { target: CloseTarget, busy: Vec<BusyAgent> },
+}
+
+/// What the close confirmation closes once the user confirms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTarget {
+    /// One zone of tab `tab` (Close Zone, the header's ×, its menu).
+    Zone { tab: TabId, zone: ZoneId },
+    /// A whole tab (Close Tab, the tab's ×, a middle click, its menu).
+    Tab(TabId),
 }
 
 impl Overlay {
@@ -392,6 +408,7 @@ impl Overlay {
             Self::Settings => Some(OverlayKind::Settings),
             Self::ProfileMenu => Some(OverlayKind::ProfileMenu),
             Self::ContextMenu { .. } => Some(OverlayKind::ContextMenu),
+            Self::CloseConfirm { .. } => Some(OverlayKind::CloseConfirm),
         }
     }
 }
@@ -525,6 +542,10 @@ pub struct Workspace {
     /// nothing, so a stray click never throws away a preview or an edit.
     settings: UiOverlay<SettingsDialog>,
     _settings_subscriptions: Vec<Subscription>,
+    /// The close confirmation's modal slot (design.md decision 12), open
+    /// while `overlay` is [`Overlay::CloseConfirm`].
+    confirm: UiOverlay<CloseConfirm>,
+    _confirm_subscriptions: Vec<Subscription>,
     /// The strip's `⌄` button and its profile menu, the third overlay: at
     /// most one of the palette, the settings dialog and this menu is open.
     /// Its items are rebuilt each time it opens (`refresh_profile_menu`),
@@ -612,6 +633,8 @@ impl Workspace {
             sessions_listing: 0,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
+            confirm: UiOverlay::modal(),
+            _confirm_subscriptions: Vec::new(),
             profile_menu,
             _profile_menu_subscription: profile_menu_subscription,
             context_menu,
@@ -1317,6 +1340,10 @@ impl Workspace {
             cx.subscribe_in(view, window, |this, view, request: &ZoneMenuRequest, window, cx| {
                 this.open_zone_menu(view, request, window, cx)
             }),
+            cx.subscribe_in(view, window, |this, view, ask: &CloseZoneAsk, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.open_close_confirm(CloseTarget::Zone { tab, zone: ask.zone }, ask.busy.clone(), window, cx);
+            }),
             // From any tab: an opener can fail after its tab went to the
             // background.
             cx.subscribe(view, |this, _, LinkFailed(text): &LinkFailed, cx| this.show_notice(text.clone(), cx)),
@@ -1410,6 +1437,9 @@ impl Workspace {
                 if self.tabs[ix].refresh_title(cx) | self.refresh_badge(ix, cx) {
                     cx.notify();
                 }
+                // And when a zone closed, which may be the one the close
+                // confirmation asks about.
+                self.drop_stale_confirm(window, cx);
             }
         }
     }
@@ -1584,6 +1614,7 @@ impl Workspace {
             }
             Removed::Active(active) => self.activate(Pick::Tab(active), window, cx),
         }
+        self.drop_stale_confirm(window, cx);
     }
 
     // ---- actions ----------------------------------------------------------------
@@ -1612,7 +1643,79 @@ impl Workspace {
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(active) = self.strip.active() {
-            self.remove_tab(active, window, cx);
+            self.request_close_tab(active, window, cx);
+        }
+    }
+
+    /// The user asked to close tab `id` (Close Tab, its ×, a middle click,
+    /// its menu): at once, or after the confirmation when one of its agent
+    /// zones is busy ([`close_plan`]). A background tab isn't activated.
+    fn request_close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_ix(id) else { return };
+        let closing = self.tabs[ix].zones.read(cx).closing(cx);
+        match close_plan(&closing) {
+            ClosePlan::Now => self.remove_tab(id, window, cx),
+            ClosePlan::Ask(busy) => self.open_close_confirm(CloseTarget::Tab(id), busy, window, cx),
+        }
+    }
+
+    /// Opens the close confirmation for `target`, naming `busy`, in place
+    /// of any overlay. Cancel, escape and the backdrop leave everything as
+    /// it was, focus going back to where it was; Close closes `target`.
+    fn open_close_confirm(&mut self, target: CloseTarget, busy: Vec<BusyAgent>, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_overlay(OverlayKind::CloseConfirm, window, cx);
+        let dialog = cx.new(|cx| CloseConfirm::new(close_text(&busy), cx));
+        let confirmed = cx.subscribe_in(&dialog, window, |this, _, _: &Confirmed, window, cx| this.confirm_close(window, cx));
+        // The slot closes itself on the dialog's `DismissEvent` (Cancel,
+        // escape, the backdrop).
+        let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| {
+            if matches!(this.overlay, Overlay::CloseConfirm { .. }) {
+                this.overlay = Overlay::Closed;
+            }
+            cx.notify();
+        });
+        self._confirm_subscriptions = vec![confirmed, dismissed];
+        self.overlay = Overlay::CloseConfirm { target, busy };
+        self.confirm.open(dialog, |this| &mut this.confirm, window, cx);
+        cx.notify();
+    }
+
+    /// Close in the confirmation: it closes, giving focus back, then what
+    /// it asked about closes, if it is still there. Nothing is asked
+    /// again, even if the agent went idle meanwhile.
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::CloseConfirm { target, .. } = std::mem::replace(&mut self.overlay, Overlay::Closed) else {
+            return;
+        };
+        self.confirm.close(window, cx);
+        self._confirm_subscriptions.clear();
+        match target {
+            CloseTarget::Tab(id) => self.remove_tab(id, window, cx),
+            CloseTarget::Zone { tab, zone } => {
+                if let Some(zones) = self.tab_ix(tab).map(|ix| self.tabs[ix].zones.clone()) {
+                    zones.update(cx, |zones, cx| zones.close_zone_by_id(zone, window, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The close confirmation's target, while it is open and still there.
+    /// One whose tab or zone went by another path (closed, exited) closes
+    /// itself.
+    fn drop_stale_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::CloseConfirm { target, .. } = &self.overlay else { return };
+        let there = match *target {
+            CloseTarget::Tab(id) => self.tab_ix(id).is_some(),
+            CloseTarget::Zone { tab, zone } => {
+                self.tab_ix(tab).is_some_and(|ix| self.tabs[ix].zones.read(cx).has_zone(zone))
+            }
+        };
+        if !there {
+            self.overlay = Overlay::Closed;
+            self.confirm.close(window, cx);
+            self._confirm_subscriptions.clear();
+            cx.notify();
         }
     }
 
@@ -1818,7 +1921,7 @@ impl Workspace {
                 TabMenuItem::Rename => self.rename_tab_at(id, window, cx),
                 TabMenuItem::MoveLeft => self.shift_tab(id, Shift::Within(-1), cx),
                 TabMenuItem::MoveRight => self.shift_tab(id, Shift::Within(1), cx),
-                TabMenuItem::Close => self.remove_tab(id, window, cx),
+                TabMenuItem::Close => self.request_close_tab(id, window, cx),
             }
             return;
         }
@@ -2058,7 +2161,8 @@ impl Workspace {
             | Overlay::Palette { kind: PaletteKind::NewTab { .. } | PaletteKind::Commands { .. } | PaletteKind::Prompt, .. }
             | Overlay::Settings
             | Overlay::ProfileMenu
-            | Overlay::ContextMenu { .. } => {}
+            | Overlay::ContextMenu { .. }
+            | Overlay::CloseConfirm { .. } => {}
         }
     }
 
@@ -2173,6 +2277,7 @@ impl Workspace {
     fn has_overlay(&self, cx: &App) -> bool {
         self.palette.is_open()
             || self.settings.is_open()
+            || self.confirm.is_open()
             || self.profile_menu.read(cx).is_open()
             || self.context_menu.read(cx).is_open()
     }
@@ -2187,6 +2292,7 @@ impl Workspace {
             OverlayKind::Settings => self.settings.is_open(),
             OverlayKind::ProfileMenu => self.profile_menu.read(cx).is_open(),
             OverlayKind::ContextMenu => self.context_menu.read(cx).is_open(),
+            OverlayKind::CloseConfirm => self.confirm.is_open(),
         };
         open.then_some(kind)
     }
@@ -2213,6 +2319,8 @@ impl Workspace {
         self.overlay = Overlay::Closed;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
+        self.confirm.close(window, cx);
+        self._confirm_subscriptions.clear();
         self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.end_previews(cx);
@@ -2452,6 +2560,13 @@ impl Workspace {
             let menu = menu.read(cx);
             out.push_str(&describe_menu(menu.entries(), menu.highlighted()));
         }
+        if let (Overlay::CloseConfirm { target, busy }, true) = (&self.overlay, self.confirm.is_open()) {
+            let target = match *target {
+                CloseTarget::Zone { zone, .. } => format!("zone:{}", zone.0),
+                CloseTarget::Tab(id) => format!("tab:{}", self.tab_ix(id).map_or(0, |ix| ix + 1)),
+            };
+            out.push_str(&format!("--- confirm close target={target} busy={}\n", describe_busy(busy)));
+        }
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
         }
@@ -2476,6 +2591,11 @@ impl Workspace {
             self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
         {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx).unwrap_or(""))
+        } else if let Some(dialog) = self.confirm.view().filter(|d| d.read(cx).contains_focused(window, cx)) {
+            match dialog.read(cx).focused_stop(window) {
+                Some(stop) => format!("confirm stop={}", stop.word()),
+                None => "confirm".to_string(),
+            }
         } else if self.strip_focus.is_focused(window) {
             "tabs".to_string()
         } else if self.open_menu(cx).is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx)) {
@@ -2577,7 +2697,7 @@ impl Workspace {
             .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
             .on_close(cx.listener(|this, ix: &usize, window, cx| {
                 if let Some(id) = this.tabs.get(*ix).map(|tab| tab.id) {
-                    this.remove_tab(id, window, cx);
+                    this.request_close_tab(id, window, cx);
                 }
             }))
             .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_dragged_tab(request, cx)))
@@ -3234,7 +3354,9 @@ impl Render for Workspace {
 
         // While the settings dialog previews a theme, only the overlay
         // toggles act, so nothing (such as a new tab) changes underneath it.
-        let settings_open = self.settings.is_open();
+        // The close confirmation holds them back the same way: its own
+        // buttons, escape and backdrop are what act.
+        let settings_open = self.settings.is_open() || self.confirm.is_open();
         let body = div()
             .id("workspace")
             .key_context("Workspace")
@@ -3319,6 +3441,7 @@ impl Render for Workspace {
             // deferred from the strip, and only while neither is open).
             .children(self.palette.render(window, cx))
             .children(self.settings.render(window, cx))
+            .children(self.confirm.render(window, cx))
             // The tab and zone menus: drawn deferred, taking no room here.
             .child(self.context_menu.clone());
 

@@ -24,6 +24,8 @@ pub enum OverlayKind {
     ProfileMenu,
     /// A tab's or a zone header's menu.
     ContextMenu,
+    /// The close confirmation for a busy agent (it replaces what is open).
+    CloseConfirm,
 }
 
 /// How asking for an overlay treats the one open.
@@ -62,7 +64,7 @@ pub fn toggle(open: Option<OverlayKind>, wanted: OverlayKind, how: Opens) -> Tog
 mod tests {
     use super::*;
 
-    const KINDS: [OverlayKind; 7] = [
+    const KINDS: [OverlayKind; 8] = [
         OverlayKind::Palette(PaletteRole::NewTab),
         OverlayKind::Palette(PaletteRole::Commands),
         OverlayKind::Palette(PaletteRole::Prompt),
@@ -70,6 +72,7 @@ mod tests {
         OverlayKind::Settings,
         OverlayKind::ProfileMenu,
         OverlayKind::ContextMenu,
+        OverlayKind::CloseConfirm,
     ];
 
     /// The workspace's rule before this function, for a palette asked for
@@ -101,8 +104,9 @@ mod tests {
         assert_eq!(toggle(None, OverlayKind::Settings, Opens::Toggles), Toggle::Open);
     }
 
-    /// A prompt, a context menu and the sessions palette once its
-    /// listings are in replace what is open, even one of their own kind.
+    /// A prompt, a context menu, the close confirmation and the sessions
+    /// palette once its listings are in replace what is open, even one of
+    /// their own kind.
     #[test]
     fn an_overlay_that_replaces_never_only_closes() {
         for wanted in KINDS {

@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::*;
 use crate::TabKind;
 use crate::agent::Agent;
+use crate::agent::close::{AgentBusy, BusyAgent, ClosePlan, Closing, close_plan};
 use crate::agent::spawn::OpenedBy;
 use crate::agent::view::AgentView;
 use brindle_ui::FocusStops as _;
@@ -352,6 +353,15 @@ pub struct ZoneMenuRequest {
     pub at: Point<Pixels>,
     /// The secondary press that asked, whose release ends the gesture.
     pub press: Option<MouseDownEvent>,
+}
+
+/// A zone's close asks first (design.md decision 12): its agent is busy.
+/// The tab's window opens the confirmation, and closes the zone
+/// ([`ZoneTreeView::close_zone_by_id`]) once the user confirms.
+#[derive(Clone, Debug)]
+pub struct CloseZoneAsk {
+    pub zone: ZoneId,
+    pub busy: Vec<BusyAgent>,
 }
 
 /// Formats `--dump-screen-after` zone lines when a tab has 2 or more zones,
@@ -716,6 +726,7 @@ struct LaidOut {
 
 impl EventEmitter<TerminalEvent> for ZoneTreeView {}
 impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
+impl EventEmitter<CloseZoneAsk> for ZoneTreeView {}
 /// A zone's link wasn't opened, passed on to the window (whichever tab the
 /// zone is in: an opener can fail after its tab went to the background).
 impl EventEmitter<LinkFailed> for ZoneTreeView {}
@@ -1312,8 +1323,47 @@ impl ZoneTreeView {
         self.split_zone(self.active, SplitAxis::Vertical, window, cx);
     }
 
+    /// Close Zone (its key, the header's ×, the header menu's item): at
+    /// once, or after the window's confirmation when its agent is busy
+    /// ([`close_plan`]).
     fn close_active_zone(&mut self, _: &CloseZone, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_zone_by_id(self.active, window, cx);
+        self.request_close_zone(self.active, window, cx);
+    }
+
+    /// The user asked to close zone `target`: [`close_plan`] decides
+    /// whether it closes now or the window asks first ([`CloseZoneAsk`]).
+    pub fn request_close_zone(&mut self, target: ZoneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(closing) = self.closing_zone(target, cx) else { return };
+        match close_plan(&[closing]) {
+            ClosePlan::Now => self.close_zone_by_id(target, window, cx),
+            ClosePlan::Ask(busy) => cx.emit(CloseZoneAsk { zone: target, busy }),
+        }
+    }
+
+    /// What closing zone `id` would end, for [`close_plan`]: a terminal, or
+    /// an agent with its title and whether the status it shows is busy.
+    fn closing_zone(&self, id: ZoneId, cx: &App) -> Option<Closing> {
+        let zone = self.zones.get(&id)?;
+        Some(match &zone.content {
+            ZoneContent::Terminal(_) => Closing::Terminal(id),
+            ZoneContent::Agent(_) => Closing::Agent {
+                zone: id,
+                name: zone.title.to_string(),
+                busy: AgentBusy::of(zone.content.status(cx).0),
+            },
+        })
+    }
+
+    /// What closing the whole tab would end: every zone, in the tree's
+    /// order.
+    pub fn closing(&self, cx: &App) -> Vec<Closing> {
+        self.tree.leaves().into_iter().filter_map(|id| self.closing_zone(id, cx)).collect()
+    }
+
+    /// Whether the tab still has zone `id` (a confirmation open on it
+    /// closes itself once it is gone).
+    pub fn has_zone(&self, id: ZoneId) -> bool {
+        self.zones.contains_key(&id)
     }
 
     /// `OpenZoneMenu`: the active zone's header menu, below its header (see
@@ -1464,7 +1514,7 @@ impl ZoneTreeView {
             .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Vertical, window, cx)));
         let close = button("zone-close", Icon::X)
             .tooltip_with(tip("Close zone", Box::new(CloseZone)))
-            .on_click(cx.listener(move |this, _, window, cx| this.close_zone_by_id(id, window, cx)));
+            .on_click(cx.listener(move |this, _, window, cx| this.request_close_zone(id, window, cx)));
 
         // The title in the terminal's foreground on the active zone, muted
         // on the others (`trigger_label` cuts it, as `truncate` can't).
@@ -1816,6 +1866,8 @@ mod tests {
 
     use std::cell::Cell;
 
+    use crate::agent::close::describe_busy;
+
     /// Puts `toml`'s config in the test app's settings.
     fn use_config(cx: &mut gpui::TestAppContext, toml: &str) {
         let config = Config::parse(toml).expect("the test config").config;
@@ -1948,6 +2000,72 @@ mod tests {
         zone.feed(&[ready()]);
         settle(tab.cx);
         assert_eq!(zone.take_calls(), Vec::new(), "sent once");
+    }
+
+    /// Close Zone (its key and the header menu's item, both the
+    /// `CloseZone` action) and the header's × (`request_close_zone`) on a
+    /// working agent zone ask the window first and close nothing; on an
+    /// idle one they close it at once, ending its session.
+    #[test]
+    fn closing_a_busy_agent_zone_asks_and_an_idle_one_closes_at_once() {
+        use crate::agent::test_support::{Call, Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        let asks = Rc::<RefCell<Vec<CloseZoneAsk>>>::default();
+        let _asked = tab.cx.update(|_, cx| {
+            let asks = asks.clone();
+            cx.subscribe(&tab.view, move |_, ask: &CloseZoneAsk, _| asks.borrow_mut().push(ask.clone()))
+        });
+        zone.feed(&[ready(), Event::Turn { state: TurnState::Working }]);
+        settle(tab.cx);
+
+        // The action, as ctrl-shift-x and the header menu's item run it.
+        tab.view.update_in(tab.cx, |view, window, cx| view.close_active_zone(&CloseZone, window, cx));
+        // The header's ×.
+        tab.view.update_in(tab.cx, |view, window, cx| view.request_close_zone(view.active, window, cx));
+        let asked: Vec<_> = asks.borrow().iter().map(|ask| (ask.zone, describe_busy(&ask.busy))).collect();
+        assert_eq!(asked, [(ZoneId(1), "1:working".to_string()), (ZoneId(1), "1:working".to_string())]);
+        assert!(!tab.exited.get(), "nothing closed");
+        assert!(!zone.take_calls().contains(&Call::Close), "the session wasn't ended");
+
+        // Closing the whole tab would name it too.
+        let closing = tab.view.read_with(tab.cx, |view, cx| view.closing(cx));
+        assert!(matches!(close_plan(&closing), ClosePlan::Ask(busy) if describe_busy(&busy) == "1:working"));
+
+        // Once the turn has ended, the same close is at once.
+        zone.feed(&[Event::Turn { state: TurnState::Ended { stop: crate::agent::transcript::StopReason::EndTurn } }]);
+        settle(tab.cx);
+        tab.view.update_in(tab.cx, |view, window, cx| view.close_active_zone(&CloseZone, window, cx));
+        assert_eq!(asks.borrow().len(), 2, "nothing more asked");
+        assert!(tab.exited.get(), "the only zone closed, and the tab with it");
+        assert_eq!(zone.take_calls(), vec![Call::Close]);
+    }
+
+    /// A zone waiting on a permission request is busy too, and a terminal
+    /// zone never is: what a tab's close names.
+    #[test]
+    fn a_tab_names_only_its_busy_agents() {
+        use crate::agent::test_support::{Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        zone.feed(&[ready(), Event::Turn { state: TurnState::Blocked }]);
+        settle(tab.cx);
+        let closing = tab.view.read_with(tab.cx, |view, cx| view.closing(cx));
+        assert!(matches!(&closing[..], [Closing::Agent { name, .. }] if name == "Fake Agent"));
+        assert!(matches!(close_plan(&closing), ClosePlan::Ask(busy) if describe_busy(&busy) == "1:blocked"));
+
+        let shell = Tab::new(&mut app, Profile::default_shell(), |cx| {
+            let config = Settings::get(cx).config.clone();
+            ZoneStart::Terminal(cx.new(|cx| Terminal::message("shell", Theme::default(), &config, cx)))
+        });
+        let closing = shell.view.read_with(shell.cx, |view, cx| view.closing(cx));
+        assert_eq!(close_plan(&closing), ClosePlan::Now);
     }
 
     /// An agent zone whose agent exits stays open, its tab with it: the

@@ -858,8 +858,13 @@ pub struct Dump {
     /// `settings`, `tabs` (the tab strip), `menu`, `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
-    /// `sections`, `list`, `close`, a field's or a button's label.
+    /// `sections`, `list`, `close`, a field's or a button's label; an
+    /// agent zone's stop (`--- focus agent stop=prompt|queued:remove|…`);
+    /// the close confirmation's button (`--- focus confirm stop=cancel|close`).
     pub focus_stop: Option<String>,
+    /// The close confirmation's line while it is open (`--- confirm close
+    /// target=zone:ID|tab:N busy=…`), without the `--- confirm `.
+    pub confirm: Option<String>,
     /// The window's focus-visible modality (`modality=`): `keyboard` or
     /// `pointer`.
     pub modality: Option<String>,
@@ -972,9 +977,15 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- find ") {
                 dump.find = Some(rest.to_string());
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- confirm ") {
+                dump.confirm = Some(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- focus ") {
                 let (rest, modality) = rest.rsplit_once(" modality=").map_or((rest, None), |(r, m)| (r, Some(m)));
-                let (place, stop) = rest.split_once(" stop=").map_or((rest, None), |(p, s)| (p, unquote(s)));
+                // The settings dialog quotes its stop (a label); an agent
+                // zone's and the close confirmation's are bare words.
+                let (place, stop) =
+                    rest.split_once(" stop=").map_or((rest, None), |(p, s)| (p, unquote(s).or_else(|| Some(s.to_string()))));
                 dump.focus = Some(place.to_string());
                 dump.focus_stop = stop;
                 dump.modality = modality.map(str::to_string);
@@ -1308,6 +1319,17 @@ pub fn self_test_dump() -> Result {
     let dump = Dump::parse("--- focus settings stop=\"Font size\" modality=keyboard\n");
     ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);
     ensure!(dump.focus_stop.as_deref() == Some("Font size"), "stop {:?}", dump.focus_stop);
+    ensure!(dump.confirm.is_none(), "no confirmation {:?}", dump.confirm);
+    // The close confirmation's line and its bare-word stop.
+    let dump = Dump::parse(
+        "--- tab 1 \"Fake Agent\" (active)\n--- prompt status=streaming\n\
+         --- confirm close target=zone:1 busy=1:working\n--- focus confirm stop=cancel modality=keyboard\n",
+    );
+    ensure!(dump.confirm.as_deref() == Some("close target=zone:1 busy=1:working"), "confirm {:?}", dump.confirm);
+    ensure!(dump.focus.as_deref() == Some("confirm") && dump.focus_stop.as_deref() == Some("cancel"), "{:?}", dump.focus_stop);
+    let dump = Dump::parse("--- focus agent stop=permission:5:allow-once modality=keyboard\n");
+    ensure!(dump.focus.as_deref() == Some("agent"), "focus {:?}", dump.focus);
+    ensure!(dump.focus_stop.as_deref() == Some("permission:5:allow-once"), "stop {:?}", dump.focus_stop);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- menu items=Shell|[Off]|Other highlighted=0\n\
          Shell  bash  [ctrl-alt-1]\nOff\nOther  sh · /tmp  [ctrl-alt-3]\n--- focus menu modality=keyboard\n",
