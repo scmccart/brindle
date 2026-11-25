@@ -1,0 +1,31 @@
+## ADDED Requirements
+
+### Requirement: Tool call rows in the dump
+In an agent zone's dump, a tool call's `--- entry` line SHALL say whether its row is open (`open=yes`, `open=no`, or `open=none` when it has nothing to open) and how many content items it holds (`items=N`). A permission request's `--- entry` line SHALL say how many parts of its tool call's detail it shows (`detail=N`).
+
+#### Scenario: A closed row
+- **WHEN** the fake ACP agent reports a tool call with one diff, and the dump is taken
+- **THEN** the tool call's `--- entry` line has `open=no items=1`
+
+#### Scenario: A pending permission's detail
+- **WHEN** the fake ACP agent asks permission for a tool call that holds one file change, and the dump is taken
+- **THEN** the permission's `--- entry` line has `detail=` with a count above zero, and the tool call's line has `open=no`
+
+### Requirement: Tool call content in the dump
+After a tool call's `--- entry` line, whether its row is open or closed, the dump SHALL print a `--- item` line per content item (the entry, the item's index, its kind and that kind's fields), a `--- hunk` line per hunk after its diff's line, a `--- location` line per location, and a `--- raw` line for each raw value the detail shows. Every text SHALL be escaped onto one line, and `--wait-for` SHALL match these lines.
+
+#### Scenario: A diff in the dump
+- **WHEN** the fake ACP agent reports a tool call whose diff of `/p/main.rs` replaces `old();` with `new();`, and the dump is taken
+- **THEN** the dump has a line `--- item entry=N index=0 kind=diff op=modify path="/p/main.rs" added=1 removed=1 omitted=0` and a `--- hunk` line whose text holds `-    old();` and `+    new();`
+
+#### Scenario: Command output in the dump
+- **WHEN** the fake ACP agent reports a command `cargo test` whose output is `ok\n` with exit status 0
+- **THEN** the dump has `--- item entry=N index=0 kind=output command="cargo test" exit=0 omitted=0 "ok\n"`
+
+#### Scenario: Waiting for content
+- **WHEN** Brindle runs with `--wait-for 'kind=diff'` against a fake ACP agent that sends a diff after a delay
+- **THEN** the later steps run once the diff has arrived
+
+#### Scenario: Raw input only as the fallback
+- **WHEN** a tool call has a file change and a raw input
+- **THEN** the dump has no `--- raw` line for it
