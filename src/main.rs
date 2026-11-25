@@ -2267,6 +2267,21 @@ mod tests {
         assert!(!HELP.contains("-p, --profile"));
     }
 
+    /// agents-profiles 6.10: the README's `brindle agent` lines are the
+    /// help's: the usage block's form, and the lines it quotes from
+    /// `--help` verbatim.
+    #[test]
+    fn the_readme_quotes_the_agent_help() {
+        let readme = include_str!("../README.md");
+        assert!(readme.contains("\nbrindle agent [PROFILE] [-d DIR] [-p PROMPT] "), "the usage block's line");
+        let opening = "From `brindle --help`:\n\n```\n";
+        let start = readme.find(opening).expect("the quoted help") + opening.len();
+        let quoted = &readme[start..];
+        let quoted = &quoted[..quoted.find("```").expect("its end")];
+        assert!(quoted.lines().any(|line| line.contains("brindle agent")), "{quoted}");
+        assert!(HELP.contains(quoted), "README quotes {quoted:?}, which `--help` doesn't print");
+    }
+
     #[test]
     fn an_unknown_action_is_a_usage_error() {
         let why = refused(&["--action", "split_zone_rihgt", "--dump-screen-after", "3"]);

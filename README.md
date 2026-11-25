@@ -18,6 +18,10 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   ctrl-shift-x.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
+- **Agent tabs**: a profile with `type = "agent"` runs an ACP (Agent Client
+  Protocol) agent in the terminal server and shows its conversation in a zone:
+  prompts, a queued prompt, tool calls, permission requests and thoughts, kept
+  across quits like a terminal's session. See [Agent tabs](#agent-tabs).
 - **Shell integration** (OSC 133, and VS Code's OSC 633): jump between prompts, select or
   copy the last command's output or command line, and see failed commands marked in the
   gutter.
@@ -548,6 +552,7 @@ writes its WinGet manifest.
 ```
 brindle [--no-restore]              # the window: the restored tabs, else the default profile
 brindle terminal [PROFILE] [-d DIR] [-e COMMAND ARGS...]   # a terminal tab
+brindle agent [PROFILE] [-d DIR] [-p PROMPT]               # an agent tab
 brindle --attach ID                 # a detached terminal server session
 brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish|pwsh
 brindle --export-ui-tokens          # the built-in themes' UI tokens as CSS
@@ -587,7 +592,7 @@ scripts that pass them need changing:
 
 A profile name that no profile has used to open the default profile with a
 dim line saying so; it is now refused with status 2, before any window opens.
-`brindle agent` is reserved for agent tabs and refused for now.
+`brindle agent` opens an agent tab (see [Agent tabs](#agent-tabs)).
 
 On first launch Brindle writes a commented config to
 `~/.config/brindle/config.toml`. The file is reloaded automatically when it changes.
@@ -698,6 +703,92 @@ or another section drop the changes.
 The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes over a selection too, clearing it; see [Clipboard](#clipboard)). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
+
+### Agent tabs
+
+A profile with `type = "agent"` runs its command as an
+[ACP](https://agentclientprotocol.com) agent (Agent Client Protocol, version
+1) instead of a terminal. The agent runs in the terminal server, like a
+terminal tab's program, so it keeps working while Brindle is closed and its
+tab comes back at the next launch. Its arguments, directory, environment,
+theme, font size and remote target mean what they do for a terminal profile;
+the command is required.
+
+```toml
+[[profiles]]
+name = "Agent"
+type = "agent"
+command = "my-acp-agent"
+args = ["--acp"]
+cwd = "/home/me/src/project"
+env = { MY_AGENT_LOG = "warn" }
+font_size = 14
+```
+
+`brindle agent [PROFILE] [-d DIR] [-p PROMPT]` opens an agent tab of PROFILE
+(the config's `default_profile` when it is an agent profile, else the first
+agent profile), in DIR (else the profile's `cwd`, else the directory it was
+typed in). `-p PROMPT` is a first prompt, sent once the agent is ready, and
+`-p -` reads it from standard input (a file or a pipe, at most 256 KiB of
+UTF-8; one trailing line break is dropped). A terminal profile named after
+`agent`, an agent profile named after `terminal`, and `agent` in a config
+with no agent profile are refused with status 2. As with `brindle terminal`,
+a launch beside a running Brindle is handed to it. From `brindle --help`:
+
+```
+    brindle agent [PROFILE] [-d DIR] [-p PROMPT] [OPTIONS]
+                                 Open an agent tab
+```
+
+An agent zone shows the conversation, newest at the bottom, with the prompt
+input under it. Tool calls show as rows with their status, a permission
+request as buttons for its options, and the agent's thoughts as closed
+blocks that Toggle Agent Thoughts opens. The zone's status dot follows the agent: working, blocked
+(waiting on a permission), done or error, as a program's status does; a done
+or error dot goes once you type in the prompt input. An agent's tab title is
+the name it gives, else the profile's.
+
+| Keys | Action |
+|---|---|
+| enter / shift-enter | send the prompt / add a line |
+| escape | stop the agent's turn |
+| tab / shift-tab | move between the prompt input, the queued prompt's buttons, a permission request's buttons and the stop button; enter or space presses the button |
+| shift-pageup/down | scroll the conversation |
+
+A prompt sent while the agent works waits in a row above the input, and is
+sent when the turn ends normally; another one stays in the input. A turn that
+is stopped, fails or ends for a limit holds the waiting prompt instead (the
+row says why), which you can send again or discard. Commands in the palette
+while an agent zone has focus: Send Prompt, Stop Agent Turn, Remove Queued
+Prompt, Send Held Prompt Again, Copy Queued Prompt, Copy Last Agent Message,
+Toggle Agent Thoughts and Scroll Agent to Bottom (the actions `agent_submit`,
+`agent_cancel`, `agent_unqueue`, `agent_resend`, `copy_queued_prompt`,
+`copy_last_agent_message`, `toggle_agent_thoughts`, `agent_scroll_to_bottom`),
+with the zone and tab commands; the terminal's commands aren't listed there.
+
+Splitting an agent zone opens another agent zone, with a session of its own,
+on the same profile. Closing a zone or tab whose agent is working or waiting
+on a permission asks first, naming the agents, with Cancel focused (enter and
+escape cancel; tab then enter closes); closing an idle one, and quitting,
+don't ask. Detached agent sessions are listed in the sessions palette ("Attach
+Session…") as `agent · <activity>`, and `brindle-remote list` lists them too.
+
+An agent that needs a login says so, with its own message: log in through the
+agent's own command line, then open a new tab. An agent that exits, or speaks
+another ACP version, leaves its conversation readable.
+
+Not yet: markdown in messages (`agents-markdown`), logging in from the zone
+(`agents-login`), going on after an agent exits (`agents-session-recovery`),
+paging long conversations (`agents-log-paging`) and ACP version 2
+(`agents-acp-v2`), each a change of its own; nor the agent's file and
+terminal access, modes, slash commands, mixing agent and terminal zones in a
+tab, finding or selecting text in a conversation, or editing agent profiles
+in the settings dialog.
+
+**Release note:** a Brindle from before agent tabs rejects a config with an
+agent profile (`type` is an unknown key to it): it shows the error on its
+config line and runs on the default settings. Keep agent profiles out of a
+config that an older Brindle also reads.
 
 ### Clipboard
 

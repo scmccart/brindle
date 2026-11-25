@@ -1035,6 +1035,23 @@ mod tests {
         .is_err());
     }
 
+    /// agents-profiles 6.10: the README's agent profile example loads as
+    /// the agent profile it describes.
+    #[test]
+    fn the_readme_agent_example_parses() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("\n### Agent tabs\n").expect("the agent section");
+        let section = &readme[start..];
+        let block = &section[section.find("```toml\n").expect("its example") + 8..];
+        let toml = &block[..block.find("```").expect("the example's end")];
+        let config = parsed(toml).unwrap();
+        let [profile] = &config.profiles[..] else { panic!("one profile: {:?}", config.profiles) };
+        assert_eq!(profile.kind(), ProfileKind::Agent);
+        assert_eq!((profile.name.as_str(), profile.command.as_deref()), ("Agent", Some("my-acp-agent")));
+        assert_eq!(profile.args, ["--acp"]);
+        assert_eq!(profile.description(), "agent · my-acp-agent");
+    }
+
     /// 8.5: the config examples in the README's remote section, together,
     /// load as the profiles they describe.
     #[test]
