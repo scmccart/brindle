@@ -100,7 +100,7 @@ acp/
   diff.rs  plain.rs  lines.rs  rpc.rs  reduce.rs  checkpoint.rs
 ```
 
-- **`Dialect` is a closed enum, not a trait** (`ports R6`: no indirection to make a decision mockable; `types R2`). Its methods (`session_update`, `permission_request`, `initialize_result`, `new_session_result`, `prompt_result`, `request_kind`, `notification_kind`, `encode`) each hold one exhaustive `match self` that calls the same-named item of that version's module, as a per-platform module set exports the same names (`ports R5`). Adding `V2` then fails to compile until every method has its arm.
+- **`Dialect` is a closed enum, not a trait** (confirmed by the user, 2026-11-25; `ports R6`: no indirection to make a decision mockable; `types R2`). Its methods (`session_update`, `permission_request`, `initialize_result`, `new_session_result`, `prompt_result`, `request_kind`, `notification_kind`, `encode`) each hold one exhaustive `match self` that calls the same-named item of that version's module, as a per-platform module set exports the same names (`ports R5`). Adding `V2` then fails to compile until every method has its arm.
 - **Chosen once.** `Dialect::newest()` writes `initialize`. The answer's `protocolVersion` is read from the raw result (it is a number in every version) and `Dialect::from_version(n) -> Result<Dialect, Unsupported>` picks the session's dialect, which the session keeps and the checkpoint already records as the version. `Unsupported` is today's "the agent speaks ACP version N" failure, unchanged. Until `agents-acp-v2`, `newest()` is `V1` and `from_version` accepts only 1.
 - **`reduce.rs` and `rpc.rs` name no version.** `rpc.rs` keeps ids, pending requests and held permissions; the line for a request comes from `dialect.encode(Request)`. The reducer holds a `Dialect` value and calls its methods; it never matches on it.
 - **`Patch<T> { Keep, Clear, Set(T) }`** carries a field's change in `ToolChange`. v1 produces only `Keep` and `Set`; v2's `null` is `Clear`. The reducer handles all three once.
@@ -157,8 +157,10 @@ Content items are decoded one by one from the raw JSON, as permission options ar
 
 How a v1 agent delivers an allowed command's output isn't in any capture. Task 1.1 records it for the agents we can run. The mapping then follows these rules, in the v1 module only:
 - output that arrives as a text content block (expected of the Claude adapter) stays a `ToolItem::Text`, with nothing more to do;
-- output that arrives only through the `_meta` terminal convention some v1 agents share (`terminal_info`, `terminal_output`, `terminal_exit`, which Codex's `terminal_info` suggests) becomes an `Output` item, if the capture shows it is sent to a client that offered no terminal capability, or only needs a `_meta` capability flag to be sent. This is an open decision for the user (below);
+- output that arrives only through the `_meta` terminal convention some v1 agents share (`terminal_info`, `terminal_output`, `terminal_exit`, which Codex's `terminal_info` suggests) becomes an `Output` item, if the capture shows it is sent to a client that offered no terminal capability, or only needs a `_meta` capability flag to be sent, which `initialize` then carries. The user decided this on 2026-11-25: read the convention when a capture shows an agent's output reaches Brindle no other way. It is outside the ACP spec, so it stays inside `acp/v1/`, is pinned by the captures, and reads only those three keys;
 - a bare `terminal` item with no output to show adds nothing.
+
+**The `terminal` client capability stays unoffered here** (user, 2026-11-25). It is ACP v1's way for the agent to have the client run a command (`terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release`), which changes who runs the command and what an agent can make the server do, and v2 has no such methods. Task 1.1 also records which agents call `terminal/create` when it is offered, as evidence for the proposal-only change `agents-client-terminals`.
 
 Either way v2 fills the same `Output` (decision 9), so its transcript forms and fold are added now. If the answer is that v1 never fills an `Output`, nothing can produce one until `agents-acp-v2`: the requirement "Command output is kept as plain text", `plain.rs`, the zone's output block and their tests then move to that change, and this one keeps only the forms (tasks 3.2, 4.1's output half, 7.3, 8.2 and 8.4's output half go with them).
 
@@ -260,7 +262,10 @@ Tool content is in the transcript, so it is checkpointed with it at the existing
 
 Each has a recommendation, which the text above already follows. They are the user's to settle before implementation.
 
-1. **Output a v1 agent sends only through the `_meta` terminal convention.** Recommended: capture first (task 1.1); support it in `acp/v1/` if a capture shows an agent's command output reaches Brindle no other way. The alternative is to leave such agents' output to their v2 implementations.
+Decided on 2026-11-25: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6).
+
+Still open:
+
 2. **The diff algorithm:** hand-written and bounded (recommended), or the `similar` crate on `brindle-remote-agent`'s closed list.
 3. **Tool rows start closed, and a pending permission always shows its detail** (recommended). The alternative is rows that start open while a turn runs.
 4. **Raw input and result only when a call has no content** (recommended), or always under a second trigger.
