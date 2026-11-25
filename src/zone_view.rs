@@ -19,7 +19,8 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::actions::*;
-use crate::config::{Config, Profile};
+use crate::TabKind;
+use crate::config::{Config, Profile, ProfileKind};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
@@ -287,6 +288,42 @@ pub fn can_split_zone(
             let child_h = (h - ZONE_GAP) * 0.5;
             w >= min_zone_w && child_h >= min_zone_h
         }
+    }
+}
+
+/// What a split of a tab starts (design.md decision 4): a zone of the
+/// tab's kind, or nothing, and why. `ZoneTreeView` asks it once tabs have
+/// a kind (`agents-profiles` task 6.2); until then only the tests do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum SplitPlan {
+    Terminal,
+    Agent,
+    Refused(SplitRefusal),
+}
+
+/// Why a tab can't start a zone of its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum SplitRefusal {
+    /// The tab's profile is gone from the config.
+    ProfileGone,
+    /// The tab's profile, as the config has it now, is of the other kind.
+    ProfileKindChanged,
+}
+
+/// What splitting a tab of kind `tab` starts, `profile` being the kind of
+/// the tab's profile as the config has it now (`None`: gone). A tab starts
+/// a zone of its own kind only, from a profile of that kind.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn split_plan(tab: TabKind, profile: Option<ProfileKind>) -> SplitPlan {
+    match (tab, profile) {
+        (TabKind::Terminal, Some(ProfileKind::Terminal)) => SplitPlan::Terminal,
+        (TabKind::Agent, Some(ProfileKind::Agent)) => SplitPlan::Agent,
+        (TabKind::Terminal, Some(ProfileKind::Agent)) | (TabKind::Agent, Some(ProfileKind::Terminal)) => {
+            SplitPlan::Refused(SplitRefusal::ProfileKindChanged)
+        }
+        (TabKind::Terminal | TabKind::Agent, None) => SplitPlan::Refused(SplitRefusal::ProfileGone),
     }
 }
 
@@ -1248,6 +1285,23 @@ impl Render for ZoneTreeView {
 mod tests {
     use super::*;
     use gpui::size;
+
+    /// Every (tab kind, profile kind or gone) pair: a tab starts a zone of
+    /// its own kind from a profile of that kind, and nothing otherwise.
+    #[test]
+    fn a_split_starts_a_zone_of_the_tabs_kind_only() {
+        let table = [
+            (TabKind::Terminal, Some(ProfileKind::Terminal), SplitPlan::Terminal),
+            (TabKind::Terminal, Some(ProfileKind::Agent), SplitPlan::Refused(SplitRefusal::ProfileKindChanged)),
+            (TabKind::Terminal, None, SplitPlan::Refused(SplitRefusal::ProfileGone)),
+            (TabKind::Agent, Some(ProfileKind::Agent), SplitPlan::Agent),
+            (TabKind::Agent, Some(ProfileKind::Terminal), SplitPlan::Refused(SplitRefusal::ProfileKindChanged)),
+            (TabKind::Agent, None, SplitPlan::Refused(SplitRefusal::ProfileGone)),
+        ];
+        for (tab, profile, plan) in table {
+            assert_eq!(split_plan(tab, profile), plan, "{tab:?} tab, {profile:?} profile");
+        }
+    }
 
     #[test]
     fn tree_split_remove_and_rects() {

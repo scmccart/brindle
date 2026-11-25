@@ -14,3 +14,7 @@ pub mod transcript;
 // builds it; until then only the tests do.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod spawn;
+
+// Whether a close asks first: group 6's close paths call it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod close;
