@@ -295,12 +295,22 @@ pub struct NotificationConfig {
     /// A program status record (OSC 7501) that becomes blocked, done or
     /// error.
     pub osc7501: bool,
+    /// An agent zone whose status becomes blocked, done or error.
+    pub agent: bool,
     pub when: NotifyWhen,
 }
 
 impl Default for NotificationConfig {
     fn default() -> Self {
-        Self { bell: true, osc9: true, osc777: true, osc99: true, osc7501: true, when: NotifyWhen::Unfocused }
+        Self {
+            bell: true,
+            osc9: true,
+            osc777: true,
+            osc99: true,
+            osc7501: true,
+            agent: true,
+            when: NotifyWhen::Unfocused,
+        }
     }
 }
 
@@ -1364,8 +1374,12 @@ mod tests {
         let config = parsed("").unwrap();
         assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.notifications.bell && config.notifications.osc9 && config.notifications.osc777);
-        assert!(config.notifications.osc7501 && config.notifications.osc99);
+        assert!(config.notifications.osc7501 && config.notifications.osc99 && config.notifications.agent);
+        let config = parsed("[notifications]\nagent = false").unwrap();
+        assert!(!config.notifications.agent);
+        assert!(config.notifications.osc7501 && config.notifications.bell);
         let config = parsed("[notifications]\nbell = false\nosc7501 = false\nwhen = \"always\"").unwrap();
+        assert!(config.notifications.agent);
         assert!(!config.notifications.bell);
         assert!(config.notifications.osc9 && config.notifications.osc99);
         assert!(!config.notifications.osc7501);

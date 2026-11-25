@@ -12,6 +12,8 @@ pub enum Source {
     Osc99,
     /// A program status record (OSC 7501) that needs the user.
     Osc7501,
+    /// An agent zone whose status became blocked, done or error.
+    Agent,
 }
 
 impl Source {
@@ -22,6 +24,7 @@ impl Source {
             Source::Osc777 => "osc777",
             Source::Osc99 => "osc99",
             Source::Osc7501 => "osc7501",
+            Source::Agent => "agent",
         }
     }
 }
@@ -49,6 +52,7 @@ mod tests {
             (Source::Osc777, "osc777"),
             (Source::Osc99, "osc99"),
             (Source::Osc7501, "osc7501"),
+            (Source::Agent, "agent"),
         ];
         for (source, name) in names {
             assert_eq!(source.name(), name, "{source:?}");

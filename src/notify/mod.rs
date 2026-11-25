@@ -423,7 +423,9 @@ impl Notifier {
                 self.open.send(notice.terminal.entity_id(), id, key)
             }),
             (None, Source::Bell) => self.bell_ids.get(&request.tab).map_or(Replace::Nothing, |&id| Replace::Id(id)),
-            (None, Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501) => Replace::Nothing,
+            (None, Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 | Source::Agent) => {
+                Replace::Nothing
+            }
         };
         let replaces = match replace {
             Replace::Id(id) => id,
