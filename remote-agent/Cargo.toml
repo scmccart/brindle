@@ -9,6 +9,13 @@ publish = false
 name = "brindle-remote"
 path = "src/main.rs"
 
+# The fake ACP agent the tests play agents with (OpenSpec change
+# agents-sessions, design decision 16): built with the helper, never
+# packaged.
+[[bin]]
+name = "brindle-fake-acp-agent"
+path = "src/fake_acp/main.rs"
+
 [dependencies]
 agent-client-protocol-schema = { version = "=1.22.0", default-features = false }
 brindle-remote-protocol = { path = "../remote-protocol" }
