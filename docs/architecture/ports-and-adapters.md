@@ -35,7 +35,7 @@ use crate::server::platform::{Loop, Source, Listener, Pty};
 
 | Concern | Its one home |
 | --- | --- |
-| the terminal server's OS layer (loop, pipes and sockets, locks, detached start, PTYs) | `remote-agent/src/server/platform/` (`mod.rs` and its `unix` and `windows` sets) |
+| the terminal server's OS layer (loop, pipes and sockets, locks, detached start, PTYs, and pipe sessions: `piped`'s `Piped`, `PipeCommand` and `spawn_piped`, re-exported at `platform::`'s top, with `agent_directory` for an agent session's directory; the pure `platform/piped.rs` beside them decides the Windows flags, handle list and job, the launch, the batch-file hint, the hang-up steps and that directory) | `remote-agent/src/server/platform/` (`mod.rs` and its `unix` and `windows` sets) |
 | PTYs and pseudoconsoles | `remote-agent/src/pty.rs`, `remote-agent/src/pty/`, `remote-agent/src/conpty/` |
 | the server directory, endpoint names, access checks, scopes | `remote-protocol/src/{server_dir,endpoint,access,scope,win}.rs` |
 | the app's connection to a server | `src/remote/local/{unix,windows,pipe}.rs` |
@@ -48,7 +48,7 @@ use crate::server::platform::{Loop, Source, Listener, Pty};
 | opening links | `src/terminal/links.rs` |
 | small Windows helpers | `src/win.rs` |
 | the relay, which runs on Linux only (declared under `target_os = "linux"`; every other platform refuses `relay`) | `remote-agent/src/server/relay.rs`, `remote-agent/src/liveness.rs` |
-| resources compiled into the Windows executables (icon, version, manifest; `embed-resource` exists only on a Windows build host) | `build.rs`, `remote-agent/build.rs` |
+| resources compiled into the Windows executables (icon, version, manifest; `embed-resource` exists only on a Windows build host; the helper's version resource goes into `brindle-remote` only, not the test binary `brindle-fake-acp-agent`) | `build.rs`, `remote-agent/build.rs` |
 | the UI toolkit | `gpui`, used by `brindle` and `brindle-ui` only |
 | the emulator | `alacritty_terminal`, wrapped by `brindle-term-core` |
 

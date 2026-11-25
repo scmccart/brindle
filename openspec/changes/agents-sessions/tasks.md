@@ -69,7 +69,7 @@ Each module below in `remote-agent/src/acp/` joins `PURE_MODULES` and `fcis`'s p
 
 ## 9. Docs
 
-- [ ] 9.1 Update `docs/architecture/process-architecture.md` (the protocols line: client 1–4 and H1 3, R9's queue list with decision 12's bounds, the agent-session analogue of R19 from decision 4), `ports-and-adapters.md`'s seam table (the `piped` items), `functional-core-imperative-shell.md`'s pure-module table (`piped.rs`, `fake_acp/script.rs`; checked by the architecture test), and `docs/code-map.md`'s terminal server entries (holder pipe sessions, the core's agent sessions, protocols, checkpoints, the queue of one, tests, the fake ACP agent binary). Verify with `cargo test -p brindle --test architecture` and by review against the design.
+- [x] 9.1 Update `docs/architecture/process-architecture.md` (the protocols line: client 1–4 and H1 3, R9's queue list with decision 12's bounds, the agent-session analogue of R19 from decision 4), `ports-and-adapters.md`'s seam table (the `piped` items), `functional-core-imperative-shell.md`'s pure-module table (`piped.rs`, `fake_acp/script.rs`; checked by the architecture test), and `docs/code-map.md`'s terminal server entries (holder pipe sessions, the core's agent sessions, protocols, checkpoints, the queue of one, tests, the fake ACP agent binary). Verify with `cargo test -p brindle --test architecture` and by review against the design.
 
 ## 10. Integration checks
 
