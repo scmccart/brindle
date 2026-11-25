@@ -3,7 +3,7 @@
 **Depends on:** `agents-profiles` (the agent zone, its GUI-free chat model and its message blocks, and the `Message` component in `brindle-ui`), implemented and archived.
 **Next:** `agents-login`, in-zone login through ACP's `authenticate`. The five follow-ups of `agents-profiles` are independent of one another, so that order is a suggestion.
 
-**Status: proposal stage.** This change has no design, specs or tasks yet. It is taken further once `agents-profiles` is archived (and with it `agents-launch-commands` and `agents-sessions`, which that change needs).
+**Status: designed.** `agents-profiles` is archived; the open questions below were answered by the user on 2026-11-25, and design.md, the delta specs and tasks.md follow from those answers.
 
 ## Why
 
@@ -11,19 +11,19 @@ In step 1 an agent zone shows every message as plain text. ACP agents write Mark
 
 ## What Changes
 
-- Agent messages in an agent zone are rendered as Markdown: at least paragraphs, emphasis, inline code, fenced code blocks in the terminal's monospace font, lists and headings. The stored text doesn't change: the server keeps plain text and Brindle renders it.
+- Agent messages and thoughts in an agent zone are rendered as Markdown: paragraphs, emphasis, inline code, code blocks in the terminal's monospace font with a copy button, lists, headings, quotes, tables and links. The stored text doesn't change: the server keeps plain text and Brindle renders it.
 - Fields ACP defines as plain text stay plain (tool call titles, permission titles, notices, error messages); ACP v2 says clients SHOULD NOT render those as Markdown.
 - Raw HTML is never rendered (ACP: clients SHOULD disable or sanitize it).
 
-Open questions, to answer before a design:
-1. **Where the parser comes from.** `brindle-ui`'s closed dependency list is `gpui` and `log` (`ports R3`), so the choices are a parser dependency added to that list (with `tests/architecture.rs`, `ports R3` and the `Cargo.lock` rule in `CLAUDE.md`: additions only, no regenerated lock or broad update), a parser in the `brindle` crate handing `brindle-ui` plain styled runs so its list stays closed, or a hand-written subset. Zed's `markdown` crate is GPL-3.0 and can't be copied from.
-2. **Which subset:** CommonMark only, or GFM's tables, task lists and strikethrough as well; what happens to images (shown as their alt text or link?).
-3. **Which entries:** agent messages only, or thoughts, the user's own messages and plan entries too.
-4. **Streaming.** How an unfinished construct (an unclosed fence) looks while it streams, and how the message blocks split. Step 1 splits a message at blank lines and past 4 KiB so a streaming message re-lays out only its last block, which would cut a fenced code block or a list in two.
-5. **Links:** shown only, or clickable through Brindle's existing link handling (`links`), with its refusals and opener.
-6. **Copying:** whether the copy button and Copy Last Agent Message copy the Markdown source or the rendered text; whether a code block gets its own copy button.
-7. **The dump:** how `--dump-screen-after`'s `--- entry` lines describe a rendered message, so e2e cases can check it.
-8. **Tokens:** whether code blocks and inline code need tokens the theme set doesn't have yet.
+Open questions, answered by the user on 2026-11-25 (design.md decision 1 says where each is worked out):
+1. **Where the parser comes from:** `pulldown-cmark` (`default-features = false`) in the app crate, behind a pure function in `src/agent/` that hands `brindle-ui` plain blocks of styled runs; `brindle-ui`'s list stays `gpui`, `log`; `Cargo.lock` gains one package.
+2. **Which subset:** CommonMark plus GFM strikethrough, task lists, tables (a grid) and autolinks; no footnotes, math or smart punctuation; raw HTML as literal text; images never fetched, shown as a muted `[image: alt]` with the target, clickable as a link.
+3. **Which entries:** agent messages and thoughts. User messages and tool, permission and notice titles stay plain; there are no plan entries.
+4. **Streaming:** the whole message is parsed again as it grows; its parts follow the parser's top-level blocks; an unclosed fence is code to the end. A perf guard pins the cost.
+5. **Links:** clickable through `terminal/links.rs` with the terminal's gesture, the target shown on hover when it differs, schemes other than http and https confirmed first; no focus stops.
+6. **Copying:** the copy button and Copy Last Agent Message copy the source; each code block has a pointer-only copy button; a palette action Copy Last Code Block.
+7. **The dump:** `--- entry` keeps the source; `--- block` lines describe each rendered part.
+8. **Tokens:** reuse `muted`, `border`, `muted_foreground` and the accent, adding a token only if the legibility test fails on a built-in. It does for links on `brindle-light`, so a `link` token is added.
 
 ## What the full changes already say
 
@@ -40,14 +40,16 @@ Open questions, to answer before a design:
 - None expected.
 
 ### Modified Capabilities
-- `agent-zones` (added by `agents-profiles`): "The conversation" renders agent messages as Markdown; possibly "Copying from the conversation".
-- `ui-components`: "Messages" gains rendered Markdown content, or a new Markdown component beside it.
-- `links`: possibly, if links in messages become clickable.
+- `agent-zones`: "The conversation", "Copying from the conversation", "Agent zone appearance" and "Agent commands in the palette" change; Markdown, code blocks, Copy Last Code Block, streaming, tables, images and HTML are added.
+- `ui-components`: responses, their code blocks, links and tables are added beside "Messages".
+- `links`: links in agent messages, their target on hover, and confirming schemes other than http and https.
+- `command-line`: the dump's `--- block`, `--- link` and `--- confirm link` lines.
+- `ui-theme-tokens`: the `link` token and more legible pairs.
 
 ## Impact
 
-- `ui/` (`brindle-ui`): the message component, and possibly a new dependency on its closed list, with `docs/architecture/ports-and-adapters.md` (`ports R3`) and `tests/architecture.rs` changed in the same change.
-- `src/agent/`: the chat model's blocks and how a message splits.
-- `Cargo.lock`, if a parser is added.
-- The `--dump-screen-after` output for an agent zone, and e2e cases against the fake ACP agent.
-- No change to the terminal server, the transcript or the client protocol.
+- `ui/` (`brindle-ui`): `Response` and `CodeBlock` components, the rich-text data types and the `link` token; its closed list is unchanged.
+- `src/agent/`: a pure Markdown renderer, the chat model's parts for agent messages and thoughts, link handling, Copy Last Code Block; `src/link_confirm.rs` and the workspace overlay; `terminal/links.rs` gains `plan_here` and the shared gesture.
+- `Cargo.lock`: one added package, `pulldown-cmark`.
+- The `--dump-screen-after` output for an agent zone, e2e cases against the fake ACP agent, and a perf case.
+- No change to the terminal server, the transcript, the client protocol, config keys or state files.
