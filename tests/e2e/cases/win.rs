@@ -1222,7 +1222,10 @@ fn agent_batch_hint(ctx: &Ctx) -> Result<Outcome> {
     super::agent::waited(&out)?;
     let line = out.dump.agent.first().map(String::as_str).unwrap_or_default();
     ensure!(
-        line.starts_with("agent zone=1 state=not-started message=\"the agent my-agent didn't start: my-agent is a batch file (")
+        // The server's refusal reads "cannot run my-agent: …" (the holder's
+        // spawn-failure form), after the zone's own prefix.
+        line.starts_with("agent zone=1 state=not-started message=\"the agent my-agent didn't start: ")
+            && line.contains("my-agent is a batch file (")
             && line.contains("my-agent.cmd); run it as `cmd /c my-agent`\""),
         "not the batch file's hint: {line}"
     );

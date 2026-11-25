@@ -334,15 +334,21 @@ jobs:
           # xclip: the clipboard cases' other application.
           # shellcheck disable=SC2086 # a list of packages
           sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
-            xvfb x11-utils xclip openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish
+            xvfb x11-utils xclip openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish musl-tools
+      # The musl target: remote-agent-ssh copies a static fake ACP agent
+      # into its container.
       - name: Install Rust
-        run: rustup toolchain install
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: dev
       - name: Build
         run: |
           cargo build --locked -p brindle-remote-agent
+          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent \
+            --target x86_64-unknown-linux-musl
           cargo test --locked -p brindle --test e2e --no-run
       - name: End-to-end suite
         run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- --shard ${{ matrix.shard }}/3
