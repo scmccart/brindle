@@ -19,7 +19,8 @@ libc = "0.2"
 
 # The holder's pseudoconsoles (`conpty`, which asks `ntdll` which console a
 # program is on), the list of processes a hang-up looks through for those
-# still on a session's console, and the server's event loop and pipes.
+# still on a session's console, the server's event loop and pipes, and the
+# jobs a pipe session's program runs in.
 # Brindle already builds this version, so only the features below are the
 # agent's own.
 [target.'cfg(windows)'.dependencies]
@@ -31,6 +32,7 @@ windows = { version = "0.61", features = [
   "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
+  "Win32_System_JobObjects",
   "Win32_System_LibraryLoader",
   "Win32_System_Pipes",
   "Win32_System_Threading",

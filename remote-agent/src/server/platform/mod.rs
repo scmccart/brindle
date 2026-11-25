@@ -10,6 +10,9 @@
 //! - `daemon`: starting a role detached, and its ready signal;
 //! - `pty`: a session's PTY and program (spawn, I/O, resize, hang up, exit),
 //!   and for the core its foreground program (none on Windows);
+//! - `piped`: a session's program on plain pipes (`Piped`, its three
+//!   streams, and `spawn_piped`), sharing `pty`'s `Program` and `Group`;
+//!   declared, and refusing, until `agents-sessions` section 5;
 //! - `dir`: finding and securing the server directory;
 //! - `sys`: the running binary and random numbers.
 //!
