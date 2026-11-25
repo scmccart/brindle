@@ -38,6 +38,11 @@ pub struct Tokens {
     pub input: Hsla,
     /// The focus ring.
     pub ring: Hsla,
+    /// Link text on `card` and `background`. Not one of shadcn's
+    /// variables: the neutral sets take their `primary`, and a source that
+    /// derives `primary` from an accent may push it towards black or white
+    /// to keep links legible on the card.
+    pub link: Hsla,
     /// The base corner radius (`--radius`); see [`Tokens::radius_md`] and
     /// its siblings for the steps components use.
     pub radius: Rems,
@@ -87,6 +92,7 @@ impl Tokens {
             border: hex(0xe5e5e5),                 // oklch(0.922 0 0)
             input: hex(0xe5e5e5),                  // oklch(0.922 0 0)
             ring: hex(0xa1a1a1),                   // oklch(0.708 0 0)
+            link: hex(0x171717),                   // primary
             radius: rems(0.625),
             dark: false,
         }
@@ -115,6 +121,7 @@ impl Tokens {
             border: hsla(0., 0., 1., 0.10),        // oklch(1 0 0 / 10%)
             input: hsla(0., 0., 1., 0.15),         // oklch(1 0 0 / 15%)
             ring: hex(0x737373),                   // oklch(0.556 0 0)
+            link: hex(0xe5e5e5),                   // primary
             radius: rems(0.625),
             dark: true,
         }
@@ -291,6 +298,13 @@ mod tests {
         assert!(!light.dark);
         assert!(dark.dark);
         assert!(light.background.l > 0.5 && dark.background.l < 0.5);
+    }
+
+    #[test]
+    fn the_neutral_sets_link_in_their_primary() {
+        for set in [Tokens::neutral_light(), Tokens::neutral_dark()] {
+            assert_eq!(set.link, set.primary);
+        }
     }
 
     #[test]
