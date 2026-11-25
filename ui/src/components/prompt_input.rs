@@ -409,8 +409,11 @@ impl PromptInput {
             .border_1()
             .border_color(border)
             .text_size(rems(0.75))
-            .child(trigger_label(first_line(queued.text()).to_string().into()))
-            .child(div().flex_shrink().min_w_0().truncate().text_color(label_color).child(queued.label()))
+            // Both cut with an ellipsis (`truncate` cuts nothing in a flex
+            // row in gpui 0.2.2): the text takes the room left, keeping a
+            // little; the label its own width, giving way after.
+            .child(trigger_label(first_line(queued.text()).to_string().into()).min_w(rems(3.)))
+            .child(trigger_label(queued.label()).flex_initial().text_color(label_color))
             .children(buttons)
     }
 }

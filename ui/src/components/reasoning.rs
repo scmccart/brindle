@@ -19,7 +19,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, rems,
 };
 
-use crate::components::accepts_click;
+use crate::components::{accepts_click, trigger_label};
 use crate::icon::{Icon, IconElement};
 use crate::theme::ActiveTheme;
 
@@ -80,7 +80,7 @@ impl RenderOnce for Reasoning {
             .hover(move |s| s.text_color(foreground))
             .when(on_toggle.is_some(), |d| d.cursor_pointer())
             .child(Icon::Brain.size(rems(1.)))
-            .child(div().min_w_0().truncate().child(self.label))
+            .child(trigger_label(self.label).flex_initial())
             .child(IconElement::new(Icon::ChevronDown).size(rems(1.)).turn(if open { 0.5 } else { 0. }))
             .when_some(on_toggle, |d, on_toggle| {
                 d.on_click(move |event, window, cx| {
