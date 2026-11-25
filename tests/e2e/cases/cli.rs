@@ -50,7 +50,7 @@ pub fn list_fault_switches(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// A removed flat option (`-p work`, `-e htop`), the reserved `agent`, a
+/// A removed flat option (`-p work`, `-e htop`), `agent` with no agent profile, a
 /// bare profile name, `--attach` with a subcommand, an unknown profile
 /// under `terminal` (checked against the case's config, whose one profile
 /// is `Shell`), a misspelled `--action` and `--dump-screen-after` without a
@@ -63,7 +63,7 @@ pub fn usage_errors(ctx: &Ctx) -> Result<Outcome> {
     let cases: [(&str, &[&str], &str); 9] = [
         ("profile", &["-p", "work"], "brindle terminal work"),
         ("command", &["-e", "htop"], "brindle terminal -e htop"),
-        ("agent", &["agent"], "agent tabs"),
+        ("agent", &["agent"], "the config has no agent profile"),
         ("word", &["work"], "brindle terminal work"),
         ("attach", &["terminal", "Work", "--attach", "7"], "--attach"),
         ("unknown-profile", &["terminal", "wrk"], "no profile is named \"wrk\" (the profiles are: Shell)"),

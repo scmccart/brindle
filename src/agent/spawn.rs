@@ -224,7 +224,9 @@ mod tests {
     #[test]
     fn a_tilde_in_the_profiles_cwd_is_home_here_and_left_to_a_remote_server() {
         let local = agent("cwd = \"~/src\"\n");
-        assert_eq!(request(&local, &Host::Local, None, &OpenedBy::Window).cwd.as_deref(), Some("/home/u/src"));
+        // Joined onto this machine's home, so with its separator (`\` on Windows).
+        let joined = Path::new(HOME).join("src").to_string_lossy().into_owned();
+        assert_eq!(request(&local, &Host::Local, None, &OpenedBy::Window).cwd, Some(joined));
         let tilde = agent("cwd = \"~\"\n");
         assert_eq!(request(&tilde, &Host::Local, None, &OpenedBy::Window).cwd.as_deref(), Some(HOME));
         let remote = agent("cwd = \"~/src\"\nremote = { type = \"ssh\", host = \"A8\" }\n");
