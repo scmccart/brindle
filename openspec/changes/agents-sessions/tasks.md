@@ -73,9 +73,9 @@ Each module below in `remote-agent/src/acp/` joins `PURE_MODULES` and `fcis`'s p
 
 ## 10. Integration checks
 
-- [ ] 10.1 Run `cargo test --workspace --locked` and `cargo clippy --locked --workspace --all-targets -- -D warnings` on Linux, and the CI `windows` job on the branch; report each with its counts, and the skipped-capability log.
-- [ ] 10.2 Run `cargo build --release --locked` and the static musl helper build, compare the helper's size against `main` with the spike's numbers, and check `target/release/` holds `brindle-fake-acp-agent` and the archives don't.
-- [ ] 10.3 Run `openspec validate agents-sessions --strict`.
+- [x] 10.1 Run `cargo test --workspace --locked` and `cargo clippy --locked --workspace --all-targets -- -D warnings` on Linux, and the CI `windows` job on the branch; report each with its counts, and the skipped-capability log.
+- [x] 10.2 Run `cargo build --release --locked` and the static musl helper build, compare the helper's size against `main` with the spike's numbers, and check `target/release/` holds `brindle-fake-acp-agent` and the archives don't.
+- [x] 10.3 Run `openspec validate agents-sessions --strict`.
 
 ## Workflow follow-up
 
