@@ -1,0 +1,41 @@
+## MODIFIED Requirements
+
+### Requirement: Scrolling the conversation
+The conversation SHALL scroll, and SHALL stay at its end while new text arrives as long as the user is at the end. Scrolling away from the end SHALL keep the view where it is while text arrives or earlier entries are added above, and show a button that jumps to the end; reaching the end again SHALL make it follow again. The wheel, shift-pageup, shift-pagedown and the `agent_scroll_to_bottom` action SHALL scroll it.
+
+#### Scenario: Follows the reply
+- **WHEN** the conversation is at its end and the agent streams a reply longer than the zone
+- **THEN** the end of the reply stays in view
+
+#### Scenario: Reading back
+- **WHEN** the user scrolls up while the agent streams a reply
+- **THEN** the lines in view stay put, a jump-to-end button shows, and pressing it shows the end and follows again
+
+#### Scenario: Earlier entries arrive above
+- **WHEN** the user has scrolled up to the top of the entries the zone holds, and earlier entries are loaded above them
+- **THEN** the lines in view stay put, and the earlier entries are above them
+
+## ADDED Requirements
+
+### Requirement: Earlier messages
+When an agent session has entries before the oldest one its zone holds, the conversation SHALL start with an "Earlier messages" item. When that item scrolls into view, the zone SHALL fetch the entries before its oldest one, showing a spinner on the item until they arrive, then add them above. Fetched entries SHALL stay in the zone until it closes or its session is replayed again. When nothing earlier remains, the item SHALL go.
+
+#### Scenario: Scrolling to the top loads more
+- **WHEN** an agent zone shows the newest page of a long conversation and the user scrolls to its top
+- **THEN** the "Earlier messages" item shows a spinner, then the earlier entries appear above the ones the user was reading
+
+#### Scenario: Everything loaded
+- **WHEN** the user keeps scrolling up until the zone holds the session's whole log
+- **THEN** the "Earlier messages" item is gone and the conversation starts with the first kept entry
+
+#### Scenario: A short conversation
+- **WHEN** an agent zone is opened on a session whose whole log fits in one page
+- **THEN** the conversation shows no "Earlier messages" item
+
+#### Scenario: A fetch that fails
+- **WHEN** fetching earlier entries is refused, or the link to the endpoint goes down while it waits
+- **THEN** the item says the earlier messages couldn't be loaded and why, with nothing else in the conversation changed, and the fetch is tried again the next time the item scrolls into view or is pressed
+
+#### Scenario: Reattached
+- **WHEN** a zone that had fetched earlier entries is restored after Brindle restarts
+- **THEN** it shows the newest page again with the "Earlier messages" item, and scrolling up fetches the earlier entries again

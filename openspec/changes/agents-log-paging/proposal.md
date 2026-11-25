@@ -3,7 +3,7 @@
 **Depends on:** `agents-profiles` (the agent zone's copy of the log and its scrolling, and through it `agents-sessions`' transcript log, its 16 MiB bound, its checkpoint and its replay), implemented and archived.
 **Next:** `agents-acp-v2`, speaking ACP v2. The five follow-ups of `agents-profiles` are independent of one another, so that order is a suggestion.
 
-**Status: proposal stage.** This change has no design, specs or tasks yet. It is taken further once `agents-profiles` is archived (and with it `agents-launch-commands` and `agents-sessions`).
+**Status: designed.** Design, specs and tasks are written; it lands after `agents-markdown`, `agents-session-recovery` and `agents-login`, in the same release as them.
 
 ## Why
 
@@ -13,15 +13,16 @@ In step 1 an agent session's whole conversation log is kept, sent and copied who
 
 - Attaching an agent session sends a page of the newest entries, and the agent zone fetches older entries when the user scrolls up to them.
 - The server's checkpoints append to the stored log instead of rewriting it, so a checkpoint's cost no longer grows with the conversation.
-- Both are additive: a later client protocol version and a new checkpoint format version; clients on protocol 4 keep the whole replay.
+- Client protocol 4 and holder protocol H1 3, both unreleased, are amended in place (the agent changes ship in one release), and the checkpoint gets format 2. Released versions are unchanged.
 
-Open questions, to answer before a design:
-1. **The page:** how much an attach sends (entries or bytes), and how a client asks for older entries (a new client message, by entry id).
-2. **The bound:** whether the 16 MiB cap stays, rises or goes once checkpoints append, and what bounds the stored log then (the holder accepts at most a 64 MiB checkpoint).
-3. **The fold's guarantee.** Step 1 promises that folding a replay gives the server's log (`fold(replay(t)) == t`). With paging the client holds a suffix: what the fold's property becomes, and how an entry the client hasn't fetched is updated (a tool call updated by id, a permission's outcome) or referred to.
-4. **The checkpoint format:** how appended segments are stored and compacted, what an older core does with them (`process R15`), and what an upgrade or a truncated tail does.
-5. **The zone:** what it shows above the newest page, how scrolling up waits for a fetch, whether it drops pages it fetched to stay bounded, and what the dump says.
-6. **Who else uses it:** whether a page-sized replay is also what a small client needs (`add-pocket-client` notes a smaller replay as something its device may need from the relay).
+Open questions, answered by the user (design.md decision 1):
+1. **The page:** the newest whole entries up to about 256 KiB encoded, at least the newest entry, always reaching the oldest pending permission; an optional `ATTACH` field asks for less; older entries through `AGENT_FETCH {req, session, before, max_bytes}`, answered by entry events and `more`.
+2. **The bound:** 16 MiB stays.
+3. **The fold's guarantee:** a new event `Window { from, earlier }` (fetchable; `Trimmed` still means gone); the fold ignores events below its floor and a fetch returns current state; `fold(page(t)) == t.suffix(from)`, and fetched pages folded in front give `t`; pending permissions are always in the page.
+4. **The checkpoint format:** in this change, a base and appended segments, `CHECKPOINT_APPEND` in H1 3 (the holder only concatenates), format 2, compaction at step-down, on a trim, or when segments outgrow the base.
+5. **The zone:** an "Earlier messages" row that fetches when scrolled into view, with a spinner; the view kept; fetched pages kept; `earlier=N|loading|none` in the dump.
+6. **Who else uses it:** no pocket work; the budget stays a field the client sets.
+- **Versions:** protocol 4 and H1 3 are amended, with no fallback for pre-release builds of them.
 
 ## What the full changes already say
 
@@ -39,12 +40,14 @@ Open questions, to answer before a design:
 
 ### Modified Capabilities
 - `agent-sessions` (added by `agents-sessions`): "Attach replays the transcript" and "The log is bounded", and a new requirement for fetching older entries.
-- `agent-zones` (added by `agents-profiles`): "Scrolling the conversation", for entries fetched on demand.
-- `terminal-server`: "Protocol versions", for the new client protocol version.
+- `agent-zones` (added by `agents-profiles`): "Scrolling the conversation", for entries fetched on demand, and a new requirement for the "Earlier messages" row.
+- `command-line`: "Debug hooks in an agent zone", for the dump's `earlier=`.
+- `terminal-server`: "Protocol versions", for what client protocol 4 and holder protocol 3 now carry.
 
 ## Impact
 
 - `transcript/` (`brindle-transcript`): the replay, the fold over a partial log, and their property tests.
 - `remote-agent/src/acp/` and the core: the checkpoint format, its segments and their compaction, the page on attach and the fetch.
-- `remote-protocol/`: a new client protocol version, transcript tests and fuzzing for its messages.
+- `remote-protocol/`: new messages in client protocol 4 and H1 3, transcript tests and fuzzing for them.
+- `remote-agent/src/server/holder.rs`: storing appended checkpoints.
 - `src/agent/`: the zone's copy, its fetches and scrolling.
