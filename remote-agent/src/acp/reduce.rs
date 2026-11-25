@@ -1319,6 +1319,8 @@ impl Step<'_> {
             Purpose::NewSession => self.created(result),
             Purpose::Prompt => self.prompted(result),
             Purpose::Resume | Purpose::Load => self.continued(result),
+            // Stopgap until agents-login task 3.3: nothing sends one yet.
+            Purpose::Authenticate => {}
         }
     }
 
@@ -2180,12 +2182,12 @@ mod tests {
     // --- the start sequence (decision 4) --------------------------------
 
     #[test]
-    fn spawning_sends_initialize_for_version_1_with_no_client_capabilities() {
+    fn spawning_sends_initialize_for_version_1_advertising_only_auth_terminal() {
         let mut agent = Agent::new();
         let out = agent.step(Input::Spawned);
         assert_eq!(
             out.stdin,
-            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"0.3.0\"}}}\n"
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{\"auth\":{\"terminal\":true}},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"0.3.0\"}}}\n"
         );
         assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
         assert_eq!(*agent.s.phase(), Phase::Initializing { start: Start::New });
@@ -3931,7 +3933,15 @@ mod tests {
                     Some(method @ ("initialize" | "session/new")) => {
                         let line = agent.last(method).clone();
                         if line["id"] == id {
-                            assert_eq!(line, sent, "the core's {method}");
+                            // The captures before `agents-login` sent no
+                            // `auth.terminal`; rpc's tests pin the
+                            // capabilities against the later capture.
+                            let (mut ours_line, mut sent) = (line.clone(), sent.clone());
+                            if method == "initialize" {
+                                ours_line["params"]["clientCapabilities"] = Value::Null;
+                                sent["params"]["clientCapabilities"] = Value::Null;
+                            }
+                            assert_eq!(ours_line, sent, "the core's {method}");
                         }
                         ours.push((id, line["id"].as_u64().expect("an id")));
                     }

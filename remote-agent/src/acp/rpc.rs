@@ -8,9 +8,11 @@
 //!
 //! The lines are written here, not through the schema crate's types: the
 //! crate encodes `clientCapabilities` with explicit `false` fields, and
-//! decision 4 offers `{}`. Every string goes through JSON's own escaping,
-//! so no line holds a raw newline, and a request id from the agent is
-//! echoed as it was sent.
+//! decision 4 offers nothing but what Brindle does, which since the
+//! OpenSpec change `agents-login` is `{"auth":{"terminal":true}}` (a client
+//! runs an agent's terminal login methods). Every string goes through
+//! JSON's own escaping, so no line holds a raw newline, and a request id
+//! from the agent is echoed as it was sent.
 
 use std::collections::BTreeMap;
 
@@ -37,6 +39,9 @@ pub enum Purpose {
     Resume,
     /// `session/load`: continue a conversation, replayed first.
     Load,
+    /// `authenticate`: a login the agent runs itself (OpenSpec change
+    /// `agents-login`).
+    Authenticate,
 }
 
 /// The JSON-RPC errors the core answers an agent's request with.
@@ -148,14 +153,23 @@ impl Rpc {
         ))
     }
 
-    /// `initialize`, asking for [`PROTOCOL_VERSION`] with no client
-    /// capabilities, as Brindle at `version`.
+    /// `initialize`, asking for [`PROTOCOL_VERSION`] as Brindle at
+    /// `version`, with one client capability: `auth.terminal`, since a
+    /// client runs an agent's terminal login methods (`agents-login`).
+    /// No `fs` and no `terminal`.
     pub fn initialize(&mut self, version: &str) -> Vec<u8> {
         let params = format!(
-            r#"{{"protocolVersion":{PROTOCOL_VERSION},"clientCapabilities":{{}},"clientInfo":{{"name":"brindle","version":{}}}}}"#,
+            r#"{{"protocolVersion":{PROTOCOL_VERSION},"clientCapabilities":{{"auth":{{"terminal":true}}}},"clientInfo":{{"name":"brindle","version":{}}}}}"#,
             quote(version)
         );
         self.request(Purpose::Initialize, "initialize", &params)
+    }
+
+    /// `authenticate` with the login method `method` (`agents-login`); the
+    /// request's id is the one [`cancel_request`] names.
+    pub fn authenticate(&mut self, method: &str) -> Vec<u8> {
+        let params = format!(r#"{{"methodId":{}}}"#, quote(method));
+        self.request(Purpose::Authenticate, "authenticate", &params)
     }
 
     /// `session/new` in `cwd` (already absolute), with no MCP servers.
@@ -199,6 +213,21 @@ impl Rpc {
         let before = self.outgoing.len();
         self.outgoing.retain(|_, awaited| *awaited != purpose);
         self.outgoing.len() != before
+    }
+
+    /// Stops awaiting the request `id` (a cancelled `authenticate`), so a
+    /// later answer to it matches nothing; what it was for, or `None` when
+    /// it wasn't awaited.
+    pub fn forget_id(&mut self, id: u64) -> Option<Purpose> {
+        self.outgoing.remove(&id)
+    }
+
+    /// The id of the awaited request for `purpose`, the lowest when there
+    /// are several.
+    pub fn awaited(&self, purpose: Purpose) -> Option<u64> {
+        self.outgoing
+            .iter()
+            .find_map(|(id, awaited)| (*awaited == purpose).then_some(*id))
     }
 
     /// Forgets every request awaited and every permission request waiting,
@@ -254,6 +283,15 @@ pub fn cancel(session: &str) -> Vec<u8> {
     line(format!(
         r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":{}}}}}"#,
         quote(session)
+    ))
+}
+
+/// `$/cancel_request` for the core's own request `id` (a login the user
+/// cancelled), a notification. The agent may ignore it, but must still
+/// answer the request.
+pub fn cancel_request(id: u64) -> Vec<u8> {
+    line(format!(
+        r#"{{"jsonrpc":"2.0","method":"$/cancel_request","params":{{"requestId":{id}}}}}"#
     ))
 }
 
@@ -324,19 +362,65 @@ mod tests {
     const CLAUDE: &str = include_str!("../../tests/fixtures/acp/claude-code-acp-0.16.2-reject.log");
     const ANTIGRAVITY: &str =
         include_str!("../../tests/fixtures/acp/antigravity-1.5.16-reject.log");
+    /// The capture made with `auth.terminal` advertised (`agents-login`
+    /// task 1.1), whose `initialize` is Brindle's.
+    const CLAUDE_AUTH: &str =
+        include_str!("../../tests/fixtures/acp/claude-code-acp-0.16.2-auth-terminal.log");
 
     #[test]
-    fn initialize_asks_for_version_1_with_empty_capabilities() {
+    fn initialize_asks_for_version_1_advertising_only_auth_terminal() {
         let mut rpc = Rpc::new();
         assert_eq!(
             text(&rpc.initialize("0.3.0")),
-            captured(CLAUDE, r#"{"jsonrpc":"2.0","id":1,"method":"initialize""#)
+            captured(CLAUDE_AUTH, r#"{"jsonrpc":"2.0","id":1,"method":"initialize""#)
         );
         assert_eq!(
             text(&Rpc::new().initialize("1.2.3")),
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\
-             \"clientCapabilities\":{},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"1.2.3\"}}}\n"
+             \"clientCapabilities\":{\"auth\":{\"terminal\":true}},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"1.2.3\"}}}\n"
         );
+    }
+
+    #[test]
+    fn authenticate_names_the_method_and_awaits_its_answer() {
+        let mut rpc = Rpc::from_parts(5, BTreeMap::new(), BTreeMap::new())
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(
+            text(&rpc.authenticate("oauth-personal")),
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"authenticate\",\"params\":{\"methodId\":\"oauth-personal\"}}\n"
+        );
+        assert_eq!(rpc.awaited(Purpose::Authenticate), Some(5));
+        assert_eq!(rpc.answered(&Id::number(5)), Some(Purpose::Authenticate));
+        assert_eq!(rpc.awaited(Purpose::Authenticate), None);
+        // A method id is quoted as any text.
+        assert_eq!(
+            text(&rpc.authenticate("a\"b\n")),
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"authenticate\",\"params\":{\"methodId\":\"a\\\"b\\n\"}}\n"
+        );
+    }
+
+    #[test]
+    fn cancel_request_is_a_notification_naming_the_core_request() {
+        assert_eq!(
+            text(&cancel_request(5)),
+            "{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{\"requestId\":5}}\n"
+        );
+    }
+
+    #[test]
+    fn a_forgotten_id_matches_no_later_answer_and_keeps_the_others() {
+        let mut rpc = Rpc::new();
+        rpc.initialize("0.3.0");
+        rpc.authenticate("chat-gpt");
+        assert_eq!(rpc.forget_id(2), Some(Purpose::Authenticate));
+        assert_eq!(rpc.forget_id(2), None);
+        assert_eq!(rpc.answered(&Id::number(2)), None);
+        assert_eq!(
+            rpc.outgoing().values().copied().collect::<Vec<_>>(),
+            [Purpose::Initialize]
+        );
+        // The ids go on past it.
+        assert_eq!(rpc.next_id(), 3);
     }
 
     #[test]
@@ -462,7 +546,9 @@ mod tests {
             rpc.resume("s\n", "/"),
             rpc.load("s", "/\n"),
             rpc.prompt("s", "hi"),
+            rpc.authenticate("m\n"),
             cancel("s"),
+            cancel_request(9),
             permission_answer(&id, Some("a")),
             permission_answer(&id, None),
             error(Some(&id), Refusal::MethodNotFound),
