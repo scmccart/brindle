@@ -1300,7 +1300,8 @@ pub fn self_test_dump() -> Result {
     // focus lines.
     let dump = Dump::parse(
         "--- tab 1 \"Fake Agent\" (active)\n--- fonts terminal=\"A\" ui=\"B\"\n\
-         --- agent zone=1 state=ready name=\"Fake Agent\" turn=ended:end_turn activity=done status=done link=up session=open\n\
+         --- agent zone=1 state=ready name=\"Fake Agent\" turn=ended:end_turn activity=done status=done link=up session=open \
+         continue=none:not-ended\n\
          --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n\
          --- block entry=2 part=0 kind=paragraph \"Hello!\"\n\
          --- link entry=2 part=0 target=\"https://example.com\" text=\"Hello\" action=open\n--- queued waiting \"next\"\n\
@@ -1317,6 +1318,7 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.link.is_none(), "an agent's link isn't the terminal's hovered one: {:?}", dump.link);
     ensure!(dump.agent_field("state") == Some("ready") && dump.agent_field("session") == Some("open"), "{:?}", dump.agent);
     ensure!(dump.agent_field("zone") == Some("1") && dump.agent_field("missing").is_none(), "{:?}", dump.agent);
+    ensure!(dump.agent_field("continue") == Some("none:not-ended"), "{:?}", dump.agent);
     ensure!(dump.agent_entries() == ["user \"hi there\"", "agent \"Hello!\""], "entries {:?}", dump.agent_entries());
     ensure!(dump.size.is_none() && dump.screen.is_empty(), "no screen {:?}", dump.screen);
     ensure!(dump.focus.as_deref() == Some("other"), "focus after the agent block {:?}", dump.focus);

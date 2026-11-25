@@ -288,6 +288,16 @@ fn unix() -> Vec<Case> {
         // The agent profile is only listed: its agent never runs.
         display("agent-settings-profiles", agent::settings_profiles),
         needing("agent-broken", &[TestSwitch::SinkPanic], agent::broken).needs_fake_agent(),
+        display("agent-continue-resume", agent::continue_resume).needs_fake_agent(),
+        display("agent-continue-load", agent::continue_load).needs_fake_agent(),
+        display("agent-continue-held", agent::continue_held).needs_fake_agent(),
+        display("agent-continue-palette", agent::continue_palette).needs_fake_agent(),
+        display("agent-continue-holder-lost", agent::continue_holder_lost).needs_fake_agent(),
+        display("agent-continue-lost", agent::continue_lost).needs_fake_agent(),
+        display("agent-continue-none", agent::continue_none).needs_fake_agent(),
+        display("agent-continue-profile-gone", agent::continue_profile_gone).needs_fake_agent(),
+        display("agent-continue-refused", agent::continue_refused).needs_fake_agent(),
+        display("agent-continue-not-restored", agent::continue_not_restored).needs_fake_agent(),
     ]
 }
 

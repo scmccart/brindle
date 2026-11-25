@@ -88,12 +88,37 @@ impl Script {
         self.step("expect session/prompt").step(format!("wait-file {}", gate.display()))
     }
 
+    /// An agent as [`Script::ready`] whose `initialize` offers
+    /// `capabilities` (its `agentCapabilities`, [`RESUME`] or another), so
+    /// its conversation `s1` can be continued unless it offers [`NEITHER`].
+    fn offering(received: &Path, capabilities: &str) -> Self {
+        Script::initialized(received, capabilities).step("expect session/new").step(r#"respond {"sessionId":"s1"}"#)
+    }
+
+    /// An agent that records what it is sent in `received` and answers
+    /// `initialize` offering `capabilities`; the case adds the rest (a
+    /// continue's `session/resume` or `session/load`).
+    fn initialized(received: &Path, capabilities: &str) -> Self {
+        Script(vec![
+            format!("record {}", received.display()),
+            "expect initialize".into(),
+            format!(
+                r#"respond {{"protocolVersion":1,"agentInfo":{{"name":"Fake Agent","version":"1.0"}},"agentCapabilities":{capabilities}}}"#
+            ),
+        ])
+    }
+
+    /// Writes the script as `NAME.script` in the case directory.
+    fn write(self, ctx: &Ctx, name: &str) -> Result<PathBuf> {
+        let path = ctx.dir.join(format!("{name}.script"));
+        std::fs::write(&path, self.0.join("\n") + "\n").map_err(|e| format!("writing {}: {e}", path.display()))?;
+        Ok(path)
+    }
+
     /// Writes the script as `NAME.script` in the case directory and
     /// returns the `Fake` profile running it.
     fn profile(self, ctx: &Ctx, name: &str) -> Result<String> {
-        let path = ctx.dir.join(format!("{name}.script"));
-        std::fs::write(&path, self.0.join("\n") + "\n").map_err(|e| format!("writing {}: {e}", path.display()))?;
-        Ok(fake_profile(ctx, &path))
+        Ok(fake_profile(ctx, &self.write(ctx, name)?))
     }
 }
 
@@ -493,8 +518,14 @@ fn recorded(received: &Path, method: &str) -> bool {
 /// (`first`), tab 2 after that, its shell typing `touch`; then back to the
 /// agent's tab, the first, whose prompt input takes focus again.
 fn touch_from_shell<'a>(run: Run<'a>, gate: &Path, first: bool) -> Run<'a> {
+    from_shell(run, &format!("touch '{}'", gate.display()), first)
+}
+
+/// The steps that run `command` from a Shell tab, as [`touch_from_shell`]
+/// does, so it runs after the steps before.
+fn from_shell<'a>(run: Run<'a>, command: &str, first: bool) -> Run<'a> {
     let run = if first { run.action("new_tab") } else { run.action("activate_tab_2") };
-    run.send(&format!("touch '{}'\r", gate.display())).action("activate_tab_1")
+    run.send(&format!("{command}\r")).action("activate_tab_1")
 }
 
 /// The dump's agent lines start with `prefix`, one of them.
@@ -1592,5 +1623,444 @@ pub fn broken(ctx: &Ctx) -> Result<Outcome> {
     let listed = crate::brindle::listed_sessions(ctx)?;
     ensure!(listed.len() == 1 && !listed[0].1, "the agent session isn't listed detached: {listed:?}");
     crate::brindle::hang_up_detached(ctx)?;
+    Ok(Outcome::Pass)
+}
+
+// Continuing a conversation (OpenSpec change `agents-session-recovery`):
+// the zone's profile runs `agent.script`, and the case's Shell tab copies
+// the continue's script over it (`cp`) before it lets the first agent end,
+// so the restart plays the second script; the agents record into
+// `first.jsonl` and `second.jsonl`.
+
+/// `agentCapabilities` offering `session/resume`.
+const RESUME: &str = r#"{"sessionCapabilities":{"resume":{}}}"#;
+/// `agentCapabilities` offering `session/load` alone (as Copilot does).
+const LOAD: &str = r#"{"loadSession":true}"#;
+/// `agentCapabilities` offering neither.
+const NEITHER: &str = "{}";
+
+/// What `--wait-for` waits for until the first agent has exited.
+const EXITED: &str = "state=exited:1";
+
+/// The notice the core adds when it starts the agent again.
+const RESTARTED: &str = "the agent was started again to continue the conversation";
+
+/// Where the first and the second agent record what they are sent.
+fn records(ctx: &Ctx) -> (PathBuf, PathBuf) {
+    let (first, second) = (ctx.dir.join("first.jsonl"), ctx.dir.join("second.jsonl"));
+    // A run's records start empty, as its gates start closed.
+    for path in [&first, &second] {
+        std::fs::remove_file(path).ok();
+    }
+    (first, second)
+}
+
+/// An agent offering `capabilities` that answers its first prompt with
+/// [`HELLO`], waits for `gate`, then exits with status 1.
+fn turn_then_exit(received: &Path, capabilities: &str, gate: &Path) -> Script {
+    Script::offering(received, capabilities)
+        .step("expect session/prompt")
+        .step(says(HELLO))
+        .step(stop("end_turn"))
+        .step(format!("wait-file {}", gate.display()))
+        .step("exit 1")
+}
+
+/// A `session/update` step replaying the user's `text`, as `session/load`
+/// does.
+fn user_says(text: &str) -> String {
+    update(&format!(r#"{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"{text}"}}}}"#))
+}
+
+/// The agent continued by `session/load` replaying the first turn
+/// (`hi`, then [`HELLO`]: two updates).
+fn loaded(received: &Path) -> Script {
+    Script::initialized(received, LOAD)
+        .step("expect session/load")
+        .step(user_says("hi"))
+        .step(says(HELLO))
+        .step("respond {}")
+}
+
+/// Writes `first` as the profile's `agent.script` and `next` beside it,
+/// closes `gate`, and gives the `Fake` profile and the shell command that
+/// puts `next` in `first`'s place, then runs `then` (opening a gate).
+fn continued(ctx: &Ctx, first: Script, next: Script, then: &str) -> Result<(String, String)> {
+    let next = next.write(ctx, "next")?;
+    let profile = first.profile(ctx, "agent")?;
+    let current = ctx.dir.join("agent.script");
+    Ok((profile, format!("cp '{}' '{}' && {then}", next.display(), current.display())))
+}
+
+/// `touch` of `gate`, closed first.
+fn touch(gate: &Path) -> String {
+    std::fs::remove_file(gate).ok();
+    format!("touch '{}'", gate.display())
+}
+
+/// The conversation's user and agent messages, in order.
+fn messages(out: &crate::brindle::Output) -> Vec<&str> {
+    out.dump.agent_entries().into_iter().filter(|e| e.starts_with("user ") || e.starts_with("agent ")).collect()
+}
+
+/// Whether the conversation has a notice containing `text`.
+fn has_notice(out: &crate::brindle::Output, text: &str) -> bool {
+    out.dump.agent_entries().iter().any(|e| e.starts_with("notice ") && e.contains(text))
+}
+
+/// How many messages with `method` the agent's record holds.
+fn recorded_count(received: &Path, method: &str) -> usize {
+    let text = std::fs::read_to_string(received).unwrap_or_default();
+    text.lines().filter(|line| line.contains(&format!("\"method\":\"{method}\""))).count()
+}
+
+/// An agent that offered `session/resume` exits after a turn: the zone
+/// offers Continue conversation one Tab from the prompt, and continues
+/// nothing on its own; enter on the button starts the agent again on the
+/// same session with `session/resume`, the earlier turn stays shown once,
+/// and a new prompt reaches the new agent.
+pub fn continue_resume(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let next = |second: &Path| {
+        Script::initialized(second, RESUME)
+            .step("expect session/resume")
+            .step("respond {}")
+            .step("expect session/prompt")
+            .step(says("Again"))
+            .step(stop("end_turn"))
+    };
+
+    let (first, second) = records(ctx);
+    let (profile, swap) = continued(ctx, turn_then_exit(&first, RESUME, &go), next(&second), &touch(&go))?;
+    let run = Run::new(ctx, "button").config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+    let out = from_shell(run, &swap, true).wait_for(EXITED).wait_for("continue=restart").key("tab").dump_at(10.0).run()?;
+    waited(&out)?;
+    ensure!(
+        out.dump.focus.as_deref() == Some("agent") && out.dump.focus_stop.as_deref() == Some("continue"),
+        "Tab from the prompt reaches the button: {:?} {:?}",
+        out.dump.focus,
+        out.dump.focus_stop
+    );
+    ensure!(out.dump.agent_field("state") == Some("exited:1"), "agent: {:?}", out.dump.agent);
+    ensure!(!recorded(&second, "initialize"), "the agent was started again on its own");
+
+    let (first, second) = records(ctx);
+    let (profile, swap) = continued(ctx, turn_then_exit(&first, RESUME, &go), next(&second), &touch(&go))?;
+    let run = Run::new(ctx, "continue").config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+    let out = from_shell(run, &swap, true)
+        .wait_for(EXITED)
+        .key("tab")
+        .key("enter")
+        .wait_for(READY)
+        .send("again")
+        .key("enter")
+        .wait_for("agent \"Again\"")
+        .dump_at(16.0)
+        .run()?;
+    waited(&out)?;
+    let want = ["user \"hi\"", "agent \"Hello!\"", "user \"again\"", "agent \"Again\""];
+    ensure!(messages(&out) == want, "messages: {:?}", out.dump.agent);
+    ensure!(has_notice(&out, RESTARTED), "no restart notice: {:?}", out.dump.agent);
+    ensure!(out.dump.agent_field("session") == Some("open"), "agent: {:?}", out.dump.agent);
+    ensure!(prompts_sent(&first)? == ["hi"] && prompts_sent(&second)? == ["again"], "sent: {:?} then {:?}", prompts_sent(&first)?, prompts_sent(&second)?);
+    let resumed = std::fs::read_to_string(&second).unwrap_or_default();
+    ensure!(
+        resumed.lines().any(|l| l.contains("\"session/resume\"") && l.contains("\"sessionId\":\"s1\"")),
+        "no session/resume of s1: {resumed}"
+    );
+    ensure!(recorded_count(&second, "session/new") == 0, "a new conversation was started: {resumed}");
+    Ok(Outcome::Pass)
+}
+
+/// An agent offering `session/load` alone (Copilot-like) is continued by a
+/// load whose replay isn't shown: the earlier turn shows once, then the
+/// notice that the replay of 2 updates wasn't shown.
+pub fn continue_load(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let (first, second) = records(ctx);
+    let (profile, swap) = continued(ctx, turn_then_exit(&first, LOAD, &go), loaded(&second), &touch(&go))?;
+    let run = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+    let out = from_shell(run, &swap, true).wait_for(EXITED).action("agent_continue").wait_for(READY).dump_at(11.0).run()?;
+    waited(&out)?;
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(has_notice(&out, "replay of 2 updates wasn't shown"), "no muted replay's notice: {:?}", out.dump.agent);
+    ensure!(recorded(&second, "session/load"), "no session/load was sent");
+    Ok(Outcome::Pass)
+}
+
+/// A prompt waiting when the agent exits is held; continued, its
+/// send-again comes back once the agent is ready and sends it to the new
+/// agent, while the turn in flight at the exit failed and is never sent
+/// again.
+pub fn continue_held(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let (first, second) = records(ctx);
+    let next = Script::initialized(&second, RESUME)
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(says("B"))
+        .step(stop("end_turn"));
+    let first_agent = Script::offering(&first, RESUME).prompt_held(&go).step("exit 1");
+    let (profile, swap) = continued(ctx, first_agent, next, &touch(&go))?;
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("one")
+        .wait_for(WORKING)
+        .send("two")
+        .key("enter")
+        .wait_for("queued waiting \"two\"");
+    let out = from_shell(run, &swap, true)
+        .wait_for(EXITED)
+        .wait_for("queued held reason=agent-stopped resend=no \"two\"")
+        .action("agent_continue")
+        .wait_for(READY)
+        .wait_for("queued held reason=agent-stopped resend=yes \"two\"")
+        .action("agent_resend")
+        .wait_for("agent \"B\"")
+        .dump_at(20.0)
+        .run()?;
+    waited(&out)?;
+    no_queued_row(&out)?;
+    ensure!(messages(&out) == ["user \"one\"", "user \"two\"", "agent \"B\""], "messages: {:?}", out.dump.agent);
+    ensure!(prompts_sent(&first)? == ["one"], "the first agent was sent {:?}", prompts_sent(&first)?);
+    ensure!(prompts_sent(&second)? == ["two"], "the continued agent was sent {:?}", prompts_sent(&second)?);
+    Ok(Outcome::Pass)
+}
+
+/// Continue Agent Conversation from the command palette continues the
+/// conversation as the button does.
+pub fn continue_palette(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let (first, second) = records(ctx);
+    let next = Script::initialized(&second, RESUME).step("expect session/resume").step("respond {}");
+    let (profile, swap) = continued(ctx, turn_then_exit(&first, RESUME, &go), next, &touch(&go))?;
+    let run = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+    let out = from_shell(run, &swap, true)
+        .wait_for(EXITED)
+        .action("open_command_palette")
+        .send("Continue Agent Conversation")
+        .action("picker_confirm")
+        .wait_for(READY)
+        .dump_at(13.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.palette.is_empty(), "the palette closed: {:?}", out.dump.palette);
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(has_notice(&out, RESTARTED), "no restart notice: {:?}", out.dump.agent);
+    ensure!(recorded(&second, "session/resume"), "no session/resume was sent");
+    Ok(Outcome::Pass)
+}
+
+/// The session running the fake agent, from `brindle-remote list --json`:
+/// its pid, `None` while none is listed running.
+fn agent_pid(helper: &Path, server_dir: &Path) -> Result<Option<u32>> {
+    let out = std::process::Command::new(helper)
+        .args(["list", "--json"])
+        .env("BRINDLE_SERVER_DIR", server_dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("running {}: {e}", helper.display()))?;
+    ensure!(out.status.success(), "`brindle-remote list --json` failed: {}", String::from_utf8_lossy(&out.stderr));
+    let listed: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("`brindle-remote list --json`: {e}"))?;
+    Ok(listed.as_array().into_iter().flatten().find_map(|session| {
+        let command = session["command"].as_str()?;
+        let pid = session["pid"].as_u64()?;
+        (command.contains("brindle-fake-acp-agent") && pid != 0).then_some(pid as u32)
+    }))
+}
+
+/// The holder running an agent that offered `session/load` is killed: the
+/// zone says the agent was lost with its holder and offers to continue on
+/// the same session, which a muted load does.
+pub fn continue_holder_lost(ctx: &Ctx) -> Result<Outcome> {
+    let (first, second) = records(ctx);
+    let first_agent = Script::offering(&first, LOAD).step("expect session/prompt").step(says(HELLO)).step(stop("end_turn"));
+    let go = gate(ctx, "kill-holder");
+    let (profile, swap) = continued(ctx, first_agent, loaded(&second), &touch(&go))?;
+    let (helper, server_dir, scale) = (ctx.helper.clone(), ctx.server_dir.clone(), ctx.scale());
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        // The case's go-ahead comes from its Shell tab, after the turn.
+        .call_at(1.0, move |_| {
+            scale.eventually(60.0, "the Shell tab's go-ahead to kill the holder", || go.exists())?;
+            let agent = agent_pid(&helper, &server_dir)?.ok_or("no running agent session listed")?;
+            let holder = super::local_server::parent(agent)?
+                .filter(|&pid| super::local_server::is_holder(pid))
+                .ok_or_else(|| format!("the agent {agent}'s parent isn't a holder"))?;
+            super::local_server::kill(holder)
+        })
+        .wait_for(&answered());
+    let out = from_shell(run, &swap, true)
+        .wait_for("state=holder-lost")
+        .wait_for("continue=restart")
+        .action("agent_continue")
+        .wait_for(READY)
+        .dump_at(14.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(has_notice(&out, "replay of 2 updates wasn't shown"), "no muted replay's notice: {:?}", out.dump.agent);
+    ensure!(out.dump.agent_field("session") == Some("open"), "the same session: {:?}", out.dump.agent);
+    ensure!(recorded(&second, "session/load"), "no session/load was sent");
+    Ok(Outcome::Pass)
+}
+
+/// The core killed while the agent has exited loses the ended session: the
+/// zone says the session was lost and offers to continue it in a new one,
+/// whose log is the agent's replay after the notice that it continues an
+/// earlier conversation.
+pub fn continue_lost(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let (first, second) = records(ctx);
+    let (profile, swap) = continued(ctx, turn_then_exit(&first, LOAD, &go), loaded(&second), &touch(&go))?;
+    let kill_core = gate(ctx, "kill-core");
+    let ask = touch(&kill_core);
+    let (server_dir, scale) = (ctx.server_dir.clone(), ctx.scale());
+    let run = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        // The go-ahead comes from the Shell tab once the agent has exited.
+        .call_at(1.0, move |_| {
+            scale.eventually(60.0, "the Shell tab's go-ahead to kill the core", || kill_core.exists())?;
+            let core = crate::server_processes(&server_dir).into_iter().find(|(_, role)| role == "serve");
+            let (core, _) = core.ok_or("no core running")?;
+            super::local_server::kill(core)
+        })
+        .wait_for(&answered());
+    let run = from_shell(run, &swap, true).wait_for(EXITED);
+    let out = from_shell(run, &ask, false)
+        .wait_for("state=lost")
+        .wait_for("continue=respawn")
+        .action("agent_continue")
+        .wait_for(READY)
+        .dump_at(25.0)
+        .run()?;
+    waited(&out)?;
+    let entries = out.dump.agent_entries();
+    ensure!(
+        entries.len() == 3
+            && entries[0].starts_with("notice ")
+            && entries[0].contains("this continues an earlier conversation")
+            && entries[1..] == ["user \"hi\"", "agent \"Hello!\""],
+        "a fresh log of the replay: {entries:?}"
+    );
+    ensure!(out.dump.agent_field("session") == Some("open"), "agent: {:?}", out.dump.agent);
+    ensure!(recorded(&second, "session/load"), "no session/load was sent");
+    Ok(Outcome::Pass)
+}
+
+/// An agent that offered neither `session/load` nor `session/resume`
+/// exits: no Continue conversation button (Tab from the prompt finds no
+/// other stop), the dump says why, and `agent_continue` starts nothing.
+pub fn continue_none(ctx: &Ctx) -> Result<Outcome> {
+    let (first, _) = records(ctx);
+    let profile = Script::offering(&first, NEITHER)
+        .step("expect session/prompt")
+        .step(says(HELLO))
+        .step(stop("end_turn"))
+        .step("exit 1")
+        .profile(ctx, "agent")?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for(EXITED)
+        .wait_for("continue=none:not-offered")
+        .key("tab")
+        .action("agent_continue")
+        .dump_at(7.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.focus_stop.as_deref() == Some("prompt"), "no button to Tab to: {:?}", out.dump.focus_stop);
+    ensure!(out.dump.agent_field("state") == Some("exited:1"), "agent: {:?}", out.dump.agent);
+    ensure!(recorded_count(&first, "initialize") == 1, "the agent was started again");
+    Ok(Outcome::Pass)
+}
+
+/// The zone's agent profile removed from the config after its agent
+/// exited: no button, the dump says the profile is gone, and
+/// `agent_continue` starts nothing.
+pub fn continue_profile_gone(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let (first, _) = records(ctx);
+    let without = ctx.dir.join("without-fake.toml");
+    std::fs::write(&without, crate::brindle::config("e2e")).map_err(|e| format!("writing {}: {e}", without.display()))?;
+    let profile = turn_then_exit(&first, RESUME, &go).profile(ctx, "agent")?;
+    let swap = format!("cp '{}' '{}' && {}", without.display(), ctx.dir.join("config.toml").display(), touch(&go));
+    let run = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+    let out = from_shell(run, &swap, true)
+        .wait_for(EXITED)
+        .action("reload_config")
+        .wait_for("continue=none:profile-gone")
+        .key("tab")
+        .action("agent_continue")
+        .dump_at(13.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.focus_stop.as_deref() == Some("prompt"), "no button to Tab to: {:?}", out.dump.focus_stop);
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    ensure!(recorded_count(&first, "initialize") == 1, "the agent was started again");
+    Ok(Outcome::Pass)
+}
+
+/// A continue the agent refuses (`session/resume` answered `no such
+/// session`) leaves the zone saying the agent can't be used, with the
+/// agent's message, its session ended and the earlier turn kept.
+pub fn continue_refused(ctx: &Ctx) -> Result<Outcome> {
+    let go = gate(ctx, "exit");
+    let (first, second) = records(ctx);
+    let next = Script::initialized(&second, RESUME)
+        .step("expect session/resume")
+        .step(r#"respond-error -32603 "no such session""#);
+    let (profile, swap) = continued(ctx, turn_then_exit(&first, RESUME, &go), next, &touch(&go))?;
+    let run = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(&answered());
+    let out = from_shell(run, &swap, true)
+        .wait_for(EXITED)
+        .action("agent_continue")
+        .wait_for("state=failed")
+        .wait_for("session=ended")
+        .dump_at(12.0)
+        .run()?;
+    waited(&out)?;
+    let line = out.dump.agent.iter().find(|l| l.starts_with("agent ")).cloned().unwrap_or_default();
+    ensure!(line.contains("no such session"), "the agent's message isn't shown: {line}");
+    ensure!(out.dump.agent_field("continue") == Some("none:not-ended"), "offered again: {line}");
+    ensure!(messages(&out) == ["user \"hi\"", "agent \"Hello!\""], "messages: {:?}", out.dump.agent);
+    Ok(Outcome::Pass)
+}
+
+/// Quitting with an exited agent that could be continued leaves no session
+/// on the server, and the next launch doesn't bring the zone back.
+pub fn continue_not_restored(ctx: &Ctx) -> Result<Outcome> {
+    let (first, _) = records(ctx);
+    let profile = Script::offering(&first, RESUME)
+        .step("expect session/prompt")
+        .step(says(HELLO))
+        .step(stop("end_turn"))
+        .step("exit 1")
+        .profile(ctx, "agent")?;
+    Run::new(ctx, "quit")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .keep_detached()
+        .wait_for(EXITED)
+        .wait_for("continue=restart")
+        .action("quit")
+        .expect_exit()
+        .dump_at(8.0)
+        .run()?;
+    ctx.scale().eventually(10.0, "no session listed after the quit", || {
+        crate::brindle::listed_sessions(ctx).is_ok_and(|listed| listed.is_empty())
+    })?;
+    let out = Run::new(ctx, "relaunch").config(&profile).restore().dump_at(4.0).run()?;
+    ensure!(out.dump.agent.is_empty(), "an agent zone came back: {:?}", out.dump.agent);
+    ensure!(!out.dump.tabs.iter().any(|(title, _)| title == "Fake Agent"), "tabs: {:?}", out.dump.tabs);
     Ok(Outcome::Pass)
 }

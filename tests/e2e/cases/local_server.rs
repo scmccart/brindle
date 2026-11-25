@@ -173,12 +173,12 @@ fn alive(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-fn parent(pid: u32) -> Result<Option<u32>> {
+pub(super) fn parent(pid: u32) -> Result<Option<u32>> {
     Ok(stat(pid).and_then(|fields| fields.get(1)?.parse().ok()))
 }
 
 #[cfg(windows)]
-fn parent(pid: u32) -> Result<Option<u32>> {
+pub(super) fn parent(pid: u32) -> Result<Option<u32>> {
     crate::winproc::parent(pid).map_err(|e| format!("listing processes for the parent of {pid}: {e}"))
 }
 
@@ -201,19 +201,19 @@ fn described(pid: u32) -> String {
 
 /// `brindle-remote hold`, as the server starts it.
 #[cfg(unix)]
-fn is_holder(pid: u32) -> bool {
+pub(super) fn is_holder(pid: u32) -> bool {
     cmdline(pid).get(1).is_some_and(|role| role == "hold")
 }
 
 /// `brindle-remote.exe hold …`, as the server starts it.
 #[cfg(windows)]
-fn is_holder(pid: u32) -> bool {
+pub(super) fn is_holder(pid: u32) -> bool {
     crate::winproc::command_line(pid).as_deref().and_then(crate::winproc::first_argument) == Some("hold")
 }
 
 /// Ends `pid` at once: SIGKILL.
 #[cfg(unix)]
-fn kill(pid: u32) -> Result {
+pub(super) fn kill(pid: u32) -> Result {
     let status = std::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status();
     ensure!(status.is_ok_and(|s| s.success()), "kill -KILL {pid} failed");
     Ok(())
@@ -221,7 +221,7 @@ fn kill(pid: u32) -> Result {
 
 /// Ends `pid` at once: `taskkill /F`, which is `TerminateProcess`.
 #[cfg(windows)]
-fn kill(pid: u32) -> Result {
+pub(super) fn kill(pid: u32) -> Result {
     let out = std::process::Command::new("taskkill")
         .args(["/F", "/PID", &pid.to_string()])
         .stdin(std::process::Stdio::null())
