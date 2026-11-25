@@ -506,6 +506,14 @@ impl ZoneContent {
         }
     }
 
+    /// The agent zone's view; `None` for a terminal zone.
+    pub fn agent_view(&self) -> Option<&Entity<AgentView>> {
+        match self {
+            Self::Terminal(_) => None,
+            Self::Agent(view) => Some(view),
+        }
+    }
+
     /// The terminal; `None` for an agent zone.
     pub fn terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
         Some(self.terminal_view()?.read(cx).terminal.clone())

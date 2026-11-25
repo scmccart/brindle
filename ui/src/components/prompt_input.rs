@@ -58,6 +58,22 @@ pub enum PromptStatus {
     Disabled,
 }
 
+/// A [`PromptInput`] stop that can have keyboard focus
+/// ([`PromptInput::focused`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptFocus {
+    /// The text area.
+    Text,
+    /// A waiting text's remove button.
+    Remove,
+    /// A held text's send-again button.
+    SendAgain,
+    /// A held text's discard button.
+    Discard,
+    /// The stop button.
+    Stop,
+}
+
 /// Whether a held text can be sent again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Resend {
@@ -274,6 +290,19 @@ impl PromptInput {
     /// The stop button's handle while it shows (streaming).
     pub fn stop_button(&self) -> Option<FocusHandle> {
         (self.status == PromptStatus::Streaming).then(|| self.stop_handle.clone())
+    }
+
+    /// Which of its stops has keyboard focus, if one of them has it (for an
+    /// owner that reports where focus is).
+    pub fn focused(&self, window: &Window, cx: &App) -> Option<PromptFocus> {
+        let stops = [
+            (self.area.read(cx).focus_handle(cx), PromptFocus::Text),
+            (self.remove_handle.clone(), PromptFocus::Remove),
+            (self.resend_handle.clone(), PromptFocus::SendAgain),
+            (self.discard_handle.clone(), PromptFocus::Discard),
+            (self.stop_handle.clone(), PromptFocus::Stop),
+        ];
+        stops.into_iter().find(|(handle, _)| handle.is_focused(window)).map(|(_, stop)| stop)
     }
 
     fn blank(&self, cx: &App) -> bool {

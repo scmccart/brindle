@@ -4,9 +4,9 @@
 
 use std::path::{Path, PathBuf};
 
-use super::cli::usage_refusal;
+use super::cli::{usage_refusal, usage_refusal_from};
 use super::instance::Launcher;
-use crate::brindle::Run;
+use crate::brindle::{Run, Stdin};
 use crate::{Ctx, Outcome, Result, ensure};
 
 /// What a turn's answer says.
@@ -115,6 +115,90 @@ fn sessions_listed(ctx: &Ctx, count: usize) -> Result {
     })
 }
 
+/// What `--wait-for` waits for until the agent is ready.
+const READY: &str = "state=ready";
+
+/// A turn typed into the prompt input (`--send`, then enter): the prompt
+/// has focus at launch, `--send` types the draft (shown in `--- input`),
+/// enter sends it once the agent is ready, and the reply streamed in three
+/// chunks reads as one agent message; the turn ends `done`, the input is
+/// empty and keeps focus.
+pub fn turn(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let profile = Script::ready(&received)
+        .step("expect session/prompt")
+        .step(says("Hel"))
+        .step(says("lo"))
+        .step(says("!"))
+        .step(r#"respond {"stopReason":"end_turn"}"#)
+        .profile(ctx, "turn")?;
+    let out = Run::new(ctx, "draft").config(&profile).agent("Fake").wait_for(READY).send("hi").dump_at(4.0).run()?;
+    ensure!(out.dump.focus.as_deref() == Some("agent") && out.dump.focus_stop.as_deref() == Some("prompt"), "{:?}", out.dump.focus_stop);
+    ensure!(out.dump.input.as_ref().map(|i| i.text.as_str()) == Some("hi"), "the draft: {:?}", out.dump.input);
+    ensure!(out.dump.agent_entries().is_empty(), "nothing sent yet: {:?}", out.dump.agent);
+
+    let out = Run::new(ctx, "turn")
+        .config(&profile)
+        .agent("Fake")
+        .wait_for(READY)
+        .send("hi")
+        .key("enter")
+        .wait_for(&answered())
+        .dump_at(6.0)
+        .run()?;
+    ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
+    ensure!(out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello!\""], "entries: {:?}", out.dump.agent);
+    ensure!(out.dump.agent_field("turn") == Some("ended:end_turn"), "agent: {:?}", out.dump.agent);
+    ensure!(out.dump.agent_field("status") == Some("done"), "agent: {:?}", out.dump.agent);
+    ensure!(out.dump.input.as_ref().map(|i| i.text.as_str()) == Some(""), "the input emptied: {:?}", out.dump.input);
+    ensure!(out.dump.focus_stop.as_deref() == Some("prompt"), "focus stays in the prompt: {:?}", out.dump.focus_stop);
+    let sent = std::fs::read_to_string(&received).map_err(|e| format!("reading {}: {e}", received.display()))?;
+    ensure!(sent.lines().filter(|l| l.contains("\"session/prompt\"")).count() == 1, "one prompt sent: {sent}");
+    Ok(Outcome::Pass)
+}
+
+/// `brindle agent Fake -p -` reads its first prompt from standard input,
+/// a file or a pipe, one trailing line break dropped, and sends it once
+/// the agent is ready. Over 256 KiB, empty and not UTF-8 are usage errors
+/// (status 2) before any window.
+pub fn prompt_stdin(ctx: &Ctx) -> Result<Outcome> {
+    let (profile, _) = hello_agent(ctx)?;
+    let file = ctx.dir.join("prompt.txt");
+    std::fs::write(&file, "from a file\n").map_err(|e| format!("writing {}: {e}", file.display()))?;
+    for (label, stdin, text) in [
+        ("file", Stdin::File(file.clone()), "from a file"),
+        ("pipe", Stdin::Pipe(b"from a pipe\r\n".to_vec()), "from a pipe"),
+    ] {
+        let out = Run::new(ctx, label)
+            .config(&profile)
+            .agent("Fake")
+            .first_prompt("-")
+            .stdin(stdin)
+            .wait_for(&answered())
+            .dump_at(5.0)
+            .run()?;
+        ensure!(out.dump.wait_timeouts.is_empty(), "{label}: waits that gave up: {:?}", out.dump.wait_timeouts);
+        let user = format!("user {text:?}");
+        ensure!(out.dump.agent_entries() == [user.as_str(), "agent \"Hello!\""], "{label}: entries {:?}", out.dump.agent);
+    }
+
+    let config = ctx.dir.join("config.toml");
+    std::fs::write(&config, crate::brindle::config("e2e") + &profile).map_err(|e| format!("writing the config: {e}"))?;
+    let refusals: [(&str, Vec<u8>, &str); 3] = [
+        ("long", vec![b'a'; 256 * 1024 + 1], "the prompt is over the 256 KiB limit"),
+        ("empty", Vec::new(), "the prompt is blank"),
+        ("not-utf8", b"\xff\xfe hi".to_vec(), "the prompt isn't UTF-8"),
+    ];
+    for (label, bytes, says) in refusals {
+        let path = ctx.dir.join(format!("{label}.txt"));
+        std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        let stdin = std::fs::File::open(&path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+        let said = usage_refusal_from(ctx, label, &config, &["agent", "Fake", "-p", "-"], stdin.into())?;
+        ensure!(said.contains(says), "{label}: brindle agent -p - said {said:?}, not {says:?}");
+    }
+    Ok(Outcome::Pass)
+}
+
 /// Closing a working agent asks first (design.md decision 12): Close
 /// Zone opens the confirmation naming the working agent, Cancel focused,
 /// with the turn going on; enter and escape cancel, leaving the zone and
@@ -142,6 +226,12 @@ pub fn close_confirm(ctx: &Ctx) -> Result<Outcome> {
         ensure!(out.dump.confirm.is_none(), "{key} closed the confirmation: {:?}", out.dump.confirm);
         ensure!(out.dump.tabs.len() == 1, "{key}: the tab stays: {:?}", out.dump.tabs);
         ensure!(out.dump.agent_field("turn") == Some("working"), "{key}: the turn goes on: {:?}", out.dump.agent);
+        ensure!(
+            out.dump.focus.as_deref() == Some("agent") && out.dump.focus_stop.as_deref() == Some("prompt"),
+            "{key}: focus back in the prompt input: {:?} {:?}",
+            out.dump.focus,
+            out.dump.focus_stop
+        );
     }
 
     // A tab of two agent zones, the first working and the second idle, and

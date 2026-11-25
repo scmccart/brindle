@@ -83,6 +83,17 @@ pub fn usage_errors(ctx: &Ctx) -> Result<Outcome> {
 /// as a broken config's, may come before it) once it has exited with
 /// status 2, as a usage error does; its stderr is kept in `<label>.log`.
 pub fn usage_refusal(ctx: &Ctx, label: &str, config: &std::path::Path, args: &[&str]) -> Result<String> {
+    usage_refusal_from(ctx, label, config, args, Stdio::null())
+}
+
+/// [`usage_refusal`] with `stdin` as Brindle's standard input (`-p -`).
+pub fn usage_refusal_from(
+    ctx: &Ctx,
+    label: &str,
+    config: &std::path::Path,
+    args: &[&str],
+    stdin: Stdio,
+) -> Result<String> {
     let stderr = ctx.dir.join(format!("{label}.log"));
     let log = std::fs::File::create(&stderr).map_err(|e| format!("creating {}: {e}", stderr.display()))?;
     let mut command = Command::new(&ctx.bin);
@@ -94,7 +105,7 @@ pub fn usage_refusal(ctx: &Ctx, label: &str, config: &std::path::Path, args: &[&
     command.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
     let mut child = command
         .args(args)
-        .stdin(Stdio::null())
+        .stdin(stdin)
         .stdout(Stdio::null())
         .stderr(log)
         .spawn()

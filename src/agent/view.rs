@@ -24,7 +24,7 @@ use gpui::{
 use brindle_ui::{
     Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
     ConfirmationState, FocusScope, FocusStops, Icon, ItemKey, Message, MessageFrom, MessageScroller, PageDirection,
-    PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning, Resend as UiResend, TextAreaEvent, Tool,
+    PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning, Resend as UiResend, TextAreaEvent, Tool,
     ToolStatus as UiToolStatus, TooltipFor as _,
 };
 
@@ -186,9 +186,30 @@ impl AgentView {
         &self.agent
     }
 
-    #[allow(dead_code, reason = "agents-profiles task 6.7 types `--send` into the prompt")]
     pub fn prompt(&self) -> &Entity<PromptInput> {
         &self.prompt
+    }
+
+    /// The zone's stop with keyboard focus, for the dump's focus line
+    /// (`agent stop=…`): `prompt`, `queued:remove`, `queued:send-again`,
+    /// `queued:discard`, `permission:<entry>:<option>` or `stop`.
+    pub fn focused_stop(&self, window: &Window, cx: &App) -> Option<String> {
+        if let Some(stop) = self.prompt.read(cx).focused(window, cx) {
+            return Some(
+                match stop {
+                    PromptFocus::Text => "prompt",
+                    PromptFocus::Remove => "queued:remove",
+                    PromptFocus::SendAgain => "queued:send-again",
+                    PromptFocus::Discard => "queued:discard",
+                    PromptFocus::Stop => "stop",
+                }
+                .to_string(),
+            );
+        }
+        self.permissions
+            .iter()
+            .find(|(_, handle)| handle.is_focused(window))
+            .map(|((entry, option), _)| format!("permission:{}:{option}", entry.0))
     }
 
     pub fn scroller(&self) -> &Entity<MessageScroller> {
@@ -283,7 +304,7 @@ impl AgentView {
 
     /// The focus handle of permission request `entry`'s button `option`,
     /// while it is pending.
-    #[cfg_attr(not(test), allow(dead_code, reason = "agents-profiles task 6.7's focus line names the permission stops"))]
+    #[cfg(test)]
     pub fn permission_handle(&self, entry: EntryId, option: &str) -> Option<&FocusHandle> {
         self.permissions.iter().find(|((own, id), _)| *own == entry && id == option).map(|(_, handle)| handle)
     }

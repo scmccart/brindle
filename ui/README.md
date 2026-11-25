@@ -336,7 +336,8 @@ rule, not a convenience.
     `Resend::Unavailable` reason as the tooltip) and `x` (discard) for
     `Queued::Held`. Its focus stops for the owner's scope: the text area
     (`Focusable`), the row's enabled buttons (`row_stops()`), and the stop
-    button while streaming (`stop_button()`).
+    button while streaming (`stop_button()`); `focused(window, cx)` says
+    which of them has focus (`PromptFocus`), for an owner that reports it.
   - `Reasoning`: a trigger (lucide `brain`, the owner's label, a chevron
     turned over while open) over muted content; the owner holds `open` and
     flips it from `on_toggle`.

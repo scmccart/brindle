@@ -157,6 +157,38 @@ fn tab_walks_the_prompt_the_row_the_permissions_and_stop() {
     assert_eq!(f.tabs(3), [row[0].clone(), row[1].clone(), prompt]);
 }
 
+/// The focus line names each stop (task 6.7): the prompt, the waiting
+/// row's remove, the permission's buttons by entry and option, stop; then
+/// a held row's send again and discard.
+#[test]
+fn the_focus_line_names_each_stop() {
+    let mut f = Fixture::new();
+    f.feed(&[ready(), added(1, user("hi")), working(), slot(waiting()), added(2, permission())]);
+    let mut names = Vec::new();
+    for _ in 0..5 {
+        let view = f.view.clone();
+        names.push(f.cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).unwrap_or_default());
+        f.cx.simulate_keystrokes("tab");
+    }
+    assert_eq!(names, ["prompt", "queued:remove", "permission:2:allow-once", "permission:2:reject-once", "stop"]);
+    f.focus_prompt();
+    f.feed(&[
+        Event::Answered {
+            id: EntryId(2),
+            outcome: crate::agent::transcript::PermissionOutcome::Selected { option: "allow-once".into() },
+        },
+        ended(StopReason::Cancelled),
+        slot(held()),
+    ]);
+    let mut names = Vec::new();
+    for _ in 0..3 {
+        f.cx.simulate_keystrokes("tab");
+        let view = f.view.clone();
+        names.push(f.cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).unwrap_or_default());
+    }
+    assert_eq!(names, ["queued:send-again", "queued:discard", "prompt"]);
+}
+
 /// Enter during a turn with the slot empty sends (the server queues it);
 /// with the slot taken it keeps the text with the reason.
 #[test]

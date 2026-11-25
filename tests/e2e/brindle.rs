@@ -200,6 +200,16 @@ pub struct Run<'a> {
     /// The run opens `brindle agent PROFILE` rather than `brindle
     /// terminal PROFILE` ([`Run::agent`]).
     agent: bool,
+    /// Brindle's standard input ([`Run::stdin`]), else the harness's.
+    stdin: Option<Stdin>,
+}
+
+/// What a run gives Brindle as its standard input ([`Run::stdin`]).
+pub enum Stdin {
+    /// A file, opened for reading.
+    File(std::path::PathBuf),
+    /// A pipe the harness writes these bytes into, then closes.
+    Pipe(Vec<u8>),
 }
 
 /// The case server's sessions as `brindle-remote list` prints them
@@ -316,6 +326,7 @@ impl<'a> Run<'a> {
             interval: None,
             no_state_dir: false,
             agent: false,
+            stdin: None,
         }
     }
 
@@ -331,6 +342,13 @@ impl<'a> Run<'a> {
     /// [`Run::agent`]. Not `prompt`: that name waits for a shell's prompt.
     pub fn first_prompt(mut self, text: &str) -> Self {
         self.args.extend(["-p".to_string(), text.to_string()]);
+        self
+    }
+
+    /// Gives Brindle `stdin` as its standard input (for `-p -`), in place
+    /// of the harness's own.
+    pub fn stdin(mut self, stdin: Stdin) -> Self {
+        self.stdin = Some(stdin);
         self
     }
 
@@ -643,6 +661,16 @@ impl<'a> Run<'a> {
         if self.no_state_dir {
             command.env_remove("BRINDLE_STATE_DIR").env_remove("HOME").env_remove("XDG_STATE_HOME").current_dir(&ctx.dir);
         }
+        match &self.stdin {
+            Some(Stdin::File(path)) => {
+                let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+                command.stdin(file);
+            }
+            Some(Stdin::Pipe(_)) => {
+                command.stdin(Stdio::piped());
+            }
+            None => {}
+        }
         let mut child = command
             .args(&self.args)
             .args(&self.steps)
@@ -660,6 +688,11 @@ impl<'a> Run<'a> {
             .spawn()
             .map(Reaped)
             .map_err(|e| format!("starting {}: {e}", ctx.bin.display()))?;
+        if let (Some(Stdin::Pipe(bytes)), Some(mut pipe)) = (&self.stdin, child.stdin.take()) {
+            // Brindle reads it before it opens a window; the pipe closes
+            // when `pipe` drops.
+            std::io::Write::write_all(&mut pipe, bytes).map_err(|e| format!("writing Brindle's stdin: {e}"))?;
+        }
         let started = Instant::now();
         // Captures count from the window's first appearance, as Brindle's
         // steps and dump do; the rest of the timeline counts from the spawn.
@@ -902,8 +935,8 @@ fn parse_input(rest: &str) -> Option<Input> {
     let (text, fields) = rest.strip_prefix("text=")?.rsplit_once(" cursor=")?;
     let (cursor, selection) = fields.split_once(" selection=")?;
     let (start, end) = selection.split_once("..")?;
-    // The text is Rust-debug quoted; tests use plain ASCII without escapes.
-    let text = text.strip_prefix('"')?.strip_suffix('"')?.replace("\\\"", "\"");
+    // The text is Rust-debug quoted (an agent's prompt can hold line breaks).
+    let text = unquote(text)?;
     Some(Input { text, cursor: cursor.parse().ok()?, selection: (start.parse().ok()?, end.parse().ok()?) })
 }
 

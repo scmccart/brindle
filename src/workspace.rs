@@ -413,6 +413,23 @@ impl Overlay {
     }
 }
 
+/// The text input `--send` types into and the dump's `--- input` line
+/// describes: a one-line input (a palette's, the settings dialog's, the
+/// find bar's) or an agent zone's prompt, a text area.
+enum FocusedInput {
+    Line(Entity<TextInput>),
+    Area(Entity<brindle_ui::TextArea>),
+}
+
+impl FocusedInput {
+    fn describe(&self, cx: &App) -> String {
+        match self {
+            Self::Line(input) => input.read(cx).describe(),
+            Self::Area(area) => area.read(cx).describe(),
+        }
+    }
+}
+
 /// What a context menu was opened on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MenuFor {
@@ -2429,27 +2446,48 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The text input that has keyboard focus, if any: the overlay's, or
-    /// the find bar's in the active terminal.
-    fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
+    /// The text input that has keyboard focus, if any: the overlay's, the
+    /// find bar's in the active terminal, or the active agent zone's
+    /// prompt.
+    fn focused_input(&self, window: &Window, cx: &App) -> Option<FocusedInput> {
         if let Some(palette) = self.palette.view() {
             let input = palette.read(cx).input(cx);
-            return input.read(cx).is_focused(window).then_some(input);
+            return input.read(cx).is_focused(window).then_some(FocusedInput::Line(input));
         }
         if self.settings.is_open() {
-            return self.settings.view()?.read(cx).focused_input(window, cx);
+            return self.settings.view()?.read(cx).focused_input(window, cx).map(FocusedInput::Line);
+        }
+        if let Some(area) = self.active_prompt_area(cx) {
+            return area.read(cx).is_focused(window).then_some(FocusedInput::Area(area));
         }
         let input = self.active_tab()?.active_view(cx)?.read(cx).find_input()?;
-        input.read(cx).is_focused(window).then_some(input)
+        input.read(cx).is_focused(window).then_some(FocusedInput::Line(input))
+    }
+
+    /// The active agent zone's prompt input's text area.
+    fn active_prompt_area(&self, cx: &App) -> Option<Entity<brindle_ui::TextArea>> {
+        let zones = self.active_tab()?.zones.read(cx);
+        let view = zones.active_content()?.agent_view()?;
+        Some(view.read(cx).prompt().read(cx).area().clone())
     }
 
     /// Debug hook for `--send`: types into the focused text input, or else
-    /// the active tab.
+    /// the active tab: its terminal, or its agent zone's prompt input.
     pub fn send_to_active(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(input) = self.focused_input(window, cx) {
-            let text: String = String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect();
-            input.update(cx, |input, cx| input.insert(&text, cx));
-            return;
+        let text = String::from_utf8_lossy(bytes);
+        let input = self.focused_input(window, cx).or_else(|| self.active_prompt_area(cx).map(FocusedInput::Area));
+        match input {
+            Some(FocusedInput::Line(input)) => {
+                let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                input.update(cx, |input, cx| input.insert(&text, cx));
+                return;
+            }
+            // A text area keeps line breaks and tabs, as a paste does.
+            Some(FocusedInput::Area(area)) => {
+                area.update(cx, |area, cx| area.insert(&text, cx));
+                return;
+            }
+            None => {}
         }
         if let Some(terminal) = self.active_tab().and_then(|t| t.active_terminal(cx)) {
             let bytes = bytes.to_vec();
@@ -2568,23 +2606,32 @@ impl Workspace {
             out.push_str(&format!("--- confirm close target={target} busy={}\n", describe_busy(busy)));
         }
         if let Some(input) = self.focused_input(window, cx) {
-            out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
+            out.push_str(&format!("--- input {}\n", input.describe(cx)));
         }
         out.push_str(&format!("--- focus {}\n", self.describe_focus(window, cx)));
         out
     }
 
     /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
-    /// active tab's active terminal), `palette` (inside an open palette),
-    /// `settings stop=NAME` (inside the settings dialog, on the control
+    /// active tab's active terminal), `agent stop=STOP` (on one of the
+    /// active agent zone's stops: `prompt`, `queued:remove`,
+    /// `queued:send-again`, `queued:discard`, `permission:ENTRY:OPTION`,
+    /// `stop`), `palette` (inside an open palette), `confirm stop=cancel|close`
+    /// (the close confirmation), `settings stop=NAME` (inside the settings dialog, on the control
     /// `NAME`), `tabs` (the tab strip, on the active tab), `menu` (an open
     /// menu: the profile menu, or a tab or zone menu), `none`, or
     /// `other`; then the window's `modality=keyboard|pointer`, which
     /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
         let terminal = self.active_tab().and_then(|t| t.active_view(cx));
+        let agent_stop = self.active_tab().and_then(|t| {
+            let zones = t.zones.read(cx);
+            zones.active_content()?.agent_view()?.read(cx).focused_stop(window, cx)
+        });
         let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
             "terminal".to_string()
+        } else if let Some(stop) = agent_stop {
+            format!("agent stop={stop}")
         } else if self.palette.view().is_some_and(|p| p.read(cx).focus_handle(cx).contains_focused(window, cx)) {
             "palette".to_string()
         } else if let Some(dialog) =
