@@ -112,7 +112,13 @@ Request::Prompt { session, parts: &[PromptPart] }
 
 ### 7. Where attachments come from
 
-**Terminal text** (`src/terminal_view.rs`, `src/workspace.rs`):
+**Terminal text** (`src/terminal_view.rs`, `src/workspace.rs`). The term means exactly two things, each the text its copy command would put on the clipboard, with lines joined by `\n` on every platform:
+- **the selection:** what Copy copies (`terminal-emulation`, "Selection and copy" and "Clipboard shared with other applications"): the selected cells' characters, a line the program wrapped as one line, no trailing blanks, no colours or other attributes;
+- **the last command's output:** what Copy Last Command Output copies (`shell-integration`, "Last command output"): the grid's text from the most recent command's output mark to its end mark, or to the next prompt or the cursor while it still runs; not the prompt, and not the command line, which becomes the attachment's name. It exists only with shell integration loaded, and not when the output is empty or has left the scrollback.
+
+Both are what the grid shows, not the bytes the program wrote: no escape sequences, and a progress bar as its last state. Nothing else is terminal text here: not the whole scrollback, the visible screen, an earlier command's output, or a full-screen program's screen other than through a selection.
+
+The two actions:
 - `send_selection_to_agent` ("Send Selection to Agent"): the selection's text, named `selection from TAB TITLE`. Listed and enabled only with a selection.
 - `send_last_output_to_agent` ("Send Last Command Output to Agent"): the text Copy Last Command Output would take, named by the command line (`cargo test`) when the shell reported one, else `output from TAB TITLE`. Listed only once the terminal has a prompt mark, as the output commands are.
 - **Which agent zone:** `target_plan(agent_zones) -> Target::{ None, One(zone), Ask(Vec<zone>) }`. `None` shows "no agent zone is open" on the notice line. `Ask` opens a palette of the window's agent zones, the most recently focused first, each as its tab's and zone's titles. Then the attachment joins that zone's draft (or its refusal shows), its tab becomes active and its prompt input takes focus. Nothing is sent.

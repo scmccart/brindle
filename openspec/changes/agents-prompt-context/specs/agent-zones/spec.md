@@ -78,6 +78,25 @@ In a terminal zone, the `send_selection_to_agent` action SHALL attach the select
 - **WHEN** the user selects two lines in a terminal and runs Send Selection to Agent
 - **THEN** the agent zone's prompt input has a text attachment holding those two lines
 
+### Requirement: What text a terminal sends
+The text sent from a terminal SHALL be the text the matching copy command would copy: for the selection, what Copy copies, and for the last command's output, what Copy Last Command Output copies, with lines joined by a line feed on every platform. It SHALL hold no escape sequences, colours or trailing blanks, a wrapped line SHALL be one line, and the output SHALL NOT include the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached and the terminal SHALL keep focus.
+
+#### Scenario: The same text as copying
+- **WHEN** the user ran `printf 'one\ntwo\n'` and runs Send Last Command Output to Agent
+- **THEN** the attachment's text is `one` and `two` on two lines, the same text Copy Last Command Output copies, without the prompt line
+
+#### Scenario: Colours are not sent
+- **WHEN** the selected lines were printed in red
+- **THEN** the attachment holds their characters and no escape sequence
+
+#### Scenario: A wrapped line
+- **WHEN** the selection covers one long line the terminal wrapped over two rows
+- **THEN** the attachment holds it as one line
+
+#### Scenario: Output that has scrolled away
+- **WHEN** the last command's output has left the scrollback and the user runs Send Last Command Output to Agent
+- **THEN** nothing is attached, and the terminal keeps focus
+
 ### Requirement: When the terminal's agent commands are listed
 The command palette SHALL list Send Selection to Agent only while the terminal has a selection, and Send Last Command Output to Agent only once the terminal has received a prompt mark, as Copy Last Command Output is. Neither SHALL be listed in an agent zone.
 
