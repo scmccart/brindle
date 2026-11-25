@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Slash command completion
-When the prompt input's text starts with `/` and the cursor is in its first word, an agent zone SHALL list above the input the agent's commands that match the word typed after `/`, each with its input hint and description, commands whose names start with the word first. The list SHALL follow the text as the user types, and SHALL NOT show when no command matches or the agent offers none.
+When the prompt input's text starts with `/` and the cursor is in its first word, an agent zone SHALL list above the input the commands that match the word typed after `/`: the agent's commands and Brindle's option commands, each with its input hint and description, commands whose names start with the word first. The list SHALL follow the text as the user types, and SHALL NOT show when no command matches.
 
 #### Scenario: Typing a slash
 - **WHEN** the agent offers `compact`, `context` and `review`, and the user types `/`
@@ -15,7 +15,7 @@ When the prompt input's text starts with `/` and the cursor is in its first word
 - **WHEN** the user types `/zzz`
 - **THEN** no list shows
 
-#### Scenario: Past the first word
+#### Scenario: Past the first word of an agent's command
 - **WHEN** the user types `/compact keep the plan`
 - **THEN** no list shows
 
@@ -24,7 +24,7 @@ When the prompt input's text starts with `/` and the cursor is in its first word
 - **THEN** no list shows
 
 ### Requirement: Choosing a slash command
-While the command list shows, up and down SHALL move its highlight, enter and tab SHALL replace the typed word with the highlighted command's name followed by a space, and escape SHALL close the list until the text stops being a command word; none of these SHALL send the prompt, move keyboard focus or stop a turn. A press on a row SHALL choose that command. A chosen command SHALL be sent only when the user sends the prompt, as text.
+While the command list shows, up and down SHALL move its highlight, enter and tab SHALL replace the typed word with the highlighted command's name followed by a space, and escape SHALL close the list until the text stops being a command word; none of these SHALL send the prompt, move keyboard focus or stop a turn. A press on a row SHALL choose that command. A chosen command of the agent's SHALL be sent only when the user sends the prompt, as text.
 
 #### Scenario: Enter takes the command
 - **WHEN** the list shows `compact` highlighted and the user presses enter
@@ -41,6 +41,62 @@ While the command list shows, up and down SHALL move its highlight, enter and ta
 #### Scenario: Without a list, keys are as before
 - **WHEN** no list shows and the user presses tab
 - **THEN** focus moves to the zone's next stop
+
+### Requirement: Option commands
+An agent zone SHALL offer one slash command of Brindle's own for each session option, named from the option's name in lower case with each run of other characters as one `-` (`/mode`, `/model`, `/thinking-level`, `/fast-mode`). When the agent offers a command of the same name, the agent's SHALL be the one offered.
+
+#### Scenario: Listed with the agent's commands
+- **WHEN** the agent offers the command `compact` and options named `Mode` and `Model`, and the user types `/mo`
+- **THEN** the list shows `/mode` and `/model`, each described by its option's current value
+
+#### Scenario: The agent has its own
+- **WHEN** the agent offers a command named `model` and an option named `Model`
+- **THEN** `/model` in the list is the agent's command, and sending `/model x` sends that text to the agent
+
+### Requirement: Option commands stay in Brindle
+A prompt that is an option command SHALL be carried out by Brindle, and SHALL NOT be sent to the agent, queued or added to the conversation as a user message. Text that doesn't start with `/`, and text of more than one line, SHALL always be sent as it is.
+
+#### Scenario: Not a user message
+- **WHEN** the user sends `/mode plan` and the agent confirms the plan mode
+- **THEN** the agent received a request to set the mode and no prompt, and the conversation has no user message `/mode plan`
+
+#### Scenario: A leading space
+- **WHEN** the user sends ` /mode plan`, with a space before the slash
+- **THEN** the agent receives that text as a prompt
+
+### Requirement: Setting an option with its command
+After an option command and a space, the list SHALL show that option's choices that match the rest of the line, by name or value, without regard to case, all of them when nothing follows, with the current choice highlighted first. Enter SHALL ask the server to set the highlighted choice and empty the prompt input. An option command SHALL be carried out while a turn is running.
+
+#### Scenario: Set the model by typing
+- **WHEN** the model option's choices are `Opus` and `Sonnet`, and the user types `/model so` and presses enter
+- **THEN** the agent is asked for `Sonnet`, the prompt input is empty, and the conversation has no user message for it
+
+#### Scenario: All the choices
+- **WHEN** the user types `/mode ` with a space
+- **THEN** the list shows every choice of the mode option, the current one marked
+
+#### Scenario: A choice with a space in its name
+- **WHEN** the mode option has a choice named `Accept edits` and the user types `/mode accept e` and presses enter
+- **THEN** the agent is asked for `Accept edits`
+
+#### Scenario: During a turn
+- **WHEN** a turn is running and the user sends `/mode plan`
+- **THEN** the agent is asked for the plan mode at once, and nothing is queued
+
+### Requirement: Option commands that name no choice
+Text after an option command that matches none of its choices SHALL NOT be sent anywhere: the prompt input SHALL keep it and say the option has no such choice. An on/off option's command SHALL accept `on` and `off`, and SHALL flip the option when sent alone.
+
+#### Scenario: No such choice
+- **WHEN** the user types `/model gpt` and presses enter, and no choice matches
+- **THEN** nothing is sent, the text stays, and the prompt input says the model has no choice `gpt`
+
+#### Scenario: A toggle set by word
+- **WHEN** the session has an on/off option `Fast mode` that is off, and the user sends `/fast-mode on`
+- **THEN** the agent is asked to turn it on
+
+#### Scenario: A toggle flipped
+- **WHEN** `Fast mode` is on and the user sends `/fast-mode` alone
+- **THEN** the agent is asked to turn it off
 
 ### Requirement: Session options under the prompt input
 An agent zone SHALL show its session's options under the prompt input as their current values: for an option with choices the current choice's name, for an on/off option its name and `on` or `off`, in the order mode, model, thinking level, model configuration, then the agent's others. It SHALL follow the session's options as they change, and SHALL show nothing when the session has none. The items SHALL NOT be keyboard stops.

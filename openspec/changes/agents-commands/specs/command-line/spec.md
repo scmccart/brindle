@@ -16,11 +16,19 @@ In an agent zone's dump, after the `--- agent` line, the dump SHALL print a `---
 - **THEN** the later steps run once the option has changed
 
 ### Requirement: The command list in the dump
-While the slash command list shows, the dump SHALL print after the `--- prompt` line a `--- completion` line with the typed word and the highlighted row's index, then one row per listed command as palette rows are printed. `--key` SHALL drive the list as real keys do.
+While the slash command list shows, the dump SHALL print after the `--- prompt` line a `--- completion` line with the typed word and the highlighted row's index, and the option command when the list shows an option's choices, then one row per listed command or choice as palette rows are printed. `--key` SHALL drive the list as real keys do.
 
 #### Scenario: The list in the dump
 - **WHEN** the fake ACP agent offers `compact` and `context`, and Brindle runs `--send '/co' --dump-screen-after 2`
 - **THEN** the dump has `--- completion query="co" highlighted=0` followed by a row for `/compact` and a row for `/context`
+
+#### Scenario: An option's choices in the dump
+- **WHEN** the fake ACP agent offers a model option with choices `Opus` and `Sonnet`, and Brindle runs `--send '/model so' --dump-screen-after 2`
+- **THEN** the dump has `--- completion command="model" query="so" highlighted=0` followed by a row for `Sonnet`
+
+#### Scenario: An option set by its command
+- **WHEN** Brindle then runs `--key enter --wait-for 'current="sonnet"'` and the fake agent confirms
+- **THEN** the dump's model option line has `current="sonnet"`, and no user entry holds `/model`
 
 #### Scenario: Accepted with a key
 - **WHEN** Brindle runs `--send '/co' --key down --key enter --dump-screen-after 2`

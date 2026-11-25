@@ -121,7 +121,11 @@ When an option of category `Mode` gets a different current value, the reducer ad
 ### 6. The chat model (`src/agent/model.rs`, GPUI-free; `fcis R1`, `R5`)
 
 - **Completion.** `completion(text, cursor, commands) -> Option<Completion>`: `Some` when the text starts with `/`, the cursor is inside the first word, and at least one command matches the word after `/` with `ui`'s `fuzzy_match`; names that start with the word come first, then the rest in the agent's order. `Completion { range, items, highlighted }`; `accept(completion) -> (String, usize)` replaces the range with `/NAME ` and gives the new cursor. The model keeps `dismissed: bool`, set by escape and cleared when the text stops being a command word, so a dismissed list doesn't come back on the next key.
-- **Keys while the list shows** (`completion_key(key) -> CompletionAction`, pure): up and down move the highlight, wrapping; enter and tab accept; escape dismisses. They are taken before the prompt input's own handling, so enter doesn't send and tab doesn't move focus. With no list, every key does what it did.
+- **Option commands** (the user's condition for the labels, 2026-11-25: options must be changeable by slash command too). `option_commands(options, agent_commands) -> Vec<OptionCommand>` gives one command of Brindle's own per option: its name is the option's name in lower case with each run of characters other than ASCII letters and digits as one `-`, trimmed (`mode`, `model`, `reasoning-effort`, `fast-mode`); an empty name is skipped, a second option with the same name gets `-2`, and a name the agent's own commands hold is dropped, so the agent's command is the one offered. Its description is the option's name and current value, its hint `<choice>` or `on|off`. They are listed with the agent's commands, after them.
+- **The second stage.** When the text is an option command, a space and anything after it on one line, `completion` returns that option's choices matching the rest of the line (by name or value, case-insensitive, fuzzy with prefix matches first), with the highlight starting on the current choice when nothing is typed. A toggle offers `on` and `off`.
+- **`local_command(text, options, agent_commands) -> Option<Local>`** (pure) decides what a submit does before anything is sent: `None` (send the text as a prompt), `Set { id, value }`, `Choose { id }` (an option command alone: show its choices; a toggle alone flips), or `NoSuchChoice { option, text }`. Only single-line text that starts with `/` and names an option command is local. `Set` clears the input and sends `AGENT_SET_OPTION`, during a turn too, and never touches the queue; `NoSuchChoice` keeps the text and shows its reason beside the input, where a refused prompt's reason shows. A local command is never a user message: only the server's mode notice records it.
+- **What stays text:** a first prompt from `brindle agent -p` and a queued or held prompt are sent as they are, option command or not; text with anything before the `/`, a space included, is sent as it is.
+- **Keys while the list shows** (`completion_key(key) -> CompletionAction`, pure): up and down move the highlight, wrapping; enter and tab accept (a command's name in the first stage; in the second, tab writes the choice's name into the text and enter sets it); escape dismisses. They are taken before the prompt input's own handling, so enter doesn't send and tab doesn't move focus. With no list, every key does what it did.
 - **Option items.** `option_items(options) -> Vec<OptionItem>`: the options in the order mode, model, thinking level, model config, then others in the agent's order, each `{ id, label }` where the label is the current choice's name, or the option's name followed by `on` or `off`.
 - **`next_mode(options) -> Option<(String, OptionValue)>`:** the first option of category `Mode` that is a `Select`, and the choice after its current one, wrapping; `None` with no such option or fewer than two choices.
 - **The options palette's rows:** one row per option ("Model: opus", its description as the detail); choosing a `Select` shows its choices (grouped under their group names, the current one marked), choosing a `Toggle` flips it.
@@ -144,6 +148,8 @@ When an option of category `Mode` gets a different current value, the reducer ad
 /compact  <optional custom summarization instructions>  Free up context by summarizing the conversation so far
 /context    Show current context usage
 ```
+
+In the second stage the line names the option command, and the rows are its choices: `--- completion command="model" query="so" highlighted=0`, then `Sonnet  …`.
 
 - `--- commands` and the `--- option` lines come after the `--- agent` line, whenever the lists aren't empty. `--- completion` and its rows (as palette rows print) come after the `--- prompt` line while the list shows.
 - `wait_text` holds them, so `--wait-for 'current="plan"'` works. `--key` drives the list (`down`, `enter`, `tab`, `escape`), and `--action agent_options`, `agent_next_mode` and the palette's own actions drive the options.
@@ -172,7 +178,10 @@ Commands, options and their keys are in the session's checkpoint. A core restart
 
 Each has a recommendation, which the text above follows. They are the user's to settle before implementation.
 
-1. **Where options show:** their current values as small pointer buttons under the prompt input, with palette actions for the keyboard (recommended), or keyboard-focusable selectors in the prompt input's toolbar.
+Decided on 2026-11-25: options show as small labels under the prompt input, with palette actions, on the user's condition that slash commands change them too, which the option commands of decision 6 do.
+
+Still open:
+
 2. **A notice in the conversation for every mode change** (recommended), or none.
 3. **Starting values per profile** (for example always start one agent in its plan mode): left out of this change (recommended, as a follow-up), or included.
 4. **Completion matching:** fuzzy, with names that start with the typed word first (recommended), or prefix only.
@@ -182,6 +191,8 @@ Each has a recommendation, which the text above follows. They are the user's to 
 
 - Options changed through pointer buttons and palette actions only → no tab stop is added, at the cost of one more step for a keyboard user than a focusable selector would take.
 - A set shows no change until the agent answers → the value on screen is never a guess; a slow agent makes the control feel slow.
+- An option command is named from what the agent calls the option, so the same setting is `/effort` with one agent and `/reasoning-effort` with another → the list shows the names as the user types `/`, and the labels under the input use the same words.
+- An agent's own command hides Brindle's option command of the same name → the label and the palette still set that option.
 - Fuzzy matching can list a command the user didn't mean → prefix matches come first, and enter takes only the highlighted one.
 - `OptionKey::Modes` puts a v1 idea in the version-free forms → it is opaque outside `acp/v1/`, and the architecture test says so.
 

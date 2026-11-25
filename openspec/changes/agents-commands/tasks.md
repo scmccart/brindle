@@ -30,6 +30,7 @@ Before starting, check that the changes this one builds on are implemented and a
 
 - [ ] 4.1 Extend `src/agent/shared.rs` and `transcript.rs` for the two events; add the client's `set_option` request with the protocol gate naming the endpoint; verify with unit tests folding each event, a replay holding both lists, and the gate.
 - [ ] 4.2 Add to `src/agent/model.rs` the pure `completion`, `accept`, `completion_key` and the `dismissed` flag; verify with unit tests for: `/` alone, a prefix, a fuzzy match ordered after prefix matches, no match, the cursor past the first word, a slash later in the text, a second line starting with `/`, each key's action, wrapping, dismissal lasting until the text stops being a command word, and IME composition leaving the list alone.
+- [ ] 4.2a Add `option_commands`, the second stage of `completion` and `local_command` (design decision 6); verify with unit tests for: each naming rule (case, runs of other characters, an empty name, two options with one name, a name the agent's commands hold), choices matched by name and by value without regard to case, a choice with a space in its name, the highlight starting on the current choice, a toggle's `on`, `off` and bare form, `NoSuchChoice`, multi-line text and text with a leading space staying a prompt, and a bare option command giving `Choose`.
 - [ ] 4.3 Add `option_items`, `next_mode` and the options palette's rows; verify with unit tests for the order, a current value not among the choices, a toggle's label, grouped choices, `next_mode` wrapping and its `None` cases.
 - [ ] 4.4 Extend the dump (`describe`, `wait_text`) with the `--- commands`, `--- option` and `--- completion` lines; verify with unit tests for each form and escaping.
 
@@ -41,12 +42,14 @@ Before starting, check that the changes this one builds on are implemented and a
 ## 6. The zone
 
 - [ ] 6.1 Wire completion in `src/agent/view.rs`: recompute on every text or cursor change, take the list's keys before the prompt input's own, accept on a row press; verify in the e2e case of 7.1.
+- [ ] 6.1a Run `local_command` on every submit before the prompt is sent: send the set and clear the input, open the choices, or keep the text with the reason beside it; a first prompt from `-p` and the queue's prompts skip it; verify in the e2e case of 7.1a.
 - [ ] 6.2 Show the footer from `option_items`; a press opens the option's choices in the zone's palette or flips a toggle; send the set, and show a refusal on the notice line.
 - [ ] 6.3 Add `agent_options` ("Agent Options…") and `agent_next_mode` ("Next Agent Mode") to `ACTIONS` with no default keys, handled only by `AgentView` and listed only when the session has options (a mode option with two or more choices for the second); verify with unit tests for the palette's listing in an agent zone with and without options and in a terminal zone.
 
 ## 7. End-to-end cases (fake ACP agent)
 
 - [ ] 7.1 `agent-command-completion`: the list on `/`, narrowing, down and enter taking a command, escape closing it without stopping the turn, enter then sending `/name` as a prompt, and tab moving focus when no list shows.
+- [ ] 7.1a `agent-option-command`: `/mo` lists `/mode` and `/model`; `/model so` and enter sets the model with no user entry and an empty input; `/mode ` lists every choice with the current one highlighted; `/model gpt` keeps the text with its reason; `/mode plan` during a turn sets at once and queues nothing; an agent command named like an option is sent to the agent; ` /mode plan` is sent as a prompt.
 - [ ] 7.2 `agent-option-set`: the options in the dump, `agent_options` choosing a model, the value changing only after the agent's answer (behind a `Gate`), and the footer following an update the agent sends on its own.
 - [ ] 7.3 `agent-option-modes`: an agent with modes only shows one mode option; `agent_next_mode` steps and wraps it; the conversation gets its `Mode:` notices.
 - [ ] 7.4 `agent-option-refused`: a second set while one is unanswered shows the notice line's reason; the agent's error shows as a notice in the conversation.
