@@ -1434,7 +1434,16 @@ impl Connection {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let AgentSpawnRequest { command, args, cwd, env, profile } = request;
         let started = self.ask("start the agent session", abandon, None, |req, reply| {
-            let spawn = SpawnAgent { req, command, args, cwd, env, policy: Policy::Detach, profile: Some(profile) };
+            let spawn = SpawnAgent {
+                req,
+                command,
+                args,
+                cwd,
+                env,
+                policy: Policy::Detach,
+                profile: Some(profile),
+                conversation: None,
+            };
             (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;
         let Started { session, pid, key } = started;
@@ -2606,6 +2615,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentPermission(_)
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
+        | ToCore::AgentRestart(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)

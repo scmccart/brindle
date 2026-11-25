@@ -25,12 +25,13 @@
 //! |   12 | `STEP_DOWN`     | client → core | `req`                                                          |
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
 //! |   14 | `SET_LAYOUT`    | client → core | `session, layout?` (protocol 3 only)                           |
-//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?` (protocol 4)  |
+//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?, conversation?` (protocol 4) |
 //! |   16 | `AGENT_PROMPT`  | client → core | `req, session, text` (protocol 4)                              |
 //! |   17 | `AGENT_CANCEL`  | client → core | `session` (protocol 4)                                         |
 //! |   18 | `AGENT_PERMISSION` | client → core | `req, session, entry, option?` (protocol 4)                 |
 //! |   19 | `AGENT_UNQUEUE` | client → core | `req, session` (protocol 4)                                    |
 //! |   20 | `AGENT_RESEND`  | client → core | `req, session` (protocol 4)                                    |
+//! |   21 | `AGENT_RESTART` | client → core | `req, session, command, args, env` (protocol 4)                |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
 //! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
@@ -98,6 +99,17 @@
 //!   an `ERROR` with its `session`. Only the client that has the session
 //!   attached may send them. Whether a prompt was sent or queued, the client
 //!   learns from the events, not the reply.
+//! - `AGENT_RESTART` → `OK` or `ERROR` starts a new agent process for an
+//!   agent session whose agent ended (exited, or lost with its holder), to
+//!   continue its conversation in the same log; the client sends the
+//!   program to run, and the conversation's directory is the session's.
+//!   Only the client that has the session attached may send it, and the
+//!   core refuses it for a session whose agent hasn't ended or can't
+//!   continue. The outcome arrives as transcript events.
+//! - `SPAWN_AGENT`'s `conversation` (`id`, `cwd`) asks the new agent to
+//!   continue that conversation (by `session/load` or `session/resume`)
+//!   instead of starting one, for a client whose session the server no
+//!   longer has; left out, the agent starts a new one.
 //! - `TRANSCRIPT` carries a session's transcript events, each a JSON object
 //!   this crate doesn't read: `brindle-transcript` encodes and decodes them
 //!   on both sides. It is checked only to be an array of objects, and a
@@ -153,6 +165,8 @@ pub const MSG_AGENT_PERMISSION: u8 = 18;
 pub const MSG_AGENT_UNQUEUE: u8 = 19;
 /// Protocol 4.
 pub const MSG_AGENT_RESEND: u8 = 20;
+/// Protocol 4.
+pub const MSG_AGENT_RESTART: u8 = 21;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_ERROR: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -451,6 +465,35 @@ pub struct SpawnAgent {
     /// The client's name for what started the session (a profile).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    /// A conversation for the agent to continue instead of starting one;
+    /// the session then runs in the conversation's `cwd`, which ACP ties
+    /// the conversation to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<AgentConversation>,
+}
+
+/// An agent's conversation, as `SPAWN_AGENT` names one to continue: the ACP
+/// session id the agent gave, and the directory it was started in.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConversation {
+    pub id: String,
+    pub cwd: String,
+}
+
+/// `AGENT_RESTART` (protocol 4): run the agent again for a session whose
+/// agent ended, continuing its conversation. The core refuses an empty
+/// `command`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentRestart {
+    pub req: RequestId,
+    pub session: SessionId,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// The agent's complete environment; the server adds nothing.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 /// `AGENT_PROMPT` (protocol 4): plain text for the agent, sent now or
@@ -648,6 +691,8 @@ pub enum ToCore {
     AgentUnqueue(AgentRequest),
     /// Protocol 4: send a held prompt again.
     AgentResend(AgentRequest),
+    /// Protocol 4: run an ended agent again to continue its conversation.
+    AgentRestart(AgentRestart),
 }
 
 impl ToCore {
@@ -673,6 +718,7 @@ impl ToCore {
             Self::AgentPermission(m) => wire::json(MSG_AGENT_PERMISSION, m),
             Self::AgentUnqueue(m) => wire::json(MSG_AGENT_UNQUEUE, m),
             Self::AgentResend(m) => wire::json(MSG_AGENT_RESEND, m),
+            Self::AgentRestart(m) => wire::json(MSG_AGENT_RESTART, m),
         }
     }
 
@@ -700,6 +746,7 @@ impl ToCore {
             }
             MSG_AGENT_UNQUEUE => Self::AgentUnqueue(wire::from_json("AGENT_UNQUEUE", frame)?),
             MSG_AGENT_RESEND => Self::AgentResend(wire::from_json("AGENT_RESEND", frame)?),
+            MSG_AGENT_RESTART => Self::AgentRestart(wire::from_json("AGENT_RESTART", frame)?),
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -886,6 +933,20 @@ pub(crate) mod samples {
                 env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
                 policy: Policy::Detach,
                 profile: Some("Claude".into()),
+                conversation: None,
+            }),
+            ToCore::SpawnAgent(SpawnAgent {
+                req: 15,
+                command: "copilot".into(),
+                args: vec!["--acp".into()],
+                cwd: None,
+                env: BTreeMap::new(),
+                policy: Policy::Kill,
+                profile: Some("Copilot".into()),
+                conversation: Some(AgentConversation {
+                    id: "sess-4f1c".into(),
+                    cwd: "/home/u/src".into(),
+                }),
             }),
             ToCore::AgentPrompt(AgentPrompt {
                 req: 10,
@@ -912,6 +973,13 @@ pub(crate) mod samples {
             ToCore::AgentResend(AgentRequest {
                 req: 14,
                 session: 9,
+            }),
+            ToCore::AgentRestart(AgentRestart {
+                req: 16,
+                session: 9,
+                command: "npx".into(),
+                args: vec!["@agentclientprotocol/claude-agent-acp".into()],
+                env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
             }),
         ]
     }
@@ -1066,7 +1134,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_DATA..=MSG_AGENT_RESEND {
+        for expected in MSG_DATA..=MSG_AGENT_RESTART {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -1207,12 +1275,22 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, 21, 31, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, 255] {
+        for msg_type in [0, 22, 31, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             let error = ToCore::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-        for msg_type in [0, MSG_HELLO, MSG_REPARENT, MSG_SPAWN_AGENT, MSG_AGENT_RESEND, 31, 43, 255] {
+        for msg_type in [
+            0,
+            MSG_HELLO,
+            MSG_REPARENT,
+            MSG_SPAWN_AGENT,
+            MSG_AGENT_RESEND,
+            MSG_AGENT_RESTART,
+            31,
+            43,
+            255,
+        ] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             assert!(ToClient::decode(&frame).is_err());
         }
@@ -1298,6 +1376,51 @@ mod tests {
             panic!("not SPAWN_AGENT");
         };
         assert_eq!(spawn.command, "");
+        assert_eq!(spawn.conversation, None);
+        let frame = ToCore::SpawnAgent(SpawnAgent {
+            req: 1,
+            command: "agent".into(),
+            conversation: Some(AgentConversation {
+                id: "s1".into(),
+                cwd: "/w".into(),
+            }),
+            ..Default::default()
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame.payload,
+            br#"{"req":1,"command":"agent","args":[],"cwd":null,"env":{},"policy":"kill","conversation":{"id":"s1","cwd":"/w"}}"#
+        );
+        let frame = ToCore::AgentRestart(AgentRestart {
+            req: 2,
+            session: 5,
+            command: "agent".into(),
+            ..Default::default()
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.msg_type, 21);
+        assert_eq!(
+            frame.payload,
+            br#"{"req":2,"session":5,"command":"agent","args":[],"env":{}}"#
+        );
+        // An AGENT_RESTART without a command decodes, for the core to refuse
+        // with a reason; without a session it doesn't.
+        let frame = Frame::new(MSG_AGENT_RESTART, br#"{"req":2,"session":5}"#.to_vec()).unwrap();
+        let ToCore::AgentRestart(restart) = ToCore::decode(&frame).unwrap() else {
+            panic!("not AGENT_RESTART");
+        };
+        assert_eq!(restart.command, "");
+        let frame = Frame::new(MSG_AGENT_RESTART, br#"{"req":2}"#.to_vec()).unwrap();
+        assert!(ToCore::decode(&frame).is_err());
+        // A conversation without its id is refused.
+        let frame = Frame::new(
+            MSG_SPAWN_AGENT,
+            br#"{"req":1,"command":"a","conversation":{"cwd":"/w"}}"#.to_vec(),
+        )
+        .unwrap();
+        assert!(ToCore::decode(&frame).is_err());
         for (activity, name) in [
             (AgentActivity::Idle, "idle"),
             (AgentActivity::Working, "working"),

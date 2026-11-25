@@ -1466,6 +1466,7 @@ pub fn client_agent(script: &Path) -> client::SpawnAgent {
         env: base_env(),
         policy: client::Policy::Kill,
         profile: None,
+        conversation: None,
     }
 }
 

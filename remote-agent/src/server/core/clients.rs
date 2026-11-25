@@ -344,6 +344,15 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentResend(request) => {
                 self.client_agent_command(client, AgentCommand::resend(request))
             }
+            // Stopgap until task 3.3 handles it in `agents.rs`.
+            ToCore::AgentRestart(restart) => self.send_client(
+                client,
+                error(
+                    Some(restart.req),
+                    Some(restart.session),
+                    "this server can't restart agents yet",
+                ),
+            ),
         }
     }
 

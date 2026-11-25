@@ -1665,6 +1665,7 @@ mod tests {
             env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
             policy: client::Policy::Detach,
             profile: Some("Claude".into()),
+            conversation: None,
         };
         assert_eq!(spawn, expected);
         shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
