@@ -501,7 +501,23 @@ impl Args {
                 });
                 request.command = launch.command.as_ref().map(Command::argv);
             }
-            Asked::Agent(_) => request.kind = Some(TabKind::Agent.word().into()),
+            Asked::Agent(launch) => {
+                request.kind = Some(TabKind::Agent.word().into());
+                let prompt = match &launch.prompt {
+                    Some(PromptArg::Text(prompt)) => Some(prompt.text().to_string()),
+                    // `main` read standard input before anything else, so
+                    // nothing is left unread by now.
+                    Some(PromptArg::Stdin) | None => None,
+                };
+                request.agent = Some(instance::AgentRequest {
+                    profile: launch.profile.clone(),
+                    cwd: launch.cwd.as_ref().map(|d| match &request.launch_dir {
+                        Some(here) => here.join(d),
+                        None => d.clone(),
+                    }),
+                    prompt,
+                });
+            }
             Asked::Attach(session) => request.attach = Some(*session),
         }
         request
@@ -1147,6 +1163,12 @@ fn forwarded_launch(
             // otherwise.
             let cwd = launch.cwd.or_else(|| command.as_ref().and(request.launch_dir.clone()));
             Ok(Some(Launch::Request(LaunchRequest { profile, command, cwd })))
+        }
+        instance::Forward::Agent(launch) => {
+            workspace::profile_for(config, TabKind::Agent, launch.profile.as_deref(), config_error)
+                .map_err(Refusal::Usage)?;
+            // Until agent zones are in the window (task 6.3).
+            Err(Refusal::Other(AGENT_TABS_PENDING.into()))
         }
     }
 }
@@ -2460,8 +2482,70 @@ mod tests {
         let answer = Refusal::Usage(refusal).answer();
         assert!(matches!(answer, instance::Answer::Usage(_)), "{answer:?}");
         let agent = instance::Request { kind: Some("agent".into()), ..Default::default() };
-        let Some(Refusal::Other(why)) = request(agent, false) else { panic!("an unknown kind is refused") };
-        assert!(why.contains("can't open agent tabs"), "{why}");
+        let Some(Refusal::Other(why)) = request(agent, false) else { panic!("an agent kind without its fields") };
+        assert_eq!(why, "an agent request needs its agent fields");
+        let chat = instance::Request { kind: Some("chat".into()), ..Default::default() };
+        let Some(Refusal::Other(why)) = request(chat, false) else { panic!("an unknown kind is refused") };
+        assert!(why.contains("can't open chat tabs"), "{why}");
+    }
+
+    /// Every [`workspace::LaunchRefusal`] a forwarded agent launch meets is
+    /// a `usage:` answer, which the launch prints and exits 2 on.
+    #[test]
+    fn a_forwarded_agent_launchs_refusals_are_usage_answers() {
+        let config = Config::parse("[[profiles]]\nname = \"Shell\"\n").unwrap().config;
+        let agent = |profile: Option<&str>| instance::Request {
+            kind: Some("agent".into()),
+            agent: Some(instance::AgentRequest { profile: profile.map(Into::into), ..Default::default() }),
+            ..Default::default()
+        };
+        let cases = [
+            (agent(Some("wrk")), "usage: no profile is named \"wrk\" (the profiles are: Shell)\n"),
+            (agent(Some("shell")), "usage: \"Shell\" is a terminal profile: open it with brindle terminal Shell\n"),
+            (agent(None), "usage: the config has no agent profile (add one with type = \"agent\"; the profiles are: Shell)\n"),
+        ];
+        for (request, line) in cases {
+            let Err(refusal @ Refusal::Usage(_)) = forwarded_launch(&request, &Listing::Skipped, &config, false) else {
+                panic!("{request:?} is a usage error")
+            };
+            assert_eq!(instance::Answer::line(&refusal.answer()), line);
+        }
+        let terminal = |profile: &str| instance::Request {
+            kind: Some("terminal".into()),
+            profile: Some(profile.into()),
+            ..Default::default()
+        };
+        let config = Config::parse("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"f\"\n")
+            .unwrap()
+            .config;
+        let Err(refusal) = forwarded_launch(&terminal("fake"), &Listing::Skipped, &config, false) else {
+            panic!("a terminal launch naming an agent profile is refused")
+        };
+        assert_eq!(
+            instance::Answer::line(&refusal.answer()),
+            "usage: \"Fake\" is an agent profile: open it with brindle agent Fake\n"
+        );
+    }
+
+    /// An agent launch's request carries its own fields and fills none of a
+    /// terminal launch's.
+    #[test]
+    fn an_agent_launch_becomes_a_request_with_its_own_fields() {
+        let here = PathBuf::from("/home/u/src");
+        let request =
+            parse(&["agent", "Fake", "-d", "rel", "-p", "hi"]).instance_request(Some(here.clone()), None);
+        assert_eq!(request.kind.as_deref(), Some("agent"));
+        assert_eq!(
+            request.agent,
+            Some(instance::AgentRequest {
+                profile: Some("Fake".into()),
+                cwd: Some(here.join("rel")),
+                prompt: Some("hi".into())
+            }),
+            "-d is made absolute here"
+        );
+        assert_eq!((request.profile, request.cwd, request.command), (None, None, None));
+        assert_eq!(parse(&["agent"]).instance_request(None, None).encode(), "{\"kind\":\"agent\",\"agent\":{}}\n");
     }
 
     #[test]
