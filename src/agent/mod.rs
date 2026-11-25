@@ -19,6 +19,11 @@ pub mod spawn;
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod close;
 
+// The fold the reader thread and the zone share: group 4's sink folds
+// into it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod shared;
+
 // The chat model and the protocol gate: groups 4 and 5 use them.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod model;
