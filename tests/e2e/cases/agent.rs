@@ -54,7 +54,7 @@ pub(super) fn answered() -> String {
 }
 
 /// A `send` step streaming `text` into the agent's message.
-fn says(text: &str) -> String {
+pub(super) fn says(text: &str) -> String {
     let text = text.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\t', "\\t");
     format!(
         r#"send {{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{text}"}}}}}}}}"#
@@ -63,7 +63,7 @@ fn says(text: &str) -> String {
 
 /// A fake agent's script, built step by step and written into the case
 /// directory.
-struct Script(Vec<String>);
+pub(super) struct Script(Vec<String>);
 
 impl Script {
     /// An agent that records what it is sent in `received`, names itself
@@ -78,7 +78,7 @@ impl Script {
         ])
     }
 
-    fn step(mut self, step: impl Into<String>) -> Self {
+    pub(super) fn step(mut self, step: impl Into<String>) -> Self {
         self.0.push(step.into());
         self
     }
@@ -98,7 +98,7 @@ impl Script {
     /// An agent that records what it is sent in `received` and answers
     /// `initialize` offering `capabilities`; the case adds the rest (a
     /// continue's `session/resume` or `session/load`).
-    fn initialized(received: &Path, capabilities: &str) -> Self {
+    pub(super) fn initialized(received: &Path, capabilities: &str) -> Self {
         Script(vec![
             format!("record {}", received.display()),
             "expect initialize".into(),
@@ -109,7 +109,7 @@ impl Script {
     }
 
     /// Writes the script as `NAME.script` in the case directory.
-    fn write(self, ctx: &Ctx, name: &str) -> Result<PathBuf> {
+    pub(super) fn write(self, ctx: &Ctx, name: &str) -> Result<PathBuf> {
         let path = ctx.dir.join(format!("{name}.script"));
         std::fs::write(&path, self.0.join("\n") + "\n").map_err(|e| format!("writing {}: {e}", path.display()))?;
         Ok(path)
@@ -117,7 +117,7 @@ impl Script {
 
     /// Writes the script as `NAME.script` in the case directory and
     /// returns the `Fake` profile running it.
-    fn profile(self, ctx: &Ctx, name: &str) -> Result<String> {
+    pub(super) fn profile(self, ctx: &Ctx, name: &str) -> Result<String> {
         Ok(fake_profile(ctx, &self.write(ctx, name)?))
     }
 }
@@ -125,7 +125,7 @@ impl Script {
 /// A file in the case directory a fake agent's `wait-file` waits for,
 /// which the case creates; it is never created when it holds a turn for
 /// the whole run.
-fn gate(ctx: &Ctx, name: &str) -> PathBuf {
+pub(super) fn gate(ctx: &Ctx, name: &str) -> PathBuf {
     ctx.dir.join(name)
 }
 
@@ -141,7 +141,7 @@ fn sessions_listed(ctx: &Ctx, count: usize) -> Result {
 }
 
 /// What `--wait-for` waits for until the agent is ready.
-const READY: &str = "state=ready";
+pub(super) const READY: &str = "state=ready";
 
 /// A turn typed into the prompt input (`--send`, then enter): the prompt
 /// has focus at launch, `--send` types the draft (shown in `--- input`),
@@ -489,12 +489,12 @@ fn ask_about(id: &str, title: &str) -> String {
 }
 
 /// A `respond` step ending the prompt's turn with `stop`.
-fn stop(stop: &str) -> String {
+pub(super) fn stop(stop: &str) -> String {
     format!(r#"respond {{"stopReason":"{stop}"}}"#)
 }
 
 /// The prompts' texts the agent was sent, in order, from its record.
-fn prompts_sent(received: &Path) -> Result<Vec<String>> {
+pub(super) fn prompts_sent(received: &Path) -> Result<Vec<String>> {
     let text = std::fs::read_to_string(received).map_err(|e| format!("reading {}: {e}", received.display()))?;
     let mut prompts = Vec::new();
     for line in text.lines() {
@@ -508,7 +508,7 @@ fn prompts_sent(received: &Path) -> Result<Vec<String>> {
 }
 
 /// Whether the agent's record holds a message with `method`.
-fn recorded(received: &Path, method: &str) -> bool {
+pub(super) fn recorded(received: &Path, method: &str) -> bool {
     let text = std::fs::read_to_string(received).unwrap_or_default();
     text.lines().any(|line| line.contains(&format!("\"method\":\"{method}\"")))
 }
@@ -1633,20 +1633,20 @@ pub fn broken(ctx: &Ctx) -> Result<Outcome> {
 // `first.jsonl` and `second.jsonl`.
 
 /// `agentCapabilities` offering `session/resume`.
-const RESUME: &str = r#"{"sessionCapabilities":{"resume":{}}}"#;
+pub(super) const RESUME: &str = r#"{"sessionCapabilities":{"resume":{}}}"#;
 /// `agentCapabilities` offering `session/load` alone (as Copilot does).
 const LOAD: &str = r#"{"loadSession":true}"#;
 /// `agentCapabilities` offering neither.
 const NEITHER: &str = "{}";
 
 /// What `--wait-for` waits for until the first agent has exited.
-const EXITED: &str = "state=exited:1";
+pub(super) const EXITED: &str = "state=exited:1";
 
 /// The notice the core adds when it starts the agent again.
-const RESTARTED: &str = "the agent was started again to continue the conversation";
+pub(super) const RESTARTED: &str = "the agent was started again to continue the conversation";
 
 /// Where the first and the second agent record what they are sent.
-fn records(ctx: &Ctx) -> (PathBuf, PathBuf) {
+pub(super) fn records(ctx: &Ctx) -> (PathBuf, PathBuf) {
     let (first, second) = (ctx.dir.join("first.jsonl"), ctx.dir.join("second.jsonl"));
     // A run's records start empty, as its gates start closed.
     for path in [&first, &second] {
@@ -1657,7 +1657,7 @@ fn records(ctx: &Ctx) -> (PathBuf, PathBuf) {
 
 /// An agent offering `capabilities` that answers its first prompt with
 /// [`HELLO`], waits for `gate`, then exits with status 1.
-fn turn_then_exit(received: &Path, capabilities: &str, gate: &Path) -> Script {
+pub(super) fn turn_then_exit(received: &Path, capabilities: &str, gate: &Path) -> Script {
     Script::offering(received, capabilities)
         .step("expect session/prompt")
         .step(says(HELLO))
@@ -1699,12 +1699,12 @@ fn touch(gate: &Path) -> String {
 }
 
 /// The conversation's user and agent messages, in order.
-fn messages(out: &crate::brindle::Output) -> Vec<&str> {
+pub(super) fn messages(out: &crate::brindle::Output) -> Vec<&str> {
     out.dump.agent_entries().into_iter().filter(|e| e.starts_with("user ") || e.starts_with("agent ")).collect()
 }
 
 /// Whether the conversation has a notice containing `text`.
-fn has_notice(out: &crate::brindle::Output, text: &str) -> bool {
+pub(super) fn has_notice(out: &crate::brindle::Output, text: &str) -> bool {
     out.dump.agent_entries().iter().any(|e| e.starts_with("notice ") && e.contains(text))
 }
 
@@ -1855,7 +1855,7 @@ pub fn continue_palette(ctx: &Ctx) -> Result<Outcome> {
 
 /// The session running the fake agent, from `brindle-remote list --json`:
 /// its pid, `None` while none is listed running.
-fn agent_pid(helper: &Path, server_dir: &Path) -> Result<Option<u32>> {
+pub(super) fn agent_pid(helper: &Path, server_dir: &Path) -> Result<Option<u32>> {
     let out = std::process::Command::new(helper)
         .args(["list", "--json"])
         .env("BRINDLE_SERVER_DIR", server_dir)
