@@ -1013,7 +1013,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 42] = [
+const PURE_MODULES: [&str; 43] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1056,6 +1056,7 @@ const PURE_MODULES: [&str; 42] = [
     "remote-agent/src/pty/stat.rs",
     "remote-agent/src/server/core/policy.rs",
     "remote-agent/src/server/holder/policy.rs",
+    "remote-agent/src/acp/wire.rs",
 ];
 
 /// The type names that make a `static` mutable state (a name containing

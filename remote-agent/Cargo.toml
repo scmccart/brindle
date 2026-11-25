@@ -10,6 +10,7 @@ name = "brindle-remote"
 path = "src/main.rs"
 
 [dependencies]
+agent-client-protocol-schema = { version = "=1.22.0", default-features = false }
 brindle-remote-protocol = { path = "../remote-protocol" }
 brindle-term-core = { path = "../term-core" }
 brindle-transcript = { path = "../transcript" }

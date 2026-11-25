@@ -2,6 +2,14 @@
 // code only; `docs/architecture/README.md` lists the exceptions.
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "the core's agent sessions (task group 7 of agents-sessions) call it; until then only its tests do"
+    )
+)]
+mod acp;
 mod conpty;
 #[cfg(target_os = "linux")]
 mod liveness;
