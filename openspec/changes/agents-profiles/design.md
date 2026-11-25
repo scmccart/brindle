@@ -388,6 +388,22 @@ Two points to keep in step, neither a gap:
 - `agents-launch-commands`' `LaunchRefusal` has two variants; this change adds `NoProfileOfKind`, which that change's text leaves to "default of the kind" here. Its `usage:` answer and status 2 follow that change's rule unchanged.
 - `agents-sessions` refuses `AGENT_RESEND` on a waiting prompt with "no prompt is held"; Brindle never sends it then (send again shows only on a held row), so the zone shows that text only if the slot changed in flight, as the prompt input's refusal.
 
+## As built
+
+**Section 1, shared contracts (2026-11-25).** The prerequisites the tasks list were checked against the code: all are there. Where what `agents-sessions` and `agents-launch-commands` built differs from this design's Context, the later sections use what was built:
+- `profile_for` is `profile_for(config, kind, name, config_error) -> Result<usize, LaunchRefusal>` (as decision 3 already says, not the Context's `Result<Chosen, KindMismatch>`).
+- `SessionInfo.agent` is `Option<client::AgentInfo { activity: AgentActivity, name: Option<String> }>`.
+- `Event::from_value` takes `&serde_json::Value`. The transcript crate also exports `PermissionKind` (an option's kind), `TEXT_CHUNK` and `chunks`; `agent::transcript` re-exports `PermissionKind` beside the Context's list, since permissions put allow kinds first.
+- The core already resolves an agent's directory (`platform::agent_dir`: the request's directory with `~` expanded when it is absolute and a directory, else the home the request's environment names, else the core's own) and refuses a blank command ("an agent session needs a command"); `agent_spawn_request` (2.5) need not duplicate the fallback.
+
+Choices the artifacts left open:
+- **`Profile.kind` is `pub(crate)`,** not private: a private field breaks `Profile { name, ..Default::default() }` in other modules (the settings dialog builds profiles that way). Only `config.rs` sets it; everything else reads `kind()`.
+- **A blank command is missing too:** `command = "  "` on an agent profile is the same config error as no command (the core refuses a blank one anyway).
+- **The kind mismatch's words** take an article: `"Fake" is an agent profile: open it with brindle agent Fake`. Until 2.3, a terminal launch naming an agent profile is the only mismatch, and a launch naming no profile still opens the default profile whatever its kind.
+- **`src/agent/transcript.rs` joined `PURE_MODULES` and `fcis`' pure-module table in 1.4,** with the module (the rule for a new whole pure module); 2.11 adds the other four. The check that no other file names `brindle_transcript` is `only_the_agent_transcript_module_names_the_transcript_crate`, cited under `ports R3`, whose text now says so.
+- **`remote::agent_link<Start, Sink>(host: Host, start, sink) -> Result<AgentLink, Unsupported>`** leaves `start` and `sink` generic until group 4 gives them their types (`Start::SpawnAgent`'s request and `agent::shared::Sink`). `AgentLink` is an uninhabited enum until group 4 gives it the session on Linux and Windows. `Unsupported` is a struct holding its reason (`Display`, `Error`): elsewhere "agent sessions run in the terminal server, which needs Linux or Windows"; the Linux and Windows stub answers "agent sessions aren't connected to the terminal server in this build", which group 4 removes.
+- **The fake agent's freshness check also applies to one `BRINDLE_FAKE_ACP_AGENT` names** (unlike `check_helper`'s `Chosen`, taken as it is): decision 16 calls any found binary older than its sources stale, and the archive jobs build it from the same checkout. The pure parts are `fake_agent::{locate, build_command, verdict}`; `find` reads the variable and `check` the files. `Ctx::fake_agent` carries the path to every case, and the runner checks it only when `wants_fake_agent` (a selected case that opens windows declares it, with a display to run it on).
+
 ## Risks / Trade-offs
 
 - [GPUI 0.2.2's `list` has no public "is at end" query] → `Follow` from its scroll events and the visible range; a unit-tested rule, and `agent-scroll` checks it through the dump.
