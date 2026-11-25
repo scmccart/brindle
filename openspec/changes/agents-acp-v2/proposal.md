@@ -5,6 +5,8 @@
 
 **Status: proposal stage.** This change has no design, specs or tasks yet. It is taken further once `agents-profiles` is archived (and with it `agents-launch-commands` and `agents-sessions`), and preferably once ACP v2 leaves Preview.
 
+**Decided (user, 2026-11-25):** this change starts only after ACP v2 leaves Preview, and then Brindle always offers v2 (question 1). Its other open questions are deferred until then. `agents-session-recovery` is v1-only (it calls `session/load` and `session/resume` directly), and `agents-login` sends v1's `authenticate` and `$/cancel_request`, so this change reshapes the recovery and login requests (`session/resume { replayFrom }`, `auth/login`, v2's required method `type` and `capabilities.auth.terminal: {}`).
+
 ## Why
 
 In step 1 the terminal server speaks ACP v1 only. ACP v2 went to Preview on 2026-11-20, with Zed, JetBrains and the Claude and Codex adapters building on it, and the ACP project says to support v1 and v2 side by side rather than drop v1. Agents will move to v2 over time; some features (background work, subagents, structured diffs, flexible permission requests) exist only there, and a v2-only agent can't be used from Brindle at all: it rejects a v1 `initialize`.
