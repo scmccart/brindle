@@ -56,7 +56,7 @@ use crate::terminal::status::State;
 use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
-use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView, describe_badge, ui_badge};
+use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneStart, ZoneTreeView, describe_badge, ui_badge};
 
 /// The tab strip's height in logical pixels: the pill tab list's
 /// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default rem,
@@ -179,9 +179,10 @@ impl Tab {
         self.zones.read(cx).active_terminal(cx)
     }
 
-    /// The view of the terminal that has (or last had) focus in this tab.
+    /// The view of the terminal that has (or last had) focus in this tab;
+    /// `None` when that zone is an agent's.
     fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
-        self.zones.read(cx).active_view()
+        self.zones.read(cx).active_terminal_view()
     }
 
     /// Where the active terminal was last painted.
@@ -754,10 +755,8 @@ impl Workspace {
                         }
                     }
                     let Some(tab) = self.active_ix().and_then(|ix| self.tabs.get_mut(ix)) else { continue };
-                    if let Some(note) = &missing_note
-                        && let Some(terminal) = tab.active_terminal(cx)
-                    {
-                        terminal.update(cx, |terminal, cx| terminal.note(note, cx));
+                    if let Some(note) = &missing_note {
+                        tab.zones.update(cx, |zones, cx| zones.note_active(note, cx));
                     }
                     if let Some(title) = title {
                         tab.set_manual_title(&title, cx);
@@ -790,7 +789,7 @@ impl Workspace {
             .into_iter()
             .map(|(id, cwd, session)| {
                 let terminal = self.restored_terminal(&profile, &host, cwd, session.as_ref(), &config, cx);
-                (id, terminal)
+                (id, ZoneStart::Terminal(terminal))
             })
             .collect();
         let font_size = profile.font_size;
@@ -935,7 +934,7 @@ impl Workspace {
         if !same_endpoint(&tab.host, host) {
             return None;
         }
-        tab.active_terminal(cx)?.read(cx).working_directory()
+        tab.zones.read(cx).active_content()?.working_directory(cx)
     }
 
     /// Opens a tab for the request on its profile's endpoint.
@@ -977,7 +976,8 @@ impl Workspace {
         let theme = self.previews.theme_for(&profile, &config);
         let p_clone = profile.clone();
         let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
+        let start = ZoneStart::Terminal(terminal);
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, start, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
@@ -1000,7 +1000,8 @@ impl Workspace {
         let font_size = profile.font_size;
         let p_clone = profile.clone();
         let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
+        let start = ZoneStart::Terminal(terminal);
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, start, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         let id = tab.id;
@@ -1039,7 +1040,7 @@ impl Workspace {
                 let (tree, leaves, active) = tab.into_tree();
                 let terminals: Vec<_> = leaves
                     .into_iter()
-                    .map(|(id, info)| (id, Self::attached_terminal(&host, &info, &profile, &config, cx)))
+                    .map(|(id, info)| (id, ZoneStart::Terminal(Self::attached_terminal(&host, &info, &profile, &config, cx))))
                     .collect();
                 let theme = self.previews.theme_for(&profile, &config);
                 let font_size = profile.font_size;
@@ -1528,7 +1529,8 @@ impl Workspace {
         let p_clone = profile.clone();
         let host = Host::of(&profile);
         let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, terminal, window, cx));
+        let start = ZoneStart::Terminal(terminal);
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, start, window, cx));
         let tab = Tab::new(profile, host, view, TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
