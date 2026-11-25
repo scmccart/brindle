@@ -16,7 +16,7 @@ ACP has two forms. Version 1's `plan` is one unnamed checklist. A newer form, `p
 - **Brindle never clears a plan on its own, and the user can dismiss one.** A plan stays until the agent replaces or removes it. Since agents often stop keeping a plan up to date, a dismiss mark on the plan and the `agent_dismiss_plan` action put it away, on the server, so it is gone for every client and after a restart. The same plan sent again unchanged doesn't bring it back; a changed one does.
 - **The zone shows the plan above the prompt input**, where it stays in view while the conversation scrolls: one line with how many items are done and the step in progress, which opens to the whole checklist. Items' text is rendered as agent messages are.
 - **`toggle_agent_plan`** opens and closes it from the keyboard and the palette; `[agent] plan_details` (`"closed"` by default, or `"open"`) sets how it starts.
-- **Bounds on what an agent sends:** 8 plans, 256 items a plan, 64 KiB of Markdown.
+- **Bounds on what an agent sends:** 256 items a plan and 64 KiB of Markdown. The number of plans isn't limited; a session's plans together may take 4 MiB, so the server's memory stays bounded.
 - **Client protocol 4 is amended**, as for the rest of the series: two transcript event kinds and one client message, to dismiss a plan.
 
 Not in this change: editing a plan, or telling the agent to skip or reorder a step; a plan as an entry in the conversation, or a history of its earlier states; opening a Markdown plan's file; notifications when a step finishes; plans in the sessions palette or a tab's title.

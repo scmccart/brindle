@@ -82,7 +82,7 @@ Event::PlanRemoved { id: String }    // nothing when no plan has the id
 - Both are upserts or removals by id, so applying one twice gives the same state. That is what makes `agents-session-recovery`'s muted replay harmless: an agent replaying its conversation resends plans, which replace themselves.
 - `Transcript` gains `plans`, in the order they were first set; `replay()` sends one `Plan` each after the agent's state, on every attach, whatever page of entries `agents-log-paging` sends with it; `fold(replay(t)) == t` gains them. No fold error is possible beyond decoding.
 - The core sends an event only when a plan differs from the one it holds (agents resend them).
-- **Bounds** (`railway R5`), applied by the reducer before the event: at most `MAX_PLANS` = 8 plans (a ninth id is refused with a notice); `MAX_PLAN_ITEMS` = 256 items a plan, later ones dropped and counted; an item's text bounded at 1 KiB; `PLAN_TEXT` = 64 KiB of Markdown, its end dropped with a mark; a path bounded as titles are; ids bounded as tool call ids are; every text cleaned. One plan therefore fits one event under `TEXT_CHUNK`'s frame.
+- **Bounds** (`railway R5`), applied by the reducer before the event. **The number of plans isn't limited** (the user's decision, 2026-11-25). The server still must bound what an agent can make it hold (`process R9`), so the limit is on their size together: `PLANS_LIMIT` = 4 MiB of plans a session, counted as they are encoded, the dismissed ones' records included; a plan that would pass it isn't kept, with a notice. That is room for dozens of the largest checklists and thousands of ordinary ones. Each plan: `MAX_PLAN_ITEMS` = 256 items a plan, later ones dropped and counted; an item's text bounded at 1 KiB; `PLAN_TEXT` = 64 KiB of Markdown, its end dropped with a mark; a path bounded as titles are; ids bounded as tool call ids are; every text cleaned. One plan therefore fits one event under `TEXT_CHUNK`'s frame.
 - **Versions.** Client protocol 4 is unreleased and amended, as `agents-tool-content`'s decision 8 says: two event kinds, new `tests/fixtures/v4/` files and none edited. The checkpoint keeps format 1 with the plans in its state; one from before this change decodes with none.
 
 ### 4. When a plan goes (`acp/reduce.rs`; the user's decision, 2026-11-25)
@@ -93,7 +93,7 @@ Brindle never clears a plan on its own: not when a turn ends, not when every ite
 - **The user dismisses it.** Agents often stop updating a plan, leaving steps unchecked that were done, and v1's unnamed plan can't be withdrawn at all, so the user needs a way to put one away.
   - **`AGENT_DISMISS_PLAN { req, session, plan }`**, a new client message of protocol 4 (amended; the next free number when the stack is assembled), `plan` being an id, or absent for every plan the session holds. Answered `OK`, or `ERROR` (`NoSuchPlan`, `NotAnAgentSession`). Fixtures pin it and it joins the protocol's fuzzing.
   - **The server removes the plan** from the session's state and tells attached clients (`PlanRemoved`), so it is gone for every client and after a restart. The agent isn't told: ACP has no message for it.
-  - **Dismissed until the agent changes it.** The server remembers each dismissed plan beside the session's state (`dismissed: id → Plan`, at most `MAX_PLANS`, in the checkpoint). A plan the agent sends that equals the one dismissed under its id is ignored; one that differs is kept and shown again, and the record is dropped. So a stale plan an agent keeps resending stays away, and real progress brings it back. A removal by the agent drops the record too.
+  - **Dismissed until the agent changes it.** The server remembers each dismissed plan beside the session's state (`dismissed: id → Plan`, counted within `PLANS_LIMIT`, in the checkpoint). A plan the agent sends that equals the one dismissed under its id is ignored; one that differs is kept and shown again, and the record is dropped. So a stale plan an agent keeps resending stays away, and real progress brings it back. A removal by the agent drops the record too.
 - This is also what keeps `agents-session-recovery`'s replay quiet: an agent replaying its conversation resends the plans it had, and one the user dismissed is equal to its record.
 
 ### 5. The chat model (`src/agent/model.rs`, GPUI-free; `fcis R1`, `R5`)
@@ -124,7 +124,7 @@ Brindle never clears a plan on its own: not when a turn ends, not when every ite
 
 ### 8. Failures (`railway R6`, `R8`)
 
-- An entry or a plan that can't be read, an unknown plan type, a ninth plan, items past the bound: left out, one notice in the conversation saying what and how many.
+- An entry or a plan that can't be read, an unknown plan type, a plan past the size the session's plans may reach together, items past the bound: left out, one notice in the conversation saying what and how many.
 - A Markdown render panic: the plan's text as plain text, as for messages.
 - A `PlanRemoved` for an id not held: nothing, as ACP requires.
 
@@ -140,15 +140,13 @@ Plans are in the session's checkpoint, so a core restart and an upgrade keep the
 - **E2E:** `agent-plan-progress`, `agent-plan-markdown`, `agent-plan-dismiss`, `agent-plan-restore`, `agent-plan-settings`.
 - **Manual:** a pointer press on the trigger; scrolling a long open plan; a real agent's plan on a task of several steps.
 
-## Open decisions
+## The user's decisions
 
-Each has a recommendation, which the text above follows. They are the user's to settle before implementation.
+The user settled each on 2026-11-25, one at a time: the plan shows above the prompt input, staying in view (decision 6). It starts closed, as one line with the count and the current step, and `[agent] plan_details` opens it by default (decisions 5 and 6). A plan stays until the agent replaces or removes it, which the user chose over clearing a finished one at the next turn, and the user can dismiss one, since agents often forget to check items off (decision 4). Only high-priority items are marked (decision 6). Brindle tells v1 agents it takes the newer form, so they may send named and Markdown plans and withdraw them (decision 2).
 
-Decided on 2026-11-25: the plan shows above the prompt input, staying in view (decision 6). It starts closed, as one line with the count and the current step, and `[agent] plan_details` opens it by default (decisions 5 and 6). A plan stays until the agent replaces or removes it, which the user chose over clearing a finished one at the next turn, and the user can dismiss one, since agents often forget to check items off (decision 4).
+The bounds are 256 items a plan and 64 KiB of Markdown, and the number of plans isn't limited, which the user chose over a cap of 8; their size together is bounded instead (decision 3).
 
-4. **Priority:** only high-priority items are marked (recommended), or every item shows its priority.
-5. **Brindle tells v1 agents it takes the newer form**, so they may send named and Markdown plans (recommended), or only v1's one checklist is read until `agents-acp-v2`.
-6. **The bounds:** 8 plans, 256 items a plan, 64 KiB of Markdown (recommended).
+None is open.
 
 ## Risks / Trade-offs
 

@@ -51,7 +51,7 @@ The server SHALL read a plan the agent sends without an id as the session's one 
 - **THEN** nothing changes, and the session carries on
 
 ### Requirement: Plans are bounded
-At most 8 plans SHALL be kept for a session, each with at most 256 items, and at most 64 KiB of a Markdown plan's text, with texts cleaned and bounded as tool call titles are. An item, or a plan, the server can't read SHALL be left out without losing the others. What is left out SHALL be said in one notice.
+A plan SHALL hold at most 256 items, and a Markdown plan at most 64 KiB of text, with texts cleaned and bounded as tool call titles are. The number of plans SHALL NOT be limited, but a plan that would bring the session's plans over 4 MiB together SHALL NOT be kept. An item, or a plan, the server can't read SHALL be left out without losing the others. What is left out SHALL be said in one notice.
 
 #### Scenario: Too many items
 - **WHEN** the agent reports a plan of 300 items
@@ -61,9 +61,13 @@ At most 8 plans SHALL be kept for a session, each with at most 256 items, and at
 - **WHEN** the agent reports a plan of three items, the second with no text
 - **THEN** the first and third are kept, and a notice says one item couldn't be read
 
-#### Scenario: A ninth plan
-- **WHEN** the session holds 8 plans and the agent sends one with a new id
-- **THEN** it isn't kept, and a notice says a session keeps at most 8 plans
+#### Scenario: Many plans
+- **WHEN** the agent sends 40 small plans with different ids
+- **THEN** the session holds all 40
+
+#### Scenario: Too much plan text together
+- **WHEN** the session's plans hold 4 MiB together and the agent sends another
+- **THEN** it isn't kept, and a notice says the session's plans are at their limit
 
 ### Requirement: The server never clears a plan on its own
 A plan SHALL stay as the agent last reported it until the agent replaces or removes it, or a client dismisses it. A turn's end, every item being completed, and a new prompt SHALL NOT remove a plan.
