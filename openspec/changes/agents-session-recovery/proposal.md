@@ -3,7 +3,7 @@
 **Depends on:** `agents-profiles` (the agent zone's exit and lost states, and through it `agents-sessions`' agent sessions, their checkpoint and their exit report), implemented and archived.
 **Next:** `agents-log-paging`, paging the conversation log. The five follow-ups of `agents-profiles` are independent of one another, so that order is a suggestion.
 
-**Status: proposal stage.** This change has no design, specs or tasks yet. It is taken further once `agents-profiles` is archived (and with it `agents-launch-commands` and `agents-sessions`).
+**Status: designed.** Specs, design.md and tasks.md are written; the open questions below are answered (2026-11-25).
 
 ## Why
 
@@ -28,6 +28,16 @@ Open questions, to answer before a design:
 7. **`session/list`:** in scope here or not, and how it would show.
 8. **ACP v2:** v2 drops `session/load` and gives `session/resume` an optional `replayFrom` cursor that does both, with a `replay_complete` marker. This change speaks v1 (`agents-acp-v2` adds v2); its design should keep the v2 mapping in view so that change only swaps the requests.
 
+Answers (user, 2026-11-25; design.md has the detail):
+1. The user: a Continue conversation button in an exited or lost zone, and a palette action. No automatic restarts.
+2. `session/resume` when the log is kept and it is offered; `session/load` with the replay muted and a notice when only load is offered (Copilot); `session/load` folded into a fresh log when the server lost the session. Entry ids continue from the kept log.
+3. The core keeps an ended session in memory (log, slot, ACP session id, version, directory, what the agent offered); the client re-sends command, arguments and environment in a new `AGENT_RESTART`, so no secrets are stored and a profile edit applies; a deleted profile means no recovery. Kept until the zone closes, or as exits are kept for an absent owner today. A lost holder is recoverable too. Client protocol 4 is amended in place, since the `agents-*` changes ship in one release.
+4. Exited zones aren't recorded for session restore, and the state file gains no field. `AgentState::Ready` gains no session id: the conversation is its own transcript event.
+5. A turn in flight ends failed ("the agent exited"), stays in the log and is never resubmitted or offered for it; a held prompt can be sent again once the continued agent is ready.
+6. As built: the exit cancels pending permissions, and a continued agent asks anew.
+7. Out of scope: the proposal-only change `agents-session-list`.
+8. v1 only: `session/load` and `session/resume` are called directly, and `agents-acp-v2` reshapes them later.
+
 ## What the full changes already say
 
 - `agents-sessions`, design decision 17: an exit gives `AgentState::Exited { code, stderr }`, then the session's `EXIT`; no restart; `session/load`/`session/resume` recovery is this change.
@@ -44,10 +54,10 @@ Open questions, to answer before a design:
 - None expected.
 
 ### Modified Capabilities
-- `agent-sessions` (added by `agents-sessions`): "The agent's exit is reported", and new requirements for recovering a session.
-- `agent-zones` (added by `agents-profiles`): "An agent that exits", "A disconnected endpoint" (a lost session), and the held prompt's send-again after a recovery.
-- `session-restore`: whether exited agent zones are recorded and recovered.
-- `terminal-server`: "Protocol versions", if recovery needs a new client message.
+- `agent-sessions` (added by `agents-sessions`): "The agent's exit is reported", "Transcript event forms are fixed for each protocol version", and new requirements for recovering a session.
+- `agent-zones` (added by `agents-profiles`): "An agent that exits", "A disconnected endpoint" (a lost session), "Sending a held prompt again, or discarding it", and new requirements for continuing a conversation.
+- `session-restore`: a new requirement that agent zones whose agent ended aren't restored.
+- `terminal-server` is unchanged: `AGENT_RESTART` joins client protocol 4, which "Protocol versions" already says adds agent sessions.
 
 ## Impact
 
@@ -55,4 +65,4 @@ Open questions, to answer before a design:
 - `remote-agent/src/server/`: keeping an ended agent session's state, and starting its agent again.
 - `transcript/` and `remote-protocol/`: possibly new agent states and a new client message, with transcript tests.
 - `src/agent/`, `src/session.rs`: the exited zone's recover action, and restore.
-- The fake ACP agent gains `loadSession`, `resume` and an exit on request, for server tests and e2e cases.
+- The fake ACP agent plays `loadSession`, `resume` and exits with its existing steps (`respond`, `send`, `exit`), for server tests and e2e cases.
