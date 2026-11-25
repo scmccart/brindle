@@ -50,7 +50,7 @@ See proposal.md for why. Facts this design rests on, from the code on `feat/agen
 | `Tool` (trigger, summary), `Diff` | components | `brindle-ui`, `ui/src/components/tool.rs`, `diff.rs` (new) |
 | `diff_added`, `diff_removed` | tokens | `ui/src/theme.rs`; values in `src/theme.rs` `ui_tokens` |
 
-Crate references don't change (`ports R1`, `R3`): no crate gains a dependency. `acp/{envelope, forms, dialect, diff, plain}.rs` and `acp/v1/*.rs` are whole pure modules and join `PURE_MODULES` (`fcis R2`, `R3`, `R7`).
+Crate references don't change (`ports R1`). One closed list does (`ports R3`): `brindle-remote-agent` gains `similar` (decision 4). `acp/{envelope, forms, dialect, diff, plain}.rs` and `acp/v1/*.rs` are whole pure modules and join `PURE_MODULES` (`fcis R2`, `R3`, `R7`).
 
 ## Decisions
 
@@ -126,14 +126,15 @@ Content items are decoded one by one from the raw JSON, as permission options ar
 
 ### 4. The line diff (`acp/diff.rs`, pure; `fcis R1`–`R3`, `process R8`)
 
-`pub fn hunks(old: &str, new: &str, budget: Budget) -> Diffed` where `Diffed { hunks: Vec<Hunk>, omitted: u32 }`.
+`pub fn hunks(old: &str, new: &str) -> Diffed` where `Diffed { hunks: Vec<Hunk>, omitted: u32 }`.
 
-- Lines are split at `\n`; a trailing `\r` stays part of the line (it is cleaned later with the rest). Common leading and trailing lines are skipped first, which makes the usual small edit of a large file cost its size once.
-- The middle is compared with Myers' algorithm over lines, with 3 lines of context, adjacent hunks merged.
-- **Bounded work.** `Budget { lines: 20_000, distance: 2_000 }`: when either side's middle has more lines than `lines`, or the edit distance passes `distance`, the middle becomes one hunk that removes the old middle and adds the new one. The result is always a correct diff, sometimes not a minimal one.
-- **Bounded size.** Hunk lines are kept until their text passes `ITEM_LIMIT` (decision 5); the rest are counted in `omitted`.
-- **Hand-written, no dependency.** The crate's closed list stays as it is and the static musl helper gains no code it doesn't use. *Rejected:* the `similar` crate (a new entry on `ports R3`'s list and in `Cargo.lock` for about 150 lines of code whose bounds we would still have to add).
-- Tests: `apply(old, hunks) == new` for a table of edits and for 10,000 deterministic pseudo-random pairs; every case of the budget; an added file (`old` absent) is one hunk of added lines; line numbers are 1-based and match the texts.
+- **The `similar` crate does the comparing** (the user's choice, 2026-11-25, over a hand-written Myers). Facts read from the crate's sources and `cargo info` on 2026-11-25: `similar` 3.2.1, Apache-2.0, `rust-version` 1.85 (the pin is 1.99.1); features `default = [std, text]`; every dependency (`bstr`, `hashbrown`, `serde`, `unicode-segmentation`, `web-time`) is optional. Its default `Algorithm::Myers` trims the common prefix and suffix, then follows Git's xdiff policy: it accepts a long snake once the search is expensive and forces a split at a size-dependent work limit, so its work is bounded without a deadline and its result is a correct, sometimes non-minimal, script.
+- **The dependency.** `similar = { version = "3.2.1", default-features = false, features = ["text"] }` on `brindle-remote-agent`, added with `cargo add similar@3.2.1 --no-default-features -F text -p brindle-remote-agent`. Without `std` the crate's deadline type is `()`, so it can't read a clock and `diff.rs` stays pure (`fcis R2`). If `text` turns out not to build without `std`, the default features are used instead and `diff.rs` never calls `deadline` or `timeout`, which the architecture check below pins. `CLAUDE.md`'s lock rule holds: `git diff Cargo.lock` shows exactly one added `[[package]]` and the one added name in `brindle-remote-agent`'s dependencies; anything else moved means reverting and pinning, never regenerating.
+- **The closed list and one door** (`ports R3`). `similar` joins `brindle-remote-agent`'s list in `tests/architecture.rs`, `ports R3`'s text and `.claude/rules/remote-agent.md`. Only `acp/diff.rs` names it (`only_the_diff_module_names_similar`, as only the ACP modules name the schema crate), so swapping the library touches one file. The static musl helper must still build, and its size is noted in the PR.
+- **No clock, so the same result twice.** No deadline or timeout is ever set: a time limit would make a restarted core compute different hunks from the same bytes (decision 14).
+- **What `diff.rs` adds around it.** `TextDiff::configure().algorithm(Algorithm::Myers).diff_lines(old, new)` and `grouped_ops(3)` give the groups; `diff.rs` turns each into a `Hunk` (1-based starts, each line without its line break; a trailing `\r` stays part of the line and is cleaned later with the rest), keeps lines until their text passes `ITEM_LIMIT` (decision 5) and counts the rest in `omitted`. As a guard on memory, texts with more than `MAX_DIFF_LINES` = 200,000 lines together aren't compared: the change becomes one hunk removing the old lines and adding the new, cut the same way.
+- Tests: `apply(old, hunks) == new` for a table of edits and for 10,000 deterministic pseudo-random pairs; an added file (`old` absent) is one hunk of added lines; line numbers are 1-based and match the texts; a text with and without a final line break; 50,000 lines against 50,000 unrelated lines finishes and is cut at `ITEM_LIMIT`; the `MAX_DIFF_LINES` guard; the same inputs give the same hunks twice.
+- *Rejected:* a hand-written Myers (no dependency, but our own code to get right where a maintained library already carries xdiff's safeguards); `similar`'s deadline (a clock in the reducer, and results that differ between runs).
 
 ### 5. Bounds (`railway R5`, `process R9`)
 
@@ -251,7 +252,7 @@ Tool content is in the transcript, so it is checkpointed with it at the existing
 
 ### 15. Tests
 
-- **Unit:** the fold over every new event, error and bound; `fold(replay(t)) == t` with tool content; the fuzz corpus gains the new forms; `diff::hunks` (decision 4); `plain::feed` over split sequences, carriage returns and every escape form; `v1::decode` over each captured line and awkward ones (an item of the wrong shape, a diff with no `newText`, a 9 MiB text); the reducer's upsert, the permission's tool call, equal content emitting nothing; the model's parts, summaries, toggles, copy text and dump lines.
+- **Unit:** the fold over every new event, error and bound; `fold(replay(t)) == t` with tool content; the fuzz corpus gains the new forms; `diff::hunks` (decision 4); `only_the_diff_module_names_similar` and the closed list; `plain::feed` over split sequences, carriage returns and every escape form; `v1::decode` over each captured line and awkward ones (an item of the wrong shape, a diff with no `newText`, a 9 MiB text); the reducer's upsert, the permission's tool call, equal content emitting nothing; the model's parts, summaries, toggles, copy text and dump lines.
 - **Captures:** the replay test over `tests/fixtures/acp/` asserts what each agent's diff becomes, and gains the new captures of task 1.1.
 - **Real roles** (`remote-agent/tests/agents.rs`, the fake ACP agent): a diff and a streamed output reach an attached client; both survive a core restart mid-output and an upgrade.
 - **Architecture:** `acp_versions_stay_in_their_modules`; the pure modules.
@@ -262,11 +263,10 @@ Tool content is in the transcript, so it is checkpointed with it at the existing
 
 Each has a recommendation, which the text above already follows. They are the user's to settle before implementation.
 
-Decided on 2026-11-25: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6).
+Decided on 2026-11-25: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6); the diff comes from the `similar` crate, which the user chose over the recommended hand-written one (decision 4).
 
 Still open:
 
-2. **The diff algorithm:** hand-written and bounded (recommended), or the `similar` crate on `brindle-remote-agent`'s closed list.
 3. **Tool rows start closed, and a pending permission always shows its detail** (recommended). The alternative is rows that start open while a turn runs.
 4. **Raw input and result only when a call has no content** (recommended), or always under a second trigger.
 5. **The bounds** of decision 5, 64 KiB an item and 256 KiB a call: a single-file diff past about 1,000 changed lines shows its first 64 KiB and a count.
@@ -274,7 +274,8 @@ Still open:
 ## Risks / Trade-offs
 
 - A long diff is cut at 64 KiB → the row says how many lines aren't shown, and the agent's file is on disk to read.
-- The line diff isn't minimal past its budget → still correct, and bounded work on the core's thread is the point.
+- The line diff isn't always minimal (`similar` forces a split when a search gets expensive) → still correct, and bounded work on the core's thread is the point.
+- A new dependency in the helper that is copied to remote hosts → one package with no dependencies of its own, named in one file, with the lock diff and the musl build checked in the tasks.
 - Command output loses its colours → plain and legible; drawing it through the emulator is a later change.
 - The Claude adapter resends content with every update → each resend costs a diff on the core. The prefix and suffix skip makes that proportional to the file's size, and equal results emit nothing.
 - Amending protocol 4 assumes no release ships it first → decision 8 says what changes if one does.

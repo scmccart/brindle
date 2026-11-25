@@ -40,7 +40,7 @@ None.
 ## Impact
 
 - **`brindle-transcript`** (`transcript/`): `ToolItem`, `FileChange`, `Hunk`, `DiffLine`, `Output`, `Location`; `Entry::Tool`'s optional fields; `Event::ToolItems` and `Event::ToolOutput`; the fold's bounds; new `tests/fixtures/v4/` files (none edited); the fuzz corpus.
-- **`brindle-remote-agent`** (`remote-agent/src/acp/`): `wire.rs` and `rpc.rs` split into the version-free envelope and forms, `dialect.rs` and `v1/`; a pure line diff (`diff.rs`) and escape-sequence filter (`plain.rs`); the reducer's tool handling. No new dependency. The checkpoint's format number stays 1, amended (unreleased).
+- **`brindle-remote-agent`** (`remote-agent/src/acp/`): `wire.rs` and `rpc.rs` split into the version-free envelope and forms, `dialect.rs` and `v1/`; a line diff (`diff.rs`, over the `similar` crate, which joins the crate's closed dependency list and adds one package to `Cargo.lock`) and a pure escape-sequence filter (`plain.rs`); the reducer's tool handling. The static helper copied to remote hosts grows by that crate. The checkpoint's format number stays 1, amended (unreleased).
 - **`brindle`** (`src/agent/`): the chat model's tool detail, its parts and open state, the dump; the view's drawing and copy; a new action in `src/actions.rs`.
 - **`brindle-ui`** (`ui/`): `Tool` gains a trigger and a summary; a new `Diff` component; two tokens. Its dependency list is unchanged.
 - **Tests:** fixtures captured from real agents running an allowed edit and command, real-role tests through the fake ACP agent, and new `agent-tool-*` e2e cases. Existing agent e2e expectations change where the dump's tool line gains fields.

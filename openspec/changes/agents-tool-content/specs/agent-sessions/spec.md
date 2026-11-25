@@ -50,7 +50,7 @@ When the agent gives a file's old and new text, the server SHALL compute the fil
 
 #### Scenario: A very large rewrite
 - **WHEN** the agent reports a diff whose old and new text each hold 50,000 lines with nothing in common
-- **THEN** the server answers the agent's next message without delay, and the entry's file change removes old lines and adds new ones up to the item bound, with the rest counted as not kept
+- **THEN** the entry's file change removes old lines and adds new ones up to the item bound, with the rest counted as not kept, and the session carries on
 
 ### Requirement: Command output is kept as plain text
 A command's output SHALL be kept as one item: its command line and directory when the agent gives them, its text, and its exit status or signal once the agent reports one. Output the agent sends in pieces SHALL be appended to the item's text as it arrives, and attached clients SHALL be sent each piece. Escape sequences SHALL be removed from the text, including one split across two pieces; of a line holding carriage returns, only what follows the last one SHALL be kept.
