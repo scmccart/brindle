@@ -105,6 +105,13 @@ pub enum Phase {
     /// ([`Purpose::Authenticate`] in [`Rpc::outgoing`]), awaited however
     /// long it takes.
     LoggingIn { login: Login, method: String },
+    /// `AGENT_RESTART` while the agent needed a login (`agents-login`
+    /// decision 8): the agent is hung up, nothing more is read from it, and
+    /// once it has exited the core steps [`Input::Restart`] again to spawn
+    /// it anew with `start`. Should its exit be stepped instead (the
+    /// restart was dropped: the session closed, or its client left), it
+    /// ends as any agent does.
+    Restarting { start: Start },
     /// The start failed (another ACP version, or an error or unreadable
     /// answer to `initialize`, `session/new`, `session/resume` or
     /// `session/load`, or a continue the agent offers no way to make;
@@ -215,6 +222,10 @@ pub fn choose(log: Log, offered: Continuation) -> Choice {
 
 /// The notice an `AGENT_RESTART` adds before the agent starts again.
 pub const RESTARTED: &str = "the agent was started again to continue the conversation";
+
+/// The notice an `AGENT_RESTART` of an agent that needed a login adds
+/// (`agents-login` decision 8).
+pub const RESTARTED_AFTER_LOGIN: &str = "the agent is started again after its login";
 
 /// The notice a fresh log's shown replay starts with.
 pub const REPLAY_SHOWN: &str =
@@ -333,6 +344,7 @@ impl AgentSession {
             | Phase::Ready { .. }
             | Phase::LoginRequired(_)
             | Phase::LoggingIn { .. }
+            | Phase::Restarting { .. }
             | Phase::Refused
             | Phase::Broken => false,
         };
@@ -350,6 +362,12 @@ impl AgentSession {
                 .transcript
                 .conversation()
                 .is_some_and(|conversation| conversation.continuation.continuable())
+    }
+
+    /// Whether the agent runs and waits for a login (`agents-login`): an
+    /// `AGENT_RESTART` is taken then, as well as once it has ended.
+    pub fn needs_login(&self) -> bool {
+        matches!(self.phase, Phase::LoginRequired(_))
     }
 
     /// The stdout line in progress and the bytes fed, for the checkpoint.
@@ -394,7 +412,9 @@ pub enum Input<'a> {
     Lost { message: &'a str },
     /// `AGENT_RESTART`: the agent ended and is spawned again to continue
     /// its conversation in this log. Refused unless
-    /// [`AgentSession::continuable`].
+    /// [`AgentSession::continuable`], or the agent needs a login
+    /// ([`Phase::LoginRequired`]): then it is hung up first
+    /// ([`Phase::Restarting`]), and stepped again once it has exited.
     Restart,
     /// A command from the client that has the session attached.
     Command(Command),
@@ -740,7 +760,8 @@ impl Step<'_> {
             | Phase::Initializing { .. }
             | Phase::Creating { .. }
             | Phase::Resuming { .. }
-            | Phase::Loading { .. } => Err(Refused::NotReady),
+            | Phase::Loading { .. }
+            | Phase::Restarting { .. } => Err(Refused::NotReady),
             Phase::Ready { session } => Ok(session.clone()),
             Phase::LoginRequired(_) => Err(Refused::LoginRequired),
             Phase::LoggingIn { .. } => Err(Refused::LoggingIn),
@@ -765,7 +786,8 @@ impl Step<'_> {
     }
 
     /// Whether the agent's lines are still read: not after a failed start,
-    /// a failed handling, an exit or a lost holder.
+    /// a failed handling, an exit or a lost holder, nor from an agent hung
+    /// up to be started again.
     fn reading(&self) -> bool {
         match self.s.phase {
             Phase::Spawning { .. }
@@ -776,7 +798,11 @@ impl Step<'_> {
             | Phase::Ready { .. }
             | Phase::LoginRequired(_)
             | Phase::LoggingIn { .. } => true,
-            Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost => false,
+            Phase::Restarting { .. }
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => false,
         }
     }
 
@@ -862,6 +888,7 @@ impl Step<'_> {
             | Phase::Ready { .. }
             | Phase::LoginRequired(_)
             | Phase::LoggingIn { .. }
+            | Phase::Restarting { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -878,6 +905,7 @@ impl Step<'_> {
                 | Phase::Ready { .. }
                 | Phase::LoginRequired(_)
                 | Phase::LoggingIn { .. }
+                | Phase::Restarting { .. }
                 | Phase::Refused
                 | Phase::Broken
                 | Phase::Exited
@@ -955,6 +983,28 @@ impl Step<'_> {
     /// No checkpoint: the session has no holder until the spawn is placed,
     /// and [`Input::Spawned`] checkpoints before `initialize`.
     fn restart(&mut self) -> Result<(), Refused> {
+        match &self.s.phase {
+            Phase::LoginRequired(login) => {
+                let login = login.clone();
+                return self.restart_for_login(login);
+            }
+            Phase::Restarting { start } => {
+                let start = start.clone();
+                self.respawn(start);
+                return Ok(());
+            }
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
+            | Phase::Ready { .. }
+            | Phase::LoggingIn { .. }
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => {}
+        }
         if !self.ended() {
             return Err(Refused::NotEnded);
         }
@@ -964,19 +1014,55 @@ impl Step<'_> {
         let Some(conversation) = self.s.transcript.conversation().cloned() else {
             return Err(Refused::CannotContinue);
         };
+        self.respawn(Start::Continue {
+            conversation,
+            log: Log::Kept,
+        });
+        self.notice(NoticeLevel::Info, RESTARTED.to_owned());
+        self.agent(AgentState::Starting);
+        Ok(())
+    }
+
+    /// The agent is to be spawned again with `start`: the old agent's
+    /// requests are dead with it, its stdout's line is gone (the new
+    /// agent's holder session counts from 0), and the request ids go on.
+    fn respawn(&mut self, start: Start) {
         self.s.rpc.restart();
         self.s.lines = Lines::new();
         self.s.run = None;
         self.s.tools.clear();
         self.s.bad = None;
-        self.s.phase = Phase::Spawning {
-            start: Start::Continue {
-                conversation,
-                log: Log::Kept,
-            },
+        self.s.phase = Phase::Spawning { start };
+    }
+
+    /// `AGENT_RESTART` while the agent needs a login (`agents-login`
+    /// decision 8, after a terminal login): the running agent is hung up,
+    /// and the start it is to make again is kept. A start's demand makes
+    /// that start again (`session/new`, or the continue); a prompt's takes
+    /// up its ACP session as a kept log's continue, refused when the agent
+    /// offered no way to continue it. The log, the slot and the methods
+    /// stay; the agent is starting from here on.
+    fn restart_for_login(&mut self, login: Login) -> Result<(), Refused> {
+        let start = match login.then {
+            AfterLogin::Start(start) => start,
+            AfterLogin::Ready { session } => {
+                if !login.greeting.continuation.continuable() {
+                    return Err(Refused::CannotContinue);
+                }
+                Start::Continue {
+                    conversation: Conversation {
+                        id: session,
+                        cwd: self.s.cwd.clone(),
+                        continuation: login.greeting.continuation,
+                    },
+                    log: Log::Kept,
+                }
+            }
         };
-        self.notice(NoticeLevel::Info, RESTARTED.to_owned());
+        self.s.phase = Phase::Restarting { start };
+        self.notice(NoticeLevel::Info, RESTARTED_AFTER_LOGIN.to_owned());
         self.agent(AgentState::Starting);
+        self.out.hang_up = true;
         Ok(())
     }
 
@@ -1135,6 +1221,7 @@ impl Step<'_> {
             | Phase::Ready { .. }
             | Phase::LoginRequired(_)
             | Phase::LoggingIn { .. }
+            | Phase::Restarting { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1157,6 +1244,7 @@ impl Step<'_> {
             | Phase::Creating { .. }
             | Phase::LoginRequired(_)
             | Phase::LoggingIn { .. }
+            | Phase::Restarting { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1578,6 +1666,7 @@ impl Step<'_> {
             | Phase::Ready { .. }
             | Phase::LoginRequired(_)
             | Phase::LoggingIn { .. }
+            | Phase::Restarting { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1836,6 +1925,7 @@ impl Step<'_> {
             | Phase::Resuming { .. }
             | Phase::Loading { .. }
             | Phase::Ready { .. }
+            | Phase::Restarting { .. }
             | Phase::Refused
             | Phase::Broken
             | Phase::Exited
@@ -1968,7 +2058,11 @@ impl Step<'_> {
 
     fn answer(&mut self, entry: EntryId, option: Option<String>) -> Result<(), Refused> {
         match self.s.phase {
-            Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost => {
+            Phase::Restarting { .. }
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => {
                 self.readiness()?;
             }
             Phase::Spawning { .. }
@@ -5608,5 +5702,142 @@ mod tests {
         ] {
             assert_eq!(refused.to_string(), text);
         }
+    }
+
+    // agents-login 5.3: a restart while a login is needed.
+
+    #[test]
+    fn a_restart_at_a_starts_login_demand_hangs_up_then_sends_session_new_again() {
+        let mut agent = Agent::needing_login();
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert!(out.hang_up, "the running agent is hung up");
+        assert!(out.stdin.is_empty());
+        assert_eq!(out.checkpoint, None);
+        assert_eq!(shape(&out.events), ["added notice", "agent starting"]);
+        assert_eq!(
+            agent.notices().last().map(String::as_str),
+            Some(RESTARTED_AFTER_LOGIN)
+        );
+        assert_eq!(*agent.s.phase(), Phase::Restarting { start: Start::New });
+        assert!(!agent.s.continuable());
+        // Nothing is read from the agent being hung up, and nothing taken.
+        let n = agent.events.len();
+        agent.feed(&said("late words"));
+        assert_eq!(agent.events.len(), n);
+        assert_eq!(agent.prompt("hi").reply, Some(Err(Refused::NotReady)));
+        assert_eq!(
+            agent.login("oauth-personal").reply,
+            Some(Err(Refused::NoLoginNeeded))
+        );
+
+        // Its exit: the core steps the restart again, and the new agent
+        // starts as a new conversation, the request ids going on.
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert!(out.events.is_empty() && !out.hang_up);
+        assert_eq!(*agent.s.phase(), Phase::Spawning { start: Start::New });
+        agent.step(Input::Spawned);
+        let init = agent.last("initialize");
+        assert_eq!(init["id"], json!(3));
+        assert_eq!(
+            init["params"]["clientCapabilities"],
+            json!({"auth": {"terminal": true}})
+        );
+        agent.feed(&initialized_with_methods(3, both()));
+        assert_eq!(agent.last("session/new")["id"], json!(4));
+        let out = agent.feed(&result(4, json!({"sessionId": "s2"})));
+        assert_eq!(shape(&out.events), ["conversation", "agent ready"]);
+        assert_eq!(
+            *agent.s.phase(),
+            Phase::Ready {
+                session: "s2".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_restart_at_a_prompts_login_demand_takes_up_its_session_keeping_the_log() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        let log = agent.entries().len();
+        assert_eq!(agent.step(Input::Restart).reply, Some(Ok(())));
+        assert_eq!(
+            *agent.s.phase(),
+            Phase::Restarting {
+                start: Start::Continue {
+                    conversation: conversation_s1(Continuation::ResumeAndLoad),
+                    log: Log::Kept,
+                }
+            }
+        );
+        let id = agent.restart();
+        agent.feed(&initialized(id, resume_only()));
+        let resume = agent.last("session/resume");
+        assert_eq!(resume["params"]["sessionId"], json!("s1"));
+        assert_eq!(resume["params"]["cwd"], json!("/home/u/src"));
+        let out = agent.feed(&result(resume["id"].as_u64().expect("an id"), json!({})));
+        assert_eq!(shape(&out.events), ["conversation", "agent ready"]);
+        // The log (with its notice) and the held prompt are kept, and the
+        // held prompt goes again only by a resend.
+        assert_eq!(agent.entries().len(), log + 1);
+        assert_eq!(
+            *agent.s.transcript().slot(),
+            Slot::Held {
+                text: "two".into(),
+                reason: HoldReason::LoginRequired
+            }
+        );
+        assert_eq!(agent.cmd(Command::Resend).reply, Some(Ok(())));
+        assert_eq!(agent.last("session/prompt")["params"]["sessionId"], json!("s1"));
+    }
+
+    #[test]
+    fn a_restart_at_a_prompts_demand_is_refused_when_the_agent_cant_continue() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&initialized_with_methods(1, json!({})));
+        agent.feed(&result(2, json!({"sessionId": "s1"})));
+        let id = agent.turn("one");
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        let phase = agent.s.phase().clone();
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Err(Refused::CannotContinue)));
+        assert!(!out.hang_up && out.events.is_empty());
+        assert_eq!(*agent.s.phase(), phase);
+    }
+
+    #[test]
+    fn a_restart_while_logging_in_or_ready_is_refused() {
+        let mut agent = Agent::needing_login();
+        agent.login("oauth-personal");
+        assert_eq!(
+            agent.step(Input::Restart).reply,
+            Some(Err(Refused::NotEnded))
+        );
+        let mut ready = Agent::ready_with_methods();
+        assert_eq!(
+            ready.step(Input::Restart).reply,
+            Some(Err(Refused::NotEnded))
+        );
+    }
+
+    /// A restart dropped before the agent's exit (the session closed, its
+    /// client gone): the exit is stepped, and the agent ends as any does.
+    #[test]
+    fn an_exit_stepped_while_restarting_ends_the_agent() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        agent.step(Input::Restart);
+        agent.exit();
+        assert_eq!(*agent.s.phase(), Phase::Exited);
+        assert!(matches!(
+            agent.agent_state(),
+            AgentState::Exited { code: Some(1), .. }
+        ));
+        assert!(agent.s.continuable(), "its conversation can be continued");
     }
 }

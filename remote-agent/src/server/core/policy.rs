@@ -475,18 +475,23 @@ impl fmt::Display for RestartRefusal {
 }
 
 /// Why an `AGENT_RESTART` of `command` for a session in `life` is refused:
-/// only an ended agent whose conversation is `continuable` is started
-/// again, and it needs a command.
-pub(super) fn restart_refusal(life: &Life, continuable: bool, command: &str) -> Option<RestartRefusal> {
+/// only an ended agent whose conversation is `continuable`, or a running
+/// one that `needs_login` (OpenSpec change `agents-login`, decision 8), is
+/// started again, and it needs a command.
+pub(super) fn restart_refusal(
+    life: &Life,
+    continuable: bool,
+    needs_login: bool,
+    command: &str,
+) -> Option<RestartRefusal> {
     match life {
+        Life::AgentEnded { .. } if !continuable => return Some(RestartRefusal::CannotContinue),
         Life::AgentEnded { .. } => {}
+        Life::Running { .. } if needs_login => {}
         Life::Starting { .. }
         | Life::Running { .. }
         | Life::HungUp { .. }
         | Life::ExitedAwaitingOwner { .. } => return Some(RestartRefusal::NotEnded),
-    }
-    if !continuable {
-        return Some(RestartRefusal::CannotContinue);
     }
     command
         .trim()
@@ -1132,29 +1137,40 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_is_refused_unless_the_agent_ended_continuably_with_a_command() {
+    fn a_restart_is_refused_unless_the_agent_ended_continuably_or_needs_a_login_with_a_command() {
         for life in lives() {
             for continuable in [false, true] {
-                for command in ["", " ", "fake-agent"] {
-                    let expected = match (&life, continuable, command.trim().is_empty()) {
-                        (Life::AgentEnded { .. }, true, false) => None,
-                        (Life::AgentEnded { .. }, true, true) => {
-                            Some("AGENT_RESTART needs a command")
-                        }
-                        (Life::AgentEnded { .. }, false, _) => {
-                            Some("the agent can't continue this conversation")
-                        }
-                        (
-                            Life::Starting { .. }
-                            | Life::Running { .. }
-                            | Life::HungUp { .. }
-                            | Life::ExitedAwaitingOwner { .. },
-                            _,
-                            _,
-                        ) => Some("the agent hasn't ended"),
-                    };
-                    let refusal = restart_refusal(&life, continuable, command).map(|r| r.to_string());
-                    assert_eq!(refusal.as_deref(), expected, "{life:?} {continuable} {command:?}");
+                for needs_login in [false, true] {
+                    for command in ["", " ", "fake-agent"] {
+                        let no_command = command.trim().is_empty();
+                        let expected = match (&life, continuable, needs_login, no_command) {
+                            (Life::AgentEnded { .. }, true, _, false)
+                            | (Life::Running { .. }, _, true, false) => None,
+                            (Life::AgentEnded { .. }, true, _, true)
+                            | (Life::Running { .. }, _, true, true) => {
+                                Some("AGENT_RESTART needs a command")
+                            }
+                            (Life::AgentEnded { .. }, false, _, _) => {
+                                Some("the agent can't continue this conversation")
+                            }
+                            (Life::Running { .. }, _, false, _)
+                            | (
+                                Life::Starting { .. }
+                                | Life::HungUp { .. }
+                                | Life::ExitedAwaitingOwner { .. },
+                                _,
+                                _,
+                                _,
+                            ) => Some("the agent hasn't ended"),
+                        };
+                        let refusal = restart_refusal(&life, continuable, needs_login, command)
+                            .map(|r| r.to_string());
+                        assert_eq!(
+                            refusal.as_deref(),
+                            expected,
+                            "{life:?} {continuable} {needs_login} {command:?}"
+                        );
+                    }
                 }
             }
         }

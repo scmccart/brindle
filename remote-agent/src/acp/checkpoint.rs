@@ -219,6 +219,7 @@ fn phase_value(phase: &Phase) -> Value {
     match phase {
         Phase::Spawning { start } => with_start(json!({ "phase": "spawning" }), start),
         Phase::Initializing { start } => with_start(json!({ "phase": "initializing" }), start),
+        Phase::Restarting { start } => with_start(json!({ "phase": "restarting" }), start),
         Phase::Creating { greeting } => greeting_value("creating", greeting),
         Phase::Resuming {
             greeting,
@@ -528,6 +529,9 @@ fn restore_phase(phase: &Map<String, Value>) -> Result<Phase, Unreadable> {
             start: restore_start(phase)?,
         },
         "initializing" => Phase::Initializing {
+            start: restore_start(phase)?,
+        },
+        "restarting" => Phase::Restarting {
             start: restore_start(phase)?,
         },
         "creating" => Phase::Creating {
@@ -1086,6 +1090,10 @@ mod tests {
                     session: "s1".into(),
                 }),
                 method: "chat-gpt".into(),
+            },
+            Phase::Restarting { start: Start::New },
+            Phase::Restarting {
+                start: continuing(Log::Kept),
             },
             Phase::Refused,
             Phase::Broken,
