@@ -29,7 +29,7 @@
 //! [`Toggle`]: crate::components::Toggle
 
 use gpui::{
-    AnyView, App, AppContext, Context, FontWeight, IntoElement, ParentElement, Render, RenderOnce, SharedString,
+    AnyView, App, AppContext, Context, FontWeight, InteractiveElement, IntoElement, ParentElement, Render, RenderOnce, SharedString,
     StatefulInteractiveElement, Styled, Subscription, Window, div, prelude::FluentBuilder,
 };
 
@@ -159,6 +159,7 @@ impl RenderOnce for Tooltip {
         // gpui lays a tooltip out at its smallest size, so text that may
         // wrap would break at every word.
         div()
+            .debug_selector(|| "tooltip".into())
             .flex()
             .items_center()
             .gap(style.gap)

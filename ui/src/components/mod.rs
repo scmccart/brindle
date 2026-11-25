@@ -40,6 +40,7 @@ pub mod badge;
 pub mod button;
 pub mod card;
 pub mod checkbox;
+pub mod code_block;
 pub mod combobox;
 pub mod command;
 pub mod confirmation;
@@ -80,8 +81,10 @@ pub use badge::{Badge, BadgeContent, TITLE_KEEPS, kept_title};
 pub use confirmation::{Confirmation, ConfirmationAction, ConfirmationState};
 pub use reasoning::Reasoning;
 pub use response::{
-    Code, ColumnAlign, HeadingLevel, Inline, InlineError, InlineLink, ListItem, ListKind, RichBlock, RunStyle, Table, Task,
+    Code, ColumnAlign, HeadingLevel, Inline, InlineError, InlineLink, ListItem, ListKind, Response, RichBlock, RunBase,
+    RunStyle, Span, Table, Task, holds_modifiers, list_marker, spans, text_runs, tooltip_at,
 };
+pub use code_block::{COPY_CODE, CodeBlock, shown_code};
 pub use tool::{Tool, ToolStatus, tool_status_colors};
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
