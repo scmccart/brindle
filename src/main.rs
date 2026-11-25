@@ -53,7 +53,7 @@ use crate::remote::protocol::client::SessionInfo;
 use crate::settings::Settings;
 use crate::terminal_view::{PointerAction, PointerButton};
 use crate::session::{PendingWrite, SessionStore, WindowState};
-use crate::workspace::{Launch, LaunchRequest, Workspace};
+use crate::workspace::{Launch, LaunchRequest, LaunchWith, Workspace};
 
 const HELP: &str = "\
 Brindle — a GPU-accelerated terminal
@@ -365,6 +365,17 @@ pub struct AgentLaunch {
     pub prompt: Option<PromptArg>,
 }
 
+impl AgentLaunch {
+    /// The first prompt, once `main` has read `-p -`'s (a `Stdin` still
+    /// unread has none).
+    pub fn first_prompt(&self) -> Option<FirstPrompt> {
+        match &self.prompt {
+            Some(PromptArg::Text(prompt)) => Some(prompt.clone()),
+            Some(PromptArg::Stdin) | None => None,
+        }
+    }
+}
+
 /// A program and its arguments (`brindle terminal -e`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Command {
@@ -464,16 +475,25 @@ impl Args {
     }
 
     /// What the launch opens as its active tab, `profile` being the checked
-    /// profile of a terminal launch: nothing for bare `brindle`. An agent
-    /// launch opens nothing here: `main` refuses it until agent zones are
-    /// in the window (`agents-profiles` task 6.3).
-    fn opening(&self, profile: usize) -> Option<Opening> {
+    /// profile of a terminal or agent launch and `here` the directory the
+    /// launch runs in: nothing for bare `brindle`.
+    fn opening(&self, profile: usize, here: Option<PathBuf>) -> Option<Opening> {
         match &self.asked {
-            Asked::Window | Asked::Agent(_) => None,
+            Asked::Window => None,
             Asked::Terminal(launch) => Some(Opening::Tab(LaunchRequest {
                 profile,
-                command: launch.command.clone().map(|c| (c.program, c.args)),
+                with: launch.command.clone().map_or(LaunchWith::Profile, |c| LaunchWith::Command(c.program, c.args)),
                 cwd: launch.cwd.clone(),
+            })),
+            Asked::Agent(launch) => Some(Opening::Tab(LaunchRequest {
+                profile,
+                // Relative to where this launch runs: the agent's directory
+                // is the server's to resolve.
+                cwd: launch.cwd.as_ref().map(|d| match &here {
+                    Some(here) => here.join(d),
+                    None => d.clone(),
+                }),
+                with: LaunchWith::Agent { launched_in: here, first: launch.first_prompt() },
             })),
             Asked::Attach(session) => Some(Opening::Attach(*session)),
         }
@@ -587,10 +607,6 @@ fn shell_words(words: &[String], placeholder: &str) -> String {
 fn value_of(it: &mut impl Iterator<Item = String>, option: &str, what: &str) -> Result<String, String> {
     it.next().ok_or_else(|| format!("{option} needs {what}"))
 }
-
-/// What an agent launch says until agent zones are in the window
-/// (`agents-profiles` task 6.3), after its profile was checked.
-const AGENT_TABS_PENDING: &str = "agent tabs aren't connected to the window in this build of Brindle";
 
 /// `brindle agent`'s `-p VALUE`: `-` for standard input, else the prompt,
 /// or the usage error naming `option`.
@@ -1158,17 +1174,19 @@ fn forwarded_launch(
         instance::Forward::Terminal(launch) => {
             let profile = workspace::profile_for(config, TabKind::Terminal, launch.profile.as_deref(), config_error)
                 .map_err(Refusal::Usage)?;
-            let command = launch.command.map(|c| (c.program, c.args));
             // A command starts where it was typed, unless `-d` says
             // otherwise.
-            let cwd = launch.cwd.or_else(|| command.as_ref().and(request.launch_dir.clone()));
-            Ok(Some(Launch::Request(LaunchRequest { profile, command, cwd })))
+            let cwd = launch.cwd.or_else(|| launch.command.as_ref().and(request.launch_dir.clone()));
+            let with = launch.command.map_or(LaunchWith::Profile, |c| LaunchWith::Command(c.program, c.args));
+            Ok(Some(Launch::Request(LaunchRequest { profile, with, cwd })))
         }
         instance::Forward::Agent(launch) => {
-            workspace::profile_for(config, TabKind::Agent, launch.profile.as_deref(), config_error)
+            let profile = workspace::profile_for(config, TabKind::Agent, launch.profile.as_deref(), config_error)
                 .map_err(Refusal::Usage)?;
-            // Until agent zones are in the window (task 6.3).
-            Err(Refusal::Other(AGENT_TABS_PENDING.into()))
+            // `-d` was made absolute where the launch ran; without it, the
+            // profile's `cwd`, else that directory.
+            let with = LaunchWith::Agent { launched_in: request.launch_dir.clone(), first: launch.first_prompt() };
+            Ok(Some(Launch::Request(LaunchRequest { profile, with, cwd: launch.cwd })))
         }
     }
 }
@@ -1600,11 +1618,6 @@ fn main() {
     let (config, report) = Config::load_or_default();
     let profile = launch_profile(&args.asked, &config, report.error.is_some())
         .unwrap_or_else(|refusal| usage_error(&refusal.to_string()));
-    if let Asked::Agent(_) = &args.asked {
-        console_output();
-        eprintln!("brindle: {AGENT_TABS_PENDING}");
-        std::process::exit(1);
-    }
     let (forwarded, requests) = futures::channel::mpsc::unbounded::<Forwarded>();
     let mut socket = None;
     if lock.is_some()
@@ -1708,7 +1721,7 @@ fn main() {
         #[cfg(not(unix))]
         let _ = socket;
         // What the launch asked for opens as the active tab.
-        let asked = args.opening(profile);
+        let asked = args.opening(profile, std::env::current_dir().ok());
         // Before the wait: the endpoints of profiles that connect at launch
         // start connecting while this machine's listing runs.
         watch_hosts(cx);
@@ -2293,24 +2306,41 @@ mod tests {
         assert_eq!(terminal(&["terminal", "-d", "/srv"]).cwd, Some(PathBuf::from("/srv")));
     }
 
-    /// Bare `brindle` opens nothing of its own; `brindle terminal`, even
-    /// alone, asks for a tab; `--attach` for its session.
+    /// Bare `brindle` opens nothing of its own; `brindle terminal` and
+    /// `brindle agent`, even alone, ask for a tab; `--attach` for its
+    /// session.
     #[test]
     fn what_a_launch_opens_as_its_active_tab() {
+        let here = || Some(PathBuf::from("/work"));
         for args in [&[][..], &["--send", "x", "--dump-screen-after", "3"], &["--no-restore"]] {
-            assert!(parse(args).opening(0).is_none(), "{args:?}");
+            assert!(parse(args).opening(0, here()).is_none(), "{args:?}");
         }
-        let Some(Opening::Tab(tab)) = parse(&["terminal"]).opening(3) else { panic!("brindle terminal opens a tab") };
-        assert_eq!((tab.profile, tab.command, tab.cwd), (3, None, None));
-        let Some(Opening::Tab(tab)) = parse(&["terminal", "-d", "/tmp", "-e", "htop", "-d", "1"]).opening(1) else {
+        let Some(Opening::Tab(tab)) = parse(&["terminal"]).opening(3, here()) else {
+            panic!("brindle terminal opens a tab")
+        };
+        assert_eq!((tab.profile, tab.with, tab.cwd), (3, LaunchWith::Profile, None));
+        let Some(Opening::Tab(tab)) = parse(&["terminal", "-d", "/tmp", "-e", "htop", "-d", "1"]).opening(1, here())
+        else {
             panic!("a command opens a tab")
         };
         assert_eq!(
-            (tab.profile, tab.command, tab.cwd),
-            (1, Some(("htop".into(), vec!["-d".into(), "1".into()])), Some("/tmp".into()))
+            (tab.profile, tab.with, tab.cwd),
+            (1, LaunchWith::Command("htop".into(), vec!["-d".into(), "1".into()]), Some("/tmp".into()))
+        );
+        // An agent launch: the directory it runs in, `-d` relative to it,
+        // and its first prompt.
+        let Some(Opening::Tab(tab)) = parse(&["agent"]).opening(2, here()) else { panic!("brindle agent opens a tab") };
+        assert_eq!((tab.profile, tab.with, tab.cwd), (2, LaunchWith::Agent { launched_in: here(), first: None }, None));
+        let Some(Opening::Tab(tab)) = parse(&["agent", "Fake", "-d", "src", "-p", "hi"]).opening(1, here()) else {
+            panic!("brindle agent opens a tab")
+        };
+        let first = FirstPrompt::new("hi".into()).ok();
+        assert_eq!(
+            (tab.profile, tab.with, tab.cwd),
+            (1, LaunchWith::Agent { launched_in: here(), first }, Some("/work/src".into()))
         );
         #[cfg(any(target_os = "linux", windows))]
-        assert!(matches!(parse(&["--attach", "7"]).opening(0), Some(Opening::Attach(7))));
+        assert!(matches!(parse(&["--attach", "7"]).opening(0, here()), Some(Opening::Attach(7))));
     }
 
     #[test]
@@ -2470,6 +2500,54 @@ mod tests {
         };
     }
 
+    /// A forwarded `brindle agent` opens an agent tab: the instance checks
+    /// the profile against its own config (each refusal a usage error), and
+    /// the tab starts in `-d`, else as the profile and the directory the
+    /// launch ran in say, with the launch's first prompt.
+    #[test]
+    fn forwarded_agent_requests_open_agent_tabs() {
+        let config = Config::parse(
+            "default_profile = \"a\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"f\"\n",
+        )
+        .unwrap()
+        .config;
+        let request = |r: instance::Request| forwarded_launch(&r, &Listing::Skipped, &config, false).map(|l| l.map(opens));
+        let agent = |profile: Option<&str>, cwd: Option<&str>, prompt: Option<&str>| instance::Request {
+            kind: Some("agent".into()),
+            launch_dir: Some("/work".into()),
+            agent: Some(instance::AgentRequest {
+                profile: profile.map(str::to_string),
+                cwd: cwd.map(PathBuf::from),
+                prompt: prompt.map(str::to_string),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            request(agent(None, None, Some("hi"))),
+            Ok(Some(Opens::Agent(1, Some("/work".into()), Some("hi".into()), None))),
+            "the first agent profile, opened by the command"
+        );
+        assert_eq!(
+            request(agent(Some("Fake"), Some("/srv"), None)),
+            Ok(Some(Opens::Agent(1, Some("/work".into()), None, Some("/srv".into()))))
+        );
+        for (profile, says) in [
+            ("wrk", "no profile is named \"wrk\" (the profiles are: a, Fake)"),
+            ("a", "\"a\" is a terminal profile: open it with brindle terminal a"),
+        ] {
+            let Err(Refusal::Usage(refusal)) = request(agent(Some(profile), None, None)) else {
+                panic!("{profile}: a usage error")
+            };
+            assert_eq!(refusal.to_string(), says);
+        }
+        let shells = Config::parse("[[profiles]]\nname = \"a\"\n").unwrap().config;
+        let Err(Refusal::Usage(refusal)) = forwarded_launch(&agent(None, None, None), &Listing::Skipped, &shells, false)
+        else {
+            panic!("no agent profile: a usage error")
+        };
+        assert!(refusal.to_string().starts_with("the config has no agent profile"), "{refusal}");
+    }
+
     #[test]
     fn a_forwarded_unknown_profile_or_kind_is_refused() {
         let config = Config::parse("[[profiles]]\nname = \"Shell\"\n").unwrap().config;
@@ -2572,13 +2650,22 @@ mod tests {
     #[derive(Debug, PartialEq)]
     enum Opens {
         Tab(usize, Option<(String, Vec<String>)>, Option<PathBuf>),
+        /// An agent tab: its profile, the directory the launch ran in, its
+        /// first prompt and its `-d`.
+        Agent(usize, Option<PathBuf>, Option<String>, Option<PathBuf>),
         Restore(WindowState),
         Attach(u32, Result<SessionInfo, String>),
     }
 
     fn opens(launch: Launch) -> Opens {
         match launch {
-            Launch::Request(LaunchRequest { profile, command, cwd }) => Opens::Tab(profile, command, cwd),
+            Launch::Request(LaunchRequest { profile, with, cwd }) => match with {
+                LaunchWith::Profile => Opens::Tab(profile, None, cwd),
+                LaunchWith::Command(program, args) => Opens::Tab(profile, Some((program, args)), cwd),
+                LaunchWith::Agent { launched_in, first } => {
+                    Opens::Agent(profile, launched_in, first.map(|first| first.text().to_string()), cwd)
+                }
+            },
             Launch::Restore(window) => Opens::Restore(window),
             Launch::Attach { session, target } => Opens::Attach(session, target),
         }
@@ -2622,7 +2709,7 @@ mod tests {
     }
 
     fn htop() -> LaunchRequest {
-        LaunchRequest { profile: 1, command: Some(("htop".into(), vec![])), cwd: None }
+        LaunchRequest { profile: 1, with: LaunchWith::Command("htop".into(), vec![]), cwd: None }
     }
 
     #[test]

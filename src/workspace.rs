@@ -22,12 +22,14 @@ mod tabs;
 
 pub use tabs::{TabId, TabTarget};
 
-use self::launch::{NewTabCwd, new_tab_cwd};
+pub use self::launch::LaunchWith;
+use self::launch::{LaunchPlan, NewTabCwd, agent_cwd, launch_plan, new_tab_cwd};
 use self::notices::Notices;
 use self::overlays::{Opens, OverlayKind, PaletteRole, Toggle, toggle};
 use self::previews::Previews;
 use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
+use crate::agent::Agent;
 use crate::config::{Config, Profile, ProfileKey, ProfileKind};
 use crate::TabKind;
 use crate::config_edit;
@@ -196,16 +198,17 @@ impl Tab {
     }
 }
 
-/// What to run in a new tab.
+/// What to run in a new tab: profile `profile`, in `cwd` when given, with
+/// what the launch asks beyond it.
 pub struct LaunchRequest {
     pub profile: usize,
-    pub command: Option<(String, Vec<String>)>,
+    pub with: LaunchWith,
     pub cwd: Option<PathBuf>,
 }
 
 impl LaunchRequest {
     pub fn profile(profile: usize) -> Self {
-        Self { profile, command: None, cwd: None }
+        Self { profile, with: LaunchWith::Profile, cwd: None }
     }
 }
 
@@ -747,11 +750,11 @@ impl Workspace {
                         (None, Some(recorded)) => {
                             let profile = config.profiles[profile].clone();
                             let terminal = self.restored_terminal(&profile, &host, cwd, Some(&recorded), &config, cx);
-                            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
+                            self.insert_zone_tab(profile, host, ZoneStart::Terminal(terminal), true, window, cx);
                         }
                         // No record: the tab follows its profile.
                         (None, None) => {
-                            self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx)
+                            self.launch(LaunchRequest { profile, with: LaunchWith::Profile, cwd: Some(cwd) }, window, cx)
                         }
                     }
                     let Some(tab) = self.active_ix().and_then(|ix| self.tabs.get_mut(ix)) else { continue };
@@ -962,35 +965,34 @@ impl Workspace {
             log::warn!("no profile #{}", request.profile + 1);
             return;
         };
-        let command = request.command;
-        // New tabs follow the current directory only on the same endpoint,
-        // unless the destination profile pins one.
-        let cwd = match new_tab_cwd(request.cwd, &host, profile.cwd.is_some()) {
-            NewTabCwd::Given(cwd) => Some(cwd),
-            NewTabCwd::FollowActive => self.active_cwd_for(&host, cx),
-            NewTabCwd::ProfileDefault => None,
+        let start = match launch_plan(profile.kind(), request.with) {
+            LaunchPlan::Terminal { command } => {
+                // New tabs follow the current directory only on the same
+                // endpoint, unless the destination profile pins one.
+                let cwd = match new_tab_cwd(request.cwd, &host, profile.cwd.is_some()) {
+                    NewTabCwd::Given(cwd) => Some(cwd),
+                    NewTabCwd::FollowActive => self.active_cwd_for(&host, cx),
+                    NewTabCwd::ProfileDefault => None,
+                };
+                ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx)))
+            }
+            LaunchPlan::Agent { opened, first } => {
+                let cwd = agent_cwd(request.cwd, &host);
+                ZoneStart::Agent(cx.new(|cx| Agent::spawn(&profile, &host, cwd, opened, first, cx)))
+            }
         };
-
-        let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
-        let font_size = profile.font_size;
-        let theme = self.previews.theme_for(&profile, &config);
-        let p_clone = profile.clone();
-        let tree_host = host.clone();
-        let start = ZoneStart::Terminal(terminal);
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, start, window, cx));
-        let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
-        self.insert_tab(tab, None, window, cx);
+        self.insert_zone_tab(profile, host, start, true, window, cx);
     }
 
-    /// A tab on `host` showing `terminal` alone: inserted after the active
-    /// tab and activated when `activate`, else at the end. Attached and
-    /// restored sessions open this way: `host` is the one they run on.
-    fn insert_terminal_tab(
+    /// A tab on `host` showing `start`'s zone alone: inserted after the
+    /// active tab and activated when `activate`, else at the end. Launched,
+    /// attached and restored sessions open this way: `host` is the one
+    /// they run on.
+    fn insert_zone_tab(
         &mut self,
         profile: Profile,
         host: Host,
-        terminal: Entity<Terminal>,
+        start: ZoneStart,
         activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1000,7 +1002,6 @@ impl Workspace {
         let font_size = profile.font_size;
         let p_clone = profile.clone();
         let tree_host = host.clone();
-        let start = ZoneStart::Terminal(terminal);
         let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, start, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
@@ -1016,7 +1017,7 @@ impl Workspace {
 
     /// Opens a tab a sweep grouped from `host`'s detached sessions
     /// ([`crate::layout::group`]) at the end, with `profile`: one session as
-    /// [`Workspace::insert_terminal_tab`] does, several in their recorded
+    /// [`Workspace::insert_zone_tab`] does, several in their recorded
     /// split with its active zone focused, either way with the recorded
     /// title. It is activated only when it is the window's first tab.
     #[cfg(any(target_os = "linux", windows))]
@@ -1034,7 +1035,7 @@ impl Workspace {
         let id = match tab.into_single() {
             Ok(info) => {
                 let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
-                self.insert_terminal_tab(profile, host, terminal, activate, window, cx)
+                self.insert_zone_tab(profile, host, ZoneStart::Terminal(terminal), activate, window, cx)
             }
             Err(tab) => {
                 let (tree, leaves, active) = tab.into_tree();
@@ -2044,7 +2045,7 @@ impl Workspace {
             let index = crate::reattach::session_profile(&info, &host, &config, first.as_deref());
             let profile = config.profiles[index].clone();
             let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
-            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
+            self.insert_zone_tab(profile, host, ZoneStart::Terminal(terminal), true, window, cx);
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (host, info, window, cx);
@@ -2300,9 +2301,10 @@ impl Workspace {
         }
     }
 
-    /// The active terminal's visible screen text, for `--wait-for`.
+    /// What `--wait-for` matches in the active zone: the terminal's visible
+    /// screen text, or the agent zone's dump lines.
     pub fn active_screen_text(&self, cx: &App) -> Option<String> {
-        Some(self.active_tab()?.active_terminal(cx)?.read(cx).screen_text())
+        Some(self.active_tab()?.zones.read(cx).active_content()?.wait_text(cx))
     }
 
     /// Debug hook for `--dump-screen-after`.
@@ -2355,6 +2357,20 @@ impl Workspace {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&terminal.screen_text());
+        } else if let Some(agent) = self.active_tab().and_then(|t| t.zones.read(cx).describe_active_agent(cx)) {
+            // An agent zone (design.md decision 15): the fonts, progress,
+            // badges and zone lines, then its block in place of a screen.
+            out.push_str(&describe_fonts(cx));
+            out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_progress());
+            }
+            out.push_str(&describe_tab_badges(self.tabs.iter().map(|tab| tab.badge.as_ref())));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_badges());
+                out.push_str(&tab.zones.read(cx).describe_zones());
+            }
+            out.push_str(&agent);
         } else {
             out.push_str(&describe_fonts(cx));
         }
@@ -2806,9 +2822,14 @@ fn same_endpoint(tab: &Host, host: &Host) -> bool {
 /// still runs here.
 fn config_editor_launch(config: &Config, editor: (String, Vec<String>)) -> (LaunchRequest, Host) {
     let default = config.default_profile_index();
-    let local = |index: &usize| config.profiles.get(*index).is_some_and(|profile| Host::of(profile).is_local());
+    // A terminal profile: an agent tab runs no editor.
+    let local = |index: &usize| {
+        config.profiles.get(*index).is_some_and(|profile| {
+            Host::of(profile).is_local() && profile.kind() == ProfileKind::Terminal
+        })
+    };
     let profile = Some(default).filter(local).or_else(|| (0..config.profiles.len()).find(local)).unwrap_or(default);
-    (LaunchRequest { profile, command: Some(editor), cwd: None }, Host::Local)
+    (LaunchRequest { profile, with: LaunchWith::Command(editor.0, editor.1), cwd: None }, Host::Local)
 }
 
 /// A tab's profile once the config is reloaded: the config's profile of
@@ -3509,7 +3530,7 @@ mod tests {
     fn editor_tab(config: &Config) -> usize {
         let (request, host) = config_editor_launch(config, editor());
         assert_eq!(host, Host::Local);
-        assert_eq!(request.command, Some(editor()));
+        assert_eq!(request.with, LaunchWith::Command(editor().0, editor().1));
         assert_eq!(request.cwd, None);
         let profile = &config.profiles[request.profile];
         let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config, None);

@@ -627,6 +627,28 @@ impl ZoneContent {
         }
     }
 
+    /// The agent zone's dump block as zone `zone` (design.md decision 15),
+    /// with where its conversation is scrolled; `None` for a terminal.
+    pub fn describe_agent(&self, zone: ZoneId, cx: &App) -> Option<String> {
+        match self {
+            Self::Terminal(_) => None,
+            Self::Agent(view) => {
+                let view = view.read(cx);
+                let at_end = view.scroller().read(cx).follow() == brindle_ui::Follow::AtEnd;
+                Some(view.agent().read(cx).model().describe(zone.0, at_end))
+            }
+        }
+    }
+
+    /// What `--wait-for` matches: the terminal's screen, or the agent
+    /// zone's dump lines without its id and scroll position.
+    pub fn wait_text(&self, cx: &App) -> String {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.read(cx).screen_text(),
+            Self::Agent(view) => view.read(cx).agent().read(cx).model().wait_text(),
+        }
+    }
+
     /// Where the terminal's grid was last painted; `None` for an agent
     /// zone, whose size the tree estimates from its rectangle.
     fn grid(&self, cx: &App) -> Option<GridLayout> {
@@ -892,6 +914,11 @@ impl ZoneTreeView {
     /// The active zone's content.
     pub fn active_content(&self) -> Option<&ZoneContent> {
         Some(&self.zones.get(&self.active)?.content)
+    }
+
+    /// The active zone's agent dump block; `None` for a terminal zone.
+    pub fn describe_active_agent(&self, cx: &App) -> Option<String> {
+        self.active_content()?.describe_agent(self.active, cx)
     }
 
     pub fn active_id(&self) -> ZoneId {
@@ -1902,6 +1929,25 @@ mod tests {
         let agent = zone.agent.clone();
         let mut same = Tab::new(&mut app, fake, |_| ZoneStart::Agent(agent));
         assert_eq!(same.splits(), (true, true, vec![true, true]));
+    }
+
+    /// An agent tab a launch opened (`brindle agent -p hi`, task 6.3) sends
+    /// its first prompt once the agent is ready, and only then, once.
+    #[test]
+    fn a_launched_agent_tab_sends_its_first_prompt_once_ready() {
+        use crate::agent::test_support::{Call, Zone, app, ready, settle};
+        let mut app = app();
+        let mut zone = Zone::new(Some("hi"), &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), Vec::new(), "nothing before the agent is ready");
+        zone.feed(&[ready()]);
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), vec![Call::Prompt("hi".into())]);
+        zone.feed(&[ready()]);
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), Vec::new(), "sent once");
     }
 
     /// An agent zone whose agent exits stays open, its tab with it: the
