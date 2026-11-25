@@ -2104,6 +2104,102 @@ fn holders_and_restarted_cores_run_in_scopes_of_their_own() {
     assert!(unit.starts_with("brindle-serve-") && unit.ends_with(".scope"), "core in {unit}");
 }
 
+// Agent sessions kept for their conversation across core restarts
+// (OpenSpec change `agents-session-recovery`, task 3.5), on both platforms.
+
+mod agent_recovery {
+    use brindle_remote_protocol::SessionId;
+    use brindle_remote_protocol::client::ToClient;
+    use brindle_transcript::AgentState;
+
+    use super::support::fake_agent::{
+        Gate, RESUME_AND_LOAD, RESUME_ONLY, continuable, initialized, methods,
+    };
+    use super::support::*;
+
+    fn ready(log: &Transcript) -> bool {
+        matches!(log.agent(), AgentState::Ready { .. })
+    }
+
+    fn exited(log: &Transcript) -> bool {
+        matches!(log.agent(), AgentState::Exited { .. })
+    }
+
+    /// A core with a client of `token`, and a ready agent session that can
+    /// be continued, whose agent exits with status 1 once the gate opens.
+    fn ready_agent(tag: &str, token: &str) -> (TempDir, TestClient, SessionId, u32, Gate) {
+        let mut dir = TempDir::new(tag);
+        start_core(&dir.path, &[]).unwrap();
+        let mut client = TestClient::hello(&dir.path, token);
+        dir.track(client.core_pid());
+        let (mut script, _) = continuable(&dir.path, tag, RESUME_AND_LOAD);
+        let gate = script.gate();
+        script.step("exit 1");
+        let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+        dir.track(pid);
+        client.transcript_until(id, "is ready", ready);
+        // A round trip: the ready agent's checkpoint is in the holder's
+        // connection.
+        client.list();
+        (dir, client, id, pid, gate)
+    }
+
+    /// Kills the client's core and starts another; gives its client with
+    /// `token`.
+    fn kill_and_restart_core(dir: &mut TempDir, client: &mut TestClient, token: &str) -> TestClient {
+        kill(client.core_pid());
+        assert!(client.closes());
+        start_core(&dir.path, &[]).unwrap();
+        let client = TestClient::hello(&dir.path, token);
+        dir.track(client.core_pid());
+        client
+    }
+
+    #[test]
+    fn an_agent_adopted_after_a_core_kill_is_kept_at_its_exit_and_continued() {
+        let token = "token-agent-recovery-adopted";
+        let (mut dir, mut client, id, pid, gate) = ready_agent("agent-recovery-adopted", token);
+        let mut client = kill_and_restart_core(&mut dir, &mut client, token);
+        let (start, _) = client.reconnect_replay();
+        assert_eq!((start.session, start.pid), (id, pid));
+        let conversation = client.transcript(id).conversation().map(|conversation| conversation.id.clone());
+        assert_eq!(conversation.as_deref(), Some("s1"), "the checkpoint kept the conversation");
+
+        gate.open();
+        client.transcript_until(id, "has the agent's exit", exited);
+        let listed = client.list().into_iter().find(|info| info.session == id);
+        assert_eq!(listed.map(|info| info.pid), Some(0), "kept, with no program");
+
+        let (mut again, record) = initialized(&dir.path, "adopted-again", RESUME_ONLY);
+        again.step("expect session/resume").step("respond {}");
+        client.restart(id, &again.write()).unwrap();
+        client.transcript_until(id, "is ready again", ready);
+        if let Some(info) = client.list().into_iter().find(|info| info.session == id) {
+            dir.track(info.pid);
+        }
+        assert_eq!(methods(&record), ["initialize", "session/resume"]);
+    }
+
+    #[test]
+    fn an_ended_agent_session_ends_with_its_core() {
+        let token = "token-agent-recovery-ended";
+        let (mut dir, mut client, id, _, gate) = ready_agent("agent-recovery-ended", token);
+        gate.open();
+        client.transcript_until(id, "has the agent's exit", exited);
+        assert!(client.list().iter().any(|info| info.session == id), "kept");
+
+        let mut client = kill_and_restart_core(&mut dir, &mut client, token);
+        assert!(!client.list().iter().any(|info| info.session == id), "not listed");
+        // Nor given back: a replay would have come before the list.
+        while let Recv::Message(message) = client.next(std::time::Duration::ZERO) {
+            assert!(
+                !matches!(&message, ToClient::ReplayStart(start) if start.session == id),
+                "{message:?}"
+            );
+        }
+    }
+}
+
 /// The Windows tests of what the Linux-only ones above cover with a Unix
 /// shell: the same behaviour, over a pseudoconsole. A replay is compared
 /// with the session's output as an attached client saw it, since the

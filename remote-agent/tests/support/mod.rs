@@ -1261,6 +1261,30 @@ impl TestClient {
         self.agent_reply(req)
     }
 
+    /// `AGENT_RESTART` (change `agents-session-recovery`): the ended agent
+    /// is started again as the fake ACP agent playing `script`.
+    pub fn restart(&mut self, session: SessionId, script: &Path) -> Result<(), client::ErrorMessage> {
+        self.restart_with(session, FAKE_AGENT, &[&script.display().to_string()])
+    }
+
+    /// `AGENT_RESTART` of `command args`, with a minimal environment.
+    pub fn restart_with(
+        &mut self,
+        session: SessionId,
+        command: &str,
+        args: &[&str],
+    ) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentRestart(client::AgentRestart {
+            req,
+            session,
+            command: command.into(),
+            args: args.iter().map(|arg| arg.to_string()).collect(),
+            env: base_env(),
+        }));
+        self.agent_reply(req)
+    }
+
     /// `AGENT_CANCEL`, which has no reply (an `ERROR` without a `req` if
     /// it is refused).
     pub fn cancel(&mut self, session: SessionId) {

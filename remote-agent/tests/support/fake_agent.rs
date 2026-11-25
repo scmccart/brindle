@@ -144,6 +144,34 @@ pub fn started(dir: &Path, name: &str) -> (AgentScript, PathBuf) {
     (script, record)
 }
 
+/// What an agent's `initialize` may offer for continuing a conversation
+/// (OpenSpec change `agents-session-recovery`), as its `agentCapabilities`.
+pub const RESUME_AND_LOAD: &str = r#"{"loadSession":true,"sessionCapabilities":{"resume":{}}}"#;
+pub const LOAD_ONLY: &str = r#"{"loadSession":true}"#;
+pub const RESUME_ONLY: &str = r#"{"sessionCapabilities":{"resume":{}}}"#;
+pub const NEITHER: &str = r#"{}"#;
+
+/// A script whose agent answers `initialize` as `fake` 1.0 offering
+/// `capabilities` (one of [`RESUME_AND_LOAD`] and the others), its record
+/// kept; the test adds the rest (`session/new`, or a continue's
+/// `session/resume` or `session/load`). Gives it and the record's path.
+pub fn initialized(dir: &Path, name: &str, capabilities: &str) -> (AgentScript, PathBuf) {
+    let mut script = AgentScript::new(dir, name);
+    let record = script.record();
+    script.step("expect initialize").step(format!(
+        r#"respond {{"protocolVersion":1,"agentInfo":{{"name":"fake","version":"1.0"}},"agentCapabilities":{capabilities}}}"#
+    ));
+    (script, record)
+}
+
+/// As [`started`], offering `capabilities` in `initialize`: an agent whose
+/// conversation `s1` can be continued, unless it offers [`NEITHER`].
+pub fn continuable(dir: &Path, name: &str, capabilities: &str) -> (AgentScript, PathBuf) {
+    let (mut script, record) = initialized(dir, name, capabilities);
+    script.step("expect session/new").step(r#"respond {"sessionId":"s1"}"#);
+    (script, record)
+}
+
 /// A `send` step of a `session/update` for `s1` with `update`.
 pub fn update(update: Value) -> String {
     let message = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": update}});
@@ -153,6 +181,12 @@ pub fn update(update: Value) -> String {
 /// A `send` step of an agent message chunk.
 pub fn said(text: &str) -> String {
     update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}))
+}
+
+/// A `send` step of a user message chunk, as an agent's `session/load`
+/// replays one.
+pub fn user_said(text: &str) -> String {
+    update(json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": text}}))
 }
 
 /// A `send` step of a permission request with the JSON-RPC id `id` about

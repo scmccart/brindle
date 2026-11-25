@@ -24,7 +24,8 @@ use brindle_transcript::{
 };
 
 use support::fake_agent::{
-    AgentScript, Gate, ask, methods, prompts, recorded, responses, said, started, stop, update,
+    AgentScript, Gate, LOAD_ONLY, NEITHER, RESUME_AND_LOAD, RESUME_ONLY, ask, continuable,
+    initialized, methods, prompts, recorded, responses, said, started, stop, update, user_said,
 };
 use support::*;
 
@@ -1847,4 +1848,343 @@ fn a_truncated_tail_fails_the_turn_and_holds_the_waiting_prompt() {
     });
     assert_eq!(*log.slot(), held("two", HoldReason::OutputLost));
     assert_eq!(prompts(&record), ["one", "three"]);
+}
+
+// OpenSpec change `agents-session-recovery`, task 3.4: an agent that ended
+// is kept for its conversation and continued (`AGENT_RESTART`, or a
+// `SPAWN_AGENT` that names a conversation).
+
+/// The notice a restart adds to the log.
+const RESTARTED: &str = "the agent was started again to continue the conversation";
+
+fn agent_exited(log: &Transcript) -> bool {
+    matches!(log.agent(), AgentState::Exited { .. })
+}
+
+/// A session whose agent offers `capabilities`, answered prompt `one` with
+/// `first`, and exits with status 1 once the gate opens. Gives the session
+/// and the gate.
+fn one_turn_then_exit(client: &mut TestClient, dir: &mut TempDir, name: &str, capabilities: &str) -> (SessionId, Gate) {
+    let (mut script, _) = continuable(&dir.path, name, capabilities);
+    script.step("expect session/prompt").step(said("first")).step(stop("end_turn"));
+    let gate = script.gate();
+    script.step("exit 1");
+    let (id, _) = spawned(client, dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", ended(1));
+    (id, gate)
+}
+
+/// Waits until the session's log says its agent `is` what `done` checks,
+/// then asserts the session was kept: listed with activity `error` and no
+/// program, and no `EXIT` came.
+fn kept(client: &mut TestClient, id: SessionId, is: &str, done: impl FnMut(&Transcript) -> bool) -> Transcript {
+    let log = client.transcript_until(id, is, done);
+    let info = listed(client, id).expect("the ended session is still listed");
+    assert_eq!(info.agent.map(|agent| agent.activity), Some(AgentActivity::Error));
+    assert_eq!(info.pid, 0, "an ended session has no program");
+    let exits: Vec<ToClient> = already_sent(client)
+        .into_iter()
+        .filter(|message| matches!(message, ToClient::Exit(exit) if exit.session == id))
+        .collect();
+    assert!(exits.is_empty(), "{exits:?}");
+    log
+}
+
+/// A [`one_turn_then_exit`] session whose agent has exited and is kept.
+fn ended_and_kept(client: &mut TestClient, dir: &mut TempDir, name: &str, capabilities: &str) -> SessionId {
+    let (id, gate) = one_turn_then_exit(client, dir, name, capabilities);
+    gate.open();
+    let log = kept(client, id, "has the agent's exit", agent_exited);
+    assert_eq!(log.conversation().map(|conversation| conversation.id.as_str()), Some("s1"));
+    id
+}
+
+/// Waits for the continued agent to be ready, and tracks its process.
+fn ready_again(client: &mut TestClient, dir: &mut TempDir, id: SessionId) -> Transcript {
+    let log = client.transcript_until(id, "is ready again", ready);
+    let pid = listed(client, id).expect("listed").pid;
+    assert_ne!(pid, 0);
+    dir.track(pid);
+    log
+}
+
+#[test]
+fn an_exit_is_kept_for_its_conversation_and_continued_by_resume() {
+    let (mut dir, mut client) = agent_core("agent-continue-resume", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "resume", RESUME_AND_LOAD);
+    let cwd = listed(&mut client, id).and_then(|info| info.cwd).expect("its directory");
+
+    let (mut again, record) = initialized(&dir.path, "resume-again", RESUME_ONLY);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("second"))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    assert_in_order(&client.events(id), &[
+        "state Exited",
+        &format!("notice {RESTARTED}"),
+        "state Starting",
+        "conversation s1",
+        "state Ready",
+    ]);
+    // The new agent was sent `initialize`, then `session/resume` for the
+    // conversation in its directory, with no MCP servers; never
+    // `session/new`.
+    let sent = recorded(&record);
+    assert_eq!(methods(&record), ["initialize", "session/resume"]);
+    assert_eq!(sent[1]["params"], json!({"sessionId": "s1", "cwd": cwd, "mcpServers": []}));
+    // Listed with the command it was continued with.
+    let info = listed(&mut client, id).expect("listed");
+    assert!(info.command.contains("resume-again.script"), "{}", info.command);
+    assert_eq!(info.cwd.as_deref(), Some(cwd.as_str()));
+
+    // Entry ids follow the log's last.
+    let next = log.next_id();
+    client.prompt(id, "two").unwrap();
+    let log = client.transcript_until(id, "has the second turn", ended(2));
+    assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: second"]);
+    let two = log
+        .entries()
+        .find_map(|(entry, kept)| matches!(kept, Entry::User { text } if text == "two").then_some(entry));
+    assert_eq!(two, Some(next));
+    assert_eq!(prompts(&record), ["two"]);
+}
+
+#[test]
+fn a_load_only_agent_continues_with_its_replay_muted() {
+    let (mut dir, mut client) = agent_core("agent-continue-load", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "load", LOAD_ONLY);
+
+    let (mut again, record) = initialized(&dir.path, "load-again", LOAD_ONLY);
+    again
+        .step("expect session/load")
+        .step(user_said("one"))
+        .step(said("first"))
+        .step(said(" again"))
+        .step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    assert_eq!(methods(&record), ["initialize", "session/load"]);
+    // The turn once, and the notice.
+    assert_eq!(says(&log), ["user: one", "agent: first"]);
+    assert_eq!(
+        notices(&log).last().map(String::as_str),
+        Some("conversation continued; the agent's replay of 3 updates wasn't shown")
+    );
+}
+
+#[test]
+fn a_holder_killed_under_a_continuable_agent_leaves_it_to_continue() {
+    let (mut dir, mut client) = agent_core("agent-continue-holder", &[]);
+    let (script, _) = continuable(&dir.path, "holder", LOAD_ONLY);
+    let (id, pid) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    let holder = parent(pid).expect("the agent's holder");
+    kill(holder);
+
+    let log = kept(&mut client, id, "has lost the agent", |log| matches!(log.agent(), AgentState::Lost { .. }));
+    assert_eq!(*log.agent(), AgentState::Lost { message: "its holder ended".into() });
+
+    let (mut again, record) = initialized(&dir.path, "holder-again", LOAD_ONLY);
+    again.step("expect session/load").step(said("hello")).step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    assert_eq!(methods(&record), ["initialize", "session/load"]);
+    assert_eq!(
+        notices(&log).last().map(String::as_str),
+        Some("conversation continued; the agent's replay of 1 update wasn't shown")
+    );
+}
+
+#[test]
+fn a_continuing_spawn_folds_the_agents_replay_into_a_new_log() {
+    let (mut dir, mut client) = agent_core("agent-continue-fresh", &[]);
+    let (mut script, record) = initialized(&dir.path, "fresh", RESUME_AND_LOAD);
+    script.step("expect session/load").step(user_said("hi")).step(said("hello")).step("respond {}");
+    let cwd = dir.path.display().to_string();
+    let spawn = client::SpawnAgent {
+        conversation: Some(client::AgentConversation { id: "s1".into(), cwd: cwd.clone() }),
+        ..client_agent(&script.write())
+    };
+    let (id, _) = spawned(&mut client, &mut dir, spawn);
+    let log = client.transcript_until(id, "is ready", ready);
+
+    assert_eq!(
+        notices(&log),
+        ["this continues an earlier conversation; what follows is the agent's replay of it"]
+    );
+    assert_eq!(says(&log), ["user: hi", "agent: hello"]);
+    let conversation = log.conversation().expect("the conversation");
+    assert_eq!((conversation.id.as_str(), conversation.cwd.as_str()), ("s1", cwd.as_str()));
+    assert_eq!(methods(&record), ["initialize", "session/load"]);
+    assert_eq!(recorded(&record)[1]["params"], json!({"sessionId": "s1", "cwd": cwd, "mcpServers": []}));
+    assert_eq!(listed(&mut client, id).and_then(|info| info.cwd), Some(cwd));
+}
+
+/// Continues an ended session with an agent whose script is `steps` after
+/// `initialize` (offering `capabilities`): its start fails with a message
+/// `failure` checks, and the session ends; the agent was sent the methods
+/// `sent`, and nothing else.
+fn continue_fails(tag: &str, capabilities: &str, steps: &[&str], sent: &[&str], failure: impl FnOnce(&str)) {
+    let (mut dir, mut client) = agent_core(tag, &[]);
+    let id = ended_and_kept(&mut client, &mut dir, tag, RESUME_AND_LOAD);
+    let (mut again, record) = initialized(&dir.path, &format!("{tag}-again"), capabilities);
+    for step in steps {
+        again.step(*step);
+    }
+    client.restart(id, &again.write()).unwrap();
+    exit_of(&mut client, id);
+    match agent_states(&client.events(id)).last() {
+        Some(AgentState::Failed { message }) => failure(message),
+        other => panic!("the last agent state is {other:?}"),
+    }
+    assert!(listed(&mut client, id).is_none());
+    assert_eq!(methods(&record), sent, "never session/new");
+}
+
+#[test]
+fn a_continue_offered_neither_fails_and_ends_the_session() {
+    continue_fails("agent-continue-neither", NEITHER, &[], &["initialize"], |message| {
+        assert_eq!(
+            message,
+            "the agent can't continue conversations: it offers neither session/load nor session/resume"
+        );
+    });
+}
+
+#[test]
+fn a_resume_error_fails_the_agent_and_ends_the_session() {
+    let steps = ["expect session/resume", r#"respond-error -32603 "no such session""#];
+    let sent = ["initialize", "session/resume"];
+    continue_fails("agent-continue-unknown", RESUME_AND_LOAD, &steps, &sent, |message| {
+        assert_eq!(message, "the agent couldn't continue the conversation: no such session");
+    });
+}
+
+#[test]
+fn a_turn_in_flight_is_never_sent_again_and_a_held_prompt_is_once_ready() {
+    let (mut dir, mut client) = agent_core("agent-continue-held", &[]);
+    let (mut script, first) = continuable(&dir.path, "held", RESUME_AND_LOAD);
+    script.step("expect session/prompt");
+    let gate = script.gate();
+    script.step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "fix it").unwrap();
+    client.prompt(id, "next").unwrap();
+    prompted(&first, &["fix it"]);
+    gate.open();
+    let log = kept(&mut client, id, "has the agent's exit", agent_exited);
+    assert_eq!(*log.turn(), TurnState::Failed { message: "the agent exited".into() });
+    assert_eq!(*log.slot(), held("next", HoldReason::AgentStopped));
+
+    let (mut again, record) = initialized(&dir.path, "held-again", RESUME_AND_LOAD);
+    again.step("expect session/resume");
+    let resume = again.gate();
+    again
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("done"))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    // Not before the continued agent is ready.
+    let refused = client.resend(id).unwrap_err();
+    assert_eq!(refused.message, format!("session {id}: the agent isn't ready"));
+    resume.open();
+    ready_again(&mut client, &mut dir, id);
+    client.resend(id).unwrap();
+    let log = client.transcript_until(id, "has the resent prompt's turn", |log| says(log).contains(&"agent: done".to_owned()));
+    assert_eq!(*log.slot(), Slot::Empty);
+    prompted(&record, &["next"]);
+    assert_eq!(prompts(&first), ["fix it"]);
+}
+
+#[test]
+fn a_pending_permission_at_the_exit_stays_cancelled_after_a_continue() {
+    let (mut dir, mut client) = agent_core("agent-continue-permission", &[]);
+    let (mut script, first) = continuable(&dir.path, "permission", RESUME_AND_LOAD);
+    script.step("expect session/prompt").step(ask("perm-1"));
+    let gate = script.gate();
+    script.step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "write").unwrap();
+    client.transcript_until(id, "waits on the permission", blocked);
+    gate.open();
+    kept(&mut client, id, "has the agent's exit", agent_exited);
+
+    let (mut again, record) = initialized(&dir.path, "permission-again", RESUME_AND_LOAD);
+    again.step("expect session/resume").step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    let asked = permissions(&log);
+    let [(_, Entry::Permission { outcome, .. })] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(*outcome, Some(PermissionOutcome::Cancelled));
+    assert!(responses(&first).is_empty() && responses(&record).is_empty());
+}
+
+#[test]
+fn detaching_an_ended_session_ends_it() {
+    let (mut dir, mut client) = agent_core("agent-continue-detach", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "detach", RESUME_AND_LOAD);
+    client.detach(id);
+    assert!(listed(&mut client, id).is_none());
+}
+
+#[test]
+fn closing_an_ended_session_ends_it_with_its_exit() {
+    let (mut dir, mut client) = agent_core("agent-continue-close", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "close", RESUME_AND_LOAD);
+    client.send(client::ToCore::Close(client::SessionRef { session: id }));
+    assert_eq!(exit_of(&mut client, id).code, Some(1));
+    assert!(listed(&mut client, id).is_none());
+}
+
+#[test]
+fn a_restart_is_refused_while_the_agent_runs_and_from_a_client_without_it() {
+    let (mut dir, mut client) = agent_core("agent-continue-refused", &[]);
+    let (mut script, _) = continuable(&dir.path, "refused", RESUME_AND_LOAD);
+    let gate = script.gate();
+    script.step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    let (unused, record) = initialized(&dir.path, "refused-again", RESUME_AND_LOAD);
+    let unused = unused.write();
+
+    let refused = client.restart(id, &unused).unwrap_err();
+    assert_eq!((refused.session, refused.message), (Some(id), format!("session {id}: the agent hasn't ended")));
+    gate.open();
+    kept(&mut client, id, "has the agent's exit", agent_exited);
+    let mut other = TestClient::hello(&dir.path, "other");
+    let refused = other.restart(id, &unused).unwrap_err();
+    assert_eq!((refused.session, refused.message), (Some(id), format!("session {id} isn't attached to this client")));
+    let refused = client.restart_with(id, "  ", &[]).unwrap_err();
+    assert_eq!(refused.message, format!("session {id}: AGENT_RESTART needs a command"));
+    // Nothing was started.
+    assert!(!record.exists());
+    assert!(listed(&mut client, id).is_some());
+}
+
+#[test]
+fn an_unrunnable_restart_returns_the_session_to_ended_for_another_try() {
+    let (mut dir, mut client) = agent_core("agent-continue-unrunnable", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "unrunnable", RESUME_AND_LOAD);
+    client.restart_with(id, "brindle-no-such-agent", &[]).unwrap();
+    let log = kept(&mut client, id, "has the failed start", |log| {
+        matches!(log.agent(), AgentState::Exited { code: None, stderr } if !stderr.is_empty())
+    });
+    assert_eq!(notices(&log).last().map(String::as_str), Some(RESTARTED));
+
+    let (mut again, record) = initialized(&dir.path, "unrunnable-again", RESUME_AND_LOAD);
+    again.step("expect session/resume").step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    assert_eq!(methods(&record), ["initialize", "session/resume"]);
 }
