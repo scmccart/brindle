@@ -27,3 +27,8 @@ pub mod shared;
 // The chat model and the protocol gate: groups 4 and 5 use them.
 #[cfg_attr(not(test), allow(dead_code))]
 pub mod model;
+
+// The sink the connection's reader folds an agent session's transcript
+// through, and its zone's end: group 5's `Agent` entity drains it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub mod sink;

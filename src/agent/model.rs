@@ -45,6 +45,20 @@ pub enum StartFailure {
     Refused { command: String, cause: String },
 }
 
+/// For logs and the client's error chain; the zone words it with
+/// [`failure_text`].
+impl std::fmt::Display for StartFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoServer(cause) => write!(f, "no terminal server: {cause}"),
+            Self::TooOld { endpoint } => f.write_str(&too_old_text(endpoint)),
+            Self::Refused { command, cause } => write!(f, "the agent {command} didn't start: {cause}"),
+        }
+    }
+}
+
+impl std::error::Error for StartFailure {}
+
 /// Whether a connection that agreed on client `protocol` can start an
 /// agent session on `endpoint`: only protocol 4 and up carry
 /// `SPAWN_AGENT`, so an older server is refused before anything is sent.
