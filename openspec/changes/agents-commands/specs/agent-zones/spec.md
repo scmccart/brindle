@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Slash command completion
-When the prompt input's text starts with `/` and the cursor is in its first word, an agent zone SHALL list above the input the commands that match the word typed after `/`: the agent's commands and Brindle's option commands, each with its input hint and description, commands whose names start with the word first. The list SHALL follow the text as the user types, and SHALL NOT show when no command matches.
+When the first character of the prompt input's text that isn't whitespace is `/` and the cursor is in that word, an agent zone SHALL list above the input the commands that match the word typed after `/`: the agent's commands and Brindle's option commands, each with its input hint and description, commands whose names start with the word first. The list SHALL follow the text as the user types, and SHALL NOT show when no command matches.
 
 #### Scenario: Typing a slash
 - **WHEN** the agent offers `compact`, `context` and `review`, and the user types `/`
@@ -22,6 +22,25 @@ When the prompt input's text starts with `/` and the cursor is in its first word
 #### Scenario: A slash later in the text
 - **WHEN** the user types `see src/main.rs`
 - **THEN** no list shows
+
+#### Scenario: A space typed first
+- **WHEN** the user types a space and then `/co`
+- **THEN** the list shows `compact` and `context`, as it does without the space
+
+### Requirement: Whitespace before a slash command makes no difference
+A prompt whose first character other than whitespace is `/` SHALL be treated as if that whitespace weren't there: an option command SHALL be carried out, and any other SHALL be sent to the agent without the whitespace before the `/`.
+
+#### Scenario: An option command after a space
+- **WHEN** the user sends ` /mode plan`, with a space before the slash
+- **THEN** the agent is asked for the plan mode, and receives no prompt
+
+#### Scenario: An agent's command after a space
+- **WHEN** the agent offers the command `compact` and the user sends ` /compact`, with a space before the slash
+- **THEN** the agent receives the prompt `/compact`
+
+#### Scenario: Other prompts keep their whitespace
+- **WHEN** the user sends a prompt whose first line is indented code
+- **THEN** the agent receives it with its indentation
 
 ### Requirement: Choosing a slash command
 While the command list shows, up and down SHALL move its highlight, enter and tab SHALL replace the typed word with the highlighted command's name followed by a space, and escape SHALL close the list until the text stops being a command word; none of these SHALL send the prompt, move keyboard focus or stop a turn. A press on a row SHALL choose that command. A chosen command of the agent's SHALL be sent only when the user sends the prompt, as text.
@@ -54,15 +73,15 @@ An agent zone SHALL offer one slash command of Brindle's own for each session op
 - **THEN** `/model` in the list is the agent's command, and sending `/model x` sends that text to the agent
 
 ### Requirement: Option commands stay in Brindle
-A prompt that is an option command SHALL be carried out by Brindle, and SHALL NOT be sent to the agent, queued or added to the conversation as a user message. Text that doesn't start with `/`, and text of more than one line, SHALL always be sent as it is.
+A prompt that is an option command SHALL be carried out by Brindle, and SHALL NOT be sent to the agent, queued or added to the conversation as a user message. A prompt with more lines after the command's line SHALL NOT be an option command, and SHALL be sent as a prompt.
 
 #### Scenario: Not a user message
 - **WHEN** the user sends `/mode plan` and the agent confirms the plan mode
 - **THEN** the agent received a request to set the mode and no prompt, and the conversation has no user message `/mode plan`
 
-#### Scenario: A leading space
-- **WHEN** the user sends ` /mode plan`, with a space before the slash
-- **THEN** the agent receives that text as a prompt
+#### Scenario: More lines follow
+- **WHEN** the user sends two lines, `/mode plan` and `then refactor it`
+- **THEN** the agent receives both lines as one prompt, and no option is set
 
 ### Requirement: Setting an option with its command
 After an option command and a space, the list SHALL show that option's choices that match the rest of the line, by name or value, without regard to case, all of them when nothing follows, with the current choice highlighted first. Enter SHALL ask the server to set the highlighted choice and empty the prompt input. An option command SHALL be carried out while a turn is running.
