@@ -55,6 +55,21 @@ jobs:
           retention-days: 14
       - name: Release archive
         run: scripts/package-linux.sh
+      # The archive holds exactly the files scripts/package-linux.sh names,
+      # so nothing else this build makes (the tests' fake ACP agent, say)
+      # slips in. A change to what it packs changes this list with it.
+      - name: Release archive contents
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          name=brindle-$version-x86_64-unknown-linux-gnu
+          expected=$(printf '%s\n' "$name/" "$name/LICENSE-APACHE" "$name/LICENSE-MIT" "$name/brindle" "$name/brindle-remote-linux-x86_64" | LC_ALL=C sort)
+          actual=$(tar -tzf "target/dist/$name.tar.gz" | LC_ALL=C sort)
+          echo "$actual"
+          if [ "$actual" != "$expected" ]; then
+            echo "the archive's files aren't the expected ones:" >&2
+            diff <(echo "$expected") <(echo "$actual") >&2 || true
+            exit 1
+          fi
       # The one-command installer as a release publishes it (release.yml
       # stamps scripts/get.sh as install.sh), read from stdin as `curl | sh`
       # runs it, against this archive in a local release directory and into
