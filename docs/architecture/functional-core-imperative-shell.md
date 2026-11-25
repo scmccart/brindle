@@ -81,6 +81,10 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | `src/terminal/dir_check.rs` | whether the directory a local program last reported exists, from checks the terminal runs off the UI thread: which directory to check next, one at a time, and which answer still counts |
 | `src/notify/policy.rs` | whether to notify, the notification's text, rate limits |
 | `src/agent/transcript.rs` | the app's one door to `brindle-transcript` (its re-exports), and the status a live or listed agent session's activity shows |
+| `src/agent/spawn.rs` | what an agent session's start asks for: its command, directory and environment, local or remote |
+| `src/agent/close.rs` | whether closing zones asks first (a working or blocked agent among them), and the question's words |
+| `src/agent/shared.rs` | the fold an agent session's reader and its zone share: the transcript from the server's events, and what changed since the zone last looked |
+| `src/agent/model.rs` | everything an agent zone shows and decides: its blocks and their splices, the queue row, the failure alert, the prompt's status and sends, the first prompt, thoughts, permissions, status, notices, title and dump; and whether a server's protocol can start an agent session |
 | `src/layout.rs` | the layout a tab is detached with (`record`), and which tabs and splits a launch rebuilds from them (`group`) |
 | `src/reattach.rs` | which profile a session takes, which sessions are swept into tabs, which endpoints stay connected |
 | `src/workspace/{tabs,launch,overlays,previews,notices}.rs` | which tab is active once one is added, removed, switched to or moved, and where a new one goes; the directory a new tab starts in; what asking for an overlay does while another shows; the theme and profile a tab shows while the settings dialog previews them; which transient notices the config line shows, and when the next one goes |
