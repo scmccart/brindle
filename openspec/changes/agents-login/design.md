@@ -203,6 +203,8 @@ enum Offer {
 - Focus stops join the zone's `FocusStops` after the queue row's and before permission rows': `login:<id>` per enabled method, or `login:cancel`. Nothing takes focus when the row appears (`agent-zones`, "Nothing is answered for the user" applies by analogy).
 - A choice sends `AGENT_LOGIN` (`Session::login`, `Sent::Login`); an `ERROR` reply shows its text beside the row, as a refused prompt's does. A press while a request is in flight does nothing.
 
+**As built (2026-11-25, tasks 6.1 and 7.2).** `Running` is `Running { method, name, terminal }` (`terminal` for a terminal login, decision 9), and `Offer` is named `MethodOffer` (`Agent`, `Terminal(TerminalLogin)`, `Withheld(Withheld)`, in `login.rs`), since recovery's continue offer is already `Offer`. The split text is two variants, `DisabledWhy::LoginRequired` ("the agent needs a login") and `LoginElsewhere` (today's command-line words), and `failure_text` takes whether any method is usable. A refused `AGENT_LOGIN` is `ChatModel::login_note`, shown under the row's title (and cleared by the next choice or once the agent needs no login). The row sits above the prompt input with the alert, not in the conversation list. `Confirmation` had no per-action description, so `ConfirmationAction` gained `description` (plain text under the button; any description stacks the actions) and `disabled` (muted, no stop, asking nothing), with a gallery check and a `ui-components` delta requirement. A method's description shows the agent's text, then a terminal login's `shown()` or a withheld one's reason, joined by " · ".
+
 ### 7. Cancelling, timeouts, closing
 
 - **No timeout** anywhere: not in the reducer, the client or the row. A browser OAuth can take minutes.
@@ -228,6 +230,13 @@ Only if task 1.1 finds a terminal method. All decisions are pure, in `src/agent/
 - **Running it:** the agent zone asks its `ZoneView` for a login zone: a terminal zone split beside it (right, else down when too narrow, as `can_split` decides), started through `Terminal::spawn` on the tab's `Host` with the `TerminalLogin` as its command, in the agent session's directory, with close policy `kill`, marked as a login zone. A login zone is the one exception to "a tab starts zones of its own kind only" (`zones`), and it is never recorded in the session state or a detached layout: on quit its session is closed, not detached (`process R16`: done in the quit path). One login zone per agent zone at a time; while it runs the row is `Running` with "Cancel login" closing the zone.
 - **Its exit** closes the zone as any terminal zone's exit does. The agent entity watches it: status 0 sends `AGENT_RESTART` (decision 8); anything else shows the methods again with "the login program exited with status N" beside the row. A login zone the user closes is a cancel.
 
+**As built (2026-11-25, tasks 6.5 and 7.4).**
+- `terminal_login(command: &AgentCommand, args, env)` takes the profile's program and arguments and whether the host's variable names ignore case (`AgentCommand`, set on the model by the `Agent` entity from the profile and `LOCAL_ENV_IGNORES_CASE` on a local host), not `AgentProfileSpawn`. `TerminalLogin.env` holds only the method's applied variables (`appended` the method's own arguments, for the button); the zone runs `Terminal::spawn` with a clone of the profile whose `env` is `login::overlay(profile env, applied)`, so the base is the terminal spawn's environment (the profile's over Brindle's, the terminal variables kept, since the login runs in a terminal), not `agent_spawn_request`'s. The button's words are `shown()`: "Runs with ARGS; sets K=V, …; not applied: K, …".
+- The re-parse check (`reparses`) runs on every platform; a batch file, `cmd /c|/k` and `ssh` re-parse their arguments wherever the profile names them.
+- A terminal login is the client's alone: the server stays `LoginRequired` while it runs, and the model's `terminal_login` makes the row `Running { terminal: true }` and the prompt `Disabled(LoggingIn)`. So a quit or a crash while it runs leaves the agent needing a login, and the zone, restored, shows the methods again. `choose_login` refuses a second login while one runs. `cancel_login` returns `CancelLogin::CloseZone`, and the zone tree closes the login zone.
+- The exit status reaches the zone through a new `ChannelEvent::Exited(Option<i32>)` (the server's `EXIT` code, where the reader sent a bare alacritty `Exit` before) and `Terminal::exit_code`; no status (a signal) shows "the login program was ended by a signal". `ZoneTreeView` owns the zone (`Zone::login_for`, the agent zone's id): it subscribes to each agent zone's `LoginZone::{Open, Close}`, splits the agent zone (`login_axis`: right when the agent zone is wide enough, else down; the size check only, since the split plan's same-kind rule doesn't apply), focuses the new zone (the login asks for typing), and reports its exit (`LoginZoneEnd::Exited`) or its close (`Closed`) to the agent once. Closing the agent zone closes its login zone. The command override gives `Closing::Ends` with policy kill, and `recorded_leaves` leaves login zones out of `zone_records` and `session_keys`, so neither session restore nor a detached layout records them.
+- Status 0 restarts through `Agent::restart` with the profile found as recovery's continue finds it; a profile gone since shows `NoOffer::ProfileGone`'s words.
+
 ### 10. The `-p` first prompt after a login (`agent-zones`, "A launch's first prompt")
 
 The user decided the first prompt is sent automatically once a login succeeds. Exactly:
@@ -238,6 +247,8 @@ The user decided the first prompt is sent automatically once a login succeeds. E
 - A failed or cancelled login keeps it pending. The agent failing or exiting, the session being lost or ending, makes it a plain draft (`First::Draft`), as today.
 - **The dump** while it waits: `--- prompt status=disabled first="TEXT"` (TEXT escaped as the other dump strings), and `--- input text=TEXT …` as for any focused input.
 
+**As built (2026-11-25, tasks 6.2 and 7.2).** `First::Show` reaches the view as `AgentUpdate::SetDraft` (the input is read-only while disabled) and is given once (`first_shown`); `First::SendIfUnchanged` is `AgentUpdate::SendFirstIfUnchanged`, which the view answers with `Agent::send_first` when the input's text is exactly the prompt. A terminal login's restart keeps it pending too (`Starting`). In the dump `first=` comes before `refusal=` on the prompt line.
+
 ### 11. The dump and debug hooks (`testing R2`)
 
 - `--- agent zone=ID state=…` gains `logging-in`.
@@ -245,6 +256,8 @@ The user decided the first prompt is sent automatically once a login succeeds. E
 - Focus stops: `agent stop=login:ID` and `agent stop=login:cancel`.
 - `--wait-for` matches these lines as it matches the other agent lines (`wait_text`).
 - `CLAUDE.md`'s dump description is updated in the same task as the code (task 6.4).
+
+**As built (2026-11-25, task 6.3).** A withheld terminal method's line has `kind=terminal` and ` withheld="WHY"`; a terminal login running is `--- login running …` as an agent one. The last `--- login` line's ` refusal="…"` also carries a login program's exit ("the login program exited with status N"). The e2e harness reads the lines as agent lines (`AGENT_LINES` gains `login `, `Dump::agent_logins`).
 
 ### 12. Descriptions stay plain (`agents-markdown`)
 
