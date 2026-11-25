@@ -991,8 +991,16 @@ osc9 = true          # OSC 9
 osc777 = true        # OSC 777
 osc99 = true         # kitty's OSC 99, see below (off: no replies either)
 osc7501 = true       # program status (OSC 7501), see below
+agent = true         # agent tabs: a permission, a finished turn, a failure
 when = "unfocused"   # or "always"
 ```
+
+An agent tab notifies when its agent asks for a permission (with the request's
+title), ends a turn normally (`Done`) or fails (with the failure's message),
+titled with the agent's name and the tab's. The same focus rule and rate limits
+apply, and a conversation replayed when Brindle attaches to it again notifies
+nothing. `notifications.agent = false` keeps the tab's status dot and drops the
+notifications.
 
 #### kitty's notification protocol (OSC 99)
 

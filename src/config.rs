@@ -1052,6 +1052,22 @@ mod tests {
         assert_eq!(profile.description(), "agent · my-acp-agent");
     }
 
+    /// agents-profiles 7.2: the README's `[notifications]` example names
+    /// every source's key, each at its default, and parses as the defaults.
+    /// The destructuring fails to compile when a key is added, so the
+    /// README is updated with it.
+    #[test]
+    fn the_readme_notifications_example_names_every_key() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("```toml\n[notifications]\n").expect("the notifications example") + 8;
+        let toml = &readme[start..start + readme[start..].find("```").expect("the example's end")];
+        let config = parsed(toml).unwrap();
+        assert_eq!(config.notifications, NotificationConfig::default());
+        let NotificationConfig { bell: _, osc9: _, osc777: _, osc99: _, osc7501: _, agent: _, when: _ } = config.notifications;
+        let keys: Vec<&str> = toml.lines().skip(1).filter_map(|line| line.split_once(" =").map(|(key, _)| key)).collect();
+        assert_eq!(keys, ["bell", "osc9", "osc777", "osc99", "osc7501", "agent", "when"]);
+    }
+
     /// 8.5: the config examples in the README's remote section, together,
     /// load as the profiles they describe.
     #[test]
