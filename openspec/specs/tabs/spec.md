@@ -10,7 +10,7 @@ The user SHALL be able to:
 - open a new tab with the default profile (ctrl-shift-t, or the `+` button);
 - close the active tab (ctrl-shift-w, its `×` button, or a middle click).
 
-A local tab whose last remaining zone's program exits SHALL close. When a local tab has more than one zone and one zone's program exits, only that zone SHALL close, as defined by the `zones` capability. A new local tab SHALL open next to the active tab and become active.
+A local tab whose last remaining zone's program exits SHALL close. When a local tab has more than one zone and one zone's program exits, only that zone SHALL close, as defined by the `zones` capability. Closing a tab that holds an agent zone whose agent is working or waiting for permission SHALL ask first, as `agent-zones` defines. A new local tab SHALL open next to the active tab and become active.
 
 #### Scenario: Shell exit closes its tab
 - **WHEN** the user runs `exit` in a single-zone tab
@@ -23,6 +23,14 @@ A local tab whose last remaining zone's program exits SHALL close. When a local 
 #### Scenario: New tab position
 - **WHEN** the second of three tabs is active and the user opens a new tab
 - **THEN** the new tab appears third and is active
+
+#### Scenario: Close a tab with a working agent
+- **WHEN** a background tab's agent is running a turn and the user middle-clicks that tab
+- **THEN** a dialog asks first, the tab stays until the user confirms, and the active tab doesn't change
+
+#### Scenario: Default profile is an agent
+- **WHEN** the default profile is an agent profile and the user presses ctrl-shift-t
+- **THEN** a new agent tab of that profile opens
 
 ### Requirement: Window closes with its last tab
 Closing the last tab SHALL close the window, which quits Brindle. Closing the window, by its close button, the window manager or `Close Window`, SHALL quit Brindle, as defined by "Quitting keeps programs running".
@@ -263,7 +271,7 @@ A bell from a tab that is not active, or from any tab while the window is inacti
 - **THEN** a dot appears on that tab and disappears when the tab is activated
 
 ### Requirement: Program status dot
-A tab SHALL show a status dot while any of its zones holds a program status record (see the `program-status` capability) other than `idle`. The dot's colour SHALL follow the most pressing state across those records, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit before the title, at the face's left, followed by the bell dot when both apply.
+A tab SHALL show a status dot while any of its zones holds a program status record (see the `program-status` capability), or an agent zone status (see `agent-zones`), other than `idle`. The dot's colour SHALL follow the most pressing state across those records and statuses, in the order `blocked` (the theme's yellow, ANSI 3), `error` (red, ANSI 1), `done` (green, ANSI 2), `working` (the muted foreground). It SHALL sit before the title, at the face's left, followed by the bell dot when both apply.
 
 #### Scenario: Blocked in a background tab
 - **WHEN** a program in a background tab reports `state=blocked:kind=permission`
@@ -272,6 +280,10 @@ A tab SHALL show a status dot while any of its zones holds a program status reco
 #### Scenario: Zones in a tab
 - **WHEN** a program in one zone of a tab reports `state=error`, and another zone in the same tab reports `state=working`
 - **THEN** that tab shows a red dot
+
+#### Scenario: Agent waiting for permission
+- **WHEN** an agent zone in a background tab waits on a permission request, and the tab's other agent zone is running a turn
+- **THEN** that tab shows a yellow dot
 
 ### Requirement: Tab context menu
 Right-clicking a tab SHALL open a menu for that tab beside the pointer, listing Rename Tab, Move Tab Left, Move Tab Right and Close Tab. It SHALL NOT activate the tab: the active tab and the focus stay as they were, and closing the menu returns focus to the active tab. Move Tab Left SHALL be disabled on the first tab and Move Tab Right on the last. Each item SHALL do what the action of the same name does, but to the right-clicked tab rather than the active one, without activating it. Each item SHALL show that action's shortcut when it has one.

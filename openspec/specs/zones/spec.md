@@ -6,7 +6,7 @@ Split local tabs into a binary tree of zones with native controls around each zo
 ## Requirements
 
 ### Requirement: Splitting the active zone
-The user SHALL be able to split the active zone of a local tab in half horizontally (`Split Zone Right`, ctrl-shift-e, or the zone header's split-right button) or vertically (`Split Zone Down`, ctrl-shift-o, or the zone header's split-down button). The existing zone SHALL keep the left or top half, and a new terminal zone SHALL occupy the right or bottom half and receive keyboard focus.
+The user SHALL be able to split the active zone of a local tab in half horizontally (`Split Zone Right`, ctrl-shift-e, or the zone header's split-right button) or vertically (`Split Zone Down`, ctrl-shift-o, or the zone header's split-down button). The existing zone SHALL keep the left or top half, and a new zone of the tab's kind (a terminal zone in a terminal tab, an agent zone in an agent tab) SHALL occupy the right or bottom half and receive keyboard focus.
 
 #### Scenario: Split right with the shortcut
 - **WHEN** a local tab has one zone and the user presses ctrl-shift-e
@@ -20,8 +20,12 @@ The user SHALL be able to split the active zone of a local tab in half horizonta
 - **WHEN** a local tab is split right and the user presses ctrl-shift-o in the right zone
 - **THEN** the left zone occupies the left half of the tab and the right half contains two vertically stacked zones, with the bottom-right zone focused
 
+#### Scenario: Split an agent tab
+- **WHEN** an agent tab has one zone and the user presses ctrl-shift-e
+- **THEN** the right zone is a new agent zone, with its own agent session, and its prompt input has keyboard focus
+
 ### Requirement: New zone profile and working directory
-A zone created by splitting SHALL run the tab's profile and start in the working directory of the zone that was split, following the same working-directory rules as a new tab in `tabs`.
+A zone created by splitting SHALL run the tab's profile and start in the working directory of the zone that was split, following the same working-directory rules as a new tab in `tabs`. An agent zone's working directory SHALL be the one its agent session was started in. A tab SHALL start a zone only of its own kind: when the tab's profile, as the config has it now, is gone or of the other kind, splitting SHALL do nothing.
 
 #### Scenario: Split inherits working directory
 - **WHEN** the active zone's shell is in `~/src/brindle` and the user splits the zone right
@@ -30,6 +34,14 @@ A zone created by splitting SHALL run the tab's profile and start in the working
 #### Scenario: Split in a profile with a configured directory
 - **WHEN** a tab's profile sets `cwd = "/var/log"`, the active zone has changed to `/tmp`, and the user splits the zone down
 - **THEN** the new zone starts in `/tmp`
+
+#### Scenario: Agent split in the same directory
+- **WHEN** an agent zone's session was started in `~/src/brindle` and the user splits it down
+- **THEN** the new agent zone's session starts in `~/src/brindle`
+
+#### Scenario: Profile changed kind
+- **WHEN** a terminal tab's profile is changed to `type = "agent"` and saved, and the user splits the tab's zone
+- **THEN** no zone is created
 
 ### Requirement: Minimum size for splitting
 Splitting the active zone SHALL do nothing when the active zone's current bounds cannot fit two minimum 10-column by 2-row terminal grids together with the gap between the new cards, each card's border and each card's header bar. No terminal grid Brindle creates or resizes SHALL be narrower than 10 columns, so a pane narrower than that is laid out as 10 columns wide. Shrinking the window or restoring a saved session SHALL NOT remove existing zones when zones become smaller than this threshold.
@@ -84,7 +96,7 @@ While a local tab contains two or more zones, Brindle SHALL draw a native header
 - **THEN** the zone's header bar is drawn on `gruvbox-dark`'s background with its foreground and muted foreground for the title and buttons
 
 ### Requirement: Closing a zone
-Closing a zone (with `Close Zone`, ctrl-shift-x, its header `×` button, or when its terminal's program exits) SHALL shut down that zone's terminal and replace its parent split with the sibling subtree. Shutting down a local terminal SHALL end its program (see "Closing ends the program"). Focus SHALL move to the most recently focused zone in that sibling subtree. Closing or exiting the only zone in a tab SHALL close the tab. `Close Tab` (ctrl-shift-w) SHALL close the entire tab and all of its zones.
+Closing a zone (with `Close Zone`, ctrl-shift-x, its header `×` button, or when its terminal's program exits) SHALL shut down that zone's terminal or agent session and replace its parent split with the sibling subtree. Shutting down a local terminal SHALL end its program (see "Closing ends the program"). Closing an agent zone whose agent is working or waiting for permission SHALL ask first, and an agent zone whose agent exits SHALL stay open until the user closes it (see `agent-zones`). Focus SHALL move to the most recently focused zone in that sibling subtree. Closing or exiting the only zone in a tab SHALL close the tab. `Close Tab` (ctrl-shift-w) SHALL close the entire tab and all of its zones.
 
 #### Scenario: Shell exit in one of two zones
 - **WHEN** a local tab has two zones and the user runs `exit` in the focused right zone
@@ -97,6 +109,14 @@ Closing a zone (with `Close Zone`, ctrl-shift-x, its header `×` button, or when
 #### Scenario: Close Tab closes all zones
 - **WHEN** a local tab has three zones and the user presses ctrl-shift-w
 - **THEN** the entire tab and all three terminals close
+
+#### Scenario: Close a working agent zone
+- **WHEN** an agent tab has two zones, the active one's turn is running, and the user presses ctrl-shift-x
+- **THEN** a dialog asks first, and the zone closes only once the user confirms
+
+#### Scenario: Agent exit keeps its zone
+- **WHEN** an agent tab has two zones and one zone's agent exits
+- **THEN** both zones stay, and the exited one says its agent exited
 
 ### Requirement: Directional focus between zones
 The user SHALL be able to move focus between zones with `Focus Zone Left` (alt-left), `Focus Zone Right` (alt-right), `Focus Zone Up` (alt-up) and `Focus Zone Down` (alt-down). Using normalized split-tree rectangles, Brindle SHALL focus the zone in that direction whose perpendicular span overlaps the active zone's span, preferring the nearest edge, then the closest perpendicular center, then tree order. When no zone lies in that direction, focus SHALL NOT move.
@@ -148,7 +168,7 @@ When the user closes a local or remote terminal (its zone or its tab), on Linux 
 - **THEN** the tab closes, and on `A8` the `sleep` process is gone within a few seconds and no session is listed for it
 
 ### Requirement: Zone header menu
-Right-clicking a zone's header bar SHALL focus that zone and open a menu beside the pointer listing Split Zone Right, Split Zone Down and Close Zone, each running the action of the same name on that zone and showing its shortcut when it has one. Split items SHALL be disabled where the zone is too small to split.
+Right-clicking a zone's header bar SHALL focus that zone and open a menu beside the pointer listing Split Zone Right, Split Zone Down and Close Zone, each running the action of the same name on that zone and showing its shortcut when it has one. Split items SHALL be disabled where the zone is too small to split, and where the tab can't start a zone of its kind (see "New zone profile and working directory").
 
 #### Scenario: Split from the menu
 - **WHEN** the user right-clicks the unfocused zone's header and selects Split Zone Down
@@ -161,6 +181,10 @@ Right-clicking a zone's header bar SHALL focus that zone and open a menu beside 
 #### Scenario: Keyboard path
 - **WHEN** the config binds a key to `open_zone_menu`
 - **THEN** the key opens the active zone's header menu beside the header
+
+#### Scenario: Agent tab without its agent profile
+- **WHEN** an agent tab's profile has been deleted from the config and the user opens a zone header's menu
+- **THEN** the split items are disabled and Close Zone is enabled
 
 ### Requirement: Zone header button tooltips
 The split-right, split-down and close buttons on a zone header SHALL show a tooltip with their name and shortcut, when they have one: "Split right", "Split down" and "Close zone".
