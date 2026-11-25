@@ -788,7 +788,7 @@ impl Step<'_> {
     }
 
     fn tool_call(&mut self, call: ToolCall) {
-        let id = bound(call.call);
+        let id = bound(clean(&call.call));
         let title = bound(clean(&call.title));
         match self.tool(&id) {
             // An agent may send `tool_call` again for a call it already
@@ -801,7 +801,7 @@ impl Step<'_> {
     }
 
     fn tool_change(&mut self, change: ToolChange) {
-        let id = bound(change.call);
+        let id = bound(clean(&change.call));
         let title = change.title.map(|title| bound(clean(&title)));
         match self.tool(&id) {
             Some(entry) => self.change_tool(entry, title, change.kind, change.status),
@@ -884,7 +884,7 @@ impl Step<'_> {
                 OptionKind::Unknown { name } => unknown.push(clean(&name)),
             }
         }
-        let call = request.call.as_ref().map(|call| bound(call.call.clone()));
+        let call = request.call.as_ref().map(|call| bound(clean(&call.call)));
         let title = request
             .call
             .as_ref()
@@ -2508,6 +2508,22 @@ mod tests {
                 outcome: None,
             }
         );
+    }
+
+    #[test]
+    fn a_tool_calls_id_is_cleaned_and_still_matches_its_updates() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "c\u{1b}]0;x\u{7}"})));
+        assert!(matches!(
+            agent.last_entry().1,
+            Entry::Tool { call, title, .. } if call == "c\u{fffd}]0;x\u{fffd}" && title == "c\u{fffd}]0;x\u{fffd}"
+        ));
+        let entries = agent.entries().len();
+        agent.feed(&update(
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c\u{1b}]0;x\u{7}", "status": "completed"}),
+        ));
+        assert_eq!(agent.entries().len(), entries);
     }
 
     #[test]
