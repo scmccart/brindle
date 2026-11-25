@@ -30,6 +30,17 @@ The server SHALL keep a text attachment's text in a file of its own, in a direct
 - **WHEN** a text attachment has been kept on Linux
 - **THEN** its directory is accessible to the user alone, and its file can't be written
 
+### Requirement: Where attached text is kept
+The directory that keeps attached text SHALL be under the user's cache directory on the agent's host: `$BRINDLE_CACHE_DIR` when set, else `$XDG_CACHE_HOME/brindle`, else `~/.cache/brindle`, and on Windows `%LOCALAPPDATA%\brindle\cache`. It SHALL NOT be the terminal server's own directory, so kept text is on disk and is still there after a reboot.
+
+#### Scenario: The default place
+- **WHEN** neither `BRINDLE_CACHE_DIR` nor `XDG_CACHE_HOME` is set and a text attachment is kept for a user whose home is `/home/u`
+- **THEN** its file is under `/home/u/.cache/brindle/attachments/`
+
+#### Scenario: Named by the environment
+- **WHEN** the terminal server was started with `BRINDLE_CACHE_DIR=/tmp/case-7`
+- **THEN** kept text is written under `/tmp/case-7/attachments/`, and nothing is written under the user's own cache directory
+
 ### Requirement: A client can read an attachment's text
 A client attached to an agent session SHALL be able to ask for a kept attachment's text by its id, and SHALL receive that text. A request for an id the session doesn't hold, or whose text is no longer kept, SHALL be refused with an error saying so.
 
@@ -110,15 +121,11 @@ A prompt that waits in the queue slot, or is held there, SHALL keep its attachme
 - **THEN** the agent receives the prompt with its attachment's text
 
 ### Requirement: Kept text is removed when nothing refers to it
-The server SHALL remove a kept text when its queued or held prompt is discarded, when its log entry is dropped by the log's bound, and when a client that attached it detaches or disconnects before a prompt took it. When the session ends, everything kept for it SHALL be removed. A kept text that is missing when its prompt is sent SHALL be left out, with a notice naming it, and the prompt SHALL still be sent.
+While its session lives, the server SHALL remove a kept text when its queued or held prompt is discarded, when its log entry is dropped by the log's bound, and when a client that attached it detaches or disconnects before a prompt took it. A kept text that is missing when its prompt is sent SHALL be left out, with a notice naming it, and the prompt SHALL still be sent.
 
 #### Scenario: Discarded
 - **WHEN** a client discards a waiting prompt that has a text attachment
 - **THEN** the slot is empty, the agent never receives the prompt, and the attachment's file is gone
-
-#### Scenario: The session ends
-- **WHEN** an agent session with kept attachments is closed
-- **THEN** its attachment directory is gone
 
 #### Scenario: A client that never sent
 - **WHEN** a client attaches a text and disconnects without sending a prompt
@@ -127,3 +134,22 @@ The server SHALL remove a kept text when its queued or held prompt is discarded,
 #### Scenario: A missing file
 - **WHEN** a held prompt's kept text has been deleted from the directory, and a client sends the prompt again
 - **THEN** the agent receives the prompt without that attachment, and the conversation gets a notice naming it
+
+### Requirement: Kept text outlasts its session by a week
+When an agent session ends, the text kept for it SHALL stay for 7 days, so that a link the agent was given still leads to its file if the conversation is taken up again, and SHALL then be removed. The server SHALL remove such directories when it starts and whenever a session ends, and SHALL NOT remove the directory of a session that is still live, however old its files.
+
+#### Scenario: Still there after the session
+- **WHEN** an agent session with a kept attachment is closed, and its directory is looked at an hour later
+- **THEN** the attachment's file is still there
+
+#### Scenario: Gone after a week
+- **WHEN** a session ended 8 days ago, and the terminal server starts
+- **THEN** that session's attachment directory is removed
+
+#### Scenario: A long-lived session
+- **WHEN** a live session's kept text is 30 days old and another session ends
+- **THEN** the live session's text is still there
+
+#### Scenario: After a reboot
+- **WHEN** the machine is restarted a day after a session kept an attachment
+- **THEN** the attachment's file is still at the path the agent was given

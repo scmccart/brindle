@@ -24,7 +24,7 @@ See proposal.md for why. The user split images into their own change on 2026-11-
 - The storage and the attachment form are ready for images.
 - No new keyboard stop, and no change to a requirement another stacked change modifies.
 
-**Non-Goals:** images and audio (`agents-prompt-images`); completing a path after `@`, and listing an agent host's files (`agents-file-mentions`); an action for a terminal selection (it is copied and pasted); attachments on `brindle agent -p`; a long paste becoming an attachment; directories; reading a linked file's contents from the agent's host; a prompt with attachments and blank text; sending on attach; attachment items as tab stops; keeping attachments after their session ends. No config key and no state file.
+**Non-Goals:** images and audio (`agents-prompt-images`); completing a path after `@`, and listing an agent host's files (`agents-file-mentions`); an action for a terminal selection (it is copied and pasted); attachments on `brindle agent -p`; a long paste becoming an attachment; directories; reading a linked file's contents from the agent's host; a prompt with attachments and blank text; sending on attach; attachment items as tab stops; showing an attachment's text in Brindle after its session has ended; a setting for how long kept text stays. No config key and no state file.
 
 ## Layer map
 
@@ -62,9 +62,11 @@ pub enum Cut { Start, End }                                          // which en
 
 - `Entry::User` and both `Slot` variants that hold a prompt gain `attachments: Vec<Attachment>`, defaulted and omitted when empty, so every existing fixture is unchanged. A reference is about a hundred bytes, so a user entry and a slot stay small, and they travel in `Added` and `Queue` as today: no new event kind.
 - **`id`** is the server's, per session, from 1, never reused (`types R3`). **`cut`** is data, not a mark in the text.
-- **Where.** `<server directory>/attachments/<session>/<id>`: a directory per session, made private to the user as the server directory is, each text in a file named by its id alone. An attachment's name never reaches the file system, so no name can escape the directory. Files are written once and made read-only, so what the conversation shows is what was sent.
+- **Where** (the user's decision, 2026-11-25: somewhere more durable than the server directory, under `~/.cache`). `<cache directory>/attachments/<store>/<id>`, on the agent's host. The cache directory is `$BRINDLE_CACHE_DIR`, else `$XDG_CACHE_HOME/brindle`, else `~/.cache/brindle`; on Windows `%LOCALAPPDATA%\brindle\cache`. It is on disk, not in memory as `$XDG_RUNTIME_DIR` usually is, and it outlives a reboot, so a file URI the agent was given, which the agent keeps in its own saved conversation, still leads somewhere when that conversation is taken up again (decision 4).
+- **A directory per session**, made private to the user as the server directory is (the same checks: not a link, the user's own). Its name, `<store>`, is made once by the core's shell from the date and random bytes and recorded in the session's checkpoint, since session ids start again with each server. Each text is a file named by its id alone. An attachment's name never reaches the file system, so no name can escape the directory. Files are written once and made read-only, so what the conversation shows is what was sent.
+- **`cache_dir(env, home, windows)`** is a pure helper beside the platform seam, tested on every platform (`ports R7`, `fcis R3`). `BRINDLE_CACHE_DIR` is what tests and the throwaway scripts set, so no run writes to the real cache (`testing R7`): the e2e and perf harnesses' `isolate` gains it, with a directory per case.
 - **Why beside the log.** Inlined, 64 KiB attachments would have pushed the log towards its 16 MiB bound, made every checkpoint copy them, and forced a 128 KiB total so that a queued prompt fitted one frame. Kept aside they cost the log nothing, and the same store holds images next (`agents-prompt-images`). *Rejected:* inlining (above); a store in the holder (it parses nothing and keeps one blob per session, `process R1`).
-- **The server directory is often memory-backed** (`$XDG_RUNTIME_DIR`), so the store is bounded (decision 2) and nothing outlives the session (decision 4).
+- *Rejected for the place:* the server directory (`$XDG_RUNTIME_DIR/brindle`), the first draft's choice: it is usually memory-backed, so kept text would count against RAM, and it is emptied at reboot or logout, which breaks every link an agent's saved conversation holds.
 
 ### 2. Bounds (`railway R5`, `process R9`)
 
@@ -96,12 +98,13 @@ Three messages are added to client protocol 4, which is unreleased and amended a
 
 `store::plan(state, event) -> Vec<Step>` is pure: given what the session's log and slot reference and what the directory lists, it says what to write and what to remove. The core's shell runs the steps through `server/platform/`.
 
-- **Kept while referenced.** A text is kept while a log entry or the queue slot references it. It is removed when its entry is trimmed from the log, when its queued or held prompt is discarded, and with the whole directory when the session ends.
-- **A core restart** loses nothing: the files are on disk and the references are in the checkpoint. The adopting core lists the directory and removes what nothing references (uploads no prompt took before the restart).
-- **At start,** the core removes attachment directories of sessions it doesn't hold.
+- **Kept while referenced.** While its session lives, a text is kept while a log entry or the queue slot references it. It is removed when its entry is trimmed from the log and when its queued or held prompt is discarded (a discarded prompt was never sent, so no agent holds its link).
+- **Kept for a while after the session ends.** A session's directory stays for `RETENTION` = 7 days after the session ends, then goes. The agent may have saved the conversation, with its links, and `agents-session-recovery` and `agents-session-list` let a user take one up again; within that week its attached files are still there. Nothing reads them through Brindle once the session is gone: they are there for the agent.
+- **The sweep.** When a core starts and whenever a session ends, the core removes every store directory that no live session uses and whose newest file is older than `RETENTION`, `now` being given to `store::plan` as a value (`fcis R2`). No timer is needed. It is a cache: the user, or the system, may empty it at any time, and decision 11 says what a missing file does.
+- **A core restart** loses nothing: the files are on disk and the store's name and the references are in the checkpoint. The adopting core lists the directory and removes what nothing references (uploads no prompt took before the restart).
 - **A missing or unreadable file** isn't fatal: sending leaves that attachment out and adds a warning notice naming it; a read answers `ERROR`, and the zone says the text is no longer kept.
 - **Writes are bounded** (one text of at most 256 KiB) and done before the prompt is accepted; a write that fails (the directory is full) refuses the attach in words.
-- The server writes and reads only its own directory here. It still reads no file on the agent's behalf (`agents-sessions`' bound).
+- The server writes and reads only its own attachment directories here. It still reads no file on the agent's behalf (`agents-sessions`' bound).
 
 ### 5. Links (`acp/reduce.rs`, `acp/uri.rs`)
 
@@ -180,7 +183,7 @@ The action:
 
 ### 12. Restarts, crashes and upgrades (`process R1`–`R3`, `R12`)
 
-Kept texts are files, and their references are in the checkpoint, so a waiting or held prompt keeps its attachments across a core restart and an upgrade, and a restored zone can open them. `PromptSupport` is checkpointed with the session. A Brindle crash loses a draft that wasn't sent, as it loses unsent text, and its untaken uploads are removed when its connection closes. A reboot ends the sessions and, with a memory-backed server directory, the store with them. The holder is untouched: it never sees an attachment.
+Kept texts are files, and their references are in the checkpoint, so a waiting or held prompt keeps its attachments across a core restart and an upgrade, and a restored zone can open them. `PromptSupport` is checkpointed with the session. A Brindle crash loses a draft that wasn't sent, as it loses unsent text, and its untaken uploads are removed when its connection closes. A reboot ends the sessions; their kept texts stay in the cache directory until the sweep finds them a week old. The holder is untouched: it never sees an attachment.
 
 ### 13. With the changes stacked under this one
 
@@ -208,9 +211,12 @@ Decided on 2026-11-25:
 - Attached text is written beside the log, with a reference in the log, and read on demand (decision 1). The user proposed this in place of the first draft's inlined text.
 - The agent is given the kept file's URI where that is the right form: small text is embedded for agents that take it, and everything else is a link to the kept file (decision 6). The user offered "hand off a file URI" conditionally; embedding small text is kept because it needs no file read and ACP prefers it.
 
+- The bounds: 8 attachments, 256 KiB a text, 16 MiB kept a session, and 64 KiB as the most that is embedded (decision 2).
+- Kept text lives in the cache directory (`~/.cache/brindle`), not the server directory, so it is on disk and outlives a reboot (decision 1).
+
 Still open, each with a recommendation the text above follows:
 
-1. **The bounds:** 8 attachments, 256 KiB a text, 16 MiB kept a session, and 64 KiB as the most that is embedded (recommended).
+1. **How long kept text stays after its session ends:** 7 days (recommended), another length, or until the cache is cleared by hand.
 2. **Longer text is cut** (command output keeps its end, a file its start; recommended), or refused.
 3. **A file dropped on a remote agent's zone** is attached as text when it is text (recommended), or every such drop is refused.
 4. **Several agent zones open:** a palette asks which (recommended), or the most recently focused one takes it.
@@ -218,8 +224,9 @@ Still open, each with a recommendation the text above follows:
 ## Risks / Trade-offs
 
 - An agent may ask before reading a kept file outside its project → only text over 64 KiB, or an agent with no embedded context, is sent that way; the capture of task 1.1 says what each agent does, and additional directories are the remedy where an agent offers them.
-- Kept texts may hold secrets a command printed → the directory is the user's alone, files are named by number, and everything goes when the session ends.
-- The store lives in a directory that is often memory-backed → 16 MiB a session, with trimmed entries freeing theirs.
+- Kept texts may hold secrets a command printed, and now stay on disk for a week after their session → the directory is the user's alone, files are named by number, the README says where they are and how long they stay, and clearing `~/.cache/brindle` is always safe.
+- The cache directory can grow → 16 MiB a session, trimmed entries free theirs, and the sweep removes ended sessions' directories after a week.
+- The cache may be emptied under a live session → a missing text is left out of a prompt with a notice, and its row says it is no longer kept.
 - A prompt needs text even with attachments → one sentence of intent goes with the context, and "The prompt input" needs no change.
 - A link's file isn't checked → a typo shows up as the agent's reply, not at once.
 - A text can't be shown once its session has ended → the conversation still lists its name and size.
