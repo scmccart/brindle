@@ -1759,3 +1759,446 @@ mod on_windows {
         assert_eq!(core.exit_code(2), Some(3));
     }
 }
+
+/// The pipe sessions' programs (H1 version 3's `SPAWN_PIPES`), as `sh` runs
+/// them: no terminal, so their bytes are exact.
+#[cfg(unix)]
+mod pipe_programs {
+    use std::path::Path;
+
+    use brindle_remote_protocol::SessionId;
+    use brindle_remote_protocol::holder::SpawnPipes;
+
+    use super::support::pipe_spawn;
+
+    /// How the hang-up ends a program that ignores its stdin's end, as the
+    /// holder's log names it.
+    pub const ENDED_BY_THE_HANG_UP: Option<i32> = None;
+
+    fn sh(session: SessionId, script: &str) -> SpawnPipes {
+        pipe_spawn(session, "/bin/sh", &["-c", script])
+    }
+
+    /// Copies its stdin to its stdout, byte for byte, until stdin ends.
+    pub fn copies(session: SessionId) -> SpawnPipes {
+        pipe_spawn(session, "cat", &[])
+    }
+
+    /// Writes `1` to `count`, a line each, to its stderr and exits with 0.
+    pub fn counts_on_stderr(session: SessionId, count: u32) -> SpawnPipes {
+        sh(session, &format!("seq 1 {count} >&2"))
+    }
+
+    /// Reads a line, then writes `1` to `count` to stderr and `done` to
+    /// stdout, and exits with 0.
+    pub fn counts_on_stderr_after_a_line(session: SessionId, count: u32) -> SpawnPipes {
+        sh(session, &format!("read x; seq 1 {count} >&2; echo done"))
+    }
+
+    /// Ignores its stdin's end and `SIGHUP`, and starts a child that ignores
+    /// them too, printing `bg=<pid>.`.
+    pub fn ignores_its_end(session: SessionId) -> SpawnPipes {
+        sh(session, "trap '' HUP; sleep 1000 & echo \"bg=$!.\"; wait")
+    }
+
+    /// Prints `first`, waits for [`super::programs::release`] through `go`,
+    /// prints `second`, makes `printed`, and waits for its stdin's end.
+    pub fn prints_twice(session: SessionId, go: &Path, printed: &Path) -> SpawnPipes {
+        super::programs::make_fifo(go);
+        sh(
+            session,
+            &format!(
+                "exec 3<>'{}'; echo first; read x <&3; echo second; : > '{}'; cat >/dev/null",
+                go.display(),
+                printed.display()
+            ),
+        )
+    }
+
+    /// Prints `ready` once it has `go` open (a release before that would be
+    /// lost), waits for [`super::programs::release`] through it, writes
+    /// `bye` to stderr, and exits with 3.
+    pub fn exits_when_released(session: SessionId, go: &Path) -> SpawnPipes {
+        super::programs::make_fifo(go);
+        sh(
+            session,
+            &format!(
+                "exec 3<>'{}'; echo ready; read x <&3; echo bye >&2; exit 3",
+                go.display()
+            ),
+        )
+    }
+
+    pub fn release(go: &Path) {
+        super::programs::release(go);
+    }
+}
+
+/// The pipe sessions' programs, as PowerShell (or `cmd`) runs them with
+/// their standard streams on pipes.
+#[cfg(windows)]
+mod pipe_programs {
+    use std::path::Path;
+
+    use brindle_remote_protocol::SessionId;
+    use brindle_remote_protocol::holder::SpawnPipes;
+
+    use super::support::{inherited_env, pipe_spawn};
+
+    /// How the hang-up ends a program that ignores its stdin's end: its job
+    /// is terminated with 1.
+    pub const ENDED_BY_THE_HANG_UP: Option<i32> = Some(1);
+
+    pub fn powershell(session: SessionId, script: &str) -> SpawnPipes {
+        let mut request = pipe_spawn(
+            session,
+            "powershell.exe",
+            &["-NoProfile", "-NonInteractive", "-Command", script],
+        );
+        request.env = inherited_env(&[]);
+        request
+    }
+
+    /// Copies its stdin to its stdout, byte for byte, until stdin ends.
+    pub fn copies(session: SessionId) -> SpawnPipes {
+        powershell(
+            session,
+            "$i = [Console]::OpenStandardInput(); $o = [Console]::OpenStandardOutput(); \
+             $i.CopyTo($o); $o.Flush()",
+        )
+    }
+
+    /// Writes `1` to `count`, a line each (`\n`), to its stderr and exits
+    /// with 0.
+    pub fn counts_on_stderr(session: SessionId, count: u32) -> SpawnPipes {
+        powershell(
+            session,
+            &format!("[Console]::Error.Write(((1..{count}) -join \"`n\") + \"`n\")"),
+        )
+    }
+
+    /// Reads a line, then writes `1` to `count` to stderr and `done` to
+    /// stdout, and exits with 0.
+    pub fn counts_on_stderr_after_a_line(session: SessionId, count: u32) -> SpawnPipes {
+        powershell(
+            session,
+            &format!(
+                "$null = [Console]::In.ReadLine(); \
+                 [Console]::Error.Write(((1..{count}) -join \"`n\") + \"`n\"); \
+                 [Console]::Out.Write('done')"
+            ),
+        )
+    }
+
+    /// Never reads its stdin, and waits on a child (`ping`).
+    pub fn ignores_its_end(session: SessionId) -> SpawnPipes {
+        let mut request = pipe_spawn(session, "cmd.exe", &["/d", "/c", "ping -n 1000 127.0.0.1 >nul"]);
+        request.env = inherited_env(&[]);
+        request
+    }
+
+    /// Prints `first`, waits until `go` exists, prints `second`, makes
+    /// `printed`, and waits for its stdin's end.
+    pub fn prints_twice(session: SessionId, go: &Path, printed: &Path) -> SpawnPipes {
+        powershell(
+            session,
+            &format!(
+                "[Console]::Out.Write(\"first`n\"); \
+                 while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 20 }}; \
+                 [Console]::Out.Write(\"second`n\"); New-Item '{}' | Out-Null; \
+                 $null = [Console]::In.ReadToEnd()",
+                go.display(),
+                printed.display()
+            ),
+        )
+    }
+
+    /// Prints `ready`, waits until `go` exists, writes `bye` to stderr, and
+    /// exits with 3.
+    pub fn exits_when_released(session: SessionId, go: &Path) -> SpawnPipes {
+        powershell(
+            session,
+            &format!(
+                "[Console]::Out.Write(\"ready`n\"); \
+                 while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 20 }}; \
+                 [Console]::Error.Write('bye'); exit 3",
+                go.display()
+            ),
+        )
+    }
+
+    pub fn release(go: &Path) {
+        std::fs::write(go, b"").unwrap();
+    }
+}
+
+/// `1` to `count`, a line each, as [`pipe_programs::counts_on_stderr`]
+/// writes them.
+fn counted(count: u32) -> Vec<u8> {
+    (1..=count).map(|n| format!("{n}\n")).collect::<String>().into_bytes()
+}
+
+/// What a pipe session's program is sent, as an agent's JSON lines may
+/// carry it: a line end of each kind, a tab, UTF-8, and bytes that are no
+/// text at all. A PTY would rewrite or echo some of it.
+const RAW: &[u8] = b"{\"jsonrpc\":\"2.0\",\"id\":0}\n\tx\r\n\xc3\xa9\xff\x00\x1b[0m end";
+
+#[test]
+fn a_pipe_programs_bytes_pass_unchanged_both_ways() {
+    let (_dir, mut core, _) = holder("pipes-bytes");
+    core.spawn_pipes(pipe_programs::copies(1));
+    core.input(1, RAW);
+    let mut output = core.output_until(1, b" end");
+    // A pipe session has no size and no console window.
+    core.send(ToHolder::Resize(h1::Resize {
+        session: 1,
+        cols: 80,
+        rows: 24,
+        cell_w: 9,
+        cell_h: 18,
+    }));
+    core.send(ToHolder::Reparent(h1::Reparent {
+        session: 1,
+        hwnd: 1,
+    }));
+    let mut errors = Vec::new();
+    while errors.len() < 2 {
+        match core.recv() {
+            ToCore::Error(error) => errors.push((error.session, error.message)),
+            ToCore::Output(data) if data.session == 1 => output.extend(data.bytes),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        errors,
+        [
+            (Some(1), "session 1 is on pipes and has no size".to_string()),
+            (Some(1), "session 1 is on pipes and has no console window".to_string()),
+        ]
+    );
+    // A hang-up closes its stdin first, its polite end: it exits on its own.
+    core.hang_up(1);
+    let (rest, stderr, code) = core.pipes_end(1);
+    output.extend(rest);
+    assert_eq!(output, RAW);
+    assert_eq!((stderr, code), (Vec::new(), Some(0)));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pipe_program_has_no_controlling_terminal() {
+    let (_dir, mut core, holder_pid) = holder("pipes-no-tty");
+    let pid = core.spawn_pipes(pipe_programs::copies(1));
+    assert_eq!(parent(pid), Some(holder_pid), "the holder is its parent");
+    // `/proc/<pid>/stat` after the name: state, ppid, pgrp, session, tty_nr.
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..].split_whitespace().collect();
+    let pid_text = pid.to_string();
+    assert_eq!(fields[2], pid_text, "its own process group: {stat}");
+    assert_eq!(fields[3], pid_text, "its own session: {stat}");
+    assert_eq!(fields[4], "0", "no controlling terminal: {stat}");
+    core.hang_up(1);
+    assert_eq!(core.pipes_end(1).2, Some(0));
+}
+
+#[cfg(windows)]
+#[test]
+fn a_pipe_program_has_no_pseudoconsole_and_no_console_window() {
+    let (_dir, mut core, _) = holder("pipes-no-console");
+    // Its standard handles are the pipes (a console's would not be
+    // redirected), and no console window shows.
+    let script = "Add-Type -Name W -Namespace BrindleTest -MemberDefinition \
+        '[DllImport(\"kernel32.dll\")] public static extern System.IntPtr GetConsoleWindow(); \
+         [DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(System.IntPtr w);'; \
+        $w = [BrindleTest.W]::GetConsoleWindow(); \
+        [Console]::Out.Write('redirected=' + [Console]::IsInputRedirected + ',' + \
+            [Console]::IsOutputRedirected + ',' + [Console]::IsErrorRedirected + \
+            ' visible=' + [BrindleTest.W]::IsWindowVisible($w) + '.'); \
+        $null = [Console]::In.ReadToEnd()";
+    core.spawn_pipes(pipe_programs::powershell(1, script));
+    let output = core.output_until(1, b".");
+    let output = String::from_utf8_lossy(&output);
+    assert!(
+        output.contains("redirected=True,True,True visible=False."),
+        "{output}"
+    );
+    core.hang_up(1);
+    assert_eq!(core.pipes_end(1).2, Some(0));
+}
+
+#[test]
+fn a_pipe_sessions_stderr_tail_keeps_its_newest_16_kib() {
+    const COUNT: u32 = 10_000;
+    let (_dir, mut core, _) = holder("pipes-stderr");
+    core.spawn_pipes(pipe_programs::counts_on_stderr(1, COUNT));
+    let (output, stderr, code) = core.pipes_end(1);
+    let all = counted(COUNT);
+    assert!(all.len() > h1::MAX_STDERR_TAIL);
+    assert_eq!(stderr.len(), h1::MAX_STDERR_TAIL);
+    assert!(
+        all.ends_with(&stderr),
+        "not the newest bytes: {}",
+        String::from_utf8_lossy(&stderr[..64])
+    );
+    assert_eq!((output, code), (Vec::new(), Some(0)));
+}
+
+#[test]
+fn a_paused_pipe_sessions_stderr_is_still_read() {
+    // Far more than a pipe holds, so the program blocks unless the holder
+    // reads its stderr while its stdout is paused.
+    const COUNT: u32 = 100_000;
+    let (_dir, mut core, _) = holder("pipes-paused");
+    let pid = core.spawn_pipes(pipe_programs::counts_on_stderr_after_a_line(1, COUNT));
+    core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
+    core.input(1, b"go\n");
+    assert!(
+        eventually(TIMEOUT, || !alive(pid)),
+        "the program blocked writing its stderr"
+    );
+    core.send(ToHolder::Resume(h1::SessionRef { session: 1 }));
+    let (_, stderr, code) = core.pipes_end(1);
+    assert!(counted(COUNT).ends_with(&stderr) && !stderr.is_empty());
+    assert_eq!(code, Some(0));
+}
+
+#[test]
+fn a_hang_up_ends_a_pipe_program_that_ignores_its_end_and_its_children() {
+    /// `pty::GRACEFUL_SHUTDOWN`: the hang-up ends the group or job one
+    /// grace after it closes stdin, and kills what is left one after that.
+    const GRACE: Duration = Duration::from_secs(1);
+    let (_dir, mut core, _) = holder("pipes-hang-up");
+    let pid = core.spawn_pipes(pipe_programs::ignores_its_end(1));
+    #[cfg(unix)]
+    let child = reported_pid(&core.output_until(1, b"."), "bg");
+    #[cfg(windows)]
+    let child = until("its ping", TIMEOUT, || {
+        children_named(pid, "PING.EXE").first().copied()
+    });
+    assert!(alive(child));
+
+    core.hang_up(1);
+    let started = std::time::Instant::now();
+    let (_, _, code) = core.pipes_end(1);
+    assert_eq!(code, pipe_programs::ENDED_BY_THE_HANG_UP);
+    // Within the graces and a bound for a loaded machine.
+    assert!(
+        eventually(2 * GRACE + Duration::from_secs(5), || !alive(pid) && !alive(child)),
+        "still running {:?} after the hang-up",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn an_older_core_isnt_shown_a_pipe_session_and_a_newer_one_gets_it_with_its_tail() {
+    let (dir, mut first, _) = holder("pipes-old-core");
+    let go = dir.path.join("go");
+    let printed = dir.path.join("printed");
+    // A terminal session too: the older core is shown that one.
+    first.spawn(programs::exits_after_a_line(2, 0));
+    first.spawn_pipes(pipe_programs::prints_twice(1, &go, &printed));
+    first.output_until(1, b"first\n");
+
+    // An H1 version 2 core adopts the holder.
+    let mut older = TestCore::connect_to(&dir);
+    let adopted = older.hello_up_to(2, 2);
+    assert!(first.closes());
+    let welcome = adopted.welcome();
+    assert_eq!(welcome.protocol, 2);
+    let listed: Vec<_> = welcome.sessions.iter().map(|held| held.session).collect();
+    assert_eq!(listed, [2], "only the terminal session is listed");
+    // The pipe session prints while that core is connected.
+    pipe_programs::release(&go);
+    assert!(eventually(TIMEOUT, || printed.exists()));
+    // Round trips: what the holder read meanwhile has been handled.
+    for _ in 0..2 {
+        older.hang_up(99);
+        loop {
+            match older.recv() {
+                ToCore::Error(error) if error.session == Some(99) => break,
+                ToCore::Output(data) => assert_ne!(data.session, 1, "{data:?}"),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    // A core that speaks version 3 gets it back, with what it printed.
+    let mut newer = TestCore::connect_to(&dir);
+    let adopted = newer.hello(3);
+    for message in older.until_closed() {
+        if let ToCore::Output(data) = message {
+            assert_ne!(data.session, 1, "the older core was sent its output");
+        }
+    }
+    let held = adopted
+        .welcome()
+        .sessions
+        .iter()
+        .find(|held| held.session == 1)
+        .expect("the pipe session is listed");
+    assert_eq!((held.mode, held.exit), (h1::SpawnMode::Pipes, None));
+    let mut seen = adopted.tails[&1].clone();
+    if !contains(&seen, b"second\n") {
+        seen.extend(newer.output_until(1, b"second\n"));
+    }
+    assert_eq!(seen, b"first\nsecond\n");
+    newer.hang_up(1);
+    assert_eq!(newer.pipes_end(1).2, Some(0));
+    newer.input(2, programs::ENTER);
+    assert_eq!(newer.exit_code(2), Some(0));
+}
+
+#[test]
+fn a_pipe_session_that_ended_with_no_core_has_its_stderr_tail_after_its_tail() {
+    let (mut dir, mut core, _) = holder("pipes-held-exit");
+    let go = dir.path.join("go");
+    let pid = core.spawn_pipes(pipe_programs::exits_when_released(1, &go));
+    dir.track(pid);
+    core.output_until(1, b"ready\n");
+    drop(core);
+    pipe_programs::release(&go);
+    assert!(
+        eventually(TIMEOUT, || dir
+            .logs()
+            .contains("session 1: ended with no core to tell")),
+        "{}",
+        dir.logs()
+    );
+
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(2);
+    let held = &adopted.welcome().sessions[0];
+    assert_eq!(
+        (held.session, held.mode, held.exit),
+        (1, h1::SpawnMode::Pipes, Some(h1::ExitStatus { code: Some(3) }))
+    );
+    // `hello` checks that it follows the session's `TAIL_END`.
+    let stderr = String::from_utf8_lossy(&adopted.stderr_tails[&1]).into_owned();
+    assert!(stderr.contains("bye"), "{stderr:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_bare_name_that_is_a_batch_file_fails_with_how_to_run_it() {
+    let (dir, mut core, _) = holder("pipes-batch");
+    let bin = dir.path.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::write(bin.join("fake-agent.cmd"), b"@echo off\r\n").unwrap();
+    let mut request = pipe_spawn(1, "fake-agent", &["--acp"]);
+    let path = format!("{};{}", bin.display(), request.env["PATH"]);
+    request.env.insert("PATH".into(), path);
+    core.send(ToHolder::SpawnPipes(request));
+    match core.recv() {
+        ToCore::SpawnFailed(failed) => {
+            assert_eq!(failed.session, 1);
+            assert!(
+                failed.message.contains("fake-agent is a batch file")
+                    && failed.message.contains("fake-agent.cmd")
+                    && failed.message.contains("cmd /c fake-agent --acp"),
+                "{}",
+                failed.message
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+}

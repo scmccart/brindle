@@ -36,7 +36,8 @@ use brindle_remote_protocol::client::{self, ToClient};
 use brindle_remote_protocol::relay::{MSG_RELAY_HEARTBEAT, is_relay_type};
 use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::holder::{
-    self as h1, Assembler, Data, Hello, SessionRef, Spawn, ToCore, ToHolder, Welcome,
+    self as h1, Assembler, Data, Hello, SessionRef, Spawn, SpawnMode, SpawnPipes, ToCore,
+    ToHolder, Welcome,
 };
 use brindle_remote_protocol::{Frame, RequestId, SessionId};
 use brindle_term_core::alacritty_terminal::grid::Dimensions;
@@ -166,6 +167,9 @@ pub struct Adopted {
     pub welcome: Option<Welcome>,
     pub checkpoints: HashMap<SessionId, Vec<u8>>,
     pub tails: HashMap<SessionId, Vec<u8>>,
+    /// The `STDERR_TAIL` of each pipe session that ended with no core, each
+    /// right after that session's `TAIL_END`.
+    pub stderr_tails: HashMap<SessionId, Vec<u8>>,
 }
 
 impl Adopted {
@@ -289,9 +293,15 @@ impl TestCore {
 
     /// Sends `HELLO` and collects `WELCOME` with every checkpoint and tail.
     pub fn hello(&mut self, instance: u64) -> Adopted {
+        self.hello_up_to(instance, h1::PROTOCOLS.max)
+    }
+
+    /// [`TestCore::hello`] from a core that speaks H1 up to `max`: one
+    /// below 3 stands for an older core, which isn't shown pipe sessions.
+    pub fn hello_up_to(&mut self, instance: u64, max: u32) -> Adopted {
         self.send(ToHolder::Hello(Hello {
             min: h1::PROTOCOLS.min,
-            max: h1::PROTOCOLS.max,
+            max,
             core_build: "test-core".into(),
             instance,
         }));
@@ -301,7 +311,19 @@ impl TestCore {
         let mut adopted = Adopted::default();
         let mut checkpoints = Assembler::new(h1::MAX_CHECKPOINT_LEN);
         let mut tails = Assembler::new(h1::TAIL_LIMIT);
-        let mut left = welcome.sessions.len();
+        // A pipe session that ended has its stderr tail after its tail.
+        let ended_on_pipes = |id: SessionId| {
+            welcome.sessions.iter().any(|held| {
+                held.session == id && held.mode == SpawnMode::Pipes && held.exit.is_some()
+            })
+        };
+        let mut left = welcome.sessions.len()
+            + welcome
+                .sessions
+                .iter()
+                .filter(|held| ended_on_pipes(held.session))
+                .count();
+        let mut last_tail = None;
         while left > 0 {
             match self.recv() {
                 ToCore::CheckpointBegin(begin) => checkpoints.begin(begin).unwrap(),
@@ -314,7 +336,18 @@ impl TestCore {
                 ToCore::TailBegin(begin) => tails.begin(begin).unwrap(),
                 ToCore::TailChunk(chunk) => tails.chunk(&chunk).unwrap(),
                 ToCore::TailEnd(end) => {
+                    last_tail = Some(end.session);
                     adopted.tails.insert(end.session, tails.end(end).unwrap());
+                    left -= 1;
+                }
+                ToCore::StderrTail(Data { session, bytes }) => {
+                    assert_eq!(
+                        last_tail,
+                        Some(session),
+                        "session {session}'s STDERR_TAIL doesn't follow its TAIL_END"
+                    );
+                    assert!(ended_on_pipes(session), "STDERR_TAIL for {session}");
+                    adopted.stderr_tails.insert(session, bytes);
                     left -= 1;
                 }
                 other => panic!("unexpected {other:?} while adopting"),
@@ -334,6 +367,55 @@ impl TestCore {
             ToCore::Spawned(spawned) if spawned.session == session => spawned.pid,
             other => panic!("expected SPAWNED for {session}, got {other:?}"),
         }
+    }
+
+    /// Sends a `SPAWN_PIPES` and returns the program's pid, dropping output
+    /// as [`TestCore::spawn`] does.
+    pub fn spawn_pipes(&mut self, spawn: SpawnPipes) -> u32 {
+        let session = spawn.session;
+        self.send(ToHolder::SpawnPipes(spawn));
+        match self.recv_skipping_output() {
+            ToCore::Spawned(spawned) if spawned.session == session => spawned.pid,
+            other => panic!("expected SPAWNED for {session}, got {other:?}"),
+        }
+    }
+
+    /// A pipe session's output up to its end, its `STDERR_TAIL` (which
+    /// must come once, just before its `EXITED`) and its exit code. Other
+    /// sessions' messages are skipped.
+    pub fn pipes_end(&mut self, session: SessionId) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        let mut output = Vec::new();
+        let mut stderr = None;
+        loop {
+            match self.recv() {
+                ToCore::Output(Data { session: s, bytes }) if s == session => {
+                    assert!(stderr.is_none(), "output after STDERR_TAIL");
+                    output.extend(bytes);
+                }
+                ToCore::StderrTail(Data { session: s, bytes }) if s == session => {
+                    assert!(stderr.is_none(), "a second STDERR_TAIL");
+                    stderr = Some(bytes);
+                }
+                ToCore::Exited(exited) if exited.session == session => {
+                    let stderr = stderr.expect("no STDERR_TAIL before EXITED");
+                    return (output, stderr, exited.code);
+                }
+                ToCore::Output(_) | ToCore::StderrTail(_) | ToCore::Exited(_) | ToCore::Error(_) => {
+                    assert!(stderr.is_none(), "messages between STDERR_TAIL and EXITED");
+                }
+                other => panic!("expected EXITED for {session}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every message the holder sends until it closes the connection.
+    pub fn until_closed(&mut self) -> Vec<ToCore> {
+        let mut messages = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while let Some(message) = self.try_recv(deadline.saturating_duration_since(Instant::now())) {
+            messages.push(message);
+        }
+        messages
     }
 
     /// The next message that isn't `OUTPUT`.
@@ -476,6 +558,18 @@ pub fn spawn(session: SessionId, command: &str, args: &[&str]) -> Spawn {
         rows: 24,
         cell_w: 0,
         cell_h: 0,
+        meta: Default::default(),
+    }
+}
+
+/// A `SPAWN_PIPES` of `command args` with [`base_env`].
+pub fn pipe_spawn(session: SessionId, command: &str, args: &[&str]) -> SpawnPipes {
+    SpawnPipes {
+        session,
+        command: command.into(),
+        args: args.iter().map(|arg| arg.to_string()).collect(),
+        cwd: None,
+        env: base_env(),
         meta: Default::default(),
     }
 }
