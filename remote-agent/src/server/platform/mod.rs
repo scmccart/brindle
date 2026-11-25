@@ -13,8 +13,8 @@
 //! - `{unix,windows}/piped.rs`: a session's program on plain pipes
 //!   (`Piped`, its three streams, `PipeCommand` and `spawn_piped`,
 //!   re-exported at this module's top, since `piped` here names the
-//!   neutral module below), sharing `pty`'s `Program` and `Group`;
-//!   declared, and refusing, until `agents-sessions` section 5;
+//!   neutral module below), sharing `pty`'s `Program` and `Group` (on
+//!   Windows a pipe session's group is its job);
 //! - `dir`: finding and securing the server directory;
 //! - `sys`: the running binary and random numbers.
 //!
@@ -67,10 +67,10 @@ mod pipe_state;
 mod wait;
 
 #[cfg_attr(
-    not(test),
+    all(not(windows), not(test)),
     allow(
         dead_code,
-        reason = "the pipe sessions that use it come with agents-sessions section 5"
+        reason = "the creation flags, handle list and launch are the Windows spawn's"
     )
 )]
 pub mod piped;

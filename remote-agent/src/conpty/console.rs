@@ -330,6 +330,12 @@ pub struct Process {
 }
 
 impl Process {
+    /// The process `handle`, whose id is `pid`, started some other way: a
+    /// pipe session's (`server::platform`'s `spawn_piped`).
+    pub fn new(pid: u32, handle: OwnedHandle) -> Self {
+        Self { pid, handle }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
