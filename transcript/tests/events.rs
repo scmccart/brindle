@@ -676,3 +676,57 @@ fn an_unknown_kind_or_value_is_a_decode_error() {
         "an unknown event kind"
     );
 }
+
+/// The `TRANSCRIPT` frames (core to client, type 42) of
+/// `brindle-remote-protocol`'s fixtures: their session and events, in order.
+/// That crate carries the events without reading them, so this is where the
+/// two crates' fixtures are checked to agree.
+fn protocol_transcripts() -> Vec<(String, u32, Vec<Value>)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../remote-protocol/tests/fixtures");
+    let mut found = Vec::new();
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "hex"))
+        .collect();
+    files.sort();
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let ["core", "2a", _, payload] = fields[..] else {
+                continue;
+            };
+            let bytes: Vec<u8> = (0..payload.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&payload[i..i + 2], 16).unwrap())
+                .collect();
+            let message: Value = serde_json::from_slice(&bytes).unwrap();
+            let session = message["session"].as_u64().unwrap() as u32;
+            let events = message["events"].as_array().unwrap().clone();
+            found.push((name.clone(), session, events));
+        }
+    }
+    found
+}
+
+#[test]
+fn the_protocols_transcript_fixtures_carry_v4_events_that_fold() {
+    let mut logs: std::collections::BTreeMap<(String, u32), brindle_transcript::Transcript> =
+        Default::default();
+    let mut events = 0usize;
+    for (fixture, session, values) in protocol_transcripts() {
+        let log = logs.entry((fixture.clone(), session)).or_default();
+        for value in values {
+            let event =
+                Event::from_value(&value).unwrap_or_else(|e| panic!("{fixture}: {value}: {e}"));
+            log.apply(&event)
+                .unwrap_or_else(|e| panic!("{fixture}: {event:?}: {e}"));
+            events += 1;
+        }
+    }
+    assert!(
+        events > 0,
+        "no TRANSCRIPT frame in remote-protocol's fixtures"
+    );
+}

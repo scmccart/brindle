@@ -1,4 +1,4 @@
-//! Transcript tests that pin client protocols 1–3, the relay link and H1 on
+//! Transcript tests that pin client protocols 1–4, the relay link and H1 on
 //! the wire.
 //!
 //! Each fixture in `tests/fixtures/` is one connection's frames in order, as
@@ -52,16 +52,32 @@ macro_rules! forms {
 
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
-    Reparent, SetLayout);
+    Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
+    AgentResend);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
-    Process);
+    Process, Transcript);
 forms!(to_holder_form, TO_HOLDER_FORMS, holder::ToHolder, "holder::ToHolder::":
     Hello, Spawn, Input, Resize, Hangup, CheckpointBegin, CheckpointChunk, CheckpointEnd, Drain,
-    Goodbye, Reparent, Pause, Resume, SetMeta);
+    Goodbye, Reparent, Pause, Resume, SetMeta, SpawnPipes);
 forms!(holder_to_core_form, HOLDER_TO_CORE_FORMS, holder::ToCore, "holder::ToCore::":
     Welcome, Output, Spawned, SpawnFailed, Exited, Error, CheckpointBegin, CheckpointChunk,
-    CheckpointEnd, TailBegin, TailChunk, TailEnd);
+    CheckpointEnd, TailBegin, TailChunk, TailEnd, StderrTail);
+forms!(activity_form, ACTIVITY_FORMS, client::AgentActivity, "client::AgentActivity::":
+    Idle, Working, Blocked, Done, Error);
+forms!(spawn_mode_form, SPAWN_MODE_FORMS, holder::SpawnMode, "holder::SpawnMode::": Pty, Pipes);
+
+/// Whether a permission answer chose an option or answered it cancelled.
+fn permission_option_form(answer: &client::AgentPermission) -> &'static str {
+    match answer.option {
+        Some(_) => "client::AgentPermission.option=Some",
+        None => "client::AgentPermission.option=None",
+    }
+}
+const PERMISSION_OPTION_FORMS: &[&str] = &[
+    "client::AgentPermission.option=Some",
+    "client::AgentPermission.option=None",
+];
 forms!(relay_form, RELAY_FORMS, relay::RelayMessage, "relay::RelayMessage::":
     Host, Heartbeat, Error);
 forms!(policy_form, POLICY_FORMS, Policy, "client::Policy::": Kill, Detach);
@@ -102,6 +118,9 @@ fn expected_forms() -> Vec<&'static str> {
         PREVIOUS_FORMS,
         LOST_FORMS,
         EXIT_STATUS_FORMS,
+        ACTIVITY_FORMS,
+        SPAWN_MODE_FORMS,
+        PERMISSION_OPTION_FORMS,
     ]
     .concat()
 }
@@ -161,6 +180,12 @@ impl Step {
                 if let client::ToCore::Kill(kill) = message {
                     forms.push(kill_target_form(&kill.target));
                 }
+                if let client::ToCore::SpawnAgent(spawn) = message {
+                    forms.push(policy_form(&spawn.policy));
+                }
+                if let client::ToCore::AgentPermission(answer) = message {
+                    forms.push(permission_option_form(answer));
+                }
                 forms
             }
             Self::CoreToClient(message) => {
@@ -174,6 +199,13 @@ impl Step {
                             .sessions
                             .iter()
                             .map(|info| policy_form(&info.policy)),
+                    );
+                    forms.extend(
+                        sessions
+                            .sessions
+                            .iter()
+                            .filter_map(|info| info.agent.as_ref())
+                            .map(|agent| activity_form(&agent.activity)),
                     );
                 }
                 forms
@@ -190,6 +222,7 @@ impl Step {
                             .filter_map(|held| held.exit.as_ref())
                             .map(exit_status_form),
                     );
+                    forms.extend(welcome.sessions.iter().map(|held| spawn_mode_form(&held.mode)));
                 }
                 forms
             }
@@ -207,6 +240,8 @@ enum Protocol {
     Client2,
     /// Client protocol 3: protocol 2 plus `SET_LAYOUT`.
     Client3,
+    /// Client protocol 4: protocol 3 plus agent sessions and `TRANSCRIPT`.
+    Client4,
     /// The link to a `brindle-remote relay`: the client protocol and the
     /// relay's own frames.
     Relay,
@@ -216,10 +251,10 @@ enum Protocol {
 impl Protocol {
     fn decode(self, sender: &str, frame: &Frame) -> std::io::Result<Step> {
         Ok(match (self, sender) {
-            (Self::Client | Self::Client2 | Self::Client3 | Self::Relay, "client") => {
+            (Self::Client | Self::Client2 | Self::Client3 | Self::Client4 | Self::Relay, "client") => {
                 Step::Client(client::ToCore::decode(frame)?)
             }
-            (Self::Client | Self::Client2 | Self::Client3 | Self::Relay, "core") => {
+            (Self::Client | Self::Client2 | Self::Client3 | Self::Client4 | Self::Relay, "core") => {
                 Step::CoreToClient(client::ToClient::decode(frame)?)
             }
             (Self::Relay, "relay") => Step::Relay(relay::RelayMessage::decode(frame)?),
@@ -234,6 +269,7 @@ impl Protocol {
             Self::Client => "protocol 1 (client <-> core)",
             Self::Client2 => "protocol 2 (client <-> core)",
             Self::Client3 => "protocol 3 (client <-> core)",
+            Self::Client4 => "protocol 4 (client <-> core)",
             Self::Relay => "relay link (Brindle <-> brindle-remote relay)",
             Self::Holder => "H1 (core <-> holder)",
         }
@@ -460,6 +496,7 @@ fn every_meta_in_the_fixtures_is_read_whole() {
         for step in parse(&transcript, &text) {
             let metas: Vec<serde_json::Value> = match step {
                 Step::CoreToHolder(holder::ToHolder::Spawn(spawn)) => vec![spawn.meta],
+                Step::CoreToHolder(holder::ToHolder::SpawnPipes(spawn)) => vec![spawn.meta],
                 Step::CoreToHolder(holder::ToHolder::SetMeta(update)) => vec![update.meta],
                 Step::Holder(holder::ToCore::Welcome(welcome)) => {
                     welcome.sessions.into_iter().map(|held| held.meta).collect()
@@ -1185,6 +1222,7 @@ fn transcripts() -> Vec<Transcript> {
                                 exit: None,
                                 meta: meta("kill", "bash -l"),
                                 truncated: false,
+                                mode: holder::SpawnMode::Pty,
                             },
                             holder::HeldSession {
                                 session: 4,
@@ -1194,6 +1232,7 @@ fn transcripts() -> Vec<Transcript> {
                                 exit: Some(holder::ExitStatus { code: Some(0) }),
                                 meta: meta("detach", "make"),
                                 truncated: true,
+                                mode: holder::SpawnMode::Pty,
                             },
                         ],
                     })),
@@ -1387,6 +1426,7 @@ fn transcripts() -> Vec<Transcript> {
                                 exit: None,
                                 meta: meta("detach", "bash -l"),
                                 truncated: false,
+                                mode: holder::SpawnMode::Pty,
                             },
                             holder::HeldSession {
                                 session: 2,
@@ -1396,12 +1436,610 @@ fn transcripts() -> Vec<Transcript> {
                                 exit: Some(holder::ExitStatus { code: None }),
                                 meta: meta("kill", "sleep 1000"),
                                 truncated: false,
+                                mode: holder::SpawnMode::Pty,
                             },
                         ],
                     })),
                 ],
                 adopted(1, CHECKPOINT, b"ls\r\nnotes.md\r\n$ ", 16),
                 adopted(2, b"\x1bc$ sleep 1000\r\n", b"", 16),
+            ]
+            .concat(),
+        },
+    ]
+    .into_iter()
+    .chain(agent_transcripts())
+    .collect()
+}
+
+// Agent sessions: client protocol 4 and H1 version 3.
+
+/// `value` with every object's keys inserted in sorted order, so it encodes
+/// the same whether or not serde_json's `preserve_order` is on (see
+/// client-layout).
+fn sorted(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries: Vec<(String, serde_json::Value)> = object.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sorted(value)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted).collect())
+        }
+        other => other,
+    }
+}
+
+/// A `TRANSCRIPT` of `events`, which are `brindle-transcript`'s protocol 4
+/// forms (pinned in `transcript/tests/fixtures/v4/`).
+fn transcript(session: u32, events: Vec<serde_json::Value>) -> Step {
+    s(client::ToClient::Transcript(client::Transcript {
+        session,
+        events: events.into_iter().map(sorted).collect(),
+    }))
+}
+
+fn ok(req: u64) -> Step {
+    s(client::ToClient::Ok(client::Request { req }))
+}
+
+fn hello_4(token: &str) -> Step {
+    c(client::ToCore::Hello(client::Hello {
+        min: 1,
+        max: 4,
+        client_version: "0.6.0".into(),
+        client_token: token.into(),
+        ..Default::default()
+    }))
+}
+
+fn welcome_4() -> Step {
+    s(client::ToClient::Welcome(client::Welcome {
+        protocol: 4,
+        core_version: "0.6.0".into(),
+        core_build: "e4a3".into(),
+        pid: 4242,
+        holder_protocols: vec![3],
+    }))
+}
+
+fn prompt(req: u64, session: u32, text: &str) -> Step {
+    c(client::ToCore::AgentPrompt(client::AgentPrompt {
+        req,
+        session,
+        text: text.into(),
+    }))
+}
+
+fn answer(req: u64, session: u32, entry: u64, option: Option<&str>) -> Step {
+    c(client::ToCore::AgentPermission(client::AgentPermission {
+        req,
+        session,
+        entry,
+        option: option.map(Into::into),
+    }))
+}
+
+fn added(id: u64, entry: serde_json::Value) -> serde_json::Value {
+    json!({"event": "added", "id": id, "entry": entry})
+}
+
+fn text_entry(kind: &str, text: &str) -> serde_json::Value {
+    json!({"type": kind, "text": text})
+}
+
+fn turn(state: serde_json::Value) -> serde_json::Value {
+    json!({"event": "turn", "state": state})
+}
+
+fn queue(slot: serde_json::Value) -> serde_json::Value {
+    json!({"event": "queue", "slot": slot})
+}
+
+fn permission_entry(call: Option<&str>, title: &str) -> serde_json::Value {
+    let mut entry = json!({
+        "type": "permission",
+        "title": title,
+        "options": [
+            {"id": "allow-once", "name": "Allow", "kind": "allow_once"},
+            {"id": "reject-once", "name": "Reject", "kind": "reject_once"},
+        ],
+    });
+    if let Some(call) = call {
+        entry["call"] = json!(call);
+    }
+    entry
+}
+
+fn ready() -> serde_json::Value {
+    json!({"event": "agent", "state": {"agent": "ready", "name": "fake-acp-agent", "version": "1.0.0"}})
+}
+
+const AGENT: &str = "fake-acp-agent --script /home/u/turn.script";
+
+fn agent_info(session: u32, activity: client::AgentActivity) -> client::SessionInfo {
+    client::SessionInfo {
+        session,
+        pid: 5000 + session,
+        command: AGENT.into(),
+        cwd: Some("/home/u/src".into()),
+        policy: Policy::Detach,
+        key: format!("{session:032x}"),
+        started: 1_794_000_000,
+        profile: Some("Agent".into()),
+        owned: true,
+        detached_secs: 30,
+        agent: Some(client::AgentInfo {
+            activity,
+            name: Some("fake-acp-agent".into()),
+        }),
+        ..Default::default()
+    }
+}
+
+fn agent_transcripts() -> Vec<Transcript> {
+    let held_waiting = "and then the tests";
+    vec![
+        Transcript {
+            name: "client-agent-session",
+            protocol: Protocol::Client4,
+            about: "Protocol 4: an agent session's spawn, a turn with a waiting prompt discarded and queued again, a permission answered (and answered again, refused), a cancel holding the waiting prompt, its resend, a permission answered cancelled, and the close.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                c(client::ToCore::SpawnAgent(client::SpawnAgent {
+                    req: 1,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/turn.script".into()],
+                    cwd: Some("~/src".into()),
+                    env: BTreeMap::from([
+                        ("HOME".into(), "/home/u".into()),
+                        ("PATH".into(), "/usr/local/bin:/usr/bin".into()),
+                    ]),
+                    policy: Policy::Detach,
+                    profile: Some("Agent".into()),
+                })),
+                s(client::ToClient::Spawned(client::Spawned {
+                    req: 1,
+                    session: 1,
+                    pid: 5000,
+                    key: KEY.into(),
+                })),
+                transcript(1, vec![ready()]),
+                prompt(2, 1, "Write notes.md"),
+                ok(2),
+                transcript(
+                    1,
+                    vec![
+                        added(1, text_entry("user", "Write notes.md")),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+                transcript(1, vec![added(2, text_entry("agent", "I'll"))]),
+                transcript(1, vec![json!({"event": "appended", "id": 2, "text": " write it.\n"})]),
+                prompt(3, 1, held_waiting),
+                ok(3),
+                transcript(1, vec![queue(json!({"slot": "waiting", "text": held_waiting}))]),
+                prompt(4, 1, "and lint"),
+                error(Some(4), Some(1), "a prompt is already queued"),
+                c(client::ToCore::AgentUnqueue(client::AgentRequest { req: 5, session: 1 })),
+                ok(5),
+                transcript(1, vec![queue(json!({"slot": "empty"}))]),
+                prompt(6, 1, held_waiting),
+                ok(6),
+                transcript(1, vec![queue(json!({"slot": "waiting", "text": held_waiting}))]),
+                transcript(
+                    1,
+                    vec![
+                        added(
+                            3,
+                            json!({"type": "tool", "call": "call_1", "title": "Write notes.md", "kind": "edit", "status": "pending"}),
+                        ),
+                        added(4, permission_entry(Some("call_1"), "Write notes.md")),
+                        turn(json!({"turn": "blocked"})),
+                    ],
+                ),
+                answer(7, 1, 4, Some("allow-once")),
+                ok(7),
+                transcript(
+                    1,
+                    vec![
+                        json!({"event": "answered", "id": 4, "outcome": {"outcome": "selected", "option": "allow-once"}}),
+                        turn(json!({"turn": "working"})),
+                        json!({"event": "tool_changed", "id": 3, "status": "completed"}),
+                    ],
+                ),
+                answer(8, 1, 4, Some("reject-once")),
+                error(Some(8), Some(1), "permission request 4 was already answered"),
+                c(client::ToCore::AgentCancel(client::SessionRef { session: 1 })),
+                transcript(
+                    1,
+                    vec![
+                        queue(json!({"slot": "held", "text": held_waiting, "reason": {"hold": "cancelled"}})),
+                        turn(json!({"turn": "cancelling"})),
+                    ],
+                ),
+                transcript(1, vec![turn(json!({"turn": "ended", "stop": {"reason": "cancelled"}}))]),
+                c(client::ToCore::AgentResend(client::AgentRequest { req: 9, session: 1 })),
+                ok(9),
+                transcript(
+                    1,
+                    vec![
+                        queue(json!({"slot": "empty"})),
+                        added(5, text_entry("user", held_waiting)),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+                transcript(
+                    1,
+                    vec![
+                        added(6, permission_entry(None, "Run cargo test")),
+                        turn(json!({"turn": "blocked"})),
+                    ],
+                ),
+                answer(10, 1, 6, None),
+                ok(10),
+                transcript(
+                    1,
+                    vec![
+                        json!({"event": "answered", "id": 6, "outcome": {"outcome": "cancelled"}}),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+                transcript(
+                    1,
+                    vec![
+                        added(7, text_entry("agent", "I didn't run the tests.")),
+                        turn(json!({"turn": "ended", "stop": {"reason": "end_turn"}})),
+                    ],
+                ),
+                c(client::ToCore::AgentUnqueue(client::AgentRequest { req: 11, session: 1 })),
+                error(Some(11), Some(1), "nothing is queued"),
+                c(client::ToCore::Close(client::SessionRef { session: 1 })),
+                transcript(
+                    1,
+                    vec![json!({"event": "agent", "state": {"agent": "exited", "stderr": ""}})],
+                ),
+                exit(1, None),
+            ],
+        },
+        Transcript {
+            name: "client-agent-attach",
+            protocol: Protocol::Client4,
+            about: "Protocol 4: listing agent sessions, attaching one blocked on a permission request (its replay, then live events), a refused resize, a layout, and the list after a detach.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                c(client::ToCore::List(client::Request { req: 1 })),
+                s(client::ToClient::Sessions(client::Sessions {
+                    req: 1,
+                    sessions: vec![
+                        client::SessionInfo {
+                            session: 1,
+                            pid: 5001,
+                            command: "bash -l".into(),
+                            cwd: Some("/home/u".into()),
+                            policy: Policy::Detach,
+                            cols: 80,
+                            rows: 24,
+                            key: KEY.into(),
+                            ..Default::default()
+                        },
+                        client::SessionInfo {
+                            layout: Some(sorted(json!({"v": 1, "zones": {"active": true, "key": format!("{:032x}", 2)}}))),
+                            ..agent_info(2, client::AgentActivity::Blocked)
+                        },
+                        agent_info(3, client::AgentActivity::Idle),
+                        agent_info(4, client::AgentActivity::Done),
+                        agent_info(5, client::AgentActivity::Error),
+                    ],
+                })),
+                c(client::ToCore::Attach(client::Attach {
+                    req: 2,
+                    session: 2,
+                    cols: 0,
+                    rows: 0,
+                })),
+                s(client::ToClient::ReplayStart(client::ReplayStart {
+                    req: Some(2),
+                    session: 2,
+                    pid: 5002,
+                })),
+                transcript(
+                    2,
+                    vec![
+                        added(1, text_entry("user", "Write notes.md")),
+                        added(2, text_entry("thought", "The user wants a file.")),
+                        added(3, permission_entry(Some("call_1"), "Write notes.md")),
+                        queue(json!({"slot": "waiting", "text": "and then the tests"})),
+                        turn(json!({"turn": "blocked"})),
+                        ready(),
+                    ],
+                ),
+                s(client::ToClient::ReplayEnd(client::SessionRef { session: 2 })),
+                answer(3, 2, 3, Some("reject-once")),
+                ok(3),
+                transcript(
+                    2,
+                    vec![
+                        json!({"event": "answered", "id": 3, "outcome": {"outcome": "selected", "option": "reject-once"}}),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+                c(client::ToCore::Resize(client::Resize {
+                    session: 2,
+                    cols: 80,
+                    rows: 24,
+                    cell_w: 9,
+                    cell_h: 18,
+                })),
+                error(None, Some(2), "session 2 is an agent session, which has no size"),
+                transcript(
+                    2,
+                    vec![
+                        added(4, text_entry("agent", "I won't write it, then.")),
+                        turn(json!({"turn": "ended", "stop": {"reason": "end_turn"}})),
+                        queue(json!({"slot": "empty"})),
+                        added(5, text_entry("user", "and then the tests")),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+                c(client::ToCore::SetLayout(client::SetLayout {
+                    session: 2,
+                    layout: Some(sorted(json!({"v": 1, "zones": {"key": format!("{:032x}", 2)}}))),
+                })),
+                c(client::ToCore::Detach(client::Detach {
+                    session: 2,
+                    layout: Some(sorted(json!({"v": 1, "zones": {"active": true, "key": format!("{:032x}", 2)}}))),
+                })),
+                c(client::ToCore::List(client::Request { req: 4 })),
+                s(client::ToClient::Sessions(client::Sessions {
+                    req: 4,
+                    sessions: vec![client::SessionInfo {
+                        owned: false,
+                        detached_secs: 0,
+                        layout: Some(sorted(json!({"v": 1, "zones": {"active": true, "key": format!("{:032x}", 2)}}))),
+                        ..agent_info(2, client::AgentActivity::Working)
+                    }],
+                })),
+            ],
+        },
+        Transcript {
+            name: "client-agent-old-client",
+            protocol: Protocol::Client3,
+            about: "A protocol 3 client of a core with agent sessions: the list leaves them out, and attaching one by its id is refused.",
+            steps: vec![
+                c(client::ToCore::Hello(client::Hello {
+                    min: 1,
+                    max: 3,
+                    client_version: "0.5.0".into(),
+                    client_token: TOKEN.into(),
+                    ..Default::default()
+                })),
+                s(client::ToClient::Welcome(client::Welcome {
+                    protocol: 3,
+                    core_version: "0.6.0".into(),
+                    core_build: "e4a3".into(),
+                    pid: 4242,
+                    holder_protocols: vec![3],
+                })),
+                c(client::ToCore::List(client::Request { req: 1 })),
+                s(client::ToClient::Sessions(client::Sessions {
+                    req: 1,
+                    sessions: vec![client::SessionInfo {
+                        session: 1,
+                        pid: 5001,
+                        command: "bash -l".into(),
+                        cwd: Some("/home/u".into()),
+                        policy: Policy::Detach,
+                        cols: 80,
+                        rows: 24,
+                        key: KEY.into(),
+                        ..Default::default()
+                    }],
+                })),
+                c(client::ToCore::Attach(client::Attach {
+                    req: 2,
+                    session: 2,
+                    cols: 80,
+                    rows: 24,
+                })),
+                error(
+                    Some(2),
+                    Some(2),
+                    "session 2 is an agent session, which needs client protocol 4",
+                ),
+            ],
+        },
+        Transcript {
+            name: "holder-spawn-pipes",
+            protocol: Protocol::Holder,
+            about: "H1 version 3: a program on plain pipes, its JSON lines both ways, a refused resize, a failed spawn, and its stderr tail before its exit.",
+            steps: vec![
+                ch(holder::ToHolder::Hello(holder::Hello {
+                    min: 1,
+                    max: 3,
+                    core_build: "e4a3".into(),
+                    instance: 1,
+                })),
+                h(holder::ToCore::Welcome(holder::Welcome {
+                    protocol: 3,
+                    build: "e4a3".into(),
+                    pid: 4243,
+                    previous: Previous::None,
+                    sessions: Vec::new(),
+                })),
+                ch(holder::ToHolder::SpawnPipes(holder::SpawnPipes {
+                    session: 1,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/turn.script".into()],
+                    cwd: Some("/home/u/src".into()),
+                    env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                    meta: meta("detach", AGENT),
+                })),
+                h(holder::ToCore::Spawned(holder::Spawned {
+                    session: 1,
+                    pid: 5000,
+                })),
+                ch(holder::ToHolder::Input(holder::Data {
+                    session: 1,
+                    bytes: br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#
+                        .iter()
+                        .copied()
+                        .chain(*b"\n")
+                        .collect(),
+                })),
+                h(holder::ToCore::Output(holder::Data {
+                    session: 1,
+                    bytes: b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"protocolVersion\":1,\"text\":\"tab\\t\\r\\n\xc3\xa9\"}}\n".to_vec(),
+                })),
+                ch(holder::ToHolder::Resize(holder::Resize {
+                    session: 1,
+                    cols: 80,
+                    rows: 24,
+                    cell_w: 9,
+                    cell_h: 18,
+                })),
+                h(holder::ToCore::Error(holder::ErrorMessage {
+                    session: Some(1),
+                    message: "session 1 is on pipes and has no size".into(),
+                })),
+                ch(holder::ToHolder::SpawnPipes(holder::SpawnPipes {
+                    session: 2,
+                    command: "/nonexistent".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: BTreeMap::new(),
+                    meta: meta("kill", "/nonexistent"),
+                })),
+                h(holder::ToCore::SpawnFailed(holder::SpawnFailed {
+                    session: 2,
+                    message: "cannot run /nonexistent: No such file or directory (os error 2)"
+                        .into(),
+                })),
+                ch(holder::ToHolder::Hangup(holder::SessionRef { session: 1 })),
+                h(holder::ToCore::StderrTail(holder::Data {
+                    session: 1,
+                    bytes: b"stdin closed; exiting\n".to_vec(),
+                })),
+                h(holder::ToCore::Exited(holder::Exited {
+                    session: 1,
+                    code: Some(0),
+                })),
+            ],
+        },
+        Transcript {
+            name: "holder-pipes-adopt",
+            protocol: Protocol::Holder,
+            about: "H1 version 3: a core adopts a holder with a terminal session and two pipe sessions, one running and one that exited with no core, whose stderr tail follows its tail.",
+            steps: [
+                vec![
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 3,
+                        core_build: "e4a3".into(),
+                        instance: 2,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 3,
+                        build: "e4a3".into(),
+                        pid: 4243,
+                        previous: Previous::Crash,
+                        sessions: vec![
+                            holder::HeldSession {
+                                session: 1,
+                                pid: 5001,
+                                cols: 80,
+                                rows: 24,
+                                exit: None,
+                                meta: meta("detach", "bash -l"),
+                                truncated: false,
+                                mode: holder::SpawnMode::Pty,
+                            },
+                            holder::HeldSession {
+                                session: 2,
+                                pid: 5002,
+                                cols: 0,
+                                rows: 0,
+                                exit: None,
+                                meta: meta("detach", AGENT),
+                                truncated: false,
+                                mode: holder::SpawnMode::Pipes,
+                            },
+                            holder::HeldSession {
+                                session: 3,
+                                pid: 5003,
+                                cols: 0,
+                                rows: 0,
+                                exit: Some(holder::ExitStatus { code: Some(1) }),
+                                meta: meta("kill", AGENT),
+                                truncated: false,
+                                mode: holder::SpawnMode::Pipes,
+                            },
+                        ],
+                    })),
+                ],
+                adopted(1, CHECKPOINT, b"ls\r\n", 16),
+                adopted(
+                    2,
+                    b"agent-checkpoint 1\n{\"transcript\":[]}",
+                    b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{}}\n{\"jsonrpc\"",
+                    16,
+                ),
+                adopted(3, b"agent-checkpoint 1\n{}", b"", 16),
+                vec![
+                    h(holder::ToCore::StderrTail(holder::Data {
+                        session: 3,
+                        bytes: b"fatal: no model\n".to_vec(),
+                    })),
+                    ch(holder::ToHolder::Input(holder::Data {
+                        session: 2,
+                        bytes: b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/cancel\"}\n".to_vec(),
+                    })),
+                ],
+            ]
+            .concat(),
+        },
+        Transcript {
+            name: "holder-pipes-old-core",
+            protocol: Protocol::Holder,
+            about: "An H1 version 2 core adopting a version 3 holder with a pipe session: WELCOME lists only the terminal session, and only its output is sent.",
+            steps: [
+                vec![
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 2,
+                        core_build: "d3f2".into(),
+                        instance: 3,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 2,
+                        build: "e4a3".into(),
+                        pid: 4243,
+                        previous: Previous::Handover,
+                        sessions: vec![holder::HeldSession {
+                            session: 1,
+                            pid: 5001,
+                            cols: 80,
+                            rows: 24,
+                            exit: None,
+                            meta: meta("detach", "bash -l"),
+                            truncated: false,
+                            mode: holder::SpawnMode::Pty,
+                        }],
+                    })),
+                ],
+                adopted(1, CHECKPOINT, b"", 16),
+                vec![h(holder::ToCore::Output(holder::Data {
+                    session: 1,
+                    bytes: b"$ ".to_vec(),
+                }))],
             ]
             .concat(),
         },
