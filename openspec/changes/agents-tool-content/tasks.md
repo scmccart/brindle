@@ -39,10 +39,13 @@ Before starting, check that the changes this one builds on are implemented and a
 
 ## 5. Brindle's model
 
+- [ ] 5.0 Add the `[agent]` table to `src/config.rs` with `tool_details` and `tool_details_when_done`, each `"open"` or `"closed"` decoded into `Shown` (defaults `open` and `closed`), another value reported as an invalid config naming the key and its two values; document both in `assets/default-config.toml`; verify with unit tests for the defaults, each value, a bad value's message, an unknown key under `[agent]`, and that the shipped default config parses.
+
 - [ ] 5.1 Extend `src/agent/shared.rs` and `transcript.rs` for the new events (`Dirty` marks for replaced items and appended output); verify with unit tests folding each event and a replay holding tool content.
 - [ ] 5.2 Add to `src/agent/model.rs` the pure `detail(entry) -> Vec<DetailPart>` (items, locations, then raw input and result only with no items; the marks for what was left out), `summary(entry)`, and `copy_text(part)` (unified diff text, output text, a text item's source); verify with unit tests for each rule, a move with no hunks, a cut diff's mark and the copy text of a two-hunk diff.
-- [ ] 5.3 Add the detail's list items: one per text item (through `markdown::render` under `catch_unwind`), one per `DETAIL_LINES` lines of a diff or output, locations, raw values; `tools_open`, `toggle_tool(id)` and `toggle_tool_details()` returning `Splice`s; an open row absorbing appended output by splicing only its last part; verify with unit tests for the splices of opening, closing, a growing output, a replaced content list on an open row, and a `Trimmed` that drops an open tool entry.
-- [ ] 5.4 Show a pending permission's detail: the parts of the tool entry its `call` names, as items of the permission entry before its confirmation, gone once answered; verify with unit tests for pending, answered, cancelled, no `call`, a `call` the model doesn't hold, and content that arrives after the permission row.
+- [ ] 5.3 Add the detail's list items: one per text item (through `markdown::render` under `catch_unwind`), one per `DETAIL_LINES` lines of a diff or output, locations, raw values; an open row absorbing appended output by splicing only its last part; verify with unit tests for the splices of opening, closing, a growing output, a replaced content list on an open row, and a `Trimmed` that drops an open tool entry.
+- [ ] 5.3a Add `Shown`, `ToolPolicy`, `RowState` and the pure `row_state` (design decision 10), `by_hand`, `toggle_tool(id)`, `toggle_tool_details()` and `set_policy(policy)`, each returning `Splice`s; verify with unit tests over every combination of detail or none, by-hand choice, running or finished, pending permission and policy, and for: a call that arrives completed, a call left in progress when its turn stops, calls of earlier turns after a replay, a by-hand choice outliving completion and a policy change, and a policy change splicing only the rows that change.
+- [ ] 5.4 Show a pending permission's detail: the parts of the tool entry its `call` names, as items of the permission entry before its confirmation, with that tool row showing its line alone meanwhile, and gone once answered; verify with unit tests for pending, answered, cancelled, no `call`, a `call` the model doesn't hold, and content that arrives after the permission row.
 - [ ] 5.5 Extend the dump (`describe`, `wait_text`): the tool line's `open=` and `items=`, the `--- item`, `--- hunk`, `--- location` and `--- raw` lines, the permission line's `detail=`; update the unit tests and e2e expectations that quote a tool or permission entry line; verify with unit tests for each line form and escaping.
 - [ ] 5.6 When stacked on `agents-log-paging`: make a page reach the tool entry that a pending permission names, and check that a fetch returns a tool entry with its content; verify with a unit test in the paging model and a real-role test.
 
@@ -57,15 +60,17 @@ Before starting, check that the changes this one builds on are implemented and a
 - [ ] 7.1 Draw the detail parts in `src/agent/view.rs`: text items through `Response`, diffs through `Diff`, output and raw values through `CodeBlock` with the command and exit in its header, locations as a muted list, the marks for what was left out; the row's press calling `toggle_tool`; the copy buttons writing `copy_text` to the clipboard. Nothing is computed in `render` beyond reading the model's parts (`process R14`).
 - [ ] 7.2 Add `toggle_agent_tool_details` to `ACTIONS` ("Toggle Tool Details", no default key), handled only by `AgentView`; verify with a unit test that the palette lists it in an agent zone and not in a terminal zone.
 - [ ] 7.3 Keep the end in view while an open row's output grows, through the scroller's existing follow rule; verify in the e2e case of 8.2.
+- [ ] 7.4 Hand the model its `ToolPolicy` from the settings when the zone is built and on every config reload, applying the returned `Splice`s; verify in the e2e case of 8.8.
 
 ## 8. End-to-end cases (fake ACP agent)
 
-- [ ] 8.1 `agent-tool-diff`: a diff's item and hunk lines, the row's summary, opening it with `toggle_agent_tool_details`, and a pixel check of the added and removed colours against the `e2e` theme.
+- [ ] 8.1 `agent-tool-diff`: a diff's item and hunk lines, the row's summary, the row open while the call is in progress (behind a `Gate`) and closed once it completes, `toggle_agent_tool_details` opening it again and it staying open, and a pixel check of the added and removed colours against the `e2e` theme.
 - [ ] 8.2 `agent-tool-output`: output streamed in pieces behind a `Gate`, its text, exit and the conversation staying at its end.
 - [ ] 8.3 `agent-tool-raw`: a call with only a raw input shows it; a call with content doesn't.
 - [ ] 8.4 `agent-tool-bounds`: 200 KiB of output and a 40-item call show their counts.
-- [ ] 8.5 `agent-permission-detail`: a pending request shows its call's diff with the call's row closed; after `Allow once` the detail is gone from the permission and present in the opened row; content sent only in the request shows too.
+- [ ] 8.5 `agent-permission-detail`: a pending request shows its call's diff while the call's own line reads `open=permission`, also with `tool_details = "closed"`; after `Allow once` the detail is gone from the permission and back in the running call's row; content sent only in the request shows too.
 - [ ] 8.6 `agent-tool-restore`: quit mid-turn with a diff and a pending permission, relaunch, and the restored zone shows both.
+- [ ] 8.8 `agent-tool-settings`: `tool_details = "closed"` keeps a running call's row closed; `tool_details_when_done = "open"` keeps a finished one open; rewriting the config while Brindle runs opens the finished rows without a restart; a bad value shows the config line.
 - [ ] 8.7 Run the agent cases on Windows (`windows-agent-*` gains one case with a diff) and in the archive jobs.
 
 ## 9. Docs and checks

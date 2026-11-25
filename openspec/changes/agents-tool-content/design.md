@@ -31,7 +31,7 @@ See proposal.md for why. Facts this design rests on, from the code on `feat/agen
 - A long diff or output costs the view only what is on screen.
 - Every decision is a pure function or model with unit tests; the dump and e2e cases pin the rest.
 
-**Non-Goals:** syntax highlighting; word-level and side-by-side diffs; command output through the terminal emulator (colours, cursor movement, a size); opening a location or a diff's file, and links in a detail other than those Markdown text gives; applying, reverting or editing a diff; images, audio and embedded resources in tool content (a placeholder, as in messages); text selection and find in a detail; tool details as keyboard focus stops; a tool call's v2-only statuses and v2's session references (subagents), cancel controls and terminal sizes (`agents-acp-v2`); ACP's `fs` and `terminal` client capabilities. No new client message, config key or state file.
+**Non-Goals:** syntax highlighting; word-level and side-by-side diffs; command output through the terminal emulator (colours, cursor movement, a size); opening a location or a diff's file, and links in a detail other than those Markdown text gives; applying, reverting or editing a diff; images, audio and embedded resources in tool content (a placeholder, as in messages); text selection and find in a detail; tool details as keyboard focus stops; a tool call's v2-only statuses and v2's session references (subagents), cancel controls and terminal sizes (`agents-acp-v2`); ACP's `fs` and `terminal` client capabilities; a minimum time a row stays open; per-profile tool detail settings, and editing them in the settings dialog. No new client message or state file.
 
 ## Layer map
 
@@ -49,6 +49,7 @@ See proposal.md for why. Facts this design rests on, from the code on `feat/agen
 | Drawing details, the copy buttons, the toggle action | shell (entity) | `src/agent/view.rs`, `src/agent/mod.rs`, `src/actions.rs` |
 | `Tool` (trigger, summary), `Diff` | components | `brindle-ui`, `ui/src/components/tool.rs`, `diff.rs` (new) |
 | `diff_added`, `diff_removed` | tokens | `ui/src/theme.rs`; values in `src/theme.rs` `ui_tokens` |
+| `[agent]`'s `tool_details` and `tool_details_when_done`, decoded into `Shown` | pure (boundary parse) | `brindle`, `src/config.rs` |
 
 Crate references don't change (`ports R1`). One closed list does (`ports R3`): `brindle-remote-agent` gains `similar` (decision 4). `acp/{envelope, forms, dialect, diff, plain}.rs` and `acp/v1/*.rs` are whole pure modules and join `PURE_MODULES` (`fcis R2`, `R3`, `R7`).
 
@@ -205,10 +206,22 @@ Nothing in `brindle-transcript`, `reduce.rs` or Brindle changes for these: `agen
 ### 10. The chat model (`src/agent/model.rs`, GPUI-free; `fcis R1`, `R5`)
 
 - **Parts.** A tool entry's first list item is its row. When open, its detail follows as more items of the same entry: one per text item (rendered with `markdown::render`, under `catch_unwind` as messages are), one per `DETAIL_LINES` = 50 lines of a diff or an output, one for the locations, and one each for the raw input and result. So the scroller lays out only the parts on screen, however long the diff.
-- **Open state.** `tools_open: BTreeMap<EntryId, bool>`, as thoughts' `toggled`: a tool row is closed until the user opens it. `toggle_tool(id)` flips one; `toggle_tool_details()` opens every tool call that has a detail when any is closed, else closes them all. Both return `Splice`s. The state is the zone's and isn't kept across a restart.
+- **Open state** (the user's decision, 2026-11-25: open while a tool call runs, closed when it finishes, both configurable). A row's state is derived, never stored on its own (`types R10`):
+
+  ```rust
+  pub enum Shown { Open, Closed }                       // config's "open" | "closed"
+  pub struct ToolPolicy { pub running: Shown, pub done: Shown }
+  pub enum RowState { Open, Closed, WithPermission, Nothing }
+  pub fn row_state(entry, by_hand: Option<Shown>, running: bool, pending_permission: bool, policy: ToolPolicy) -> RowState
+  ```
+
+  `Nothing` when the call has no detail; else `WithPermission` while a pending permission names it (next point); else the user's own choice for that row when there is one; else `policy.running` or `policy.done`. A tool call is **running** while its status is pending or in progress, the session's turn is running (`Working`, `Blocked` or `Cancelling`), and its entry comes after the latest user message; otherwise it has **finished**. So a call that arrives completed, a call left in progress by a stopped turn, and every call of a restored conversation's earlier turns are finished.
+- **By hand.** `by_hand: BTreeMap<EntryId, Shown>`, as thoughts' `toggled`. `toggle_tool(id)` flips one row from its current state and records it; `toggle_tool_details()` opens every tool call that has a detail when any is closed, else closes them all, recording each. Both return `Splice`s. A recorded choice outlives the call's completion and a config reload; it is the zone's and isn't kept across a restart.
+- **The policy is a value** (`fcis R3`): the view reads `[agent]`'s two keys from the settings and hands the model a `ToolPolicy`; `set_policy(policy)` returns the `Splice`s for the rows that change, so a reload applies at once.
+- **Finishing closes a row at once.** With the defaults a quick call's row opens and closes within one paced wake and may never be seen open; its line still carries the summary. If that proves jarring, the remedy is a minimum visible time, which would be a third key and a `now` argument to `row_state`. It isn't in this change.
 - **The summary** on a row: `+A −R` over a call's diffs (lines added and removed, hunk lines only), and `exit N` or the signal's name for its last output with an exit. `summary(entry) -> Option<Summary>` is pure.
 - **What a detail holds**, in order: the content items; the locations; then, only when there are no content items, the raw input and the raw result (`detail(entry) -> Vec<DetailPart>`, pure).
-- **A pending permission** whose `call` names a tool entry the model holds shows that entry's detail parts as items of the permission entry, before its confirmation, whatever the tool row's own open state. Once answered, they go, and the tool row keeps the detail. A permission naming no call, or one the model doesn't hold, shows as today.
+- **A pending permission** whose `call` names a tool entry the model holds shows that entry's detail parts as items of the permission entry, before its confirmation, whatever the policy and the user's choice for the row. While it does, the tool row shows its line alone (`RowState::WithPermission`), so the detail is on screen once, next to the buttons. Once answered, the parts go from the permission entry and the tool row is whatever `row_state` then says: with the defaults, open again while the allowed call runs. A permission naming no call, or one the model doesn't hold, shows as today.
 - **Copy text:** a diff copies as unified diff text (`--- path`, `+++ path`, `@@ -a,b +c,d @@`, the lines), an output as its text, a text item as its source (`copy_text(part)`, pure).
 - **Marks for what was left out** are lines of the detail: "N more lines not shown", "the first N bytes of output aren't kept", "N more items not shown".
 
@@ -220,10 +233,11 @@ Nothing in `brindle-transcript`, `reduce.rs` or Brindle changes for these: `agen
 - **Tokens:** `diff_added` = `card` mixed with the theme's green, `diff_removed` = `card` mixed with its red, each mixed as far as keeps `foreground` at 4.5:1 on it (`Color::legible_on` gives the bound), in `src/theme.rs` `ui_tokens`; the neutral token sets take fixed tints. The legibility test gains `foreground` on each.
 - **The action** `toggle_agent_tool_details` ("Toggle Tool Details", no default key) is handled only by `AgentView`, so the palette lists it only in an agent zone.
 - The detail adds no keyboard stop: "Keyboard path through an agent zone" is unchanged. A keyboard user opens details with the action, and a pending permission shows its detail on its own.
+- **Config** (`src/config.rs`, parsed at the boundary, `types R5`): a new `[agent]` table with `tool_details = "open" | "closed"` (default `"open"`) and `tool_details_when_done = "open" | "closed"` (default `"closed"`), each decoded into `Shown`; another value is an invalid config, reported as every invalid value is. `assets/default-config.toml` documents both. They are global: an agent profile has no key of its own for them, and the settings dialog doesn't edit them (it doesn't edit agent profiles either).
 
 ### 12. The dump (`testing R2`)
 
-A tool's entry line gains `open=yes|no|none` (`none`: nothing to open) and `items=N` before its title. After it, whether open or closed:
+A tool's entry line gains `open=yes|no|permission|none` (`RowState`'s four values: `permission` while a pending request shows its detail, `none` with nothing to open) and `items=N` before its title. After it, whatever the row's state:
 
 ```
 --- entry 4 tool call="c1" kind=edit status=completed open=no items=2 "Edit main.rs"
@@ -263,11 +277,10 @@ Tool content is in the transcript, so it is checkpointed with it at the existing
 
 Each has a recommendation, which the text above already follows. They are the user's to settle before implementation.
 
-Decided on 2026-11-25: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6); the diff comes from the `similar` crate, which the user chose over the recommended hand-written one (decision 4).
+Decided on 2026-11-25: `Dialect` is a closed enum (decision 2); the `_meta` terminal convention is read for v1 when a capture shows it is an agent's only way to deliver output, and the `terminal` client capability stays out, as `agents-client-terminals` (decision 6); the diff comes from the `similar` crate, which the user chose over the recommended hand-written one (decision 4); a tool row is open while its call runs and closes when the call finishes (the user chose this over the recommended closed rows, and over closing at the turn's end), with both states configurable in `[agent]` and a minimum visible time left for later if closing at once proves jarring (decisions 10 and 11).
 
 Still open:
 
-3. **Tool rows start closed, and a pending permission always shows its detail** (recommended). The alternative is rows that start open while a turn runs.
 4. **Raw input and result only when a call has no content** (recommended), or always under a second trigger.
 5. **The bounds** of decision 5, 64 KiB an item and 256 KiB a call: a single-file diff past about 1,000 changed lines shows its first 64 KiB and a count.
 
@@ -276,6 +289,7 @@ Still open:
 - A long diff is cut at 64 KiB → the row says how many lines aren't shown, and the agent's file is on disk to read.
 - The line diff isn't always minimal (`similar` forces a split when a search gets expensive) → still correct, and bounded work on the core's thread is the point.
 - A new dependency in the helper that is copied to remote hosts → one package with no dependencies of its own, named in one file, with the lock diff and the musl build checked in the tasks.
+- A quick tool call's row closes before it can be read → its line keeps the summary, the row opens by hand and stays open, `tool_details_when_done = "open"` keeps every row open, and a minimum visible time is the next step if needed.
 - Command output loses its colours → plain and legible; drawing it through the emulator is a later change.
 - The Claude adapter resends content with every update → each resend costs a diff on the core. The prefix and suffix skip makes that proportional to the file's size, and equal results emit nothing.
 - Amending protocol 4 assumes no release ships it first → decision 8 says what changes if one does.
@@ -283,4 +297,4 @@ Still open:
 
 ## Migration Plan
 
-Nothing to migrate: no config key, state file or released protocol changes. A session checkpointed before the change keeps its tool rows as one line; content appears for tool calls made after it.
+Nothing to migrate: the two config keys are new and optional, and no state file or released protocol changes. A Brindle older than this change reports `[agent]` as an unknown key and starts with its defaults, as it does for any key it doesn't know; the release notes say so. A session checkpointed before the change keeps its tool rows as one line; content appears for tool calls made after it.

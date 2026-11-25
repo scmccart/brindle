@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Tool call rows
-A tool call SHALL be shown as a row whose line holds an icon for its kind, its title cut to one line, a summary of its content, and its status (pending, in progress, completed or failed). The summary SHALL give the lines added and removed over the call's file changes, and the exit status or signal of its last command output that has one. An update to the call SHALL change that row in place. A row whose tool call has a detail SHALL show that it can be opened; rows SHALL start closed.
+A tool call SHALL be shown as a row whose line holds an icon for its kind, its title cut to one line, a summary of its content, and its status (pending, in progress, completed or failed). The summary SHALL give the lines added and removed over the call's file changes, and the exit status or signal of its last command output that has one. An update to the call SHALL change that row in place. A row whose tool call has a detail SHALL show that it can be opened, and whether it is open.
 
 #### Scenario: Updated in place
 - **WHEN** the agent reports tool call `call_1` titled `Read main.rs` as pending, then as completed
@@ -20,7 +20,7 @@ A tool call SHALL be shown as a row whose line holds an icon for its kind, its t
 - **THEN** its row is one line with no sign that it opens
 
 ### Requirement: Permission rows
-A permission request SHALL be shown as a row with its title and one button per option the agent offers, labelled with the option's name, allow options before reject options. While the request is pending, the detail of the tool call it names SHALL be shown with it, above its buttons, whether or not that tool call's own row is open. Choosing an option SHALL send it as the answer. Once answered, the row SHALL show the chosen option, or that the request was cancelled, and offer no buttons and no detail.
+A permission request SHALL be shown as a row with its title and one button per option the agent offers, labelled with the option's name, allow options before reject options. While the request is pending, the detail of the tool call it names SHALL be shown with it, above its buttons, whatever the settings, and SHALL NOT be shown a second time in that tool call's own row. Choosing an option SHALL send it as the answer. Once answered, the row SHALL show the chosen option, or that the request was cancelled, and offer no buttons and no detail.
 
 #### Scenario: Allow from the keyboard
 - **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab and then enter
@@ -36,11 +36,15 @@ A permission request SHALL be shown as a row with its title and one button per o
 
 #### Scenario: The edit is shown before it is allowed
 - **WHEN** the agent asks permission for a tool call that holds a file change of `/p/main.rs`
-- **THEN** the permission row shows that file change's lines above its buttons, with the tool call's own row still closed
+- **THEN** the permission row shows that file change's lines above its buttons, and the tool call's own row shows its line alone
+
+#### Scenario: Shown even when rows start closed
+- **WHEN** the config sets `tool_details = "closed"` and the agent asks permission for a tool call that holds a file change
+- **THEN** the permission row shows the file change above its buttons
 
 #### Scenario: After the answer
-- **WHEN** the user allows that request
-- **THEN** the permission row shows the chosen option alone, and the file change is still in the tool call's row when that is opened
+- **WHEN** the user allows that request and the tool call goes on running
+- **THEN** the permission row shows the chosen option alone, and the file change shows in the tool call's own row again
 
 #### Scenario: A request naming no tool call
 - **WHEN** the agent asks permission without naming a tool call
@@ -62,6 +66,29 @@ An open tool call row SHALL show its detail below its line: the tool call's cont
 #### Scenario: A cut diff says so
 - **WHEN** a file change kept its first lines and counts 400 more
 - **THEN** its detail ends with a line saying 400 more lines aren't shown
+
+### Requirement: Tool call rows open while they run
+A tool call row that has a detail SHALL be open while its tool call is running and SHALL close when the tool call finishes, unless the `[agent]` settings `tool_details` and `tool_details_when_done` say otherwise. A tool call is running while its status is pending or in progress and its turn is running; it has finished once it is completed or failed, or its turn has ended. A row the user opened or closed by hand SHALL NOT be changed by this.
+
+#### Scenario: Open, then closed
+- **WHEN** the agent reports a tool call with a file change as in progress, and later as completed
+- **THEN** its row is open while in progress and closed once completed
+
+#### Scenario: A call that arrives finished
+- **WHEN** the agent reports a tool call with a file change that is already completed
+- **THEN** its row is closed
+
+#### Scenario: The turn ends first
+- **WHEN** a tool call is still in progress when its turn is stopped
+- **THEN** its row closes
+
+#### Scenario: Opened by hand stays open
+- **WHEN** the user closes a running tool call's row and opens it again, and the tool call then completes
+- **THEN** the row is still open
+
+#### Scenario: A restored conversation
+- **WHEN** Brindle is launched and restores an agent zone whose earlier turns hold finished tool calls
+- **THEN** those rows are closed
 
 ### Requirement: Opening a tool call row
 A pointer press on the line of a tool call row that has a detail SHALL open or close it. A row SHALL stay as the user left it while its tool call changes. A detail SHALL add no keyboard stop.
@@ -112,7 +139,7 @@ Each file change and each command output in a detail SHALL have a copy button, o
 - **THEN** the clipboard holds `ok\n`
 
 ### Requirement: Toggling every tool detail
-The `toggle_agent_tool_details` action SHALL open every tool call row of the zone that has a detail when any of them is closed, and close them all otherwise. The command palette SHALL list it as Toggle Tool Details while an agent zone is active, and not in a terminal zone.
+The `toggle_agent_tool_details` action SHALL open every tool call row of the zone that has a detail when any of them is closed, and close them all otherwise, as if the user had opened or closed each by hand. The command palette SHALL list it as Toggle Tool Details while an agent zone is active, and not in a terminal zone.
 
 #### Scenario: Open all
 - **WHEN** an agent zone has three tool call rows with details, one of them open, and the user runs Toggle Tool Details

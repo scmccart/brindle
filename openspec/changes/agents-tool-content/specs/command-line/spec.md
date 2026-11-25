@@ -1,15 +1,19 @@
 ## ADDED Requirements
 
 ### Requirement: Tool call rows in the dump
-In an agent zone's dump, a tool call's `--- entry` line SHALL say whether its row is open (`open=yes`, `open=no`, or `open=none` when it has nothing to open) and how many content items it holds (`items=N`). A permission request's `--- entry` line SHALL say how many parts of its tool call's detail it shows (`detail=N`).
+In an agent zone's dump, a tool call's `--- entry` line SHALL say whether its row is open (`open=yes`, `open=no`, `open=permission` while a pending permission request shows its detail, or `open=none` when it has nothing to open) and how many content items it holds (`items=N`). A permission request's `--- entry` line SHALL say how many parts of its tool call's detail it shows (`detail=N`).
 
-#### Scenario: A closed row
-- **WHEN** the fake ACP agent reports a tool call with one diff, and the dump is taken
+#### Scenario: A running tool call
+- **WHEN** the fake ACP agent reports a tool call with one diff as in progress, and the dump is taken
+- **THEN** the tool call's `--- entry` line has `open=yes items=1`
+
+#### Scenario: A finished tool call
+- **WHEN** the fake ACP agent then reports that tool call as completed, and the dump is taken
 - **THEN** the tool call's `--- entry` line has `open=no items=1`
 
 #### Scenario: A pending permission's detail
 - **WHEN** the fake ACP agent asks permission for a tool call that holds one file change, and the dump is taken
-- **THEN** the permission's `--- entry` line has `detail=` with a count above zero, and the tool call's line has `open=no`
+- **THEN** the permission's `--- entry` line has `detail=` with a count above zero, and the tool call's line has `open=permission`
 
 ### Requirement: Tool call content in the dump
 After a tool call's `--- entry` line, whether its row is open or closed, the dump SHALL print a `--- item` line per content item (the entry, the item's index, its kind and that kind's fields), a `--- hunk` line per hunk after its diff's line, a `--- location` line per location, and a `--- raw` line for each raw value the detail shows. Every text SHALL be escaped onto one line, and `--wait-for` SHALL match these lines.

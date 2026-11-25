@@ -14,8 +14,9 @@ Brindle will speak ACP v1 and v2 side by side for good, so that no agent is left
 - **Tool calls keep their content.** The terminal server keeps, for each tool call, its text, its file changes as diff hunks, its command output, the file locations it names and its raw input and result, as Brindle's own transcript forms. They are in the log, the checkpoint and every replay, so they survive a detach, a quit, a core restart and an upgrade.
 - **Everything kept is bounded** (`railway R5`): 64 KiB for each content item, 32 items and 256 KiB for a tool call, 16 KiB for each of the raw input and result, with what was left out counted and shown. Command output keeps its end, the rest keeps its start. Escape sequences are removed from command output, which is shown as plain text.
 - **Diffs are computed on the server.** For ACP v1 the server compares the old and new text and keeps only the changed lines with their context, so a one-line edit of a large file costs a few lines of log, and Brindle never sees which ACP version the agent speaks.
-- **A tool row opens.** A tool call with content shows a summary on its line (lines added and removed, a command's exit status) and opens, on a pointer press or the new `toggle_agent_tool_details` action, to show its diffs, output, text and locations. Rows start closed.
-- **A permission row shows what it asks about.** While a request is pending, the content of the tool call it names is shown with it, above its buttons, so an edit is read before it is allowed. An agent that puts the content only in the permission request (Antigravity does) is covered.
+- **A tool row opens.** A tool call with content shows a summary on its line (lines added and removed, a command's exit status) and opens to show its diffs, output, text and locations. A row is open while its tool call runs and closes when the call finishes; a pointer press or the new `toggle_agent_tool_details` action opens or closes it by hand, and a row set by hand stays that way.
+- **Both states are configurable.** A new `[agent]` config table has `tool_details` (`"open"` or `"closed"`, for a running call) and `tool_details_when_done` (`"closed"` or `"open"`, for a finished one), applied on reload.
+- **A permission row shows what it asks about.** While a request is pending, the content of the tool call it names is shown with it, above its buttons, whatever the settings, so an edit is read before it is allowed. An agent that puts the content only in the permission request (Antigravity does) is covered.
 - **Raw input and result are the fallback.** A tool call with no content shows its raw input and result instead, which is all some agents send (Copilot's edit is a patch in its raw input).
 - **Each diff and each output has a copy button.**
 - **One implementation per ACP version.** The server's ACP code is split into a version-free reducer and one module per ACP version, chosen once per session by the negotiated version through a closed `Dialect` enum that is matched in a single file. This change moves the existing v1 code behind that seam and adds its tool content mapping there; `agents-acp-v2` adds the v2 module beside it. A new architecture rule and a check in `tests/architecture.rs` hold it.
@@ -36,12 +37,13 @@ None.
 - `ui-components`: "Tool rows" gains a trigger and a summary; a new diff block.
 - `ui-theme-tokens`: new diff colours, with their legibility pairs.
 - `command-line`: the dump's lines for a tool call's content.
+- `configuration`: the `[agent]` table's two tool detail settings.
 
 ## Impact
 
 - **`brindle-transcript`** (`transcript/`): `ToolItem`, `FileChange`, `Hunk`, `DiffLine`, `Output`, `Location`; `Entry::Tool`'s optional fields; `Event::ToolItems` and `Event::ToolOutput`; the fold's bounds; new `tests/fixtures/v4/` files (none edited); the fuzz corpus.
 - **`brindle-remote-agent`** (`remote-agent/src/acp/`): `wire.rs` and `rpc.rs` split into the version-free envelope and forms, `dialect.rs` and `v1/`; a line diff (`diff.rs`, over the `similar` crate, which joins the crate's closed dependency list and adds one package to `Cargo.lock`) and a pure escape-sequence filter (`plain.rs`); the reducer's tool handling. The static helper copied to remote hosts grows by that crate. The checkpoint's format number stays 1, amended (unreleased).
-- **`brindle`** (`src/agent/`): the chat model's tool detail, its parts and open state, the dump; the view's drawing and copy; a new action in `src/actions.rs`.
+- **`brindle`** (`src/agent/`): the chat model's tool detail, its parts and open state, the dump; the view's drawing and copy; a new action in `src/actions.rs`; the `[agent]` table in `src/config.rs` and `assets/default-config.toml`.
 - **`brindle-ui`** (`ui/`): `Tool` gains a trigger and a summary; a new `Diff` component; two tokens. Its dependency list is unchanged.
 - **Tests:** fixtures captured from real agents running an allowed edit and command, real-role tests through the fake ACP agent, and new `agent-tool-*` e2e cases. Existing agent e2e expectations change where the dump's tool line gains fields.
 - **Docs:** `docs/architecture/ports-and-adapters.md` (a new rule for ACP versions) and `README.md`'s table, `tests/architecture.rs`, `docs/code-map.md`, `README.md`, `CLAUDE.md`, `.claude/rules/remote-agent.md` and `transcript.md`.
