@@ -35,12 +35,14 @@
 //! component keeps across a refresh and what its events name the chosen
 //! item by, never a position.
 
+pub mod alert;
 pub mod badge;
 pub mod button;
 pub mod card;
 pub mod checkbox;
 pub mod combobox;
 pub mod command;
+pub mod confirmation;
 pub mod context_menu;
 pub mod dialog;
 pub mod dropdown_menu;
@@ -52,12 +54,14 @@ pub mod message;
 pub mod message_scroller;
 pub mod popover;
 pub mod prompt_input;
+pub mod reasoning;
 pub mod select;
 pub mod separator;
 pub mod switch;
 pub mod tabs;
 pub mod textarea;
 pub mod toggle;
+pub mod tool;
 pub mod tooltip;
 
 use std::rc::Rc;
@@ -70,7 +74,11 @@ use gpui::{
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::style::ring_geometry;
 
+pub use alert::{Alert, AlertStyle, AlertVariant, alert_style};
 pub use badge::{Badge, BadgeContent, TITLE_KEEPS, kept_title};
+pub use confirmation::{Confirmation, ConfirmationAction, ConfirmationState};
+pub use reasoning::Reasoning;
+pub use tool::{Tool, ToolStatus, tool_status_colors};
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};
