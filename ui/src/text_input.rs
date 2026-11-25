@@ -38,6 +38,27 @@ pub enum Motion {
     End,
 }
 
+/// How many lines an [`EditState`] holds, which decides what becomes of
+/// line breaks and other control characters in text put into it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lines {
+    /// A text input's one line ([`single_line`]).
+    #[default]
+    One,
+    /// A text area's lines ([`many_lines`]).
+    Many,
+}
+
+impl Lines {
+    /// `text` as this kind of state holds it.
+    pub fn normalize(self, text: &str) -> String {
+        match self {
+            Lines::One => single_line(text),
+            Lines::Many => many_lines(text),
+        }
+    }
+}
+
 /// The text of an input and what is selected in it. Offsets are byte
 /// indices into `text`, always on char boundaries. The selection runs from
 /// `anchor` to `head`, where the cursor is; they are equal when nothing is
@@ -49,6 +70,7 @@ pub struct EditState {
     head: usize,
     /// Text an input method is composing.
     marked: Option<Range<usize>>,
+    lines: Lines,
 }
 
 /// Input text is a single line: line breaks become spaces and other control
@@ -58,6 +80,20 @@ pub fn single_line(text: &str) -> String {
         .chars()
         .filter_map(|c| match c {
             '\r' | '\n' => Some(' '),
+            c if c.is_control() => None,
+            c => Some(c),
+        })
+        .collect()
+}
+
+/// Text-area text keeps its lines: `\r\n` and a lone `\r` become `\n`, a
+/// tab stays, and other control characters are dropped.
+pub fn many_lines(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .chars()
+        .filter_map(|c| match c {
+            '\r' | '\n' => Some('\n'),
+            '\t' => Some('\t'),
             c if c.is_control() => None,
             c => Some(c),
         })
@@ -99,11 +135,25 @@ pub fn hit_for_y(y: Pixels, top: Pixels, bottom: Pixels) -> Hit {
 }
 
 impl EditState {
-    /// `text` with the cursor at its end.
+    /// One line of `text` with the cursor at its end.
     pub fn new(text: &str) -> Self {
-        let text = single_line(text);
+        Self::with_lines(text, Lines::One)
+    }
+
+    /// The lines of `text`, as a text area holds them, with the cursor at
+    /// its end.
+    pub fn multiline(text: &str) -> Self {
+        Self::with_lines(text, Lines::Many)
+    }
+
+    pub fn with_lines(text: &str, lines: Lines) -> Self {
+        let text = lines.normalize(text);
         let end = text.len();
-        Self { text, anchor: end, head: end, marked: None }
+        Self { text, anchor: end, head: end, marked: None, lines }
+    }
+
+    pub fn lines(&self) -> Lines {
+        self.lines
     }
 
     pub fn text(&self) -> &str {
@@ -133,7 +183,7 @@ impl EditState {
 
     /// Replaces the whole text, cursor at the end.
     pub fn set_text(&mut self, text: &str) {
-        *self = Self::new(text);
+        *self = Self::with_lines(text, self.lines);
     }
 
     pub fn select_all(&mut self) {
@@ -211,7 +261,7 @@ impl EditState {
 
     /// Replaces `range` with `new` and puts the cursor after it.
     pub fn replace(&mut self, range: Range<usize>, new: &str) {
-        let new = single_line(new);
+        let new = self.lines.normalize(new);
         let start = self.clamp(range.start);
         let range = start..self.clamp(range.end).max(start);
         self.text.replace_range(range.clone(), &new);
@@ -230,7 +280,7 @@ impl EditState {
     /// selects `selected` within it (the cursor after it when `None`).
     pub fn replace_and_mark(&mut self, range: Option<Range<usize>>, new: &str, selected: Option<Range<usize>>) {
         let range = range.or_else(|| self.marked.clone()).unwrap_or_else(|| self.selection());
-        let new = single_line(new);
+        let new = self.lines.normalize(new);
         let start = self.clamp(range.start);
         self.replace(start..range.end, &new);
         self.marked = (!new.is_empty()).then(|| start..start + new.len());
@@ -369,6 +419,147 @@ pub fn scroll_for_caret(scroll: f32, caret_x: f32, width: f32, text_width: f32) 
         scroll
     };
     scroll.clamp(0.0, max)
+}
+
+// ---- shown lines ------------------------------------------------------------
+
+/// One shown line of a text area's text: a line of the text, or the part of
+/// one that fits before it wraps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WrapRow {
+    /// Where the row starts in the text.
+    pub start: usize,
+    /// Where it ends: the offset of its line break, the start of the row it
+    /// wraps into, or the end of the text.
+    pub end: usize,
+    /// Whether the row wraps into the next one (so `end` is that row's
+    /// start, and an offset there is shown on the next row).
+    pub wraps: bool,
+    /// Every char boundary from `start` to `end`, both included, with its
+    /// distance in pixels from the row's start, in order.
+    pub stops: Vec<(usize, f32)>,
+}
+
+impl WrapRow {
+    /// The stops the cursor can be shown at on this row: all of them, but
+    /// a wrapping row's end, which is shown at the next row's start.
+    fn cursor_stops(&self) -> &[(usize, f32)] {
+        match self.stops.split_last() {
+            Some((_, rest)) if self.wraps && !rest.is_empty() => rest,
+            _ => &self.stops,
+        }
+    }
+}
+
+/// How a text area's text is shown: its rows, top to bottom, as the
+/// element laid it out at its width. Pure, so the vertical motions and the
+/// pointer's offsets are unit-tested without a window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WrapMap {
+    rows: Vec<WrapRow>,
+}
+
+impl WrapMap {
+    /// The rows, which must cover the text in order: each starts where the
+    /// one before it wraps, or after its line break.
+    pub fn new(rows: Vec<WrapRow>) -> Self {
+        Self { rows }
+    }
+
+    pub fn rows(&self) -> &[WrapRow] {
+        &self.rows
+    }
+
+    /// The row `offset` is shown on: the last one starting at or before it.
+    pub fn row_of(&self, offset: usize) -> usize {
+        self.rows.partition_point(|row| row.start <= offset).saturating_sub(1)
+    }
+
+    /// How far right of its row's start `offset` is shown.
+    pub fn x_of(&self, offset: usize) -> f32 {
+        let Some(row) = self.rows.get(self.row_of(offset)) else { return 0. };
+        let ix = row.stops.partition_point(|(stop, _)| *stop < offset);
+        row.stops.get(ix).or(row.stops.last()).map_or(0., |(_, x)| *x)
+    }
+
+    /// The offset on `row` nearest to `x` (from the row's start).
+    pub fn offset_at(&self, row: usize, x: f32) -> usize {
+        let Some(row) = self.rows.get(row) else { return 0 };
+        row.cursor_stops()
+            .iter()
+            .min_by(|(_, a), (_, b)| (a - x).abs().total_cmp(&(b - x).abs()))
+            .map_or(row.start, |(offset, _)| *offset)
+    }
+
+    /// The start of the row `offset` is shown on.
+    pub fn row_start(&self, offset: usize) -> usize {
+        self.rows.get(self.row_of(offset)).map_or(0, |row| row.start)
+    }
+
+    /// The end of the row `offset` is shown on: its line break or the end
+    /// of the text, or, on a row that wraps, its last char boundary before
+    /// the next row (an offset at the wrap is shown on the next row).
+    pub fn row_end(&self, offset: usize) -> usize {
+        self.rows
+            .get(self.row_of(offset))
+            .and_then(|row| row.cursor_stops().last().map(|(stop, _)| *stop))
+            .unwrap_or(offset)
+    }
+}
+
+/// Up or down a shown line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vertical {
+    Up,
+    Down,
+}
+
+/// What a vertical motion did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum VerticalMotion {
+    /// The cursor moved a row, aiming at `goal_x`, which the next vertical
+    /// motion of the run keeps.
+    Moved { goal_x: f32 },
+    /// The cursor is on the first row (up) or the last (down): nothing
+    /// moved, and the key is the owner's.
+    AtEdge,
+}
+
+/// Moves the cursor to the row above or below, as near to `goal_x` (the
+/// run's, else the cursor's own x) as that row allows, extending the
+/// selection when `extend`. On the first row up, or the last down, nothing
+/// moves.
+pub fn motion_vertical(
+    state: &mut EditState,
+    wrap: &WrapMap,
+    dir: Vertical,
+    goal_x: Option<f32>,
+    extend: bool,
+) -> VerticalMotion {
+    let row = wrap.row_of(state.cursor());
+    let target = match dir {
+        Vertical::Up => row.checked_sub(1),
+        Vertical::Down => (row + 1 < wrap.rows().len()).then_some(row + 1),
+    };
+    let Some(target) = target else { return VerticalMotion::AtEdge };
+    let goal_x = goal_x.unwrap_or_else(|| wrap.x_of(state.cursor()));
+    state.move_to(wrap.offset_at(target, goal_x), extend);
+    VerticalMotion::Moved { goal_x }
+}
+
+/// The first shown row of an area `visible` rows tall over `total` rows,
+/// from the one shown first now: unchanged while `cursor_row` is in view,
+/// else just enough to bring it in, and never past the last row.
+pub fn first_row_for_cursor(first: usize, cursor_row: usize, visible: usize, total: usize) -> usize {
+    let visible = visible.max(1);
+    let first = if cursor_row < first {
+        cursor_row
+    } else if cursor_row >= first + visible {
+        cursor_row + 1 - visible
+    } else {
+        first
+    };
+    first.min(total.saturating_sub(visible))
 }
 
 // ---- entity -----------------------------------------------------------------
@@ -1158,6 +1349,141 @@ mod tests {
         ] {
             assert_eq!(hit_for_y(y, top, bottom), hit, "{y:?}");
         }
+    }
+
+    /// A text area's lines keep their breaks and tabs; `\r\n` and `\r`
+    /// become `\n`, other controls go. A one-line state is unchanged.
+    #[test]
+    fn many_lines_keep_their_breaks() {
+        assert_eq!(many_lines("one\r\ntwo\rthree\nfour\tfive\u{7}\u{1b}"), "one\ntwo\nthree\nfour\tfive");
+        let mut s = EditState::multiline("");
+        assert_eq!(s.lines(), Lines::Many);
+        s.insert("one\r\ntwo");
+        assert_eq!(show(&s), "one\ntwo|");
+        s.set_text("a\rb");
+        assert_eq!((s.text(), s.lines()), ("a\nb", Lines::Many));
+        s.replace_and_mark(None, "x\r\ny", None);
+        assert_eq!(s.text(), "a\nbx\ny");
+        assert_eq!(s.marked(), Some(3..6));
+        // Word motions cross line breaks as separators.
+        let mut s = EditState::multiline("ab\ncd");
+        s.motion(Motion::WordLeft, false);
+        assert_eq!(show(&s), "ab\n|cd");
+        s.motion(Motion::WordLeft, false);
+        assert_eq!(show(&s), "|ab\ncd");
+        // The single-line rule is unchanged.
+        assert_eq!(EditState::new("a\r\nb\tc").text(), "a bc");
+        assert_eq!(Lines::default(), Lines::One);
+    }
+
+    /// Rows of `text` wrapped at `cols` characters, each one pixel wide.
+    fn monospace(text: &str, cols: usize) -> WrapMap {
+        let mut rows = Vec::new();
+        let mut line_start = 0;
+        for line in text.split('\n') {
+            let bounds: Vec<usize> =
+                line.char_indices().map(|(ix, _)| line_start + ix).chain([line_start + line.len()]).collect();
+            let chars = bounds.len() - 1;
+            let mut first = 0;
+            loop {
+                let last = (first + cols).min(chars);
+                let wraps = last < chars;
+                let stops = (first..=last).map(|ix| (bounds[ix], (ix - first) as f32)).collect();
+                rows.push(WrapRow { start: bounds[first], end: bounds[last], wraps, stops });
+                if !wraps {
+                    break;
+                }
+                first = last;
+            }
+            line_start += line.len() + 1;
+        }
+        WrapMap::new(rows)
+    }
+
+    #[test]
+    fn rows_and_their_offsets() {
+        let wrap = monospace("abcdef\nxy\nabcdefghij", 4);
+        let starts: Vec<(usize, usize, bool)> = wrap.rows().iter().map(|r| (r.start, r.end, r.wraps)).collect();
+        assert_eq!(starts, [(0, 4, true), (4, 6, false), (7, 9, false), (10, 14, true), (14, 18, true), (18, 20, false)]);
+        // An offset at a wrap shows on the next row; at a line break, on
+        // its own line.
+        assert_eq!(wrap.row_of(3), 0);
+        assert_eq!(wrap.row_of(4), 1);
+        assert_eq!(wrap.row_of(6), 1);
+        assert_eq!(wrap.row_of(7), 2);
+        assert_eq!(wrap.row_of(20), 5);
+        assert_eq!(wrap.x_of(5), 1.);
+        assert_eq!(wrap.x_of(9), 2.);
+        // A wrapping row's end isn't a place for the cursor on that row.
+        assert_eq!(wrap.offset_at(0, 9.), 3);
+        assert_eq!(wrap.offset_at(1, 9.), 6);
+        assert_eq!(wrap.offset_at(2, 1.4), 8);
+        // Home and end of the shown line.
+        assert_eq!((wrap.row_start(2), wrap.row_end(2)), (0, 3));
+        assert_eq!((wrap.row_start(5), wrap.row_end(4)), (4, 6));
+        assert_eq!((wrap.row_start(12), wrap.row_end(12)), (10, 13));
+        assert_eq!((wrap.row_start(19), wrap.row_end(19)), (18, 20));
+        // An empty text is one empty row.
+        let empty = monospace("", 4);
+        assert_eq!(empty.rows().len(), 1);
+        assert_eq!((empty.row_of(0), empty.offset_at(0, 3.), empty.row_end(0)), (0, 0, 0));
+    }
+
+    /// The spec's "Down keeps the column": down twice from after `abcd`
+    /// passes the short line and comes back to the same column.
+    #[test]
+    fn down_keeps_the_column() {
+        let mut s = EditState::multiline("abcdef\nxy\nabcdef");
+        s.move_to(4, false);
+        let wrap = monospace(s.text(), 20);
+        let VerticalMotion::Moved { goal_x } = motion_vertical(&mut s, &wrap, Vertical::Down, None, false) else {
+            panic!("moved down");
+        };
+        assert_eq!((show(&s), goal_x), ("abcdef\nxy|\nabcdef".to_string(), 4.));
+        assert_eq!(motion_vertical(&mut s, &wrap, Vertical::Down, Some(goal_x), false), VerticalMotion::Moved { goal_x });
+        assert_eq!(show(&s), "abcdef\nxy\nabcd|ef");
+        // On the last row down is the owner's; so is up on the first.
+        assert_eq!(motion_vertical(&mut s, &wrap, Vertical::Down, Some(goal_x), false), VerticalMotion::AtEdge);
+        assert_eq!(show(&s), "abcdef\nxy\nabcd|ef");
+        let mut top = EditState::multiline("ab\ncd");
+        top.move_to(1, false);
+        let top_wrap = monospace(top.text(), 20);
+        assert_eq!(motion_vertical(&mut top, &top_wrap, Vertical::Up, None, false), VerticalMotion::AtEdge);
+        assert_eq!(show(&top), "a|b\ncd");
+        // A fresh run aims at the cursor's own column.
+        assert!(matches!(motion_vertical(&mut s, &wrap, Vertical::Up, None, false), VerticalMotion::Moved { goal_x } if goal_x == 4.));
+        assert_eq!(show(&s), "abcdef\nxy|\nabcdef");
+    }
+
+    #[test]
+    fn vertical_motion_over_wrapped_rows_and_with_shift() {
+        // 30 characters at 20 wide: two rows, no line break.
+        let text = "abcdefghijklmnopqrstuvwxyz0123";
+        let mut s = EditState::multiline(text);
+        let wrap = monospace(text, 20);
+        assert_eq!(wrap.rows().len(), 2);
+        s.move_to(3, false);
+        motion_vertical(&mut s, &wrap, Vertical::Down, None, false);
+        assert_eq!(s.cursor(), 23);
+        motion_vertical(&mut s, &wrap, Vertical::Up, None, true);
+        assert_eq!((s.cursor(), s.selection()), (3, 3..23));
+        // From past the second row's end, up goes to the same x above.
+        s.move_to(30, false);
+        motion_vertical(&mut s, &wrap, Vertical::Up, None, false);
+        assert_eq!(s.cursor(), 10);
+    }
+
+    #[test]
+    fn the_first_row_follows_the_cursor() {
+        // Fits: never scrolled.
+        assert_eq!(first_row_for_cursor(0, 3, 8, 5), 0);
+        // 12 rows in 8: the cursor's row is brought in, just.
+        assert_eq!(first_row_for_cursor(0, 11, 8, 12), 4);
+        assert_eq!(first_row_for_cursor(4, 6, 8, 12), 4);
+        assert_eq!(first_row_for_cursor(4, 2, 8, 12), 2);
+        // Text got shorter: no empty rows after it.
+        assert_eq!(first_row_for_cursor(6, 6, 8, 9), 1);
+        assert_eq!(first_row_for_cursor(3, 0, 0, 2), 0);
     }
 
     /// b43 #3: a single press moves the cursor (extending with shift) and

@@ -29,7 +29,7 @@ Before starting, check that both changes this one depends on are implemented and
 
 ## 3. brindle-ui components
 
-- [ ] 3.1 Give `EditState` a `Lines` mode (`Many` keeping `\n` and tab, turning `\r\n` and `\r` into `\n`) and a pure `WrapMap` with `motion_vertical` keeping a goal x; verify with unit tests for normalizing and vertical motion and that every existing `text_input` test still passes.
+- [x] 3.1 Give `EditState` a `Lines` mode (`Many` keeping `\n` and tab, turning `\r\n` and `\r` into `\n`) and a pure `WrapMap` with `motion_vertical` keeping a goal x; verify with unit tests for normalizing and vertical motion and that every existing `text_input` test still passes.
 - [ ] 3.2 Add the `TextArea` entity (`ui/src/text_area.rs`): wrapped shaping, the `TextArea` key context, growth to `max_lines` then scrolling, `EntityInputHandler` with caret bounds on wrapped lines, `composing()`, `Changed`, and enter, escape, tab, shift-tab and edge up/down propagated; verify with `TestAppContext` tests for each `text-input` scenario keys can drive.
 - [ ] 3.3 Add `Textarea` (the `Input` frame around a `TextArea`); verify a frame press focuses the area with the cursor at the end in a `TestAppContext` test.
 - [ ] 3.4 Add `MessageScroller` over GPUI's `list` (`ListAlignment::Bottom`), the pure `Follow` rule and the scroll button; verify with unit tests for `Follow` and a `TestAppContext` test that an item added while away leaves the offset unchanged.
