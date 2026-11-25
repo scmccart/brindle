@@ -31,15 +31,15 @@ With the cursor at the very start of the prompt input's text and nothing selecte
 - **THEN** the prompt input has none, and its text is unchanged
 
 ### Requirement: Attachment limits are said when attaching
-Adding an attachment that would make more than 8, or more than 128 KiB of attached text together, SHALL be refused: the window's notice line SHALL say which limit, and the attachments already there SHALL stay. Text longer than 64 KiB SHALL be attached cut to 64 KiB, the output of a command keeping its end and any other text its start, and its item SHALL say it was cut.
+Adding a ninth attachment SHALL be refused: the window's notice line SHALL say a prompt takes at most 8, and the attachments already there SHALL stay. Text longer than 256 KiB SHALL be attached cut to 256 KiB, the output of a command keeping its end and a file its start, and its item SHALL say it was cut.
 
 #### Scenario: A ninth attachment
 - **WHEN** the prompt input holds 8 attachments and the user attaches a file
 - **THEN** the notice line says a prompt takes at most 8 attachments, and 8 remain
 
 #### Scenario: Long output keeps its end
-- **WHEN** the user sends a command's output of 200 KiB to an agent
-- **THEN** the attachment holds the last 64 KiB of it, and its item says it was cut
+- **WHEN** the user sends a command's output of 1 MiB to an agent
+- **THEN** the attachment holds the last 256 KiB of it, and its item says it was cut
 
 ### Requirement: Attaching a file by path
 The `agent_attach_file` action SHALL ask for a path and attach it as a link, as typed, without checking it; the agent reads the file on its own host, where a relative path is relative to the session's working directory. The command palette SHALL list it as Attach File… while an agent zone is active.
@@ -120,15 +120,26 @@ When the window has several agent zones, sending a command's output to an agent 
 - **THEN** the notice line says no agent zone is open, and the terminal keeps focus
 
 ### Requirement: Attachments in the conversation
-A user message SHALL list its attachments under its text: a link as its path, and a text attachment as a row with its name and size that opens, on a pointer press, to show the text that was sent, in the terminal's font family, with which end was cut when it was. Rows SHALL start closed and SHALL add no keyboard stop. A waiting or held prompt's row SHALL say how many attachments it has.
+A user message SHALL list its attachments under its text: a link as its path, and a text attachment as a row with its name and size. Rows SHALL start closed and SHALL add no keyboard stop. A waiting or held prompt's row SHALL say how many attachments it has.
 
 #### Scenario: Shown with the message
 - **WHEN** the user sends `why?` with a text attachment `cargo test` and a link to `src/main.rs`
 - **THEN** the user message shows `why?`, a closed row `cargo test` with its size, and `src/main.rs`
 
+### Requirement: Opening a text attachment
+A pointer press on a text attachment's row SHALL fetch its text from the server and show it under the row, in the terminal's font family, with which end was cut when it was; until it arrives the row SHALL show that it is loading. A second press SHALL close it. When the server no longer keeps the text, the row SHALL say so. An agent zone SHALL hold the text of open rows only.
+
 #### Scenario: Opened
 - **WHEN** the user presses the `cargo test` row
-- **THEN** the attached output shows under it
+- **THEN** the row shows it is loading, then the attached output shows under it
+
+#### Scenario: After a relaunch
+- **WHEN** Brindle is quit and launched again, and the user opens the same row in the restored zone
+- **THEN** the same output shows
+
+#### Scenario: No longer kept
+- **WHEN** the server can't read the attachment's text any more and the user presses its row
+- **THEN** the row says the text is no longer kept
 
 #### Scenario: A queued prompt
 - **WHEN** a prompt with two attachments waits in the queue

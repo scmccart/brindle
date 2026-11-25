@@ -1,14 +1,18 @@
 ## ADDED Requirements
 
 ### Requirement: Attachments in the dump
-In an agent zone's dump, a user message's `--- entry` line SHALL say how many attachments it has (`attachments=N`) when it has any, followed by one `--- attached` line each: the entry, the index, the kind, and a link's path and name or a text's name, which end was cut, its size and its text. Texts SHALL be escaped onto one line, and `--wait-for` SHALL match these lines.
+In an agent zone's dump, a user message's `--- entry` line SHALL say how many attachments it has (`attachments=N`) when it has any, followed by one `--- attached` line each: the entry, the index, the kind, and a link's path and name, or a text's id, name, which end was cut, its size and its row's state (`closed`, `loading`, `shown` with its text, or `gone`). Texts SHALL be escaped onto one line, and `--wait-for` SHALL match these lines.
+
+#### Scenario: A kept text
+- **WHEN** the user sent a prompt with a 3-byte text attachment named `cargo test`, and the dump is taken
+- **THEN** the dump has a line `--- attached entry=N index=0 kind=text id=1 name="cargo test" cut=none bytes=3 state=closed`
 
 #### Scenario: A sent attachment
 - **WHEN** the user sent `why?` with a link to `src/main.rs`, and the dump is taken
 - **THEN** the dump has a user entry line with `attachments=1` and a line `--- attached entry=N index=0 kind=link path="src/main.rs" name="main.rs"`
 
 ### Requirement: Waiting attachments in the dump
-Before the `--- prompt` line, an agent zone's dump SHALL print one `--- draft` line per attachment waiting in the prompt input, in the form of an `--- attached` line without the entry. A `--- queued` line SHALL say how many attachments its prompt has (`attachments=N`) when it has any. `--wait-for` SHALL match these lines.
+Before the `--- prompt` line, an agent zone's dump SHALL print one `--- draft` line per attachment waiting in the prompt input, with its index, kind, a link's path and name, or a text's name, which end was cut, its size and its text. A `--- queued` line SHALL say how many attachments its prompt has (`attachments=N`) when it has any. `--wait-for` SHALL match these lines.
 
 #### Scenario: A draft
 - **WHEN** a text attachment named `cargo test` holding `ok\n` waits in the prompt input, and the dump is taken
