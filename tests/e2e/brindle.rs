@@ -825,7 +825,7 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 6] = ["agent ", "note ", "entry ", "queued ", "conversation ", "prompt "];
+const AGENT_LINES: [&str; 8] = ["agent ", "note ", "entry ", "block ", "link ", "queued ", "conversation ", "prompt "];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -962,7 +962,9 @@ impl Dump {
                 dump.fonts = parse_fonts(rest);
             } else if let Some(rest) = line.strip_prefix("--- config ") {
                 dump.config = unquote(rest);
-            } else if let Some(rest) = line.strip_prefix("--- link ") {
+            } else if let Some(rest) = line.strip_prefix("--- link ").filter(|rest| !rest.starts_with("entry=")) {
+                // A terminal's hovered link; an agent zone's links name
+                // their entry and are agent lines.
                 dump.link = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- selection ") {
                 dump.selection = unquote(rest);
@@ -1049,6 +1051,24 @@ impl Dump {
             .iter()
             .filter_map(|line| line.strip_prefix("entry ")?.split_once(' ').map(|(_, rest)| rest))
             .collect()
+    }
+
+    /// Entry `entry`'s parts (`--- block entry=N part=P kind=K "TEXT"`),
+    /// each as `part=P kind=K "TEXT"`.
+    pub fn agent_blocks(&self, entry: u64) -> Vec<&str> {
+        self.entry_lines("block ", entry)
+    }
+
+    /// The links in entry `entry`'s parts (`--- link entry=N part=P
+    /// target="…" text="…" action=A`), each as `part=P target=… text=…
+    /// action=A`.
+    pub fn agent_links(&self, entry: u64) -> Vec<&str> {
+        self.entry_lines("link ", entry)
+    }
+
+    fn entry_lines(&self, word: &str, entry: u64) -> Vec<&str> {
+        let prefix = format!("entry={entry} ");
+        self.agent.iter().filter_map(|line| line.strip_prefix(word)?.strip_prefix(prefix.as_str())).collect()
     }
 
     /// A `key=value` field of the find line (values without spaces).
@@ -1281,10 +1301,20 @@ pub fn self_test_dump() -> Result {
     let dump = Dump::parse(
         "--- tab 1 \"Fake Agent\" (active)\n--- fonts terminal=\"A\" ui=\"B\"\n\
          --- agent zone=1 state=ready name=\"Fake Agent\" turn=ended:end_turn activity=done status=done link=up session=open\n\
-         --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n--- queued waiting \"next\"\n\
+         --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n\
+         --- block entry=2 part=0 kind=paragraph \"Hello!\"\n\
+         --- link entry=2 part=0 target=\"https://example.com\" text=\"Hello\" action=open\n--- queued waiting \"next\"\n\
          --- conversation entries=2 at=end\n--- prompt status=ready\n--- focus other modality=keyboard\n",
     );
-    ensure!(dump.agent.len() == 7, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent.len() == 9, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent_blocks(2) == ["part=0 kind=paragraph \"Hello!\""], "blocks {:?}", dump.agent_blocks(2));
+    ensure!(dump.agent_blocks(1).is_empty() && dump.agent_links(1).is_empty(), "entry 1's {:?}", dump.agent);
+    ensure!(
+        dump.agent_links(2) == ["part=0 target=\"https://example.com\" text=\"Hello\" action=open"],
+        "links {:?}",
+        dump.agent_links(2)
+    );
+    ensure!(dump.link.is_none(), "an agent's link isn't the terminal's hovered one: {:?}", dump.link);
     ensure!(dump.agent_field("state") == Some("ready") && dump.agent_field("session") == Some("open"), "{:?}", dump.agent);
     ensure!(dump.agent_field("zone") == Some("1") && dump.agent_field("missing").is_none(), "{:?}", dump.agent);
     ensure!(dump.agent_entries() == ["user \"hi there\"", "agent \"Hello!\""], "entries {:?}", dump.agent_entries());

@@ -81,6 +81,7 @@ pub fn all() -> Vec<Case> {
         // The agent never starts: no fake agent is run.
         display("windows-agent-batch-hint", agent_batch_hint),
         display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
+        display("windows-agent-markdown", agent_markdown).needs_fake_agent(),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -1267,6 +1268,30 @@ fn agent_prompt_stdin(ctx: &Ctx) -> Result<Outcome> {
 
     let said = refused_without_stdin(ctx, "absent", &config)?;
     ensure!(said == "brindle: -p - needs a file or pipe on standard input", "no standard input: {said:?}");
+    Ok(Outcome::Pass)
+}
+
+/// An agent message in Markdown on Windows: a fence and a list are parts
+/// of their kinds, and its `file:` links are planned as Windows plans
+/// them: `file:///C:/x`, a path on a drive, is confirmed before Explorer
+/// shows it, and `file:///etc/hosts`, a path on no drive, is refused
+/// (`refuse:no-drive`).
+fn agent_markdown(ctx: &Ctx) -> Result<Outcome> {
+    use super::agent::{link, part};
+    let answer = "```\nfn x() {}\n```\n\n- a\n- b\n\nSee [c](file:///C:/x) and [h](file:///etc/hosts).\n";
+    let profile = super::agent::answering(ctx, "markdown", answer)?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("turn=ended:end_turn")
+        .dump_at(5.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    let parts = [part(0, "code", "fn x() {}\n"), part(1, "list", "- a\n- b"), part(2, "paragraph", "See c and h.")];
+    ensure!(out.dump.agent_blocks(2) == parts, "parts {:#?}", out.dump.agent_blocks(2));
+    let links = [link(2, "file:///C:/x", "c", "confirm"), link(2, "file:///etc/hosts", "h", "refuse:no-drive")];
+    ensure!(out.dump.agent_links(2) == links, "links {:#?}", out.dump.agent_links(2));
     Ok(Outcome::Pass)
 }
 

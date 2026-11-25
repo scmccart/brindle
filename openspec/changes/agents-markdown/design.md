@@ -277,3 +277,10 @@ Nothing to migrate: no config key, state file or protocol changes, and the serve
 - **`ConfirmLink { uri, back }` carries the zone's prompt focus handle,** and the workspace focuses it when the confirmation closes, whichever way, rather than relying on the overlay's own restore (the press might have moved focus).
 - **The link confirmation has its own modal slot** (`Workspace::link_confirm`, `Overlay::LinkConfirm { uri, back }`, `OverlayKind::LinkConfirm`, which replaces what is open) and shares `_confirm_subscriptions` with the close confirmation, since one overlay is open at most. It holds the workspace's actions back as the close confirmation does. The link is drawn on `muted` (foreground on muted, a pair the legibility test checks).
 - **The view redraws on every modifiers change** (`on_modifiers_changed` → `cx.notify()`), not only ctrl's: modifier changes are rare, and filtering would need state for no gain.
+
+**Section 5, end-to-end cases (2026-11-25).**
+- **The e2e `Dump` keeps `block` and `link` lines as agent lines,** read through `Dump::agent_blocks(entry)` and `Dump::agent_links(entry)` (self-tested). A terminal's hovered link already printed `--- link URI`, so the parser takes a `--- link` line naming `entry=` as an agent line and any other as the terminal's.
+- **`agent-markdown-stream` launches twice,** each run on a script with its own gates: `held` never sends the reference definition and checks the paragraph shown as written (`See [docs][d].`, no link) with the fence closed and one part; `defined` sends it and checks the link. One run could show only the end state.
+- **`agent-palette-commands` gains a terminal run,** whose palette lists Clear Scrollback (so the check isn't vacuous) and none of the agent's commands, Copy Last Code Block included.
+- **`windows-agent-markdown` is written but not yet compiled or run on Windows:** a Linux cross-check stops at the C build scripts of `ring`, `psm` and `libz-sys`. It uses only helpers the Linux cases compile (`agent::answering`, `part`, `link`, `waited`); the plan it depends on is unit-tested with the Windows `Plan` in `markdown.rs`.
+- No case exposed a product bug.
