@@ -612,14 +612,16 @@ pub fn thoughts(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// A conversation longer than the zone: shift-pageup leaves its end
-/// (`at=away`), and Scroll Agent to Bottom returns to it.
+/// (`at=away`), and Scroll Agent to Bottom returns to it. The lines are
+/// paragraphs: a single line break is a space in Markdown, which would
+/// make them one short paragraph.
 pub fn scroll(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let long: Vec<String> = (1..=200).map(|n| format!("line {n}")).collect();
     let profile = Script::ready(&received)
         .step("expect session/prompt")
-        .step(says(&long.join("\n")))
-        .step(says("\nthe end"))
+        .step(says(&long.join("\n\n")))
+        .step(says("\n\nthe end"))
         .step(stop("end_turn"))
         .profile(ctx, "scroll")?;
     let started =

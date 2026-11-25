@@ -32,7 +32,8 @@ use crate::actions::{
     AgentCancel, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyQueuedPrompt,
     ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts,
 };
-use crate::agent::model::{Block, BlockBody, ChatModel, PromptStatus, QueueRow, Resend, Speaker};
+use crate::agent::markdown;
+use crate::agent::model::{Block, BlockBody, ChatModel, PromptStatus, QueueRow, Resend};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
 use crate::agent::{Agent, AgentUpdate};
 use crate::settings::Settings;
@@ -407,31 +408,31 @@ fn block_element(
 ) -> gpui::AnyElement {
     let entry = block.entry;
     let id = |what: &str| ElementId::Name(format!("agent-{what}-{}-{}", entry.0, block.part).into());
+    let message = |view: WeakEntity<AgentView>, from: MessageFrom, text: SharedString| {
+        let copy = Button::icon_only(id("copy"), Icon::Copy)
+            .variant(ButtonVariant::Ghost)
+            .size(ButtonSize::IconXs)
+            .tooltip_for("Copy", None)
+            .on_click(move |_, _, cx| {
+                let Some(view) = view.upgrade() else { return };
+                let text = view.read(cx).agent.read(cx).model().message_text(entry).map(str::to_string);
+                if let Some(text) = text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            });
+        Message::text(id("message"), from, text).part(bubble_part(block.part, block.last)).action(copy).into_any_element()
+    };
+    // Until agent parts are drawn as rich text (section 4 of
+    // `agents-markdown`), a part and a thought show their plain text.
     match &block.body {
-        BlockBody::Text { speaker, text } => {
-            let from = match speaker {
-                Speaker::User => MessageFrom::User,
-                Speaker::Agent => MessageFrom::Assistant,
-            };
-            let copy = Button::icon_only(id("copy"), Icon::Copy)
-                .variant(ButtonVariant::Ghost)
-                .size(ButtonSize::IconXs)
-                .tooltip_for("Copy", None)
-                .on_click(move |_, _, cx| {
-                    let Some(view) = view.upgrade() else { return };
-                    let text = view.read(cx).agent.read(cx).model().message_text(entry).map(str::to_string);
-                    if let Some(text) = text {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    }
-                });
-            Message::text(id("message"), from, text.clone()).part(bubble_part(block.part, block.last)).action(copy).into_any_element()
-        }
-        BlockBody::Thought { text, open } => Reasoning::new(id("thought"), *open)
+        BlockBody::UserText { text } => message(view, MessageFrom::User, text.clone()),
+        BlockBody::AgentPart { block } => message(view, MessageFrom::Assistant, markdown::shown_text(block).into()),
+        BlockBody::Thought { blocks, open } => Reasoning::new(id("thought"), *open)
             .label("Thought")
             .on_toggle(move |_, _, cx| {
                 view.update(cx, |view, cx| view.agent.update(cx, |agent, cx| agent.toggle_thought(entry, cx))).ok();
             })
-            .child(text.clone())
+            .child(blocks.iter().map(|block| markdown::shown_text(block)).collect::<Vec<_>>().join("\n\n"))
             .into_any_element(),
         BlockBody::Tool { kind, title, status } => {
             Tool::new(tool_icon(*kind), title.clone(), tool_status(*status)).into_any_element()

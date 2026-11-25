@@ -94,6 +94,10 @@ impl InlineBuf {
     fn finish(mut self) -> Inline {
         for range in std::mem::take(&mut self.plain) {
             let Some(slice) = self.text.get(range.clone()) else { continue };
+            // Every scheme ends in a colon: most text has none to look at.
+            if !slice.contains(':') {
+                continue;
+            }
             let starts: Vec<usize> = slice.char_indices().map(|(at, _)| at).collect();
             let chars: Vec<char> = slice.chars().collect();
             for url in links::find_urls(&chars) {
@@ -108,7 +112,7 @@ impl InlineBuf {
                 self.links.push(link);
             }
         }
-        let text = self.text;
+        let text = SharedString::from(self.text);
         match Inline::new(text.clone(), self.runs, self.links) {
             Ok(inline) => inline,
             // A bug in the walk, never the text's fault: the tests' corpus
