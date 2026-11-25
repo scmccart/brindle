@@ -47,7 +47,9 @@ pub const UNSUPPORTED_VERSION: i64 = -32022;
 pub struct Id(Value);
 
 impl Id {
-    /// The id of a request the core sends.
+    /// The id of a request the core sends (the core's own come from
+    /// `Rpc`; the tests build them).
+    #[cfg(test)]
     pub fn number(id: u64) -> Self {
         Self(Value::from(id))
     }

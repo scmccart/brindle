@@ -151,19 +151,25 @@ impl AgentSession {
         &self.transcript
     }
 
-    pub fn rpc(&self) -> &Rpc {
-        &self.rpc
-    }
-
     /// The stdout line in progress and the bytes fed, for the checkpoint.
     pub fn lines(&self) -> &Lines {
         &self.lines
     }
 
+    // What the tests look at; the core sees a session through its
+    // transcript and its lines.
+
+    #[cfg(test)]
+    pub fn rpc(&self) -> &Rpc {
+        &self.rpc
+    }
+
+    #[cfg(test)]
     pub fn phase(&self) -> &Phase {
         &self.phase
     }
 
+    #[cfg(test)]
     pub fn cwd(&self) -> &str {
         &self.cwd
     }

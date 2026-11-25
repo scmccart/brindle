@@ -418,13 +418,6 @@ pub(super) enum SessionKind {
     /// A program on a PTY, with an emulator in the core.
     Terminal,
     /// An ACP agent on plain pipes, with its transcript in the core.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the core's agent sessions (task group 7 of agents-sessions) make them"
-        )
-    )]
     Agent,
 }
 
@@ -440,13 +433,6 @@ pub(super) fn shown(kind: SessionKind, protocol: u32) -> bool {
 }
 
 /// When the core checkpoints an agent session (decision 11).
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the core's agent sessions (task group 7 of agents-sessions) call it"
-    )
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AgentCheckpoint {
     /// After `acp::reduce::step`, with the moment it asked to checkpoint
@@ -465,13 +451,6 @@ pub(super) enum AgentCheckpoint {
 /// last checkpoint is checkpointed now: at every moment the reducer names,
 /// before a step-down and on a detach, and otherwise past
 /// [`CHECKPOINT_AFTER`] (512 KiB), as a terminal is.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the core's agent sessions (task group 7 of agents-sessions) call it"
-    )
-)]
 pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
     match at {
         AgentCheckpoint::Stepped(Some(
@@ -486,6 +465,15 @@ pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
         | AgentCheckpoint::Detach => true,
         AgentCheckpoint::Stepped(None) => since > CHECKPOINT_AFTER,
     }
+}
+
+/// Why a `SPAWN_AGENT` of `command` is refused before anything starts: an
+/// agent session has no login-shell default, so it needs a command.
+pub(super) fn agent_spawn_refusal(command: &str) -> Option<&'static str> {
+    command
+        .trim()
+        .is_empty()
+        .then_some("an agent session needs a command")
 }
 
 /// A client protocol 4 message.
@@ -656,6 +644,7 @@ mod tests {
 
     use brindle_remote_protocol::client::Spawn;
 
+    use super::super::sessions::SpawnRequest;
     use super::*;
 
     fn secs(n: u64) -> Duration {
@@ -937,8 +926,8 @@ mod tests {
         NonZeroU32::new(pid).unwrap()
     }
 
-    fn spawn() -> Spawn {
-        Spawn {
+    fn spawn() -> SpawnRequest {
+        SpawnRequest::Terminal(Spawn {
             req: 1,
             command: None,
             args: Vec::new(),
@@ -951,7 +940,7 @@ mod tests {
             scrollback: 100,
             policy: Policy::Kill,
             profile: None,
-        }
+        })
     }
 
     /// One of each kind of life.
@@ -1139,6 +1128,14 @@ mod tests {
             }
             assert_eq!(agent_request_refusal(4, request), None);
         }
+    }
+
+    #[test]
+    fn an_agent_spawn_needs_a_command() {
+        for command in ["", "  ", "\t"] {
+            assert_eq!(agent_spawn_refusal(command), Some("an agent session needs a command"));
+        }
+        assert_eq!(agent_spawn_refusal("fake-agent"), None);
     }
 
     // agents-sessions 4.6: agent checkpoints.

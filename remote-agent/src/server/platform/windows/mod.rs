@@ -14,7 +14,7 @@ pub mod lock;
 // Its items are the platform's (`platform::spawn_piped`); `platform::piped`
 // is the neutral module of what they decide.
 mod piped;
-pub use piped::{PipeCommand, Piped, spawn_piped};
+pub use piped::{PipeCommand, Piped, agent_directory, spawn_piped};
 mod pipe;
 pub mod pty;
 pub mod sys;

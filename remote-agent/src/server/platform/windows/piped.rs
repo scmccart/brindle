@@ -70,6 +70,24 @@ pub struct PipeCommand<'a> {
     pub env: &'a BTreeMap<String, String>,
 }
 
+/// The absolute directory an agent session asking for `cwd`, with the
+/// environment `env`, works in (`piped::agent_dir`): `~` is the request's
+/// `USERPROFILE` (else its `HOME`, else this process's `USERPROFILE`), and
+/// with neither a usable directory nor a home it is the core's own
+/// directory.
+pub fn agent_directory(cwd: Option<&str>, env: &BTreeMap<String, String>) -> String {
+    let own = std::env::var_os("USERPROFILE");
+    let home = ["USERPROFILE", "HOME"]
+        .iter()
+        .find_map(|name| env.get(*name).filter(|home| !home.is_empty()))
+        .map(std::path::PathBuf::from)
+        .or_else(|| own.filter(|home| !home.is_empty()).map(std::path::PathBuf::from));
+    decide::agent_dir(cwd, home.as_deref(), Path::is_absolute, Path::is_dir)
+        .or_else(|| std::env::current_dir().ok())
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// The holder's ends of a program's three pipes, overlapped: reads and
 /// writes never block.
 pub struct Piped {

@@ -17,12 +17,16 @@ pub const HOLDER_PANIC: &str = "BRINDLE_TEST_HOLDER_PANIC";
 /// The core's switch: `inject_fault` in `core/screen.rs` panics on output
 /// holding its marker.
 pub const FEED_PANIC: &str = "BRINDLE_TEST_FEED_PANIC";
+/// The core's switch for agent sessions: `inject_fault` in
+/// `core/agents.rs` panics, inside the guarded call to the ACP reducer, on
+/// agent output or a prompt holding its marker.
+pub const ACP_PANIC: &str = "BRINDLE_TEST_ACP_PANIC";
 
 /// The switches this build honours, as `--list-fault-switches` prints
-/// them: both in a debug build, none in a release build, which never reads
+/// them: all in a debug build, none in a release build, which never reads
 /// them (`process R20`).
 pub fn honoured() -> &'static [&'static str] {
-    if cfg!(debug_assertions) { &[HOLDER_PANIC, FEED_PANIC] } else { &[] }
+    if cfg!(debug_assertions) { &[HOLDER_PANIC, FEED_PANIC, ACP_PANIC] } else { &[] }
 }
 
 /// What a caught panic said: its message, or "no message".
@@ -64,7 +68,10 @@ mod tests {
     #[test]
     fn the_helper_lists_its_switches_only_in_debug_builds() {
         if cfg!(debug_assertions) {
-            assert_eq!(honoured(), ["BRINDLE_TEST_HOLDER_PANIC", "BRINDLE_TEST_FEED_PANIC"]);
+            assert_eq!(
+                honoured(),
+                ["BRINDLE_TEST_HOLDER_PANIC", "BRINDLE_TEST_FEED_PANIC", "BRINDLE_TEST_ACP_PANIC"]
+            );
         } else {
             assert!(honoured().is_empty(), "{:?}", honoured());
         }

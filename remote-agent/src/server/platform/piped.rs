@@ -21,13 +21,18 @@
 //! - **Hanging it up** ([`HangUp`]): close its stdin, ACP's polite end;
 //!   after [`GRACEFUL_SHUTDOWN`] end its group or job; after another, kill
 //!   what remains.
+//! - **An agent session's directory** ([`agent_dir`]): absolute, as ACP's
+//!   `session/new` needs, with `~` expanded and the home directory for a
+//!   relative or missing one.
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::conpty::cmdline::{self, Resolved};
 use crate::pty::GRACEFUL_SHUTDOWN;
+use crate::pty::program::expand_home;
 
 /// `CREATE_NEW_PROCESS_GROUP`.
 pub const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
@@ -178,6 +183,26 @@ pub fn batch_hint(
     ))
 }
 
+/// The directory an agent session works in, which the core gives the
+/// agent's `session/new` and its spawn, and lists (decisions 4 and 9): the
+/// requested `cwd` with a leading `~` expanded with `home`
+/// ([`expand_home`], a PTY session's rule), when that is an absolute path
+/// and a directory here; else `home`, when it is one; else `None`, for the
+/// seam's own fallback. A relative directory, or none, is the home
+/// directory. `absolute` and `is_dir` are the platform's probes.
+pub fn agent_dir(
+    cwd: Option<&str>,
+    home: Option<&Path>,
+    absolute: impl Fn(&Path) -> bool,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let usable = |path: &Path| absolute(path) && is_dir(path);
+    cwd.filter(|cwd| !cwd.is_empty())
+        .map(|cwd| expand_home(cwd, home))
+        .filter(|wanted| usable(wanted))
+        .or_else(|| home.filter(|home| usable(home)).map(Path::to_path_buf))
+}
+
 /// A step of a pipe session's hang-up, which its platform seam takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HangUpStep {
@@ -264,6 +289,35 @@ mod tests {
     /// A file system of `files`, compared without case as Windows does.
     fn files<'a>(files: &'a [&'a str]) -> impl Fn(&str) -> bool + 'a {
         move |path| files.iter().any(|file| file.eq_ignore_ascii_case(path))
+    }
+
+    // --- an agent's directory ----------------------------------------------
+
+    /// Paths starting with `/` are absolute; `dirs` are the directories.
+    fn agent(cwd: Option<&str>, home: Option<&str>, dirs: &[&str]) -> Option<PathBuf> {
+        agent_dir(
+            cwd,
+            home.map(Path::new),
+            |path| path.to_str().is_some_and(|path| path.starts_with('/')),
+            |path| dirs.iter().any(|dir| Path::new(dir) == path),
+        )
+    }
+
+    #[test]
+    fn an_agents_directory_is_absolute_with_home_expanded() {
+        let dirs = ["/home/u", "/home/u/src", "/srv"];
+        let home = Some("/home/u");
+        assert_eq!(agent(Some("~/src"), home, &dirs), Some(PathBuf::from("/home/u/src")));
+        assert_eq!(agent(Some("~"), home, &dirs), Some(PathBuf::from("/home/u")));
+        assert_eq!(agent(Some("/srv"), home, &dirs), Some(PathBuf::from("/srv")));
+        // Relative, missing, empty or not a directory here: home.
+        for cwd in [Some("src"), None, Some(""), Some("/gone"), Some("~/gone")] {
+            assert_eq!(agent(cwd, home, &dirs), Some(PathBuf::from("/home/u")), "{cwd:?}");
+        }
+        // No usable home: the seam decides.
+        assert_eq!(agent(Some("src"), None, &dirs), None);
+        assert_eq!(agent(None, Some("relative"), &["relative"]), None);
+        assert_eq!(agent(Some("~/src"), None, &dirs), None);
     }
 
     // --- creation ----------------------------------------------------------

@@ -54,6 +54,7 @@
 //!   for not being protected (`dir::prune_copies`), holding its own copies'
 //!   directory for its life.
 
+mod agents;
 mod clients;
 mod holders;
 mod manage;
@@ -453,6 +454,7 @@ impl<L: EventLoop> Core<L> {
     fn tick(&mut self, now: Instant) {
         self.expire_pending(now);
         self.end_lingering(now);
+        self.tick_agents(now);
         if now >= self.next_look {
             self.next_look = now + process::PROCESS_LOOK;
             self.look_at_processes(now);

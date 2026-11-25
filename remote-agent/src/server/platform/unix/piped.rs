@@ -18,11 +18,13 @@ use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
+use super::super::piped::agent_dir;
 use super::event_loop::Source;
 use super::pty::Program;
-use crate::pty::{default_signals, set_nonblocking, start_directory};
+use crate::pty::{default_signals, home_dir, set_nonblocking, start_directory};
 
 /// What to run on pipes. `env` is the program's whole environment.
 pub struct PipeCommand<'a> {
@@ -30,6 +32,19 @@ pub struct PipeCommand<'a> {
     pub args: &'a [String],
     pub cwd: Option<&'a str>,
     pub env: &'a BTreeMap<String, String>,
+}
+
+/// The absolute directory an agent session asking for `cwd`, with the
+/// environment `env`, works in (`piped::agent_dir`): `~` is the
+/// environment's home ([`crate::pty::home_dir`], as for a PTY session), and
+/// with neither a usable directory nor a home it is the core's own
+/// directory.
+pub fn agent_directory(cwd: Option<&str>, env: &BTreeMap<String, String>) -> String {
+    let home = home_dir(env);
+    agent_dir(cwd, home.as_deref(), Path::is_absolute, Path::is_dir)
+        .or_else(|| std::env::current_dir().ok())
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/".to_owned())
 }
 
 /// The holder's ends of a program's three pipes, non-blocking.
