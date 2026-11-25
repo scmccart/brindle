@@ -263,6 +263,23 @@ fn unix() -> Vec<Case> {
         display("agent-palette-commands", agent::palette_commands).needs_fake_agent(),
         display("agent-close-confirm", agent::close_confirm).needs_fake_agent(),
         display("agent-close-idle", agent::close_idle).needs_fake_agent(),
+        display("agent-multiline", agent::multiline).needs_fake_agent(),
+        display("agent-cancel", agent::cancel).needs_fake_agent(),
+        display("agent-permission-keys", agent::permission_keys).needs_fake_agent(),
+        display("agent-thoughts", agent::thoughts).needs_fake_agent(),
+        display("agent-scroll", agent::scroll).needs_fake_agent(),
+        display("agent-copy", agent::copy).needs_fake_agent(),
+        display("agent-split", agent::split).needs_fake_agent(),
+        display("agent-no-command", agent::no_command).needs_fake_agent(),
+        display("agent-first-prompt-login", agent::first_prompt_login).needs_fake_agent(),
+        display("agent-login", agent::login).needs_fake_agent(),
+        display("agent-acp-version", agent::acp_version).needs_fake_agent(),
+        display("agent-exit", agent::exit).needs_fake_agent(),
+        display("agent-queue", agent::queue).needs_fake_agent(),
+        display("agent-quit-restore", agent::quit_restore).needs_fake_agent(),
+        display("agent-sweep", agent::sweep).needs_fake_agent(),
+        display("agent-sessions-palette", agent::sessions_palette).needs_fake_agent(),
+        needing("agent-broken", &[TestSwitch::SinkPanic], agent::broken).needs_fake_agent(),
     ]
 }
 
