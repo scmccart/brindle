@@ -1286,9 +1286,11 @@ impl ChatModel {
             AgentPhase::Live(AgentState::LoginRequired { message } | AgentState::Failed { message }) => {
                 out.push_str(&format!(" message={message:?}"));
             }
+            // The failure as logged, the server's cause verbatim (on
+            // Windows a batch file's `cmd /c` form included).
+            AgentPhase::NotStarted(failure) => out.push_str(&format!(" message={:?}", failure.to_string())),
             AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::Exited { .. })
             | AgentPhase::Connecting
-            | AgentPhase::NotStarted(_)
             | AgentPhase::Lost { .. }
             | AgentPhase::Broken { .. } => {}
         }
@@ -2102,7 +2104,8 @@ mod tests {
         let dump = zone.model.describe(2, false);
         assert_eq!(
             dump,
-            "--- agent zone=2 state=not-started turn=idle activity=none status=none link=up session=open\n\
+            "--- agent zone=2 state=not-started message=\"the terminal server on A8 is too old for agent sessions; \
+             it will update once its terminals have ended\" turn=idle activity=none status=none link=up session=open\n\
              --- note \"the profile \\\"Old\\\" is gone; this tab uses \\\"Fake\\\"\"\n\
              --- conversation entries=0 at=away\n\
              --- prompt status=disabled\n"

@@ -694,6 +694,7 @@ pub fn no_command(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(4.0)
         .run()?;
     waited(&out)?;
+    agent_has(&out, "agent zone=1 state=not-started message=\"the agent no-such-agent didn't start: ")?;
     agent_has(&out, "prompt status=disabled")?;
     ensure!(out.dump.input.as_ref().map(|i| i.text.as_str()) == Some("hi"), "the draft: {:?}", out.dump.input);
     ensure!(crate::brindle::listed_sessions(ctx)?.is_empty(), "sessions left: {:?}", crate::brindle::listed_sessions(ctx)?);
