@@ -746,6 +746,7 @@ dependencies = [
  "libc",
  "log",
  "parking_lot",
+ "pulldown-cmark",
  "raw-window-handle",
  "serde",
  "serde_json",
@@ -4386,6 +4387,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e66fcd288453b748497d8fb18bccc83a16b0518e3906d4b8df0a8d42d93dbb1c"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3db2be46835f013dd3f4fa7f5f7402c537787b54ebb6fe2b94bbdd7e2669bb7b"
+dependencies = [
+ "bitflags 2.9.4",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]
