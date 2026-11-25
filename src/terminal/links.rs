@@ -85,24 +85,61 @@ pub fn find_url(text: &[char], at: usize) -> Option<Range<usize>> {
     // The last scheme that starts at or before `at`.
     let (start, body) = (run_start..=at).rev().find_map(|i| Some((i, scheme_at(text, i, run_start)?)))?;
 
+    // The brackets in the URL, counted once and kept as its end moves, so
+    // trimming is linear in its length (an agent's text can be long).
+    let count = |c: char| text[start..run_end].iter().filter(|&&x| x == c).count();
+    let (opens, mut closes) = ((count('('), count('[')), (count(')'), count(']')));
     let mut end = run_end;
     while end > body {
-        let url = &text[start..end];
-        let unmatched = |open: char, close: char| {
-            url.iter().filter(|&&c| c == close).count() > url.iter().filter(|&&c| c == open).count()
-        };
         let drop = match text[end - 1] {
             '.' | ',' | ':' | ';' | '!' | '?' | '\'' | '*' => true,
-            ')' => unmatched('(', ')'),
-            ']' => unmatched('[', ']'),
+            ')' => closes.0 > opens.0,
+            ']' => closes.1 > opens.1,
             _ => false,
         };
         if !drop {
             break;
         }
+        match text[end - 1] {
+            ')' => closes.0 -= 1,
+            ']' => closes.1 -= 1,
+            _ => {}
+        }
         end -= 1;
     }
     (end > body && at < end).then_some(start..end)
+}
+
+/// Every URL in `text`, as char ranges in order and apart: in each run of
+/// URL characters, the URL [`find_url`] finds from the first scheme that
+/// starts a word, then again after its end. Linear in the text's length,
+/// so it suits long text (an agent's message) as well as a terminal line.
+pub fn find_urls(text: &[char]) -> Vec<Range<usize>> {
+    let mut urls = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if !is_url_char(text[i]) {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut run_end = i;
+        while run_end < text.len() && is_url_char(text[run_end]) {
+            run_end += 1;
+        }
+        let mut at = run_start;
+        while at < run_end {
+            match scheme_at(text, at, run_start).and_then(|_| find_url(text, at)) {
+                Some(url) => {
+                    at = url.end.max(at + 1);
+                    urls.push(url);
+                }
+                None => at += 1,
+            }
+        }
+        i = run_end;
+    }
+    urls
 }
 
 /// Whether `uri` starts with a URI scheme (`ALPHA *( ALPHA / DIGIT / "+" /
@@ -603,6 +640,25 @@ mod tests {
         let chars: Vec<char> = "https://example.com.".chars().collect();
         assert_eq!(find_url(&chars, chars.len() - 1), None);
         assert_eq!(find_url(&chars, chars.len()), None);
+    }
+
+    fn urls_in(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        find_urls(&chars).into_iter().map(|r| chars[r].iter().collect()).collect()
+    }
+
+    #[test]
+    fn every_url_in_a_text_is_found_in_order() {
+        assert_eq!(
+            urls_in("see https://example.com/a, and (http://b.example/x_(y)). mailto:dev@example.com!"),
+            ["https://example.com/a", "http://b.example/x_(y)", "mailto:dev@example.com"]
+        );
+        assert_eq!(urls_in("https://a.example/?u=https://b.example"), ["https://a.example/?u=https://b.example"]);
+        assert_eq!(urls_in("www.example.com a@example.com https:// xhttps://x.example"), Vec::<String>::new());
+        assert_eq!(urls_in(""), Vec::<String>::new());
+        // Long runs stay linear: a long tail of brackets is trimmed in one pass.
+        let long = format!("https://example.com/{}", ")".repeat(100_000));
+        assert_eq!(urls_in(&long), ["https://example.com/"]);
     }
 
     #[test]
