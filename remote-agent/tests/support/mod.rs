@@ -778,6 +778,9 @@ pub struct TestClient {
     /// is folded in as it is read ([`TestClient::next`]), and a
     /// `REPLAY_START` starts the session's log again.
     transcripts: HashMap<SessionId, Transcript>,
+    /// The events folded into each session's log, in order, since its
+    /// last `REPLAY_START` (for checks of what came in which order).
+    events: HashMap<SessionId, Vec<Event>>,
 }
 
 impl TestClient {
@@ -799,6 +802,7 @@ impl TestClient {
             welcome: None,
             heartbeats: 0,
             transcripts: HashMap::new(),
+            events: HashMap::new(),
         }
     }
 
@@ -908,15 +912,20 @@ impl TestClient {
         match message {
             ToClient::ReplayStart(start) => {
                 self.transcripts.remove(&start.session);
+                self.events.remove(&start.session);
             }
             ToClient::Transcript(transcript) => {
                 let log = self.transcripts.entry(transcript.session).or_default();
+                let events = self.events.entry(transcript.session).or_default();
                 for value in &transcript.events {
                     let event = Event::from_value(value)
                         .unwrap_or_else(|error| panic!("TRANSCRIPT event {value}: {error}"));
+                    // Protocol 4's forms only: nothing the decode dropped.
+                    assert_eq!(event.to_value(), *value, "TRANSCRIPT event {value} isn't one of protocol 4's forms");
                     log.apply(&event).unwrap_or_else(|error| {
                         panic!("session {}: {event:?} doesn't fold: {error}", transcript.session)
                     });
+                    events.push(event);
                 }
             }
             _ => {}
@@ -1279,6 +1288,12 @@ impl TestClient {
     /// The agent session's log as this client has folded it so far.
     pub fn transcript(&self, session: SessionId) -> Transcript {
         self.transcripts.get(&session).cloned().unwrap_or_default()
+    }
+
+    /// The events this client folded into the session's log so far, in
+    /// the order they came, since its last replay started.
+    pub fn events(&self, session: SessionId) -> Vec<Event> {
+        self.events.get(&session).cloned().unwrap_or_default()
     }
 
     /// Reads until the session's log satisfies `done` (`what` names it for

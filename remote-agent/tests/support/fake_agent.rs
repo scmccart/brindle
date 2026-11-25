@@ -7,7 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use brindle_remote_protocol::serde_json::{self, Value};
+use brindle_remote_protocol::serde_json::{self, Value, json};
 
 /// A fake agent's script, built step by step and written with
 /// [`AgentScript::write`]. Steps are the lines of `src/fake_acp/script.rs`.
@@ -16,6 +16,9 @@ pub struct AgentScript {
     name: String,
     lines: Vec<String>,
     gates: usize,
+    marks: usize,
+    /// The file the last `record` step names.
+    recording: Option<PathBuf>,
 }
 
 impl AgentScript {
@@ -27,6 +30,8 @@ impl AgentScript {
             name: name.to_owned(),
             lines: Vec::new(),
             gates: 0,
+            marks: 0,
+            recording: None,
         }
     }
 
@@ -40,6 +45,22 @@ impl AgentScript {
     pub fn record(&mut self) -> PathBuf {
         let path = self.dir.join(format!("{}.received.jsonl", self.name));
         self.lines.push(format!("record {}", path.display()));
+        self.recording = Some(path.clone());
+        path
+    }
+
+    /// Adds steps that create a new file when the agent gets to them, and
+    /// gives its path: everything the agent wrote before them is written
+    /// (each step flushes), so a test waits for the file to know it. It is
+    /// a `record` step on the file, then one back on the record, if any.
+    pub fn reached(&mut self) -> PathBuf {
+        self.marks += 1;
+        let path = self.dir.join(format!("{}.reached-{}", self.name, self.marks));
+        let _ = fs::remove_file(&path);
+        self.lines.push(format!("record {}", path.display()));
+        if let Some(record) = &self.recording {
+            self.lines.push(format!("record {}", record.display()));
+        }
         path
     }
 
@@ -85,4 +106,71 @@ pub fn recorded(path: &Path) -> Vec<Value> {
         .filter(|line| line.ends_with('\n'))
         .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("recorded {line:?}: {error}")))
         .collect()
+}
+
+/// The methods of the requests and notifications recorded so far.
+pub fn methods(path: &Path) -> Vec<String> {
+    recorded(path)
+        .iter()
+        .filter_map(|value| value["method"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The texts of the prompts recorded so far, in the order they came.
+pub fn prompts(path: &Path) -> Vec<String> {
+    recorded(path)
+        .iter()
+        .filter(|value| value["method"] == "session/prompt")
+        .map(|value| value["params"]["prompt"][0]["text"].as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// The responses to the agent's own requests recorded so far
+/// (`expect-response`).
+pub fn responses(path: &Path) -> Vec<Value> {
+    recorded(path).into_iter().filter(|value| value.get("method").is_none()).collect()
+}
+
+/// A script that starts as `fake` 1.0 and takes ACP session `s1`, its
+/// record kept; the test adds the rest. Gives it and the record's path.
+pub fn started(dir: &Path, name: &str) -> (AgentScript, PathBuf) {
+    let mut script = AgentScript::new(dir, name);
+    let record = script.record();
+    script
+        .step("expect initialize")
+        .step(r#"respond {"protocolVersion":1,"agentInfo":{"name":"fake","version":"1.0"}}"#)
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#);
+    (script, record)
+}
+
+/// A `send` step of a `session/update` for `s1` with `update`.
+pub fn update(update: Value) -> String {
+    let message = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": update}});
+    format!("send {message}")
+}
+
+/// A `send` step of an agent message chunk.
+pub fn said(text: &str) -> String {
+    update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}))
+}
+
+/// A `send` step of a permission request with the JSON-RPC id `id` about
+/// tool call `call_1`, offering `allow-once` and `reject-once`.
+pub fn ask(id: &str) -> String {
+    let options = json!([
+        {"optionId": "allow-once", "name": "Allow", "kind": "allow_once"},
+        {"optionId": "reject-once", "name": "Reject", "kind": "reject_once"},
+    ]);
+    let message = json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {
+        "sessionId": "s1",
+        "toolCall": {"toolCallId": "call_1", "title": "Write a file"},
+        "options": options,
+    }});
+    format!("send {message}")
+}
+
+/// A `respond` step ending the prompt's turn with `stop`.
+pub fn stop(stop: &str) -> String {
+    format!(r#"respond {{"stopReason":"{stop}"}}"#)
 }
