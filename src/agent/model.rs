@@ -541,7 +541,6 @@ pub enum NoOffer {
 
 impl NoOffer {
     /// The prompt input's reason line for an ended agent with no offer.
-    #[cfg_attr(not(test), expect(dead_code, reason = "agents-session-recovery task 5.1 shows it in the reason line"))]
     pub fn text(&self) -> String {
         match self {
             Self::NotEnded => "the agent hasn't ended".into(),
@@ -564,7 +563,6 @@ impl NoOffer {
 
 impl Offer {
     /// The dump's `continue=` value: `restart`, `respawn` or `none:REASON`.
-    #[cfg_attr(not(test), expect(dead_code, reason = "agents-session-recovery task 5.2 dumps it"))]
     pub fn word(&self) -> String {
         match self {
             Self::Restart => "restart".into(),
@@ -833,7 +831,6 @@ impl ChatModel {
         &self.profile
     }
 
-    #[cfg(test)]
     pub fn phase(&self) -> &AgentPhase {
         &self.phase
     }
@@ -1572,16 +1569,18 @@ impl ChatModel {
     }
 
     /// The dump's lines for this zone (decision 15), zone `zone`, with the
-    /// conversation `at_end` or away from it; each link's action from what
-    /// `plan` says of its target (`links::plan_here` in Brindle).
-    pub fn describe(&self, zone: u64, at_end: bool, plan: &dyn Fn(&str) -> Plan) -> String {
-        self.lines(Some(zone), Some(at_end), plan)
+    /// conversation `at_end` or away from it and the continue `offer`
+    /// ([`Self::offer`], which needs the config's profiles); each link's
+    /// action from what `plan` says of its target (`links::plan_here` in
+    /// Brindle).
+    pub fn describe(&self, zone: u64, at_end: bool, offer: &Offer, plan: &dyn Fn(&str) -> Plan) -> String {
+        self.lines(Some(zone), Some(at_end), offer, plan)
     }
 
     /// What `--wait-for` matches in an agent zone: the dump's lines,
     /// without the zone's id and the scroll position.
-    pub fn wait_text(&self, plan: &dyn Fn(&str) -> Plan) -> String {
-        self.lines(None, None, plan)
+    pub fn wait_text(&self, offer: &Offer, plan: &dyn Fn(&str) -> Plan) -> String {
+        self.lines(None, None, offer, plan)
     }
 
     /// The `--- block` line of each of entry `id`'s rendered parts, in
@@ -1603,7 +1602,7 @@ impl ChatModel {
         out
     }
 
-    fn lines(&self, zone: Option<u64>, at_end: Option<bool>, plan: &dyn Fn(&str) -> Plan) -> String {
+    fn lines(&self, zone: Option<u64>, at_end: Option<bool>, offer: &Offer, plan: &dyn Fn(&str) -> Plan) -> String {
         let mut out = String::from("--- agent");
         if let Some(zone) = zone {
             out.push_str(&format!(" zone={zone}"));
@@ -1638,8 +1637,9 @@ impl ChatModel {
             SessionLife::Ended => "ended",
         };
         out.push_str(&format!(
-            " turn={} activity={activity} status={status} link={link} session={session}\n",
-            turn_word(&self.turn)
+            " turn={} activity={activity} status={status} link={link} session={session} continue={}\n",
+            turn_word(&self.turn),
+            offer.word()
         ));
         if let Some(note) = &self.note {
             out.push_str(&format!("--- note {note:?}\n"));
@@ -1758,6 +1758,12 @@ mod tests {
     use super::*;
     use crate::agent::shared::AgentShared;
     use crate::agent::transcript::Event;
+
+    /// The continue offer of `model` with its profile found, as the dump
+    /// takes it.
+    fn found(model: &ChatModel) -> Offer {
+        model.offer(&ProfileFound::Agent)
+    }
 
     /// A zone's model fed through the fold, as the view feeds it.
     struct Zone {
@@ -2227,7 +2233,7 @@ mod tests {
             "Fake Agent needs you to log in. Log in through the agent's own command line, then open the profile again."
         );
         assert_eq!((alert.destructive, alert.detail.as_deref()), (false, Some(message)));
-        assert!(zone.model.describe(1, true, &linux).contains("--- queued held reason=login-required resend=no \"next\"\n"));
+        assert!(zone.model.describe(1, true, &found(&zone.model), &linux).contains("--- queued held reason=login-required resend=no \"next\"\n"));
     }
 
     /// Decision 13: a version mismatch's `Failed`, then the session's exit,
@@ -2246,9 +2252,9 @@ mod tests {
         let alert = zone.model.alert("fake-acp", "this machine").unwrap();
         assert_eq!(alert.text, format!("Fake can't be used: {message}"));
         assert!(!alert.text.contains("exit"));
-        let dump = zone.model.describe(1, true, &linux);
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
         assert!(dump.starts_with(&format!("--- agent zone=1 state=failed message={message:?} turn=idle")), "{dump}");
-        assert!(dump.contains(" session=ended\n"), "{dump}");
+        assert!(dump.contains(" session=ended continue=none:not-ended\n"), "{dump}");
         assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::Failed));
     }
 
@@ -2349,7 +2355,7 @@ mod tests {
         zone.feed(&[Event::Answered { id: EntryId(1), outcome: PermissionOutcome::Selected { option: "allow-once".into() } }]);
         assert!(!zone.model.answer(EntryId(1), "allow-once"), "answered");
         assert!(zone.model.pending_permissions().is_empty());
-        assert!(zone.model.describe(1, true, &linux).contains("outcome=selected:allow-once"));
+        assert!(zone.model.describe(1, true, &found(&zone.model), &linux).contains("outcome=selected:allow-once"));
     }
 
     /// Decision 10: the shown status is the activity's while live, with
@@ -2429,7 +2435,7 @@ mod tests {
             queue(waiting()),
         ]);
         let expected = "\
---- agent zone=1 state=ready name=\"Fake Agent\" turn=working activity=working status=working link=up session=open
+--- agent zone=1 state=ready name=\"Fake Agent\" turn=working activity=working status=working link=up session=open continue=none:not-ended
 --- entry 1 user \"hi\"
 --- entry 2 agent \"Hello!\"
 --- block entry=2 part=0 kind=paragraph \"Hello!\"
@@ -2442,8 +2448,8 @@ mod tests {
 --- conversation entries=6 at=end
 --- prompt status=streaming
 ";
-        assert_eq!(zone.model.describe(1, true, &linux), expected);
-        let wait = zone.model.wait_text(&linux);
+        assert_eq!(zone.model.describe(1, true, &found(&zone.model), &linux), expected);
+        let wait = zone.model.wait_text(&found(&zone.model), &linux);
         assert!(wait.starts_with("--- agent state=ready name=\"Fake Agent\" turn=working"), "{wait}");
         assert!(wait.contains("--- conversation entries=6\n"), "{wait}");
 
@@ -2451,11 +2457,12 @@ mod tests {
         zone.model.set_note("the profile \"Old\" is gone; this tab uses \"Fake\"");
         zone.model.not_started(StartFailure::TooOld { endpoint: "A8".into() });
         zone.model.submit("x", false);
-        let dump = zone.model.describe(2, false, &linux);
+        let dump = zone.model.describe(2, false, &found(&zone.model), &linux);
         assert_eq!(
             dump,
             "--- agent zone=2 state=not-started message=\"the terminal server on A8 is too old for agent sessions; \
-             it will update once its terminals have ended\" turn=idle activity=none status=none link=up session=open\n\
+             it will update once its terminals have ended\" turn=idle activity=none status=none link=up session=open \
+             continue=none:no-conversation\n\
              --- note \"the profile \\\"Old\\\" is gone; this tab uses \\\"Fake\\\"\"\n\
              --- conversation entries=0 at=away\n\
              --- prompt status=disabled\n"
@@ -2465,14 +2472,14 @@ mod tests {
         held.feed(&[queue(held_slot())]);
         held.model.sent(1, Sent::Prompt);
         held.model.replied(1, Err("the agent isn't ready".into()));
-        let dump = held.model.describe(1, true, &linux);
+        let dump = held.model.describe(1, true, &found(&held.model), &linux);
         assert!(dump.contains("--- queued held reason=stopped:max_tokens resend=yes \"next\"\n"), "{dump}");
         assert!(dump.ends_with("--- prompt status=ready refusal=\"the agent isn't ready\"\n"), "{dump}");
         assert_eq!(held.model.banner("A8"), None);
         held.model.set_link(Link::Reconnecting);
         assert_eq!(held.model.link(), Link::Reconnecting);
         assert_eq!(held.model.banner("A8").as_deref(), Some("reconnecting to A8…"));
-        assert!(held.model.describe(1, true, &linux).contains("link=reconnecting"));
+        assert!(held.model.describe(1, true, &found(&held.model), &linux).contains("link=reconnecting"));
     }
 
     fn held_slot() -> Slot {
@@ -2768,7 +2775,7 @@ mod tests {
             added(2, agent("Try:\n\n```rust\nfn main() {}\n```\nSee [docs](https://example.com) or <mailto:a@example.com> [x](javascript:void).")),
             added(3, thought("- [ ] check `x`\n- see https://t.example")),
         ]);
-        let dump = zone.model.describe(1, true, &linux);
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
         let expected = "\
 --- entry 1 user \"**hi**\"
 --- entry 2 agent \"Try:\\n\\n```rust\\nfn main() {}\\n```\\nSee [docs](https://example.com) or <mailto:a@example.com> [x](javascript:void).\"
@@ -2785,13 +2792,13 @@ mod tests {
 ";
         assert!(dump.contains(expected), "{dump}");
         assert!(!dump.contains("--- block entry=1"), "{dump}");
-        let wait = zone.model.wait_text(&linux);
+        let wait = zone.model.wait_text(&found(&zone.model), &linux);
         assert!(wait.contains("--- block entry=2 part=1 kind=code:rust \"fn main() {}\\n\"\n"), "{wait}");
         assert!(wait.contains("--- link entry=2 part=2 target=\"https://example.com\" text=\"docs\" action=open\n"), "{wait}");
         // The plan is the caller's: Windows refuses a file link with no drive.
         zone.feed(&[added(4, agent("[f](file:///etc/hosts)"))]);
         let windows = |uri: &str| crate::terminal::links::plan(uri, "thishost", true);
-        assert!(zone.model.wait_text(&windows).contains("action=refuse:no-drive\n"));
+        assert!(zone.model.wait_text(&found(&zone.model), &windows).contains("action=refuse:no-drive\n"));
     }
 
     /// `copy_last_code_block`: the last code block of the latest agent
@@ -2938,7 +2945,11 @@ mod tests {
         let alert = zone.model.alert("fake-acp", "this machine").unwrap();
         assert_eq!(alert.text, "Fake Agent was lost with its terminal server's holder");
         assert_eq!(alert.detail.as_deref(), Some("its holder ended"));
-        assert!(zone.model.wait_text(&linux).starts_with("--- agent state=holder-lost "));
+        let wait = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(wait.starts_with("--- agent state=holder-lost "), "{wait}");
+        assert!(wait.contains(" session=open continue=restart\n"), "{wait}");
+        let gone = zone.model.offer(&ProfileFound::Gone { name: "Fake".into() });
+        assert!(zone.model.describe(1, true, &gone, &linux).contains(" continue=none:profile-gone\n"));
         assert!(!zone.model.keeps_session(), "not recorded while the agent is lost");
         assert_eq!(zone.model.offer(&ProfileFound::Agent), Offer::Restart);
         zone.feed(&[agent_state(exited())]);

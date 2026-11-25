@@ -104,6 +104,9 @@ actions!(
         AgentUnqueue,
         /// Sends the held prompt again.
         AgentResend,
+        /// Continues the conversation of an agent that exited or was lost,
+        /// as the Continue conversation button does.
+        AgentContinue,
         /// Copies the queued prompt's text, waiting or held.
         CopyQueuedPrompt,
         /// Copies the agent's latest message.
@@ -194,6 +197,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("agent_cancel", Some("Stop Agent Turn"), || Box::new(AgentCancel)),
     ("agent_unqueue", Some("Remove Queued Prompt"), || Box::new(AgentUnqueue)),
     ("agent_resend", Some("Send Held Prompt Again"), || Box::new(AgentResend)),
+    ("agent_continue", Some("Continue Agent Conversation"), || Box::new(AgentContinue)),
     ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
     ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
     ("copy_last_code_block", Some("Copy Last Code Block"), || Box::new(CopyLastCodeBlock)),
@@ -890,6 +894,7 @@ mod tests {
             "Stop Agent Turn",
             "Remove Queued Prompt",
             "Send Held Prompt Again",
+            "Continue Agent Conversation",
             "Copy Queued Prompt",
             "Copy Last Agent Message",
             "Copy Last Code Block",

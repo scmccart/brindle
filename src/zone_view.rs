@@ -664,7 +664,8 @@ impl ZoneContent {
             Self::Agent(view) => {
                 let view = view.read(cx);
                 let at_end = view.scroller().read(cx).follow() == brindle_ui::Follow::AtEnd;
-                Some(view.agent().read(cx).model().describe(zone.0, at_end, &crate::terminal::links::plan_here))
+                let agent = view.agent().read(cx);
+                Some(agent.model().describe(zone.0, at_end, &agent.offer(cx), &crate::terminal::links::plan_here))
             }
         }
     }
@@ -674,7 +675,10 @@ impl ZoneContent {
     pub fn wait_text(&self, cx: &App) -> String {
         match self {
             Self::Terminal(view) => view.read(cx).terminal.read(cx).screen_text(),
-            Self::Agent(view) => view.read(cx).agent().read(cx).model().wait_text(&crate::terminal::links::plan_here),
+            Self::Agent(view) => {
+                let agent = view.read(cx).agent().read(cx);
+                agent.model().wait_text(&agent.offer(cx), &crate::terminal::links::plan_here)
+            }
         }
     }
 

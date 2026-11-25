@@ -9,11 +9,12 @@
 //! Keys (design.md decision 1): in the `AgentZone` context escape stops the
 //! turn and the page keys scroll; the prompt input's and its text area's
 //! contexts have enter and shift-enter. Tab walks the zone's stops
-//! ([`FocusStops`]): the prompt, the queue row's buttons, the pending
+//! ([`FocusStops`]): the prompt, the Continue conversation button while an
+//! ended agent can be continued, the queue row's buttons, the pending
 //! permission requests' buttons, and the stop button while a turn runs.
 //! When a stop the focus is on goes away (the row's buttons when the slot
-//! changes, the stop button when the turn ends, a permission answered),
-//! focus goes back to the prompt.
+//! changes, the stop button when the turn ends, a permission answered, the
+//! Continue button once pressed), focus goes back to the prompt.
 
 use std::sync::Arc;
 
@@ -31,11 +32,11 @@ use brindle_ui::{
 };
 
 use crate::actions::{
-    AgentCancel, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
+    AgentCancel, AgentContinue, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
     CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts,
 };
 use crate::agent::markdown::{LinkAction, link_action};
-use crate::agent::model::{Block, BlockBody, ChatModel, PromptStatus, QueueRow, Resend};
+use crate::agent::model::{AgentPhase, Block, BlockBody, ChatModel, NoOffer, Offer, PromptStatus, QueueRow, Resend};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
 use crate::agent::{Agent, AgentUpdate};
 use crate::settings::Settings;
@@ -96,18 +97,44 @@ pub fn item_padding(block: &Block) -> (bool, bool) {
     }
 }
 
-/// What the prompt input shows for the model: its status, its queue row
-/// and the line beside its button (why it is disabled, else the last
-/// refusal).
-pub fn prompt_state(model: &ChatModel) -> (UiStatus, Option<Queued>, Option<SharedString>) {
+/// The Continue conversation button's label.
+pub const CONTINUE: &str = "Continue conversation";
+
+/// What the prompt input shows: its status and queue row, and its reason
+/// line, `reason` then the `action` button's label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromptState {
+    pub status: UiStatus,
+    pub queued: Option<Queued>,
+    pub reason: Option<SharedString>,
+    pub action: Option<SharedString>,
+}
+
+/// What the prompt input shows for the model and its continue `offer`
+/// ([`Agent::offer`]). The reason is why it is disabled, else the last
+/// refusal; an ended agent that can be continued shows the Continue
+/// conversation button after the reason, or after a refused continue's
+/// words; one that can't says why not instead (a never-started agent
+/// keeps its own reason).
+pub fn prompt_state(model: &ChatModel, offer: &Offer) -> PromptState {
     let (status, reason) = match model.prompt_status() {
         PromptStatus::Ready => (UiStatus::Ready, None),
         PromptStatus::Submitted => (UiStatus::Submitted, None),
         PromptStatus::Streaming => (UiStatus::Streaming, None),
         PromptStatus::Disabled(why) => (UiStatus::Disabled, Some(SharedString::from(why.text()))),
     };
-    let reason = reason.or_else(|| model.refusal().map(|refusal| SharedString::from(refusal.to_string())));
-    (status, queued_of(model.queue()), reason)
+    let refusal = model.refusal().map(|refusal| SharedString::from(refusal.to_string()));
+    let (reason, action) = match offer {
+        Offer::Restart | Offer::Respawn { .. } => (refusal.or(reason), Some(SharedString::from(CONTINUE))),
+        Offer::None(NoOffer::NotEnded) => (reason.or(refusal), None),
+        Offer::None(NoOffer::NoConversation) if matches!(model.phase(), AgentPhase::NotStarted(_)) => {
+            (reason.or(refusal), None)
+        }
+        Offer::None(why @ (NoOffer::NoConversation | NoOffer::NotOffered | NoOffer::ProfileGone { .. })) => {
+            (Some(SharedString::from(why.text())), None)
+        }
+    };
+    PromptState { status, queued: queued_of(model.queue()), reason, action }
 }
 
 /// The prompt input's queue row for the model's [`QueueRow`].
@@ -193,11 +220,13 @@ impl Focusable for AgentView {
 }
 
 impl FocusStops for AgentView {
-    /// The prompt, the queue row's buttons, the pending permissions'
-    /// buttons, then the stop button while a turn runs.
+    /// The prompt, the Continue conversation button while it shows, the
+    /// queue row's buttons, the pending permissions' buttons, then the
+    /// stop button while a turn runs.
     fn stops(&self, cx: &App) -> Vec<FocusHandle> {
         let prompt = self.prompt.read(cx);
         let mut stops = vec![prompt.focus_handle(cx)];
+        stops.extend(prompt.action_stop());
         stops.extend(prompt.row_stops());
         stops.extend(self.permissions.iter().map(|(_, handle)| handle.clone()));
         stops.extend(prompt.stop_button());
@@ -225,6 +254,9 @@ impl AgentView {
         let subscriptions = vec![
             cx.subscribe_in(&agent, window, |this, _, update: &AgentUpdate, _, cx| this.on_update(update, cx)),
             cx.observe_in(&agent, window, |this, _, window, cx| this.sync(window, cx)),
+            // The continue offer reads the config's profiles: an edit can
+            // take the button away or bring it back.
+            cx.observe_global_in::<Settings>(window, |this, window, cx| this.sync(window, cx)),
             cx.subscribe(&prompt, |this, _, event: &PromptInputEvent, cx| this.on_prompt(event, cx)),
             cx.subscribe(&area, |this, _, _: &TextAreaEvent, cx| {
                 this.agent.update(cx, |agent, cx| agent.seen(cx));
@@ -252,8 +284,9 @@ impl AgentView {
     }
 
     /// The zone's stop with keyboard focus, for the dump's focus line
-    /// (`agent stop=…`): `prompt`, `queued:remove`, `queued:send-again`,
-    /// `queued:discard`, `permission:<entry>:<option>` or `stop`.
+    /// (`agent stop=…`): `prompt`, `continue`, `queued:remove`,
+    /// `queued:send-again`, `queued:discard`, `permission:<entry>:<option>`
+    /// or `stop`.
     pub fn focused_stop(&self, window: &Window, cx: &App) -> Option<String> {
         if let Some(stop) = self.prompt.read(cx).focused(window, cx) {
             return Some(
@@ -263,6 +296,7 @@ impl AgentView {
                     PromptFocus::SendAgain => "queued:send-again",
                     PromptFocus::Discard => "queued:discard",
                     PromptFocus::Stop => "stop",
+                    PromptFocus::Action => "continue",
                 }
                 .to_string(),
             );
@@ -323,6 +357,7 @@ impl AgentView {
             PromptInputEvent::Stop => self.agent.update(cx, |agent, cx| agent.cancel(cx)),
             PromptInputEvent::RemoveQueued => self.agent.update(cx, |agent, cx| agent.unqueue(cx)),
             PromptInputEvent::ResendQueued => self.agent.update(cx, |agent, cx| agent.resend(cx)),
+            PromptInputEvent::Action => self.agent.update(cx, |agent, cx| agent.continue_conversation(cx)),
         }
     }
 
@@ -342,13 +377,14 @@ impl AgentView {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        let model = self.agent.read(cx).model();
-        let (status, queued, reason) = prompt_state(model);
-        let pending = model.pending_permissions();
+        let agent = self.agent.read(cx);
+        let state = prompt_state(agent.model(), &agent.offer(cx));
+        let pending = agent.model().pending_permissions();
         self.prompt.update(cx, |prompt, cx| {
-            prompt.set_status(status, cx);
-            prompt.set_queued(queued, cx);
-            prompt.set_reason(reason, cx);
+            prompt.set_status(state.status, cx);
+            prompt.set_queued(state.queued, cx);
+            prompt.set_reason(state.reason, cx);
+            prompt.set_action(state.action, cx);
         });
         let mut kept = std::mem::take(&mut self.permissions);
         for (entry, options) in pending {
@@ -386,6 +422,12 @@ impl AgentView {
 
     fn resend(&mut self, _: &AgentResend, _: &mut Window, cx: &mut Context<Self>) {
         self.agent.update(cx, |agent, cx| agent.resend(cx));
+    }
+
+    /// `agent_continue`: as the Continue conversation button, nothing when
+    /// it isn't offered.
+    fn continue_conversation(&mut self, _: &AgentContinue, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.continue_conversation(cx));
     }
 
     fn copy_queued(&mut self, _: &CopyQueuedPrompt, _: &mut Window, cx: &mut Context<Self>) {
@@ -690,6 +732,7 @@ impl Render for AgentView {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::unqueue))
             .on_action(cx.listener(Self::resend))
+            .on_action(cx.listener(Self::continue_conversation))
             .on_action(cx.listener(Self::copy_queued))
             .on_action(cx.listener(Self::copy_last))
             .on_action(cx.listener(Self::copy_last_code))

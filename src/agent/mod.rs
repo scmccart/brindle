@@ -310,10 +310,6 @@ impl Agent {
     /// What continuing the conversation would do now, with the config's
     /// profiles as they are (`agent_continue`, the Continue conversation
     /// button, the dump).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "agents-session-recovery task 5.1 draws the button and 5.2 dumps the offer")
-    )]
     pub fn offer(&self, cx: &App) -> Offer {
         self.model.offer(&self.profile_found(&Settings::get(cx).config).0)
     }
@@ -330,10 +326,6 @@ impl Agent {
     /// Continues the conversation as [`Self::offer`] says: restarts the
     /// agent on the session, or starts a new session continuing it.
     /// Nothing when there is no offer, or once the zone let its session go.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "agents-session-recovery task 5.1 calls it from the button and agent_continue")
-    )]
     pub fn continue_conversation(&mut self, cx: &mut Context<Self>) {
         if self.held == Held::Left {
             return;
