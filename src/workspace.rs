@@ -219,6 +219,10 @@ pub enum LaunchRefusal {
     /// The profile is of another kind than the subcommand's: `kind` is the
     /// profile's.
     KindMismatch { profile: String, kind: ProfileKind },
+    /// The launch names no profile and the config has none of the
+    /// subcommand's `kind`. `known` and `config_error` as for
+    /// [`Self::UnknownProfile`].
+    NoProfileOfKind { kind: ProfileKind, known: Vec<String>, config_error: bool },
 }
 
 impl std::fmt::Display for LaunchRefusal {
@@ -240,25 +244,58 @@ impl std::fmt::Display for LaunchRefusal {
                 };
                 write!(f, "{profile:?} is {kind} profile: open it with brindle {subcommand} {profile}")
             }
+            Self::NoProfileOfKind { kind, known, config_error } => {
+                let (kind, add) = match kind {
+                    ProfileKind::Terminal => ("terminal", "no type, or type = \"terminal\""),
+                    ProfileKind::Agent => ("agent", "type = \"agent\""),
+                };
+                let whose = if *config_error {
+                    "the config has an error, so Brindle is using the default config, whose profiles are"
+                } else {
+                    "the profiles are"
+                };
+                write!(f, "the config has no {kind} profile (add one with {add}; {whose}: {})", known.join(", "))
+            }
         }
     }
 }
 
+/// The profile kind a `kind` launch opens.
+fn profile_kind(kind: TabKind) -> ProfileKind {
+    match kind {
+        TabKind::Terminal => ProfileKind::Terminal,
+        TabKind::Agent => ProfileKind::Agent,
+    }
+}
+
 /// The profile a `kind` launch opens: the one `name` names (matched without
-/// regard to case), else the default one when there is no name. A name no
-/// profile has, or a profile of another kind, is refused: the one rule for
-/// a launch's first window and a later launch forwarded to it.
-/// `config_error` says the config failed to load, for the refusal's words.
+/// regard to case); with no name, the default one when it is of the kind,
+/// else the first of the kind in config order. A name no profile has, a
+/// profile of another kind, and no profile of the kind are refused, with no
+/// fallback: the one rule for a launch's first window and a later launch
+/// forwarded to it. `config_error` says the config failed to load, for the
+/// refusal's words.
 pub fn profile_for(
     config: &Config,
     kind: TabKind,
     name: Option<&str>,
     config_error: bool,
 ) -> Result<usize, LaunchRefusal> {
-    let Some(name) = name else { return Ok(config.default_profile_index()) };
+    let wanted = profile_kind(kind);
+    let known = || config.profiles.iter().map(|profile| profile.name.clone()).collect();
+    let Some(name) = name else {
+        let default = config.default_profile_index();
+        if config.profiles.get(default).is_some_and(|profile| profile.kind() == wanted) {
+            return Ok(default);
+        }
+        return config
+            .profiles
+            .iter()
+            .position(|profile| profile.kind() == wanted)
+            .ok_or_else(|| LaunchRefusal::NoProfileOfKind { kind: wanted, known: known(), config_error });
+    };
     let Some(index) = config.profile_index(name) else {
-        let known = config.profiles.iter().map(|profile| profile.name.clone()).collect();
-        return Err(LaunchRefusal::UnknownProfile { name: name.to_string(), known, config_error });
+        return Err(LaunchRefusal::UnknownProfile { name: name.to_string(), known: known(), config_error });
     };
     let profile = &config.profiles[index];
     match (kind, profile.kind()) {
@@ -3355,6 +3392,95 @@ mod tests {
         assert_eq!(
             profile_for(&config, TabKind::Terminal, Some("fake"), false),
             Err(LaunchRefusal::KindMismatch { profile: "Fake".into(), kind: ProfileKind::Agent })
+        );
+    }
+
+    /// Profiles `Shell` (terminal), `Fake` (agent), `Work` (terminal) and
+    /// `Other` (agent), `default` the default one.
+    fn both_kinds(default: &str) -> Config {
+        let text = format!(
+            "default_profile = \"{default}\"\n\
+             [[profiles]]\nname = \"Shell\"\n\n\
+             [[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n\n\
+             [[profiles]]\nname = \"Work\"\n\n\
+             [[profiles]]\nname = \"Other\"\ntype = \"agent\"\ncommand = \"other\"\n"
+        );
+        Config::parse(&text).unwrap().config
+    }
+
+    #[test]
+    fn a_profile_of_the_other_kind_is_refused_under_either_subcommand() {
+        let config = both_kinds("Shell");
+        assert_eq!(profile_for(&config, TabKind::Agent, Some("fake"), false), Ok(1));
+        assert_eq!(profile_for(&config, TabKind::Terminal, Some("work"), false), Ok(2));
+        let refusal = profile_for(&config, TabKind::Agent, Some("shell"), false).unwrap_err();
+        assert_eq!(refusal, LaunchRefusal::KindMismatch { profile: "Shell".into(), kind: ProfileKind::Terminal });
+        assert_eq!(refusal.to_string(), "\"Shell\" is a terminal profile: open it with brindle terminal Shell");
+        let refusal = profile_for(&config, TabKind::Terminal, Some("Other"), false).unwrap_err();
+        assert_eq!(refusal.to_string(), "\"Other\" is an agent profile: open it with brindle agent Other");
+    }
+
+    /// With no name: the default profile when it is of the kind, else the
+    /// first profile of the kind in config order.
+    #[test]
+    fn no_name_is_the_default_profile_of_the_kind() {
+        let config = both_kinds("Shell");
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(0), "the default is a terminal");
+        assert_eq!(profile_for(&config, TabKind::Agent, None, false), Ok(1), "the first agent profile");
+        let config = both_kinds("Other");
+        assert_eq!(profile_for(&config, TabKind::Agent, None, false), Ok(3), "the default is an agent");
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(0), "the first terminal profile");
+        let config = both_kinds("Work");
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(2));
+        assert_eq!(profile_for(&config, TabKind::Agent, None, false), Ok(1));
+    }
+
+    /// An unknown name is refused under both subcommands, listing every
+    /// profile, with no fallback to a default of the kind.
+    #[test]
+    fn an_unknown_name_is_refused_under_either_subcommand() {
+        let config = both_kinds("Shell");
+        for kind in [TabKind::Terminal, TabKind::Agent] {
+            let refusal = profile_for(&config, kind, Some("agnt"), false).unwrap_err();
+            assert_eq!(refusal.to_string(), "no profile is named \"agnt\" (the profiles are: Shell, Fake, Work, Other)");
+            let defaults = Config::parse("").unwrap().config;
+            let refusal = profile_for(&defaults, kind, Some("agnt"), true).unwrap_err();
+            assert_eq!(
+                refusal.to_string(),
+                "no profile is named \"agnt\" (the config has an error, so Brindle is using the default config, \
+                 whose profiles are: Shell)",
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_profile_of_the_kind_is_refused() {
+        let refusal = profile_for(&shell_and_work(), TabKind::Agent, None, false).unwrap_err();
+        assert_eq!(
+            refusal,
+            LaunchRefusal::NoProfileOfKind {
+                kind: ProfileKind::Agent,
+                known: vec!["Shell".into(), "Work".into()],
+                config_error: false
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "the config has no agent profile (add one with type = \"agent\"; the profiles are: Shell, Work)"
+        );
+        let defaults = Config::parse("").unwrap().config;
+        assert_eq!(
+            profile_for(&defaults, TabKind::Agent, None, true).unwrap_err().to_string(),
+            "the config has no agent profile (add one with type = \"agent\"; the config has an error, so Brindle \
+             is using the default config, whose profiles are: Shell)"
+        );
+        let agents_only =
+            Config::parse("[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n").unwrap().config;
+        assert_eq!(
+            profile_for(&agents_only, TabKind::Terminal, None, false).unwrap_err().to_string(),
+            "the config has no terminal profile (add one with no type, or type = \"terminal\"; \
+             the profiles are: Fake)"
         );
     }
 

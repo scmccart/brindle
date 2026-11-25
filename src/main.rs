@@ -2409,6 +2409,18 @@ mod tests {
         assert_eq!(launch_profile(&parse(&["terminal", "A"]).asked, &config, false), Ok(0));
         let refusal = launch_profile(&parse(&["terminal", "wrk"]).asked, &config, false).unwrap_err();
         assert_eq!(refusal.to_string(), "no profile is named \"wrk\" (the profiles are: a, b)");
+        let refusal = launch_profile(&parse(&["agent"]).asked, &config, false).unwrap_err();
+        assert!(refusal.to_string().starts_with("the config has no agent profile"), "{refusal}");
+        let config = Config::parse(
+            "default_profile = \"fake\"\n[[profiles]]\nname = \"a\"\n[[profiles]]\nname = \"fake\"\ntype = \"agent\"\ncommand = \"f\"\n",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(launch_profile(&parse(&[]).asked, &config, false), Ok(1), "bare brindle: the default, whatever its kind");
+        assert_eq!(launch_profile(&parse(&["agent"]).asked, &config, false), Ok(1));
+        assert_eq!(launch_profile(&parse(&["terminal"]).asked, &config, false), Ok(0), "the first terminal profile");
+        let refusal = launch_profile(&parse(&["agent", "a"]).asked, &config, false).unwrap_err();
+        assert_eq!(refusal.to_string(), "\"a\" is a terminal profile: open it with brindle terminal a");
     }
 
     #[test]
