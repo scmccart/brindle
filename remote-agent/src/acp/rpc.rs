@@ -201,6 +201,14 @@ impl Rpc {
         self.outgoing.len() != before
     }
 
+    /// Forgets every request awaited and every permission request waiting,
+    /// keeping the next id: for an agent started again, to which the ended
+    /// agent's requests mean nothing, and whose ids must not repeat them.
+    pub fn restart(&mut self) {
+        self.outgoing.clear();
+        self.permissions.clear();
+    }
+
     /// Keeps a permission request, shown as `entry`, until it is answered.
     /// Past the cap it isn't kept, and the caller answers it `cancelled`.
     pub fn hold_permission(&mut self, entry: EntryId, id: Id) -> Result<(), Full> {
@@ -570,6 +578,20 @@ mod tests {
             Some((EntryId(2), permission_answer(&Id::number(0), None)))
         );
         assert_eq!(rpc.withdraw(&Id::number(0)), None);
+    }
+
+    #[test]
+    fn a_restart_forgets_every_request_and_keeps_counting() {
+        let mut rpc = Rpc::new();
+        rpc.initialize("0.3.0");
+        rpc.prompt("s", "hi");
+        assert_eq!(rpc.hold_permission(EntryId(1), Id::number(0)), Ok(()));
+        rpc.restart();
+        assert!(rpc.outgoing().is_empty() && rpc.permissions().is_empty());
+        assert_eq!(rpc.answered(&Id::number(2)), None);
+        assert_eq!(rpc.next_id(), 3);
+        rpc.initialize("0.3.0");
+        assert_eq!(rpc.outgoing().keys().copied().collect::<Vec<_>>(), [3]);
     }
 
     #[test]

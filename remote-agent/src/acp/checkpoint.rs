@@ -16,7 +16,8 @@
 //! The state holds the log as the events of [`Transcript::replay`] (the
 //! queue slot, the turn and the agent's state among them), the ACP version
 //! (`acp`, always 1 here), the [`Phase`] (with the ACP session id once
-//! ready), the [`Rpc`] parts (the next outgoing id, the core's requests
+//! ready, what a spawn starts or continues, what `initialize` offered, and
+//! a load's muted count), the [`Rpc`] parts (the next outgoing id, the core's requests
 //! awaiting a response and what each was for, the agent's waiting
 //! permission requests by entry with their JSON-RPC ids as sent), the chunk
 //! run, the tool entries by call id, the count of a bad-line run not yet
@@ -43,11 +44,14 @@ use std::time::Instant;
 
 use brindle_remote_protocol::holder::MAX_CHECKPOINT_LEN;
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
-use brindle_transcript::{AgentState, Entry, EntryId, Event, NoticeLevel, Transcript};
+use brindle_transcript::{
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, NoticeLevel, Transcript,
+};
 
 use super::lines::{Lines, Partial};
 use super::reduce::{
-    self, AgentSession, BAD_RUN_QUIET, BadRun, Input, Output, Phase, Run, RunKind,
+    self, AgentSession, BAD_RUN_QUIET, BadRun, Greeting, Input, Log, Output, Phase, Replay, Run,
+    RunKind, Start,
 };
 use super::rpc::{BadParts, PROTOCOL_VERSION, Purpose, Rpc};
 use super::wire::Id;
@@ -200,18 +204,94 @@ fn encode_within(session: &AgentSession, limit: u64) -> Result<Vec<u8>, TooLarge
     Ok(out)
 }
 
+/// A phase as the state's `phase` object. Of the fields
+/// `agents-session-recovery` added, `start` is left out for a new
+/// conversation, so its spawning and initializing phases encode as before;
+/// a state written without them reads as a new conversation's, its
+/// `creating` phase's agent offering nothing ([`restore_phase`]).
 fn phase_value(phase: &Phase) -> Value {
     match phase {
-        Phase::Spawning => json!({ "phase": "spawning" }),
-        Phase::Initializing => json!({ "phase": "initializing" }),
-        Phase::Creating { name, version } => {
-            json!({ "phase": "creating", "name": name, "version": version })
+        Phase::Spawning { start } => with_start(json!({ "phase": "spawning" }), start),
+        Phase::Initializing { start } => with_start(json!({ "phase": "initializing" }), start),
+        Phase::Creating { greeting } => greeting_value("creating", greeting),
+        Phase::Resuming {
+            greeting,
+            conversation,
+            log,
+        } => {
+            let mut value = greeting_value("resuming", greeting);
+            value["conversation"] = json!(conversation);
+            value["log"] = json!(log_name(*log));
+            value
+        }
+        Phase::Loading {
+            greeting,
+            conversation,
+            replay,
+        } => {
+            let mut value = greeting_value("loading", greeting);
+            value["conversation"] = json!(conversation);
+            match replay {
+                Replay::Muted { updates } => {
+                    value["replay"] = json!("muted");
+                    value["updates"] = json!(updates);
+                }
+                Replay::Shown => value["replay"] = json!("shown"),
+            }
+            value
         }
         Phase::Ready { session } => json!({ "phase": "ready", "session": session }),
         Phase::LoginRequired => json!({ "phase": "login_required" }),
         Phase::Refused => json!({ "phase": "refused" }),
         Phase::Broken => json!({ "phase": "broken" }),
         Phase::Exited => json!({ "phase": "exited" }),
+        Phase::Lost => json!({ "phase": "lost" }),
+    }
+}
+
+fn with_start(mut value: Value, start: &Start) -> Value {
+    match start {
+        Start::New => {}
+        Start::Continue { conversation, log } => {
+            value["start"] = json!({
+                "conversation": conversation_value(conversation),
+                "log": log_name(*log),
+            });
+        }
+    }
+    value
+}
+
+fn greeting_value(phase: &str, greeting: &Greeting) -> Value {
+    json!({
+        "phase": phase,
+        "name": greeting.name,
+        "version": greeting.version,
+        "continuation": continuation_name(greeting.continuation),
+    })
+}
+
+fn conversation_value(conversation: &Conversation) -> Value {
+    json!({
+        "id": conversation.id,
+        "cwd": conversation.cwd,
+        "continuation": continuation_name(conversation.continuation),
+    })
+}
+
+fn continuation_name(continuation: Continuation) -> &'static str {
+    match continuation {
+        Continuation::ResumeAndLoad => "resume_and_load",
+        Continuation::Resume => "resume",
+        Continuation::Load => "load",
+        Continuation::Neither => "neither",
+    }
+}
+
+fn log_name(log: Log) -> &'static str {
+    match log {
+        Log::Kept => "kept",
+        Log::Fresh => "fresh",
     }
 }
 
@@ -410,11 +490,30 @@ fn restore(
 fn restore_phase(phase: &Map<String, Value>) -> Result<Phase, Unreadable> {
     let name = "phase";
     Ok(match text(phase, name)? {
-        "spawning" => Phase::Spawning,
-        "initializing" => Phase::Initializing,
+        "spawning" => Phase::Spawning {
+            start: restore_start(phase)?,
+        },
+        "initializing" => Phase::Initializing {
+            start: restore_start(phase)?,
+        },
         "creating" => Phase::Creating {
-            name: optional_text(phase, "name")?,
-            version: optional_text(phase, "version")?,
+            greeting: restore_greeting(phase)?,
+        },
+        "resuming" => Phase::Resuming {
+            greeting: restore_greeting(phase)?,
+            conversation: text(phase, "conversation")?.to_owned(),
+            log: restore_log_kind(text(phase, "log")?)?,
+        },
+        "loading" => Phase::Loading {
+            greeting: restore_greeting(phase)?,
+            conversation: text(phase, "conversation")?.to_owned(),
+            replay: match text(phase, "replay")? {
+                "muted" => Replay::Muted {
+                    updates: number(phase, "updates")?,
+                },
+                "shown" => Replay::Shown,
+                _ => return Err(Unreadable::Field { name: "replay" }),
+            },
         },
         "ready" => Phase::Ready {
             session: text(phase, "session")?.to_owned(),
@@ -423,8 +522,57 @@ fn restore_phase(phase: &Map<String, Value>) -> Result<Phase, Unreadable> {
         "refused" => Phase::Refused,
         "broken" => Phase::Broken,
         "exited" => Phase::Exited,
+        "lost" => Phase::Lost,
         _ => return Err(Unreadable::Field { name }),
     })
+}
+
+/// A spawning or initializing phase's start: new without a `start`.
+fn restore_start(phase: &Map<String, Value>) -> Result<Start, Unreadable> {
+    let name = "start";
+    let start = match phase.get(name) {
+        None | Some(Value::Null) => return Ok(Start::New),
+        Some(start) => object(start, name)?,
+    };
+    let conversation = object(field(start, "conversation")?, "conversation")?;
+    Ok(Start::Continue {
+        conversation: Conversation {
+            id: text(conversation, "id")?.to_owned(),
+            cwd: text(conversation, "cwd")?.to_owned(),
+            continuation: restore_continuation(Some(field(conversation, "continuation")?))?,
+        },
+        log: restore_log_kind(text(start, "log")?)?,
+    })
+}
+
+/// What `initialize` said; a state without `continuation` predates it, and
+/// its agent offers nothing.
+fn restore_greeting(phase: &Map<String, Value>) -> Result<Greeting, Unreadable> {
+    Ok(Greeting {
+        name: optional_text(phase, "name")?,
+        version: optional_text(phase, "version")?,
+        continuation: restore_continuation(phase.get("continuation"))?,
+    })
+}
+
+fn restore_continuation(value: Option<&Value>) -> Result<Continuation, Unreadable> {
+    let name = "continuation";
+    match value.map(Value::as_str) {
+        None => Ok(Continuation::Neither),
+        Some(Some("resume_and_load")) => Ok(Continuation::ResumeAndLoad),
+        Some(Some("resume")) => Ok(Continuation::Resume),
+        Some(Some("load")) => Ok(Continuation::Load),
+        Some(Some("neither")) => Ok(Continuation::Neither),
+        Some(Some(_) | None) => Err(Unreadable::Field { name }),
+    }
+}
+
+fn restore_log_kind(log: &str) -> Result<Log, Unreadable> {
+    match log {
+        "kept" => Ok(Log::Kept),
+        "fresh" => Ok(Log::Fresh),
+        _ => Err(Unreadable::Field { name: "log" }),
+    }
 }
 
 /// The log the replayed events fold into.
@@ -699,13 +847,15 @@ mod tests {
             }
         }
 
-        /// Spawned, `initialize` (id 1) and `session/new` (id 2) answered.
+        /// Spawned, `initialize` (id 1, offering load and resume) and
+        /// `session/new` (id 2) answered.
         fn ready() -> Self {
             let mut agent = Self::new();
             agent.step(Input::Spawned);
             agent.feed(&result(
                 1,
                 json!({"protocolVersion": 1,
+                "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"resume": {}}},
                 "agentInfo": {"name": "fake", "version": "1.0"}}),
             ));
             agent.feed(&result(2, json!({"sessionId": "s1"})));
@@ -794,18 +944,61 @@ mod tests {
         );
     }
 
+    fn greeting(name: Option<&str>, version: Option<&str>, continuation: Continuation) -> Greeting {
+        Greeting {
+            name: name.map(Into::into),
+            version: version.map(Into::into),
+            continuation,
+        }
+    }
+
+    fn continuing(log: Log) -> Start {
+        Start::Continue {
+            conversation: Conversation {
+                id: "s1".into(),
+                cwd: "/home/u/src".into(),
+                continuation: Continuation::Load,
+            },
+            log,
+        }
+    }
+
     #[test]
     fn every_phase_round_trips() {
         let phases = [
-            Phase::Spawning,
-            Phase::Initializing,
-            Phase::Creating {
-                name: Some("fake".into()),
-                version: None,
+            Phase::Spawning { start: Start::New },
+            Phase::Spawning {
+                start: continuing(Log::Kept),
+            },
+            Phase::Initializing { start: Start::New },
+            Phase::Initializing {
+                start: continuing(Log::Fresh),
             },
             Phase::Creating {
-                name: None,
-                version: Some("2".into()),
+                greeting: greeting(Some("fake"), None, Continuation::ResumeAndLoad),
+            },
+            Phase::Creating {
+                greeting: greeting(None, Some("2"), Continuation::Neither),
+            },
+            Phase::Resuming {
+                greeting: greeting(Some("fake"), Some("1.0"), Continuation::Resume),
+                conversation: "s1".into(),
+                log: Log::Kept,
+            },
+            Phase::Resuming {
+                greeting: greeting(None, None, Continuation::ResumeAndLoad),
+                conversation: "s1".into(),
+                log: Log::Fresh,
+            },
+            Phase::Loading {
+                greeting: greeting(Some("Copilot"), None, Continuation::Load),
+                conversation: "s1".into(),
+                replay: Replay::Muted { updates: 7 },
+            },
+            Phase::Loading {
+                greeting: greeting(None, None, Continuation::ResumeAndLoad),
+                conversation: "s1".into(),
+                replay: Replay::Shown,
             },
             Phase::Ready {
                 session: "s1".into(),
@@ -814,12 +1007,137 @@ mod tests {
             Phase::Refused,
             Phase::Broken,
             Phase::Exited,
+            Phase::Lost,
         ];
         for phase in phases {
             let mut agent = Agent::new();
             agent.s.phase = phase;
             assert_eq!(agent.round_trip(), agent.s);
         }
+    }
+
+    /// A state written before `agents-session-recovery`: no `start`, and a
+    /// `creating` phase without `continuation`.
+    #[test]
+    fn an_older_shaped_state_reads_as_a_new_conversation_offering_nothing() {
+        let agent = Agent::new();
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(state["phase"], json!({"phase": "spawning"}), "encoded as before");
+        for (phase, expected) in [
+            (json!({"phase": "spawning"}), Phase::Spawning { start: Start::New }),
+            (
+                json!({"phase": "initializing"}),
+                Phase::Initializing { start: Start::New },
+            ),
+            (
+                json!({"phase": "creating", "name": "fake", "version": null}),
+                Phase::Creating {
+                    greeting: greeting(Some("fake"), None, Continuation::Neither),
+                },
+            ),
+        ] {
+            state["phase"] = phase;
+            let restored = decode(&rebuild(&state, &partial), agent.now).expect("it reads");
+            assert_eq!(restored.phase, expected);
+        }
+    }
+
+    #[test]
+    fn a_malformed_continuing_phase_is_unreadable_naming_its_field() {
+        let agent = Agent::new();
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        for (phase, name) in [
+            (json!({"phase": "spawning", "start": 7}), "start"),
+            (
+                json!({"phase": "spawning", "start": {"log": "kept"}}),
+                "conversation",
+            ),
+            (
+                json!({"phase": "spawning", "start": {"log": "sometimes",
+                    "conversation": {"id": "s1", "cwd": "/", "continuation": "load"}}}),
+                "log",
+            ),
+            (
+                json!({"phase": "initializing", "start": {"log": "kept",
+                    "conversation": {"id": "s1", "cwd": "/", "continuation": "maybe"}}}),
+                "continuation",
+            ),
+            (
+                json!({"phase": "resuming", "conversation": "s1", "log": "kept", "continuation": 1}),
+                "continuation",
+            ),
+            (
+                json!({"phase": "loading", "conversation": "s1", "replay": "muted"}),
+                "updates",
+            ),
+            (
+                json!({"phase": "loading", "conversation": "s1", "replay": "loud"}),
+                "replay",
+            ),
+            (json!({"phase": "loading", "replay": "shown"}), "conversation"),
+        ] {
+            state["phase"] = phase.clone();
+            assert_eq!(
+                decode(&rebuild(&state, &partial), agent.now),
+                Err(Unreadable::Field { name }),
+                "{phase}"
+            );
+        }
+    }
+
+    /// Mid-load with a muted count, a permission request waiting: the
+    /// adopted core finishes the load, notice and count included.
+    #[test]
+    fn a_checkpoint_taken_mid_load_round_trips_and_finishes_the_load() {
+        let mut agent = Agent::ready();
+        agent.prompt("first");
+        agent.feed(&chunk("Done."));
+        agent.feed(&result(3, json!({"stopReason": "end_turn"})));
+        agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"",
+        });
+        assert_eq!(agent.step(Input::Restart).reply, Some(Ok(())));
+        agent.step(Input::Spawned);
+        let out = agent.feed(&result(
+            4,
+            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}),
+        ));
+        assert_eq!(sent(&out.stdin)[0]["method"], "session/load");
+        agent.feed(&chunk("replayed"));
+        agent.feed(&chunk(" twice"));
+        agent.feed(&permission(json!(9)));
+        assert!(matches!(
+            agent.s.phase,
+            Phase::Loading {
+                replay: Replay::Muted { updates: 2 },
+                ..
+            }
+        ));
+        let mut restored = agent.round_trip();
+        assert_eq!(restored, agent.s);
+        let out = step(&mut restored, Input::Stdout(&result(5, json!({}))), agent.now);
+        assert_eq!(restored.phase, Phase::Ready { session: "s1".into() });
+        assert!(out.events.iter().any(|event| matches!(event,
+            Event::Added { entry: Entry::Notice { text, .. }, .. }
+                if text == "conversation continued; the agent's replay of 2 updates wasn't shown")));
+        assert_eq!(restored.rpc.permissions().len(), 1, "the request still waits");
+    }
+
+    #[test]
+    fn a_lost_agent_with_its_conversation_round_trips_continuable() {
+        let mut agent = Agent::ready();
+        agent.step(Input::Lost {
+            message: "its holder ended",
+        });
+        assert!(agent.s.continuable());
+        let restored = agent.round_trip();
+        assert_eq!(restored, agent.s);
+        assert!(restored.continuable());
+        assert_eq!(
+            restored.transcript.conversation().map(|c| c.id.as_str()),
+            Some("s1")
+        );
     }
 
     #[test]
@@ -1310,7 +1628,7 @@ mod tests {
     fn a_session_never_checkpointed_is_adopted_new_and_started() {
         let adopted = adopt(&[], false, "/home/u/src", "0.3.0", Instant::now());
         assert_eq!(adopted.restored, Ok(()));
-        assert_eq!(adopted.session.phase, Phase::Initializing);
+        assert_eq!(adopted.session.phase, Phase::Initializing { start: Start::New });
         assert_eq!(sent(&adopted.output.stdin)[0]["method"], "initialize");
         assert_eq!(
             adopted.output.checkpoint,

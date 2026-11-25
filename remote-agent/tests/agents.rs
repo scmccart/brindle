@@ -1618,8 +1618,9 @@ fn kind(event: &Event) -> &'static str {
 
 /// Every event the client folds is decoded with `Event::from_value` and
 /// must encode back to the very JSON it came as (the test client's
-/// `fold`): so each is one of protocol 4's forms. This run has a turn, a
-/// queue, a permission, a cancel and an exit; the trim's are in
+/// `fold`): so each is one of protocol 4's forms. This run has the
+/// conversation, a turn, a queue, a permission, a cancel and an exit; the
+/// trim's are in
 /// [`a_log_past_16_mib_drops_its_oldest_entries`].
 #[test]
 fn every_event_of_a_session_decodes_as_protocol_4s() {
@@ -1655,7 +1656,10 @@ fn every_event_of_a_session_decodes_as_protocol_4s() {
     let mut kinds: Vec<&str> = events.iter().map(kind).collect();
     kinds.sort_unstable();
     kinds.dedup();
-    assert_eq!(kinds, ["added", "agent", "answered", "appended", "queue", "tool_changed", "turn"]);
+    assert_eq!(
+        kinds,
+        ["added", "agent", "answered", "appended", "conversation", "queue", "tool_changed", "turn"]
+    );
 }
 
 /// The client's log, and a fresh attach's, after an agent said 17

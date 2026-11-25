@@ -198,6 +198,8 @@ fn inject_fault(input: &Input<'_>) {
         Input::Spawned
         | Input::OutputLost
         | Input::Exited { .. }
+        | Input::Lost { .. }
+        | Input::Restart
         | Input::Command(
             Command::Unqueue | Command::Resend | Command::Cancel | Command::Answer { .. },
         )
