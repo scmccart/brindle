@@ -264,7 +264,12 @@ rule, not a convenience.
   rounded rectangles (`Stroke::Rect`) in the text colour, sized in rems:
   `Check`, `ChevronDown`, `ChevronUp`, `X`, `Search`, `Plus`, `Minus`,
   `Square`, `Copy`, `AppWindow`, `ArrowUp`, `ArrowDown`, `Columns2`, `Rows2`,
-  `Lock`, `TriangleAlert`, `ClipboardPaste` and `Ban`. Strokes have butt caps and miter joins, since
+  `Lock`, `TriangleAlert`, `ClipboardPaste`, `Ban`, and for the AI elements
+  `Send`, `Brain`, `FileText`, `Pencil`, `Trash`, `Move`, `Terminal`,
+  `Globe`, `Wrench`, `CircleAlert` and `LoaderCircle` (lucide's arcs and
+  curves flattened into chords once, the path data quoted beside each).
+  `IconElement::turn` (and `Button::icon_turn`) draws one turned about its
+  centre, a spinner's frame under gpui's `with_animation`. Strokes have butt caps and miter joins, since
   gpui doesn't expose lucide's round caps (so `TriangleAlert`'s dot is a
   short rule). Lucide's stroke (2 on its 24 grid) scales with the
   icon, which leaves a 16px icon 1.33px thin; `IconElement::min_stroke`
@@ -275,10 +280,83 @@ rule, not a convenience.
   keep lucide's weight.
 - **`TextInput`** (`text_input.rs`) and **`filter`** (`fuzzy_match`, the
   case-insensitive subsequence match palettes use).
-- **Actions** (`actions.rs`): `brindle_ui::TextInput*`, `Dismiss`,
-  `FocusNext`/`FocusPrev` and `ListUp`/`ListDown`/`ListFirst`/`ListLast`/
-  `ListConfirm`, bound by `default_bindings()` in the key contexts
-  `TextInput`, `UiLayer`, `UiCommand`, `UiFocusScope` and `UiList`.
+- **`TextArea`** (`text_area.rs`), the multi-line text input: the same
+  `EditState` in `Lines::Many` (`\r\n` and `\r` become `\n`, tab stays,
+  other controls go), wrapped at its width with gpui's `shape_text`, growing
+  to `max_lines` rows (`DEFAULT_MAX_LINES`, 8) and then scrolling to keep
+  the cursor in view. Up and down move by shown row keeping a goal column
+  (`motion_vertical` over the pure `WrapMap` of the last layout), home and
+  end go to the shown row's ends, shift-enter breaks the line. It binds no
+  escape, tab or shift-tab, passes enter on (`TextAreaEnter`) unless an
+  input method is composing (`composing()`), and passes up at its first row
+  and down at its last, so an owner's keys reach them. The IME window sits
+  at the cursor on its wrapped row. `set_read_only(true)` keeps the text,
+  takes no edits and draws no caret. `TextAreaEvent::Changed` follows every
+  edit the person makes (`set_text` sends none). **`Textarea`**
+  (`components/textarea.rs`) is `Input`'s frame around one: the input
+  border, the ring while focused, the destructive colour when invalid, at
+  least 4rem tall, and a press in its padding focuses the area with the
+  cursor at the end.
+- **The AI elements** (`components/`), named after shadcn/ui's AI Elements
+  and drawn from the tokens; they know nothing of agents:
+  - `MessageScroller` (an entity): gpui's `list` with
+    `ListAlignment::Bottom`, laying out only the items in view and 512px
+    around. The owner keeps the items, renders one by index
+    (`MessageScroller::new(count, render_item, cx)`) and reports changes
+    with `splice(range, count)` (a changed item is replaced by itself) or
+    `reset(count)`. `Follow` (`AtEnd`, `Away`) comes from the list's scroll
+    events (`Follow::after_scroll`): at the end it stays there as items are
+    added or grow; away, the items in view stay put and an outline
+    `arrow-down` button shows, which scrolls to the end and follows again
+    (`scroll_to_end`). `scroll_page(PageDirection)` is the owner's page keys'
+    way in (`page_scroll`, pure), and a page down that reaches the end
+    follows it (`Follow::after_draw`).
+  - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
+    at the end on `muted`, the other side's (`Assistant`) at the start on
+    the card with a border, at most four fifths of the row. A long message
+    drawn as several list items uses `BubblePart::{First, Middle, Last}`,
+    which round, border and pad only the outer edges (`BubblePart::edges`).
+    `Message::action(..)` adds an element (a copy button) under a whole
+    message or its last part, drawn only while the pointer is over the
+    message.
+  - `PromptInput` (an entity owning its `TextArea`): a queue row, the
+    `Textarea`, and a toolbar with a reason line (`set_reason`) and the
+    submit button, which reads the owner's `PromptStatus`: `Ready` an
+    `arrow-up` (disabled while the text is blank), `Submitted` a turning
+    `loader-circle` (disabled), `Streaming` a `square` that asks to stop,
+    `Disabled` the arrow disabled and the text read-only. It emits
+    `PromptInputEvent::{Submit(text), Stop, RemoveQueued, ResendQueued}`
+    and never changes its own text: the owner clears it
+    (`set_text("")`) once a prompt is taken. The pure rules are
+    `button_request`, `enter_submits`, `escape_stops` and `is_blank`. The
+    queue row (`set_queued(Some(Queued::..))`) shows the text's first line
+    cut with an ellipsis, then `queued` and a ghost `x` (remove) for
+    `Queued::Waiting`, or `not sent: REASON` (in `set_held_color`'s colour,
+    destructive by default) with ghost `send` (send again, disabled with its
+    `Resend::Unavailable` reason as the tooltip) and `x` (discard) for
+    `Queued::Held`. Its focus stops for the owner's scope: the text area
+    (`Focusable`), the row's enabled buttons (`row_stops()`), and the stop
+    button while streaming (`stop_button()`).
+  - `Reasoning`: a trigger (lucide `brain`, the owner's label, a chevron
+    turned over while open) over muted content; the owner holds `open` and
+    flips it from `on_toggle`.
+  - `Tool`: one row, an icon, the title cut with an ellipsis and a status
+    badge (`ToolStatus`: pending, running, done, failed in the destructive
+    colour, `tool_status_colors`) that stays whole.
+  - `Confirmation`: a title and, while `ConfirmationState::Requested`, one
+    small button per `ConfirmationAction` (keyed by `ItemKey`, a focus stop
+    through the owner's handle), `on_action(key)`; once `Accepted`,
+    `Rejected` or `Cancelled`, the outcome (`check` or `x` and the label,
+    `ConfirmationState::outcome`) and no buttons.
+  - `Alert`: shadcn's alert (`AlertVariant::{Default, Destructive}`,
+    `alert_style`), lucide `circle-alert` by default, with the children as
+    the description.
+- **Actions** (`actions.rs`): `brindle_ui::TextInput*`, `TextArea*`,
+  `PromptSubmit`/`PromptStop`, `Dismiss`, `FocusNext`/`FocusPrev` and
+  `ListUp`/`ListDown`/`ListFirst`/`ListLast`/`ListConfirm`, bound by
+  `default_bindings()` in the key contexts `TextInput`, `TextArea`,
+  `PromptInput`, `UiLayer`, `UiCommand`, `UiFocusScope` and `UiList`. A text
+  area shares every editing key of a text input but home and end.
 
 ## Deviations from shadcn
 
@@ -709,6 +787,60 @@ content below it. The differences, mostly what a terminal pane needs:
   Reason: the card isn't focusable itself; its owner knows whether the
   pane inside has keyboard focus.
 
+**Textarea and text area.** shadcn's `Textarea` is a `<textarea>`; here
+the editing is the crate's own, so these are differences from a browser's:
+
+- **Enter is the owner's.** A text area binds enter to `TextAreaEnter`,
+  which passes it on unless an input method is composing; a line break is
+  shift-enter. Reason: every owner (a prompt) sends on enter, and a
+  browser's textarea has no way to say "composing" to its page's keys.
+- **A lone enter or tab no owner binds inserts nothing.** gpui hands an
+  unbound enter or tab to the input handler as `\n` or `\t`; the area drops
+  those (`is_unbound_key_text`), so a key reaching no binding does nothing
+  instead of typing. Pasted and composed text keeps its breaks and tabs.
+- **End on a wrapped row stops before the wrap**, so the cursor stays on
+  that row (a browser shows it at the next row's start).
+- **Up at the first row and down at the last go to the owner** (a browser
+  moves to the text's start or end); with shift they extend the selection
+  to the start or end, as a browser does.
+- **Read-only, not disabled:** `set_read_only` keeps the text, takes no
+  edits and draws it at half opacity with no caret.
+  Reason: a prompt input shows its draft while it can't send.
+
+**AI elements.** Anatomy and behaviour after shadcn/ui's AI Elements; no
+code comes from there.
+
+- **The scroll button is outline**, not ghost: it floats over the
+  messages, which a ghost button's transparent face would show through.
+  It takes no focus; the owner's keyboard path is `scroll_to_end`.
+- **A change that contains the list's top item resets the offset to that
+  item's start** (gpui's `ListState::splice`). An owner splices only the
+  items that changed, so a growing last item moves nothing above it.
+- **Hover actions are drawn only while the pointer is over the message**,
+  so they take no focus; the owner gives each a keyboard path (an action).
+- **The prompt input's toolbar is under the frame**, not inside it, with
+  the reason line at its start. Reason: the frame is `Textarea`'s, and the
+  key context that makes enter submit wraps the text area alone, so the
+  row's and the toolbar's buttons keep their own enter.
+- **Enter submits while streaming too.** AI Elements' button is a stop
+  then; enter in the text asks the owner to submit, which queues it.
+- **The submit button is a focus stop only while streaming** (as a stop
+  button); ready, enter in the text area does what it would.
+- **The spinner turns `loader-circle`** with gpui's `with_animation`.
+- **The held label's colour is the owner's** (`set_held_color`): the
+  tokens have no warning colour; it defaults to destructive.
+- **The queue row** has no AI Elements counterpart (an addition): a text
+  queued apart from the draft, which none of its buttons touch.
+- **Reasoning's trigger is pointer-only** (AI Elements' is a button): a
+  conversation holds many, and Tab through each would bury the prompt. The
+  owner holds `open`; no auto-close timer.
+- **Tool is one row** with no collapsible input and output, and takes no
+  focus; its badge says pending, running, done or failed.
+- **Confirmation's outcome shows the chosen action's label**, and
+  `Cancelled` shows "Cancelled"; the actions are keyed (`ItemKey`).
+- **Alert's title wraps** (shadcn clamps it to one line): an app's titles
+  name a failure and its cause and are read whole.
+
 Not verified against the upstream source here, so worth a check before
 relying on them:
 
@@ -810,7 +942,11 @@ dots, tooltips and a long title cut at the maximum width) and a crowded
 strip whose triggers shrink to their minimum, and cards: the default look
 with a header, two in a terminal's colours on a surround of their own (one
 with its title muted), a headerless one whose content paints a square
-background to its corners, and a pair without and with the ring.
+background to its corners, and a pair without and with the ring, and the
+AI elements: a conversation (messages on both sides, one in three parts,
+tool rows, copy actions on hover) in a message scroller over a prompt input
+whose submits join it, and beside them a reasoning block, tool rows in
+three states, a permission confirmation and the two alerts.
 
 `--check` drives the scenarios of the `ui-components` spec (the Verify
 clauses of the change's tasks 4.x and 5.1–5.7) and prints one `ok NAME`,
@@ -830,6 +966,11 @@ cargo clippy -p brindle-ui --all-targets           # the gallery included
 ```
 
 Every decision is a pure function with unit tests; the GPUI glue around
-them is thin. GUI behaviour is checked by the gallery's `--check` on a
+them is thin. The text area and the AI elements also have `TestAppContext`
+tests (gpui's `test-support`, a dev-dependency only), which drive keys,
+clicks and input-method text through a headless window
+(`test_support::app()`). gpui keeps a `debug_selector`'s last bounds from
+frame to frame, so a test that something is no longer drawn records the
+paint itself. GUI behaviour is checked by the gallery's `--check` on a
 desktop, and by Brindle's end-to-end suite as each surface adopts a
 component.
