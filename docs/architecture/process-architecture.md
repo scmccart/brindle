@@ -56,7 +56,7 @@ let Some(lock) = Lock::acquire(&dir.join("core.lock"))? else {
 | Process or thread | Owns | Rules that bind it most |
 | --- | --- | --- |
 | holder (`brindle-remote hold`) | PTYs and pseudoconsoles, programs, each session's meta, checkpoint and tail | R1, R9, R10 |
-| server core (`brindle-remote serve`) | an `Emulator` per session, the client protocol, policy | R2, R3, R4–R8, R12, R19 |
+| server core (`brindle-remote serve`) | an `Emulator` per session, the client protocol (`brindle-remote-protocol`) and the transcript events it carries (`brindle-transcript`), policy | R2, R3, R4–R8, R12, R19 |
 | relay (`brindle-remote relay`; Linux only: built under `target_os = "linux"`, and refused with "relay runs only on Linux" on every other platform, macOS included) | one endpoint's link, copied by frame | R7, R18 |
 | Brindle's connection threads (`src/remote/local/`) | one reader and one writer per endpoint | R13, R14, R18 |
 | Brindle's UI thread | entities, painting | R13, R14, R16 |
@@ -86,7 +86,7 @@ Protocols: client protocol versions 1–3 and core↔holder H1 at version 2, bot
 - **R18.** Peer liveness MUST be stamped on the reader thread, which drops heartbeats itself. Never measure it where output is copied: a slow client blocks that path and healthy peers' frames go unread.
 - **R19.** The server core MUST NOT answer a terminal's queries. Its emulator's listener drops every event but title changes; the attached client answers. Two answerers would reply twice.
 - **R20.** A test-only switch MUST be an environment variable named `BRINDLE_TEST_…`, and one that injects a fault MUST exist only in debug builds (`BRINDLE_TEST_FEED_PANIC`), and each binary lists the ones it honours with `--list-fault-switches`, so a test tells a missing switch from a broken feature.
-- **R21.** The five workspace crates MUST share one version: Brindle matches its helper by version. Versions are moved by release-please alone.
+- **R21.** The six workspace crates MUST share one version: Brindle matches its helper by version. Versions are moved by release-please alone.
 
 ## Anti-patterns
 

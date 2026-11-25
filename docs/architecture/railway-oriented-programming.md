@@ -1,6 +1,6 @@
 # Railway-oriented programming
 
-In Brindle an expected failure is a value in the return type, and it ends up as visible state on the thing that failed: a tab's message, an endpoint's offline row, a line in the terminal. `brindle-remote-protocol`, `brindle-term-core`, `brindle-ui` and `brindle-remote-agent` return their own error types or `io::Result`; `anyhow` is for the app alone, where errors are only reported. Code review enforces the **Rules** section; reviewers cite rules by number (`railway R5`).
+In Brindle an expected failure is a value in the return type, and it ends up as visible state on the thing that failed: a tab's message, an endpoint's offline row, a line in the terminal. `brindle-remote-protocol`, `brindle-term-core`, `brindle-transcript`, `brindle-ui` and `brindle-remote-agent` return their own error types or `io::Result`; `anyhow` is for the app alone, where errors are only reported. Code review enforces the **Rules** section; reviewers cite rules by number (`railway R5`).
 
 ## Why
 
@@ -57,7 +57,7 @@ pub enum Listing { Sessions(Vec<SessionInfo>), Connecting, Offline(String), Pend
 ## Rules
 
 - **R1.** An expected failure MUST be in the return type: `Result<T, E>`, or an outcome enum when success has several shapes. Not a panic, a sentinel value, or a log line with a default returned in its place.
-- **R2.** `brindle-remote-protocol`, `brindle-term-core`, `brindle-ui` and `brindle-remote-agent` MUST return their own error types or `io::Result` with a meaningful `ErrorKind`. `anyhow` MUST stay in `brindle`, where errors are reported and nothing branches on them.
+- **R2.** `brindle-remote-protocol`, `brindle-term-core`, `brindle-transcript`, `brindle-ui` and `brindle-remote-agent` MUST return their own error types or `io::Result` with a meaningful `ErrorKind`. `anyhow` MUST stay in `brindle`, where errors are reported and nothing branches on them.
 - **R3.** A `match` on one of Brindle's own enums MUST be exhaustive, with no `_ =>` arm, so a new variant fails to compile everywhere it matters. Wildcards are for foreign types, bytes, strings and integers. Don't use `#[non_exhaustive]`: no crate here is published.
 - **R4.** Error cases SHOULD carry data that code can branch on. `Result<_, String>` is acceptable only where the single consumer shows the text (a tab's message, a CLI's stderr, a dump line). Once code needs to tell two failures apart, give them an enum; never compare error text.
 - **R5.** Code that reads bytes from another process, a file, the user or the wire MUST NOT panic on any input: it returns `Err`, or skips and continues, and it bounds what it accepts (frame lengths, control lines, layout blobs). Every decoder has a fuzz test (`process R6`).
@@ -83,7 +83,7 @@ pub enum Listing { Sessions(Vec<SessionInfo>), Connecting, Offline(String), Pend
 
 - `tests/architecture.rs` checks R2's dependency half: `crates_below_the_app_name_only_their_allowed_dependencies` fails if a shared crate or the helper gains `anyhow`.
 - `remote-protocol/src/fuzz.rs` holds R5 for the decoders, and `term-core/src/fuzz.rs` (with the parser tests in `shell_integration.rs`) for the OSC scanners, the status parser and the emulator.
-- CI runs clippy with `-D warnings` on Linux and Windows. In non-test code, `clippy::wildcard_enum_match_arm` holds R3 on all five crates (a foreign enum's allow says `foreign enum: <type>`; an own-enum exception says `railway R3 exception`, see `docs/architecture/README.md`), and `clippy::unwrap_used` and `clippy::expect_used` hold R5's no-panic half and R9 on `brindle-remote-protocol` and `brindle-term-core`. `tests/architecture.rs` (`the_crate_roots_enable_the_restriction_lints`) fails if a crate root loses its attribute.
+- CI runs clippy with `-D warnings` on Linux and Windows. In non-test code, `clippy::wildcard_enum_match_arm` holds R3 on all six crates (a foreign enum's allow says `foreign enum: <type>`; an own-enum exception says `railway R3 exception`, see `docs/architecture/README.md`), and `clippy::unwrap_used` and `clippy::expect_used` hold R5's no-panic half and R9 on `brindle-remote-protocol`, `brindle-term-core` and `brindle-transcript`. `tests/architecture.rs` (`the_crate_roots_enable_the_restriction_lints`) fails if a crate root loses its attribute.
 - R1, R4, R5's bounds, R9 on the other three crates and R6–R12 otherwise rely on review.
 
 ## PR checklist

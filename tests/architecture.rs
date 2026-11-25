@@ -17,28 +17,32 @@ use std::path::{Path, PathBuf};
 
 /// The workspace's crates by directory, with their package names. A new
 /// crate needs an entry here and its rules below.
-const CRATES: [(&str, &str); 5] = [
+const CRATES: [(&str, &str); 6] = [
     (".", "brindle"),
     ("remote-agent", "brindle-remote-agent"),
     ("remote-protocol", "brindle-remote-protocol"),
     ("term-core", "brindle-term-core"),
+    ("transcript", "brindle-transcript"),
     ("ui", "brindle-ui"),
 ];
 
 /// Every dependency a crate below the app may name, of any kind (normal,
 /// build, dev) and for any target. The app (`brindle`) has no closed list.
-const ALLOWED: [(&str, &[&str]); 4] = [
+const ALLOWED: [(&str, &[&str]); 5] = [
     ("ui", &["gpui", "log"]),
     (
         "term-core",
         &["alacritty_terminal", "base64", "parking_lot"],
     ),
     ("remote-protocol", &["serde", "serde_json", "windows"]),
+    ("transcript", &["serde", "serde_json"]),
     (
         "remote-agent",
         &[
+            "agent-client-protocol-schema",
             "brindle-remote-protocol",
             "brindle-term-core",
+            "brindle-transcript",
             "embed-resource",
             "libc",
             "windows",
@@ -456,7 +460,7 @@ fn assert_none(found: Vec<String>, rule: &str) {
 
 /// ports R1: the rules below cover every crate there is.
 #[test]
-fn the_workspace_is_the_five_crates_these_rules_cover() {
+fn the_workspace_is_the_six_crates_these_rules_cover() {
     let manifest = manifest(".");
     let members: BTreeSet<&str> = manifest["workspace"]["members"]
         .as_array()
@@ -587,11 +591,16 @@ gpui = { path = "../gpui" }
 #[test]
 fn the_app_and_the_helper_build_on_the_shared_crates() {
     let app = dependencies(".", &["dependencies"]);
-    for shared in ["brindle-ui", "brindle-term-core", "brindle-remote-protocol"] {
+    for shared in [
+        "brindle-ui",
+        "brindle-term-core",
+        "brindle-remote-protocol",
+        "brindle-transcript",
+    ] {
         assert!(app.contains(shared), "brindle must depend on {shared}");
     }
     let helper = dependencies("remote-agent", &["dependencies"]);
-    for shared in ["brindle-term-core", "brindle-remote-protocol"] {
+    for shared in ["brindle-term-core", "brindle-remote-protocol", "brindle-transcript"] {
         assert!(
             helper.contains(shared),
             "brindle-remote-agent must depend on {shared}"
@@ -607,7 +616,7 @@ fn no_crate_names_a_forbidden_dependency() {
     assert!(
         !app.contains("brindle-remote-agent"),
         "brindle must not depend on the helper's crate: shared code goes in \
-         brindle-remote-protocol or brindle-term-core"
+         brindle-remote-protocol, brindle-term-core or brindle-transcript"
     );
     for (dir, name) in CRATES {
         let named = dependencies(dir, &EVERY_KIND);
@@ -659,6 +668,51 @@ fn term_core_does_no_io_and_reads_no_clock() {
         offenders(&files, Scope::All, &needles),
         "brindle-term-core takes bytes and values and returns values \
          (docs/architecture/functional-core-imperative-shell.md R4)",
+    );
+}
+
+/// fcis R4: `brindle-transcript` is pure as a crate.
+#[test]
+fn transcript_does_no_io_and_reads_no_clock() {
+    let files = sources("transcript/src");
+    assert!(!files.is_empty());
+    let needles = [&IO[..], &CLOCK_AND_THREADS[..]].concat();
+    assert_none(
+        offenders(&files, Scope::All, &needles),
+        "brindle-transcript takes values and returns values \
+         (docs/architecture/functional-core-imperative-shell.md R4)",
+    );
+}
+
+/// The ACP schema crate's home: no source outside the helper's pure
+/// `src/acp/` modules names it, so the core's shell reaches ACP only
+/// through `acp::reduce`, and no manifest but the helper's lists it, so it
+/// never enters Brindle's build graph (ports R1, R3).
+#[test]
+fn only_the_acp_modules_name_the_schema_crate() {
+    let acp = Path::new("remote-agent/src/acp");
+    let mut files = vec![PathBuf::from("build.rs")];
+    files.extend(sources("src"));
+    files.extend(sources("tests"));
+    for (dir, _) in CRATES.iter().filter(|(dir, _)| *dir != ".") {
+        files.extend(sources(dir));
+    }
+    files.retain(|file| !file.starts_with(acp));
+    assert!(files.iter().any(|file| file.starts_with("remote-agent/src")));
+    assert_none(
+        offenders(&files, Scope::All, &["agent_client_protocol_schema"]),
+        "only remote-agent/src/acp/ decodes ACP (docs/architecture/ports-and-adapters.md R3)",
+    );
+    let listing: Vec<&str> = CRATES
+        .iter()
+        .filter(|(dir, _)| *dir != "remote-agent")
+        .filter(|(dir, _)| dependencies(dir, &EVERY_KIND).contains("agent-client-protocol-schema"))
+        .map(|(_, name)| *name)
+        .collect();
+    assert!(
+        listing.is_empty(),
+        "only brindle-remote-agent may depend on agent-client-protocol-schema \
+         (docs/architecture/ports-and-adapters.md R3), but {listing:?} do"
     );
 }
 
@@ -2641,9 +2695,9 @@ mod tests {
 }
 
 /// The lints a crate root must switch on, as `(root file, lints)`: the
-/// wildcard lint on every crate, and the panicking-call lints on the two
+/// wildcard lint on every crate, and the panicking-call lints on the three
 /// crates that decode what comes from outside the process.
-const ROOT_LINTS: [(&str, &[&str]); 5] = [
+const ROOT_LINTS: [(&str, &[&str]); 6] = [
     ("src/main.rs", &["clippy::wildcard_enum_match_arm"]),
     ("remote-agent/src/main.rs", &["clippy::wildcard_enum_match_arm"]),
     (
@@ -2654,7 +2708,11 @@ const ROOT_LINTS: [(&str, &[&str]); 5] = [
         "term-core/src/lib.rs",
         &["clippy::wildcard_enum_match_arm", "clippy::unwrap_used", "clippy::expect_used"],
     ),
-    ("ui/src/lib.rs", &["clippy::wildcard_enum_match_arm"]),
+    (
+        "transcript/src/lib.rs",
+        &["clippy::wildcard_enum_match_arm", "clippy::unwrap_used", "clippy::expect_used"],
+    ),
+    ("ui/src/lib.rs",&["clippy::wildcard_enum_match_arm"]),
 ];
 
 /// The lints of `wanted` that `root_text` doesn't switch on in a

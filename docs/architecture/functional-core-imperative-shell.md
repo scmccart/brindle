@@ -1,6 +1,6 @@
 # Functional core, imperative shell
 
-In Brindle every decision is a pure function or a GPUI-free model, and the code around it (a GPUI entity, a connection thread, an event-loop handler, `main.rs`) only gathers inputs, calls it and applies the result. The split is by module and type inside `brindle` and `brindle-remote-agent`, and by crate for `brindle-term-core`, which is pure as a whole. Code review enforces the **Rules** section; reviewers cite rules by number (`fcis R3`).
+In Brindle every decision is a pure function or a GPUI-free model, and the code around it (a GPUI entity, a connection thread, an event-loop handler, `main.rs`) only gathers inputs, calls it and applies the result. The split is by module and type inside `brindle` and `brindle-remote-agent`, and by crate for `brindle-term-core` and `brindle-transcript`, which are pure as a whole. Code review enforces the **Rules** section; reviewers cite rules by number (`fcis R3`).
 
 ## Why
 
@@ -68,6 +68,7 @@ Every line of production code in these is pure. `the_pure_modules_read_nothing_a
 | Pure code | What it decides |
 | --- | --- |
 | `brindle-term-core` (whole crate) | parsing, OSC 133 marks, OSC 7501 status records, replay rendering, the emulator's state |
+| `brindle-transcript` (whole crate) | the transcript's events, their encoding and decoding, and the fold both sides apply them with |
 | `term-core/src/progress.rs` | a terminal's OSC 9;4 progress after each report, and which of its terminals' progress a tab's bar shows |
 | `term-core/src/context.rs` | a terminal's OSC 3008 context stack after each start or end, its limits, and the badge its notable context gives |
 | `term-core/src/pointer.rs` | a terminal's OSC 22 pointer shape stacks after each set, push or pop, the names Brindle shows, and the reply each query gets |
@@ -115,7 +116,7 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 - **R1.** A decision MUST be a pure function or a method of a GPUI-free model: what to show, send, open, keep or drop; an ordering, a grouping or a policy. The entity, thread or handler around it gathers inputs, calls it and applies the result. A decision inside the shell can only be tested with a window or a server.
 - **R2.** Pure code MUST take time as an argument (`now: Instant`, seconds as `u64`) and MUST NOT call `Instant::now()` or `SystemTime::now()`. Random values (tokens, session keys) are made in the shell and passed in.
 - **R3.** Pure code MUST NOT read the environment, files, `/proc`, sockets, GPUI globals or mutable statics. The caller reads them and passes values.
-- **R4.** `brindle-term-core` MUST stay pure as a crate: no filesystem, network, process, environment, thread or clock call, and no dependency beyond `alacritty_terminal`, `base64` and `parking_lot`. It is what makes the server core's emulator and the app's agree.
+- **R4.** `brindle-term-core` and `brindle-transcript` MUST stay pure as crates: no filesystem, network, process, environment, thread or clock call, and no dependency beyond their closed lists (`alacritty_terminal`, `base64` and `parking_lot` for `brindle-term-core`; `serde` and `serde_json` for `brindle-transcript`). `brindle-term-core` is what makes the server core's emulator and the app's agree, and `brindle-transcript` is what makes the core's transcript and the one Brindle folds from its events agree.
 - **R5.** Pure functions and models MUST take and return plain values: no `Entity`, `Window`, `App` or `Context`, no `Task`, no socket or handle, no callback that reaches the world. A view holds its model; the model never holds the view. A probe is allowed: a read-only `Fn(&Path) -> bool` (or a check of the same kind) that answers one question about a path the function itself derived, such as whether a candidate is a file. The shell passes the real check; tests pass a closure over plain values. A callback that acts, waits, or reads an entity, a window or a process is not a probe.
 - **R6.** Parsing, marks, status and replay logic MUST live in `brindle-term-core` and be used by both the app and the server core. Never fork that logic into `src/` or `remote-agent/`: the two would drift, and replays would differ from what the client drew.
 - **R7.** A pure helper MUST compile and be tested on every platform, whichever platform's data it handles. Don't `cfg`-gate logic; `cfg` belongs to the seam that calls it (`ports R4`). Don't use `Path` on another platform's paths.
@@ -135,7 +136,7 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 
 ## Enforcement
 
-- `tests/architecture.rs` checks R4: `term_core_does_no_io_and_reads_no_clock` (source search) and `crates_below_the_app_name_only_their_allowed_dependencies` (the closed dependency list). `the_wire_modules_do_no_io` holds the same for the protocol's message modules.
+- `tests/architecture.rs` checks R4: `term_core_does_no_io_and_reads_no_clock` and `transcript_does_no_io_and_reads_no_clock` (source searches), and `crates_below_the_app_name_only_their_allowed_dependencies` (the closed dependency lists). `the_wire_modules_do_no_io` holds the same for the protocol's message modules.
 - `the_pure_modules_read_nothing_ambient` checks R2 and R3 for the whole pure modules (the first table in "How it applies here"). Their production code calls no clock, names nothing of `std::{fs, net, process, env, thread}`, declares no mutable static (`OnceLock`, `LazyLock`, `Mutex`, `RwLock`, `Cell`, `Atomic…`, `static mut`, `thread_local!`) and calls no file-system method (`.is_file()`, `.exists()`, `.metadata()` and the like), so a probe is passed in. The search follows `use` items (grouped, nested, renamed, globs) and full paths, as every source search in that file does, and skips test code. `the_pure_module_list_matches_the_fcis_table` keeps its list equal to the table, `every_pure_module_exists` keeps each file real, and `a_pure_module_reading_the_world_is_found` plants each kind of read and a test-only `Instant::now()` that must not count.
 - `platform_cfgs_stay_in_their_seams` (`ports R4`) holds R7's `cfg` half in production code: outside the seams and `ports R4`'s excepted files nothing is platform-gated, and `brindle-term-core` has no platform `cfg` at all.
 - `the_neutral_code_is_never_gated` holds R7's `cfg` half inside the seams too, for the code every platform calls, wherever it sits:
@@ -150,7 +151,7 @@ The shell is the GPUI entities (`Workspace`, `ZoneTreeView`, `TerminalView`, `Pa
 - [ ] New decisions are pure functions or model methods; shell changes only gather, call, apply and dispatch.
 - [ ] Pure code takes time and environment values as arguments and reads nothing ambient.
 - [ ] No GPUI handle, socket or world-reaching callback crosses into pure code.
-- [ ] Nothing was added to `brindle-term-core` that does IO, reads a clock or starts a thread.
+- [ ] Nothing was added to `brindle-term-core` or `brindle-transcript` that does IO, reads a clock or starts a thread.
 - [ ] Parsing, marks, status and replay changes are in `brindle-term-core`, used by both sides.
 - [ ] Pure helpers are ungated and have unit tests that run on every platform.
 

@@ -10,16 +10,18 @@ These are the normative architecture docs for Brindle, a GPU-accelerated termina
 brindle (src/)  ─────────┬──▶ brindle-ui (ui/)                            ──▶ gpui
                          ├──▶ brindle-term-core (term-core/)              ──▶ alacritty_terminal
 brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-protocol/)  ──▶ serde
-(remote-agent/)          │
+(remote-agent/)          ├──▶ brindle-transcript (transcript/)            ──▶ serde
+                         │
                          references point only rightward
 ```
 
-- **`brindle`**, the app: GPUI entities, the server's client, config, the composition root (`main.rs`). It depends on all three shared crates and may add dependencies with care.
-- **`brindle-remote-agent`**, the `brindle-remote` helper: the terminal server's roles, the relay, the management commands. It depends on `brindle-term-core` and `brindle-remote-protocol`, never on `gpui` or `brindle-ui`.
+- **`brindle`**, the app: GPUI entities, the server's client, config, the composition root (`main.rs`). It depends on all four shared crates and may add dependencies with care.
+- **`brindle-remote-agent`**, the `brindle-remote` helper: the terminal server's roles, the relay, the management commands, and the ACP client its core runs agents with. It depends on `brindle-term-core`, `brindle-remote-protocol` and `brindle-transcript`, never on `gpui` or `brindle-ui`. It alone names `agent-client-protocol-schema`, in `src/acp/` only, so ACP's types never enter Brindle's build.
 - **The two binaries never reference each other.** What both need goes in a shared crate.
 - **`brindle-ui`**: components and tokens on `gpui` (and the `log` facade). It knows nothing of terminals, config or the `ACTIONS` table.
 - **`brindle-term-core`**: the pure terminal state both sides share (parser, marks, status records, replay, emulator). No IO, no clock, no threads.
 - **`brindle-remote-protocol`**: frames, messages and versions (pure codecs), plus the small platform helpers both sides must agree on (server directory, endpoint names, access checks, scopes).
+- **`brindle-transcript`**: the agent transcript's events and their fold, which Brindle and the server core share; client protocol 4 carries the events as JSON values the protocol crate doesn't interpret. Pure as a crate (no IO, no clock, no threads), with `serde` and `serde_json` as its closed list.
 - **The shared crates never reference each other**, and each has a closed list of dependencies (`ports R3`).
 
 ## Read by layer
@@ -30,7 +32,9 @@ brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-pr
 | `term-core/**` | fcis, types |
 | `ui/**` | ports, fcis |
 | `remote-protocol/**` | process, types, railway |
+| `transcript/**` | fcis, types, railway, process |
 | `remote-agent/**` | process, ports, railway |
+| `remote-agent/src/acp/**` | fcis, railway |
 | `src/remote/**`, `src/terminal/**`, `src/instance.rs`, `src/session.rs`, `src/config.rs` | process, railway, fcis |
 | the rest of `src/**` (views, overlays, settings) | fcis, types, ports |
 | `tests/**`, `remote-agent/tests/**`, any new kind of test, any flake | testing |
@@ -59,7 +63,7 @@ brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-pr
 
 ## Enforcement
 
-`tests/architecture.rs` runs with plain `cargo test` on every platform CI builds. It checks the crate boundaries from the manifests and a few source rules by text search; each doc's Enforcement section says which of its rules that covers. CI also runs `cargo clippy --workspace --all-targets -- -D warnings` on Linux and Windows, and the crate roots switch on `clippy::wildcard_enum_match_arm` (all five crates) and `clippy::unwrap_used` and `clippy::expect_used` (`brindle-remote-protocol` and `brindle-term-core`) for non-test code; `tests/architecture.rs` fails if a root loses one. Everything else is held by review, through the `architecture-review` skill.
+`tests/architecture.rs` runs with plain `cargo test` on every platform CI builds. It checks the crate boundaries from the manifests and a few source rules by text search; each doc's Enforcement section says which of its rules that covers. CI also runs `cargo clippy --workspace --all-targets -- -D warnings` on Linux and Windows, and the crate roots switch on `clippy::wildcard_enum_match_arm` (all six crates) and `clippy::unwrap_used` and `clippy::expect_used` (`brindle-remote-protocol`, `brindle-term-core` and `brindle-transcript`) for non-test code; `tests/architecture.rs` fails if a root loses one. Everything else is held by review, through the `architecture-review` skill.
 
 ## Scope of adoption
 

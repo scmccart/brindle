@@ -680,6 +680,7 @@ dependencies = [
  "base64",
  "brindle-remote-protocol",
  "brindle-term-core",
+ "brindle-transcript",
  "brindle-ui",
  "dirs 5.0.1",
  "dunce",
@@ -714,6 +715,7 @@ version = "0.3.0"
 dependencies = [
  "brindle-remote-protocol",
  "brindle-term-core",
+ "brindle-transcript",
  "embed-resource",
  "libc",
  "windows 0.61.3",
@@ -735,6 +737,14 @@ dependencies = [
  "alacritty_terminal",
  "base64",
  "parking_lot",
+]
+
+[[package]]
+name = "brindle-transcript"
+version = "0.3.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
