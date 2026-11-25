@@ -1,8 +1,9 @@
 //! The management commands, `brindle-remote list | kill | status | stop`,
 //! and the dispatch of those and `check`.
 //!
-//! The management commands are protocol 1 clients of the core in the
-//! current server directory. They never start a core: with none running,
+//! The management commands are clients of the core in the current server
+//! directory, offering the whole client range (so a protocol 4 core lists
+//! them its agent sessions). They never start a core: with none running,
 //! `list` prints nothing, `status` says no server is running, and `kill`
 //! and `stop` say so on stderr; all of them exit 0.
 
@@ -122,7 +123,8 @@ fn list(json: bool) -> Result<(), String> {
 /// whether it is `owned` (its last client left without detaching it, and
 /// may come back for it) or `unowned`, and how long it has been detached
 /// (both `-` when attached); policy, age (`-` from a core that doesn't
-/// report it), title (`-` when none), command, directory.
+/// report it), title (`-` when none; `agent: <activity>` for an agent
+/// session, which has no title), command, directory.
 fn list_line(session: &SessionInfo, now: u64) -> String {
     let (state, owner, detached) = if session.attached {
         ("attached", "-", "-".to_string())
@@ -143,13 +145,28 @@ fn list_line(session: &SessionInfo, now: u64) -> String {
         0 => "-".to_string(),
         started => uptime(now.saturating_sub(started)),
     };
-    let title = if session.title.is_empty() { "-" } else { &session.title };
+    let title = match &session.agent {
+        Some(agent) => format!("agent: {}", activity_name(agent.activity)),
+        None if session.title.is_empty() => "-".to_string(),
+        None => session.title.clone(),
+    };
     format!(
         "{}\t{}\t{state}\t{owner}\t{detached}\t{policy}\t{age}\t{title}\t{command}\t{}",
         session.session,
         session.pid,
         session.cwd.as_deref().unwrap_or("-")
     )
+}
+
+/// An agent's activity as `list` shows it: the name `--json` gives it.
+fn activity_name(activity: client::AgentActivity) -> &'static str {
+    match activity {
+        client::AgentActivity::Idle => "idle",
+        client::AgentActivity::Working => "working",
+        client::AgentActivity::Blocked => "blocked",
+        client::AgentActivity::Done => "done",
+        client::AgentActivity::Error => "error",
+    }
 }
 
 #[allow(
@@ -428,6 +445,42 @@ mod tests {
             list_line(&session, 1065),
             "3\t4242\tdetached\tunowned\t0s\tdetach\t-\t-\t(login shell)\t-"
         );
+    }
+
+    /// An agent session shows its activity in the title's place, by the
+    /// names `--json` gives it, whatever its title field holds.
+    #[test]
+    fn an_agent_sessions_line_shows_its_activity_as_its_title() {
+        use client::{AgentActivity, AgentInfo};
+
+        let mut session = SessionInfo {
+            session: 7,
+            pid: 99,
+            attached: true,
+            command: "agent --acp".into(),
+            cwd: Some("/home/u/src".into()),
+            started: 1000,
+            agent: Some(AgentInfo { activity: AgentActivity::Blocked, name: Some("fake".into()) }),
+            ..Default::default()
+        };
+        assert_eq!(
+            list_line(&session, 1005),
+            "7\t99\tattached\t-\t-\tkill\t5s\tagent: blocked\tagent --acp\t/home/u/src"
+        );
+        for activity in [
+            AgentActivity::Idle,
+            AgentActivity::Working,
+            AgentActivity::Blocked,
+            AgentActivity::Done,
+            AgentActivity::Error,
+        ] {
+            session.agent = Some(AgentInfo { activity, name: None });
+            session.title = "ignored".into();
+            let line = list_line(&session, 1005);
+            let title = line.split('\t').nth(7).unwrap();
+            let json = serde_json::to_value(activity).unwrap();
+            assert_eq!(title, format!("agent: {}", json.as_str().unwrap()), "{activity:?}");
+        }
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! The management commands (task 6.2, and the owner columns of
 //! `terminal-server-remote` 3.4): `brindle-remote list`, `kill`,
-//! `status` and `stop`, run against a real core, on Linux and Windows.
+//! `status` and `stop`, run against a real core, on Linux and Windows; and
+//! agent sessions in them (`agents-sessions` 8.1).
 
 #![cfg(any(target_os = "linux", windows))]
 
@@ -8,9 +9,12 @@ mod support;
 
 use std::process::Output;
 
-use brindle_remote_protocol::client::{self, SessionInfo};
-use brindle_remote_protocol::serde_json::{self, Value};
+use brindle_remote_protocol::SessionId;
+use brindle_remote_protocol::client::{self, SessionInfo, ToClient};
+use brindle_remote_protocol::serde_json::{self, Value, json};
+use brindle_transcript::TurnState;
 
+use support::fake_agent::{ask, started};
 use support::programs::{self, hung_up, say};
 use support::*;
 
@@ -388,4 +392,153 @@ fn stop_ends_every_session_the_core_and_the_holders() {
     // And now there is no server.
     let output = succeeded(cli(&dir.path, &["status"]));
     assert_eq!(stdout(&output), "no server is running\n");
+}
+
+/// A fake agent that is given one prompt and then waits on permission
+/// request `perm-1` until its stdin closes. Gives its `SPAWN_AGENT`.
+fn asks_and_waits(dir: &TempDir, name: &str) -> client::SpawnAgent {
+    let (mut script, _) = started(&dir.path, name);
+    script.step("expect session/prompt").step(ask("perm-1")).step(r#"expect-response "perm-1""#);
+    client_agent(&script.write())
+}
+
+/// A fake agent that starts and idles until its stdin closes.
+fn idles(dir: &TempDir, name: &str) -> client::SpawnAgent {
+    let (script, _) = started(&dir.path, name);
+    client_agent(&script.write())
+}
+
+/// Starts an agent session, tracking its agent, and waits until it is
+/// ready.
+fn agent_session(client: &mut TestClient, dir: &mut TempDir, spawn: client::SpawnAgent) -> (SessionId, u32) {
+    let (id, pid) = client.spawn_agent(spawn);
+    dir.track(pid);
+    client.transcript_until(id, "is ready", |log| {
+        matches!(log.agent(), brindle_transcript::AgentState::Ready { .. })
+    });
+    (id, pid)
+}
+
+/// An agent session in the middle of a turn, waiting on a permission
+/// request nobody answers.
+fn blocked_agent(client: &mut TestClient, dir: &mut TempDir, name: &str) -> (SessionId, u32) {
+    let spawn = asks_and_waits(dir, name);
+    let (id, pid) = agent_session(client, dir, spawn);
+    client.prompt(id, "write").unwrap();
+    client.transcript_until(id, "waits on the permission", |log| *log.turn() == TurnState::Blocked);
+    (id, pid)
+}
+
+/// Waits for the `EXIT` of each of `sessions`, in whatever order they
+/// come, and gives their codes in `sessions`' order; other messages are
+/// skipped (each `TRANSCRIPT` is folded as it is read).
+fn exits(client: &mut TestClient, sessions: &[SessionId]) -> Vec<Option<i32>> {
+    let mut codes = vec![None; sessions.len()];
+    let mut left = sessions.len();
+    while left > 0 {
+        if let ToClient::Exit(exit) = client.recv()
+            && let Some(n) = sessions.iter().position(|&session| session == exit.session)
+        {
+            codes[n] = exit.code;
+            left -= 1;
+        }
+    }
+    codes
+}
+
+#[test]
+fn list_shows_an_agent_sessions_activity_in_its_titles_place() {
+    let (mut dir, mut client) = core("cli-agent-list");
+    let [terminal_dir, _] = directories();
+    let mut terminal = programs::echoer();
+    terminal.cwd = Some(terminal_dir.clone());
+    let terminal_command = command_of(&terminal);
+    let (shell, shell_pid) = client.spawn(terminal);
+    #[cfg(windows)]
+    say(&mut client, shell, "up");
+    let (agent, agent_pid) = blocked_agent(&mut client, &mut dir, "list");
+    let listed = client.list();
+    let info = |session| listed.iter().find(|info: &&SessionInfo| info.session == session).unwrap().clone();
+    let agent_info = info(agent);
+
+    let output = succeeded(cli(&dir.path, &["list"]));
+    let lines: Vec<Vec<String>> = stdout(&output)
+        .lines()
+        .map(|line| line.split('\t').map(String::from).collect())
+        .collect();
+    let line = |session: SessionId| lines.iter().find(|line| line[0] == session.to_string()).unwrap();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    // The terminal's line is as before: its title, or `-`.
+    let shell_title = info(shell).title;
+    let shell_title = if shell_title.is_empty() { "-".to_string() } else { shell_title };
+    let shell_line = line(shell);
+    assert_eq!(
+        [&shell_line[..4], &shell_line[5..6], &shell_line[7..]].concat(),
+        [&*shell.to_string(), &*shell_pid.to_string(), "attached", "-", "kill", &shell_title, &terminal_command, &terminal_dir]
+    );
+    // The agent's shows its activity where the title goes, then its
+    // command and its absolute directory.
+    let agent_line = line(agent);
+    assert_eq!(
+        [&agent_line[..4], &agent_line[5..6], &agent_line[7..8]].concat(),
+        [&*agent.to_string(), &*agent_pid.to_string(), "attached", "-", "kill", "agent: blocked"]
+    );
+    assert_eq!(agent_line[8], agent_info.command);
+    assert!(agent_line[8].contains("brindle-fake-acp-agent"), "{agent_line:?}");
+    assert_eq!(Some(agent_line[9].clone()), agent_info.cwd);
+
+    let output = succeeded(cli(&dir.path, &["list", "--json"]));
+    let sessions: Vec<Value> = serde_json::from_slice(&output.stdout).unwrap();
+    let entry = |session: SessionId| sessions.iter().find(|entry| entry["session"] == session).unwrap();
+    assert_eq!(entry(agent)["agent"], json!({ "activity": "blocked", "name": "fake" }));
+    assert_eq!((&entry(agent)["cols"], &entry(agent)["rows"]), (&json!(0), &json!(0)));
+    assert!(entry(shell).get("agent").is_none(), "{sessions:?}");
+    // The same entries the core lists to a client.
+    let decoded: Vec<SessionInfo> = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(decoded, listed);
+}
+
+#[test]
+fn kill_ends_an_agent_session_mid_turn_without_asking() {
+    let (mut dir, mut client) = core("cli-agent-kill");
+    let (blocked, blocked_pid) = blocked_agent(&mut client, &mut dir, "kill-one");
+    let spawn = idles(&dir, "kill-other");
+    let (idle, idle_pid) = agent_session(&mut client, &mut dir, spawn);
+
+    // Mid-turn, with a permission request pending: nothing is asked.
+    let output = succeeded(cli(&dir.path, &["kill", &blocked.to_string()]));
+    assert!(output.stdout.is_empty() && output.stderr.is_empty(), "{output:?}");
+    exits(&mut client, &[blocked]);
+    assert!(gone(blocked_pid));
+    assert!(alive(idle_pid));
+    assert!(client.list().iter().all(|info| info.session != blocked));
+
+    let (shell, shell_pid) = client.spawn(programs::echoer());
+    say(&mut client, shell, "up");
+    succeeded(cli(&dir.path, &["kill", "--all"]));
+    let codes = exits(&mut client, &[idle, shell]);
+    assert_hung_up(shell, codes[1]);
+    assert!(gone(idle_pid) && gone(shell_pid));
+    assert!(client.list().is_empty());
+}
+
+#[test]
+fn stop_ends_agent_sessions_with_the_rest() {
+    let (mut dir, mut client) = core("cli-agent-stop");
+    let core_pid = client.core_pid();
+    let (blocked, blocked_pid) = blocked_agent(&mut client, &mut dir, "stop-blocked");
+    let spawn = client::SpawnAgent { policy: client::Policy::Detach, ..idles(&dir, "stop-detached") };
+    let (kept, kept_pid) = agent_session(&mut client, &mut dir, spawn);
+    let (shell, shell_pid) = client.spawn(programs::echoer());
+    say(&mut client, shell, "up");
+    let holder = parent(blocked_pid).unwrap();
+
+    let output = succeeded(cli(&dir.path, &["stop"]));
+    assert!(output.stdout.is_empty() && output.stderr.is_empty(), "{output:?}");
+    let codes = exits(&mut client, &[blocked, kept, shell]);
+    assert_hung_up(shell, codes[2]);
+    assert!(client.closes());
+    assert!(gone(blocked_pid) && gone(kept_pid) && gone(shell_pid));
+    assert!(gone(core_pid) && gone(holder));
+    assert!(dir.holder_endpoints().is_empty());
 }
