@@ -329,6 +329,14 @@ fn the_agent_messages_reject_bad_values_without_panicking() {
             format!(r#"{{"req":1,"session":1,"command":"a","args":[{value}],"env":{{"K":{value}}}}}"#),
         ));
         cases.push((
+            client::MSG_AGENT_LOGIN,
+            format!(r#"{{"req":{value},"session":{value},"method":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_LOGIN,
+            format!(r#"{{"req":1,"session":1,"method":{value}}}"#),
+        ));
+        cases.push((
             client::MSG_TRANSCRIPT,
             format!(r#"{{"session":{value},"events":{value}}}"#),
         ));

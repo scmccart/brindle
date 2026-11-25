@@ -2295,7 +2295,8 @@ impl Connection {
             | ToCore::AgentPermission(AgentPermission { req, .. })
             | ToCore::AgentUnqueue(AgentRequest { req, .. })
             | ToCore::AgentResend(AgentRequest { req, .. })
-            | ToCore::AgentRestart(AgentRestart { req, .. }) => Some(*req),
+            | ToCore::AgentRestart(AgentRestart { req, .. })
+            | ToCore::AgentLogin(client::AgentLogin { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2617,6 +2618,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
         | ToCore::AgentRestart(_)
+        | ToCore::AgentLogin(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)

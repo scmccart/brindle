@@ -53,7 +53,7 @@ macro_rules! forms {
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
     Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
-    AgentResend, AgentRestart);
+    AgentResend, AgentRestart, AgentLogin);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
     Process, Transcript);
@@ -1526,6 +1526,26 @@ fn answer(req: u64, session: u32, entry: u64, option: Option<&str>) -> Step {
     }))
 }
 
+fn login(req: u64, session: u32, method: &str) -> Step {
+    c(client::ToCore::AgentLogin(client::AgentLogin {
+        req,
+        session,
+        method: method.into(),
+    }))
+}
+
+/// The agent state "login required" with `message` and two `agent` methods.
+fn login_required(message: &str) -> serde_json::Value {
+    json!({"event": "agent", "state": {"agent": "login_required", "message": message, "methods": [
+        {"id": "oauth-personal", "name": "Log in with Google", "kind": "agent"},
+        {"id": "api-key", "name": "API Key", "description": "Use an API key", "kind": "agent"},
+    ]}})
+}
+
+fn logging_in() -> serde_json::Value {
+    json!({"event": "agent", "state": {"agent": "logging_in", "method": "oauth-personal", "name": "Log in with Google"}})
+}
+
 fn added(id: u64, entry: serde_json::Value) -> serde_json::Value {
     json!({"event": "added", "id": id, "entry": entry})
 }
@@ -1782,6 +1802,56 @@ fn agent_transcripts() -> Vec<Transcript> {
                     vec![json!({"event": "agent", "state": {"agent": "exited", "stderr": ""}})],
                 ),
                 exit(2, None),
+            ],
+        },
+        // Added by `agents-login`, within protocol 4 before it shipped (its
+        // design decision 2).
+        Transcript {
+            name: "client-agent-login",
+            protocol: Protocol::Client4,
+            about: "Protocol 4: an agent that needs a login at its start, offering two methods; a login refused for a method it doesn't offer, one accepted and cancelled, one accepted again and answered, and the session ready.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                c(client::ToCore::SpawnAgent(client::SpawnAgent {
+                    req: 1,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/login.script".into()],
+                    cwd: Some("~/src".into()),
+                    env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                    policy: Policy::Detach,
+                    profile: Some("Agent".into()),
+                    conversation: None,
+                })),
+                s(client::ToClient::Spawned(client::Spawned {
+                    req: 1,
+                    session: 1,
+                    pid: 5000,
+                    key: KEY.into(),
+                })),
+                transcript(1, vec![login_required("Authentication required")]),
+                login(2, 1, "no-such-method"),
+                error(
+                    Some(2),
+                    Some(1),
+                    "session 1: the agent offers no login method \"no-such-method\"",
+                ),
+                login(3, 1, "oauth-personal"),
+                ok(3),
+                transcript(1, vec![logging_in()]),
+                c(client::ToCore::AgentCancel(client::SessionRef { session: 1 })),
+                transcript(1, vec![login_required("Authentication required")]),
+                login(4, 1, "oauth-personal"),
+                ok(4),
+                transcript(1, vec![logging_in()]),
+                transcript(1, vec![json!({"event": "agent", "state": {"agent": "starting"}})]),
+                transcript(1, vec![conversation("resume_and_load"), ready()]),
+                c(client::ToCore::Close(client::SessionRef { session: 1 })),
+                transcript(
+                    1,
+                    vec![json!({"event": "agent", "state": {"agent": "exited", "stderr": ""}})],
+                ),
+                exit(1, None),
             ],
         },
         Transcript {
