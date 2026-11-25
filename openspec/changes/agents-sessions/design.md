@@ -151,6 +151,20 @@ If any check fails, `wire.rs` holds a hand-written subset instead (the `initiali
   - `available_commands_update` lists were cut to the agent's built-in commands.
 
   A `.gitattributes` there keeps the bytes (Gemini's CRLF). The spike's scripts and its per-line table were not committed.
+- **More captures (2026-11-24).** Five more files from four agents, each one bare-chat turn that asks for a file and rejects the permission (`reject_once`) when one is asked, scrubbed as above (every UUID became a placeholder, and a scratch path streamed across text chunks was joined, replaced and its covered chunks dropped):
+  - `copilot-1.0.115-reject.log`: GitHub Copilot CLI 1.0.115 (`copilot --acp`), in its default `agent` mode with `allow_all` off;
+  - `codex-acp-2.12.0-reject.log`: `@agentclientprotocol/codex-acp` 2.12.0 (Codex has no native ACP mode; `codex app-server` is its own protocol), switched from its default `agent` mode to `read-only`, model `gpt-6-luna[low]`;
+  - `antigravity-1.5.16-reject.log`: Antigravity 1.5.16 (`agy acp`) in `default` mode, cwd outside its trusted workspaces;
+  - `antigravity-1.5.16-trusted-workspace.log`: the same in a trusted workspace (`/tmp` is in the user's `trustedWorkspaces`), where it writes the file without asking even in `default` mode;
+  - `claude-agent-acp-0.112.0-haiku-reject.log`: the Claude adapter on Haiku, chosen with `session/set_config_option` (`configId: "model"`, `value: "haiku"`).
+
+  The two-step decode (check 1) rejects none of their 223 lines; only the known kinds of drops occur (`usage`, `models`, unknown capability fields, agent extras). What 4.1 and 4.4 must handle:
+  - **Ids:** Antigravity sends `session/request_permission` with id `"1"`, a string, and puts `result` before `id`. The envelope keeps the id as a JSON value and the reply echoes it verbatim (the others send `0`). Codex's session ids are UUIDv7.
+  - **Stop reason:** Codex ends the turn `cancelled` after a rejected permission, with no `session/cancel` sent. A `cancelled` stop is not proof that the user cancelled. Every other agent ends `end_turn` after the rejection.
+  - **Tool calls:** statuses go backwards (Antigravity: `in_progress`, `pending`, the permission, `in_progress`, `failed`), and updates repeat every field, so the reducer applies whatever fields arrive and never assumes an order. A rejection ends as `failed` everywhere (Copilot adds `rawOutput.code: "rejected"`). `rawInput` can be a string (Copilot's patch text). The permission's `toolCall` can carry a different title from the `tool_call` it refers to (Copilot: `apply_patch`, then `Create file`). Antigravity adds `name`, `args` and, inside the permission's `toolCall`, `sessionUpdate`. Codex sends `"type": "terminal"` content with a `terminalId` even though the client declared no terminal capability, and puts the output only in `_meta.terminal_output_delta`/`terminal_exit`. So a terminal block renders as a placeholder, not as output.
+  - **Updates:** only known kinds arrive: `agent_message_chunk`, `agent_thought_chunk` (Copilot, word by word, with `messageId`), `tool_call`, `tool_call_update`, `available_commands_update`, `config_option_update`, `session_info_update` and `usage_update`. Codex sends `session_info_update` with no `title`, only `_meta.codex.threadStatus`, so an absent title leaves the title unchanged.
+  - **Modes and models:** Copilot's mode ids are URLs (`https://agentclientprotocol.com/protocol/session-modes#agent`), so mode ids stay opaque text. Codex answered `session/set_mode` (as the Claude adapter did in the spike), and Codex and Antigravity answered `session/set_model`. To change the model, the Claude adapter takes `session/set_config_option`, whose result is the whole `configOptions` list. Option ids vary (`deny`, `cancel`, `reject_once`), so the reply always picks by `kind`.
+  - **Auth notifications:** Codex sends `_auth/status_update` and `auth/status_update` like the Claude adapter, both carrying the account email. They stay ignored, never logged.
 
 ### 6. A sixth crate, `brindle-transcript`, and the ACP code in the helper (confirmed by the user)
 
