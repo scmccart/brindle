@@ -42,14 +42,14 @@ fn fake_profile(ctx: &Ctx, script: &Path) -> String {
 
 /// Writes [`hello_script`] into the case directory: the `Fake` profile's
 /// TOML, and where the agent records what it was sent.
-fn hello_agent(ctx: &Ctx) -> Result<(String, PathBuf)> {
+pub(super) fn hello_agent(ctx: &Ctx) -> Result<(String, PathBuf)> {
     let (script, received) = (ctx.dir.join("agent.script"), ctx.dir.join("received.jsonl"));
     std::fs::write(&script, hello_script(&received)).map_err(|e| format!("writing the script: {e}"))?;
     Ok((fake_profile(ctx, &script), received))
 }
 
 /// The waits for the answer to the first prompt.
-fn answered() -> String {
+pub(super) fn answered() -> String {
     format!("agent {HELLO:?}")
 }
 
@@ -487,13 +487,13 @@ fn touch_from_shell<'a>(run: Run<'a>, gate: &Path, first: bool) -> Run<'a> {
 }
 
 /// The dump's agent lines start with `prefix`, one of them.
-fn agent_has(out: &crate::brindle::Output, prefix: &str) -> Result {
+pub(super) fn agent_has(out: &crate::brindle::Output, prefix: &str) -> Result {
     ensure!(out.dump.agent.iter().any(|line| line.starts_with(prefix)), "no `--- {prefix}…` in {:?}", out.dump.agent);
     Ok(())
 }
 
 /// No `--wait-for` gave up or was still waiting at the dump.
-fn waited(out: &crate::brindle::Output) -> Result {
+pub(super) fn waited(out: &crate::brindle::Output) -> Result {
     ensure!(
         out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
         "waits that gave up: {:?}, still waiting: {:?}; agent {:?}",

@@ -173,6 +173,8 @@ jobs:
           shared-key: windows
       - run: scripts/fetch-conpty.ps1
         shell: pwsh
+      # The helper's package builds the fake ACP agent beside it, which the
+      # windows-agent-* cases find beside the suite's build.
       - name: Build
         run: |
           cargo build --locked -p brindle-remote-agent
