@@ -67,56 +67,56 @@ Files dropped on an agent zone SHALL be attached. When the zone's agent runs on 
 - **WHEN** the user drops `logo.png` and `notes.md` on that zone
 - **THEN** `notes.md` is attached, and the notice line says `logo.png` isn't text and can't be sent to an agent on that host
 
-### Requirement: Sending terminal text to an agent
-In a terminal zone, the `send_selection_to_agent` action SHALL attach the selected text, and the `send_last_output_to_agent` action the output of the last command, named by its command line when the shell reported one, to an agent zone's prompt as a text attachment. It SHALL then show that agent zone with keyboard focus in its prompt input, and SHALL NOT send anything.
+### Requirement: Sending a command's output to an agent
+In a terminal zone, the `send_last_output_to_agent` action SHALL attach the output of the last command, named by its command line when the shell reported one, to an agent zone's prompt as a text attachment. It SHALL then show that agent zone with keyboard focus in its prompt input, and SHALL NOT send anything: the output reaches the agent only when the user sends the prompt.
 
 #### Scenario: The last command's output
 - **WHEN** the user ran `cargo test` in a terminal tab, one agent zone is open in another tab, and the user runs Send Last Command Output to Agent
 - **THEN** the agent's tab is active, its prompt input has focus and a text attachment named `cargo test` holding that output, and the agent has received nothing
 
-#### Scenario: A selection
-- **WHEN** the user selects two lines in a terminal and runs Send Selection to Agent
-- **THEN** the agent zone's prompt input has a text attachment holding those two lines
+#### Scenario: No command line known
+- **WHEN** the shell reported no command line for the last command, in a tab titled `zsh`
+- **THEN** the attachment is named `output from zsh`
 
-### Requirement: What text a terminal sends
-The text sent from a terminal SHALL be the text the matching copy command would copy: for the selection, what Copy copies, and for the last command's output, what Copy Last Command Output copies, with lines joined by a line feed on every platform. The output SHALL NOT include the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached and the terminal SHALL keep focus.
+### Requirement: What output a terminal sends
+The output sent from a terminal SHALL be the text Copy Last Command Output would copy, with lines joined by a line feed on every platform: what the terminal shows, without the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached and the terminal SHALL keep focus.
 
 #### Scenario: The same text as copying
 - **WHEN** the user ran `printf 'one\ntwo\n'` and runs Send Last Command Output to Agent
 - **THEN** the attachment's text is `one` and `two` on two lines, the same text Copy Last Command Output copies, without the prompt line
 
 #### Scenario: Colours are not sent
-- **WHEN** the selected lines were printed in red
-- **THEN** the attachment holds their characters and no escape sequence
+- **WHEN** the command printed its output in red
+- **THEN** the attachment holds the output's characters and no escape sequence
 
 #### Scenario: A wrapped line
-- **WHEN** the selection covers one long line the terminal wrapped over two rows
+- **WHEN** the output holds one long line the terminal wrapped over two rows
 - **THEN** the attachment holds it as one line
 
 #### Scenario: Output that has scrolled away
 - **WHEN** the last command's output has left the scrollback and the user runs Send Last Command Output to Agent
 - **THEN** nothing is attached, and the terminal keeps focus
 
-### Requirement: When the terminal's agent commands are listed
-The command palette SHALL list Send Selection to Agent only while the terminal has a selection, and Send Last Command Output to Agent only once the terminal has received a prompt mark, as Copy Last Command Output is. Neither SHALL be listed in an agent zone.
-
-#### Scenario: Nothing selected
-- **WHEN** a terminal has no selection and the user opens the command palette
-- **THEN** Send Selection to Agent is not listed
+### Requirement: When Send Last Command Output to Agent is listed
+The command palette SHALL list Send Last Command Output to Agent only once the terminal has received a prompt mark, as Copy Last Command Output is, and never in an agent zone.
 
 #### Scenario: No shell integration
 - **WHEN** a terminal has received no prompt mark
 - **THEN** the command palette doesn't list Send Last Command Output to Agent
 
-### Requirement: Choosing the agent for terminal text
-When the window has several agent zones, sending terminal text to an agent SHALL first list them, the most recently focused first, each by its tab's and zone's titles, and attach to the one the user chooses; escape SHALL attach nothing. With one agent zone it SHALL be used without asking. With none, the window's notice line SHALL say no agent zone is open.
+#### Scenario: In an agent zone
+- **WHEN** an agent zone is active and the user opens the command palette
+- **THEN** Send Last Command Output to Agent is not listed
+
+### Requirement: Choosing the agent for a command's output
+When the window has several agent zones, sending a command's output to an agent SHALL first list them, the most recently focused first, each by its tab's and zone's titles, and attach to the one the user chooses; escape SHALL attach nothing. With one agent zone it SHALL be used without asking. With none, the window's notice line SHALL say no agent zone is open.
 
 #### Scenario: Two agents
-- **WHEN** two agent zones are open and the user runs Send Selection to Agent
-- **THEN** a list shows both, the one focused last first, and choosing the second attaches the selection there
+- **WHEN** two agent zones are open and the user runs Send Last Command Output to Agent
+- **THEN** a list shows both, the one focused last first, and choosing the second attaches the output there
 
 #### Scenario: No agent
-- **WHEN** no agent zone is open and the user runs Send Selection to Agent
+- **WHEN** no agent zone is open and the user runs Send Last Command Output to Agent
 - **THEN** the notice line says no agent zone is open, and the terminal keeps focus
 
 ### Requirement: Attachments in the conversation

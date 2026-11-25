@@ -9,8 +9,8 @@ In step 1 a prompt is plain text. To show an agent a compiler error the user cop
 
 ## What Changes
 
-- **A prompt can carry attachments** beside its text, of two kinds: a **link** to a file on the agent's host, and **text** with a name (a selection, a command's output, a file's contents). Images are the next change.
-- **Sending terminal text to an agent.** In a terminal zone, the new `send_selection_to_agent` and `send_last_output_to_agent` actions add the selection, or the last command's output named by its command line, to an agent zone's prompt as a text attachment, and show that zone. With several agent zones open, a palette asks which. Nothing is sent until the user sends the prompt.
+- **A prompt can carry attachments** beside its text, of two kinds: a **link** to a file on the agent's host, and **text** with a name (a command's output, a file's contents). Images are the next change.
+- **Sending a command's output to an agent.** In a terminal zone, the new `send_last_output_to_agent` action adds the last command's output, named by its command line, to an agent zone's prompt as a text attachment, and shows that zone. It is the same text Copy Last Command Output copies. With several agent zones open, a palette asks which. Nothing is sent until the user sends the prompt. A selection needs no action: it is copied and pasted into the prompt.
 - **Attaching a file.** The new `agent_attach_file` action asks for a path on the agent's host and attaches it as a link; dropping files on an agent zone attaches them. A dropped file is a link when the agent runs on this machine; for an agent on another host or in a container, where the path means nothing, a dropped text file is embedded as text instead and anything else is refused, saying why.
 - **Attachments show in the prompt input** as a row of items above the text, each with its kind, name and size. Backspace at the start of the text removes the last one; `agent_clear_attachments` removes them all. No keyboard stop is added.
 - **The server sends them as ACP content.** A link becomes a resource link, which every agent must accept. Text becomes an embedded resource when the agent says it takes embedded context, and is otherwise written into the prompt's text under its name, so no agent is left out.
@@ -29,7 +29,7 @@ None.
 ### Modified Capabilities
 
 - `agent-sessions`: new requirements for a prompt's attachments, their bounds, how each kind is sent, and their life in the queue slot and the log.
-- `agent-zones`: new requirements for attachments in the prompt input and the conversation, attaching a file, dropping files, and sending terminal text to an agent.
+- `agent-zones`: new requirements for attachments in the prompt input and the conversation, attaching a file, dropping files, and sending a command's output to an agent.
 - `ui-components`: the prompt input's attachment row.
 - `command-line`: the dump's lines for attachments, and driving them.
 
@@ -38,7 +38,7 @@ None.
 - **`brindle-transcript`** (`transcript/`): `Attachment`; `Entry::User`'s and `Slot`'s optional attachments; `Event::Attached`; the fold and replay; new `tests/fixtures/v4/` files (none edited).
 - **`brindle-remote-protocol`** (`remote-protocol/`): `AGENT_PROMPT`'s optional `attachments`, additive, with fixtures and fuzzing.
 - **`brindle-remote-agent`** (`remote-agent/src/acp/`): the agent's prompt support read from `initialize` in each version's module; the reducer's checks, bounds and the fallback for text; `acp/v1/encode.rs` writing resource links and embedded resources; a pure path-to-URI helper. The checkpoint's format 1 is amended (unreleased).
-- **`brindle`**: `src/agent/` (the draft's attachments, the drop plan, the conversation's rows, the dump), `src/terminal_view.rs` and `src/workspace.rs` (the two terminal actions and choosing the agent zone), `src/actions.rs`.
+- **`brindle`**: `src/agent/` (the draft's attachments, the drop plan, the conversation's rows, the dump), `src/terminal_view.rs` and `src/workspace.rs` (the terminal action and choosing the agent zone), `src/actions.rs`.
 - **`brindle-ui`** (`ui/`): `PromptInput` gains an attachment row. Its dependency list is unchanged.
 - **Tests:** real-role tests through the fake ACP agent; new `agent-attach-*` and `terminal-to-agent-*` e2e cases; a manual check for dropping files.
 - **Docs:** `docs/code-map.md`, `README.md`, `CLAUDE.md`.

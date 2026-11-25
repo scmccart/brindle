@@ -8,8 +8,7 @@ See proposal.md for why. The user split images into their own change on 2026-11-
 - **One frame holds at most 1 MiB** (`MAX_FRAME_PAYLOAD_SIZE`), and every event and client message must fit one. JSON escaping can double a text of line breaks.
 - **ACP prompt content** (v1 and v2, the same kinds): `text`; `resource_link { uri, name, … }`, which "all agents MUST support"; `resource` with embedded text or a blob, allowed only when the agent's `promptCapabilities.embeddedContext` is true; `image` and `audio`, each behind its own capability. Every captured agent's `initialize` answer has `embeddedContext: true` and `image: true`; none has `audio: true`.
 - **`agents-tool-content`** gives the `Dialect` seam, `acp/forms.rs` and `Request`; `agents-markdown` gives `CodeBlock`.
-- **The terminal** (`shell-integration`): Copy Last Command Output takes the text from a command's output mark to its end, only once a prompt mark was received; the command line is known where the shell reports it. `Terminal::selection_text()` gives the selection.
-- **Brindle** has one window. A tab is all terminal zones or all agent zones (`agents-profiles`). A profile's `Host` says whether its program runs on this machine, over SSH or in a container. GPUI 0.2.2 delivers files dropped on an element (`ExternalPaths`); nothing in Brindle handles a drop yet.
+- **The terminal** (`shell-integration`): Copy Last Command Output takes the text from a command's output mark to its end, only once a prompt mark was received; the command line is known where the shell reports it.- **Brindle** has one window. A tab is all terminal zones or all agent zones (`agents-profiles`). A profile's `Host` says whether its program runs on this machine, over SSH or in a container. GPUI 0.2.2 delivers files dropped on an element (`ExternalPaths`); nothing in Brindle handles a drop yet.
 - **`brindle-ui`'s `PromptInput`** has the queue row above its textarea, whose buttons are keyboard stops, and (with `agents-commands`) a suggestion list and footer items that aren't.
 
 ## Goals / Non-Goals
@@ -35,9 +34,9 @@ See proposal.md for why. The user split images into their own change on 2026-11-
 | A path as a `file://` URI | pure | `acp/uri.rs` (new) |
 | ACP v1: `promptCapabilities`; resource links and embedded resources in `session/prompt` | pure | `acp/v1/{decode, encode}.rs` |
 | The draft's attachments, `cut_text`, `drop_plan`, the conversation's attachment rows, dump lines | GPUI-free model | `brindle`, `src/agent/model.rs` |
-| Which agent zone takes terminal text (`target_plan`) | pure | `brindle`, `src/workspace.rs` |
+| Which agent zone takes a command's output (`target_plan`) | pure | `brindle`, `src/workspace.rs` |
 | Reading a dropped file | shell (background task) | `src/agent/mod.rs` |
-| The terminal actions, the drop handler, the attach prompt, drawing | shell (entities) | `src/terminal_view.rs`, `src/workspace.rs`, `src/agent/view.rs`, `src/actions.rs` |
+| The terminal action, the drop handler, the attach prompt, drawing | shell (entities) | `src/terminal_view.rs`, `src/workspace.rs`, `src/agent/view.rs`, `src/actions.rs` |
 | `PromptInput`'s attachment row | component | `brindle-ui`, `ui/src/components/prompt_input.rs` |
 
 No crate reference and no closed dependency list changes (`ports R1`, `R3`).
@@ -69,7 +68,7 @@ pub enum Cut { Start, End }                              // which end of a longe
 | a link's path, a name | bounded as titles are |
 
 - With the 256 KiB prompt, a queue slot is at most 384 KiB of text, which fits one frame even if JSON escaping doubles it. That is why the total is 128 KiB and not more.
-- **Brindle cuts before it sends** (`cut_text(text, keep) -> (String, Option<Cut>)`, pure, at a line break where one is near, else a character boundary): command output keeps its end, where the error is; a selection and a file keep their start. The server refuses what is still over a bound (`TooManyAttachments`, `AttachmentTooLong`, `AttachmentsTooLong`), so a client can't exceed them.
+- **Brindle cuts before it sends** (`cut_text(text, keep) -> (String, Option<Cut>)`, pure, at a line break where one is near, else a character boundary): command output keeps its end, where the error is; a file keeps its start. The server refuses what is still over a bound (`TooManyAttachments`, `AttachmentTooLong`, `AttachmentsTooLong`), so a client can't exceed them.
 - Every text and path is cleaned by the reducer as prompt text is.
 
 ### 3. The wire, events and the fold (`process R4`–`R6`)
@@ -112,14 +111,11 @@ Request::Prompt { session, parts: &[PromptPart] }
 
 ### 7. Where attachments come from
 
-**Terminal text** (`src/terminal_view.rs`, `src/workspace.rs`). The term means exactly two things, each the text its copy command would put on the clipboard, with lines joined by `\n` on every platform:
-- **the selection:** what Copy copies (`terminal-emulation`, "Selection and copy" and "Clipboard shared with other applications"): the selected cells' characters, a line the program wrapped as one line, no trailing blanks, no colours or other attributes;
-- **the last command's output:** what Copy Last Command Output copies (`shell-integration`, "Last command output"): the grid's text from the most recent command's output mark to its end mark, or to the next prompt or the cursor while it still runs; not the prompt, and not the command line, which becomes the attachment's name. It exists only with shell integration loaded, and not when the output is empty or has left the scrollback.
+**A command's output** (`src/terminal_view.rs`, `src/workspace.rs`). One thing is sent from a terminal: the last command's output, which is exactly the text Copy Last Command Output copies (`shell-integration`, "Last command output"), with lines joined by `\n` on every platform. That is the grid's text from the most recent command's output mark to its end mark, or to the next prompt or the cursor while it still runs: a line the program wrapped as one line, no trailing blanks, no colours. It is what the grid shows, not the bytes the program wrote, so it has no escape sequences and a progress bar is its last state. It leaves out the prompt and the command line, which becomes the attachment's name. It exists only with shell integration loaded, and not when the output is empty or has left the scrollback.
 
-Both are what the grid shows, not the bytes the program wrote: no escape sequences, and a progress bar as its last state. Nothing else is terminal text here: not the whole scrollback, the visible screen, an earlier command's output, or a full-screen program's screen other than through a selection.
+**A selection has no action of its own** (the user, 2026-11-25): selected text is copied and pasted into the prompt input, where it is part of the prompt's text and is sent when the prompt is. Nothing else is sent from a terminal either: not the scrollback, the visible screen or an earlier command's output.
 
-The two actions:
-- `send_selection_to_agent` ("Send Selection to Agent"): the selection's text, named `selection from TAB TITLE`. Listed and enabled only with a selection.
+The action:
 - `send_last_output_to_agent` ("Send Last Command Output to Agent"): the text Copy Last Command Output would take, named by the command line (`cargo test`) when the shell reported one, else `output from TAB TITLE`. Listed only once the terminal has a prompt mark, as the output commands are.
 - **Which agent zone:** `target_plan(agent_zones) -> Target::{ None, One(zone), Ask(Vec<zone>) }`. `None` shows "no agent zone is open" on the notice line. `Ask` opens a palette of the window's agent zones, the most recently focused first, each as its tab's and zone's titles. Then the attachment joins that zone's draft (or its refusal shows), its tab becomes active and its prompt input takes focus. Nothing is sent.
 
@@ -140,7 +136,7 @@ The two actions:
 --- entry 3 user attachments=2 "why does this fail?"
 --- attached entry=3 index=0 kind=text name="cargo test" cut=start bytes=65536 "…"
 --- attached entry=3 index=1 kind=link path="src/main.rs" name="main.rs"
---- draft index=0 kind=text name="selection from zsh" cut=none bytes=412 "…"
+--- draft index=0 kind=text name="output from zsh" cut=none bytes=412 "…"
 --- queued waiting attachments=1 "next"
 ```
 
@@ -153,7 +149,7 @@ The two actions:
 - A dropped file that isn't text, can't be read, or is a directory: that file refused by name; the rest attached.
 - The server refuses the prompt (a bound, the agent not ready): text and draft stay, the reason beside the input, as for any refused prompt.
 - The agent can't read a linked file: the agent says so in its reply; Brindle shows that as it shows any reply.
-- No agent zone for terminal text: the notice line says so.
+- No agent zone for a command's output: the notice line says so.
 
 ### 11. Restarts, crashes and upgrades (`process R1`–`R3`, `R12`)
 
@@ -173,7 +169,7 @@ From their designs, as the stack's session described them on 2026-11-25:
 - **Unit:** the fold, replay and bounds; `uri::file` for both path kinds and awkward bytes; the reducer's checks, path resolution, order of parts, the fenced fallback (including text holding backtick runs) and the cut note; `v1::encode` for each part and `v1::decode` for `promptCapabilities`; `cut_text`, `attach`, `backspace_at_start`, `drop_plan`, `dropped_text`, `target_plan`; the dump lines.
 - **Protocol:** fixtures for `AGENT_PROMPT` with and without attachments; fuzzing.
 - **Real roles** (the fake ACP agent): a prompt with a link and a text reaches the agent as a resource link and an embedded resource; an agent without embedded context gets the fenced text; a waiting prompt keeps its attachments across a core restart.
-- **E2E:** `terminal-to-agent-output`, `terminal-to-agent-selection`, `terminal-to-agent-choose`, `agent-attach-file`, `agent-attach-bounds`, `agent-attach-queue`, `agent-attach-restore`.
+- **E2E:** `terminal-to-agent-output`, `terminal-to-agent-choose`, `agent-attach-file`, `agent-attach-bounds`, `agent-attach-queue`, `agent-attach-restore`.
 - **Manual:** dropping files on a local and a remote agent's zone; pointer presses on an item's remove mark and on a text attachment's row.
 
 ## Open decisions
@@ -186,7 +182,7 @@ Each has a recommendation, which the text above follows. They are the user's to 
 4. **A file dropped on a remote agent's zone** is embedded as text when it is text (recommended), or every such drop is refused.
 5. **Several agent zones open:** a palette asks which (recommended), or the most recently focused one takes it.
 6. **An agent that takes no embedded context** gets the text written into the prompt in a fence (recommended), or the attachment is refused for that agent.
-7. **Attaching never sends** (recommended), or the terminal actions send at once when the prompt has text.
+Decided on 2026-11-25: attaching never sends, so a command's output reaches the agent only when the user sends the prompt, as pasted text does; and a selection gets no action of its own, since copying and pasting it into the prompt already does that (decision 7).
 
 ## Risks / Trade-offs
 

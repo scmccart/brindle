@@ -43,13 +43,12 @@ Before starting, check that the changes this one builds on are implemented and a
 - [ ] 6.1 Wire the draft into `src/agent/view.rs`: the row from the model, backspace at the start, the remove mark, sending with the prompt, refusals on the notice line.
 - [ ] 6.2 Add `agent_attach_file` ("Attach File…", a palette prompt) and `agent_clear_attachments` ("Clear Attachments") to `ACTIONS`, handled only by `AgentView`, the second listed only with attachments; verify with unit tests for the palette's listing.
 - [ ] 6.3 Handle files dropped on an agent zone: `drop_plan`, links attached at once, files for a remote agent read on a background task (at most `ATTACHMENT_TEXT` + 1 bytes) and passed to `dropped_text`, each refusal on the notice line; the prompt input highlighted while files hover. Nothing is read on the UI thread (`process R13`).
-- [ ] 6.4 Add `send_selection_to_agent` and `send_last_output_to_agent` to `ACTIONS`, handled by `TerminalView` (listed with a selection, and after a prompt mark, as their copy counterparts are), which hand the text and its name to the workspace; the workspace runs `target_plan`, opens the list when asked, attaches, activates the tab and focuses the prompt input; verify with unit tests for the listing rules and the names (`cargo test`, `output from TITLE`, `selection from TITLE`).
+- [ ] 6.4 Add `send_last_output_to_agent` to `ACTIONS`, handled by `TerminalView` (listed after a prompt mark, as Copy Last Command Output is, and taking the same text with `\n` line ends), which hands the text and its name to the workspace; the workspace runs `target_plan`, opens the list when asked, attaches, activates the tab and focuses the prompt input; verify with unit tests for the listing rule, the names (`cargo test`, `output from TITLE`), and nothing attached when the copy command would copy nothing.
 - [ ] 6.5 Draw the conversation's attachment rows and the queue row's count.
 
 ## 7. End-to-end cases (fake ACP agent)
 
 - [ ] 7.1 `terminal-to-agent-output`: a command's output in a terminal tab becomes a draft in the agent tab, named by its command line, with focus in the prompt input and nothing sent; sending it shows the user message with its attachment, and the fake agent received an embedded resource.
-- [ ] 7.2 `terminal-to-agent-selection`: a selection sent the same way; the action unlisted with no selection.
 - [ ] 7.3 `terminal-to-agent-choose`: two agent tabs, the list in most-recently-focused order, choosing the second; and no agent tab giving the notice line.
 - [ ] 7.4 `agent-attach-file`: `agent_attach_file` with a relative path; the fake agent receives the resolved `file://` link; escape attaches nothing; backspace at the start and `agent_clear_attachments` remove.
 - [ ] 7.5 `agent-attach-bounds`: a ninth attachment refused on the notice line; output over 64 KiB attached cut at its start; blank text with an attachment sends nothing.

@@ -19,7 +19,7 @@ Before the `--- prompt` line, an agent zone's dump SHALL print one `--- draft` l
 - **THEN** the dump has `--- queued waiting attachments=1 "next"`
 
 ### Requirement: Driving attachments
-`--action` SHALL run `agent_attach_file`, whose path prompt takes `--send` and is confirmed with `picker_confirm`, `agent_clear_attachments`, and, in a terminal zone, `send_selection_to_agent` and `send_last_output_to_agent`, whose list of agent zones is driven with the list actions. After a terminal action the dump SHALL be the agent zone's, since it is then the active one.
+`--action` SHALL run `agent_attach_file`, whose path prompt takes `--send` and is confirmed with `picker_confirm`, `agent_clear_attachments`, and, in a terminal zone, `send_last_output_to_agent`, whose list of agent zones is driven with the list actions. After that action the dump SHALL be the agent zone's, since it is then the active one.
 
 #### Scenario: Output to an agent, end to end
 - **WHEN** Brindle runs with a terminal tab and an agent tab, runs `printf 'one\ntwo\n'` in the terminal, waits for the prompt, and runs `--action send_last_output_to_agent --dump-screen-after 2`
