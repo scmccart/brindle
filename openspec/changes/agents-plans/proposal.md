@@ -38,7 +38,7 @@ None.
 ## Impact
 
 - **`brindle-transcript`** (`transcript/`): `Plan`, `PlanBody`, `PlanItem`, `ItemStatus`, `Priority`; `Event::Plan` and `Event::PlanRemoved`; the transcript's state and replay; new `tests/fixtures/v4/` files (none edited).
-- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms and `acp/v1/decode.rs` for `plan`, `plan_update` and `plan_removed`; the plan capability in `initialize`; the reducer keeping, bounding and clearing plans. The checkpoint's format 1 is amended (unreleased).
+- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms and `acp/v1/decode.rs` for `plan`, `plan_update` and `plan_removed`; the plan capability in `initialize`; the reducer keeping, bounding and dismissing plans; a new client message in `brindle-remote-protocol`. The checkpoint's format 1 is amended (unreleased).
 - **`brindle`** (`src/agent/`): the chat model's plans and their summary, the view's block, the dump; an action in `src/actions.rs`; `plan_details` in `src/config.rs`.
 - **`brindle-ui`** (`ui/`): a `Plan` component. Its dependency list is unchanged.
 - **Tests:** captures of real agents on a task of several steps, which no fixture holds yet; real-role tests through the fake ACP agent; new `agent-plan-*` e2e cases.
