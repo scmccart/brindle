@@ -1,55 +1,47 @@
 # Proposal
 
-**Depends on:** `agents-prompt-context` (a prompt's attachments, their row in the prompt input, their life in the queue slot and the log), implemented and archived.
-**Next:** nothing depends on it.
-
-**Status: proposal stage.** This change has no design, specs or tasks yet. The user split it from `agents-prompt-context` on 2026-11-25, to be defined as a full change right after it.
+**Depends on:** `agents-prompt-context` (a prompt's attachments, the store that keeps them beside the log, their row in the prompt input and the conversation), implemented and archived.
+**Next:** `agents-plans`, still to be proposed.
 
 ## Why
 
 Much of what a user wants to show a coding agent is a picture: a screenshot of a broken layout, a diagram, an error dialog. Every agent we captured says it accepts images in a prompt (`promptCapabilities.image`). With `agents-prompt-context` a prompt carries links and text, but an image on the clipboard can't be pasted into an agent's prompt, and a dropped image file is refused for an agent on another host.
 
-Images weren't part of that change because they don't fit its transport: one message between Brindle and the terminal server holds at most 1 MiB, a screenshot is often several, and a prompt waiting in the queue must keep its bytes across a restart.
+Images weren't part of that change because they don't fit its transport: one message between Brindle and the terminal server holds at most 1 MiB, and a screenshot is often several. The same limit is why that change refuses text over 256 KiB outright. Both need an upload that spans several messages.
 
 ## What Changes
 
-- A prompt's attachments gain a third kind, an image, which the server sends to the agent as an ACP `image` content block.
-- Pasting with an image on the clipboard, and dropping an image file on an agent zone, attach it.
-- Brindle sends an image's bytes to the terminal server in pieces before the prompt that names them.
+- **An upload in pieces.** Brindle sends an attachment to the terminal server as a start, pieces of at most one message each, and an end, and reads one back the same way, a piece at a time. It replaces `agents-prompt-context`'s one-message attach, so there is one way to send an attachment.
+- **Text attachments grow.** The 256 KiB limit, which was only what one message carries, becomes 5 MiB. Text over 64 KiB was already sent to the agent as a link to the kept file, so nothing else changes for it.
+- **Images are a third kind of attachment:** PNG, JPEG, GIF and WebP, up to 5 MiB each and 8 MiB a prompt, kept in the same store as text. The type is decided from the file's first bytes, by Brindle and again by the server, never from a name.
+- **Pasting and dropping.** Pasting into the prompt input with an image on the clipboard attaches it; `agent_paste_image` does so by name. An image file dropped on an agent zone is attached as an image, whichever host the agent runs on.
+- **How the agent gets it.** An agent that accepts images receives the image itself, as ACP's image content. One that doesn't receives a link to the kept file, so no agent is left out.
+- **Showing it.** An image waiting in the prompt input shows a small preview. In the conversation it is a row with its name, type and size that opens, on a pointer press, to the image, fetched from the server then. Brindle draws only images the user attached; an image in an agent's message is still never drawn.
+- **Sending shows progress** and can be stopped: a large image over a slow connection takes time.
+- **The store's bound** rises from 16 MiB to 64 MiB a session, now that it is on disk.
+- **The holder's bound on input queued for an agent session** rises from 4 MiB to 16 MiB, so that one prompt with its images always fits.
+- **Client protocol 4 is amended**, as for the rest of the series.
 
-Open questions, to answer before a design:
-1. **The upload:** new client messages that carry an image in pieces of at most one frame, how a prompt names an upload, what bounds uploads in flight, and what a dropped connection or a core restart does to one that is half sent.
-2. **Limits:** the largest image, how many a prompt may hold, and their total; and whether Brindle shrinks or re-encodes a large image (which needs an image library on the app's dependency list) or refuses it.
-3. **Formats:** which are accepted (PNG, JPEG, GIF, WebP are what GPUI's clipboard can give), and how the type is decided for a dropped file.
-4. **The queue slot.** A waiting or held prompt must keep its images until it is sent or discarded, across restarts and upgrades. Whether they live in the session's checkpoint (which the holder accepts up to 64 MiB and which is rewritten whole), or beside it.
-5. **The log.** Whether the conversation keeps an image's bytes, a small preview, or only a note (its type and size), given the log's 16 MiB bound and that every attach replays it.
-6. **Showing it:** a thumbnail in the prompt input and the conversation needs an image drawn in an agent zone, which nothing does today; or a named item only.
-7. **An agent without image support:** refused when attaching, with the reason.
-8. **Paste:** which key or action pastes an image, and what a clipboard holding both text and an image does.
-9. **Audio,** which no captured agent accepts: left out.
-
-## What the full changes already say
-
-- `agents-prompt-context`, design decision 1: attached text is kept in files beside the log, in a private directory a session, with only a reference in the log, the queue slot and the checkpoint; `Attachment` is an enum an `Image` kind joins. That store answers most of questions 4 and 5 for images too: their bytes would be kept there, bounded by its 16 MiB a session unless this change raises it. Decision 3: `AGENT_ATTACH` carries one text in one frame under a number the client picks, which the upload in pieces would extend (question 1). Decision 2: text over 256 KiB is refused outright, and that limit is only what one frame carries, so this change's upload is meant to serve text as well and raise it; a bound stays, since the server must limit what a client can make it write. Decision 6: `PromptSupport { embedded, images }` is already read from `initialize` and checkpointed (question 7).
-- `agents-prompt-context`, `agent-zones` requirement "Dropping files on an agent zone": a file that isn't text is refused for an agent on another host. This change modifies it for images.
-- `agents-sessions`: the log's 16 MiB bound and the 64 MiB checkpoint (questions 4 and 5); the holder's `CHECKPOINT_BEGIN`/`CHUNK`/`END` is the existing example of a payload sent in pieces.
-- `agents-markdown`: images in an agent's message are never fetched or drawn, only named (question 6 is about the user's own images, which are different: the user chose them).
+Not in this change: audio, which no captured agent accepts; shrinking, converting or re-encoding an image; SVG, BMP and TIFF; previews in the conversation without opening a row; images in a first prompt from `brindle agent -p`; screenshots taken by Brindle; drawing images an agent sends.
 
 ## Capabilities
 
 ### New Capabilities
-- None expected.
+
+None.
 
 ### Modified Capabilities
-- `agent-sessions` (added by `agents-sessions`): images in a prompt, the upload, and their bounds.
-- `agent-zones` (added by `agents-profiles`): pasting and dropping images, and how they show.
-- `terminal-server`: the upload messages.
-- `ui-components`: only if a thumbnail is drawn.
+
+- `agent-sessions`: "Prompt attachments are bounded" and "A client can read an attachment's text" change; new requirements for uploads in pieces, images in a prompt, their types and how they are sent.
+- `agent-zones`: "Dropping files on an agent zone" and "Attachment limits are said when attaching" change; new requirements for pasting an image, previews, opening an image, and sending with progress.
+- `ui-components`: an attachment item's preview.
+- `command-line`: the dump's lines for images and for a send in progress, and a debug step that attaches a file.
 
 ## Impact
 
-- `remote-protocol/`: upload messages, with fixtures and fuzzing.
-- `transcript/`: the `Image` attachment and what the log keeps of it.
-- `remote-agent/src/acp/` and the core: holding uploads, the checkpoint, and each version's `image` content block.
-- `src/agent/`: paste, drop, the upload, and showing an image.
-- `Cargo.lock`, only if an image is shrunk or decoded for a thumbnail.
+- **`brindle-remote-protocol`** (`remote-protocol/`): `AGENT_UPLOAD_BEGIN`, `AGENT_UPLOAD_CHUNK`, `AGENT_UPLOAD_END` in place of `AGENT_ATTACH`; `AGENT_READ_ATTACHMENT` and `ATTACHMENT` gain an offset; fixtures and fuzzing.
+- **`brindle-transcript`** (`transcript/`): `Attachment::Image` and `ImageType`; new fixtures.
+- **`brindle-remote-agent`**: the store writing an upload as it arrives; a pure type check and base64 encoder; `acp/v1/encode.rs` writing `image` content; the holder's input bound for pipe sessions.
+- **`brindle`** (`src/agent/`): the upload and download sequences, paste, drop, previews, the conversation's image rows; an action in `src/actions.rs`.
+- **`brindle-ui`** (`ui/`): an attachment item's preview, drawn with GPUI's own image element. No new dependency anywhere.
+- **Tests:** real-role tests through the fake ACP agent, including an image's bytes arriving unchanged; new `agent-image-*` e2e cases; manual checks for paste and drop.
