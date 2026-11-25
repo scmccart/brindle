@@ -63,8 +63,8 @@ Each module below in `remote-agent/src/acp/` joins `PURE_MODULES` and `fcis`'s p
 
 ## 8. Management commands, relay and Brindle
 
-- [ ] 8.1 `brindle-remote list` shows `agent: <activity>` in the title column for agent sessions and `--json` the `agent` object; `kill` and `stop` end agent sessions without asking. Unit tests for `list_line`, and cases in `remote-agent/tests/manage.rs`. Verify with `cargo test -p brindle-remote-agent --test manage`.
-- [ ] 8.2 Relay: a case in `remote-agent/tests/relay.rs` that starts an agent session through a relay link on a socket pair and runs one turn with a waiting prompt, then a held prompt sent again, showing frames 15–20 and 42 pass unchanged. Verify with `cargo test -p brindle-remote-agent --test relay`.
+- [x] 8.1 `brindle-remote list` shows `agent: <activity>` in the title column for agent sessions and `--json` the `agent` object; `kill` and `stop` end agent sessions without asking. Unit tests for `list_line`, and cases in `remote-agent/tests/manage.rs`. Verify with `cargo test -p brindle-remote-agent --test manage`.
+- [x] 8.2 Relay: a case in `remote-agent/tests/relay.rs` that starts an agent session through a relay link on a socket pair and runs one turn with a waiting prompt, then a held prompt sent again, showing frames 15–20 and 42 pass unchanged. Verify with `cargo test -p brindle-remote-agent --test relay`.
 - [x] 8.3 Pin Brindle's offer at protocols 1–3 with its own constant in `src/remote/local.rs` (the existing assertions on `client::PROTOCOLS` move to it), and add the `ToClient::Transcript` arm to its exhaustive matches, logged and dropped. Verify with `cargo test -p brindle remote::local` and `cargo clippy --locked --workspace --all-targets -- -D warnings`.
 
 ## 9. Docs
