@@ -117,9 +117,11 @@ use super::link::{Link, Wire};
 use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::budget::{Delivery, InputBudget, Offer};
+use crate::agent::model::agent_start;
+use crate::agent::spawn::AgentSpawnRequest;
 use crate::remote::protocol::client::{
-    self, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request, Resize, SessionInfo,
-    Detach, SessionRef, SetLayout, ToClient, ToCore,
+    self, AgentPermission, AgentPrompt, AgentRequest, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request,
+    Resize, SessionInfo, Detach, SessionRef, SetLayout, SpawnAgent, ToClient, ToCore,
 };
 use crate::remote::hosts::LinkState;
 use crate::remote::protocol::relay::{RelayHost, RelayMessage, is_relay_type};
@@ -199,9 +201,27 @@ pub trait SessionSink: Send {
     /// rendered at; told before its `ATTACH` goes out.
     fn replay_size(&mut self, _cols: u16, _rows: u16) {}
     /// An earlier call into this sink panicked, saying `reason`
-    /// ([`Connection::deliver`]): the session was let go, detached, and the
-    /// sink gets nothing more.
+    /// ([`Connection::deliver`]), or [`SessionSink::transcript`] refused
+    /// what it was given: the session was let go, detached, and the sink
+    /// gets nothing more.
     fn broken(&mut self, reason: &str);
+    /// An agent session's transcript events (`TRANSCRIPT`, client protocol
+    /// 4), each a JSON object, in order; a replay's come between
+    /// [`SessionSink::replay`]'s start and end. `Err` says why they couldn't
+    /// be followed (an event that doesn't decode or fold): the session is
+    /// then let go as broken, as for a panic. A terminal's sink never gets
+    /// one from a correct core, and logs and drops it.
+    fn transcript(&mut self, events: Vec<serde_json::Value>) -> std::result::Result<(), String> {
+        log::debug!("terminal server: {} transcript events for a terminal dropped", events.len());
+        Ok(())
+    }
+    /// The core answered the agent request `request` (`OK`, or `ERROR`
+    /// with its text), or the request failed with the link or connection.
+    /// Only an agent session's sink sends requests that come back here.
+    fn reply(&mut self, _request: RequestId, _outcome: std::result::Result<(), String>) {}
+    /// The link to the core went down; the session stays shown, and a
+    /// reconnect's replay of it (or its loss) follows.
+    fn link_down(&mut self) {}
 }
 
 /// What a launch does with the first listing of an endpoint's sessions
@@ -321,7 +341,10 @@ impl AttachRequest {
     }
 }
 
-type Reply<T> = mpsc::SyncSender<Result<T, String>>;
+/// Where a request's answer goes. A failure is the core's or the
+/// connection's words, or a typed refusal a caller can tell apart (an agent
+/// spawn's [`agent_start`] gate).
+type Reply<T> = mpsc::SyncSender<Result<T>>;
 
 /// A relay that was started and greeted: its reader, the stamp its watchdog
 /// reads and the wire to write to.
@@ -368,16 +391,34 @@ enum Waiting {
     List(Reply<Vec<SessionInfo>>),
     /// `OK`.
     Done(Reply<()>),
+    /// The `OK` or `ERROR` answering an agent session's request `req`
+    /// (`AGENT_PROMPT`, `AGENT_RESEND`, `AGENT_UNQUEUE`, `AGENT_PERMISSION`):
+    /// nobody blocks on it; the session's sink is told
+    /// ([`SessionSink::reply`]), whatever becomes of it.
+    Agent { req: RequestId, session: SessionId, sink: Sink },
 }
 
 impl Waiting {
     fn fail(self, message: String) {
         match self {
-            Self::Spawn { reply, .. } => reply.try_send(Err(message)).ok(),
-            Self::Attach { reply, .. } => reply.try_send(Err(message)).ok(),
-            Self::List(reply) => reply.try_send(Err(message)).ok(),
-            Self::Done(reply) => reply.try_send(Err(message)).ok(),
+            Self::Spawn { reply, .. } => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
+            Self::Attach { reply, .. } => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
+            Self::List(reply) => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
+            Self::Done(reply) => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
+            Self::Agent { req, session, sink } => {
+                reply_to(session, &sink, req, Err(message));
+                None
+            }
         };
+    }
+}
+
+/// Tells `session`'s sink how its agent request `req` went, confining a
+/// panic to the call: it is only the request's bookkeeping, and the
+/// session's next event finds a sink that failed.
+fn reply_to(session: SessionId, sink: &Sink, req: RequestId, outcome: std::result::Result<(), String>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.lock().reply(req, outcome))) {
+        log::error!("telling session {session}'s tab how request {req} went failed: {}", panic_text(&*payload));
     }
 }
 
@@ -450,7 +491,7 @@ impl Pending {
                 Awaits::Listing => true,
                 Awaits::Replay => false,
             },
-            Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => false,
+            Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) | Waiting::Agent { .. } => false,
         }
     }
 }
@@ -775,7 +816,11 @@ impl State {
                     *told = true;
                     Some((attach.session, sink.clone()))
                 }
-                Waiting::Spawn { .. } | Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_) => None,
+                Waiting::Spawn { .. }
+                | Waiting::Attach { .. }
+                | Waiting::List(_)
+                | Waiting::Done(_)
+                | Waiting::Agent { .. } => None,
             })
             .collect();
         let keep =
@@ -857,7 +902,7 @@ impl State {
                 let displaced = self.show(session, Shown::new(sink.clone(), key.clone()));
                 Routed::Shown { sink, reply, answer: Started { session, pid: spawned.pid, key }, displaced }
             }
-            Some(other @ (Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_))) => {
+            Some(other @ (Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_) | Waiting::Agent { .. })) => {
                 Routed::Close { session, fail: Some((other, "answered with SPAWNED")) }
             }
             None => Routed::Close { session, fail: None },
@@ -874,7 +919,7 @@ impl State {
                 let displaced = self.show(session, Shown::new(sink.clone(), key));
                 Routed::Shown { sink, reply, answer: pid, displaced }
             }
-            Some(other @ (Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_))) => {
+            Some(other @ (Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) | Waiting::Agent { .. })) => {
                 Routed::Detach { session, fail: Some((other, "answered with REPLAY_START")) }
             }
             None => Routed::Detach { session, fail: None },
@@ -983,6 +1028,9 @@ pub struct Connection {
     next_req: AtomicU64,
     transport: Transport,
     token: String,
+    /// The client protocols each `HELLO` of this connection offers, its
+    /// reconnects' included.
+    offer: client::VersionRange,
     /// Keep connecting while nothing waits (a profile connects at launch).
     eager: AtomicBool,
     /// This connection's own, never another's in this process: for its
@@ -1029,13 +1077,17 @@ impl Abandon {
 }
 
 impl Connection {
+    /// A connection offering Brindle's protocols, with no threads: the
+    /// tests' way to look at its state.
+    #[cfg(test)]
     fn new(transport: Transport, token: &str) -> (Arc<Self>, mpsc::Receiver<Outgoing>) {
-        Self::made(transport, token, false, None)
+        Self::made(transport, token, super::BRINDLE_PROTOCOLS, false, None)
     }
 
     fn made(
         transport: Transport,
         token: &str,
+        offer: client::VersionRange,
         eager: bool,
         report: Option<Report>,
     ) -> (Arc<Self>, mpsc::Receiver<Outgoing>) {
@@ -1052,6 +1104,7 @@ impl Connection {
             next_req: AtomicU64::new(1),
             transport,
             token: token.to_string(),
+            offer,
             eager: AtomicBool::new(eager),
             id: next_connection_id(),
             report,
@@ -1060,10 +1113,11 @@ impl Connection {
     }
 
     /// Starts the reader and writer threads on a negotiated local connection.
+    /// Its reconnects offer what its first `HELLO` did.
     pub fn start(endpoint: Endpoint, token: &str, connected: Connected) -> Result<Arc<Self>> {
         let protocol = connected.welcome.protocol;
         let link = Link::local(connected.stream)?;
-        let (this, queue) = Self::new(Transport::Local(endpoint), token);
+        let (this, queue) = Self::made(Transport::Local(endpoint), token, connected.offer, false, None);
         this.up(link.wire, None, protocol)?;
         let writing = this.clone();
         std::thread::Builder::new()
@@ -1081,20 +1135,22 @@ impl Connection {
     /// wait for it. The process makes its own with [`Connection::relay_with`].
     #[cfg(test)]
     pub fn relay(dial: Arc<dyn Dial>, token: &str, timings: Timings) -> Result<Arc<Self>> {
-        Self::relay_with(dial, token, timings, false, None)
+        Self::relay_with(dial, token, super::BRINDLE_PROTOCOLS, timings, false, None)
     }
 
-    /// [`Connection::relay`], eager from the start when `eager` (so even its
-    /// first failure keeps it trying), telling `report` its changes of state.
+    /// [`Connection::relay`], offering the client protocols `offer` in each
+    /// `HELLO`, eager from the start when `eager` (so even its first failure
+    /// keeps it trying), telling `report` its changes of state.
     pub fn relay_with(
         dial: Arc<dyn Dial>,
         token: &str,
+        offer: client::VersionRange,
         timings: Timings,
         eager: bool,
         report: Option<Report>,
     ) -> Result<Arc<Self>> {
         let name = dial.name();
-        let (this, queue) = Self::made(Transport::Relay { dial, timings }, token, eager, report);
+        let (this, queue) = Self::made(Transport::Relay { dial, timings }, token, offer, eager, report);
         let writing = this.clone();
         std::thread::Builder::new()
             .name("relay-writer".into())
@@ -1182,8 +1238,8 @@ impl Connection {
         }
     }
 
-    /// The endpoint, for log lines.
-    fn name(&self) -> String {
+    /// The endpoint, for log lines and the agent gate's refusal.
+    pub fn name(&self) -> String {
         match &self.transport {
             Transport::Local(_) => "this machine".to_string(),
             Transport::Relay { dial, .. } => dial.name(),
@@ -1330,8 +1386,8 @@ impl Connection {
         // Gone already when answered; a late answer is dealt with by `handle`.
         self.state.lock().requests.remove(&req);
         match answer {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(message)) | Err(message) => Err(anyhow!("{message}")),
+            Ok(answered) => answered,
+            Err(message) => Err(anyhow!("{message}")),
         }
     }
 
@@ -1357,6 +1413,29 @@ impl Connection {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
         let started = self.ask("start the session", abandon, None, |req, reply| {
             (Waiting::Spawn { sink, reply }, Some(ToCore::Spawn(request.into_spawn(req))))
+        })?;
+        let Started { session, pid, key } = started;
+        Ok(Running::new(session, pid, key, self.clone()))
+    }
+
+    /// Starts an agent session (`SPAWN_AGENT`, client protocol 4) whose
+    /// transcript goes to `sink`, and waits for the core to report its id
+    /// and pid, as [`Connection::spawn`] does. It always keeps running when
+    /// its zone goes (`detach`). The writer checks the link's protocol
+    /// first ([`agent_start`]): on one below 4 nothing is sent, and the
+    /// error is the gate's [`StartFailure`](crate::agent::model::StartFailure).
+    /// Not on the UI thread: this blocks.
+    pub fn spawn_agent(
+        self: &Arc<Self>,
+        request: AgentSpawnRequest,
+        sink: Sink,
+        abandon: Option<&Abandon>,
+    ) -> Result<Running> {
+        let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
+        let AgentSpawnRequest { command, args, cwd, env, profile } = request;
+        let started = self.ask("start the agent session", abandon, None, |req, reply| {
+            let spawn = SpawnAgent { req, command, args, cwd, env, policy: Policy::Detach, profile: Some(profile) };
+            (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;
         let Started { session, pid, key } = started;
         Ok(Running::new(session, pid, key, self.clone()))
@@ -1553,7 +1632,7 @@ impl Connection {
                 RelayMessage::Heartbeat => {}
             }
         };
-        wire.send(&ToCore::Hello(super::hello_message(&self.token, true)).encode()?)?;
+        wire.send(&ToCore::Hello(super::hello_message(&self.token, true, self.offer)).encode()?)?;
         loop {
             let frame = next_frame(reader, wire)?;
             if is_relay_type(frame.msg_type) {
@@ -1659,8 +1738,11 @@ impl Connection {
             }
             ToClient::Error(error) => {
                 let pending = error.req.and_then(|req| self.state.lock().requests.remove(&req));
-                match pending {
-                    Some(pending) => pending.waiting.fail(error.message),
+                match pending.map(|pending| pending.waiting) {
+                    Some(Waiting::Agent { req, session, sink }) => {
+                        self.deliver(session, &sink, |sink| sink.reply(req, Err(error.message)));
+                    }
+                    Some(other) => other.fail(error.message),
                     None => match error.session {
                         // An answer to no request, about one session: its
                         // tab says so (the holder's fault reports, a refused
@@ -1685,6 +1767,9 @@ impl Connection {
                 match pending.map(|pending| pending.waiting) {
                     Some(Waiting::Done(reply)) => {
                         reply.try_send(Ok(())).ok();
+                    }
+                    Some(Waiting::Agent { req, session, sink }) => {
+                        self.deliver(session, &sink, |sink| sink.reply(req, Ok(())));
                     }
                     Some(other) => other.fail("answered with OK".into()),
                     None => {}
@@ -1790,10 +1875,18 @@ impl Connection {
                 }
             }
             ToClient::Welcome(_) | ToClient::ServerStatus(_) => {}
-            // Only a protocol 4 core sends one, and Brindle offers 1 to 3
-            // (`BRINDLE_PROTOCOLS`).
-            ToClient::Transcript(transcript) => {
-                log::debug!("terminal server: a transcript for session {} dropped", transcript.session);
+            // Only a protocol 4 core sends one, for an agent session: its
+            // sink folds the events, and one it can't follow breaks it.
+            ToClient::Transcript(client::Transcript { session, events }) => {
+                let Some(sink) = self.sink(session) else {
+                    log::debug!("terminal server: a transcript for session {session}, not shown here, dropped");
+                    return;
+                };
+                let mut refused = None;
+                let delivered = self.deliver(session, &sink, |sink| refused = sink.transcript(events).err());
+                if let (Delivered::Done, Some(reason)) = (delivered, refused) {
+                    self.break_session(session, &sink, &reason);
+                }
             }
         }
     }
@@ -1856,14 +1949,26 @@ impl Connection {
     /// stops being shown and is detached: its program is fine, only
     /// Brindle's view of it failed, so it keeps running for the user to
     /// attach again (not at once: the replay may carry the same bytes).
-    /// Then the sink is told it is broken, under a guard of its own. A sink
-    /// no longer shown (its session exited, was lost, or isn't shown yet)
-    /// is only told. Called without the state lock.
+    /// Then the sink is told it is broken, under a guard of its own
+    /// ([`Connection::break_session`]). A sink no longer shown (its session
+    /// exited, was lost, or isn't shown yet) is only told. Called without
+    /// the state lock.
     fn deliver(&self, session: SessionId, sink: &Sink, call: impl FnOnce(&mut dyn SessionSink)) -> Delivered {
         let Err(payload) = catch_unwind(AssertUnwindSafe(|| call(&mut **sink.lock()))) else {
             return Delivered::Done;
         };
         let reason = panic_text(&*payload);
+        self.break_session(session, sink, &reason);
+        Delivered::Panicked(reason)
+    }
+
+    /// Brindle can't follow `session` any more, for `reason`: a call into
+    /// its sink panicked ([`Connection::deliver`]), or its sink refused a
+    /// transcript it couldn't decode or fold. A session still shown with
+    /// this sink stops being shown and is detached, so it keeps running for
+    /// the user to attach again; then the sink is told it is broken, under
+    /// a guard of its own. Called without the state lock.
+    fn break_session(&self, session: SessionId, sink: &Sink, reason: &str) {
         log::error!("Brindle can't show session {session} on {} any more ({reason}): detaching it", self.name());
         {
             let mut state = self.state.lock();
@@ -1875,10 +1980,9 @@ impl Connection {
                 self.send(ToCore::Detach(Detach { session, layout: None }));
             }
         }
-        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.lock().broken(&reason))) {
+        if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.lock().broken(reason))) {
             log::error!("telling session {session}'s tab that it can't be shown failed too: {}", panic_text(&*payload));
         }
-        Delivered::Panicked(reason)
     }
 
     /// Tells the tab of an entry another session displaced from its id
@@ -1909,7 +2013,11 @@ impl Connection {
                 Awaits::Replay => Some(req),
                 Awaits::Listing => None,
             },
-            Waiting::Attach { .. } | Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => None,
+            Waiting::Attach { .. }
+            | Waiting::Spawn { .. }
+            | Waiting::List(_)
+            | Waiting::Done(_)
+            | Waiting::Agent { .. } => None,
         })?;
         let Some(Waiting::Attach { sink, reply, key, .. }) = state.requests.remove(&req).map(|pending| pending.waiting)
         else {
@@ -1927,9 +2035,17 @@ impl Connection {
             current.wire.end();
         }
         self.unwatch_link();
-        let failed = self.state.lock().link_lost();
+        let (failed, shown) = {
+            let mut state = self.state.lock();
+            let shown: Vec<(SessionId, Sink)> =
+                state.sessions.iter().map(|(&session, shown)| (session, shown.sink.clone())).collect();
+            (state.link_lost(), shown)
+        };
         for pending in failed {
             pending.waiting.fail(format!("the terminal server went away ({reason})"));
+        }
+        for (session, sink) in shown {
+            self.deliver(session, &sink, |sink| sink.link_down());
         }
     }
 
@@ -2030,7 +2146,7 @@ impl Connection {
                 return Err(reconnect_gave_up(RECONNECT_LIMIT, last.as_deref()));
             }
             match super::try_connect(endpoint) {
-                Ok(Some(stream)) => match super::hello(stream, &self.token) {
+                Ok(Some(stream)) => match super::hello_offering(stream, &self.token, self.offer) {
                     Ok(connected) => return self.resume_local(connected).map_err(|error| format!("{error:#}")),
                     Err(error) if error.downcast_ref::<Refused>().is_some() => return Err(format!("{error:#}")),
                     Err(error) => {
@@ -2057,7 +2173,7 @@ impl Connection {
     }
 
     fn resume_local(&self, connected: Connected) -> Result<Box<dyn Read + Send>> {
-        let Connected { stream, welcome } = connected;
+        let Connected { stream, welcome, .. } = connected;
         log::info!("reconnected to the terminal server (core pid {})", welcome.pid);
         let link = Link::local(stream)?;
         self.up(link.wire, None, welcome.protocol)?;
@@ -2176,7 +2292,12 @@ impl Connection {
             ToCore::Spawn(client::Spawn { req, .. })
             | ToCore::Attach(client::Attach { req, .. })
             | ToCore::List(Request { req })
-            | ToCore::Kill(Kill { req, .. }) => Some(*req),
+            | ToCore::Kill(Kill { req, .. })
+            | ToCore::SpawnAgent(SpawnAgent { req, .. })
+            | ToCore::AgentPrompt(AgentPrompt { req, .. })
+            | ToCore::AgentPermission(AgentPermission { req, .. })
+            | ToCore::AgentUnqueue(AgentRequest { req, .. })
+            | ToCore::AgentResend(AgentRequest { req, .. }) => Some(*req),
             _ => None,
         };
         loop {
@@ -2192,6 +2313,22 @@ impl Connection {
                     self.slot_ready.wait(&mut slot);
                 }
             };
+            // An agent session needs client protocol 4 on the link it would
+            // go out on: below that, nothing is sent and the spawn fails
+            // with the gate's refusal.
+            if let ToCore::SpawnAgent(spawn) = message
+                && let Err(refusal) = self.agent_gate()
+            {
+                let pending = self.state.lock().requests.remove(&spawn.req);
+                match pending.map(|pending| pending.waiting) {
+                    Some(Waiting::Spawn { reply, .. }) => {
+                        reply.try_send(Err(anyhow::Error::new(refusal))).ok();
+                    }
+                    Some(other) => other.fail(refusal.to_string()),
+                    None => {}
+                }
+                return true;
+            }
             // Nobody waits for its answer any more.
             if let Some(req) = request
                 && !self.mark_written(req, true)
@@ -2253,6 +2390,13 @@ impl Connection {
             // A flush waiting on it gives up.
             self.slot_ready.notify_all();
         }
+    }
+
+    /// Whether the current link's client protocol carries agent sessions
+    /// ([`agent_start`], on the protocol its `WELCOME` agreed on).
+    fn agent_gate(&self) -> std::result::Result<(), crate::agent::model::StartFailure> {
+        let protocol = self.state.lock().link.protocol().map_or(0, |Negotiated(protocol)| protocol);
+        agent_start(protocol, &self.name())
     }
 
     /// Marks a request written or not; false when nobody waits for it. The
@@ -2356,12 +2500,16 @@ fn next_frame(reader: &mut impl BufRead, wire: &dyn Wire) -> Result<Frame> {
     }
 }
 
-/// `message` as a frame. A relay's `SPAWN` carries the endpoint's
-/// environment with the request's over it.
+/// `message` as a frame. A relay's `SPAWN` and `SPAWN_AGENT` carry the
+/// endpoint's environment with the request's over it.
 fn encode(message: &ToCore, host: Option<&RelayHost>) -> io::Result<Frame> {
     if let (ToCore::Spawn(spawn), Some(host)) = (message, host) {
         let env = relay::relay_env(&host.env, &spawn.env);
         return ToCore::Spawn(client::Spawn { env, ..spawn.clone() }).encode();
+    }
+    if let (ToCore::SpawnAgent(spawn), Some(host)) = (message, host) {
+        let env = relay::relay_env(&host.env, &spawn.env);
+        return ToCore::SpawnAgent(SpawnAgent { env, ..spawn.clone() }).encode();
     }
     message.encode()
 }
@@ -2705,6 +2853,57 @@ impl Running {
                 *sent = LayoutSent::TooLarge(layout);
             }
         }
+    }
+
+    /// Sends the agent request `make` builds under a new request id while
+    /// the connection shows this session, and gives the id; `None` (nothing
+    /// sent) otherwise. Its `OK` or `ERROR`, or its failure with the link,
+    /// goes to the session's sink ([`SessionSink::reply`]) under that id.
+    /// Queued under the state lock, as [`Running::send_while_shown`] is.
+    fn agent_request(&self, make: impl FnOnce(RequestId) -> ToCore) -> Option<RequestId> {
+        let mut state = self.conn.state.lock();
+        let sink = state.shown(self.id, self.key.as_ref())?.sink.clone();
+        let req = self.conn.req();
+        state.requests.insert(req, Pending::queued(Waiting::Agent { req, session: self.id, sink }));
+        self.conn.send(make(req));
+        Some(req)
+    }
+
+    /// A prompt for the agent (`AGENT_PROMPT`): sent now or queued by the
+    /// core, which the transcript tells.
+    pub fn prompt(&self, text: &str) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentPrompt(AgentPrompt { req, session, text: text.to_string() }))
+    }
+
+    /// Sends the held prompt again (`AGENT_RESEND`).
+    pub fn resend(&self) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentResend(AgentRequest { req, session }))
+    }
+
+    /// Discards the queue slot's prompt, waiting or held (`AGENT_UNQUEUE`).
+    pub fn unqueue(&self) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentUnqueue(AgentRequest { req, session }))
+    }
+
+    /// Answers the permission request in entry `entry` with `option`, or
+    /// cancelled with none (`AGENT_PERMISSION`).
+    pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentPermission(AgentPermission { req, session, entry, option }))
+    }
+
+    /// Cancels the running turn (`AGENT_CANCEL`, which has no answer; a
+    /// refused one comes back as the session's note). True when it went.
+    pub fn cancel(&self) -> bool {
+        let state = self.conn.state.lock();
+        let shown = state.shows(self.id, self.key.as_ref());
+        if shown {
+            self.conn.send(ToCore::AgentCancel(SessionRef { session: self.id }));
+        }
+        shown
     }
 
     /// Leaves the session running with no client (`DETACH`), with the
@@ -4358,7 +4557,7 @@ mod tests {
         let (dial, plan) = fake::dialer("A8");
         let (idle, close_limit) = (Duration::from_millis(100), Duration::from_millis(250));
         let timings = Timings { dead: Duration::from_secs(30), idle, close_limit, ..fake::quick() };
-        let connection = Connection::relay_with(dial, "tok", timings, true, None).unwrap();
+        let connection = Connection::relay_with(dial, "tok", super::super::BRINDLE_PROTOCOLS, timings, true, None).unwrap();
         let (link, first) = fake::link(&[], fake::spawning);
         plan.link(link);
         plan.next_dial();
@@ -4443,7 +4642,8 @@ mod tests {
         let (dial, plan) = fake::dialer("A8");
         let timings = Timings { dead: Duration::from_secs(30), idle: Duration::from_millis(200), ..fake::quick() };
         let (report, reports) = reporting();
-        let connection = Connection::relay_with(dial, "tok", timings, true, Some(report)).unwrap();
+        let connection =
+            Connection::relay_with(dial, "tok", super::super::BRINDLE_PROTOCOLS, timings, true, Some(report)).unwrap();
         let id = connection.id;
         assert_eq!(reported(&reports, id), LinkState::Connecting);
         let (link, first) = fake::link(&[], |_, _| {});
@@ -4479,7 +4679,8 @@ mod tests {
     fn reporting_relay(name: &str, timings: Timings) -> (Arc<Connection>, Plan, mpsc::Receiver<(u64, LinkState)>) {
         let (dial, plan) = fake::dialer(name);
         let (report, reports) = reporting();
-        let connection = Connection::relay_with(dial, "tok", timings, true, Some(report)).unwrap();
+        let connection =
+            Connection::relay_with(dial, "tok", super::super::BRINDLE_PROTOCOLS, timings, true, Some(report)).unwrap();
         assert_eq!(reported(&reports, connection.id), LinkState::Connecting);
         (connection, plan, reports)
     }
@@ -4558,7 +4759,9 @@ mod tests {
     fn an_eager_relay_is_offline_until_its_first_link_and_a_lazy_one_ends() {
         let (dial, plan) = fake::dialer("devbox");
         let (report, reports) = reporting();
-        let eager = Connection::relay_with(dial, "tok", fake::quick(), true, Some(report.clone())).unwrap();
+        let eager =
+            Connection::relay_with(dial, "tok", super::super::BRINDLE_PROTOCOLS, fake::quick(), true, Some(report.clone()))
+                .unwrap();
         assert_eq!(reported(&reports, eager.id), LinkState::Connecting);
         plan.fail("Error response from daemon: container devbox is not running");
         let offline = LinkState::Offline("Error response from daemon: container devbox is not running".into());
@@ -4568,7 +4771,9 @@ mod tests {
         assert!(!eager.is_dead());
 
         let (dial, plan) = fake::dialer("devbox");
-        let lazy = Connection::relay_with(dial, "tok", fake::quick(), false, Some(report)).unwrap();
+        let lazy =
+            Connection::relay_with(dial, "tok", super::super::BRINDLE_PROTOCOLS, fake::quick(), false, Some(report))
+                .unwrap();
         assert!(lazy.id > eager.id);
         assert_eq!(reported(&reports, lazy.id), LinkState::Connecting);
         plan.fail("Error response from daemon: container devbox is not running");
@@ -5083,7 +5288,7 @@ mod tests {
         fn awaits(&self, req: RequestId) -> Option<Awaits> {
             match &self.requests.get(&req)?.waiting {
                 Waiting::Attach { awaits, .. } => Some(*awaits),
-                Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => None,
+                Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) | Waiting::Agent { .. } => None,
             }
         }
     }
@@ -5091,7 +5296,9 @@ mod tests {
     fn req_of(pending: &Pending) -> RequestId {
         match &pending.waiting {
             Waiting::Attach { attach, .. } => attach.req,
-            Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) => panic!("not an attach"),
+            Waiting::Spawn { .. } | Waiting::List(_) | Waiting::Done(_) | Waiting::Agent { .. } => {
+                panic!("not an attach")
+            }
         }
     }
 
@@ -5228,12 +5435,13 @@ mod tests {
             Waiting::Attach { .. } => "attach",
             Waiting::List(_) => "list",
             Waiting::Done(_) => "done",
+            Waiting::Agent { .. } => "agent",
         }
     }
 
     /// A spawn's request, the sink it shows its session with, and where its
     /// answer goes.
-    fn spawn_waiting() -> (Waiting, Sink, mpsc::Receiver<std::result::Result<Started, String>>) {
+    fn spawn_waiting() -> (Waiting, Sink, mpsc::Receiver<Result<Started>>) {
         let (sink, _tab) = fake::sink();
         let (reply, answer) = mpsc::sync_channel(1);
         (Waiting::Spawn { sink: sink.clone(), reply }, sink, answer)

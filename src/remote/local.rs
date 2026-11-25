@@ -29,6 +29,7 @@
 //! and each remote connection tells [`watch_hosts`]' callback how it
 //! stands, for `remote::hosts::Hosts`.
 
+mod agent;
 mod connection;
 mod link;
 #[cfg(windows)]
@@ -171,7 +172,7 @@ pub(crate) fn shared_with(host: &Host, helper: &HelperLookup) -> Result<Arc<Conn
                 }) as Report
             });
             let token = host_token(client_token(), host);
-            Connection::relay_with(dial, &token, relay::Timings::default(), eager, report)
+            Connection::relay_with(dial, &token, BRINDLE_PROTOCOLS, relay::Timings::default(), eager, report)
         }
     })
 }
@@ -558,10 +559,20 @@ impl Endpoint {
 pub struct Connected {
     pub stream: Stream,
     pub welcome: Welcome,
+    /// The client protocols its `HELLO` offered, which a connection made on
+    /// it offers again when it reconnects.
+    pub offer: client::VersionRange,
 }
 
-/// Connects to the core, starting one if none is listening, and negotiates.
+/// Connects to the core, starting one if none is listening, and negotiates
+/// Brindle's protocols ([`BRINDLE_PROTOCOLS`]).
 pub fn connect(endpoint: &Endpoint, token: &str) -> Result<Connected> {
+    connect_offering(endpoint, token, BRINDLE_PROTOCOLS)
+}
+
+/// [`connect`], offering the client protocols `offer`: the tests' way to
+/// reach protocol 4 while Brindle's own offer stops below it.
+pub fn connect_offering(endpoint: &Endpoint, token: &str, offer: client::VersionRange) -> Result<Connected> {
     let stream = match try_connect(endpoint)? {
         Some(stream) => stream,
         None => {
@@ -569,7 +580,7 @@ pub fn connect(endpoint: &Endpoint, token: &str) -> Result<Connected> {
             connect_started(endpoint)?
         }
     };
-    hello(stream, token)
+    hello_offering(stream, token, offer)
 }
 
 /// Connects to a listening core; `None` when none is listening.
@@ -670,10 +681,10 @@ pub fn start_core(endpoint: &Endpoint) -> Result<()> {
 /// its `kill` sessions for [`RELAY_LINGER_SECS`] after the link drops, and
 /// for `PROCESS` reports, since this machine can't read the endpoint's
 /// `/proc`.
-fn hello_message(token: &str, relay: bool) -> Hello {
+fn hello_message(token: &str, relay: bool, offer: client::VersionRange) -> Hello {
     Hello {
-        min: BRINDLE_PROTOCOLS.min,
-        max: BRINDLE_PROTOCOLS.max,
+        min: offer.min,
+        max: offer.max,
         client_version: format!("brindle {}", env!("CARGO_PKG_VERSION")),
         client_token: token.to_string(),
         linger_secs: if relay { RELAY_LINGER_SECS } else { 0 },
@@ -681,14 +692,20 @@ fn hello_message(token: &str, relay: bool) -> Hello {
     }
 }
 
-/// Says `HELLO` and waits for `WELCOME`. An `ERROR` (no common version)
-/// names both sides' ranges.
+/// Says `HELLO`, offering Brindle's protocols ([`BRINDLE_PROTOCOLS`]), and
+/// waits for `WELCOME`.
+pub fn hello(stream: Stream, token: &str) -> Result<Connected> {
+    hello_offering(stream, token, BRINDLE_PROTOCOLS)
+}
+
+/// Says `HELLO` offering the client protocols `offer` and waits for
+/// `WELCOME`. An `ERROR` (no common version) names both sides' ranges.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "railway R3 exception: any answer to HELLO but `Welcome` or `Error` fails it, naming the answer"
 )]
-pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
-    let hello = ToCore::Hello(hello_message(token, false));
+pub fn hello_offering(mut stream: Stream, token: &str, offer: client::VersionRange) -> Result<Connected> {
+    let hello = ToCore::Hello(hello_message(token, false, offer));
     let talk = |error: io::Error| anyhow!("terminal server unreachable: {error}");
     stream.set_read_timeout(Some(HELLO_LIMIT)).map_err(talk)?;
     hello.encode().and_then(|frame| frame.write_to(&mut stream)).map_err(talk)?;
@@ -702,7 +719,7 @@ pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
     };
     stream.set_read_timeout(None).map_err(talk)?;
     match ToClient::decode(&frame).map_err(talk)? {
-        ToClient::Welcome(welcome) => Ok(Connected { stream, welcome }),
+        ToClient::Welcome(welcome) => Ok(Connected { stream, welcome, offer }),
         ToClient::Error(error) => Err(refused(&error.message)),
         other => bail!("terminal server answered HELLO with {other:?}"),
     }
@@ -1315,20 +1332,25 @@ mod tests {
 
     #[test]
     fn only_a_relay_asks_for_linger_and_process_info() {
-        let local = hello_message("tok", false);
+        let local = hello_message("tok", false, BRINDLE_PROTOCOLS);
         assert_eq!((local.linger_secs, local.process_info), (0, false));
-        let relay = hello_message("tok", true);
+        let relay = hello_message("tok", true, BRINDLE_PROTOCOLS);
         assert_eq!((relay.linger_secs, relay.process_info), (300, true));
         assert_eq!((relay.min, relay.max), (BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max));
         assert_eq!(relay.client_token, "tok");
     }
 
+    /// Brindle's own offer stays below protocol 4 until the app tells agent
+    /// sessions apart (`agents-profiles` task 6.5); a connection made with
+    /// another offer (the client tests' 1 to 4) says that one.
     #[test]
     fn brindle_offers_no_protocol_with_agent_sessions_yet() {
         assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (1, 3));
         const { assert!(BRINDLE_PROTOCOLS.max < client::PROTOCOLS.max, "the codec knows protocol 4") };
-        let hello = hello_message("tok", false);
+        let hello = hello_message("tok", false, BRINDLE_PROTOCOLS);
         assert_eq!(hello.max, 3);
+        let offered = hello_message("tok", true, client::PROTOCOLS);
+        assert_eq!((offered.min, offered.max), (1, 4));
     }
 
     #[test]
