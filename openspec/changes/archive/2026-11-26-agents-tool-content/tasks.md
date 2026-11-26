@@ -319,7 +319,7 @@ Before starting, check these:
   - rewriting the config while Brindle runs opens the finished rows without a restart;
   - a bad value shows the config line.
 - [x] 8.9 **`agent-tool-theme`**: an agent profile with a dark theme in a light window; a pixel check that a diff's added line is the dark zone set's `diff_added`.
-- [ ] 8.10 **`windows-agent-tool-diff`** in `tests/e2e/cases/win.rs`: a diff and its permission detail through ConPTY.
+- [x] 8.10 **`windows-agent-tool-diff`** in `tests/e2e/cases/win.rs`: a diff and its permission detail through ConPTY. (CI run 45856554089: windows-e2e ran windows-agent-tool-diff, ok)
   - Verify: it is listed on Windows, and the archive jobs (`e2e-archive`, `windows-e2e-archive`) pick up the new `agent-*` and `windows-agent-*` cases by their filters.
   - Written: it runs `agent-permission-detail`'s function, which now also checks the diff's `--- item` line. The archive filters (`agent-` in `e2e-archive`, `windows-agent-` in `windows-e2e-archive`) take the new cases. Still to verify on Windows: its listing and run (the PR's `windows-e2e` job); `win.rs` can't be checked from Linux (the Windows target's build scripts need MSVC).
 - [x] 8.11 **The perf case `agent-tool-output`** in `tests/perf/agent.rs` (flag 13): 1 MiB of output in 4 KiB `_meta` deltas into an open row, timed from the gate to the last line shown. Its case name goes in `tests/perf/main.rs`'s list.
@@ -337,7 +337,7 @@ Before starting, check these:
 
 ## 10. Integration and landing
 
-- [ ] 10.1 **Run the full local checks**:
+- [x] 10.1 **Run the full local checks**: (local: 22 test result lines ok, release build, validate --strict; clippy, both self-tests and the agent- e2e filter (68 passed, 2 skipped) in impl-report-4)
   - `cargo test --workspace --locked`;
   - `cargo clippy --locked --workspace --all-targets -- -D warnings`;
   - both harness self-tests (`BRINDLE_E2E=1 cargo test --test e2e -- --self-test`, `BRINDLE_PERF=1 cargo test --test perf -- --self-test`);
@@ -345,15 +345,15 @@ Before starting, check these:
   - the e2e agent cases under `scripts/with-xvfb` inside `systemd-run --user --scope`: `BRINDLE_E2E=1 cargo test --test e2e -- agent-`;
   - `openspec validate agents-tool-content --strict`.
   - Run the large-output chores (full test, release build, e2e) as their own briefs, per CLAUDE.md's Delegation section.
-- [ ] 10.2 **Open the PR** and wait for CI (`gh pr checks <n> --watch`):
+- [x] 10.2 **Open the PR** and wait for CI (`gh pr checks <n> --watch`): (PR #146, CI run 45856554089: all 13 checks passed, e2e shards, windows-e2e, e2e-archive (112 passed) and windows-e2e-archive included)
   - `commits`, `test`, `clippy`, `release`, `windows`;
   - the three `e2e` shards (`--shard K/3` with `BRINDLE_E2E_SLOW=2`);
   - `windows-e2e`, `e2e-archive` and `windows-e2e-archive`.
   - Report each. Rerun an unrelated failure only with the user's go-ahead, naming its test and message.
-- [ ] 10.3 **Archive in the implementation PR**: `openspec archive agents-tool-content`, syncing the delta specs, as a `docs(openspec): archive agents-tool-content` commit on the same PR.
+- [x] 10.3 **Archive in the implementation PR**: `openspec archive agents-tool-content`, syncing the delta specs, as a `docs(openspec): archive agents-tool-content` commit on the same PR.
   - Before it, re-check each MODIFIED block against the synced main specs: agent-sessions "Transcript event forms…", "Attach replays the transcript" and "Entries a client hasn't fetched stay current"; agent-zones "Tool call rows", "Permission rows" and "Agent commands in the palette"; ui-components "Tool rows".
   - Re-check also any change archived since 20e9858 that touched them.
-- [ ] 10.4 **Hand the manual checks to the user**, with `scripts/run-throwaway.sh` (and `scripts/run-throwaway.ps1` on Windows) and a real agent profile, on Linux and on Windows:
+- [x] 10.4 **Hand the manual checks to the user**, with `scripts/run-throwaway.sh` (and `scripts/run-throwaway.ps1` on Windows) and a real agent profile, on Linux and on Windows: (handed over in PR #146's body; the user's report is pending)
   - a pointer press on a tool row's line opens and closes it;
   - the copy button of a diff and of an output;
   - an agent's edit of an existing file shows its diff in the permission row before it is allowed;
