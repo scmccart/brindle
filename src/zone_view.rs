@@ -456,9 +456,40 @@ pub struct CloseZoneAsk {
     pub busy: Vec<BusyAgent>,
 }
 
+/// What a `--- zone` line says of the zone besides its place: its kind,
+/// its profile's name and the endpoint it runs on.
+pub struct ZoneLine<'a> {
+    pub kind: ProfileKind,
+    pub profile: &'a str,
+    pub host: &'a Host,
+}
+
+impl ZoneLine<'_> {
+    /// ` kind=… profile="…"[ host="…"]` (OpenSpec change `zones-mixed-tabs`,
+    /// decision 10), strings escaped onto the line.
+    fn fields(&self) -> String {
+        let kind = match self.kind {
+            ProfileKind::Terminal => "terminal",
+            ProfileKind::Agent => "agent",
+        };
+        let host = match self.host {
+            Host::Local => String::new(),
+            Host::Remote(target) => {
+                let scheme = match target {
+                    crate::config::RemoteTarget::Ssh { .. } => "ssh",
+                    crate::config::RemoteTarget::Container { engine, .. } => engine.as_str(),
+                };
+                format!(" host={:?}", format!("{scheme}:{}", self.host.name()))
+            }
+        };
+        format!(" kind={kind} profile={:?}{host}", self.profile)
+    }
+}
+
 /// Formats `--dump-screen-after` zone lines when a tab has 2 or more zones,
-/// or returns an empty string for a single-zone tab.
-pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
+/// each with what `line` says of it, or returns an empty string for a
+/// single-zone tab.
+pub fn describe_zone_tree<'a>(tree: &ZoneTree, active: ZoneId, line: impl Fn(ZoneId) -> Option<ZoneLine<'a>>) -> String {
     let rects = tree.rects();
     if rects.len() < 2 {
         return String::new();
@@ -466,13 +497,15 @@ pub fn describe_zone_tree(tree: &ZoneTree, active: ZoneId) -> String {
     let mut out = format!("--- zones count={} active={}\n", rects.len(), active.0);
     for (id, r) in rects {
         let active_suffix = if id == active { " active" } else { "" };
+        let fields = line(id).map(|line| line.fields()).unwrap_or_default();
         out.push_str(&format!(
-            "--- zone id={} rect={},{},{},{}{}\n",
+            "--- zone id={} rect={},{},{},{}{}{}\n",
             id.0,
             fmt_unit(r.x),
             fmt_unit(r.y),
             fmt_unit(r.w),
             fmt_unit(r.h),
+            fields,
             active_suffix,
         ));
     }
@@ -1489,7 +1522,10 @@ impl ZoneTreeView {
     }
 
     pub fn describe_zones(&self) -> String {
-        describe_zone_tree(&self.tree, self.active)
+        describe_zone_tree(&self.tree, self.active, |id| {
+            let zone = self.zones.get(&id)?;
+            Some(ZoneLine { kind: zone.content.kind(), profile: &zone.profile.name, host: &zone.host })
+        })
     }
 
     /// Outer pixel size of `id`'s card (its border and header included) for
@@ -2360,12 +2396,54 @@ mod tests {
         let z1 = ZoneId(1);
         let z2 = ZoneId(2);
         let mut tree = ZoneTree::new(z1);
-        assert_eq!(describe_zone_tree(&tree, z1), "");
+        assert_eq!(describe_zone_tree(&tree, z1, |_| None), "");
 
         tree.split(z1, SplitAxis::Horizontal, z2);
+        let shell = |_| Some(ZoneLine { kind: ProfileKind::Terminal, profile: "Shell", host: &Host::Local });
         assert_eq!(
-            describe_zone_tree(&tree, z2),
-            "--- zones count=2 active=2\n--- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\n"
+            describe_zone_tree(&tree, z2, shell),
+            "--- zones count=2 active=2\n--- zone id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell\"\n\
+             --- zone id=2 rect=0.5,0,0.5,1 kind=terminal profile=\"Shell\" active\n"
+        );
+    }
+
+    /// The zone lines' kinds, profiles (escaped onto the line) and remote
+    /// hosts: an SSH host as `ssh:NAME`, a container as `ENGINE:NAME`, and
+    /// no `host=` on this machine.
+    #[test]
+    fn zone_lines_name_each_zones_kind_profile_and_host() {
+        use crate::config::RemoteTarget;
+        let (z1, z2, z3) = (ZoneId(1), ZoneId(2), ZoneId(3));
+        let mut tree = ZoneTree::new(z1);
+        tree.split(z1, SplitAxis::Horizontal, z2);
+        tree.split(z2, SplitAxis::Vertical, z3);
+        let a8 = Host::Remote(RemoteTarget::Ssh {
+            host: "A8".into(),
+            user: Some("me".into()),
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        });
+        let devbox = Host::Remote(RemoteTarget::Container {
+            engine: "docker".into(),
+            container: "devbox".into(),
+            user: None,
+            connect_at_launch: false,
+        });
+        let lines = |id: ZoneId| {
+            Some(match id.0 {
+                1 => ZoneLine { kind: ProfileKind::Terminal, profile: "Shell \"main\"", host: &Host::Local },
+                2 => ZoneLine { kind: ProfileKind::Agent, profile: "Claude", host: &a8 },
+                _ => ZoneLine { kind: ProfileKind::Terminal, profile: "Box", host: &devbox },
+            })
+        };
+        assert_eq!(
+            describe_zone_tree(&tree, z2, lines),
+            "--- zones count=3 active=2\n\
+             --- zone id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell \\\"main\\\"\"\n\
+             --- zone id=2 rect=0.5,0,0.5,0.5 kind=agent profile=\"Claude\" host=\"ssh:me@A8\" active\n\
+             --- zone id=3 rect=0.5,0.5,0.5,0.5 kind=terminal profile=\"Box\" host=\"docker:devbox\"\n"
         );
     }
 

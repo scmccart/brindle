@@ -265,7 +265,7 @@ pub fn palette_commands(ctx: &Ctx) -> Result<Outcome> {
     };
     let out = Run::new(ctx, "palette").config(&profile).agent("Fake").wait_for(READY).action("open_command_palette").dump_at(4.0).run()?;
     let agent = ["Stop Agent Turn", "Copy Last Agent Message", "Copy Last Code Block", "Scroll Agent to Bottom"];
-    for label in agent.iter().chain(&["Split Zone Right", "Close Tab"]) {
+    for label in agent.iter().chain(&["Split Agent Right", "Split Terminal Right", "Close Tab"]) {
         ensure!(listed(&out, label), "{label} isn't listed: {:?}", out.dump.palette);
     }
     for label in ["Clear Scrollback", "Find", "Scroll to Bottom", "Copy"] {
@@ -318,7 +318,7 @@ pub fn close_confirm(ctx: &Ctx) -> Result<Outcome> {
     // A tab of two agent zones, the first working and the second idle, and
     // a shell tab beside it.
     let out = started("tab")
-        .action("split_zone_right")
+        .action("split_agent_right")
         .action("new_tab")
         .action("prev_tab")
         .action("close_tab")
@@ -327,7 +327,7 @@ pub fn close_confirm(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.confirm.as_deref() == Some("close target=tab:1 busy=1:working"), "confirm: {:?}", out.dump.confirm);
     let out = started("tab-closed")
         .keep_detached()
-        .action("split_zone_right")
+        .action("split_agent_right")
         .action("new_tab")
         .action("prev_tab")
         .action("close_tab")
@@ -683,7 +683,7 @@ pub fn working(ctx: &Ctx) -> Result<Outcome> {
 
     // Split: the new zone is active and idle, the working one's header
     // spins.
-    let out = started("split").action("split_zone_right").wait_for("conversation entries=0").dump_at(6.0).run()?;
+    let out = started("split").action("split_agent_right").wait_for("conversation entries=0").dump_at(6.0).run()?;
     waited(&out)?;
     ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
     ensure!(out.dump.spinners == ["tab=1", "zone=1"], "spinners {:?}", out.dump.spinners);
@@ -1452,7 +1452,7 @@ pub fn zone_theme(ctx: &Ctx) -> Result<Outcome> {
     );
 
     let out = started("menu")
-        .action("split_zone_right")
+        .action("split_agent_right")
         .wait_for("conversation entries=0")
         .wait_for(READY)
         .modality("pointer")
@@ -1540,7 +1540,7 @@ pub fn self_test_zone_theme() -> Result {
     Ok(())
 }
 
-/// Split Zone Right in an agent tab opens a second agent zone on the same
+/// Split Agent Right in an agent tab opens a second agent zone on the same
 /// profile, with a session of its own, focused; the first keeps its turn.
 pub fn split(ctx: &Ctx) -> Result<Outcome> {
     let (profile, received) = hello_agent(ctx)?;
@@ -1549,7 +1549,7 @@ pub fn split(ctx: &Ctx) -> Result<Outcome> {
         .agent("Fake")
         .first_prompt("hi")
         .wait_for(&answered())
-        .action("split_zone_right")
+        .action("split_agent_right")
         .wait_for("conversation entries=0")
         .wait_for(READY)
         .dump_at(7.0)

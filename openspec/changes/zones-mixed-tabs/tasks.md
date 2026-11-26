@@ -34,8 +34,8 @@ Before starting:
 
 ## 5. The dump
 
-- [ ] 5.1 Add `kind=`, `profile=` and, for a remote zone, `host=` to the `--- zone` lines (decision 10); update the e2e cases that compare zone lines; verify with unit tests for each form and escaping.
-- [ ] 5.2 Move the existing e2e cases to the new commands: those that split an agent zone with `split_zone_right` or `split_zone_down` (`cases/agent.rs`, including `agents-tool-content`'s, and `cases/win.rs`) to `split_agent_*`, and the expected rows naming "Split Zone Right" or "Split Zone Down" (`palette.rs`, `zone_menu.rs`, `input.rs`, `win.rs`, `brindle.rs`'s parser test) to the new names; verify with the filters `agent-`, `zone`, `palette` and `input`.
+- [x] 5.1 Add `kind=`, `profile=` and, for a remote zone, `host=` to the `--- zone` lines (decision 10); update the e2e cases that compare zone lines; verify with unit tests for each form and escaping.
+- [x] 5.2 Move the existing e2e cases to the new commands: those that split an agent zone with `split_zone_right` or `split_zone_down` (`cases/agent.rs`, including `agents-tool-content`'s, and `cases/win.rs`) to `split_agent_*`, and the expected rows naming "Split Zone Right" or "Split Zone Down" (`palette.rs`, `zone_menu.rs`, `input.rs`, `win.rs`, `brindle.rs`'s parser test) to the new names; verify with the filters `agent-`, `zone`, `palette` and `input`.
 
 ## 6. End-to-end cases
 
