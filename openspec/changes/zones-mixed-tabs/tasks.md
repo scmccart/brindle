@@ -1,10 +1,10 @@
 # Tasks
 
 Before starting:
-- `agents-profiles`, `agents-login` and `agents-zone-theme-scope` are implemented and archived. The user's decisions are settled; design.md lists them, and the choices made in the design that the user hasn't reviewed.
-- This change MODIFIES `agent-zones`' "Agent commands in the palette", which `agents-tool-content` also modifies (it adds Toggle Tool Details). Whichever archives second carries the other's text: re-read the main spec before archiving.
+- `agents-profiles`, `agents-login`, `agents-zone-theme-scope` and `agents-tool-content` are implemented and archived. The user's decisions are settled; design.md lists them, and its "Flags" decision the choices made since that the user hasn't reviewed.
+- This change MODIFIES `agent-zones`' "Agent commands in the palette", which `agents-tool-content` modified before it (adding Toggle Tool Details); the delta carries that text. Its MODIFIED blocks were re-copied from the main specs at f806b12; re-read the main specs before archiving.
 - `agents-session-list` depends on this change.
-- The function names below are from `main` at 19368a9; check each against the code.
+- The function names below were checked against `feat/agents-tool-content` at f806b12.
 
 ## 1. The pure plans
 
@@ -35,6 +35,7 @@ Before starting:
 ## 5. The dump
 
 - [ ] 5.1 Add `kind=`, `profile=` and, for a remote zone, `host=` to the `--- zone` lines (decision 10); update the e2e cases that compare zone lines; verify with unit tests for each form and escaping.
+- [ ] 5.2 Move the existing e2e cases to the new commands: those that split an agent zone with `split_zone_right` or `split_zone_down` (`cases/agent.rs`, including `agents-tool-content`'s, and `cases/win.rs`) to `split_agent_*`, and the expected rows naming "Split Zone Right" or "Split Zone Down" (`palette.rs`, `zone_menu.rs`, `input.rs`, `win.rs`, `brindle.rs`'s parser test) to the new names; verify with the filters `agent-`, `zone`, `palette` and `input`.
 
 ## 6. End-to-end cases
 
@@ -49,6 +50,6 @@ Before starting:
 
 ## 7. Docs and checks
 
-- [ ] 7.1 Update `README.md` (keys, splitting, a tab of both kinds), `docs/code-map.md` (the zone tree, the tab model, restore and sweeps; fix the stale `as_terminal_view()` mention), `CLAUDE.md` (the dump's zone lines), and `docs/manual-checks/` (replace "an agent profile opened from the `⌄` menu, with its split buttons disabled", which no longer holds).
+- [ ] 7.1 Update `README.md` (keys, splitting, a tab of both kinds), `docs/code-map.md` (the zone tree, the tab model, restore and sweeps; fix the stale `as_terminal_view()` mention), `CLAUDE.md` (the dump's zone lines, and its manual checks' "an agent profile opened from the `⌄` menu, with its split buttons disabled", which no longer holds), and `docs/manual-checks/agents.md` (the same line).
 - [ ] 7.2 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate zones-mixed-tabs --strict`.
 - [ ] 7.3 Manual checks for the user, with `scripts/run-throwaway.sh`: a pointer press on each header split button and each header menu item in a mixed tab; the tab's face changing as focus moves between zones of different themes; ctrl-shift-alt-e and ctrl-shift-alt-o on Linux and on Windows, with a keyboard layout that has AltGr; a real agent beside a shell in the same directory; a local shell beside a shell on a real SSH host, quit and relaunched.

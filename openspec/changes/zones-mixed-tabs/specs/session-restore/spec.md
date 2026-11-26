@@ -87,11 +87,15 @@ Restoring SHALL succeed even when the recorded state no longer matches the syste
 - **THEN** only the second zone says that profile `Work` is gone, and the first is restored as `Shell`
 
 ### Requirement: Restored agent zones get their sessions back
-An agent zone SHALL be recorded and restored as a terminal zone is ("Restored zones get their sessions back"), attaching its recorded agent session and showing its whole conversation. When the listing failed, a recorded agent zone SHALL start a new agent session of its profile in its recorded directory. A recorded zone whose listed session is of another kind than its recorded profile now is SHALL be restored as what the session is, a terminal zone for a terminal session and an agent zone for an agent session, under the profile a launch's sweep would give that session.
+An agent zone SHALL be recorded and restored as a terminal zone is ("Restored zones get their sessions back"), attaching its recorded agent session and showing the newest page of its conversation, earlier entries loading as the user scrolls up to them. When the listing failed, a recorded agent zone SHALL start a new agent session of its profile in its recorded directory. A recorded zone whose listed session is of another kind than its recorded profile now is SHALL be restored as what the session is, a terminal zone for a terminal session and an agent zone for an agent session, under the profile a launch's sweep would give that session.
 
 #### Scenario: Agent survives a quit
 - **WHEN** an agent zone has a finished turn, and the user quits and relaunches
 - **THEN** the restored tab shows the same agent session, with the same pid and the whole conversation
+
+#### Scenario: A long conversation comes back as a page
+- **WHEN** an agent zone's conversation holds 2 MiB of entries, and the user quits and relaunches
+- **THEN** the restored tab shows the same agent session with its newest entries and an "Earlier messages" item above them, and scrolling up shows the rest
 
 #### Scenario: Agent split comes back
 - **WHEN** an agent tab split into two agent zones is quit and relaunched
