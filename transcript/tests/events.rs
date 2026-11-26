@@ -544,6 +544,17 @@ fn fixtures() -> Vec<(&'static str, Event)> {
                 name: "Log in with Google".into(),
             }),
         ),
+        // Added by `agents-session-title`, within protocol 4 before it
+        // shipped (its design decision 1): the untitled conversations above
+        // encode as before.
+        (
+            "conversation-titled",
+            titled(
+                "sess-5",
+                Continuation::ResumeAndLoad,
+                "Hello.txt file creation",
+            ),
+        ),
     ]
 }
 
@@ -553,6 +564,18 @@ fn conversation(id: &str, continuation: Continuation) -> Event {
             id: id.into(),
             cwd: "/home/u/src".into(),
             continuation,
+            title: None,
+        },
+    }
+}
+
+fn titled(id: &str, continuation: Continuation, title: &str) -> Event {
+    Event::Conversation {
+        conversation: Conversation {
+            id: id.into(),
+            cwd: "/home/u/src".into(),
+            continuation,
+            title: Some(title.into()),
         },
     }
 }

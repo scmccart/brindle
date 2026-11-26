@@ -433,7 +433,7 @@ fn the_prompt_state_follows_the_model() {
 // `agents-session-recovery` 5.1: the Continue conversation button.
 
 fn conversation(continuation: Continuation) -> Event {
-    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation };
+    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation, title: None };
     Event::Conversation { conversation }
 }
 

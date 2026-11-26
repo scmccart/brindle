@@ -3249,7 +3249,7 @@ mod tests {
     // `agents-session-recovery` section 4: continuing a conversation.
 
     fn conversation(continuation: crate::agent::transcript::Continuation) -> Conversation {
-        Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation }
+        Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation, title: None }
     }
 
     fn conversation_event(continuation: crate::agent::transcript::Continuation) -> Event {
@@ -3490,7 +3490,7 @@ mod tests {
             added(2, user("hi")),
             added(3, agent("Hello!")),
             Event::Conversation {
-                conversation: Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation: Continuation::Resume },
+                conversation: conversation(Continuation::Resume),
             },
             ready(),
         ]

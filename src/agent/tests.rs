@@ -178,7 +178,7 @@ fn life_events_and_leaving_the_session() {
 // `agents-session-recovery` 4.3: continuing a conversation.
 
 fn conversation(continuation: Continuation) -> Event {
-    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation };
+    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation, title: None };
     Event::Conversation { conversation }
 }
 

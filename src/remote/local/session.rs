@@ -1823,6 +1823,7 @@ mod tests {
             id: "sess-1".into(),
             cwd: "/home/u/src".into(),
             continuation: crate::agent::transcript::Continuation::Load,
+            title: None,
         };
         let request = agent_request().continuing(&conversation);
         let (sink, _feed) = AgentSink::with_fault(None);
