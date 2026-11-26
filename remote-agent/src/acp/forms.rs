@@ -4,7 +4,9 @@
 //! message into these and encodes each [`Request`] as that version's line.
 //! Plain data, with no ACP method or field name in it.
 
-use brindle_transcript::{Continuation, LoginMethod, PermissionKind, ToolKind, ToolStatus};
+use brindle_transcript::{
+    Continuation, Exit, Location, LoginMethod, PermissionKind, ToolKind, ToolStatus,
+};
 
 use super::envelope::Id;
 
@@ -187,7 +189,7 @@ pub enum ContentKind {
     Unknown,
 }
 
-/// A new tool call. Its content isn't kept (tool rows are one line).
+/// A new tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
     /// The agent's id for it.
@@ -195,6 +197,76 @@ pub struct ToolCall {
     pub title: String,
     pub kind: ToolKind,
     pub status: ToolStatus,
+    /// Its content (set, empty when it sent none), locations, raw values
+    /// and output.
+    pub detail: ToolDetail,
+}
+
+/// What a tool call carries beyond its row (design decision 3 of
+/// `agents-tool-content`), on a new call, an update or a permission
+/// request's `toolCall`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDetail {
+    /// The whole content list, which replaces the call's when set.
+    pub content: Patch<Vec<ToolItemForm>>,
+    /// Content items left out because they couldn't be read.
+    pub unreadable: u32,
+    pub locations: Patch<Vec<Location>>,
+    /// The raw input and result, as text: a JSON string as itself,
+    /// anything else as indented JSON. Not yet bounded.
+    pub input: Patch<String>,
+    pub result: Patch<String>,
+    /// Output for the call's terminals, in the order sent.
+    pub outputs: Vec<OutputForm>,
+}
+
+impl Default for ToolDetail {
+    /// Nothing said of any of it.
+    fn default() -> Self {
+        Self {
+            content: Patch::Keep,
+            unreadable: 0,
+            locations: Patch::Keep,
+            input: Patch::Keep,
+            result: Patch::Keep,
+            outputs: Vec::new(),
+        }
+    }
+}
+
+/// One content item of a tool call, as read; the reducer makes each a
+/// transcript `ToolItem`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolItemForm {
+    /// A content block: text, or a placeholder for another kind.
+    Content(Content),
+    /// A file's old and new text; no old text is a new file.
+    RawDiff {
+        path: String,
+        old: Option<String>,
+        new: String,
+    },
+    /// A terminal's output, by the agent's terminal id.
+    Terminal { terminal: String },
+    /// An item of a kind Brindle doesn't show, by its type.
+    Unknown { kind: String },
+}
+
+/// Output for one of a tool call's terminals, by the agent's terminal id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OutputForm {
+    Opened {
+        terminal: String,
+        cwd: Option<String>,
+        command: Option<String>,
+    },
+    /// The command wrote `bytes`, escape sequences and all.
+    Appended { terminal: String, bytes: Vec<u8> },
+    /// The command ended: by a code, a signal, or neither said.
+    Exited {
+        terminal: String,
+        exit: Option<Exit>,
+    },
 }
 
 /// A tool call's changed fields, each kept, cleared or set ([`Patch`]); the
@@ -208,6 +280,7 @@ pub struct ToolChange {
     pub kind: Patch<ToolKind>,
     /// Cleared, the status becomes `pending`.
     pub status: Patch<ToolStatus>,
+    pub detail: ToolDetail,
 }
 
 /// A `session/request_permission` request's params.

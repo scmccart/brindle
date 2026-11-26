@@ -22,7 +22,9 @@
 //! A segment's state has the base's fields except `log`, which becomes
 //! `events`: the events the session applied since the previous record, in
 //! order, with consecutive `Appended`s of one entry merged up to
-//! [`TEXT_CHUNK`]. Every other field is whole and replaces the previous
+//! [`TEXT_CHUNK`] and consecutive `ToolOutput`s of one item up to
+//! [`ITEM_LIMIT`], the later exit kept (`agents-tool-content` decision 8).
+//! Every other field is whole and replaces the previous
 //! record's. [`decode`] folds the base's log, then each segment's events,
 //! and takes the rest from the last record. [`encode`] writes the header
 //! and a base; [`encode_segment`] one segment record.
@@ -40,7 +42,11 @@
 //! none; OpenSpec change `agents-login`), the [`Rpc`] parts (the next outgoing id, the core's requests
 //! awaiting a response and what each was for, the agent's waiting
 //! permission requests by entry with their JSON-RPC ids as sent), the chunk
-//! run, the tool entries by call id, the count of a bad-line run not yet
+//! run, the tool entries by call id, the outputs still appended to by the
+//! agent's terminal id (`outputs`: each one's entry, its `Output` item and
+//! its plain-text filter's state, a half-received escape sequence or
+//! character included; left out when there are none, as in a checkpoint
+//! from before `agents-tool-content`), the count of a bad-line run not yet
 //! written as a notice, and the [`Lines`] state: which partial it is and
 //! `covers`, every stdout byte fed, the partial line's included.
 //!
@@ -65,16 +71,17 @@ use std::time::Instant;
 use brindle_remote_protocol::holder::MAX_CHECKPOINT_LEN;
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 use brindle_transcript::{
-    AgentState, Continuation, Conversation, Entry, EntryId, Event, LoginMethod, NoticeLevel,
-    TEXT_CHUNK, Transcript,
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, ITEM_LIMIT, LoginMethod,
+    NoticeLevel, TEXT_CHUNK, ToolItem, Transcript,
 };
 
 use super::dialect::{Dialect, Unsupported};
 use super::envelope::Id;
 use super::lines::{Lines, Partial};
+use super::plain::{self, Mode};
 use super::reduce::{
-    self, AfterLogin, AgentSession, BAD_RUN_QUIET, BadRun, Greeting, Input, Log, Login, Output,
-    Phase, Replay, Run, RunKind, Start,
+    self, AfterLogin, AgentSession, BAD_RUN_QUIET, BadRun, Greeting, Input, Log, Login, OpenOutput,
+    Output, Phase, Replay, Run, RunKind, Start,
 };
 use super::rpc::{BadParts, Purpose, Rpc};
 
@@ -272,6 +279,27 @@ fn merged(events: &[Event]) -> Vec<Event> {
             last.push_str(text);
             continue;
         }
+        // Output to one item, as the fold appends it: `a` then `b` folds as
+        // `a + b` (`agents-tool-content` decision 8), the later exit kept.
+        if let Event::ToolOutput {
+            id,
+            item,
+            text,
+            exit,
+        } = event
+            && let Some(Event::ToolOutput {
+                id: last_id,
+                item: last_item,
+                text: last,
+                exit: last_exit @ None,
+            }) = out.last_mut()
+            && (*last_id, *last_item) == (*id, *item)
+            && last.len() + text.len() <= ITEM_LIMIT
+        {
+            last.push_str(text);
+            last_exit.clone_from(exit);
+            continue;
+        }
         out.push(event.clone());
     }
     out
@@ -310,6 +338,20 @@ fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
                 .collect(),
         ),
     );
+    // The open outputs (`agents-tool-content` decision 8), left out when
+    // there are none, as a checkpoint from before them has none.
+    if !session.outputs.is_empty() {
+        state.insert(
+            "outputs".into(),
+            Value::Object(
+                session
+                    .outputs
+                    .iter()
+                    .map(|(terminal, open)| (terminal.clone(), open_output_value(open)))
+                    .collect(),
+            ),
+        );
+    }
     state.insert(
         "bad_lines".into(),
         session.bad.map_or(0, |bad| bad.lines).into(),
@@ -711,6 +753,12 @@ fn restore(
         let entry = EntryId(entry.as_u64().ok_or(Unreadable::Field { name: "tools" })?);
         tools.insert(call.clone(), entry);
     }
+    let mut outputs = BTreeMap::new();
+    if let Some(open) = state.get("outputs") {
+        for (terminal, open) in object(open, "outputs")? {
+            outputs.insert(terminal.clone(), restore_open_output(open)?);
+        }
+    }
     let bad_lines = number(state, "bad_lines")?;
     let lines = restore_lines(object(field(state, "lines")?, "lines")?, partial)?;
     let methods: Vec<LoginMethod> = match state.get("methods") {
@@ -742,6 +790,20 @@ fn restore(
             });
         }
     }
+    for open in outputs.values() {
+        let holds = match transcript.entry(open.entry) {
+            Some(Entry::Tool { content, .. }) => {
+                matches!(content.get(open.item as usize), Some(ToolItem::Output(_)))
+            }
+            Some(_) | None => false,
+        };
+        if !holds {
+            return Err(Unreadable::Entry {
+                name: "outputs",
+                entry: open.entry,
+            });
+        }
+    }
     for entry in rpc.permissions().keys() {
         if !matches!(
             transcript.entry(*entry),
@@ -762,11 +824,69 @@ fn restore(
         version,
         run,
         tools,
+        outputs,
         bad: (bad_lines > 0).then_some(BadRun {
             lines: bad_lines,
             last: now,
         }),
         methods,
+    })
+}
+
+/// An open output: its entry and item, and its plain-text filter.
+fn open_output_value(open: &OpenOutput) -> Value {
+    let filter = &open.filter;
+    let (mode, skipped) = match filter.mode {
+        Mode::Text => ("text", 0),
+        Mode::Escape => ("escape", 0),
+        Mode::EscapeIntermediate => ("escape_intermediate", 0),
+        Mode::Csi => ("csi", 0),
+        Mode::String { skipped } => ("string", skipped),
+        Mode::StringEscape { skipped } => ("string_escape", skipped),
+    };
+    json!({
+        "entry": open.entry.0,
+        "item": open.item,
+        "mode": mode,
+        "skipped": skipped,
+        "line": filter.line,
+        "cr": filter.cr,
+        "partial": filter.partial,
+    })
+}
+
+fn restore_open_output(value: &Value) -> Result<OpenOutput, Unreadable> {
+    let name = "outputs";
+    let bad = Unreadable::Field { name };
+    let open = object(value, name)?;
+    let skipped =
+        usize::try_from(number(open, "skipped")?).map_err(|_| Unreadable::Field { name })?;
+    let mode = match text(open, "mode")? {
+        "text" => Mode::Text,
+        "escape" => Mode::Escape,
+        "escape_intermediate" => Mode::EscapeIntermediate,
+        "csi" => Mode::Csi,
+        "string" => Mode::String { skipped },
+        "string_escape" => Mode::StringEscape { skipped },
+        _ => return Err(bad),
+    };
+    let partial: Vec<u8> = serde_json::from_value(field(open, "partial")?.clone())
+        .map_err(|_| Unreadable::Field { name })?;
+    if partial.len() > 3 {
+        return Err(bad);
+    }
+    Ok(OpenOutput {
+        entry: EntryId(number(open, "entry")?),
+        item: u32::try_from(number(open, "item")?).map_err(|_| Unreadable::Field { name })?,
+        filter: plain::State {
+            mode,
+            line: text(open, "line")?.to_owned(),
+            cr: open
+                .get("cr")
+                .and_then(Value::as_bool)
+                .ok_or(Unreadable::Field { name })?,
+            partial,
+        },
     })
 }
 
@@ -1099,7 +1219,7 @@ fn merge(earlier: &mut Output, later: Output) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use brindle_transcript::{HoldReason, Slot, TurnState};
+    use brindle_transcript::{Exit, HoldReason, Slot, TurnState};
     use reduce::{Command, Refused, step};
 
     /// A fixed-seed xorshift, so the fuzz run is the same every time.
@@ -2722,6 +2842,180 @@ mod tests {
                 // What reads encodes again.
                 encode(&adopted.session).expect("it fits");
             }
+        }
+    }
+
+    // --- tool content (`agents-tool-content` decision 8) -----------------
+
+    fn tool_update(meta: Value, content: Value) -> Vec<u8> {
+        update(
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+            "content": content, "_meta": meta}),
+        )
+    }
+
+    /// A session mid-turn with a diff, and an output whose last piece ended
+    /// inside an escape sequence and a character.
+    fn with_tool_content(stored: Option<&mut Stored>) -> Agent {
+        let mut agent = Agent::ready();
+        let mut seen = Vec::new();
+        seen.push(agent.prompt("go"));
+        seen.push(agent.feed(&update(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "Edit", "kind": "edit",
+            "content": [{"type": "diff", "path": "/w/a", "oldText": "1\n2\n", "newText": "1\nb\n"},
+                {"type": "terminal", "terminalId": "t1"}]}),
+        )));
+        seen.push(agent.feed(&tool_update(
+            json!({"terminal_info": {"terminal_id": "t1", "cwd": "/w"},
+                "terminal_output_delta": {"terminal_id": "t1", "data": "line\n\u{1b}[3"}}),
+            Value::Null,
+        )));
+        // Data is a JSON string, so no character arrives cut; the escape
+        // sequence is what stays held between pieces.
+        seen.push(agent.feed(&tool_update(
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": "1mbold"}}),
+            Value::Null,
+        )));
+        if let Some(stored) = stored {
+            for out in seen {
+                stored.saw(out);
+            }
+        }
+        agent
+    }
+
+    #[test]
+    fn a_session_with_tool_content_round_trips_whole_and_as_segments() {
+        let agent = with_tool_content(None);
+        let open = agent.s.outputs.get("t1").expect("open");
+        assert_eq!(open.filter.line, "bold");
+        let decoded = agent.round_trip();
+        assert_eq!(decoded, agent.s);
+        // A sequence cut between two pieces, restored, is still removed.
+        let mut agent = with_tool_content(None);
+        agent.feed(&tool_update(
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": "\u{1b}[3"}}),
+            Value::Null,
+        ));
+        assert_eq!(agent.s.outputs["t1"].filter.mode, Mode::Csi);
+        let mut restored = Agent {
+            s: agent.round_trip(),
+            now: agent.now,
+        };
+        assert_eq!(restored.s, agent.s);
+        restored.feed(&tool_update(
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": "2mtail\n"},
+                "terminal_exit": {"terminal_id": "t1", "exit_code": 0}}),
+            Value::Null,
+        ));
+        let Some(Entry::Tool { content, .. }) = entries(&restored.s).into_iter().nth(1) else {
+            panic!("no tool");
+        };
+        assert!(
+            matches!(&content[1], ToolItem::Output(output) if output.text == "line\nboldtail\n" && output.cwd.as_deref() == Some("/w")),
+            "{content:?}"
+        );
+        // As a base and segments, the last one mid-sequence.
+        let base = Agent::ready();
+        let mut stored = Stored::whole(&base.s);
+        let mut agent = with_tool_content(Some(&mut stored));
+        stored.append(&agent.s);
+        let out = agent.feed(&tool_update(
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": " more\u{1b}]0;ti"}}),
+            Value::Null,
+        ));
+        stored.saw(out);
+        stored.append(&agent.s);
+        assert_eq!(stored.decode(agent.now), agent.s);
+    }
+
+    #[test]
+    fn tool_output_is_merged_per_item_within_its_limit_keeping_the_later_exit_and_folds_the_same() {
+        let output = |id, item, text: &str, exit| Event::ToolOutput {
+            id: EntryId(id),
+            item,
+            text: text.into(),
+            exit,
+        };
+        let done = Some(Exit::Code { code: 0 });
+        assert_eq!(
+            merged(&[
+                output(1, 0, "a", None),
+                output(1, 0, "b", done.clone()),
+                output(1, 0, "c", None),
+                output(1, 1, "x", None),
+                output(1, 0, "d", None),
+            ]),
+            [
+                output(1, 0, "ab", done.clone()),
+                // Nothing follows an exit into its event.
+                output(1, 0, "c", None),
+                output(1, 1, "x", None),
+                output(1, 0, "d", None),
+            ]
+        );
+        let half = "y".repeat(ITEM_LIMIT / 2 + 1);
+        assert_eq!(
+            merged(&[output(1, 0, &half, None), output(1, 0, &half, None)]).len(),
+            2,
+            "a merge never passes ITEM_LIMIT"
+        );
+        // Streamed output makes a segment of a few events folding the same.
+        let mut agent = Agent::ready();
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.prompt("go"));
+        for n in 0..200 {
+            stored.saw(agent.feed(&tool_update(
+                json!({"terminal_output_delta": {"terminal_id": "t1", "data": format!("{n}\n")}}),
+                Value::Null,
+            )));
+        }
+        let unsaved = stored.unsaved.len();
+        stored.append(&agent.s);
+        let mut rest = &stored.bytes[PREFIX_LEN..];
+        next_record(&mut rest).expect("a base");
+        let segment = next_record(&mut rest)
+            .expect("a record")
+            .expect("a segment");
+        let state: Value = serde_json::from_slice(segment.state).expect("JSON");
+        let written = state["events"].as_array().expect("events").len();
+        assert!(written < unsaved / 10, "{written} of {unsaved}");
+        assert_eq!(stored.decode(agent.now), agent.s);
+    }
+
+    #[test]
+    fn an_open_output_naming_no_output_item_is_unreadable() {
+        let agent = with_tool_content(None);
+        let (state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        assert!(state["outputs"]["t1"].is_object(), "{state}");
+        let mut no_entry = state.clone();
+        no_entry["outputs"]["t1"]["entry"] = json!(99);
+        let mut not_output = state.clone();
+        // Item 0 is the diff.
+        not_output["outputs"]["t1"]["item"] = json!(0);
+        let mut user = state.clone();
+        user["outputs"]["t1"]["entry"] = json!(1);
+        user["outputs"]["t1"]["item"] = json!(1);
+        for (bad, entry) in [(no_entry, 99), (not_output, 2), (user, 1)] {
+            assert_eq!(
+                decode(&rebuild(&bad, &partial), agent.now),
+                Err(Unreadable::Entry {
+                    name: "outputs",
+                    entry: EntryId(entry)
+                }),
+                "{bad}"
+            );
+        }
+        let mut bad_mode = state.clone();
+        bad_mode["outputs"]["t1"]["mode"] = json!("teleport");
+        let mut long_partial = state;
+        long_partial["outputs"]["t1"]["partial"] = json!([1, 2, 3, 4]);
+        for bad in [bad_mode, long_partial] {
+            assert_eq!(
+                decode(&rebuild(&bad, &partial), agent.now),
+                Err(Unreadable::Field { name: "outputs" })
+            );
         }
     }
 }

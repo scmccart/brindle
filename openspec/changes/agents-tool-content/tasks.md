@@ -99,12 +99,12 @@ Before starting, check these:
 
 ## 3. Pure code in the server
 
-- [ ] 3.1 **Add the `similar` dependency** to `brindle-remote-agent` as design decision 4 says: `cargo add similar@3.2.1 --no-default-features -F text -p brindle-remote-agent`, or the default features only if `text` doesn't build without `std`.
+- [x] 3.1 **Add the `similar` dependency** to `brindle-remote-agent` as design decision 4 says: `cargo add similar@3.2.1 --no-default-features -F text -p brindle-remote-agent`, or the default features only if `text` doesn't build without `std`.
   - Check that `git diff Cargo.lock` shows exactly one added package and one added dependency name. If anything else moved, revert and pin.
   - Add `similar` to the crate's `ALLOWED` list in `tests/architecture.rs`, `ports R3`'s text and `.claude/rules/remote-agent.md`.
   - Add `only_the_diff_module_names_similar`, which also refuses `deadline` and `timeout` in `diff.rs`.
   - Verify: `cargo test -p brindle --test architecture` passes.
-- [ ] 3.2 **Add `acp/diff.rs`.** `hunks(old, new) -> Diffed`, over `similar`'s `Algorithm::Myers` with no deadline or timeout:
+- [x] 3.2 **Add `acp/diff.rs`.** `hunks(old, new) -> Diffed`, over `similar`'s `Algorithm::Myers` with no deadline or timeout:
   - a line diff;
   - groups with three lines of context, turned into `Hunk`s with 1-based starts and lines without their line breaks;
   - lines kept up to `ITEM_LIMIT`, the rest counted;
@@ -118,7 +118,7 @@ Before starting, check these:
     - 50,000 lines against 50,000 unrelated lines finishing and cut at `ITEM_LIMIT`;
     - the guard;
     - the same inputs giving the same hunks twice.
-- [ ] 3.3 **Add `acp/plain.rs`.** `feed(state, bytes) -> String`:
+- [x] 3.3 **Add `acp/plain.rs`.** `feed(state, bytes) -> String`:
   - removes CSI, OSC, DCS and the other string forms, and single-character escapes;
   - keeps `\n` and `\t`;
   - keeps only what follows a line's last carriage return;
@@ -130,7 +130,7 @@ Before starting, check these:
     - a progress line;
     - an unterminated string form bounded in what it holds back;
     - invalid UTF-8.
-- [ ] 3.4 **Add the tool content mapping to `acp/v1/decode.rs`** (design decisions 3 and 6, flag 14).
+- [x] 3.4 **Add the tool content mapping to `acp/v1/decode.rs`** (design decisions 3 and 6, flag 14).
   - The crate decodes the update with `content`, `locations`, `rawInput`, `rawOutput` and `_meta` taken out.
   - Items are decoded one at a time, with a count of those unreadable.
   - `RawDiff`, `Terminal { terminal }`, `locations`, and `rawInput` and `rawOutput` as text.
@@ -143,7 +143,7 @@ Before starting, check these:
     - an unknown `type`;
     - a non-text block;
     - raw values that are a string, an object and a 9 MiB string.
-- [ ] 3.5 **Extend the reducer's tool handling** (`Step::tool_call`, `tool_change`, `add_tool`, `change_tool` and `permission`).
+- [x] 3.5 **Extend the reducer's tool handling** (`Step::tool_call`, `tool_change`, `add_tool`, `change_tool` and `permission`).
   - The upsert over `Patch` fields.
   - `RawDiff` becomes a `FileChange` through `diff::hunks`.
   - Every bound of design decision 5 is applied before an event is made.
@@ -159,7 +159,7 @@ Before starting, check these:
     - Copilot's differing title;
     - Codex's `pwd` ending as one `Output` with text `/home/user/scratch\n` and exit 0;
     - a muted load applying no content.
-- [ ] 3.6 **Extend `acp/checkpoint.rs`** (format 2, amended).
+- [x] 3.6 **Extend `acp/checkpoint.rs`** (format 2, amended).
   - The new entry fields.
   - `outputs` in the base's and every segment's state; absent is none.
   - `merged` merges consecutive `ToolOutput`s of one item up to `ITEM_LIMIT`, keeping the later exit.
@@ -170,7 +170,7 @@ Before starting, check these:
     - the merged `ToolOutput`s fold to the same log;
     - a format 2 and a format 1 checkpoint written before this change still decode;
     - an output naming no entry is `Unreadable`.
-- [ ] 3.7 **Extend the capture replay test in `reduce.rs`** to assert what each agent's tool content becomes: Claude's and Antigravity's file changes, Claude's `-auto` new file, Copilot's raw input, Codex's output, and the captures of 1.1. Also assert no panic and no unbounded entry.
+- [x] 3.7 **Extend the capture replay test in `reduce.rs`** to assert what each agent's tool content becomes: Claude's and Antigravity's file changes, Claude's `-auto` new file, Copilot's raw input, Codex's output, and the captures of 1.1. Also assert no panic and no unbounded entry.
 
 ## 4. Server roles
 

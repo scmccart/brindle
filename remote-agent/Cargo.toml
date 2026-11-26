@@ -21,6 +21,7 @@ agent-client-protocol-schema = { version = "=1.22.0", default-features = false }
 brindle-remote-protocol = { path = "../remote-protocol" }
 brindle-term-core = { path = "../term-core" }
 brindle-transcript = { path = "../transcript" }
+similar = { version = "3.2.1", default-features = false, features = ["text"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

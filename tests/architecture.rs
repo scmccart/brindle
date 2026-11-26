@@ -45,6 +45,7 @@ const ALLOWED: [(&str, &[&str]); 5] = [
             "brindle-transcript",
             "embed-resource",
             "libc",
+            "similar",
             "windows",
         ],
     ),
@@ -798,6 +799,34 @@ fn only_the_markdown_module_names_the_parser() {
     );
 }
 
+/// The line diff's one door in the helper (ports R3): no source but
+/// `remote-agent/src/acp/diff.rs` names `similar`, and the diff itself sets
+/// no deadline or timeout, so the same texts always give the same hunks
+/// (`agents-tool-content` decision 4).
+#[test]
+fn only_the_diff_module_names_similar() {
+    let door = Path::new("remote-agent/src/acp/diff.rs");
+    let mut files = sources("remote-agent/src");
+    assert!(
+        files.iter().any(|file| file == door),
+        "{} is missing",
+        door.display()
+    );
+    files.extend(sources("remote-agent/tests"));
+    files.extend(sources("src"));
+    files.retain(|file| file != door);
+    assert_none(
+        offenders(&files, Scope::All, &["similar"]),
+        "only remote-agent/src/acp/diff.rs names similar \
+         (docs/architecture/ports-and-adapters.md R3)",
+    );
+    assert_none(
+        offenders(&[door.to_path_buf()], Scope::All, &["deadline", "timeout"]),
+        "acp/diff.rs diffs with no deadline or timeout, so its hunks are deterministic \
+         (agents-tool-content decision 4)",
+    );
+}
+
 /// ports R2: components reach the system only through gpui.
 #[test]
 fn brindle_ui_does_no_io_of_its_own() {
@@ -1095,7 +1124,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 63] = [
+const PURE_MODULES: [&str; 65] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1154,6 +1183,8 @@ const PURE_MODULES: [&str; 63] = [
     "remote-agent/src/acp/dialect.rs",
     "remote-agent/src/acp/v1/decode.rs",
     "remote-agent/src/acp/v1/encode.rs",
+    "remote-agent/src/acp/diff.rs",
+    "remote-agent/src/acp/plain.rs",
     "remote-agent/src/acp/lines.rs",
     "remote-agent/src/acp/rpc.rs",
     "remote-agent/src/acp/reduce.rs",

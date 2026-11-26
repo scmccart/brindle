@@ -14,7 +14,9 @@
 //!   the only `match` on it.
 //! - [`v1`]: ACP v1 decoded into the forms through the schema crate's types,
 //!   and the forms' requests encoded as v1 lines.
+//! - [`diff`]: a file change's hunks from its old and new text.
 //! - [`lines`]: stdout split into bounded lines ([`lines::Lines`]).
+//! - [`plain`]: a command's output as plain text.
 //! - [`rpc`]: the request bookkeeping ([`rpc::Rpc`]), which keeps the
 //!   session's dialect and takes each line from it.
 //! - [`reduce`]: the reducer ([`reduce::step`] over a [`reduce::AgentSession`]),
@@ -28,9 +30,11 @@
 
 pub mod checkpoint;
 pub mod dialect;
+pub mod diff;
 pub mod envelope;
 pub mod forms;
 pub mod lines;
+pub mod plain;
 pub mod reduce;
 pub mod rpc;
 pub mod v1;

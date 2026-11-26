@@ -32,17 +32,18 @@
 use std::collections::BTreeMap;
 
 use agent_client_protocol_schema::v1 as acp;
-use brindle_remote_protocol::serde_json::{self, Value};
+use brindle_remote_protocol::serde_json::{self, Map, Value};
 use brindle_transcript::{
-    LoginKind, LoginMethod, PermissionKind, StopReason, ToolKind, ToolStatus,
+    Exit, Location, LoginKind, LoginMethod, PermissionKind, StopReason, ToolKind, ToolStatus,
 };
 
 use crate::acp::envelope::{BadParams, Id, RpcError};
 use crate::acp::forms::{
     AgentInfo, Content, ContentKind, Continued, Initialized, MAX_LOGIN_ARG, MAX_LOGIN_ARGS,
     MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
-    NewSession, NotificationKind, OptionKind, Patch, PermissionRequest, RequestKind,
-    RequestedOption, SessionUpdate, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
+    NewSession, NotificationKind, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
+    RequestedOption, SessionUpdate, ToolCall, ToolChange, ToolDetail, ToolItemForm,
+    UNSUPPORTED_VERSION, Update,
 };
 use brindle_transcript::Continuation;
 
@@ -344,27 +345,179 @@ fn content(block: acp::ContentBlock) -> Content {
     }
 }
 
+/// The fields of a tool call read by hand (design decision 3): taken out
+/// before the crate decodes the rest, so one bad item never costs the
+/// update.
+const BY_HAND: [&str; 5] = ["content", "locations", "rawInput", "rawOutput", "_meta"];
+
+/// The update without [`BY_HAND`]'s fields, and those fields.
+fn split(update: &Value) -> (Value, Map<String, Value>) {
+    let mut rest = update.clone();
+    let mut taken = Map::new();
+    if let Some(object) = rest.as_object_mut() {
+        for key in BY_HAND {
+            if let Some(value) = object.remove(key) {
+                taken.insert(key.to_owned(), value);
+            }
+        }
+    }
+    (rest, taken)
+}
+
 fn tool_call(update: &Value) -> Result<ToolCall, BadParams> {
+    let (rest, taken) = split(update);
     let call: acp::ToolCall =
-        serde_json::from_value(update.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(rest).map_err(|e| BadParams::from_serde(&e))?;
+    let mut detail = tool_detail(&taken);
+    // A new call with no content has none.
+    if detail.content == Patch::Keep {
+        detail.content = Patch::Set(Vec::new());
+    }
     Ok(ToolCall {
         call: call.tool_call_id.0.to_string(),
         title: call.title,
         kind: tool_kind(call.kind),
         status: tool_status(call.status).unwrap_or(ToolStatus::Pending),
+        detail,
     })
 }
 
 fn tool_change(update: &Value) -> Result<ToolChange, BadParams> {
+    let (rest, taken) = split(update);
     let update: acp::ToolCallUpdate =
-        serde_json::from_value(update.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(rest).map_err(|e| BadParams::from_serde(&e))?;
     // v1 can't clear a tool call's field: `null` reads as left out.
     Ok(ToolChange {
         call: update.tool_call_id.0.to_string(),
         title: Patch::kept_or_set(update.fields.title),
         kind: Patch::kept_or_set(update.fields.kind.map(tool_kind)),
         status: Patch::kept_or_set(update.fields.status.and_then(tool_status)),
+        detail: tool_detail(&taken),
     })
+}
+
+/// [`BY_HAND`]'s fields, read one at a time. A field that is absent or
+/// `null` is kept (v1 can't clear one); `content` that isn't a list counts
+/// as one unreadable item.
+fn tool_detail(taken: &Map<String, Value>) -> ToolDetail {
+    let mut detail = ToolDetail::default();
+    match taken.get("content") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(items)) => {
+            let mut kept = Vec::new();
+            for item in items {
+                match tool_item(item) {
+                    Some(item) => kept.push(item),
+                    None => detail.unreadable = detail.unreadable.saturating_add(1),
+                }
+            }
+            detail.content = Patch::Set(kept);
+        }
+        Some(_) => detail.unreadable = 1,
+    }
+    if let Some(Value::Array(list)) = taken.get("locations") {
+        detail.locations = Patch::Set(
+            list.iter()
+                .filter_map(|location| {
+                    let location: acp::ToolCallLocation =
+                        serde_json::from_value(location.clone()).ok()?;
+                    Some(Location {
+                        path: location.path.to_string_lossy().into_owned(),
+                        line: location.line,
+                    })
+                })
+                .collect(),
+        );
+    }
+    detail.input = raw(taken.get("rawInput"));
+    detail.result = raw(taken.get("rawOutput"));
+    if let Some(meta) = taken.get("_meta") {
+        detail.outputs = terminal_meta(meta);
+    }
+    detail
+}
+
+/// One content item, through the crate's `ToolCallContent`; an item of a
+/// type the crate doesn't know is [`ToolItemForm::Unknown`], and one that
+/// doesn't decode is `None`.
+#[allow(
+    clippy::wildcard_enum_match_arm,
+    reason = "foreign enum: ToolCallContent, which is non_exhaustive"
+)]
+fn tool_item(item: &Value) -> Option<ToolItemForm> {
+    let kind = item.get("type")?.as_str()?;
+    if !matches!(kind, "content" | "diff" | "terminal") {
+        return Some(ToolItemForm::Unknown {
+            kind: kind.to_owned(),
+        });
+    }
+    let item: acp::ToolCallContent = serde_json::from_value(item.clone()).ok()?;
+    Some(match item {
+        acp::ToolCallContent::Content(block) => ToolItemForm::Content(content(block.content)),
+        acp::ToolCallContent::Diff(diff) => ToolItemForm::RawDiff {
+            path: diff.path.to_string_lossy().into_owned(),
+            old: diff.old_text,
+            new: diff.new_text,
+        },
+        acp::ToolCallContent::Terminal(terminal) => ToolItemForm::Terminal {
+            terminal: terminal.terminal_id.0.to_string(),
+        },
+        _ => ToolItemForm::Unknown {
+            kind: kind.to_owned(),
+        },
+    })
+}
+
+/// `rawInput` or `rawOutput` as text: a string as itself, anything else as
+/// indented JSON; absent or `null` keeps it.
+fn raw(value: Option<&Value>) -> Patch<String> {
+    match value {
+        None | Some(Value::Null) => Patch::Keep,
+        Some(Value::String(text)) => Patch::Set(text.clone()),
+        Some(value) => serde_json::to_string_pretty(value).map_or(Patch::Keep, Patch::Set),
+    }
+}
+
+/// Codex's terminal convention in `_meta` (flag 1; decision 6's As built):
+/// `terminal_info`, `terminal_output_delta` and `terminal_exit`, in that
+/// order. Each needs a string `terminal_id`; one without is left out.
+fn terminal_meta(meta: &Value) -> Vec<OutputForm> {
+    let mut outputs = Vec::new();
+    let field = |key: &str| meta.get(key).filter(|value| value.is_object());
+    let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_owned);
+    if let Some(info) = field("terminal_info")
+        && let Some(terminal) = text(info, "terminal_id")
+    {
+        outputs.push(OutputForm::Opened {
+            terminal,
+            cwd: text(info, "cwd"),
+            command: text(info, "command"),
+        });
+    }
+    if let Some(delta) = field("terminal_output_delta")
+        && let Some(terminal) = text(delta, "terminal_id")
+        && let Some(data) = text(delta, "data")
+    {
+        outputs.push(OutputForm::Appended {
+            terminal,
+            bytes: data.into_bytes(),
+        });
+    }
+    if let Some(exit) = field("terminal_exit")
+        && let Some(terminal) = text(exit, "terminal_id")
+    {
+        let code = exit
+            .get("exit_code")
+            .and_then(Value::as_i64)
+            .and_then(|code| i32::try_from(code).ok());
+        let exit = match (code, text(exit, "signal")) {
+            (Some(code), _) => Some(Exit::Code { code }),
+            (None, Some(name)) => Some(Exit::Signal { name }),
+            (None, None) => None,
+        };
+        outputs.push(OutputForm::Exited { terminal, exit });
+    }
+    outputs
 }
 
 #[allow(
@@ -471,7 +624,6 @@ mod tests {
     use super::*;
     use crate::acp::envelope::{Malformed, Message, decode};
     use crate::acp::forms::AUTH_REQUIRED;
-    use brindle_remote_protocol::serde_json::Map;
 
     fn ok(line: &str) -> Message {
         decode(line.as_bytes()).unwrap_or_else(|e| panic!("{line}: {e:?}"))
@@ -1461,6 +1613,7 @@ mod tests {
             title: Patch::Set("Teleport a file".into()),
             kind: Patch::Set(ToolKind::Other),
             status,
+            detail: ToolDetail::default(),
         };
         let option = |id: &str, name: &str, kind| RequestedOption {
             id: id.into(),
@@ -1481,6 +1634,10 @@ mod tests {
                     title: "Teleport a file".into(),
                     kind: ToolKind::Other,
                     status: ToolStatus::Pending,
+                    detail: ToolDetail {
+                        content: Patch::Set(Vec::new()),
+                        ..ToolDetail::default()
+                    },
                 })),
                 Decoded::Update(Update::ToolChanged(ToolChange {
                     title: Patch::Keep,
@@ -1639,5 +1796,235 @@ mod tests {
                 let _ = cancel_request(&value);
             }
         }
+    }
+
+    // --- tool content (`agents-tool-content` task 3.4) -------------------
+
+    /// Every tool call, update and permission request's detail in a capture.
+    fn details(bytes: &[u8]) -> Vec<ToolDetail> {
+        decode_capture(bytes)
+            .1
+            .into_iter()
+            .flatten()
+            .filter_map(|line| match line {
+                Decoded::Update(Update::ToolCall(call)) => Some(call.detail),
+                Decoded::Update(Update::ToolChanged(change)) => Some(change.detail),
+                Decoded::Permission(request) => request.call.map(|call| call.detail),
+                Decoded::Update(_)
+                | Decoded::Initialized(_)
+                | Decoded::NewSession
+                | Decoded::Stopped(_)
+                | Decoded::NotBrindles
+                | Decoded::Ignored
+                | Decoded::Bad(_) => None,
+            })
+            .collect()
+    }
+
+    fn capture(name: &str) -> &'static [u8] {
+        CAPTURES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, bytes)| *bytes)
+            .unwrap_or_else(|| panic!("no capture {name}"))
+    }
+
+    #[test]
+    fn every_captured_tool_calls_content_reads_whole() {
+        let mut items = 0;
+        for (name, bytes) in CAPTURES {
+            for detail in details(bytes) {
+                assert_eq!(detail.unreadable, 0, "{name}: {detail:?}");
+                if let Patch::Set(content) = &detail.content {
+                    items += content.len();
+                    for item in content {
+                        assert!(
+                            !matches!(item, ToolItemForm::Unknown { .. }),
+                            "{name}: {item:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(items > 20, "{items}");
+        // The edits: Claude's fragment and Antigravity's request and
+        // whole file, each a diff with its old text.
+        for name in [
+            "claude-agent-acp-0.112.0-edit-run",
+            "antigravity-1.5.16-edit-run",
+        ] {
+            let diffs: Vec<(String, Option<String>, String)> = details(capture(name))
+                .into_iter()
+                .filter_map(|detail| match detail.content {
+                    Patch::Set(items) => Some(items),
+                    Patch::Keep | Patch::Clear => None,
+                })
+                .flatten()
+                .filter_map(|item| match item {
+                    ToolItemForm::RawDiff { path, old, new } => Some((path, old, new)),
+                    ToolItemForm::Content(_)
+                    | ToolItemForm::Terminal { .. }
+                    | ToolItemForm::Unknown { .. } => None,
+                })
+                .collect();
+            assert!(!diffs.is_empty(), "{name}");
+            for (path, old, new) in diffs {
+                assert!(path.ends_with("notes.txt"), "{name}: {path}");
+                assert!(old.is_some_and(|old| old.contains("apple")), "{name}");
+                assert!(new.contains("banana"), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn codexs_meta_updates_read_as_output_forms() {
+        let outputs: Vec<OutputForm> = details(capture("codex-acp-2.12.0-edit-run"))
+            .into_iter()
+            .flat_map(|detail| detail.outputs)
+            .collect();
+        assert!(outputs.iter().any(|form| matches!(form,
+            OutputForm::Opened { cwd: Some(cwd), command: None, .. } if cwd == "/home/user/scratch")));
+        assert!(outputs.iter().any(|form| matches!(form,
+            OutputForm::Appended { bytes, .. } if bytes == b"1\n2\n3\n4\n")));
+        assert!(outputs.iter().any(|form| matches!(
+            form,
+            OutputForm::Exited {
+                exit: Some(Exit::Code { code: 0 }),
+                ..
+            }
+        )));
+        // The rejected command's exit has neither a code nor a signal.
+        let rejected: Vec<OutputForm> = details(capture("codex-acp-2.12.0-reject"))
+            .into_iter()
+            .flat_map(|detail| detail.outputs)
+            .collect();
+        assert!(
+            rejected
+                .iter()
+                .any(|form| matches!(form, OutputForm::Exited { exit: None, .. })),
+            "{rejected:?}"
+        );
+    }
+
+    fn changed(update: Value) -> ToolChange {
+        let mut params =
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"});
+        if let (Some(params), Some(update)) = (params.as_object_mut(), update.as_object()) {
+            params.extend(update.clone());
+        }
+        match session_update(&json!({"sessionId": "s", "update": params})) {
+            Ok(SessionUpdate {
+                update: Update::ToolChanged(change),
+                ..
+            }) => change,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_item_is_left_out_and_counted_keeping_the_update() {
+        let change = changed(json!({"content": [
+            {"type": "content", "content": {"type": "text", "text": "ok"}},
+            {"type": "diff", "path": "/a", "oldText": "x"},
+            {"type": "content"},
+            {"no": "type"},
+            {"type": "hologram", "id": 1},
+            {"type": "content", "content": {"type": "image", "data": "", "mimeType": "image/png"}},
+            {"type": "diff", "path": "/b", "newText": "new"},
+            {"type": "terminal", "terminalId": "t1"},
+        ]}));
+        assert_eq!(change.status, Patch::Set(ToolStatus::Completed));
+        assert_eq!(change.detail.unreadable, 3);
+        assert_eq!(
+            change.detail.content,
+            Patch::Set(vec![
+                ToolItemForm::Content(Content::Text("ok".into())),
+                ToolItemForm::Unknown {
+                    kind: "hologram".into()
+                },
+                ToolItemForm::Content(Content::Other(ContentKind::Image)),
+                ToolItemForm::RawDiff {
+                    path: "/b".into(),
+                    old: None,
+                    new: "new".into()
+                },
+                ToolItemForm::Terminal {
+                    terminal: "t1".into()
+                },
+            ])
+        );
+        // Content that isn't a list is one unreadable item.
+        let change = changed(json!({"content": {"type": "terminal"}}));
+        assert_eq!(
+            (change.detail.unreadable, change.detail.content),
+            (1, Patch::Keep)
+        );
+        // No content, or null, keeps the call's.
+        assert_eq!(changed(json!({})).detail.content, Patch::Keep);
+        assert_eq!(
+            changed(json!({"content": null})).detail.content,
+            Patch::Keep
+        );
+    }
+
+    #[test]
+    fn raw_values_read_as_text_and_locations_by_their_path() {
+        let change = changed(json!({
+            "rawInput": "ls -la",
+            "rawOutput": {"output": "a\n", "exit_code": 0},
+            "locations": [{"path": "/w/a.rs", "line": 3}, {"path": "/w/b.rs"}, {"line": 4}],
+        }));
+        assert_eq!(change.detail.input, Patch::Set("ls -la".into()));
+        assert_eq!(
+            change.detail.result,
+            // Indented, in the order sent.
+            Patch::Set("{\n  \"output\": \"a\\n\",\n  \"exit_code\": 0\n}".into())
+        );
+        assert_eq!(
+            change.detail.locations,
+            Patch::Set(vec![
+                Location {
+                    path: "/w/a.rs".into(),
+                    line: Some(3)
+                },
+                Location {
+                    path: "/w/b.rs".into(),
+                    line: None
+                },
+            ])
+        );
+        // A 9 MiB string reads whole; the reducer bounds it.
+        let huge = "r".repeat(9 * 1024 * 1024);
+        assert_eq!(
+            changed(json!({"rawInput": huge})).detail.input,
+            Patch::Set(huge)
+        );
+        assert_eq!(changed(json!({"rawInput": null})).detail.input, Patch::Keep);
+    }
+
+    #[test]
+    fn a_new_call_without_content_has_none() {
+        let Ok(SessionUpdate {
+            update: Update::ToolCall(call),
+            ..
+        }) = session_update(&json!({"sessionId": "s", "update":
+            {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run"}}))
+        else {
+            panic!("didn't decode");
+        };
+        assert_eq!(call.detail.content, Patch::Set(Vec::new()));
+        // A permission request's toolCall reads the same way.
+        let Ok(request) = permission_request(&json!({"sessionId": "s", "options": [],
+            "toolCall": {"toolCallId": "c1", "rawInput": {"command": "rm"},
+                "content": [{"type": "diff", "path": "/a", "oldText": "1", "newText": "2"}]}}))
+        else {
+            panic!("didn't decode");
+        };
+        let detail = request.call.map(|call| call.detail).unwrap_or_default();
+        assert_eq!(
+            detail.input,
+            Patch::Set("{\n  \"command\": \"rm\"\n}".into())
+        );
+        assert!(matches!(&detail.content, Patch::Set(items) if items.len() == 1));
     }
 }

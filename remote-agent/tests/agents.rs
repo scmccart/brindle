@@ -2937,7 +2937,11 @@ fn a_pending_permission_behind_2_mib_is_in_the_page_and_answerable() {
     let pending = permissions(&page);
     assert_eq!(pending.len(), 1, "the pending permission is in the page");
     let entry = pending[0].0;
-    assert_eq!(window.from, EntryId(entry), "the page starts at it");
+    // The request named a tool call the log didn't have, which was added
+    // right before it (`agents-tool-content` decision 7): the page starts
+    // at that tool entry.
+    assert!(matches!(page.entry(EntryId(entry - 1)), Some(Entry::Tool { .. })));
+    assert_eq!(window.from, EntryId(entry - 1), "the page starts at its tool entry");
     later.answer(id, entry, Some("allow-once")).unwrap();
     let log = later.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
     assert_eq!(says(&log).last().map(String::as_str), Some("agent: done"));
