@@ -333,7 +333,18 @@ rule, not a convenience.
     `arrow-down` button shows, which scrolls to the end and follows again
     (`scroll_to_end`). `scroll_page(PageDirection)` is the owner's page keys'
     way in (`page_scroll`, pure), and a page down that reaches the end
-    follows it (`Follow::after_draw`).
+    follows it (`Follow::after_draw`). A top row (an agent zone's "Earlier
+    messages") is the owner's to render (`with_top_row(render_top)`) and to
+    show (`show_top_row(bool)`, `refresh_top_row()` after it changes): it is
+    the list's first item, which the owner's indices don't count, so a page
+    up from the first item's top scrolls it into view.
+    `top_row_in_view()` says whether the last frame showed it, and
+    `on_top_row_view(callback)` is told when that changes. Items spliced in
+    at the owner's start leave every item in view where it was, except while
+    the row itself is in view: then the item that was first goes to the
+    view's top, moving up by what showed of the row. (GPUI's list draws its
+    top padding above whichever item is at its scroll position, so the row
+    can't live in the padding.)
   - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
     at the end on `muted`, as wide as its text up to four fifths of the
     row, the other side's (`Assistant`) at the start on the card with a
