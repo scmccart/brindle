@@ -126,7 +126,7 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - `--find` opens the find bar on the active terminal with TEXT as its query, as if the user had typed it;
 - `--wait-for` holds the steps after it until the active terminal's visible screen text, with its lines joined by line breaks, contains TEXT, unescaped as for `--send`. After 30 step intervals without it (30 seconds at the default interval), Brindle SHALL log a warning, record the wait as timed out, and run the remaining steps.
 
-`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H[ active]` line per zone in tree order (with normalized `[0, 1]` coordinates) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. For each `--wait-for` step that timed out, the dump SHALL print a `--- wait-for timeout "TEXT"` line (TEXT escaped onto one line), and for a `--wait-for` step still waiting when the dump is taken, a `--- wait-for pending "TEXT"` line, so a dump that shows an unexpected screen says which wait failed. These hooks SHALL NOT use synthetic OS-level input.
+`--dump-screen-after <SECONDS>` SHALL print every tab title, the active terminal's size and modes, the active terminal's grid geometry (the window-pixel origin of its first cell, its cell width and line height, and the window's scale factor), the link under the mouse while hover feedback is showing, the active terminal's selected text when there is a selection, one `--- status` line per program status record of the active terminal (root first, then by id: `state=` always, then `id=`, `kind=`, `progress=`, `app=`, `title=` and `msg=` when set, strings quoted), and its visible screen text, then quit. When the active tab is a local tab with two or more zones, the dump SHALL also print a `--- zones count=N active=ID` line followed by one `--- zone id=ID rect=X,Y,W,H kind=KIND profile="NAME"[ host="…"][ active]` line per zone in tree order (with normalized `[0, 1]` coordinates, and the zone's kind, profile and remote host as "Zone kinds and profiles in the dump" defines them) before the active terminal's screen text. While a text input has focus, the dump SHALL also print that input's text, cursor offset and selection. When the active terminal's find bar is open, the dump SHALL also include a line with its query, options, match count and the current match's position on screen. For each `--wait-for` step that timed out, the dump SHALL print a `--- wait-for timeout "TEXT"` line (TEXT escaped onto one line), and for a `--wait-for` step still waiting when the dump is taken, a `--- wait-for pending "TEXT"` line, so a dump that shows an unexpected screen says which wait failed. These hooks SHALL NOT use synthetic OS-level input.
 
 #### Scenario: Scripted check
 - **WHEN** Brindle runs with `--send 'echo hi\r' --dump-screen-after 3`
@@ -193,8 +193,8 @@ For automated testing, Brindle SHALL support repeatable `--send <TEXT>`, `--acti
 - **THEN** stdout contains the line `--- status state=blocked kind=auth app="brew"`
 
 #### Scenario: Zones in the dump
-- **WHEN** Brindle runs in a local tab with `--action split_zone_right --dump-screen-after 3`
-- **THEN** stdout contains `--- zones count=2 active=2`, `--- zone id=1 rect=0,0,0.5,1` and `--- zone id=2 rect=0.5,0,0.5,1 active`, and a single-zone local tab prints no `--- zones` line
+- **WHEN** Brindle runs in a local tab of profile `Shell` with `--action split_terminal_right --dump-screen-after 3`
+- **THEN** stdout contains `--- zones count=2 active=2`, `--- zone id=1 rect=0,0,0.5,1 kind=terminal profile="Shell"` and `--- zone id=2 rect=0.5,0,0.5,1 kind=terminal profile="Shell" active`, and a single-zone local tab prints no `--- zones` line
 
 ### Requirement: Latency log
 `--latency-log <FILE>` SHALL time every keystroke a terminal tab receives, whether typed or from `--latency-bench`, and append one JSON line per keystroke to FILE: the key, and the milliseconds until the program's output arrived, until that output was painted, and until the next frame began. On quit, Brindle SHALL print a summary to stderr. Without the option, no timing SHALL be recorded. If writing FILE fails, Brindle SHALL stop writing it and keep timing, and the summary SHALL say that the log stopped early, naming the file and the error.
@@ -723,3 +723,18 @@ After a tool call's `--- entry` line, whether its row is open or closed, the dum
 #### Scenario: Raw input only as the fallback
 - **WHEN** a tool call has a file change and a raw input
 - **THEN** the dump has no `--- raw` line for it
+
+### Requirement: Zone kinds and profiles in the dump
+Each `--- zone` line of `--dump-screen-after` SHALL say, after the zone's rectangle, its kind (`kind=terminal` or `kind=agent`) and its profile's name (`profile="NAME"`, escaped onto the line), and `host="…"` when the zone runs on a remote host, before `active`. The palette that asks which profile a split runs SHALL print as any palette list does and be driven by the same list actions.
+
+#### Scenario: A mixed tab's zone lines
+- **WHEN** a tab holds a shell of profile `Shell` and a focused agent zone of profile `Claude`, and the dump is taken
+- **THEN** it has a line `--- zone id=1 rect=… kind=terminal profile="Shell"` and a line `--- zone id=2 rect=… kind=agent profile="Claude" active`
+
+#### Scenario: A remote zone
+- **WHEN** one zone of the active tab runs on the SSH host `A8`
+- **THEN** its zone line holds `host=` naming `A8`, and the local zones' lines hold no `host=`
+
+#### Scenario: Driving the profile question
+- **WHEN** a run uses `--action split_agent_right` with two agent profiles, then `--action list_down` and `--action list_confirm`
+- **THEN** the dump shows a new agent zone of the second agent profile

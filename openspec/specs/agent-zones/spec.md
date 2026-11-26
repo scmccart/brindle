@@ -469,7 +469,7 @@ While an agent zone has focus, the command palette SHALL list Stop Agent Turn, R
 
 #### Scenario: Palette in an agent zone
 - **WHEN** an agent zone has focus and the user opens the command palette
-- **THEN** it lists "Stop Agent Turn", "Copy Last Code Block", "Toggle Tool Details" and "Split Zone Right", and not "Clear Scrollback"
+- **THEN** it lists "Stop Agent Turn", "Copy Last Code Block", "Toggle Tool Details", "Split Agent Right" and "Split Terminal Right", and not "Clear Scrollback"
 
 ### Requirement: Markdown in agent messages and thoughts
 Agent messages and thoughts SHALL be rendered as CommonMark with GitHub's strikethrough, task lists, tables and autolinks: paragraphs, headings, emphasis, inline code, code blocks, lists, quotes, rules and links. Footnotes, math and smart punctuation SHALL NOT be interpreted; their text shows as written. A line break inside a paragraph SHALL read as a space, as CommonMark says.
