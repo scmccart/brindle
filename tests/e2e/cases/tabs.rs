@@ -94,6 +94,14 @@ impl Strip {
         })
     }
 
+    /// The strip of a window captured in `image` at `scale`: along the
+    /// window's top, from its left edge. For a capture with no terminal's
+    /// grid in its dump to locate it from (an agent zone is active), or a
+    /// split tab's, whose grid sits under a zone header.
+    pub(super) fn window(image: &Image, scale: f32) -> Strip {
+        Strip { left: 0.0, top: 0.0, scale, window_width: image.width as f32 / scale }
+    }
+
     /// `w` x `h` logical pixels at `x`,`y` from the strip's top-left corner,
     /// in device pixels.
     pub(super) fn rect(&self, x: f32, y: f32, w: f32, h: f32) -> PxRect {
@@ -124,7 +132,7 @@ fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
 
 impl Strip {
     /// Tab `ix`'s face, clear of its rounded corners.
-    fn face(&self, ix: usize) -> PxRect {
+    pub(super) fn face(&self, ix: usize) -> PxRect {
         let left = FACE_LEFT + FACE_STEP * ix as f32;
         self.rect(left + 6.0, FACE_TOP + 5.0, 60.0, FACE_HEIGHT - 10.0)
     }

@@ -78,6 +78,8 @@ pub fn all() -> Vec<Case> {
         display("windows-elevation-badge", elevation_badge),
         display("windows-agent-turn", super::agent::turn).needs_fake_agent(),
         display("windows-agent-close-confirm", super::agent::close_confirm).needs_fake_agent(),
+        // An agent split of a PowerShell zone by its key (`zones-mixed-tabs`).
+        display("windows-agent-split", super::mixed::agent_beside_shell).needs_fake_agent(),
         // The agent never starts: no fake agent is run.
         display("windows-agent-batch-hint", agent_batch_hint),
         display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
@@ -909,13 +911,13 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
         None,
     )?;
     ensure!(split.dump.zones.as_deref() == Some("count=3 active=1"), "zones: {:?}", split.dump.zones);
+    let three = [
+        "id=1 rect=0,0,0.5,1 kind=terminal profile=\"cmd\" active",
+        "id=2 rect=0.5,0,0.5,0.5 kind=terminal profile=\"cmd\"",
+        "id=3 rect=0.5,0.5,0.5,0.5 kind=terminal profile=\"cmd\"",
+    ];
     ensure!(
-        split.dump.zone_list
-            == [
-                "id=1 rect=0,0,0.5,1 active",
-                "id=2 rect=0.5,0,0.5,0.5",
-                "id=3 rect=0.5,0.5,0.5,0.5",
-            ],
+        split.dump.zone_list == three,
         "zone_list: {:?}",
         split.dump.zone_list
     );
@@ -937,18 +939,13 @@ fn zones(ctx: &Ctx) -> Result<Outcome> {
     )?;
     ensure!(restored.dump.zones.as_deref() == Some("count=3 active=1"), "restored zones: {:?}", restored.dump.zones);
     ensure!(
-        restored.dump.zone_list
-            == [
-                "id=1 rect=0,0,0.5,1 active",
-                "id=2 rect=0.5,0,0.5,0.5",
-                "id=3 rect=0.5,0.5,0.5,0.5",
-            ],
+        restored.dump.zone_list == three,
         "restored zone_list: {:?}",
         restored.dump.zone_list
     );
     ensure!(screen(&restored.dump).contains("zone1-left"), "restored screen: {}", screen(&restored.dump));
     ensure!(
-        restored.dump.palette.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"),
+        restored.dump.palette.iter().any(|r| r == "Split Terminal Right  [ctrl-shift-e]"),
         "palette rows: {:?}",
         restored.dump.palette
     );

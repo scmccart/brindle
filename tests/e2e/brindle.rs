@@ -1470,11 +1470,13 @@ pub fn self_test_dump() -> Result {
     ensure!(Dump::parse("--- palette prompt \"Name\" text=\"\"\n").agent.is_empty(), "a palette prompt isn't an agent line");
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
-         --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",
+         --- zone id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell\"\n\
+         --- zone id=2 rect=0.5,0,0.5,1 kind=agent profile=\"Fake\" active\nhi\n",
     );
     ensure!(dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", dump.zones);
     ensure!(
-        dump.zone_list == ["id=1 rect=0,0,0.5,1", "id=2 rect=0.5,0,0.5,1 active"],
+        dump.zone_list
+            == ["id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell\"", "id=2 rect=0.5,0,0.5,1 kind=agent profile=\"Fake\" active"],
         "zone_list {:?}",
         dump.zone_list
     );
@@ -1483,11 +1485,11 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.screen == ["hi"], "screen before settings {:?}", dump.screen);
     ensure!(dump.settings.as_deref() == Some("section=Theme mode=list"), "settings {:?}", dump.settings);
     let dump = Dump::parse(
-        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- palette list query=\"splt\"\nSplit Zone Right  [ctrl-shift-e]\n\
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- palette list query=\"splt\"\nSplit Terminal Right  [ctrl-shift-e]\n\
          --- input text=\"split\" cursor=4 selection=1..4\n",
     );
     ensure!(dump.screen == ["hi"], "screen before the palette {:?}", dump.screen);
-    ensure!(dump.palette == ["list query=\"splt\"", "Split Zone Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
+    ensure!(dump.palette == ["list query=\"splt\"", "Split Terminal Right  [ctrl-shift-e]"], "palette {:?}", dump.palette);
     let input = Input { text: "split".into(), cursor: 4, selection: (1, 4) };
     ensure!(dump.input == Some(input), "input {:?}", dump.input);
     ensure!(dump.palette_highlighted().is_err(), "a header with no highlighted= has none to read");

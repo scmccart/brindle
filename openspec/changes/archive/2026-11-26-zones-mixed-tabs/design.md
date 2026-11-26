@@ -172,6 +172,17 @@ Each `--- zone` line gains `kind=` and `profile=` after its rectangle, and `host
 - **Remote** (`remote-*`, Docker): a local tab split with an SSH profile; that tab restored, and restored with the container stopped.
 - **Manual:** the header's split buttons and menu with a pointer; the tab's face changing colour as focus moves between zones of different themes; ctrl-shift-alt-e and ctrl-shift-alt-o on Linux and on Windows, with a layout that has AltGr.
 
+### 13. Flags
+
+Decided by the implementer when this change was refreshed on `agents-tool-content` (f806b12), each the recommended option, for the user's review:
+1. **A split starts in the split pane's directory** whenever both run on one host, even when the new profile sets its own `cwd` (decision 3), as recommended under "Choices made here".
+2. **A swept tab that spanned hosts comes back as one tab per host** (decision 9), as recommended.
+3. **The tab's face follows the active zone's theme** (decision 5), as recommended.
+4. **No `!` on the change.** ctrl-shift-e and ctrl-shift-o keep splitting a terminal pane with a terminal, all any released version (0.3.0 and before) did; they change meaning only in an agent pane, and agents are unreleased. `split_zone_right` and `split_zone_down` keep working as the terminal splits.
+5. **`command-line`'s "Debug automation hooks" is modified too**: its zone line format and its "Zones in the dump" scenario said `--- zone id=2 rect=0.5,0,0.5,1 active`, which the new `kind=` and `profile=` fields break.
+6. **`ui-theme-tokens`' "Chrome ignores per-tab themes" and `tabs`' "Tab faces" are left as they are**: they read correctly once "A tab follows its active zone" makes a tab's theme its active zone's, so decision 5's "wording becomes per zone" is carried by the `tabs` and `profiles` deltas.
+7. **A text area no longer binds ctrl-shift-e** (found by `zones-split-kinds`): `brindle-ui`'s `TextArea` bound it to select to the line's end, and an agent zone's prompt input is a text area, so the binding, nearer the focus, took ctrl-shift-e before the zone's Split Terminal Right could. The text area keeps shift-end for it; a one-line `TextInput` (palettes, the settings dialog, the find bar) keeps ctrl-shift-e, since none sits in an agent zone. `ui/README.md` lists the difference. *Rejected:* binding the split again in the prompt's own context (a second binding to keep in step with `[keys]`), and another default key for Split Terminal Right in agent zones (the user chose one key for both kinds of pane).
+
 ## The user's decisions
 
 Settled on 2026-11-26, one at a time:

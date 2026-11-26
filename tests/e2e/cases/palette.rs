@@ -10,12 +10,12 @@ use crate::brindle::{Input, Output, Run, state_dir, theme};
 use crate::capture::Image;
 use crate::{Ctx, Outcome, Result, ensure};
 
-/// "Split Zone Right" from the palette splits the tab as its shortcut
+/// "Split Terminal Right" from the palette splits the tab as its shortcut
 /// does: two zones side by side, with focus in the new, right one.
 pub fn zone_action(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "run")
         .action("open_command_palette")
-        .send("split zone right")
+        .send("split terminal right")
         .action("picker_confirm")
         .dump_at(5.0)
         .run()?;
@@ -307,8 +307,11 @@ pub fn lists_for_tab(ctx: &Ctx) -> Result<Outcome> {
     let local = rows(&out)?;
     let listed: Vec<&str> = local.iter().map(|r| label(r)).filter(|l| l.starts_with("tmux: ")).collect();
     ensure!(listed.is_empty(), "tmux commands in a local tab: {listed:?}");
-    ensure!(local.iter().any(|r| r == "Split Zone Right  [ctrl-shift-e]"), "local tab rows: {local:?}");
-    ensure!(local.iter().any(|r| r == "Split Zone Down  [ctrl-shift-o]"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| r == "Split Terminal Right  [ctrl-shift-e]"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| r == "Split Terminal Down  [ctrl-shift-o]"), "local tab rows: {local:?}");
+    ensure!(local.iter().any(|r| r == "Split Right With Profile…"), "local tab rows: {local:?}");
+    // The config has no agent profile, so the agent splits aren't listed.
+    ensure!(!local.iter().any(|r| label(r).starts_with("Split Agent")), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| r == "Close Zone  [ctrl-shift-x]"), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| label(r) == "Focus Zone Left"), "local tab rows: {local:?}");
     ensure!(local.iter().any(|r| label(r) == "Clear Scrollback"), "local tab rows: {local:?}");

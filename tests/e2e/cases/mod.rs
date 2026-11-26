@@ -19,6 +19,7 @@ mod instance;
 mod launch;
 mod links;
 mod local_server;
+mod mixed;
 mod multi_window;
 mod restore;
 mod notify;
@@ -69,6 +70,7 @@ fn unix() -> Vec<Case> {
         display("remote-ssh-reattach-size", remote::ssh_reattach_size),
         display("remote-ssh-reattach-background", remote::ssh_reattach_background),
         display("remote-ssh-split", remote::ssh_split),
+        display("remote-mixed-tab", remote::mixed_tab),
         display("remote-ssh-network", remote::ssh_network),
         display("remote-ssh-connect-at-launch", remote::ssh_connect_at_launch),
         display("remote-ssh-restored-closed", remote::ssh_restored_closed),
@@ -196,6 +198,13 @@ fn unix() -> Vec<Case> {
         display("zones-close", zones::close),
         display("zones-restore", zones::restore),
         display("zones-header-colors", zones::header_colors),
+        display("zones-split-kinds", mixed::split_kinds).needs_fake_agent(),
+        display("zones-split-ask", mixed::split_ask).needs_fake_agent(),
+        display("zones-split-directory", mixed::split_directory).needs_fake_agent(),
+        display("zones-mixed-restore", mixed::mixed_restore).needs_fake_agent(),
+        display("zones-mixed-themes", mixed::mixed_themes).needs_fake_agent(),
+        display("zones-login-no-split", mixed::login_no_split).needs_fake_agent(),
+        display("zones-agent-beside-shell", mixed::agent_beside_shell).needs_fake_agent(),
         display("cards-zone-border", cards::zone_border),
         display("cards-zone-corners", cards::zone_corners),
         display("cards-zone-gap", cards::zone_gap),

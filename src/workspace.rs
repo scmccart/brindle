@@ -62,7 +62,8 @@ use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::zone_view::{
-    CloseZoneAsk, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneStart, ZoneTreeView, describe_badge, ui_badge,
+    CloseZoneAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
+    ZoneTreeView, describe_badge, ui_badge,
 };
 use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
 use crate::agent::view::ConfirmLink;
@@ -96,12 +97,9 @@ pub enum TabOrigin {
 
 pub struct Tab {
     pub id: TabId,
-    /// The tab's profile, as the config has it now.
-    pub profile: Profile,
-    /// The endpoint the tab opened on: where its zones run, and where new
-    /// ones start, whatever its profile targets now. It never changes.
-    pub host: Host,
-    /// The tab's zones: one terminal, or a split tree of them.
+    /// The tab's zones: one, or a split tree of them, each of its own
+    /// profile on its own host. The tab has no profile, kind or host of
+    /// its own: what it shows of one is its active zone's.
     pub zones: Entity<ZoneTreeView>,
     pub origin: TabOrigin,
     pub bell: bool,
@@ -128,19 +126,10 @@ pub struct Tab {
 }
 
 impl Tab {
-    fn new(
-        profile: Profile,
-        host: Host,
-        zones: Entity<ZoneTreeView>,
-        origin: TabOrigin,
-        subscriptions: Vec<Subscription>,
-        cx: &mut App,
-    ) -> Self {
+    fn new(zones: Entity<ZoneTreeView>, origin: TabOrigin, subscriptions: Vec<Subscription>, cx: &mut App) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let mut tab = Self {
             id: TabId(NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
-            profile,
-            host,
             zones,
             origin,
             bell: false,
@@ -180,16 +169,22 @@ impl Tab {
         self.zones.read(cx).focus_handle(cx)
     }
 
+    /// The active zone's theme, which the tab's face is drawn in.
     fn theme(&self, cx: &App) -> Theme {
-        self.zones.read(cx).theme.clone()
+        self.zones.read(cx).active_theme()
     }
 
     /// The colours of the tab's face in the strip, active or not: its
-    /// terminal's background (the face's surface) and foreground (its
-    /// text, icons and close button).
+    /// active zone's background (the face's surface) and foreground (its
+    /// text, icons and close button), following focus between zones.
     fn face_colors(&self, cx: &App) -> (Hsla, Hsla) {
-        let theme = &self.zones.read(cx).theme;
-        (theme.background.hsla(), theme.foreground.hsla())
+        let zones = self.zones.read(cx);
+        face_colors(zones.active_zone().map(|zone| &zone.theme))
+    }
+
+    /// The endpoints its zones run on.
+    fn hosts(&self, cx: &App) -> Vec<Host> {
+        self.zones.read(cx).hosts()
     }
 
     fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
@@ -362,6 +357,11 @@ enum PaletteKind {
     /// each row stands for (enter attaches a session into a new tab,
     /// `picker_kill` ends it, both on its endpoint's connection).
     Sessions { model: SessionsModel },
+    /// The profiles a split asks which of, by row (each one's key when the
+    /// palette opened), and the zone of tab `tab` it splits along `axis`:
+    /// the zone that was active when it opened, split only if it is still
+    /// there and fits.
+    SplitProfile { keys: Vec<ProfileKey>, tab: TabId, zone: ZoneId, axis: SplitAxis },
 }
 
 impl PaletteKind {
@@ -371,6 +371,7 @@ impl PaletteKind {
             Self::Commands { .. } => PaletteRole::Commands,
             Self::Prompt => PaletteRole::Prompt,
             Self::Sessions { .. } => PaletteRole::Sessions,
+            Self::SplitProfile { .. } => PaletteRole::SplitProfile,
         }
     }
 }
@@ -816,32 +817,26 @@ impl Workspace {
                     // The profile the tab's sessions were started with, when
                     // the tab now uses another.
                     let gone = missing_profile.clone();
-                    let missing_note = missing_profile.map(|name| {
+                    let mut missing_note = missing_profile.map(|name| {
                         log::warn!("session restore: no profile named {name:?}, using the default profile");
                         missing_profile_text(&name, &config.profiles[profile].name)
                     });
-                    if !host.is_local() && !self.restored_hosts.contains(&host) {
-                        self.restored_hosts.push(host.clone());
-                    }
                     match (zones, session) {
+                        // Each zone of a split says its own missing profile.
                         (Some(zones), _) => {
-                            if !self.restore_zones(profile, host, zones, gone.as_deref(), window, cx) {
-                                continue;
-                            }
+                            missing_note = None;
+                            self.restore_zones(zones, window, cx);
                         }
                         (None, Some(recorded)) => {
+                            self.note_restored_host(&host);
                             let profile = config.profiles[profile].clone();
-                            // A tab whose one session is of the other kind
-                            // isn't restored: the session opens on its own.
-                            let Some(start) =
-                                self.restored_zone(&profile, &host, cwd, Some(&recorded), gone.as_deref(), &config, cx)
-                            else {
-                                continue;
-                            };
+                            let (profile, start) =
+                                self.restored_zone(&profile, &host, cwd, Some(&recorded), gone.as_deref(), &config, cx);
                             self.insert_zone_tab(profile, host, start, true, window, cx);
                         }
                         // No record: the tab follows its profile.
                         (None, None) => {
+                            self.note_restored_host(&host);
                             self.launch(LaunchRequest { profile, with: LaunchWith::Profile, cwd: Some(cwd) }, window, cx)
                         }
                     }
@@ -863,48 +858,41 @@ impl Workspace {
         }
     }
 
-    /// A restored split tab on `host`: the endpoint its zones recorded
-    /// sessions on, else its profile's (`session::resolve_tab`). A zone
-    /// whose listed session is of the other kind is left out of the split
-    /// ([`Workspace::restored_zone`]); `false` when none is left, and no
-    /// tab opened. `gone` names the profile the tab recorded when the
-    /// config no longer has it.
-    fn restore_zones(
-        &mut self,
-        profile_ix: usize,
-        host: Host,
-        zones: RestoredZoneNode,
-        gone: Option<&str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    /// Remembers `host` as a restored remote endpoint, whose first listing
+    /// the launch sweeps.
+    fn note_restored_host(&mut self, host: &Host) {
+        if !host.is_local() && !self.restored_hosts.contains(host) {
+            self.restored_hosts.push(host.clone());
+        }
+    }
+
+    /// A restored split tab: each zone of its own resolved profile, on its
+    /// own host, attaching or starting there independently
+    /// (`session::resolve_zone`, [`Workspace::restored_zone`]), and saying
+    /// in its own dim line when its recorded profile is gone.
+    fn restore_zones(&mut self, zones: RestoredZoneNode, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
-        let Some(profile) = config.profiles.get(profile_ix).cloned() else { return false };
-        let (mut tree, leaves, mut active_id) = zones.into_tree();
-        let mut terminals = Vec::new();
-        for (id, cwd, session) in leaves {
-            match self.restored_zone(&profile, &host, cwd, session.as_ref(), gone, &config, cx) {
-                Some(start) => terminals.push((id, start)),
-                None => {
-                    tree.remove(id);
-                }
+        let (tree, leaves, active_id) = zones.into_tree();
+        let mut started = Vec::new();
+        let mut notes = Vec::new();
+        for (id, zone) in leaves {
+            self.note_restored_host(&zone.host);
+            let profile = config.profiles[zone.profile].clone();
+            if let Some(name) = &zone.missing {
+                log::warn!("session restore: no profile named {name:?}, using the default profile");
+                notes.push((id, missing_profile_text(name, &profile.name)));
             }
+            let gone = zone.missing.as_deref();
+            let (profile, start) = self.restored_zone(&profile, &zone.host, zone.cwd, zone.session.as_ref(), gone, &config, cx);
+            started.push((id, ZoneSpec::of(profile, zone.host, &config), start));
         }
-        let Some(first) = terminals.first().map(|(id, _)| *id) else { return false };
-        if !terminals.iter().any(|(id, _)| *id == active_id) {
-            active_id = first;
+        let view = cx.new(|cx| ZoneTreeView::from_restored(tree, started, active_id, window, cx));
+        for (id, note) in notes {
+            view.update(cx, |zones, cx| zones.note_zone(id, &note, cx));
         }
-        let font_size = profile.font_size;
-        let theme = self.previews.theme_for(&profile, &config);
-        let p_clone = profile.clone();
-        let tree_host = host.clone();
-        let view = cx.new(|cx| {
-            ZoneTreeView::from_restored(p_clone, tree_host, theme, font_size, tree, terminals, active_id, window, cx)
-        });
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
-        true
     }
 
     /// This window as session restore records it.
@@ -924,9 +912,11 @@ impl Workspace {
                     match session::record_zones(z.tree(), z.active_id(), &z.zone_records(cx)) {
                         None => SnapshotTab::Skip,
                         Some(recorded) => SnapshotTab::Local {
-                            profile: tab.profile.name.clone(),
+                            // The active zone's, which an earlier Brindle
+                            // restores every zone with.
+                            profile: recorded.profile,
                             // Where it runs, which its profile may no longer name.
-                            remote: tab.host.target().cloned(),
+                            remote: recorded.remote,
                             cwd: recorded.cwd,
                             title: tab.manual_title.clone(),
                             zones: recorded.zones,
@@ -1031,13 +1021,14 @@ impl Workspace {
     }
 
     /// The active directory only has meaning to a new tab on the same host
-    /// or container as the active tab ([`same_endpoint`]).
+    /// or container as the active zone ([`same_endpoint`]).
     fn active_cwd_for(&self, host: &Host, cx: &App) -> Option<PathBuf> {
-        let tab = self.active_tab()?;
-        if !same_endpoint(&tab.host, host) {
+        let zones = self.active_tab()?.zones.read(cx);
+        let zone = zones.active_zone()?;
+        if !same_endpoint(&zone.host, host) {
             return None;
         }
-        tab.zones.read(cx).active_content()?.working_directory(cx)
+        zone.content.working_directory(cx)
     }
 
     /// Opens a tab for the request on its profile's endpoint.
@@ -1097,14 +1088,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> TabId {
-        let config = Self::settings(cx).clone();
-        let theme = self.previews.theme_for(&profile, &config);
-        let font_size = profile.font_size;
-        let p_clone = profile.clone();
-        let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, start, window, cx));
+        let spec = ZoneSpec::of(profile, host, Self::settings(cx));
+        let view = cx.new(|cx| ZoneTreeView::new(spec, start, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
+        let tab = Tab::new(view, TabOrigin::Local, subscriptions, cx);
         let id = tab.id;
         if activate {
             self.insert_tab(tab, None, window, cx);
@@ -1123,9 +1110,8 @@ impl Workspace {
     #[cfg(any(target_os = "linux", windows))]
     fn insert_layout_tab(
         &mut self,
-        profile: Profile,
         host: Host,
-        tab: crate::layout::LayoutTab,
+        tab: crate::layout::LayoutTab<(SessionInfo, usize)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1133,25 +1119,26 @@ impl Workspace {
         let activate = self.tabs.is_empty();
         let title = tab.title.clone();
         let id = match tab.into_single() {
-            Ok(info) => {
+            Ok((info, index)) => {
+                let profile = config.profiles[index].clone();
                 let start = Self::attached_zone(&host, &info, &profile, &config, cx);
                 self.insert_zone_tab(profile, host, start, activate, window, cx)
             }
             Err(tab) => {
                 let (tree, leaves, active) = tab.into_tree();
-                let terminals: Vec<_> = leaves
+                // Each zone as what its session is, of the profile its own
+                // session gives it (`zones-mixed-tabs` decision 9).
+                let zones: Vec<_> = leaves
                     .into_iter()
-                    // `layout::group` grouped sessions of one kind.
-                    .map(|(id, info)| (id, Self::attached_zone(&host, &info, &profile, &config, cx)))
+                    .map(|(id, (info, index))| {
+                        let profile = config.profiles[index].clone();
+                        let start = Self::attached_zone(&host, &info, &profile, &config, cx);
+                        (id, ZoneSpec::of(profile, host.clone(), &config), start)
+                    })
                     .collect();
-                let theme = self.previews.theme_for(&profile, &config);
-                let font_size = profile.font_size;
-                let (p_clone, tree_host) = (profile.clone(), host.clone());
-                let view = cx.new(|cx| {
-                    ZoneTreeView::from_restored(p_clone, tree_host, theme, font_size, tree, terminals, active, window, cx)
-                });
+                let view = cx.new(|cx| ZoneTreeView::from_restored(tree, zones, active, window, cx));
                 let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-                let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
+                let tab = Tab::new(view, TabOrigin::Local, subscriptions, cx);
                 let id = tab.id;
                 if activate {
                     self.insert_tab(tab, None, window, cx);
@@ -1169,15 +1156,12 @@ impl Workspace {
         }
     }
 
-    /// The detached session a restored zone of a tab of `kind` recorded,
-    /// when the launch's listing still has it and it is of that kind
-    /// ([`crate::reattach::Detached::take_of_kind`]).
+    /// The detached session a restored zone recorded, of either kind, when
+    /// the launch's listing still has it ([`crate::reattach::Detached::take`]).
     #[cfg(any(target_os = "linux", windows))]
-    fn take_detached(recorded: &session::ServerSession, kind: TabKind, cx: &mut App) -> crate::reattach::Taken {
-        if cx.try_global::<crate::reattach::Detached>().is_none() {
-            return crate::reattach::Taken::Missing;
-        }
-        cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take_of_kind(recorded, kind))
+    fn take_detached(recorded: &session::ServerSession, cx: &mut App) -> Option<SessionInfo> {
+        cx.try_global::<crate::reattach::Detached>()?;
+        cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take(recorded))
     }
 
     /// A zone attached to the detached session `info` of `host`'s server,
@@ -1227,15 +1211,16 @@ impl Workspace {
         cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
     }
 
-    /// A restored zone on `host`, of the kind its tab's `profile` opens.
+    /// A restored zone of `profile` on `host`, and the profile it runs.
     /// Its recorded session is attached: on this machine when the launch's
-    /// listing found it still detached and of that kind; on a remote
-    /// endpoint once its listing there confirms it, which the zone waits
-    /// for, saying it is connecting. A listed session of the other kind
-    /// isn't restored into the tab (`None`): it opens as a tab of its own.
-    /// Otherwise `profile` is started anew in `cwd`. `gone` names the
-    /// profile the tab recorded when `profile` stands in for it: an agent
-    /// zone attached under it continues only with that one.
+    /// listing found it still detached, as what the session is, under
+    /// `profile` when that is of the session's kind and else the profile
+    /// the sweep's rule gives the session (`zones-mixed-tabs` decision 8);
+    /// on a remote endpoint once its listing there confirms it, which the
+    /// zone waits for, saying it is connecting. Otherwise `profile` is
+    /// started anew in `cwd`. `gone` names the profile the zone recorded
+    /// when `profile` stands in for it: an agent zone attached under it
+    /// continues only with that one.
     #[allow(clippy::too_many_arguments, reason = "the recorded zone's parts, each a value the caller holds")]
     fn restored_zone(
         &mut self,
@@ -1246,14 +1231,14 @@ impl Workspace {
         gone: Option<&str>,
         config: &Config,
         cx: &mut Context<Self>,
-    ) -> Option<ZoneStart> {
+    ) -> (Profile, ZoneStart) {
         let kind = TabKind::of(profile.kind());
         #[cfg(any(target_os = "linux", windows))]
         match recorded {
             Some(recorded) if !host.is_local() => {
                 self.restored_sessions.push((host.clone(), recorded.clone()));
                 let key = crate::remote::SessionKey::from_wire(&recorded.key);
-                return Some(match kind {
+                let start = match kind {
                     TabKind::Terminal => {
                         let request = crate::remote::local::AttachRequest {
                             session: recorded.id,
@@ -1267,41 +1252,48 @@ impl Workspace {
                         let started_with = gone.map(str::to_string);
                         Agent::attach(profile, host, recorded.id, key, true, Some(cwd), started_with, cx)
                     })),
-                });
+                };
+                return (profile.clone(), start);
             }
-            Some(recorded) => match Self::take_detached(recorded, kind, cx) {
-                crate::reattach::Taken::Session(info) => {
-                    return Some(Self::attached_zone(host, &info, profile, config, cx));
+            Some(recorded) => {
+                if let Some(info) = Self::take_detached(recorded, cx) {
+                    // `profile` is the config's own (`session::resolve_zone`).
+                    let profile = match config.profile_index(&profile.name) {
+                        Some(ix) => config.profiles[crate::reattach::restored_profile(&info, ix, host, config)].clone(),
+                        None => profile.clone(),
+                    };
+                    let start = Self::attached_zone(host, &info, &profile, config, cx);
+                    return (profile, start);
                 }
-                crate::reattach::Taken::OtherKind => return None,
-                crate::reattach::Taken::Missing => {}
-            },
+            }
             None => {}
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (recorded, gone);
-        Some(match kind {
+        let start = match kind {
             TabKind::Terminal => ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))),
             TabKind::Agent => {
                 ZoneStart::Agent(cx.new(|cx| Agent::spawn(profile, host, Some(cwd), OpenedBy::Window, None, cx)))
             }
-        })
+        };
+        (profile.clone(), start)
     }
 
     /// Opens `sessions` (detached sessions of this machine nothing restored
     /// took) as tabs after the others: those detached with one tab's layout
     /// together in its split, the rest one per tab, in the order
-    /// [`crate::layout::group`] gives. Each tab takes the profile its active
-    /// session was started with, or the default one when that is gone or
-    /// remote. The active tab stays the same.
+    /// [`crate::layout::group`] gives, of both kinds. Each zone takes the
+    /// profile its own session was started with, or the default one when
+    /// that is gone or remote ([`crate::reattach::local_profile`]). The
+    /// active tab stays the same.
     pub fn attach_detached(&mut self, sessions: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
             for tab in crate::layout::group(sessions) {
-                let profile = config.profiles[crate::reattach::local_profile(tab.active(), &config)].clone();
                 // The launch listed this machine's sessions.
-                self.insert_layout_tab(profile, Host::Local, tab, window, cx);
+                let tab = crate::reattach::zone_profiles(tab, &Host::Local, &config, None);
+                self.insert_layout_tab(Host::Local, tab, window, cx);
             }
         }
         #[cfg(not(any(target_os = "linux", windows)))]
@@ -1316,46 +1308,39 @@ impl Workspace {
     /// Opens a tab at the end for each session `host`'s first listing of the
     /// launch has that the launch attaches ([`crate::reattach::swept_tabs`]):
     /// not restored into a zone, not shown here already, and with no owner
-    /// that may come back. Each takes the profile
-    /// [`crate::reattach::session_profile`] gives it, on `host` whatever that
-    /// profile targets. The active tab stays the same, and the replays raise
-    /// no bells or notifications.
+    /// that may come back. Each zone takes the profile
+    /// [`crate::reattach::session_profile`] gives its own session, on `host`
+    /// whatever that profile targets. The active tab stays the same, and
+    /// the replays raise no bells or notifications.
     #[cfg(any(target_os = "linux", windows))]
     pub fn attach_swept(&mut self, host: Host, listed: Vec<SessionInfo>, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let mut skip: Vec<session::ServerSession> =
             self.restored_sessions.iter().filter(|(on, _)| *on == host).map(|(_, s)| s.clone()).collect();
         skip.extend(self.sessions_on(&host, cx));
-        let first = self.profile_on(&host);
+        let first = self.profile_on(&host, cx);
         let tabs = crate::reattach::swept_tabs(listed, &skip, &host, &config, first.as_deref());
         if tabs.is_empty() {
             return;
         }
         log::info!("attaching {} detached session tab(s) on {}", tabs.len(), host.name());
-        for (tab, index) in tabs {
-            let profile = config.profiles[index].clone();
-            self.insert_layout_tab(profile, host.clone(), tab, window, cx);
+        for tab in tabs {
+            self.insert_layout_tab(host.clone(), tab, window, cx);
         }
     }
 
-    /// The name of the profile of the first tab on `host`, the one lookup
-    /// [`crate::reattach::session_profile`] needs from the window.
+    /// The name of the profile of the first zone on `host`, in tab order
+    /// then tree order: the one lookup [`crate::reattach::session_profile`]
+    /// needs from the window.
     #[cfg(any(target_os = "linux", windows))]
-    fn profile_on(&self, host: &Host) -> Option<String> {
-        self.tabs.iter().find(|tab| tab.host == *host).map(|tab| tab.profile.name.clone())
+    fn profile_on(&self, host: &Host, cx: &App) -> Option<String> {
+        self.tabs.iter().find_map(|tab| tab.zones.read(cx).profile_on(host))
     }
 
-    /// The sessions this window's tabs on `host` show (or are attaching).
+    /// The sessions this window's zones on `host` show (or are attaching).
     #[cfg(any(target_os = "linux", windows))]
     fn sessions_on(&self, host: &Host, cx: &App) -> Vec<session::ServerSession> {
-        self.tabs
-            .iter()
-            .filter(|tab| tab.host == *host)
-            .flat_map(|tab| {
-                let zones = tab.zones.read(cx);
-                zones.tree().leaves().into_iter().filter_map(|id| zones.zone_server_session(id, cx)).collect::<Vec<_>>()
-            })
-            .collect()
+        self.tabs.iter().flat_map(|tab| tab.zones.read(cx).sessions_on(host, cx)).collect()
     }
 
     /// Inserts `tab` at `index` (default: after the active tab) and activates it.
@@ -1371,9 +1356,7 @@ impl Workspace {
     fn insert_tab_inactive(&mut self, tab: Tab, index: Option<usize>, cx: &mut Context<Self>) {
         let index = self.strip.insert_at(&self.order(), tab.id, index);
         if self.previews.any() {
-            let profile = self.previews.profile_for(&tab.profile);
-            let theme = self.previews.theme_for(profile, Self::settings(cx));
-            set_tab_theme(&tab, theme, profile.font_size, cx);
+            self.restyle_tab(&tab, cx);
         }
         self.tabs.insert(index, tab);
         cx.notify();
@@ -1413,7 +1396,30 @@ impl Workspace {
             cx.subscribe_in(view, window, |this, _, confirm: &ConfirmLink, window, cx| {
                 this.open_link_confirm(confirm.uri.clone(), confirm.back.clone(), window, cx);
             }),
+            cx.subscribe_in(view, window, |this, view, ask: &SplitAsk, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.open_split_palette(tab, ask, window, cx);
+            }),
+            cx.subscribe(view, |this, _, SplitRefused(refusal): &SplitRefused, cx| {
+                this.show_notice(refusal.text().to_string(), cx);
+            }),
         ]
+    }
+
+    /// The palette a split asks with: `ask`'s profiles, each row as the
+    /// profile picker shows it, choosing one splitting `ask`'s zone of tab
+    /// `tab` with it.
+    fn open_split_palette(&mut self, tab: TabId, ask: &SplitAsk, window: &mut Window, cx: &mut Context<Self>) {
+        let config = Self::settings(cx);
+        let (keys, profiles): (Vec<ProfileKey>, Vec<Profile>) = ask
+            .profiles
+            .iter()
+            .filter_map(|key| config.find_profile(key).map(|ix| (key.clone(), config.profiles[ix].clone())))
+            .unzip();
+        let rows = profile_rows(&profiles, &[]);
+        let palette = cx.new(|cx| Palette::list(rows, "Split with profile…", cx));
+        let kind = PaletteKind::SplitProfile { keys, tab, zone: ask.zone, axis: ask.axis };
+        self.show_palette(palette, kind, window, cx);
     }
 
     /// Shows `text` on the config line as a transient notice, until it is
@@ -1559,7 +1565,9 @@ impl Workspace {
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
         let tab_title = notify::policy::TabTitle::of(tab.manual_title.as_deref(), &tab.title);
-        let (summary, body) = notify::policy::layout(source, title, body, tab_title, &tab.profile.name);
+        // The zone it is about names its own profile.
+        let profile = tab.zones.read(cx).notifying_profile();
+        let (summary, body) = notify::policy::layout(source, title, body, tab_title, &profile);
         let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0, program };
         Notifier::send(request, cx);
     }
@@ -1674,7 +1682,7 @@ impl Workspace {
     fn remove_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ix) = self.tab_ix(id) else { return };
         #[cfg(any(target_os = "linux", windows))]
-        let before: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
+        let before: Vec<Host> = self.tabs.iter().flat_map(|tab| tab.hosts(cx)).collect();
         let order = self.order();
         let tab = self.tabs.remove(ix);
         let removed = self.strip.removed(&order, id);
@@ -1682,7 +1690,7 @@ impl Workspace {
         self.refresh_motion(cx);
         #[cfg(any(target_os = "linux", windows))]
         {
-            let after: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
+            let after: Vec<Host> = self.tabs.iter().flat_map(|tab| tab.hosts(cx)).collect();
             let eager = crate::reattach::eager_hosts(Self::settings(cx));
             for host in crate::reattach::endpoints_without_tabs(&before, &after, &eager) {
                 crate::remote::local::stop_listing(&host);
@@ -1705,13 +1713,12 @@ impl Workspace {
     fn open_message_tab(&mut self, profile: Profile, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
         let theme = config.profile_theme(&profile);
-        let terminal = cx.new(|cx| Terminal::message(text, theme.clone(), &config, cx));
-        let p_clone = profile.clone();
+        let terminal = cx.new(|cx| Terminal::message(text, theme, &config, cx));
         let host = Host::of(&profile);
-        let tree_host = host.clone();
         let start = ZoneStart::Terminal(terminal);
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, start, window, cx));
-        let tab = Tab::new(profile, host, view, TabOrigin::Message, Vec::new(), cx);
+        let spec = ZoneSpec::of(profile, host, &config);
+        let view = cx.new(|cx| ZoneTreeView::new(spec, start, window, cx));
+        let tab = Tab::new(view, TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
 
@@ -2073,7 +2080,10 @@ impl Workspace {
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
         // The palette lists what the tab can run: GPUI's answer, applied.
         let agent = self.active_tab().is_some_and(|t| t.zones.read(cx).active_content().is_some_and(|c| c.agent_view().is_some()));
+        let profiles = &Self::settings(cx).profiles;
         let facts = PaletteFacts {
+            terminal_profiles: profiles.iter().any(|p| p.kind() == ProfileKind::Terminal),
+            agent_profiles: profiles.iter().any(|p| p.kind() == ProfileKind::Agent),
             zone: if agent { PaletteZone::Agent } else { PaletteZone::Terminal },
             prompt_marks: self
                 .active_tab()
@@ -2195,6 +2205,14 @@ impl Workspace {
                 self.dismiss_overlay(window, cx);
                 self.attach_detached_here(host, info, window, cx);
             }
+            PaletteKind::SplitProfile { keys, tab, zone, axis } => {
+                let Some(key) = keys.get(ix).cloned() else { return };
+                let (tab, zone, axis) = (*tab, *zone, *axis);
+                // Focus goes back to the tab first, then to the new zone.
+                self.dismiss_overlay(window, cx);
+                let Some(zones) = self.tabs.iter().find(|t| t.id == tab).map(|t| t.zones.clone()) else { return };
+                zones.update(cx, |zones, cx| zones.split_zone(zone, axis, SplitWith::Profile(key), window, cx));
+            }
         }
     }
 
@@ -2294,7 +2312,14 @@ impl Workspace {
             }
             // A palette closed or replaced meanwhile stays so.
             Overlay::Closed
-            | Overlay::Palette { kind: PaletteKind::NewTab { .. } | PaletteKind::Commands { .. } | PaletteKind::Prompt, .. }
+            | Overlay::Palette {
+                kind:
+                    PaletteKind::NewTab { .. }
+                    | PaletteKind::Commands { .. }
+                    | PaletteKind::Prompt
+                    | PaletteKind::SplitProfile { .. },
+                ..
+            }
             | Overlay::Settings
             | Overlay::ProfileMenu
             | Overlay::ContextMenu { .. }
@@ -2347,7 +2372,7 @@ impl Workspace {
         #[cfg(any(target_os = "linux", windows))]
         {
             let config = Self::settings(cx).clone();
-            let first = self.profile_on(&host);
+            let first = self.profile_on(&host, cx);
             let index = crate::reattach::session_profile(&info, &host, &config, first.as_deref());
             let profile = config.profiles[index].clone();
             let start = Self::attached_zone(&host, &info, &profile, &config, cx);
@@ -2513,14 +2538,19 @@ impl Workspace {
         self.launch_on(request, host, window, cx);
     }
 
-    /// Re-themes every tab (and sets its font size) from the config and the
-    /// previews.
+    /// Re-themes every zone of every tab (and sets its font size) from its
+    /// own profile in the config and the previews.
     fn apply_tab_themes(&mut self, cx: &mut Context<Self>) {
-        let config = Self::settings(cx).clone();
         for tab in &self.tabs {
-            let profile = self.previews.profile_for(&tab.profile);
-            set_tab_theme(tab, self.previews.theme_for(profile, &config), profile.font_size, cx);
+            self.restyle_tab(tab, cx);
         }
+    }
+
+    /// Re-themes `tab`'s zones, each from its own profile ([`zone_look`]).
+    fn restyle_tab(&self, tab: &Tab, cx: &mut Context<Self>) {
+        let config = Self::settings(cx).clone();
+        let previews = &self.previews;
+        tab.zones.update(cx, |zones, cx| zones.restyle(&|profile| zone_look(previews, &config, profile), cx));
     }
 
     /// Shows the edited profile's theme and font size on its tabs, or, with
@@ -2544,21 +2574,16 @@ impl Workspace {
     }
 
     /// Applies a reloaded config to running terminals. `renames` (old, new)
-    /// are profiles renamed in the settings dialog: their tabs follow the
+    /// are profiles renamed in the settings dialog: their zones follow the
     /// new name.
     pub fn apply_config(&mut self, renames: &[(String, String)], cx: &mut Context<Self>) {
         let config = Self::settings(cx).clone();
-        for tab in &mut self.tabs {
-            if let Some(new) = renamed(&tab.profile.name, renames) {
-                tab.profile.name = new.to_string();
-            }
-        }
-        // A tab whose profile now targets another endpoint stays on its
-        // own host (`Tab::host`): its splits start there.
-        for tab in &mut self.tabs {
-            if let Some(profile) = reloaded_profile(&tab.profile, &config) {
-                tab.profile = profile;
-            }
+        // A zone whose profile now targets another endpoint stays on its
+        // own host (`Zone::host`): its splits of that profile start there.
+        for tab in &self.tabs {
+            tab.zones.update(cx, |zones, _| {
+                zones.follow_profiles(&|profile| followed_profile(profile, renames, &config));
+            });
         }
         for tab in &mut self.tabs {
             tab.refresh_title(cx);
@@ -2877,7 +2902,7 @@ impl Workspace {
                 // face: a yellow warning icon for an elevation, its muted
                 // text otherwise.
                 if let Some(badge) = &tab.badge {
-                    trigger = trigger.badge(ui_badge(badge, &tab.zones.read(cx).theme));
+                    trigger = trigger.badge(ui_badge(badge, &tab.theme(cx)));
                 }
                 trigger
             })
@@ -3189,6 +3214,37 @@ fn renamed<'a>(name: &str, renames: &'a [(String, String)]) -> Option<&'a str> {
     renames.iter().find(|(old, _)| old.eq_ignore_ascii_case(name)).map(|(_, new)| new.as_str())
 }
 
+/// A tab face's background and foreground: its active zone's theme's
+/// (`theme`), the default theme's while it has none.
+fn face_colors(theme: Option<&Theme>) -> (Hsla, Hsla) {
+    match theme {
+        Some(theme) => (theme.background.hsla(), theme.foreground.hsla()),
+        None => {
+            let theme = Theme::default();
+            (theme.background.hsla(), theme.foreground.hsla())
+        }
+    }
+}
+
+/// A zone's look: the theme and font size `previews` and `config` give a
+/// zone of `profile` (the edited profile's preview, the previewed theme for
+/// one that follows the global theme).
+fn zone_look(previews: &Previews, config: &Config, profile: &Profile) -> (Theme, Option<f32>) {
+    let shown = previews.profile_for(profile);
+    (previews.theme_for(shown, config), shown.font_size)
+}
+
+/// What a zone of `profile` follows after a reload: the new name of a
+/// profile renamed in the settings dialog (`renames`, old to new), then the
+/// config's profile of that name, whatever it targets now; `None` when the
+/// config has none, and the zone keeps its own.
+fn followed_profile(profile: &Profile, renames: &[(String, String)], config: &Config) -> Option<Profile> {
+    let name = renamed(&profile.name, renames).unwrap_or(&profile.name);
+    config.profile(name).cloned().or_else(|| {
+        (name != profile.name).then(|| Profile { name: name.to_string(), ..profile.clone() })
+    })
+}
+
 /// Whether a directory from a terminal on `tab` means anything to a new tab
 /// on `host`: only on the same endpoint.
 fn same_endpoint(tab: &Host, host: &Host) -> bool {
@@ -3212,18 +3268,6 @@ fn config_editor_launch(config: &Config, editor: (String, Vec<String>)) -> (Laun
     (LaunchRequest { profile, with: LaunchWith::Command(editor.0, editor.1), cwd: None }, Host::Local)
 }
 
-/// A tab's profile once the config is reloaded: the config's profile of
-/// that name, whatever it targets now; `None` when the config has none,
-/// and the tab keeps its own.
-fn reloaded_profile(current: &Profile, config: &Config) -> Option<Profile> {
-    config.profile(&current.name).cloned()
-}
-
-/// Gives a tab's terminals `theme`, keeping its font size.
-fn set_tab_theme(tab: &Tab, theme: Theme, font_size: Option<f32>, cx: &mut App) {
-    let profile = tab.profile.clone();
-    tab.zones.update(cx, |view, cx| view.set_profile(profile, theme, font_size, cx))
-}
 
 /// The size to record for a window last recorded (or opened) at `known`,
 /// whose platform bounds are now `outer`, or `inner` without the client
@@ -4077,7 +4121,7 @@ mod tests {
         let mut config = Config::default();
         config.profiles = vec![moved.clone()];
 
-        let reloaded = reloaded_profile(&before, &config).expect("the profile is still there");
+        let reloaded = followed_profile(&before, &[], &config).expect("the profile is still there");
         assert_eq!(reloaded.remote, moved.remote);
         let split = |profile: &Profile, host: &Host| {
             let cwd = Some("/var/log/brindle-nowhere".into());
@@ -4102,8 +4146,46 @@ mod tests {
         assert_eq!(request.cwd, None, "no such directory on this machine");
         assert!(!same_endpoint(&Host::Local, &Host::of(&reloaded)));
 
-        // A profile the config dropped leaves the tab its own.
-        assert!(reloaded_profile(&before, &Config::default()).is_none());
+        // A profile the config dropped leaves the zone its own.
+        assert!(followed_profile(&before, &[], &Config::default()).is_none());
+        // A rename in the dialog: the zone follows the new name.
+        let renames = [("logs".to_string(), "Logs on A8".to_string())];
+        let mut renamed_config = config.clone();
+        renamed_config.profiles[0].name = "Logs on A8".into();
+        let followed = followed_profile(&before, &renames, &renamed_config).expect("the renamed profile");
+        assert_eq!(followed.name, "Logs on A8");
+        let kept = followed_profile(&before, &renames, &Config::default()).expect("the new name, kept");
+        assert_eq!((kept.name.as_str(), kept.command.as_deref()), ("Logs on A8", Some("htop")));
+    }
+
+    /// `zones-mixed-tabs` decision 5: each zone of a tab looks as its own
+    /// profile says, through the settings dialog's previews too; a tab's
+    /// face takes the theme it is given (the active zone's).
+    #[test]
+    fn each_zone_looks_as_its_own_profile_says() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n\
+             theme = \"brindle-light\"\nfont_size = 18.0\n",
+        )
+        .unwrap()
+        .config;
+        let (shell, fake) = (config.profile("Shell").unwrap().clone(), config.profile("Fake").unwrap().clone());
+        let light = crate::theme::builtin_theme("brindle-light").unwrap();
+        let none = Previews::default();
+        assert_eq!(zone_look(&none, &config, &shell), (config.theme(None), None));
+        assert_eq!(zone_look(&none, &config, &fake), (light.clone(), Some(18.0)));
+
+        // A previewed global theme reaches only the zone that follows it,
+        // and an edited profile's preview only that profile's zones.
+        let solarized = crate::theme::builtin_theme("solarized-dark").unwrap();
+        let edited = Profile { font_size: Some(20.0), ..fake.clone() };
+        let previews = Previews { theme: Some(solarized.clone()), profile: Some(("Fake".into(), edited)) };
+        assert_eq!(zone_look(&previews, &config, &shell), (solarized, None));
+        assert_eq!(zone_look(&previews, &config, &fake), (light.clone(), Some(20.0)));
+
+        assert_eq!(face_colors(Some(&light)), (light.background.hsla(), light.foreground.hsla()));
+        let default = Theme::default();
+        assert_eq!(face_colors(None), (default.background.hsla(), default.foreground.hsla()));
     }
 
     /// The spec's drag scenario: the first tab dropped on the third lands in
@@ -4375,7 +4457,7 @@ mod tests {
             .collect();
         use TabMenuItem::*;
         assert_eq!(items, [Some(Rename), Some(MoveLeft), Some(MoveRight), Some(Close)]);
-        assert_eq!(TabMenuItem::of(&crate::actions::SplitZoneRight), None);
+        assert_eq!(TabMenuItem::of(&crate::actions::SplitTerminalRight), None);
     }
 
     /// Moving a background tab from its menu keeps the active tab active,

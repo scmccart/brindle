@@ -150,6 +150,7 @@ impl<T> Tree<T> {
     }
 
     /// The active leaf, else the first.
+    #[cfg(test)]
     pub fn active(&self) -> &T {
         fn find<T>(tree: &Tree<T>) -> Option<&T> {
             match tree {
@@ -175,18 +176,38 @@ impl<T> Tree<T> {
     }
 }
 
-/// A tab a sweep opens: one session, or several in their recorded split.
-#[derive(Debug, Clone, PartialEq)]
-pub struct LayoutTab {
-    /// The recorded manual title.
-    pub title: Option<String>,
-    pub zones: Tree<SessionInfo>,
+impl<T> Tree<T> {
+    /// The same tree with `f` of each leaf's item.
+    pub fn map<U>(self, f: &impl Fn(T) -> U) -> Tree<U> {
+        match self {
+            Tree::Leaf { item, active } => Tree::Leaf { item: f(item), active },
+            Tree::Split { axis, first, second } => {
+                Tree::Split { axis, first: Box::new(first.map(f)), second: Box::new(second.map(f)) }
+            }
+        }
+    }
 }
 
-impl LayoutTab {
-    /// The session whose profile the tab takes: its active zone's.
-    pub fn active(&self) -> &SessionInfo {
+/// A tab a sweep opens: one session, or several in their recorded split,
+/// of either kind; `T` is a session, or a session with what was found for
+/// it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LayoutTab<T = SessionInfo> {
+    /// The recorded manual title.
+    pub title: Option<String>,
+    pub zones: Tree<T>,
+}
+
+impl<T> LayoutTab<T> {
+    /// The active zone's session.
+    #[cfg(test)]
+    pub fn active(&self) -> &T {
         self.zones.active()
+    }
+
+    /// The tab with `f` of each zone's item, its title kept.
+    pub fn map<U>(self, f: impl Fn(T) -> U) -> LayoutTab<U> {
+        LayoutTab { title: self.title, zones: self.zones.map(&f) }
     }
 
     /// The tab's one session, or the tab back when it is split.
@@ -194,20 +215,20 @@ impl LayoutTab {
         clippy::result_large_err,
         reason = "the `Err` hands the caller's own tab back unchanged, once per restored tab; a boxed copy would move it for nothing"
     )]
-    pub fn into_single(self) -> Result<SessionInfo, Self> {
+    pub fn into_single(self) -> Result<T, Self> {
         match self.zones {
             Tree::Leaf { item, .. } => Ok(item),
             zones => Err(Self { zones, ..self }),
         }
     }
 
-    /// The split as a `ZoneTree` with ids from 1, each leaf's session, and the
+    /// The split as a `ZoneTree` with ids from 1, each leaf's item, and the
     /// active zone's id.
-    pub fn into_tree(self) -> (ZoneTree, Vec<(ZoneId, SessionInfo)>, ZoneId) {
-        fn build(
-            tree: Tree<SessionInfo>,
+    pub fn into_tree(self) -> (ZoneTree, Vec<(ZoneId, T)>, ZoneId) {
+        fn build<T>(
+            tree: Tree<T>,
             next: &mut u64,
-            leaves: &mut Vec<(ZoneId, SessionInfo)>,
+            leaves: &mut Vec<(ZoneId, T)>,
             active_id: &mut Option<ZoneId>,
         ) -> ZoneTree {
             match tree {
@@ -286,19 +307,15 @@ pub fn group(sessions: Vec<SessionInfo>) -> Vec<LayoutTab> {
         if !zones.has_active() {
             zones.activate_first();
         }
-        // A tab holds zones of one kind: those of the active zone's kind
-        // stay, and the others are tabs of their own.
-        let kind = crate::reattach::session_kind(zones.active());
-        let mut other_kind = Vec::new();
-        let Some(zones) = retain(zones, &|info| crate::reattach::session_kind(info) == kind, &mut other_kind) else {
-            continue;
-        };
+        // A tab holds zones of both kinds (OpenSpec change
+        // `zones-mixed-tabs`, decision 9): every session the layout names
+        // and this server has stays.
         let oldest = zones.items().into_iter().map(|s| (s.started, s.session)).min().unwrap_or_default();
         let title = layout.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
         tabs.push(((oldest.0, oldest.1, origin, index), LayoutTab { title, zones }));
         // Members its tree doesn't name (another detach of the same tab
         // can't make these; kept anyway) are tabs of their own.
-        let mut left: Vec<SessionInfo> = members.into_values().chain(other_kind).collect();
+        let mut left: Vec<SessionInfo> = members.into_values().collect();
         left.sort_by_key(|s| (s.started, s.session));
         left.into_iter().for_each(|info| flat(info, &mut tabs));
     }
@@ -329,29 +346,6 @@ fn prune(node: Node, members: &mut HashMap<String, SessionInfo>) -> Option<Tree<
     }
 }
 
-/// `tree` with only the leaves `keep` keeps, a split's sibling taking a
-/// dropped leaf's place; the dropped ones go to `dropped`. `None` when
-/// nothing is kept.
-fn retain(
-    tree: Tree<SessionInfo>,
-    keep: &impl Fn(&SessionInfo) -> bool,
-    dropped: &mut Vec<SessionInfo>,
-) -> Option<Tree<SessionInfo>> {
-    match tree {
-        Tree::Leaf { item, active } => {
-            if keep(&item) {
-                Some(Tree::Leaf { item, active })
-            } else {
-                dropped.push(item);
-                None
-            }
-        }
-        Tree::Split { axis, first, second } => match (retain(*first, keep, dropped), retain(*second, keep, dropped)) {
-            (Some(first), Some(second)) => Some(Tree::Split { axis, first: Box::new(first), second: Box::new(second) }),
-            (one, other) => one.or(other),
-        },
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -517,29 +511,38 @@ mod tests {
         })
     }
 
-    /// A tab holds one kind: a recorded layout keeps the zones of its
-    /// active zone's kind, and the others become tabs of their own.
+    /// A tab holds both kinds (OpenSpec change `zones-mixed-tabs`,
+    /// decision 9): a recorded layout of terminals and an agent comes back
+    /// whole, whichever zone was active.
     #[test]
-    fn a_mixed_layout_keeps_the_active_zones_kind() {
+    fn a_layout_of_both_kinds_comes_back_as_one_tab() {
         let sessions = |active: &str| {
             vec![laid_out(1, "a", 10, three(active)), agent(laid_out(2, "b", 20, three(active))), laid_out(3, "c", 30, three(active))]
         };
-        let tabs = group(sessions("c"));
-        let order: Vec<Vec<&str>> = tabs.iter().map(keys).collect();
-        assert_eq!(order, [vec!["a", "c"], vec!["b"]], "the terminals stay together, the agent alone");
-        assert_eq!(tabs[0].active().key, "c");
-        assert_eq!(tabs[0].zones, Tree::Split {
-            axis: SplitAxis::Horizontal,
-            first: Box::new(Tree::Leaf { item: laid_out(1, "a", 10, three("c")), active: false }),
-            second: Box::new(Tree::Leaf { item: laid_out(3, "c", 30, three("c")), active: true }),
-        }, "the dropped zone's sibling takes its place");
+        for active in ["a", "b", "c"] {
+            let tabs = group(sessions(active));
+            assert_eq!(tabs.iter().map(keys).collect::<Vec<_>>(), [vec!["a", "b", "c"]], "{active} active");
+            assert_eq!(tabs[0].active().key, active);
+        }
         let tabs = group(sessions("b"));
-        let order: Vec<Vec<&str>> = tabs.iter().map(keys).collect();
-        assert_eq!(order, [vec!["a"], vec!["b"], vec!["c"]], "the agent active: the terminals are tabs of their own");
-        assert!(crate::reattach::session_kind(tabs[1].active()) == crate::TabKind::Agent);
-        // One kind throughout is unchanged.
-        let agents: Vec<SessionInfo> = sessions("a").into_iter().map(agent).collect();
-        assert_eq!(group(agents).iter().map(keys).collect::<Vec<_>>(), [vec!["a", "b", "c"]]);
+        assert!(crate::reattach::session_kind(tabs[0].active()) == crate::TabKind::Agent);
+    }
+
+    /// A layout whose zones ran on two servers: each server's sweep sees
+    /// only its own sessions, so each groups a tab of those, a split's
+    /// sibling taking a zone of the other server's place.
+    #[test]
+    fn a_layout_over_two_servers_groups_each_servers_zones() {
+        // `a` and `c` ran here, `b` on another server, `b` active.
+        let here = group(vec![laid_out(1, "a", 10, three("b")), laid_out(3, "c", 30, three("b"))]);
+        assert_eq!(here.iter().map(keys).collect::<Vec<_>>(), [vec!["a", "c"]]);
+        assert_eq!(here[0].zones, Tree::Split {
+            axis: SplitAxis::Horizontal,
+            first: Box::new(Tree::Leaf { item: laid_out(1, "a", 10, three("b")), active: true }),
+            second: Box::new(Tree::Leaf { item: laid_out(3, "c", 30, three("b")), active: false }),
+        }, "the missing zone's sibling takes its place, the first zone active");
+        let there = group(vec![laid_out(2, "b", 20, three("b"))]);
+        assert_eq!(there.iter().map(keys).collect::<Vec<_>>(), [vec!["b"]]);
     }
 
     #[test]

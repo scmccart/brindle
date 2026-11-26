@@ -29,6 +29,11 @@ fn expect_items(out: &Output, items: &str, what: &str) -> Result {
     Ok(())
 }
 
+/// The menu's items in a config with no agent profile (the spec's "No
+/// agent profile": the agent splits are disabled).
+const ITEMS: &str = "Split Terminal Right|Split Terminal Down|[Split Agent Right]|[Split Agent Down]\
+                     |Split Right With Profile…|Split Down With Profile…|-|Close Zone";
+
 fn expect_closed(out: &Output, what: &str) -> Result {
     ensure!(out.dump.menu.is_empty(), "{what}: the menu is open: {:?}", out.dump.menu);
     Ok(())
@@ -40,10 +45,19 @@ fn expect_closed(out: &Output, what: &str) -> Result {
 /// it; and a tab of one zone has the menu too.
 pub fn items(ctx: &Ctx) -> Result<Outcome> {
     let out = split(Run::new(ctx, "open")).action("open_zone_menu").dump_at(step_time(2) + 1.0).run()?;
-    expect_items(&out, "Split Zone Right|Split Zone Down|-|Close Zone", "two zones")?;
+    expect_items(&out, ITEMS, "two zones")?;
     let rows = &out.dump.menu[1..];
     ensure!(
-        rows == ["Split Zone Right  [ctrl-shift-e]", "Split Zone Down  [ctrl-shift-o]", "Close Zone  [ctrl-shift-x]"],
+        rows == [
+            "Split Terminal Right  [ctrl-shift-e]",
+            "Split Terminal Down  [ctrl-shift-o]",
+            // GPUI prints the modifiers in its own order.
+            "Split Agent Right  [ctrl-alt-shift-e]",
+            "Split Agent Down  [ctrl-alt-shift-o]",
+            "Split Right With Profile…",
+            "Split Down With Profile…",
+            "Close Zone  [ctrl-shift-x]",
+        ],
         "rows: {rows:?}"
     );
     ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
@@ -64,7 +78,7 @@ pub fn items(ctx: &Ctx) -> Result<Outcome> {
         .key("ctrl-shift-m")
         .dump_at(step_time(2) + 1.0)
         .run()?;
-    expect_items(&out, "Split Zone Right|Split Zone Down|-|Close Zone", "after the bound key")?;
+    expect_items(&out, ITEMS, "after the bound key")?;
     expect_focus(&out, "menu", "after the bound key")?;
 
     let out = Run::new(ctx, "one-zone")
@@ -73,7 +87,7 @@ pub fn items(ctx: &Ctx) -> Result<Outcome> {
         .action("open_zone_menu")
         .dump_at(step_time(1) + 1.0)
         .run()?;
-    expect_items(&out, "Split Zone Right|Split Zone Down|-|Close Zone", "one zone")?;
+    expect_items(&out, ITEMS, "one zone")?;
     Ok(Outcome::Pass)
 }
 
@@ -93,7 +107,12 @@ pub fn choose(ctx: &Ctx) -> Result<Outcome> {
     expect_closed(&out, "after Split Zone Down")?;
     ensure!(out.dump.zones.as_deref() == Some("count=3 active=3"), "zones {:?}", out.dump.zones);
     ensure!(
-        out.dump.zone_list == ["id=1 rect=0,0,0.5,0.5", "id=3 rect=0,0.5,0.5,0.5 active", "id=2 rect=0.5,0,0.5,1"],
+        out.dump.zone_list
+            == [
+                "id=1 rect=0,0,0.5,0.5 kind=terminal profile=\"Shell\"",
+                "id=3 rect=0,0.5,0.5,0.5 kind=terminal profile=\"Shell\" active",
+                "id=2 rect=0.5,0,0.5,1 kind=terminal profile=\"Shell\"",
+            ],
         "zone_list {:?}",
         out.dump.zone_list
     );
@@ -127,6 +146,11 @@ pub fn too_small(ctx: &Ctx) -> Result<Outcome> {
         run = run.action(action);
     }
     let out = run.action("open_zone_menu").dump_at(step_time(steps + 1) + 1.0).run()?;
-    expect_items(&out, "[Split Zone Right]|[Split Zone Down]|-|Close Zone", "the smallest zone")?;
+    expect_items(
+        &out,
+        "[Split Terminal Right]|[Split Terminal Down]|[Split Agent Right]|[Split Agent Down]\
+         |[Split Right With Profile…]|[Split Down With Profile…]|-|Close Zone",
+        "the smallest zone",
+    )?;
     Ok(Outcome::Pass)
 }

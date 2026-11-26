@@ -60,10 +60,10 @@ Remote Linux sessions SHALL report the remote foreground process name from `/pro
 - **THEN** Brindle sends that host nothing but the connection's heartbeat
 
 ### Requirement: Current working directory tracking
-Remote sessions SHALL track the remote working directory through `/proc/<pid>/cwd`, reported by the host when it changes, and through OSC 7 reports. When splitting a zone or launching a new tab from an active remote tab, the new session SHALL inherit the remote directory.
+Remote sessions SHALL track the remote working directory through `/proc/<pid>/cwd`, reported by the host when it changes, and through OSC 7 reports. When splitting a zone or launching a new tab from an active remote zone, a new session on the same host SHALL inherit the remote directory.
 
 #### Scenario: Remote zone split inherits remote CWD
-- **WHEN** the user is in `/var/log` on a remote host and triggers `Split Zone Right`
+- **WHEN** the user is in `/var/log` on a remote host and triggers `Split Terminal Right`
 - **THEN** the newly opened split zone launches in `/var/log` on the same remote host
 
 ### Requirement: Passthrough of notifications and program status

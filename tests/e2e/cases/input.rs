@@ -24,8 +24,8 @@ pub fn palette(ctx: &Ctx) -> Result<Outcome> {
         out.dump.palette
     );
     ensure!(
-        out.dump.palette.iter().any(|l| l.starts_with("Split Zone Right")),
-        "the filter doesn't list Split Zone Right: {:?}",
+        out.dump.palette.iter().any(|l| l.starts_with("Split Terminal Right")),
+        "the filter doesn't list Split Terminal Right: {:?}",
         out.dump.palette
     );
     ensure!(!out.dump.screen.iter().any(|l| l.contains("spl")), "typed into the terminal: {:?}", out.dump.screen);

@@ -74,7 +74,7 @@ args = ["acp"]
   - a thought's trigger;
   - a message's copy button, which shows on hover;
   - the close dialog's buttons and its backdrop;
-  - an agent profile opened from the `⌄` menu has its split buttons disabled.
+  - in an agent profile opened from the `⌄` menu, each of the header's split buttons opens another agent zone beside it.
 - [ ] **A desktop notification from an agent in a background tab** (D-Bus on Linux, a toast on Windows): for a permission, for `Done` and for a failure. Clicking it shows the agent tab.
 - [ ] **The settings dialog with an agent profile:**
   - its `agent` mark and note read in a light and a dark theme;

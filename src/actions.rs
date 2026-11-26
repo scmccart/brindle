@@ -52,8 +52,22 @@ actions!(
         /// link Brindle didn't open), leaving the config's errors and
         /// findings. Available while one shows.
         DismissNotices,
-        SplitZoneRight,
-        SplitZoneDown,
+        /// Splits the active zone with a terminal zone to its right
+        /// (OpenSpec change `zones-mixed-tabs`, decision 4); its profile as
+        /// `zone_view::split_choice` gives it. `split_zone_right` is its
+        /// old name.
+        SplitTerminalRight,
+        /// The same, below.
+        SplitTerminalDown,
+        /// Splits the active zone with an agent zone to its right.
+        SplitAgentRight,
+        /// The same, below.
+        SplitAgentDown,
+        /// Splits the active zone with a profile chosen from a palette of
+        /// every profile, to its right. No default key.
+        SplitRightWithProfile,
+        /// The same, below.
+        SplitDownWithProfile,
         CloseZone,
         FocusZoneLeft,
         FocusZoneRight,
@@ -186,8 +200,12 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("open_config", Some("Open Config"), || Box::new(OpenConfig)),
     ("open_settings", Some("Open Settings"), || Box::new(OpenSettings)),
     ("dismiss_notices", Some("Dismiss Notices"), || Box::new(DismissNotices)),
-    ("split_zone_right", Some("Split Zone Right"), || Box::new(SplitZoneRight)),
-    ("split_zone_down", Some("Split Zone Down"), || Box::new(SplitZoneDown)),
+    ("split_terminal_right", Some("Split Terminal Right"), || Box::new(SplitTerminalRight)),
+    ("split_terminal_down", Some("Split Terminal Down"), || Box::new(SplitTerminalDown)),
+    ("split_agent_right", Some("Split Agent Right"), || Box::new(SplitAgentRight)),
+    ("split_agent_down", Some("Split Agent Down"), || Box::new(SplitAgentDown)),
+    ("split_right_with_profile", Some("Split Right With Profile…"), || Box::new(SplitRightWithProfile)),
+    ("split_down_with_profile", Some("Split Down With Profile…"), || Box::new(SplitDownWithProfile)),
     ("close_zone", Some("Close Zone"), || Box::new(CloseZone)),
     ("focus_zone_left", Some("Focus Zone Left"), || Box::new(FocusZoneLeft)),
     ("focus_zone_right", Some("Focus Zone Right"), || Box::new(FocusZoneRight)),
@@ -289,8 +307,21 @@ pub fn action_by_name(name: &str) -> Option<Box<dyn Action>> {
             return Some(build(n.parse::<usize>().ok()?.checked_sub(1)?));
         }
     }
-    ACTIONS.iter().find(|(n, _, _)| *n == name).map(|(_, _, build)| build())
+    ACTIONS
+        .iter()
+        .find(|(n, _, _)| *n == name)
+        .map(|(_, _, build)| build())
+        .or_else(|| ALIASES.iter().find(|(n, _)| *n == name).map(|(_, build)| build()))
 }
+
+/// Earlier names that still bind, in `[keybindings]` and by `--action`, to
+/// the action they always ran, and aren't listed anywhere: in every
+/// released version a tab held terminals only, so the zone splits were the
+/// terminal splits (OpenSpec change `zones-mixed-tabs`, decision 4).
+const ALIASES: &[(&str, ActionBuilder)] = &[
+    ("split_zone_right", || Box::new(SplitTerminalRight)),
+    ("split_zone_down", || Box::new(SplitTerminalDown)),
+];
 
 /// Bindable action names, for `--list-actions`.
 pub fn action_names() -> impl Iterator<Item = String> {
@@ -315,6 +346,25 @@ pub struct PaletteFacts {
     /// It has sent a prompt mark (OSC 133/633 `A`): a shell with
     /// integration runs in it. Never in an agent zone.
     pub prompt_marks: bool,
+    /// The config has a terminal profile, and an agent profile: a kind's
+    /// split commands are listed only while it has one.
+    pub terminal_profiles: bool,
+    pub agent_profiles: bool,
+}
+
+/// The kind of profile a split command asks for, or `None` for any other
+/// action (the two that ask which profile take any).
+fn split_kind(action: &dyn Action) -> Option<crate::config::ProfileKind> {
+    use crate::config::ProfileKind;
+    let terminal: [&dyn Action; 2] = [&SplitTerminalRight, &SplitTerminalDown];
+    let agent: [&dyn Action; 2] = [&SplitAgentRight, &SplitAgentDown];
+    if terminal.iter().any(|t| action.partial_eq(*t)) {
+        Some(ProfileKind::Terminal)
+    } else if agent.iter().any(|a| action.partial_eq(*a)) {
+        Some(ProfileKind::Agent)
+    } else {
+        None
+    }
 }
 
 /// What the active zone holds, for the palette.
@@ -362,13 +412,20 @@ fn needs_prompt_marks(action: &dyn Action) -> bool {
 /// Whether the palette lists `action` for a zone with these `facts`. In a
 /// terminal zone, the commands that read shell-integration marks are hidden
 /// until a prompt mark has arrived (without one they would do nothing); in
-/// an agent zone, every command that acts on a terminal is. Every other
-/// action is the focused tab's to answer.
+/// an agent zone, every command that acts on a terminal is. A kind's split
+/// commands are hidden while the config has no profile of that kind. Every
+/// other action is the focused tab's to answer.
 pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
-    match facts.zone {
-        PaletteZone::Terminal => facts.prompt_marks || !needs_prompt_marks(action),
-        PaletteZone::Agent => !acts_on_terminal(action),
-    }
+    let kind_listed = match split_kind(action) {
+        Some(crate::config::ProfileKind::Terminal) => facts.terminal_profiles,
+        Some(crate::config::ProfileKind::Agent) => facts.agent_profiles,
+        None => true,
+    };
+    kind_listed
+        && match facts.zone {
+            PaletteZone::Terminal => facts.prompt_marks || !needs_prompt_marks(action),
+            PaletteZone::Agent => !acts_on_terminal(action),
+        }
 }
 
 /// An action's label as a menu item shows it: its command palette label.
@@ -510,8 +567,10 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("escape", FindClose, f),
         KeyBinding::new("alt-c", FindToggleCase, f),
         KeyBinding::new("alt-r", FindToggleRegex, f),
-        KeyBinding::new("ctrl-shift-e", SplitZoneRight, z),
-        KeyBinding::new("ctrl-shift-o", SplitZoneDown, z),
+        KeyBinding::new("ctrl-shift-e", SplitTerminalRight, z),
+        KeyBinding::new("ctrl-shift-o", SplitTerminalDown, z),
+        KeyBinding::new("ctrl-shift-alt-e", SplitAgentRight, z),
+        KeyBinding::new("ctrl-shift-alt-o", SplitAgentDown, z),
         KeyBinding::new("ctrl-shift-x", CloseZone, z),
         KeyBinding::new("alt-left", FocusZoneLeft, z),
         KeyBinding::new("alt-right", FocusZoneRight, z),
@@ -613,6 +672,78 @@ mod tests {
         list.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
     }
 
+    /// A zone's facts in a config with profiles of both kinds.
+    fn both_kinds(zone: PaletteZone) -> PaletteFacts {
+        PaletteFacts { zone, prompt_marks: false, terminal_profiles: true, agent_profiles: true }
+    }
+
+    /// A kind's two split commands are listed only while the config has a
+    /// profile of that kind; the two that ask which profile stay listed.
+    #[test]
+    fn a_kinds_split_commands_are_listed_only_with_a_profile_of_it() {
+        let listed = |facts| -> Vec<&'static str> {
+            palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, facts)).map(|(l, _)| l).collect()
+        };
+        let terminal = ["Split Terminal Right", "Split Terminal Down"];
+        let agent = ["Split Agent Right", "Split Agent Down"];
+        let asking = ["Split Right With Profile…", "Split Down With Profile…"];
+        for zone in [PaletteZone::Terminal, PaletteZone::Agent] {
+            let both = listed(both_kinds(zone));
+            let no_agent = listed(PaletteFacts { agent_profiles: false, ..both_kinds(zone) });
+            let no_terminal = listed(PaletteFacts { terminal_profiles: false, ..both_kinds(zone) });
+            for label in terminal.iter().chain(&agent).chain(&asking) {
+                assert!(both.contains(label), "{label} with both kinds");
+            }
+            for label in agent {
+                assert!(!no_agent.contains(&label), "{label} without an agent profile");
+                assert!(no_terminal.contains(&label), "{label} without a terminal profile");
+            }
+            for label in terminal {
+                assert!(no_agent.contains(&label), "{label} without an agent profile");
+                assert!(!no_terminal.contains(&label), "{label} without a terminal profile");
+            }
+            for label in asking {
+                assert!(no_agent.contains(&label) && no_terminal.contains(&label), "{label} stays listed");
+            }
+        }
+    }
+
+    /// The zone splits' earlier names still run the terminal splits, in
+    /// `[keys]` and `--action`, but no list shows them.
+    #[test]
+    fn the_old_split_names_run_the_terminal_splits_unlisted() {
+        for (old, new) in [("split_zone_right", &SplitTerminalRight as &dyn Action), ("split_zone_down", &SplitTerminalDown)] {
+            assert!(action_by_name(old).is_some_and(|a| a.partial_eq(new)), "{old}");
+            assert!(!action_names().any(|n| n == old), "{old} is listed");
+            let (bindings, findings) = user_bindings(&pairs(&[("ctrl-shift-y", old)]));
+            assert!(findings.is_empty(), "{findings:?}");
+            assert!(bindings[0].action().partial_eq(new), "{old} binds the terminal split");
+        }
+        let names: Vec<String> = action_names().collect();
+        for name in [
+            "split_terminal_right",
+            "split_terminal_down",
+            "split_agent_right",
+            "split_agent_down",
+            "split_right_with_profile",
+            "split_down_with_profile",
+        ] {
+            assert!(names.iter().any(|n| n == name), "{name} isn't listed");
+            assert!(action_by_name(name).is_some(), "{name}");
+        }
+        assert_eq!(menu_label(&SplitAgentRight), Some("Split Agent Right"));
+        assert_eq!(menu_label(&SplitRightWithProfile), Some("Split Right With Profile…"));
+    }
+
+    /// The two that ask which profile have no default key.
+    #[test]
+    fn the_asking_splits_have_no_default_key() {
+        for binding in default_bindings() {
+            assert!(!binding.action().partial_eq(&SplitRightWithProfile), "split_right_with_profile is bound");
+            assert!(!binding.action().partial_eq(&SplitDownWithProfile), "split_down_with_profile is bound");
+        }
+    }
+
     #[test]
     fn an_unknown_action_is_a_finding() {
         let (bindings, findings) =
@@ -685,7 +816,7 @@ mod tests {
             assert_eq!(menu_label(action), None, "{name}");
         }
         assert_eq!(menu_label(&RenameTab), Some("Rename Tab"));
-        assert_eq!(menu_label(&SplitZoneDown), Some("Split Zone Down"));
+        assert_eq!(menu_label(&SplitTerminalDown), Some("Split Terminal Down"));
 
         let menu = ActionMenu::new(
             vec![ActionRow::item(RenameTab, true), ActionRow::Separator, ActionRow::item(CloseTab, false)],
@@ -814,20 +945,33 @@ mod tests {
             key: key.into(),
             key_char: None,
         };
-        let zone_ctx: Vec<KeyContext> =
-            ["Workspace", "ZoneTree", "Terminal"].iter().map(|c| KeyContext::parse(c).unwrap()).collect();
-        for (press, expected) in [
-            (ctrl_shift("e"), &SplitZoneRight as &dyn Action),
-            (ctrl_shift("o"), &SplitZoneDown as &dyn Action),
+        let ctrl_shift_alt = |key: &str| Keystroke {
+            modifiers: Modifiers { control: true, shift: true, alt: true, ..Default::default() },
+            key: key.into(),
+            key_char: None,
+        };
+        let parse = |stack: &[&str]| -> Vec<KeyContext> { stack.iter().map(|c| KeyContext::parse(c).unwrap()).collect() };
+        // A terminal zone, and an agent zone's prompt input (its text area
+        // focused), which binds none of the zone's keys itself
+        // (`zones-mixed-tabs`: ctrl-shift-e isn't a text area's select-to-end).
+        let terminal = parse(&["Workspace", "ZoneTree", "Terminal"]);
+        let prompt = parse(&["Workspace", "ZoneTree", "AgentZone", "Owner", "PromptInput", "TextArea"]);
+        let keys = [
+            (ctrl_shift("e"), &SplitTerminalRight as &dyn Action),
+            (ctrl_shift("o"), &SplitTerminalDown as &dyn Action),
+            (ctrl_shift_alt("e"), &SplitAgentRight as &dyn Action),
+            (ctrl_shift_alt("o"), &SplitAgentDown as &dyn Action),
             (ctrl_shift("x"), &CloseZone as &dyn Action),
             (alt("left"), &FocusZoneLeft as &dyn Action),
             (alt("right"), &FocusZoneRight as &dyn Action),
             (alt("up"), &FocusZoneUp as &dyn Action),
             (alt("down"), &FocusZoneDown as &dyn Action),
-        ] {
-            let (bindings, pending) = keymap.bindings_for_input(&[press], &zone_ctx);
+        ];
+        for (zone_ctx, (press, expected)) in [&terminal, &prompt].into_iter().flat_map(|c| keys.iter().map(move |k| (c, k))) {
+            let (bindings, pending) = keymap.bindings_for_input(std::slice::from_ref(press), zone_ctx);
             assert!(!pending);
-            assert!(bindings[0].action().partial_eq(expected));
+            let first = bindings[0].action();
+            assert!(first.partial_eq(*expected), "{press} in {zone_ctx:?}: {}", first.name());
         }
     }
 
@@ -839,8 +983,8 @@ mod tests {
         let commands = palette_commands();
         let labelled: Vec<&str> = ACTIONS.iter().filter_map(|(_, label, _)| *label).collect();
         assert_eq!(commands.iter().map(|(l, _)| *l).collect::<Vec<_>>(), labelled);
-        assert!(commands.iter().any(|(l, _)| *l == "Split Zone Right"));
-        assert!(commands.iter().all(|(l, _)| !l.starts_with("tmux")));
+        assert!(commands.iter().any(|(l, _)| *l == "Split Terminal Right"));
+        assert!(commands.iter().all(|(l, _)| !l.starts_with("tmux") && !l.starts_with("Split Zone")));
 
         // As if focus were in a local terminal: workspace + terminal handlers,
         // a global listener, and ActivateTab (no_json) on the workspace.
@@ -865,8 +1009,8 @@ mod tests {
     #[test]
     fn the_last_command_actions_are_listed_only_after_a_prompt_mark() {
         let (without, with) = (
-            PaletteFacts { zone: PaletteZone::Terminal, prompt_marks: false },
-            PaletteFacts { zone: PaletteZone::Terminal, prompt_marks: true },
+            PaletteFacts { prompt_marks: false, ..both_kinds(PaletteZone::Terminal) },
+            PaletteFacts { prompt_marks: true, ..both_kinds(PaletteZone::Terminal) },
         );
         let listed = |facts| -> Vec<&'static str> {
             palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, facts)).map(|(l, _)| l).collect()
@@ -891,7 +1035,7 @@ mod tests {
     /// scrolling ones the agent view answers included.
     #[test]
     fn an_agent_zone_lists_no_terminal_commands() {
-        let agent = PaletteFacts { zone: PaletteZone::Agent, prompt_marks: false };
+        let agent = both_kinds(PaletteZone::Agent);
         let listed: Vec<&str> =
             palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, agent)).map(|(l, _)| l).collect();
         for label in [
@@ -905,7 +1049,9 @@ mod tests {
             "Toggle Agent Thoughts",
             "Toggle Tool Details",
             "Scroll Agent to Bottom",
-            "Split Zone Right",
+            "Split Agent Right",
+            "Split Terminal Right",
+            "Split Right With Profile…",
             "Close Zone",
             "New Tab",
             "Close Tab",

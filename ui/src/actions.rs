@@ -136,7 +136,10 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         // Text areas: up and down by shown line (on the first or last row
         // they go on to the owner), home and end of the shown line, the
         // text's start and end with ctrl, and shift-enter for a line break.
-        // Enter, escape, tab and shift-tab stay the owner's.
+        // Enter, escape, tab and shift-tab stay the owner's, and so does
+        // ctrl-shift-e, a text input's select-to-end: an agent zone's
+        // prompt is a text area, and the zone's Split Terminal Right must
+        // reach it (OpenSpec change `zones-mixed-tabs`).
         KeyBinding::new("up", TextAreaUp, a),
         KeyBinding::new("down", TextAreaDown, a),
         KeyBinding::new("shift-up", TextAreaSelectUp, a),
@@ -146,7 +149,6 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("ctrl-e", TextAreaLineEnd, a),
         KeyBinding::new("shift-home", TextAreaSelectLineStart, a),
         KeyBinding::new("shift-end", TextAreaSelectLineEnd, a),
-        KeyBinding::new("ctrl-shift-e", TextAreaSelectLineEnd, a),
         KeyBinding::new("ctrl-home", TextInputHome, a),
         KeyBinding::new("ctrl-end", TextInputEnd, a),
         KeyBinding::new("ctrl-shift-home", TextInputSelectHome, a),
@@ -212,9 +214,10 @@ mod tests {
         );
         // A text area shares every editing key but home and end, which go
         // to the shown line, and adds the line keys and shift-enter; it
-        // binds no escape, tab or shift-tab, and enter only to pass it on.
+        // binds no escape, tab, shift-tab or ctrl-shift-e (an agent zone's
+        // Split Terminal Right), and enter only to pass it on.
         let text_area = in_context(&bindings, "TextArea");
-        assert_eq!(text_area.len(), 23 + 16);
+        assert_eq!(text_area.len(), 23 + 15);
         let named = |keys: &str| {
             bindings
                 .iter()
@@ -228,7 +231,7 @@ mod tests {
         assert_eq!(named("down"), Some("brindle_ui::TextAreaDown"));
         assert_eq!(named("ctrl-v"), Some("brindle_ui::TextInputPaste"));
         assert_eq!(named("enter"), Some("brindle_ui::TextAreaEnter"));
-        for owners in ["escape", "tab", "shift-tab"] {
+        for owners in ["escape", "tab", "shift-tab", "ctrl-shift-e"] {
             assert_eq!(named(owners), None, "{owners}");
         }
         let prompt = in_context(&bindings, "PromptInput");

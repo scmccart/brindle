@@ -36,9 +36,9 @@ pub fn split_and_focus(ctx: &Ctx) -> Result<Outcome> {
     ensure!(
         out.dump.zone_list
             == [
-                "id=1 rect=0,0,0.5,1 active",
-                "id=2 rect=0.5,0,0.5,0.5",
-                "id=3 rect=0.5,0.5,0.5,0.5",
+                "id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell\" active",
+                "id=2 rect=0.5,0,0.5,0.5 kind=terminal profile=\"Shell\"",
+                "id=3 rect=0.5,0.5,0.5,0.5 kind=terminal profile=\"Shell\"",
             ],
         "zone_list: {:?}",
         out.dump.zone_list
@@ -144,7 +144,7 @@ const PADDING: f32 = 6.0;
 
 /// The most common colour in `r` is `color`, so text and icons drawn over
 /// the surface don't matter.
-fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
+pub(super) fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
     let got = image.dominant(r);
     ensure!(
         got.is_some_and(|c| c.near(color, 2)),
@@ -235,7 +235,11 @@ pub fn restore(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "restored zones: {:?}", out.dump.zones);
     ensure!(
-        out.dump.zone_list == ["id=1 rect=0,0,0.5,1", "id=2 rect=0.5,0,0.5,1 active"],
+        out.dump.zone_list
+            == [
+                "id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell\"",
+                "id=2 rect=0.5,0,0.5,1 kind=terminal profile=\"Shell\" active",
+            ],
         "restored zone_list: {:?}",
         out.dump.zone_list
     );

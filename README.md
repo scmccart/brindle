@@ -11,11 +11,13 @@ GPUI's Vulkan renderer on Linux and its Direct3D 11 renderer on Windows.
   A new tab starts in the active tab's directory: on Linux the foreground
   program's, on Windows the one its shell last reported (see
   [Shell integration](#shell-integration)).
-- **Zones**: split any local tab horizontally (ctrl-shift-e) or vertically (ctrl-shift-o)
-  into a binary tree of zones, each a card in its terminal's colours with a header bar
-  and controls once the tab has two or more. Move between them with alt-arrows (the
-  active zone gets a focus ring when you move by keyboard), and close a zone with
-  ctrl-shift-x.
+- **Zones**: split any tab into a binary tree of zones, with a terminal
+  (ctrl-shift-e right, ctrl-shift-o down) or an agent (ctrl-shift-alt-e,
+  ctrl-shift-alt-o) beside the active one, or any profile you choose; one tab
+  can hold terminals and agents, local and remote, each zone a card in its own
+  profile's colours with a header bar and controls once the tab has two or
+  more. Move between them with alt-arrows (the active zone gets a focus ring
+  when you move by keyboard), and close a zone with ctrl-shift-x.
 - **Profiles**: command, args, working directory, environment, theme and font size per
   profile, editable in the settings dialog.
 - **Agent tabs**: a profile with `type = "agent"` runs an ACP (Agent Client
@@ -53,7 +55,10 @@ while its build matches. Output remains the terminal's original byte stream,
 so OSC 7 directories, OSC 9/777/99 notifications, OSC 7501 program status, OSC 9;4
 progress, OSC 3008 contexts, OSC 22 pointer shapes, clipboard/color replies and
 shell-integration marks work as in a local tab.
-Zone splits stay on the same endpoint and inherit its remote directory.
+A split that runs the split zone's own profile stays on the same endpoint and
+inherits its remote directory; one that runs another profile runs where that
+profile says, so a tab can hold a local shell beside a shell on a host, and a
+directory never crosses from one host to another.
 
 SSH uses your normal OpenSSH configuration, agent and host aliases:
 
@@ -636,9 +641,10 @@ family = ["Inter", "Segoe UI"]
 | ctrl-tab, ctrl-pageup/down | switch tab |
 | alt-1 … alt-9 | go to tab (9 = last) |
 | ctrl-shift-pageup/down | move tab |
-| ctrl-shift-e / ctrl-shift-o | split zone right / down (in a local tab) |
-| ctrl-shift-x | close zone (in a local tab) |
-| alt-arrows | move between zones (in a local tab) |
+| ctrl-shift-e / ctrl-shift-o | split with a terminal right / down (see [Splitting zones](#splitting-zones)) |
+| ctrl-shift-alt-e / ctrl-shift-alt-o | split with an agent right / down |
+| ctrl-shift-x | close zone |
+| alt-arrows | move between zones |
 | ctrl-shift-p | command palette (every command, with its shortcut) |
 | ctrl-shift-space | new tab with a profile (a list you can filter by typing) |
 | the strip's `⌄` | profile menu (see below) |
@@ -662,9 +668,11 @@ The ctrl-shift-space list is the one to use to filter by name.
 Right-clicking a tab makes it the active tab and opens its menu at the pointer:
 Rename Tab, Move Tab Left, Move Tab Right (each disabled at its end of the
 strip) and Close Tab. Right-clicking a zone header focuses that zone and
-opens its menu: Split Zone Right, Split Zone Down (each disabled where the zone
-is too small to split) and Close Zone. Each item shows its key and does what
-the key does; the menus take the profile menu's keys.
+opens its menu: Split Terminal Right and Down, Split Agent Right and Down,
+Split Right With Profile… and Split Down With Profile… (each disabled where the
+zone is too small to split, and a kind's where the config has no profile of
+it), then Close Zone. Each item shows its key and does what the key does; the
+menus take the profile menu's keys.
 
 Four actions have no default key, for working without a mouse: bind
 `open_profile_menu` to open the profile menu below `⌄`, `open_tab_menu` to open
@@ -723,6 +731,31 @@ or another section drop the changes.
 The Clipboard section has two switches, Copy on select (`copy_on_select`) and Right-click pastes (`right_click = "paste"`, which pastes over a selection too, clearing it; see [Clipboard](#clipboard)). Apply (or enter) writes the changed ones and closes the dialog, and open tabs follow at once; Cancel, escape or another section drop the changes.
 
 Plain `ctrl-<letter>` always goes to the program, so a program's own keys (tmux's prefix, say) work as usual.
+
+### Splitting zones
+
+A tab's zones can run any profiles: terminals and agents, on this machine or
+on remote hosts, side by side. Each zone keeps the profile it started with,
+and draws in that profile's theme and font size; the tab's face on the strip
+takes the active zone's colours, and its title is the active zone's.
+
+- **Split Terminal** (ctrl-shift-e right, ctrl-shift-o down) and **Split
+  Agent** (ctrl-shift-alt-e, ctrl-shift-alt-o) add a zone of that kind beside
+  the active one, running the first of: the active zone's own profile when it
+  is of that kind, the default profile when it is, the only profile of that
+  kind. With several and none of these, a palette asks which (escape splits
+  nothing); with none, the config line says so.
+- **Split Right With Profile…** and **Split Down With Profile…** (no default
+  keys) list every profile, the default first, so you can add, say, an SSH
+  shell beside a local one.
+- The new zone starts in the active zone's directory when both run on the
+  same host (an agent zone's is the one its session started in), even when
+  its profile sets `cwd`; on another host it starts in the profile's `cwd`,
+  else the home directory there.
+- A zone header's split buttons split with another zone of its own kind.
+  A terminal login's zone (an agent's login program) can't be split.
+- `split_zone_right` and `split_zone_down`, the names from before, still
+  work in `[keybindings]` and `--action` as the terminal splits.
 
 ### Agent tabs
 
@@ -828,8 +861,11 @@ Agent to Bottom (the actions `agent_submit`, `agent_cancel`, `agent_unqueue`,
 `agent_scroll_to_bottom`),
 with the zone and tab commands; the terminal's commands aren't listed there.
 
-Splitting an agent zone opens another agent zone, with a session of its own,
-on the same profile. Closing a zone or tab whose agent is working or waiting
+Split Agent Right or Down (ctrl-shift-alt-e, ctrl-shift-alt-o) in an agent
+zone opens another agent zone, with a session of its own, on the same
+profile, and from a terminal zone opens one beside it in the terminal's
+directory; ctrl-shift-e and ctrl-shift-o open a terminal beside the agent
+(see [Splitting zones](#splitting-zones)). Closing a zone or tab whose agent is working or waiting
 on a permission asks first, naming the agents, with Cancel focused (enter and
 escape cancel; tab then enter closes); closing an idle one, and quitting,
 don't ask. Detached agent sessions are listed in the sessions palette ("Attach
@@ -842,8 +878,7 @@ another ACP version, leaves its conversation readable.
 Not yet: syntax highlighting, logging in from the zone (`agents-login`), going on after an agent exits (`agents-session-recovery`),
 and ACP version 2
 (`agents-acp-v2`), each a change of its own; nor the agent's file and
-terminal access, modes, slash commands, mixing agent and terminal zones in a
-tab, finding or selecting text in a conversation, or editing agent profiles
+terminal access, modes, slash commands, finding or selecting text in a conversation, or editing agent profiles
 in the settings dialog.
 
 **Release note:** a Brindle from before agent tabs rejects a config with an
@@ -944,7 +979,7 @@ Every launch reopens the tabs you had when Brindle last quit (the old
 what it asked for (`brindle terminal`'s tab or `--attach`'s session) as the active tab:
 
 - the window's size, its tabs in order, and its active tab;
-- each tab's profile and zone split tree, with each zone in its shell's last directory and the active zone focused;
+- each tab's zone split tree, with each zone's own profile and host, each zone in its shell's last directory and the active zone focused;
 
 On Linux, a local tab or zone gets its terminal server session back: the same
 program, still running, with its screen and scrollback. A zone whose session
@@ -953,7 +988,11 @@ the other side of its split takes its place, and a tab with nothing left is
 dropped. When nothing at all is left, Brindle opens one tab with the default
 profile. On Windows, shells start fresh in the recorded directory. A remote
 zone gets its session back from its host once Brindle has connected to it, and
-the host's other detached sessions open as tabs after the local ones. A state
+the host's other detached sessions open as tabs after the local ones. In a tab
+across hosts each zone comes back on its own: a host that is slow or down
+leaves its zones connecting or failed while the others work. Detached sessions
+that are swept back rather than restored come back as one tab per host, each
+with that host's zones. A state
 file written by more than one window (before Brindle had one) comes back as one
 window, with the first window's size.
 `brindle --no-restore` skips restoring once, and leaves the detached
