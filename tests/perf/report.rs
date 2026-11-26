@@ -48,6 +48,23 @@ pub struct StreamResult {
     pub step_interval_ms: f64,
 }
 
+/// A long agent conversation attached again (OpenSpec change
+/// `agents-log-paging`, design.md decision 14), timed in milliseconds from
+/// Brindle's launch to its exit on a `--wait-for` of the conversation's
+/// last entry.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AttachResult {
+    /// The conversation's text, every entry's.
+    pub bytes: u64,
+    /// Its entries, the prompt included.
+    pub entries: u64,
+    /// Launch to exit, restoring the tab that attaches it.
+    pub attach_ms: f64,
+    /// The step interval Brindle waits between seeing the last entry and
+    /// quitting, part of `attach_ms`.
+    pub step_interval_ms: f64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
     /// Environment notes: versions, CPU governor, display.
@@ -57,6 +74,9 @@ pub struct Summary {
     /// Absent from runs made before the stream cases existed.
     #[serde(default)]
     pub stream: BTreeMap<String, StreamResult>,
+    /// Absent from runs made before the attach case existed.
+    #[serde(default)]
+    pub attach: BTreeMap<String, AttachResult>,
 }
 
 impl Summary {
@@ -216,6 +236,22 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
         }
         out.push_str(&table(&rows));
     }
+    if !summary.attach.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let mut rows = vec![["attach (ms)", "launch to shown", "entries", "MiB"].map(String::from).to_vec()];
+        for (case, result) in &summary.attach {
+            let base = baseline.and_then(|b| b.attach.get(case));
+            rows.push(vec![
+                case.clone(),
+                cell(result.attach_ms, base.map(|b| b.attach_ms), false),
+                result.entries.to_string(),
+                format!("{:.1}", result.bytes as f64 / (1024.0 * 1024.0)),
+            ]);
+        }
+        out.push_str(&table(&rows));
+    }
     out
 }
 
@@ -253,7 +289,10 @@ pub fn self_test_render() -> Result {
     // A round trip keeps everything.
     let again: Summary = toml::from_str(&current.to_toml()).map_err(|e| e.to_string())?;
     crate::ensure!(
-        again.latency == current.latency && again.throughput == current.throughput && again.stream == current.stream,
+        again.latency == current.latency
+            && again.throughput == current.throughput
+            && again.stream == current.stream
+            && again.attach == current.attach,
         "round trip lost data"
     );
     // A summary from before the stream cases still loads, with none.
