@@ -827,6 +827,93 @@ pub fn ssh_split(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// A tab across two hosts (OpenSpec change `zones-mixed-tabs`): a local
+/// shell split with the SSH profile through Split Right With Profile…, its
+/// zone line naming the host. Quit and relaunched, the tab comes back whole,
+/// each zone attached to its own session. Swept by a launch with another
+/// state directory and the profile connecting at launch, it comes back as
+/// one tab per host. Restored with the container stopped, the local zone
+/// works and the SSH zone says it can't connect.
+pub fn mixed_tab(ctx: &Ctx) -> Result<Outcome> {
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    let config = ssh.profile(SSH_PROFILE, "ssh-mixed", false);
+    let host = format!("ssh:root@{}:{}", ssh.host, ssh.port);
+    let lines = |active: usize| {
+        let mark = |id: usize| if id == active { " active" } else { "" };
+        [
+            format!("id=1 rect=0,0,0.5,1 kind=terminal profile=\"Shell\"{}", mark(1)),
+            format!("id=2 rect=0.5,0,0.5,1 kind=terminal profile=\"{SSH_PROFILE}\" host=\"{host}\"{}", mark(2)),
+        ]
+    };
+    let first = needs
+        .run(ctx, "first", &config)
+        .restore()
+        .keep_detached()
+        .send("echo local-$((1+1))\r")
+        .wait_for("local-2")
+        .action("split_right_with_profile")
+        .send(SSH_PROFILE)
+        .action("list_confirm")
+        .wait_for(SSH_PROMPT)
+        .send("echo remote-$((2+2))\r")
+        .wait_for("remote-4")
+        .dump_at(15.0)
+        .run()?;
+    no_waits_left(&first.dump)?;
+    ensure!(first.dump.zone_list == lines(2), "first: zones {:#?}", first.dump.zone_list);
+
+    let restored = needs
+        .run(ctx, "restored", &config)
+        .restore()
+        .keep_detached()
+        .wait_for("remote-4")
+        .action("focus_zone_left")
+        .wait_for("local-2")
+        .dump_at(12.0)
+        .run()?;
+    no_waits_left(&restored.dump)?;
+    ensure!(restored.dump.tabs.len() == 1, "restored: tabs {:?}", restored.dump.tabs);
+    ensure!(restored.dump.zone_list == lines(1), "restored: zones {:#?}", restored.dump.zone_list);
+
+    // Nothing records the tab in this state directory, so the sweeps bring
+    // it back: the local zone from this machine's, the SSH zone from the
+    // host's, which a profile connecting at launch sweeps.
+    let other = ctx.dir.join("other-state");
+    let swept = needs
+        .run(ctx, "swept", &ssh.profile(SSH_PROFILE, "ssh-mixed", true))
+        .restore()
+        .keep_detached()
+        .env("BRINDLE_STATE_DIR", &other.to_string_lossy())
+        .action("activate_tab_2")
+        .wait_for("local-2")
+        .action("activate_tab_3")
+        .wait_for("remote-4")
+        .dump_at(15.0)
+        .run()?;
+    no_waits_left(&swept.dump)?;
+    ensure!(swept.dump.tabs.len() == 3, "swept: tabs {:?}", swept.dump.tabs);
+    ensure!(swept.dump.zones.is_none(), "swept: the SSH tab's zones {:?}", swept.dump.zone_list);
+
+    ssh.container.stop()?;
+    let stopped = needs
+        .run(ctx, "stopped", &config)
+        .restore()
+        .wait_for("local-2")
+        .send("echo still-$((3+3))\r")
+        .wait_for("still-6")
+        .action("focus_zone_right")
+        .wait_for("can't connect to root@")
+        .dump_at(15.0)
+        .run()?;
+    no_waits_left(&stopped.dump)?;
+    ensure!(stopped.dump.zone_list == lines(2), "stopped: zones {:#?}", stopped.dump.zone_list);
+    Ok(Outcome::Pass)
+}
+
 /// `remote-ssh-split`'s timeline: once the SSH tab's three zones are
 /// attached, Brindle (`brindle`) has one `ssh` and the container one relay,
 /// saved to `save`. Then it marks the active zone with `counted`, which

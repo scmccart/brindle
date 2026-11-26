@@ -22,7 +22,7 @@ Before starting:
 ## 3. Commands
 
 - [x] 3.1 Add `split_terminal_right`, `split_terminal_down` (ctrl-shift-e, ctrl-shift-o), `split_agent_right`, `split_agent_down` (ctrl-shift-alt-e, ctrl-shift-alt-o), `split_right_with_profile` and `split_down_with_profile` (no keys) to `ACTIONS`; keep `split_zone_right` and `split_zone_down` as unlisted names for the terminal splits in `[keys]` and `--action`; list a kind's two only while the config has a profile of it; verify with unit tests of the palette's listing with and without each kind, the old names resolving, and `--list-actions`.
-- [ ] 3.2 Add the choose-a-profile palette (the profiles of one kind for `Ask`, every profile for the two that ask), splitting the zone that was active when it opened if it still exists and fits; a refusal on the notice line; verify in the e2e cases of section 6.
+- [x] 3.2 Add the choose-a-profile palette (the profiles of one kind for `Ask`, every profile for the two that ask), splitting the zone that was active when it opened if it still exists and fits; a refusal on the notice line; verify in the e2e cases of section 6.
 - [x] 3.3 A zone header's split buttons run its own kind's commands; its menu lists the six and Close Zone, disabled by size and by kind; tooltips keep "Split right" and "Split down" with the key of the command they run; verify with a unit test of `zone_menu_rows`.
 
 ## 4. Session state and restore
@@ -39,14 +39,14 @@ Before starting:
 
 ## 6. End-to-end cases
 
-- [ ] 6.1 `zones-split-kinds` (fake ACP agent): each of the four kind commands from a shell and from an agent zone, by `--key`, with the zone lines' kinds and profiles; the old `split_zone_right` name through `--action`.
-- [ ] 6.2 `zones-split-ask`: two agent profiles, the palette's rows, a choice with the list actions, and escape splitting nothing; `split_right_with_profile` choosing a second terminal profile.
-- [ ] 6.3 `zones-split-directory`: an agent split of a shell that has changed directory starts there, though the agent profile sets `cwd`; a terminal split of an agent zone starts in the agent's directory.
-- [ ] 6.4 `zones-mixed-restore`: a tab of a shell and an agent zone quit and relaunched comes back with both sessions; the same tab after a `--no-restore` launch comes back from the sweep as one tab.
-- [ ] 6.5 `zones-mixed-themes`: two zones of different themes, each card and header sampled, and the tab's face before and after `focus_zone_left`.
-- [ ] 6.6 `zones-login-no-split`: the split keys do nothing in a terminal login's zone.
-- [ ] 6.7 `remote-mixed-tab` (Docker): a local shell split with an SSH profile; the tab restored; restored with the container stopped, the local zone working and the remote one saying it can't connect; and swept with another state directory, as one tab per host.
-- [ ] 6.8 Run the Windows cases that split (`windows-zones`) and add a `windows-agent-*` case for an agent split of a shell.
+- [x] 6.1 `zones-split-kinds` (fake ACP agent): each of the four kind commands from a shell and from an agent zone, by `--key`, with the zone lines' kinds and profiles; the old `split_zone_right` name through `--action`.
+- [x] 6.2 `zones-split-ask`: two agent profiles, the palette's rows, a choice with the list actions, and escape splitting nothing; `split_right_with_profile` choosing a second terminal profile.
+- [x] 6.3 `zones-split-directory`: an agent split of a shell that has changed directory starts there, though the agent profile sets `cwd`; a terminal split of an agent zone starts in the agent's directory.
+- [x] 6.4 `zones-mixed-restore`: a tab of a shell and an agent zone quit and relaunched comes back with both sessions; the same tab after a `--no-restore` launch comes back from the sweep as one tab.
+- [x] 6.5 `zones-mixed-themes`: two zones of different themes, each card and header sampled, and the tab's face before and after `focus_zone_left`.
+- [x] 6.6 `zones-login-no-split`: the split keys do nothing in a terminal login's zone.
+- [x] 6.7 `remote-mixed-tab` (Docker): a local shell split with an SSH profile; the tab restored; restored with the container stopped, the local zone working and the remote one saying it can't connect; and swept with another state directory, as one tab per host.
+- [ ] 6.8 Run the Windows cases that split (`windows-zones`) and add a `windows-agent-*` case for an agent split of a shell. (`windows-agent-split` is written, the Linux run's `zones-agent-beside-shell`; both need windows-e2e.)
 
 ## 7. Docs and checks
 

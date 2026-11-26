@@ -144,7 +144,7 @@ const PADDING: f32 = 6.0;
 
 /// The most common colour in `r` is `color`, so text and icons drawn over
 /// the surface don't matter.
-fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
+pub(super) fn expect_dominant(image: &Image, what: &str, r: PxRect, color: Rgb) -> Result {
     let got = image.dominant(r);
     ensure!(
         got.is_some_and(|c| c.near(color, 2)),
