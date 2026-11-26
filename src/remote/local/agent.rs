@@ -17,6 +17,10 @@ impl SessionSink for Sink {
         Sink::note(self, text);
     }
 
+    fn endpoint_note(&mut self, text: &str) {
+        Sink::endpoint_note(self, text);
+    }
+
     fn replay(&mut self, active: bool) {
         Sink::replay(self, active);
     }

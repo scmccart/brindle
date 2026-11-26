@@ -113,6 +113,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, bail};
 use parking_lot::{Condvar, Mutex};
 
+use super::endpoint_env::{self, EndpointEnv, Fallback};
 use super::link::{Link, Wire};
 use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
@@ -186,6 +187,13 @@ pub trait SessionSink: Send {
     /// while a replay is, and a repeat is shown once until the session
     /// prints again.
     fn note(&mut self, text: &str);
+    /// The session's program got the endpoint's SSH environment because the
+    /// login shell's wasn't read: told once, before its output. A terminal
+    /// shows it as a [`SessionSink::note`]'s dim line; an agent zone keeps
+    /// it as an endpoint note above the conversation.
+    fn endpoint_note(&mut self, text: &str) {
+        self.note(text);
+    }
     /// A replay starts (`true`) or ends.
     fn replay(&mut self, active: bool);
     /// The program exited.
@@ -534,6 +542,12 @@ struct State {
     /// ([`State::keep_listed`], [`State::shows`], [`State::forget`]).
     sessions: HashMap<SessionId, Shown>,
     requests: HashMap<RequestId, Pending>,
+    /// What a start's terminal or zone says when its answer comes (on
+    /// `SPAWNED`, or a restart's `OK`), by request: the endpoint's login
+    /// shell environment wasn't read, so it got the SSH session's
+    /// ([`Fallback`]). Set or cleared each time the writer writes the start,
+    /// for the link it goes out on.
+    fallbacks: HashMap<RequestId, String>,
     /// The `LIST` sent after a link's `WELCOME`, or for a recorded attach
     /// or a listing hook.
     list: Option<Listing>,
@@ -931,9 +945,10 @@ impl State {
 #[derive(Clone)]
 struct Current {
     wire: Arc<dyn Wire>,
-    /// The relay's `RELAY_HOST`, refreshed with each link: a remote
-    /// `SPAWN`'s environment goes over its.
-    host: Option<Arc<RelayHost>>,
+    /// The endpoint's environments from the relay's `RELAY_HOST`, refreshed
+    /// with each link: a remote start's environment goes over them
+    /// ([`endpoint_env::over_endpoint`]).
+    endpoint: Option<Arc<EndpointEnv>>,
 }
 
 #[derive(Default)]
@@ -1684,7 +1699,8 @@ impl Connection {
         if slot.closed {
             bail!("the connection ended");
         }
-        slot.link = Some(Current { wire, host: host.map(Arc::new) });
+        let endpoint = host.as_ref().map(|host| Arc::new(EndpointEnv::from_host(host)));
+        slot.link = Some(Current { wire, endpoint });
         drop(slot);
         self.slot_ready.notify_all();
         Ok(())
@@ -1707,7 +1723,10 @@ impl Connection {
                 // Heartbeats only keep the link alive.
                 match RelayMessage::decode(&frame) {
                     Ok(RelayMessage::Heartbeat) => {}
-                    Ok(other) => log::debug!("relay: {other:?} after HOST"),
+                    // Named, never printed: a `RELAY_HOST` holds the
+                    // endpoint's environments.
+                    Ok(RelayMessage::Host(_)) => log::debug!("relay: a second RELAY_HOST after HOST"),
+                    Ok(RelayMessage::Error(error)) => log::debug!("relay: RELAY_ERROR {:?} after HOST", error.message),
                     Err(error) => log::warn!("relay: {error}"),
                 }
             } else {
@@ -1730,15 +1749,27 @@ impl Connection {
                 }
             }
             ToClient::Spawned(spawned) => {
-                let routed = self.state.lock().route_spawned(&spawned);
-                if let Some((_, reply, started, displaced)) = self.route(routed) {
+                let (routed, fallback) = {
+                    let mut state = self.state.lock();
+                    let fallback = state.fallbacks.remove(&spawned.req);
+                    (state.route_spawned(&spawned), fallback)
+                };
+                if let Some((sink, reply, started, displaced)) = self.route(routed) {
                     let session = started.session;
+                    // Before the program's first output, which follows.
+                    if let Some(text) = fallback {
+                        self.deliver(session, &sink, |sink| sink.endpoint_note(&text));
+                    }
                     reply.try_send(Ok(started)).ok();
                     self.displaced_lost(session, displaced);
                 }
             }
             ToClient::Error(error) => {
-                let pending = error.req.and_then(|req| self.state.lock().requests.remove(&req));
+                let pending = error.req.and_then(|req| {
+                    let mut state = self.state.lock();
+                    state.fallbacks.remove(&req);
+                    state.requests.remove(&req)
+                });
                 match pending.map(|pending| pending.waiting) {
                     Some(Waiting::Agent { req, session, sink }) => {
                         self.deliver(session, &sink, |sink| sink.reply(req, Err(error.message)));
@@ -1764,12 +1795,20 @@ impl Connection {
                 }
             }
             ToClient::Ok(ok) => {
-                let pending = self.state.lock().requests.remove(&ok.req);
+                let (pending, fallback) = {
+                    let mut state = self.state.lock();
+                    (state.requests.remove(&ok.req), state.fallbacks.remove(&ok.req))
+                };
                 match pending.map(|pending| pending.waiting) {
                     Some(Waiting::Done(reply)) => {
                         reply.try_send(Ok(())).ok();
                     }
                     Some(Waiting::Agent { req, session, sink }) => {
+                        // A restart that fell back to the SSH session's
+                        // environment says so in its zone.
+                        if let Some(text) = fallback {
+                            self.deliver(session, &sink, |sink| sink.endpoint_note(&text));
+                        }
                         self.deliver(session, &sink, |sink| sink.reply(req, Ok(())));
                     }
                     Some(other) => other.fail("answered with OK".into()),
@@ -2352,8 +2391,13 @@ impl Connection {
             {
                 return true;
             }
-            let frame = match encode(message, current.host.as_deref()) {
-                Ok(frame) => frame,
+            let frame = match encode(message, current.endpoint.as_deref()) {
+                Ok((frame, fallback)) => {
+                    if let Some(req) = request {
+                        self.record_fallback(req, fallback);
+                    }
+                    frame
+                }
                 Err(error) => {
                     log::warn!("terminal server message not sent: {error}");
                     // Its answer would never come.
@@ -2390,6 +2434,21 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Records what request `req`'s start says when its answer comes: the
+    /// fallback this link's encoding gave it, or nothing (a later link that
+    /// read the login environment clears an earlier one's). Entries of
+    /// requests that no longer wait are dropped meanwhile.
+    fn record_fallback(&self, req: RequestId, fallback: Option<Fallback>) {
+        let name = fallback.is_some().then(|| self.name());
+        let mut state = self.state.lock();
+        let State { fallbacks, requests, .. } = &mut *state;
+        fallbacks.retain(|req, _| requests.contains_key(req));
+        match fallback.zip(name) {
+            Some((fallback, name)) => fallbacks.insert(req, fallback.text(&name)),
+            None => fallbacks.remove(&req),
+        };
     }
 
     /// Takes `wire` from the writer, unless a newer link replaced it.
@@ -2511,18 +2570,16 @@ fn next_frame(reader: &mut impl BufRead, wire: &dyn Wire) -> Result<Frame> {
     }
 }
 
-/// `message` as a frame. A relay's `SPAWN` and `SPAWN_AGENT` carry the
-/// endpoint's environment with the request's over it.
-fn encode(message: &ToCore, host: Option<&RelayHost>) -> io::Result<Frame> {
-    if let (ToCore::Spawn(spawn), Some(host)) = (message, host) {
-        let env = relay::relay_env(&host.env, &spawn.env);
-        return ToCore::Spawn(client::Spawn { env, ..spawn.clone() }).encode();
+/// `message` as a frame. On a relay link (`endpoint`), every message that
+/// starts a program (`SPAWN`, `SPAWN_AGENT`, `AGENT_RESTART`) carries the
+/// endpoint's environment with the request's over it
+/// ([`endpoint_env::over_endpoint`]), with the fallback to show when the
+/// login shell's environment wasn't read; every other message goes as it is.
+fn encode(message: &ToCore, endpoint: Option<&EndpointEnv>) -> io::Result<(Frame, Option<Fallback>)> {
+    match endpoint.and_then(|endpoint| endpoint_env::over_endpoint(message, endpoint)) {
+        Some((merged, fallback)) => Ok((merged.encode()?, fallback)),
+        None => Ok((message.encode()?, None)),
     }
-    if let (ToCore::SpawnAgent(spawn), Some(host)) = (message, host) {
-        let env = relay::relay_env(&host.env, &spawn.env);
-        return ToCore::SpawnAgent(SpawnAgent { env, ..spawn.clone() }).encode();
-    }
-    message.encode()
 }
 
 /// Why a session shown here is lost when the core no longer has it: a
@@ -2960,6 +3017,7 @@ pub(super) mod fake {
 
     use super::*;
     use crate::remote::protocol::client::{Hello, Spawned, Welcome};
+    use crate::remote::protocol::relay::LoginEnv;
 
     /// Timings short enough for tests.
     pub fn quick() -> Timings {
@@ -3141,11 +3199,16 @@ pub(super) mod fake {
     /// A link to a fake relay, which says `RELAY_HOST` with `env` at once,
     /// and to the core behind it, which welcomes the client's `HELLO`, then
     /// hands each message to `answer` and reports it.
-    pub fn link(env: &[(&str, &str)], mut answer: impl FnMut(&ToCore, &Out) + Send + 'static) -> (Link, Far) {
+    pub fn link(env: &[(&str, &str)], answer: impl FnMut(&ToCore, &Out) + Send + 'static) -> (Link, Far) {
+        link_with(relay_host(env), answer)
+    }
+
+    /// [`link`] with `host` as the fake relay's first frame.
+    pub fn link_with(host: RelayMessage, mut answer: impl FnMut(&ToCore, &Out) + Send + 'static) -> (Link, Far) {
         let (client_reader, far_writer) = io::pipe().unwrap();
         let (mut far_reader, client_writer) = io::pipe().unwrap();
         let out = Out { writer: Arc::new(Mutex::new(Some(far_writer))), cut: Arc::default(), why: Arc::default() };
-        out.relay(relay_host(env));
+        out.relay(host);
         let (got_tx, got) = mpsc::channel();
         let (hello_tx, hello) = mpsc::channel();
         let heartbeats = Arc::new(AtomicUsize::new(0));
@@ -3189,6 +3252,11 @@ pub(super) mod fake {
 
     /// The fake relay's `RELAY_HOST`, with `env`.
     fn relay_host(env: &[(&str, &str)]) -> RelayMessage {
+        relay_host_with(env, None)
+    }
+
+    /// The fake relay's `RELAY_HOST`, with `env` and `login`.
+    pub fn relay_host_with(env: &[(&str, &str)], login: Option<LoginEnv>) -> RelayMessage {
         RelayMessage::Host(RelayHost {
             version: "0.0.0".into(),
             build: "relay".into(),
@@ -3197,6 +3265,7 @@ pub(super) mod fake {
             home: "/home/u".into(),
             server_dir: "/run/user/1000/brindle".into(),
             core_pid: 4242,
+            login,
         })
     }
 
@@ -3311,7 +3380,7 @@ mod tests {
     use super::*;
     use crate::remote::budget::Refusal;
     use crate::remote::protocol::client::Spawned;
-    use crate::remote::protocol::relay::RelayError;
+    use crate::remote::protocol::relay::{LoginEnv, RelayError};
     use crate::test_support::wait::{limit, until};
 
     const MIB: usize = 1 << 20;
@@ -3448,23 +3517,76 @@ mod tests {
             policy: Policy::Detach,
             profile: None,
         });
-        let decoded = |frame: Frame| match ToCore::decode(&frame).unwrap() {
-            ToCore::Spawn(spawn) => spawn,
-            other => panic!("not SPAWN: {other:?}"),
+        let frame = |message: &ToCore, endpoint: Option<&EndpointEnv>| {
+            let (frame, fallback) = encode(message, endpoint).unwrap();
+            assert_eq!(fallback, None);
+            ToCore::decode(&frame).unwrap()
+        };
+        let env_of = |message: ToCore| match message {
+            ToCore::Spawn(spawn) => spawn.env,
+            ToCore::SpawnAgent(spawn) => spawn.env,
+            ToCore::AgentRestart(restart) => restart.env,
+            other => panic!("not a start: {other:?}"),
+        };
+        let pairs = |env: &BTreeMap<String, String>| -> Vec<(String, String)> {
+            env.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
         // The local core gets the request's environment as it is.
-        assert_eq!(decoded(encode(&spawn, None).unwrap()).env.len(), 2);
+        assert_eq!(env_of(frame(&spawn, None)).len(), 2);
         let host = RelayHost {
             env: BTreeMap::from([("LANG".into(), "C.UTF-8".into()), ("TERM".into(), "dumb".into())]),
+            login: Some(LoginEnv::Captured(BTreeMap::from([
+                ("LANG".into(), "C.UTF-8".into()),
+                ("PATH".into(), "/home/u/.local/bin:/usr/bin".into()),
+            ]))),
             ..Default::default()
         };
-        let remote = decoded(encode(&spawn, Some(&host)).unwrap());
-        let env: Vec<(&str, &str)> = remote.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(env, [("FOO", "1"), ("LANG", "C.UTF-8"), ("TERM", "xterm-256color")]);
+        let endpoint = EndpointEnv::from_host(&host);
+        // A session with no command runs the login shell: the SSH session's
+        // environment, under its own.
+        let ToCore::Spawn(remote) = frame(&spawn, Some(&endpoint)) else { panic!("not SPAWN") };
+        assert_eq!(
+            pairs(&remote.env),
+            [("FOO", "1"), ("LANG", "C.UTF-8"), ("TERM", "xterm-256color")].map(|(k, v)| (k.into(), v.into()))
+        );
         assert_eq!((remote.req, remote.command), (3, None));
+        // One with a command gets the login shell's.
+        let ToCore::Spawn(with_command) = &spawn else { unreachable!() };
+        let htop = ToCore::Spawn(client::Spawn { command: Some("htop".into()), ..with_command.clone() });
+        let login_env = env_of(frame(&htop, Some(&endpoint)));
+        assert_eq!(login_env["PATH"], "/home/u/.local/bin:/usr/bin");
+        assert_eq!(login_env["TERM"], "xterm-256color");
+        // An agent's start and its restart get it too, the restart not as
+        // its own environment alone.
+        let own = BTreeMap::from([("MODEL".to_string(), "small".to_string())]);
+        let agent = ToCore::SpawnAgent(SpawnAgent {
+            req: 5,
+            command: "agy".into(),
+            args: Vec::new(),
+            cwd: None,
+            env: own.clone(),
+            policy: Policy::Detach,
+            profile: None,
+            conversation: None,
+        });
+        let restart =
+            ToCore::AgentRestart(AgentRestart { req: 6, session: 9, command: "agy".into(), args: Vec::new(), env: own.clone() });
+        assert_eq!(env_of(frame(&restart, None)), own);
+        let started = env_of(frame(&agent, Some(&endpoint)));
+        assert_eq!((started["PATH"].as_str(), started["MODEL"].as_str()), ("/home/u/.local/bin:/usr/bin", "small"));
+        assert_eq!(env_of(frame(&restart, Some(&endpoint))), started);
         // Other messages go as they are.
         let list = ToCore::List(Request { req: 4 });
-        assert_eq!(encode(&list, Some(&host)).unwrap(), list.encode().unwrap());
+        assert_eq!(encode(&list, Some(&endpoint)).unwrap(), (list.encode().unwrap(), None));
+        // A failed capture: a program falls back and says so, a login shell
+        // doesn't.
+        let failed = EndpointEnv::from_host(&RelayHost {
+            login: Some(LoginEnv::Failed("it took longer than 10 s".into())),
+            ..host.clone()
+        });
+        let (_, fallback) = encode(&restart, Some(&failed)).unwrap();
+        assert_eq!(fallback, Some(Fallback { reason: "it took longer than 10 s".into() }));
+        assert_eq!(encode(&spawn, Some(&failed)).unwrap().1, None);
     }
 
     /// A request's `SPAWN` on the wire: no command is `null`, which the
@@ -3500,6 +3622,45 @@ mod tests {
         assert_eq!(spawn.cwd.as_deref(), Some("~/src"));
         let env: Vec<(&str, &str)> = spawn.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         assert_eq!(env, [("FOO", "1"), ("LANG", "en_GB.UTF-8"), ("TERM", "xterm-256color")]);
+    }
+
+    /// `remote-login-environment` 5.3: on an endpoint whose login shell's
+    /// environment wasn't read, a terminal with a command says so in one
+    /// line before its program's output, and one running the login shell
+    /// says nothing.
+    #[test]
+    fn a_program_that_fell_back_says_so_before_its_output() {
+        let (connection, plan) = relay("A8");
+        let host = fake::relay_host_with(&[("HOME", "/home/u")], Some(LoginEnv::Failed("it took longer than 10 s".into())));
+        let (link, far) = fake::link_with(host, |message, out| {
+            fake::spawning(message, out);
+            if let ToCore::Spawn(spawn) = message {
+                let session = 10 + spawn.req as SessionId;
+                out.send(ToClient::Data(client::Data { session, bytes: b"program output".to_vec() }));
+            }
+        });
+        plan.link(link);
+
+        let (sink, tab) = fake::sink();
+        let request = SpawnRequest { command: Some("htop".into()), ..spawn_request(&[]) };
+        connection.spawn(request, sink, None).unwrap();
+        let ToCore::Spawn(spawn) = far.next() else { panic!("not SPAWN") };
+        assert_eq!(spawn.env.get("HOME").map(String::as_str), Some("/home/u"));
+        assert_eq!(
+            seen(&tab),
+            "note the login shell's environment on A8 wasn't read (it took longer than 10 s), \
+             so this program has the SSH session's environment"
+        );
+        assert_eq!(seen(&tab), "output program output");
+
+        let (shell_sink, shell_tab) = fake::sink();
+        connection.spawn(spawn_request(&[]), shell_sink, None).unwrap();
+        assert!(matches!(far.next(), ToCore::Spawn(_)));
+        assert_eq!(seen(&shell_tab), "output program output");
+        far.round_trip(&connection);
+        told_nothing_more(&tab);
+        told_nothing_more(&shell_tab);
+        assert!(connection.state.lock().fallbacks.is_empty());
     }
 
     /// A link that reads nothing for the dead-link limit is ended (its

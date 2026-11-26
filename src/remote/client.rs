@@ -328,11 +328,14 @@ fn hex(bytes: &[u8]) -> String {
 /// files could print into the framed stream. The path and the answer are
 /// positional parameters, not variables: a variable that the user's
 /// environment already had would be changed for the relay, and the relay's
-/// environment is its sessions'.
+/// environment is its sessions'. The relay is asked for the login shell's
+/// environment too (`--login-environment`), which it reads in a child of its
+/// own, for the programs it starts; a container's relay isn't, since a
+/// container's environment is already its programs'.
 fn ssh_launch_script(helper: &Helper) -> String {
     format!(
         "set -- \"{path}\"; if test -x \"$1\"; then set -- \"$1\" \"$(\"$1\" --version 2>&1)\"; \
-         if test \"$2\" = {version}; then exec \"$1\" relay; fi; \
+         if test \"$2\" = {version}; then exec \"$1\" relay --login-environment; fi; \
          echo \"$1 --version printed: $2\" >&2; fi; exit {NOT_CACHED}",
         path = helper.ssh_path(),
         version = helper.version,
@@ -616,7 +619,7 @@ mod tests {
     /// The cache directory of [`helper`] in a container.
     const CACHE: &str = "/tmp/brindle-helper-1.2.3-abc123";
     /// The SSH launch script for [`helper`].
-    const SSH_LAUNCH: &str = r#"set -- "$HOME/.cache/brindle/1.2.3-abc123/brindle-remote"; if test -x "$1"; then set -- "$1" "$("$1" --version 2>&1)"; if test "$2" = 1.2.3; then exec "$1" relay; fi; echo "$1 --version printed: $2" >&2; fi; exit 97"#;
+    const SSH_LAUNCH: &str = r#"set -- "$HOME/.cache/brindle/1.2.3-abc123/brindle-remote"; if test -x "$1"; then set -- "$1" "$("$1" --version 2>&1)"; if test "$2" = 1.2.3; then exec "$1" relay --login-environment; fi; echo "$1 --version printed: $2" >&2; fi; exit 97"#;
     /// The SSH upload script for [`helper`].
     const SSH_UPLOAD: &str = r#"umask 077; mkdir -p "$HOME/.cache/brindle/1.2.3-abc123" && tmp="$HOME/.cache/brindle/1.2.3-abc123/brindle-remote.tmp.$$" && cat > "$tmp" && chmod 700 "$tmp" && mv "$tmp" "$HOME/.cache/brindle/1.2.3-abc123/brindle-remote""#;
 
@@ -1205,9 +1208,13 @@ mod tests {
             let cached = "home/.cache/brindle/1.2.3-abc123/brindle-remote";
             // Nothing cached.
             assert_eq!(out(&sandbox.sh(&script, &[], THEIRS)), not_cached());
-            // Cached: the relay runs, with the user's environment as it was.
+            // Cached: the relay runs, asked for the login shell's
+            // environment, with the user's environment as it was.
             sandbox.helper(cached, "1.2.3");
-            assert_eq!(out(&sandbox.sh(&script, &[], THEIRS)), (Some(0), "ran relay h=the user's\n".into()));
+            assert_eq!(
+                out(&sandbox.sh(&script, &[], THEIRS)),
+                (Some(0), "ran relay --login-environment h=the user's\n".into())
+            );
             // Not executable, or another version: not this build's helper.
             sandbox.chmod(cached, "644");
             assert_eq!(out(&sandbox.sh(&script, &[], THEIRS)), not_cached());

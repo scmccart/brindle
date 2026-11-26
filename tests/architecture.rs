@@ -1047,7 +1047,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 57] = [
+const PURE_MODULES: [&str; 58] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1063,6 +1063,7 @@ const PURE_MODULES: [&str; 57] = [
     "src/agent/transcript.rs",
     "src/agent/spawn.rs",
     "src/agent/close.rs",
+    "src/remote/local/endpoint_env.rs",
     "src/agent/login.rs",
     "src/agent/shared.rs",
     "src/agent/markdown.rs",

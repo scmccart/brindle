@@ -254,6 +254,10 @@ The smallest fixes where the design met the code:
 - **The missing-shell test** names `/nonexistent/relay-test/bash`. A name that isn't in decision 3's table, such as the planned `/bin/relay-test-shell`, is `Unsupported` before it is looked for.
 - **4.2's role test** parses the dump by hand, since the helper is a binary crate and its tests can't name `login_env`. The parser's own cases are `login_env`'s unit tests.
 - **4.5's test** is Linux-only (`cfg(target_os = "linux")`), as remote endpoints are: a Windows program needs more than two variables to start.
+- **5.1's `encode`** takes only the link's `EndpointEnv`, which replaced `Current`'s `RelayHost` (nothing else read it), and returns the frame with its `Fallback`. The match on `start_of` lives in `endpoint_env::over_endpoint`, so the shell only calls it.
+- **5.3's record** is a map of its own in the connection's state (`State::fallbacks`, by request id), not a field of `Pending`, set or cleared each time the writer writes the start, so a start written again on a later link has that link's word. `SPAWNED` takes it out and tells it before the reply, `ERROR` drops it.
+- **5.4's delivery** goes through a new `SessionSink::endpoint_note`, which a terminal's sink leaves as its dim note line and an agent's sink sends as `AgentEvent::EndpointNote`. A new agent's note comes with its `SPAWNED`, a restart's with its `OK`. The model keeps it beside the restore's note (`ChatModel::notes`), the view shows both, and the dump prints a `--- note` line for each.
+- **3.3's check** found one `Debug` print that could carry a `RelayHost`: the reader's line for a relay frame after `HOST`. It now names the frame (a second `RELAY_HOST`, or a `RELAY_ERROR` with its message) and prints no host.
 
 ## Risks / Trade-offs
 
