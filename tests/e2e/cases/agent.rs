@@ -230,16 +230,27 @@ pub fn seen(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// The command palette in an agent zone lists the agent's commands with the
-/// zone and tab ones, and none that acts on a terminal.
+/// zone and tab ones, and none that acts on a terminal; a terminal's
+/// palette lists none of the agent's (Copy Last Code Block, from
+/// `agents-markdown`, included).
 pub fn palette_commands(ctx: &Ctx) -> Result<Outcome> {
     let (profile, _) = hello_agent(ctx)?;
+    let listed = |out: &crate::brindle::Output, label: &str| {
+        out.dump.palette.iter().skip(1).any(|row| row.starts_with(&format!("{label}  ")) || row == label)
+    };
     let out = Run::new(ctx, "palette").config(&profile).agent("Fake").wait_for(READY).action("open_command_palette").dump_at(4.0).run()?;
-    let listed = |label: &str| out.dump.palette.iter().skip(1).any(|row| row.starts_with(&format!("{label}  ")) || row == label);
-    for label in ["Stop Agent Turn", "Copy Last Agent Message", "Scroll Agent to Bottom", "Split Zone Right", "Close Tab"] {
-        ensure!(listed(label), "{label} isn't listed: {:?}", out.dump.palette);
+    let agent = ["Stop Agent Turn", "Copy Last Agent Message", "Copy Last Code Block", "Scroll Agent to Bottom"];
+    for label in agent.iter().chain(&["Split Zone Right", "Close Tab"]) {
+        ensure!(listed(&out, label), "{label} isn't listed: {:?}", out.dump.palette);
     }
     for label in ["Clear Scrollback", "Find", "Scroll to Bottom", "Copy"] {
-        ensure!(!listed(label), "{label} is listed: {:?}", out.dump.palette);
+        ensure!(!listed(&out, label), "{label} is listed: {:?}", out.dump.palette);
+    }
+
+    let out = Run::new(ctx, "terminal").config(&profile).prompt().action("open_command_palette").dump_at(4.0).run()?;
+    ensure!(listed(&out, "Clear Scrollback"), "a terminal's palette: {:?}", out.dump.palette);
+    for label in agent {
+        ensure!(!listed(&out, label), "{label} is listed for a terminal: {:?}", out.dump.palette);
     }
     Ok(Outcome::Pass)
 }
@@ -612,14 +623,16 @@ pub fn thoughts(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// A conversation longer than the zone: shift-pageup leaves its end
-/// (`at=away`), and Scroll Agent to Bottom returns to it.
+/// (`at=away`), and Scroll Agent to Bottom returns to it. The lines are
+/// paragraphs: a single line break is a space in Markdown, which would
+/// make them one short paragraph.
 pub fn scroll(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let long: Vec<String> = (1..=200).map(|n| format!("line {n}")).collect();
     let profile = Script::ready(&received)
         .step("expect session/prompt")
-        .step(says(&long.join("\n")))
-        .step(says("\nthe end"))
+        .step(says(&long.join("\n\n")))
+        .step(says("\n\nthe end"))
         .step(stop("end_turn"))
         .profile(ctx, "scroll")?;
     let started =
@@ -651,6 +664,202 @@ pub fn copy(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     waited(&out)?;
     ensure!(out.dump.input.as_ref().map(|i| i.text.as_str()) == Some(HELLO), "input: {:?}", out.dump.input);
+    Ok(Outcome::Pass)
+}
+
+/// What `--wait-for` waits for until a turn has ended normally.
+const ENDED: &str = "turn=ended:end_turn";
+
+/// An agent profile `Fake` whose agent answers the first prompt with
+/// `text`, in one chunk, and ends the turn; its script is `NAME.script`
+/// and its record `NAME.jsonl`.
+pub(super) fn answering(ctx: &Ctx, name: &str, text: &str) -> Result<String> {
+    Script::ready(&ctx.dir.join(format!("{name}.jsonl")))
+        .step("expect session/prompt")
+        .step(says(text))
+        .step(stop("end_turn"))
+        .profile(ctx, name)
+}
+
+/// A part as [`Dump::agent_blocks`](crate::brindle::Dump::agent_blocks)
+/// gives it: `part=P kind=K "TEXT"`.
+pub(super) fn part(part: usize, kind: &str, text: &str) -> String {
+    format!("part={part} kind={kind} {text:?}")
+}
+
+/// A link as [`Dump::agent_links`](crate::brindle::Dump::agent_links)
+/// gives it: `part=P target="…" text="…" action=A`.
+pub(super) fn link(part: usize, target: &str, text: &str, action: &str) -> String {
+    format!("part={part} target={target:?} text={text:?} action={action}")
+}
+
+/// An agent message using every block kind and inline style the renderer
+/// knows, for `agent-markdown-render`.
+const EVERY_KIND: &str = "# Title\n\n\
+    Some *em*, **strong**, ~~gone~~ and `code`.\n\n\
+    - one\n- two\n\n\
+    1. first\n2. second\n\n\
+    - [ ] todo\n- [x] done\n\n\
+    > quoted\n\n\
+    ---\n\n\
+    | L | C | R |\n|:--|:-:|--:|\n| a | b | c |\n\n\
+    Inline <b>bold</b> html.\n\n\
+    <div>\nblock\n</div>\n\n\
+    ![chart](https://example.com/c.png)\n\n\
+    ```rust\nfn main() {}\n```\n";
+
+/// An agent message in Markdown (design.md decision 11): the dump prints
+/// a `--- block` line per part after its entry, in order, with its kind
+/// and shown text (every block kind, inline styles dropped, HTML as
+/// written, an image as its text), and a thought's parts while it is
+/// closed; the entry lines keep the source, and a user's `**hi**` has no
+/// parts.
+pub fn markdown_render(ctx: &Ctx) -> Result<Outcome> {
+    let thought = "- a\n- b";
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(says(EVERY_KIND))
+        .step(update(&format!(
+            r#"{{"sessionUpdate":"agent_thought_chunk","content":{{"type":"text","text":"{}"}}}}"#,
+            thought.replace('\n', "\\n")
+        )))
+        .step(stop("end_turn"))
+        .profile(ctx, "render")?;
+    let out = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("**hi**").wait_for(ENDED).dump_at(5.0).run()?;
+    waited(&out)?;
+    let entries = [r#"user "**hi**""#.to_string(), format!("agent {EVERY_KIND:?}"), format!("thought open=false {thought:?}")];
+    ensure!(out.dump.agent_entries() == entries, "entries {:?}", out.dump.agent);
+    ensure!(out.dump.agent_blocks(1).is_empty(), "the user's message has parts: {:?}", out.dump.agent);
+    let image = "[image: chart] https://example.com/c.png";
+    let parts = [
+        part(0, "heading:1", "Title"),
+        part(1, "paragraph", "Some em, strong, gone and code."),
+        part(2, "list", "- one\n- two"),
+        part(3, "list", "1. first\n2. second"),
+        part(4, "list", "- [ ] todo\n- [x] done"),
+        part(5, "quote", "> quoted"),
+        part(6, "rule", ""),
+        part(7, "table", "L | C | R\na | b | c"),
+        part(8, "paragraph", "Inline <b>bold</b> html."),
+        part(9, "paragraph", "<div>\nblock\n</div>"),
+        part(10, "paragraph", image),
+        part(11, "code:rust", "fn main() {}\n"),
+    ];
+    ensure!(out.dump.agent_blocks(2) == parts, "the message's parts {:#?}", out.dump.agent_blocks(2));
+    let links = [link(10, "https://example.com/c.png", image, "open")];
+    ensure!(out.dump.agent_links(2) == links, "the message's links {:?}", out.dump.agent_links(2));
+    ensure!(out.dump.agent_blocks(3) == [part(0, "list", thought)], "the thought's parts {:?}", out.dump.agent);
+    Ok(Outcome::Pass)
+}
+
+/// The fake agent's script for `agent-markdown-stream`'s run `label`: a
+/// paragraph and an opening fence with two lines, then, once the gate
+/// `LABEL-fence` exists, the closing fence and a paragraph using a
+/// reference link not yet defined, then, once `LABEL-definition` exists
+/// (unless `define` is false), its definition and the turn's end.
+fn stream_profile(ctx: &Ctx, label: &str, define: bool) -> Result<String> {
+    let script = Script::ready(&ctx.dir.join(format!("{label}.jsonl")))
+        .step("expect session/prompt")
+        .step(says("Intro.\n\n```rust\nfn a() {}\nfn b() {}\n"))
+        .step(format!("wait-file {}", gate(ctx, &format!("{label}-fence")).display()))
+        .step(says("```\n\nSee [docs][d].\n\n"));
+    let script = if define { script } else { script.step(format!("wait-file {}", gate(ctx, "never").display())) };
+    script.step(says("[d]: https://example.com\n")).step(stop("end_turn")).profile(ctx, label)
+}
+
+/// A message streamed in chunks (design.md decision 5): an unclosed
+/// fence is already a `code:rust` part while the agent holds the rest
+/// (the `--wait-for` before the gate opens); the closing fence keeps it
+/// one part, not cut, and the paragraph after it is the next part; a
+/// reference link shows as written until its definition arrives, and
+/// then as a link.
+pub fn markdown_stream(ctx: &Ctx) -> Result<Outcome> {
+    let code = part(1, "code:rust", "fn a() {}\nfn b() {}\n");
+    for (label, define) in [("held", false), ("defined", true)] {
+        let profile = stream_profile(ctx, label, define)?;
+        let run = Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for("kind=code:rust");
+        let run = touch_from_shell(run, &gate(ctx, &format!("{label}-fence")), true);
+        let out = if define {
+            run.wait_for(ENDED).dump_at(9.0).run()?
+        } else {
+            run.wait_for(r#"kind=paragraph "See [docs][d].""#).dump_at(9.0).run()?
+        };
+        waited(&out)?;
+        let (paragraph, links) = if define {
+            (part(2, "paragraph", "See docs."), vec![link(2, "https://example.com", "docs", "open")])
+        } else {
+            (part(2, "paragraph", "See [docs][d]."), Vec::new())
+        };
+        let parts = [part(0, "paragraph", "Intro."), code.clone(), paragraph];
+        ensure!(out.dump.agent_blocks(2) == parts, "{label}: parts {:#?}", out.dump.agent_blocks(2));
+        ensure!(out.dump.agent_links(2) == links, "{label}: links {:?}", out.dump.agent_links(2));
+        let turn = if define { "ended:end_turn" } else { "working" };
+        ensure!(out.dump.agent_field("turn") == Some(turn), "{label}: agent {:?}", out.dump.agent);
+    }
+    Ok(Outcome::Pass)
+}
+
+/// Copy Last Code Block puts the last code block of the agent's last
+/// message on the clipboard, its text as the agent wrote it, and Copy Last
+/// Agent Message still copies the message's Markdown source; a paste into
+/// the prompt input shows each.
+pub fn markdown_copy(ctx: &Ctx) -> Result<Outcome> {
+    let answer = "First:\n\n```sh\necho one\n```\n\nThen:\n\n```\necho two\n```\n";
+    let profile = answering(ctx, "copy", answer)?;
+    for (label, action, pasted) in
+        [("code", "copy_last_code_block", "echo two\n"), ("message", "copy_last_agent_message", answer)]
+    {
+        let out = Run::new(ctx, label)
+            .config(&profile)
+            .agent("Fake")
+            .first_prompt("hi")
+            .wait_for(ENDED)
+            .action(action)
+            .action("text_input_paste")
+            .dump_at(6.0)
+            .run()?;
+        waited(&out)?;
+        ensure!(input_text(&out) == Some(pasted), "{label}: input {:?}", out.dump.input);
+    }
+    Ok(Outcome::Pass)
+}
+
+/// An agent message's links (design.md decision 7), each in a `--- link`
+/// line with its target, its text and what a ctrl-click does: `open` for
+/// the web (inline, reference, bare and an image's), `confirm` for
+/// `mailto:` and a `file:` link on this machine, `refuse:scheme` for
+/// `javascript:` and `refuse:other-host` for another host's file; a URL in
+/// code is no link.
+pub fn markdown_links(ctx: &Ctx) -> Result<Outcome> {
+    let answer = "See [inline](https://example.com/inline) and:\n\n\
+        - [ref][r]\n\
+        - bare https://example.com/bare\n\
+        - <mailto:dev@example.com>\n\
+        - [x](javascript:void)\n\
+        - file://otherhost/share/x\n\
+        - file:///tmp/x\n\
+        - ![pic](https://example.com/p.png)\n\
+        - `https://example.com/code`\n\n\
+        [r]: https://example.com/ref\n";
+    let profile = answering(ctx, "links", answer)?;
+    let out = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(ENDED).dump_at(5.0).run()?;
+    waited(&out)?;
+    let links = [
+        link(0, "https://example.com/inline", "inline", "open"),
+        link(1, "https://example.com/ref", "ref", "open"),
+        link(1, "https://example.com/bare", "https://example.com/bare", "open"),
+        link(1, "mailto:dev@example.com", "mailto:dev@example.com", "confirm"),
+        link(1, "javascript:void", "x", "refuse:scheme"),
+        link(1, "file://otherhost/share/x", "file://otherhost/share/x", "refuse:other-host"),
+        link(1, "file:///tmp/x", "file:///tmp/x", "confirm"),
+        link(1, "https://example.com/p.png", "[image: pic] https://example.com/p.png", "open"),
+    ];
+    ensure!(out.dump.agent_links(2) == links, "links {:#?}", out.dump.agent_links(2));
+    ensure!(
+        out.dump.agent_blocks(2).last().is_some_and(|list| list.ends_with(r#"\n- https://example.com/code""#)),
+        "the code span's URL is shown: {:?}",
+        out.dump.agent_blocks(2)
+    );
     Ok(Outcome::Pass)
 }
 

@@ -343,7 +343,8 @@ BRINDLE_PERF_BASELINE=target/tmp/perf/latest BRINDLE_PERF=1 cargo test --test pe
                                                     # show changes against the last run
 ```
 
-The performance suite in `tests/perf/` measures two things, in a local shell tab:
+The performance suite in `tests/perf/` measures two things in a local shell tab,
+and one in an agent zone:
 
 - **Throughput:** how fast Brindle drains output, measured with
   [vtebench](https://github.com/alacritty/vtebench), the same method other
@@ -360,6 +361,11 @@ The performance suite in `tests/perf/` measures two things, in a local shell tab
   This is not key-to-photon latency: GPU, compositor and display time are not
   included. `brindle --latency-log FILE` records the same timings for real
   typing, as JSON lines, and prints a summary on exit.
+- **Markdown streaming** (`agent-markdown-stream`): the time an agent zone
+  takes to show a 64 KiB Markdown reply, from when a test agent starts
+  answering until Brindle sees the reply's last line and quits, streamed in 32-byte chunks and again in one, and the
+  difference. It needs the test agent `brindle-fake-acp-agent`, which
+  `cargo build --release` builds beside Brindle.
 
 The suite reports numbers and never fails on them. Run it on an idle machine and
 compare runs made on the same machine. Each run is kept in
@@ -748,6 +754,30 @@ blocks that Toggle Agent Thoughts opens. The zone's status dot follows the agent
 or error dot goes once you type in the prompt input. An agent's tab title is
 the name it gives, else the profile's.
 
+The agent's messages and thoughts are drawn as Markdown (CommonMark, with
+GitHub's strikethrough, task lists, tables and autolinks): headings,
+emphasis, inline code, code blocks in the terminal's font with a label and a
+copy button, lists, quotes, rules, tables as a grid, and links. A line break
+inside a paragraph reads as a space, as CommonMark says. A message is drawn
+again from its whole text as it streams, so a code fence not yet closed shows
+as code to the end. Raw HTML shows as written, images are never fetched (they
+show as a muted `[image: ALT]` and their target, as a link), and footnotes,
+math and smart punctuation stay as written. Your own messages, tool and
+permission titles and notices stay plain text. Copying a message, or Copy
+Last Agent Message, copies its Markdown source; Copy Last Code Block
+(`copy_last_code_block`, no default key) copies the last code block of the
+latest message that has one.
+
+Links in a message are drawn underlined in the link colour. Ctrl-click opens
+one, as in a terminal, and a plain click does nothing; the pointer is a hand
+over a link while ctrl is held, and a link whose text differs from its
+target shows the target when the pointer rests on it. `http` and `https`
+links open at once. A link of another scheme Brindle opens (`mailto:`,
+`file:`, `ssh:`, …) asks first, in a dialog showing the whole link, with
+Cancel focused (enter and escape cancel, as does a click outside it) and
+Open. Links Brindle wouldn't open in a terminal are refused the same way,
+the line under the tab strip saying why.
+
 | Keys | Action |
 |---|---|
 | enter / shift-enter | send the prompt / add a line |
@@ -761,9 +791,10 @@ is stopped, fails or ends for a limit holds the waiting prompt instead (the
 row says why), which you can send again or discard. Commands in the palette
 while an agent zone has focus: Send Prompt, Stop Agent Turn, Remove Queued
 Prompt, Send Held Prompt Again, Copy Queued Prompt, Copy Last Agent Message,
-Toggle Agent Thoughts and Scroll Agent to Bottom (the actions `agent_submit`,
-`agent_cancel`, `agent_unqueue`, `agent_resend`, `copy_queued_prompt`,
-`copy_last_agent_message`, `toggle_agent_thoughts`, `agent_scroll_to_bottom`),
+Copy Last Code Block, Toggle Agent Thoughts and Scroll Agent to Bottom (the
+actions `agent_submit`, `agent_cancel`, `agent_unqueue`, `agent_resend`,
+`copy_queued_prompt`, `copy_last_agent_message`, `copy_last_code_block`,
+`toggle_agent_thoughts`, `agent_scroll_to_bottom`),
 with the zone and tab commands; the terminal's commands aren't listed there.
 
 Splitting an agent zone opens another agent zone, with a session of its own,
@@ -777,8 +808,7 @@ An agent that needs a login says so, with its own message: log in through the
 agent's own command line, then open a new tab. An agent that exits, or speaks
 another ACP version, leaves its conversation readable.
 
-Not yet: markdown in messages (`agents-markdown`), logging in from the zone
-(`agents-login`), going on after an agent exits (`agents-session-recovery`),
+Not yet: syntax highlighting, logging in from the zone (`agents-login`), going on after an agent exits (`agents-session-recovery`),
 paging long conversations (`agents-log-paging`) and ACP version 2
 (`agents-acp-v2`), each a change of its own; nor the agent's file and
 terminal access, modes, slash commands, mixing agent and terminal zones in a
@@ -822,7 +852,9 @@ programs that use the mouse themselves (vim, htop, tmux with `mouse on`).
 Ctrl-clicks elsewhere still reach those programs. Trailing punctuation and
 enclosing brackets aren't part of a link, and a URL that wraps onto the next
 row is still one link. Ctrl-drag no longer block-selects when it starts on a
-link; alt-drag still does.
+link; alt-drag still does. Links in an agent's messages take the same
+ctrl-click, but those an agent wrote with a scheme other than `http` or
+`https` ask first (see "Agent tabs").
 
 A link is whatever a program printed, so Brindle opens only what it would
 detect itself:

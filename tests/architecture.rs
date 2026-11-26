@@ -732,6 +732,24 @@ fn only_the_agent_transcript_module_names_the_transcript_crate() {
     );
 }
 
+/// The Markdown parser's one door: no source in `src/` or `tests/` but
+/// `src/agent/markdown.rs` names `pulldown_cmark`, so the rest of the app
+/// sees only `brindle-ui`'s rich-text data and a parser swap touches one
+/// file (ports R3, fcis's "Whole pure modules").
+#[test]
+fn only_the_markdown_module_names_the_parser() {
+    let door = Path::new("src/agent/markdown.rs");
+    let mut files = sources("src");
+    assert!(files.iter().any(|file| file == door), "{} is missing", door.display());
+    files.extend(sources("tests"));
+    files.retain(|file| file != door);
+    assert_none(
+        offenders(&files, Scope::All, &["pulldown_cmark"]),
+        "the app names pulldown_cmark only in src/agent/markdown.rs; render Markdown through \
+         crate::agent::markdown (docs/architecture/functional-core-imperative-shell.md)",
+    );
+}
+
 /// ports R2: components reach the system only through gpui.
 #[test]
 fn brindle_ui_does_no_io_of_its_own() {
@@ -1029,7 +1047,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 54] = [
+const PURE_MODULES: [&str; 55] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1046,6 +1064,7 @@ const PURE_MODULES: [&str; 54] = [
     "src/agent/spawn.rs",
     "src/agent/close.rs",
     "src/agent/shared.rs",
+    "src/agent/markdown.rs",
     "src/agent/model.rs",
     "src/layout.rs",
     "src/reattach.rs",

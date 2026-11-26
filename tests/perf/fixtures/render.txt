@@ -7,3 +7,6 @@ throughput (mean ms)         brindle
 grid                          118x33
 dense_cells           210.00 (+5.0%)
 unicode               90.00 (-10.0%)
+
+stream (ms)                    streamed         one chunk       difference  chunks
+agent-markdown-stream  1450.50 (-49.50)  1120.00 (+20.00)  330.50 (-69.50)    2048

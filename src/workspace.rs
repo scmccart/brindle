@@ -63,6 +63,9 @@ use crate::zone_view::{
     CloseZoneAsk, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneStart, ZoneTreeView, describe_badge, ui_badge,
 };
 use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
+use crate::agent::view::ConfirmLink;
+use crate::link_confirm::{self, LinkConfirm, OpenLink};
+use crate::terminal::links;
 use crate::close_confirm::{CloseConfirm, Confirmed};
 
 /// The tab strip's height in logical pixels: the pill tab list's
@@ -387,6 +390,9 @@ enum Overlay {
     /// The close confirmation: what a Close closes, and the busy agents it
     /// names.
     CloseConfirm { target: CloseTarget, busy: Vec<BusyAgent> },
+    /// The link confirmation: the link it asks about, and the agent zone's
+    /// prompt input, which has focus again when it closes.
+    LinkConfirm { uri: String, back: FocusHandle },
 }
 
 /// What the close confirmation closes once the user confirms.
@@ -409,6 +415,7 @@ impl Overlay {
             Self::ProfileMenu => Some(OverlayKind::ProfileMenu),
             Self::ContextMenu { .. } => Some(OverlayKind::ContextMenu),
             Self::CloseConfirm { .. } => Some(OverlayKind::CloseConfirm),
+            Self::LinkConfirm { .. } => Some(OverlayKind::LinkConfirm),
         }
     }
 }
@@ -562,6 +569,11 @@ pub struct Workspace {
     /// The close confirmation's modal slot (design.md decision 12), open
     /// while `overlay` is [`Overlay::CloseConfirm`].
     confirm: UiOverlay<CloseConfirm>,
+    /// The link confirmation's modal slot (`agents-markdown` design.md
+    /// decision 7), open while `overlay` is [`Overlay::LinkConfirm`].
+    link_confirm: UiOverlay<LinkConfirm>,
+    /// The open confirmation's subscriptions, the close or the link one
+    /// (one overlay is open at most).
     _confirm_subscriptions: Vec<Subscription>,
     /// The strip's `⌄` button and its profile menu, the third overlay: at
     /// most one of the palette, the settings dialog and this menu is open.
@@ -651,6 +663,7 @@ impl Workspace {
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
             confirm: UiOverlay::modal(),
+            link_confirm: UiOverlay::modal(),
             _confirm_subscriptions: Vec::new(),
             profile_menu,
             _profile_menu_subscription: profile_menu_subscription,
@@ -1364,6 +1377,9 @@ impl Workspace {
             // From any tab: an opener can fail after its tab went to the
             // background.
             cx.subscribe(view, |this, _, LinkFailed(text): &LinkFailed, cx| this.show_notice(text.clone(), cx)),
+            cx.subscribe_in(view, window, |this, _, confirm: &ConfirmLink, window, cx| {
+                this.open_link_confirm(confirm.uri.clone(), confirm.back.clone(), window, cx);
+            }),
         ]
     }
 
@@ -1734,6 +1750,48 @@ impl Workspace {
             self._confirm_subscriptions.clear();
             cx.notify();
         }
+    }
+
+    /// Opens the link confirmation for `uri`, a link an agent wrote, in
+    /// place of any overlay. Cancel, escape and the backdrop open nothing;
+    /// Open opens it. Either way focus goes back to `back`, the zone's
+    /// prompt input.
+    fn open_link_confirm(&mut self, uri: String, back: FocusHandle, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_overlay(OverlayKind::LinkConfirm, window, cx);
+        let dialog = cx.new(|cx| LinkConfirm::new(uri.clone(), cx));
+        let opened = cx.subscribe_in(&dialog, window, |this, _, _: &OpenLink, window, cx| this.open_confirmed_link(window, cx));
+        // The slot closes itself on the dialog's `DismissEvent` (Cancel,
+        // escape, the backdrop).
+        let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, window, cx| {
+            if let Overlay::LinkConfirm { back, .. } = std::mem::replace(&mut this.overlay, Overlay::Closed) {
+                window.focus(&back);
+            }
+            cx.notify();
+        });
+        self._confirm_subscriptions = vec![opened, dismissed];
+        self.overlay = Overlay::LinkConfirm { uri, back };
+        self.link_confirm.open(dialog, |this| &mut this.link_confirm, window, cx);
+        cx.notify();
+    }
+
+    /// Open in the link confirmation: it closes, giving focus back to the
+    /// zone's prompt input, and the link goes to the opener, which plans it
+    /// again; a failure shows on the config line as a terminal's does.
+    fn open_confirmed_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::LinkConfirm { uri, back } = std::mem::replace(&mut self.overlay, Overlay::Closed) else {
+            return;
+        };
+        self.link_confirm.close(window, cx);
+        self._confirm_subscriptions.clear();
+        window.focus(&back);
+        let failed = links::open_reporting(&uri);
+        cx.spawn(async move |this, cx| {
+            if let Some(text) = failed.await {
+                this.update(cx, |this, cx| this.show_notice(text, cx)).ok();
+            }
+        })
+        .detach();
+        cx.notify();
     }
 
     fn next_tab(&mut self, _: &NextTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -2181,7 +2239,8 @@ impl Workspace {
             | Overlay::Settings
             | Overlay::ProfileMenu
             | Overlay::ContextMenu { .. }
-            | Overlay::CloseConfirm { .. } => {}
+            | Overlay::CloseConfirm { .. }
+            | Overlay::LinkConfirm { .. } => {}
         }
     }
 
@@ -2297,6 +2356,7 @@ impl Workspace {
         self.palette.is_open()
             || self.settings.is_open()
             || self.confirm.is_open()
+            || self.link_confirm.is_open()
             || self.profile_menu.read(cx).is_open()
             || self.context_menu.read(cx).is_open()
     }
@@ -2312,6 +2372,7 @@ impl Workspace {
             OverlayKind::ProfileMenu => self.profile_menu.read(cx).is_open(),
             OverlayKind::ContextMenu => self.context_menu.read(cx).is_open(),
             OverlayKind::CloseConfirm => self.confirm.is_open(),
+            OverlayKind::LinkConfirm => self.link_confirm.is_open(),
         };
         open.then_some(kind)
     }
@@ -2339,6 +2400,7 @@ impl Workspace {
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
         self.confirm.close(window, cx);
+        self.link_confirm.close(window, cx);
         self._confirm_subscriptions.clear();
         self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
@@ -2607,6 +2669,9 @@ impl Workspace {
             };
             out.push_str(&format!("--- confirm close target={target} busy={}\n", describe_busy(busy)));
         }
+        if let (Overlay::LinkConfirm { uri, .. }, true) = (&self.overlay, self.link_confirm.is_open()) {
+            out.push_str(&link_confirm::describe(uri));
+        }
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.describe(cx)));
         }
@@ -2619,7 +2684,8 @@ impl Workspace {
     /// active agent zone's stops: `prompt`, `queued:remove`,
     /// `queued:send-again`, `queued:discard`, `permission:ENTRY:OPTION`,
     /// `stop`), `palette` (inside an open palette), `confirm stop=cancel|close`
-    /// (the close confirmation), `settings stop=NAME` (inside the settings dialog, on the control
+    /// (the close confirmation), `confirm stop=cancel|open` (the link
+    /// confirmation), `settings stop=NAME` (inside the settings dialog, on the control
     /// `NAME`), `tabs` (the tab strip, on the active tab), `menu` (an open
     /// menu: the profile menu, or a tab or zone menu), `none`, or
     /// `other`; then the window's `modality=keyboard|pointer`, which
@@ -2641,6 +2707,11 @@ impl Workspace {
         {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx).unwrap_or(""))
         } else if let Some(dialog) = self.confirm.view().filter(|d| d.read(cx).contains_focused(window, cx)) {
+            match dialog.read(cx).focused_stop(window) {
+                Some(stop) => format!("confirm stop={}", stop.word()),
+                None => "confirm".to_string(),
+            }
+        } else if let Some(dialog) = self.link_confirm.view().filter(|d| d.read(cx).contains_focused(window, cx)) {
             match dialog.read(cx).focused_stop(window) {
                 Some(stop) => format!("confirm stop={}", stop.word()),
                 None => "confirm".to_string(),
@@ -3405,7 +3476,7 @@ impl Render for Workspace {
         // toggles act, so nothing (such as a new tab) changes underneath it.
         // The close confirmation holds them back the same way: its own
         // buttons, escape and backdrop are what act.
-        let settings_open = self.settings.is_open() || self.confirm.is_open();
+        let settings_open = self.settings.is_open() || self.confirm.is_open() || self.link_confirm.is_open();
         let body = div()
             .id("workspace")
             .key_context("Workspace")
@@ -3491,6 +3562,7 @@ impl Render for Workspace {
             .children(self.palette.render(window, cx))
             .children(self.settings.render(window, cx))
             .children(self.confirm.render(window, cx))
+            .children(self.link_confirm.render(window, cx))
             // The tab and zone menus: drawn deferred, taking no room here.
             .child(self.context_menu.clone());
 

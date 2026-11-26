@@ -1,5 +1,5 @@
 //! The cases: keystroke latency and vtebench throughput in a local shell
-//! tab.
+//! tab. The agent zone's case is in `agent.rs`.
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -9,7 +9,7 @@ use crate::common::server::{Isolation, isolate};
 use crate::report::{LatencyResult, ThroughputResult, parse_dat, parse_latency};
 use crate::{Ctx, Measured, Result, ensure};
 
-const CONFIG: &str = r#"default_profile = "Shell"
+pub const CONFIG: &str = r#"default_profile = "Shell"
 padding = 6
 
 [font]
@@ -26,8 +26,14 @@ args = ["--norc", "--noprofile"]
 
 /// Starts Brindle with the perf config; its stderr goes to `<label>.log`.
 fn spawn(ctx: &Ctx, label: &str, args: &[&str]) -> Result<Child> {
-    let config_path = ctx.dir.join("config.toml");
-    std::fs::write(&config_path, CONFIG).map_err(|e| e.to_string())?;
+    spawn_with(ctx, label, CONFIG, args)
+}
+
+/// Starts Brindle with `config` (written as `<label>-config.toml`); its
+/// stderr goes to `<label>.log`.
+pub fn spawn_with(ctx: &Ctx, label: &str, config: &str, args: &[&str]) -> Result<Child> {
+    let config_path = ctx.dir.join(format!("{label}-config.toml"));
+    std::fs::write(&config_path, config).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
     let mut command = Command::new(&ctx.bin);
     // Every launch records the session and runs its tab in a terminal

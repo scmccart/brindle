@@ -22,6 +22,9 @@ pub mod close;
 // The fold the reader thread and the zone share.
 pub mod shared;
 
+// Markdown in agent messages and thoughts: the app's one door to the parser.
+pub mod markdown;
+
 // The chat model and the protocol gate.
 pub mod model;
 

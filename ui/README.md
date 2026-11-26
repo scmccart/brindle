@@ -352,6 +352,41 @@ rule, not a convenience.
   - `Alert`: shadcn's alert (`AlertVariant::{Default, Destructive}`,
     `alert_style`), lucide `circle-alert` by default, with the children as
     the description.
+  - `Response` (`components/response.rs`): rich text the owner gives as
+    plain data, `Response::new(id, blocks)` over `Arc<RichBlock>`s. The data
+    types (`RichBlock`, `HeadingLevel`, `ListKind`, `ListItem`, `Task`,
+    `Code`, `Table` with `ColumnAlign`, `Inline` with `RunStyle` runs and
+    `InlineLink`s, checked by `Inline::new`) hold no entity or callback, and
+    the crate reads no markup: the app's Markdown renderer builds them.
+    Paragraphs and headings are one `StyledText` each (`text_runs`, over
+    `spans`): strong bold, emphasis italic, strikethrough struck, code in
+    the owner's family (`.code_font`) in the foreground on `muted`, muted
+    runs in `muted_foreground`, links in the `link` token, underlined;
+    headings bold at 1.25, 1.125 and 1 rem (levels 1–3) and the size
+    around them after. Lists have a marker column (`list_marker`: `•`, the
+    number from the list's `start`, a task mark drawn as a checkbox but
+    taking no focus) with nested blocks indented beside it; quotes a
+    `border` bar and `muted_foreground` text; rules a `border` line; code
+    blocks are `CodeBlock`s; tables a grid of equal-width columns
+    (`grid_cols(n)`) in a `border` frame, the header bold with a line
+    under it, lines between rows, each column aligned from its
+    `ColumnAlign`, cells wrapping. Links: a press and release on the same
+    link calls `.on_link(|link, modifiers, …|)` with the modifiers held at
+    the release; the pointing hand shows over a link only while the
+    owner's `.link_modifiers(Modifiers)` are held (`holds_modifiers`), and
+    a link with a `tooltip` shows it on hover (`tooltip_at`). A pointer
+    move redraws when the held modifiers change that; for a still pointer,
+    the owner redraws on its own `on_modifiers_changed`.
+  - `CodeBlock` (`components/code_block.rs`): a rounded `border` frame
+    whose header, on the surface around it, holds the label in
+    `muted_foreground` and a ghost `IconXs` lucide `copy` button (tooltip
+    "Copy code", `COPY_CODE`), over the code in the owner's family
+    (`.font`) in the foreground on `muted`, keeping its breaks and spaces
+    and wrapping long lines (`shown_code` drops the one line break that
+    ends it). The button is always shown, takes no focus and keeps focus
+    where it was on a press; it gives the owner the whole text
+    (`.on_copy`, or a response's `.on_copy_code`) and never writes the
+    clipboard.
 - **Actions** (`actions.rs`): `brindle_ui::TextInput*`, `TextArea*`,
   `PromptSubmit`/`PromptStop`, `Dismiss`, `FocusNext`/`FocusPrev` and
   `ListUp`/`ListDown`/`ListFirst`/`ListLast`/`ListConfirm`, bound by
@@ -841,6 +876,23 @@ code comes from there.
   `Cancelled` shows "Cancelled"; the actions are keyed (`ItemKey`).
 - **Alert's title wraps** (shadcn clamps it to one line): an app's titles
   name a failure and its cause and are read whole.
+- **Response reads no markup** (AI Elements' renders Markdown through
+  Streamdown): it draws blocks the owner parsed, so the crate keeps its
+  closed dependency list and knows no Markdown. It renders **no HTML**
+  (the owner hands raw HTML over as text) and **loads no images** (the
+  owner hands an image over as a muted text with a link).
+- **No syntax highlighting** in code blocks or inline code; no Mermaid
+  diagrams and no math.
+- **The link gesture is the owner's:** a press on a link is reported with
+  its modifiers and the owner decides (Brindle opens on ctrl-click, as in
+  its terminals); the pointing hand shows only while the owner's modifiers
+  are held, and links are no focus stops.
+- **The code block's copy button is always shown** (not on hover) and is
+  **pointer-only**: a conversation holds many, and the owner gives the
+  keyboard one path (an action that copies the last code block). It
+  reports the text and never writes the clipboard.
+- **Table columns are equal-width** (a browser sizes them to their
+  content), and cells wrap; there is no horizontal scroll.
 
 Not verified against the upstream source here, so worth a check before
 relying on them:
@@ -947,7 +999,12 @@ background to its corners, and a pair without and with the ring, and the
 AI elements: a conversation (messages on both sides, one in three parts,
 tool rows, copy actions on hover) in a message scroller over a prompt input
 whose submits join it, and beside them a reasoning block, tool rows in
-three states, a permission confirmation and the two alerts.
+three states, a permission confirmation and the two alerts, and a response
+in an agent's bubble with every block kind (headings, every inline style,
+links with and without tooltips, nested numbered and bulleted lists, task
+marks, a quote, a labelled and an unlabelled code block, a rule, a table
+with each alignment and a short row, an image's text) beside a code block
+on its own.
 
 `--check` drives the scenarios of the `ui-components` spec (the Verify
 clauses of the change's tasks 4.x and 5.1–5.7) and prints one `ok NAME`,

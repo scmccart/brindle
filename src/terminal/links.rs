@@ -85,24 +85,61 @@ pub fn find_url(text: &[char], at: usize) -> Option<Range<usize>> {
     // The last scheme that starts at or before `at`.
     let (start, body) = (run_start..=at).rev().find_map(|i| Some((i, scheme_at(text, i, run_start)?)))?;
 
+    // The brackets in the URL, counted once and kept as its end moves, so
+    // trimming is linear in its length (an agent's text can be long).
+    let count = |c: char| text[start..run_end].iter().filter(|&&x| x == c).count();
+    let (opens, mut closes) = ((count('('), count('[')), (count(')'), count(']')));
     let mut end = run_end;
     while end > body {
-        let url = &text[start..end];
-        let unmatched = |open: char, close: char| {
-            url.iter().filter(|&&c| c == close).count() > url.iter().filter(|&&c| c == open).count()
-        };
         let drop = match text[end - 1] {
             '.' | ',' | ':' | ';' | '!' | '?' | '\'' | '*' => true,
-            ')' => unmatched('(', ')'),
-            ']' => unmatched('[', ']'),
+            ')' => closes.0 > opens.0,
+            ']' => closes.1 > opens.1,
             _ => false,
         };
         if !drop {
             break;
         }
+        match text[end - 1] {
+            ')' => closes.0 -= 1,
+            ']' => closes.1 -= 1,
+            _ => {}
+        }
         end -= 1;
     }
     (end > body && at < end).then_some(start..end)
+}
+
+/// Every URL in `text`, as char ranges in order and apart: in each run of
+/// URL characters, the URL [`find_url`] finds from the first scheme that
+/// starts a word, then again after its end. Linear in the text's length,
+/// so it suits long text (an agent's message) as well as a terminal line.
+pub fn find_urls(text: &[char]) -> Vec<Range<usize>> {
+    let mut urls = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        if !is_url_char(text[i]) {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        let mut run_end = i;
+        while run_end < text.len() && is_url_char(text[run_end]) {
+            run_end += 1;
+        }
+        let mut at = run_start;
+        while at < run_end {
+            match scheme_at(text, at, run_start).and_then(|_| find_url(text, at)) {
+                Some(url) => {
+                    at = url.end.max(at + 1);
+                    urls.push(url);
+                }
+                None => at += 1,
+            }
+        }
+        i = run_end;
+    }
+    urls
 }
 
 /// Whether `uri` starts with a URI scheme (`ALPHA *( ALPHA / DIGIT / "+" /
@@ -322,7 +359,7 @@ fn answered(result: Result<(), OpenError>) -> Opened {
 /// (on Windows, the shell's handler for it). A Windows file is shown in
 /// Explorer whatever the opener: it is never opened.
 pub fn open(uri: &str) -> Opened {
-    match plan(uri, this_host(), cfg!(windows)) {
+    match plan_here(uri) {
         Plan::Refuse(refusal) => answered(Err(OpenError::Refused(refusal))),
         Plan::Reveal(path) => reveal(path),
         Plan::Open(link) => match std::env::var(OPENER_ENV).ok().filter(|p| !p.is_empty()) {
@@ -330,6 +367,39 @@ pub fn open(uri: &str) -> Opened {
             None => open_default(link),
         },
     }
+}
+
+/// Opens `uri` now ([`open`]), and answers, once the opener has finished,
+/// what its failure says ([`failure_text`], logged too), or `None` when it
+/// opened or no answer came. Each owner shows the text where the link was
+/// clicked (a terminal, an agent zone, the link confirmation).
+pub fn open_reporting(uri: &str) -> impl Future<Output = Option<String>> + use<> {
+    let opened = open(uri);
+    let uri = uri.to_string();
+    async move {
+        match opened.await {
+            Ok(Err(error)) => {
+                let text = failure_text(&uri, &error);
+                log::warn!("{text}");
+                Some(text)
+            }
+            Ok(Ok(())) | Err(_) => None,
+        }
+    }
+}
+
+/// What [`open`] would do with `uri` on this machine: [`plan`] with this
+/// machine's name and platform, the two facts the opener reads. Owners
+/// that decide before opening (an agent's links ask first) plan with it.
+pub fn plan_here(uri: &str) -> Plan {
+    plan(uri, this_host(), cfg!(windows))
+}
+
+/// Whether a pointer press with `modifiers` acts on links: ctrl without
+/// alt, whatever shift does (ctrl-alt-drag is a terminal's block
+/// selection). Terminals and agent zones share the gesture.
+pub fn wants_links(modifiers: &gpui::Modifiers) -> bool {
+    modifiers.control && !modifiers.alt
 }
 
 /// This machine's name, which a `file:` link may give as its host. Read
@@ -589,6 +659,25 @@ mod tests {
         let chars: Vec<char> = "https://example.com.".chars().collect();
         assert_eq!(find_url(&chars, chars.len() - 1), None);
         assert_eq!(find_url(&chars, chars.len()), None);
+    }
+
+    fn urls_in(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        find_urls(&chars).into_iter().map(|r| chars[r].iter().collect()).collect()
+    }
+
+    #[test]
+    fn every_url_in_a_text_is_found_in_order() {
+        assert_eq!(
+            urls_in("see https://example.com/a, and (http://b.example/x_(y)). mailto:dev@example.com!"),
+            ["https://example.com/a", "http://b.example/x_(y)", "mailto:dev@example.com"]
+        );
+        assert_eq!(urls_in("https://a.example/?u=https://b.example"), ["https://a.example/?u=https://b.example"]);
+        assert_eq!(urls_in("www.example.com a@example.com https:// xhttps://x.example"), Vec::<String>::new());
+        assert_eq!(urls_in(""), Vec::<String>::new());
+        // Long runs stay linear: a long tail of brackets is trimmed in one pass.
+        let long = format!("https://example.com/{}", ")".repeat(100_000));
+        assert_eq!(urls_in(&long), ["https://example.com/"]);
     }
 
     #[test]
@@ -1002,5 +1091,37 @@ mod tests {
         assert!(matches!(error, OpenError::Failed { code: Some(4), .. }), "{error:?}");
         let error = run_opener(&dir.join("missing").display().to_string(), "https://example.com").unwrap_err();
         assert!(matches!(error, OpenError::NotStarted { .. }), "{error:?}");
+    }
+
+    /// Links take ctrl without alt, whatever shift does: ctrl-alt is a
+    /// block selection, and alt alone or no modifier leaves links alone.
+    #[test]
+    fn links_take_ctrl_without_alt() {
+        let held =
+            |control: bool, alt: bool, shift: bool| gpui::Modifiers { control, alt, shift, ..Default::default() };
+        for shift in [false, true] {
+            assert!(!wants_links(&held(false, false, shift)), "none, shift {shift}");
+            assert!(wants_links(&held(true, false, shift)), "ctrl, shift {shift}");
+            assert!(!wants_links(&held(false, true, shift)), "alt, shift {shift}");
+            assert!(!wants_links(&held(true, true, shift)), "ctrl-alt, shift {shift}");
+        }
+    }
+
+    /// `plan_here` plans for this machine: the platform's rules and its own
+    /// name, so a link `plan` treats the same everywhere comes out the same,
+    /// and a file link is this platform's kind.
+    #[test]
+    fn plan_here_plans_for_this_machine() {
+        let windows = cfg!(windows);
+        for link in ["https://example.com/a", "mailto:dev@example.com", "javascript:void", "file://otherhost/x"] {
+            assert_eq!(plan_here(link), plan(link, this_host(), windows), "{link}");
+        }
+        assert_eq!(plan_here("https://example.com/a"), Plan::Open("https://example.com/a".into()));
+        assert_eq!(plan_here("javascript:void"), Plan::Refuse(Refusal::Scheme("javascript".into())));
+        let local = plan_here("file:///etc/hosts");
+        match windows {
+            true => assert_eq!(local, Plan::Refuse(Refusal::NoDrive)),
+            false => assert_eq!(local, Plan::Open("file:///etc/hosts".into())),
+        }
     }
 }

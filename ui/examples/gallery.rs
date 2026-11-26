@@ -38,6 +38,11 @@ use brindle_ui::{
     Alert, AlertVariant, BubblePart, Confirmation, ConfirmationAction, ConfirmationState, Message, MessageFrom,
     MessageScroller, PromptInput, PromptInputEvent, PromptStatus, Reasoning, Tool, ToolStatus,
 };
+use brindle_ui::{
+    Code, CodeBlock, ColumnAlign, HeadingLevel, Inline, InlineLink, ListItem, ListKind, Response, RichBlock, RunStyle,
+    Table, Task,
+};
+use std::sync::Arc;
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, Hsla,
@@ -379,6 +384,11 @@ pub struct Gallery {
     permission: ConfirmationState,
     /// The permission's actions pressed, by label, in order.
     permission_log: Vec<String>,
+    /// The demo response's blocks, built once.
+    response: Vec<Arc<RichBlock>>,
+    /// What the responses and the code block told the gallery, in order:
+    /// `link:TARGET:ctrl|plain` and `copy:TEXT`.
+    response_log: Vec<String>,
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -429,6 +439,107 @@ fn render_demo_item(item: &DemoItem, ix: usize) -> gpui::AnyElement {
         DemoItem::Tool(icon, title, status) => div().py_1().child(Tool::new(*icon, *title, *status)).into_any_element(),
     };
     div().px_4().child(item).into_any_element()
+}
+
+/// A piece of a demo text: its text, its style and, when it is a link, its
+/// target and whether it shows the target as a tooltip.
+type Piece<'a> = (&'a str, RunStyle, Option<(&'a str, bool)>);
+
+/// A text from pieces.
+fn rich(pieces: &[Piece]) -> Inline {
+    let mut text = String::new();
+    let mut runs = Vec::new();
+    let mut links = Vec::new();
+    for (piece, style, link) in pieces {
+        let start = text.len();
+        text.push_str(piece);
+        runs.push((piece.len(), *style));
+        if let Some((target, tooltip)) = link {
+            let target: SharedString = target.to_string().into();
+            links.push(InlineLink { range: start..text.len(), tooltip: tooltip.then(|| target.clone()), target });
+        }
+    }
+    Inline::new(text, runs, links).expect("the demo's texts are valid")
+}
+
+/// The demo response: every block kind, every inline style, links with and
+/// without tooltips, a labelled and an unlabelled code block and a table
+/// with each alignment.
+fn demo_response() -> Vec<Arc<RichBlock>> {
+    let plain = RunStyle::default();
+    let strong = RunStyle { strong: true, ..plain };
+    let emphasis = RunStyle { emphasis: true, ..plain };
+    let strike = RunStyle { strike: true, ..plain };
+    let code = RunStyle { code: true, ..plain };
+    let muted = RunStyle { muted: true, ..plain };
+    let text = |s: &str| Inline::plain(s.to_string());
+    let paragraph = |s: &str| RichBlock::Paragraph(text(s));
+    let item = |task, blocks| ListItem { task, blocks };
+    let blocks = vec![
+        RichBlock::Heading { level: HeadingLevel::H1, text: text("Why the Windows build fails") },
+        RichBlock::Paragraph(rich(&[
+            ("The release build needs ", plain, None),
+            ("fxc.exe", code, None),
+            (", which is ", plain, None),
+            ("not", strong, None),
+            (" on ", plain, None),
+            ("every", emphasis, None),
+            (" runner (", plain, None),
+            ("it was", strike, None),
+            ("). See ", plain, None),
+            ("the SDK notes", plain, Some(("https://learn.microsoft.com/windows/sdk", true))),
+            (" or ", plain, None),
+            ("https://github.com/zed-industries/zed", plain, Some(("https://github.com/zed-industries/zed", false))),
+            (".", plain, None),
+        ])),
+        RichBlock::Heading { level: HeadingLevel::H2, text: text("Steps") },
+        RichBlock::List {
+            kind: ListKind::Numbered { start: 3 },
+            items: vec![
+                item(None, vec![paragraph("Find the newest SDK.")]),
+                item(
+                    None,
+                    vec![
+                        paragraph("Point the build at it:"),
+                        RichBlock::List {
+                            kind: ListKind::Bullet,
+                            items: vec![
+                                item(None, vec![paragraph("set GPUI_FXC_PATH")]),
+                                item(None, vec![paragraph("or put fxc.exe on PATH")]),
+                            ],
+                        },
+                    ],
+                ),
+            ],
+        },
+        RichBlock::Heading { level: HeadingLevel::H3, text: text("Done so far") },
+        RichBlock::List {
+            kind: ListKind::Bullet,
+            items: vec![
+                item(Some(Task::Done), vec![paragraph("read the workflow")]),
+                item(Some(Task::Open), vec![paragraph("rerun the job")]),
+            ],
+        },
+        RichBlock::Quote(vec![paragraph("fxc.exe is part of the Windows SDK, not of Visual Studio.")]),
+        RichBlock::Code(Code {
+            label: Some("powershell".into()),
+            text: "$sdk = Get-ChildItem 'C:/Program Files (x86)/Windows Kits/10/bin' |\n    Sort-Object Name | Select-Object -Last 1\n$env:GPUI_FXC_PATH = \"$sdk/x64/fxc.exe\"\n".into(),
+        }),
+        RichBlock::Code(Code { label: None, text: "error: fxc.exe not found\n".into() }),
+        RichBlock::Rule,
+        RichBlock::Table(Table::new(
+            vec![ColumnAlign::Start, ColumnAlign::Center, ColumnAlign::End],
+            vec![text("SDK"), text("fxc.exe"), text("Size")],
+            vec![
+                vec![text("10.0.22621.0"), text("yes"), text("1.2 MB")],
+                vec![text("10.0.26100.0, the newest, which moved its tools into a versioned folder"), text("yes")],
+            ],
+        )),
+        RichBlock::Paragraph(rich(&[
+            ("[image: the build log]", muted, Some(("https://example.com/build-log.png", true))),
+        ])),
+    ];
+    blocks.into_iter().map(Arc::new).collect()
 }
 
 impl Gallery {
@@ -605,6 +716,8 @@ impl Gallery {
             thought_open: false,
             permission: ConfirmationState::Requested,
             permission_log: Vec::new(),
+            response: demo_response(),
+            response_log: Vec::new(),
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         }
@@ -1543,7 +1656,62 @@ impl Gallery {
         self.thought_open = false;
         self.permission = ConfirmationState::Requested;
         self.permission_log.clear();
+        self.response_log.clear();
         cx.notify();
+    }
+
+    /// A response in an agent's bubble with every block kind, and a code
+    /// block on its own.
+    fn response_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let log = |gallery: &gpui::WeakEntity<Gallery>| {
+            let gallery = gallery.clone();
+            move |entry: String, cx: &mut App| {
+                gallery
+                    .update(cx, |gallery, cx| {
+                        gallery.response_log.push(entry);
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        };
+        let weak = cx.weak_entity();
+        let (on_link, on_copy, on_block_copy) = (log(&weak), log(&weak), log(&weak));
+        let response = Response::new("demo-response", self.response.iter().cloned())
+            .code_font("monospace")
+            .link_modifiers(gpui::Modifiers::control())
+            .on_link(move |link, modifiers, _, cx| {
+                let held = if modifiers.control { "ctrl" } else { "plain" };
+                on_link(format!("link:{}:{held}", link.target), cx);
+            })
+            .on_copy_code(move |text, _, cx| on_copy(format!("copy:{text}"), cx));
+        let block = CodeBlock::new(
+            "demo-code-block",
+            Code { label: Some("sh".into()), text: "cargo run -p brindle-ui --example gallery\n".into() },
+        )
+        .font("monospace")
+        .on_copy(move |text, _, cx| on_block_copy(format!("copy:{text}"), cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Responses", cx))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_6()
+                    .child(recorded(
+                        div().w(px(560.)).child(Message::new("demo-response-message", MessageFrom::Assistant).child(response)),
+                        "response",
+                        &self.records,
+                    ))
+                    .child(div().w(px(320.)).child(recorded(block, "code-block", &self.records))),
+            )
+            .child(div().text_size(px(12.)).text_color(t.muted_foreground).child(format!(
+                "Response: {}",
+                self.response_log.last().map_or("—", String::as_str)
+            )))
     }
 
     fn status(&self, cx: &mut Context<Self>) -> Div {
@@ -1677,6 +1845,7 @@ impl Render for Gallery {
             .child(self.tabs_section(cx))
             .child(self.cards_section(cx))
             .child(self.ai_section(cx))
+            .child(self.response_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -2851,6 +3020,10 @@ mod check {
         c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
         let check = scroller_keeps_the_view_while_away(&mut c).await;
         c.run_check("message-scroller-item-added-while-away-keeps-the-view", check).await;
+        let check = response_paints(&mut c).await;
+        c.run_check("response-and-code-block-paint-every-block-kind", check).await;
+        let check = code_block_copy_press(&mut c).await;
+        c.run_check("code-block-copy-press-reports-the-text-and-keeps-focus", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -5426,6 +5599,41 @@ mod check {
         c.tick().await;
         let end = top(c)?;
         ensure!(end.0 == Follow::AtEnd, "scrolling to the end didn't follow it ({end:?})");
+        Ok(())
+    }
+
+    /// The response with every block kind paints in its bubble (the
+    /// components' own tests check the layout of each), taller than the
+    /// lone code block beside it, which keeps its width.
+    async fn response_paints(c: &mut Checker) -> Check {
+        // Taller than the window, so not revealed: painted is enough.
+        let response = c.recorded("response")?;
+        let block = c.recorded("code-block")?;
+        ensure!(response.size.width > px(500.), "the response's bubble is {response:?}, narrower than its row");
+        ensure!(
+            response.size.height > block.size.height * 4.,
+            "the response ({response:?}) isn't much taller than one code block ({block:?})"
+        );
+        ensure!(block.size.width <= px(320.), "the code block ({block:?}) outgrew its 320px column");
+        Ok(())
+    }
+
+    /// The spec's "Copy button": a press on the lone code block's copy
+    /// button reports its text, and focus stays where it was.
+    async fn code_block_copy_press(c: &mut Checker) -> Check {
+        c.focus("behind").await?;
+        let block = c.reveal("code-block").await?;
+        let rem = c.with(|_, window, _| f32::from(window.rem_size()))?;
+        // The ghost IconXs button (1.5rem) at the header's end, inside the
+        // 1px border, `pr-1` and `py-1`.
+        let at = point(block.right() - px(1. + rem), block.top() + px(1. + rem));
+        c.press(at).await?;
+        let log = c.with(|gallery, _, _| gallery.response_log.clone())?;
+        ensure!(
+            log == ["copy:cargo run -p brindle-ui --example gallery\n"],
+            "the copy button told the gallery {log:?}"
+        );
+        ensure!(c.focused_name("behind")?, "the press on the copy button moved focus");
         Ok(())
     }
 }

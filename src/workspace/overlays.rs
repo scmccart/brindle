@@ -26,6 +26,9 @@ pub enum OverlayKind {
     ContextMenu,
     /// The close confirmation for a busy agent (it replaces what is open).
     CloseConfirm,
+    /// The confirmation for a link an agent wrote (it replaces what is
+    /// open).
+    LinkConfirm,
 }
 
 /// How asking for an overlay treats the one open.
@@ -64,7 +67,7 @@ pub fn toggle(open: Option<OverlayKind>, wanted: OverlayKind, how: Opens) -> Tog
 mod tests {
     use super::*;
 
-    const KINDS: [OverlayKind; 8] = [
+    const KINDS: [OverlayKind; 9] = [
         OverlayKind::Palette(PaletteRole::NewTab),
         OverlayKind::Palette(PaletteRole::Commands),
         OverlayKind::Palette(PaletteRole::Prompt),
@@ -73,6 +76,7 @@ mod tests {
         OverlayKind::ProfileMenu,
         OverlayKind::ContextMenu,
         OverlayKind::CloseConfirm,
+        OverlayKind::LinkConfirm,
     ];
 
     /// The workspace's rule before this function, for a palette asked for

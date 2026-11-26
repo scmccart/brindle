@@ -11,15 +11,19 @@
 
 use std::collections::BTreeMap;
 use std::ops::Range;
+use std::sync::Arc;
 
+use brindle_ui::{Inline, RichBlock};
 use gpui::SharedString;
 
 use crate::FirstPrompt;
+use crate::agent::markdown::{self, Part};
 use crate::agent::shared::{Changes, Dirty};
 use crate::agent::transcript::{
     Activity, AgentState, Entry, EntryId, HoldReason, NoticeLevel, PermissionKind, PermissionOption,
     PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState, status_of,
 };
+use crate::terminal::links::Plan;
 use crate::terminal::status::State;
 
 /// The client protocol version that carries agent sessions.
@@ -29,8 +33,9 @@ pub const AGENT_PROTOCOL: u32 = 4;
 /// `req`), which its `OK` or `ERROR` names.
 pub type RequestId = u64;
 
-/// How long a message's block grows before it is cut at the next line
-/// break, so a long streaming message re-lays out only its last block.
+/// How long a user message's block grows before it is cut at the next
+/// line break, so a long pasted prompt lays out in pieces. Agent messages
+/// are cut at their top-level Markdown blocks instead.
 pub const BLOCK_LIMIT: usize = 4 * 1024;
 
 /// Why an agent session never started.
@@ -107,13 +112,6 @@ pub enum SessionLife {
     Ended,
 }
 
-/// Who wrote a message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Speaker {
-    User,
-    Agent,
-}
-
 /// One of a permission request's buttons, keyed by its entry and `id`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionButton {
@@ -125,18 +123,21 @@ pub struct PermissionButton {
 /// What a block draws.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlockBody {
-    /// A part of a user or agent message.
-    Text { speaker: Speaker, text: SharedString },
-    Thought { text: SharedString, open: bool },
+    /// A part of a user message, plain ([`parts`]).
+    UserText { text: SharedString },
+    /// One top-level Markdown block of an agent message.
+    AgentPart { block: Arc<RichBlock> },
+    /// A thought, whole: all its Markdown blocks.
+    Thought { blocks: Arc<[Arc<RichBlock>]>, open: bool },
     Tool { kind: ToolKind, title: SharedString, status: ToolStatus },
     /// The buttons in the agent's order, allow kinds first.
     Permission { title: SharedString, options: Vec<PermissionButton>, outcome: Option<PermissionOutcome> },
     Notice { level: NoticeLevel, text: SharedString },
 }
 
-/// One item of the conversation's list: an entry, or one part of a long
-/// message (`part` counts from 0; `start` is its first byte in the entry's
-/// text; `last` is the entry's last part, where its bubble ends).
+/// One item of the conversation's list: an entry, or one part of a message
+/// (`part` counts from 0; `start` is its first byte in the entry's text;
+/// `last` is the entry's last part, where its bubble ends).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub entry: EntryId,
@@ -212,30 +213,47 @@ fn buttons(options: &[PermissionOption]) -> Vec<PermissionButton> {
         .collect()
 }
 
-/// The blocks of entry `id`, from its part `part` starting at byte `from`
-/// of its text (0 and 0 for the whole entry); a thought is drawn open when
+/// The blocks of user message `id`, from its part `part` starting at byte
+/// `from` of its text (0 and 0 for the whole message).
+fn user_blocks(id: EntryId, text: &str, part: usize, from: usize) -> Vec<Block> {
+    let ranges = parts(text, from);
+    let count = ranges.len();
+    ranges
+        .into_iter()
+        .enumerate()
+        .map(|(i, range)| Block {
+            entry: id,
+            part: part + i,
+            start: range.start,
+            last: i + 1 == count,
+            body: BlockBody::UserText { text: text.get(range).unwrap_or_default().to_string().into() },
+        })
+        .collect()
+}
+
+/// The blocks an entry is drawn as: one per part of a user message
+/// ([`parts`]) or per rendered part of an agent message (`rendered`), else
+/// one; a thought holds its `rendered` blocks and is drawn open when
 /// `thought_open`.
-fn blocks_from(id: EntryId, entry: &Entry, part: usize, from: usize, thought_open: bool) -> Vec<Block> {
+fn blocks_of(id: EntryId, entry: &Entry, rendered: &[Part], thought_open: bool) -> Vec<Block> {
     let one = |body| vec![Block { entry: id, part: 0, start: 0, last: true, body }];
-    let text_blocks = |speaker, text: &str| {
-        let ranges = parts(text, from);
-        let count = ranges.len();
-        ranges
-            .into_iter()
-            .enumerate()
-            .map(|(i, range)| Block {
-                entry: id,
-                part: part + i,
-                start: range.start,
-                last: i + 1 == count,
-                body: BlockBody::Text { speaker, text: text[range].to_string().into() },
-            })
-            .collect()
-    };
     match entry {
-        Entry::User { text } => text_blocks(Speaker::User, text),
-        Entry::Agent { text } => text_blocks(Speaker::Agent, text),
-        Entry::Thought { text } => one(BlockBody::Thought { text: text.clone().into(), open: thought_open }),
+        Entry::User { text } => user_blocks(id, text, 0, 0),
+        Entry::Agent { .. } => rendered
+            .iter()
+            .enumerate()
+            .map(|(i, part)| Block {
+                entry: id,
+                part: i,
+                start: part.range.start,
+                last: i + 1 == rendered.len(),
+                body: BlockBody::AgentPart { block: part.block.clone() },
+            })
+            .collect(),
+        Entry::Thought { .. } => {
+            let blocks = rendered.iter().map(|part| part.block.clone()).collect();
+            one(BlockBody::Thought { blocks, open: thought_open })
+        }
         Entry::Tool { title, kind, status, .. } => {
             one(BlockBody::Tool { kind: *kind, title: title.clone().into(), status: *status })
         }
@@ -248,10 +266,21 @@ fn blocks_from(id: EntryId, entry: &Entry, part: usize, from: usize, thought_ope
     }
 }
 
-/// The blocks an entry is drawn as: one, or one per part of a message
-/// ([`parts`]).
-pub fn blocks_of(id: EntryId, entry: &Entry, thought_open: bool) -> Vec<Block> {
-    blocks_from(id, entry, 0, 0, thought_open)
+/// An agent message's or thought's text rendered ([`markdown::render`]),
+/// and whether the renderer panicked, when its text is shown as one plain
+/// paragraph instead; `None` for the entries that aren't Markdown.
+fn render_entry(entry: &Entry) -> Option<(Vec<Part>, bool)> {
+    let text = match entry {
+        Entry::Agent { text } | Entry::Thought { text } => text,
+        Entry::User { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => return None,
+    };
+    Some(match std::panic::catch_unwind(|| markdown::render(text)) {
+        Ok(parts) => (parts, false),
+        Err(_) => {
+            let block = RichBlock::Paragraph(Inline::plain(text.clone()));
+            (vec![Part { range: 0..text.len(), block: Arc::new(block) }], true)
+        }
+    })
 }
 
 /// Whether a value may be resent from the queue row.
@@ -604,6 +633,12 @@ pub struct ChatModel {
     queue: QueueRow,
     /// The zone's copy of the kept entries, in id order.
     entries: Vec<(EntryId, Entry)>,
+    /// The rendered parts of the agent messages and thoughts in `entries`
+    /// (`types R10`): refreshed when one is appended to or replaced,
+    /// rebuilt on a reset, dropped with a trimmed entry.
+    rendered: BTreeMap<EntryId, Vec<Part>>,
+    /// The renderer panicked once (logged once).
+    render_failed: bool,
     blocks: Vec<Block>,
     /// Thoughts the user opened or closed.
     toggled: BTreeMap<EntryId, bool>,
@@ -641,6 +676,8 @@ impl ChatModel {
             slot: Slot::Empty,
             queue: QueueRow::None,
             entries: Vec::new(),
+            rendered: BTreeMap::new(),
+            render_failed: false,
             blocks: Vec::new(),
             toggled: BTreeMap::new(),
             auto_open: None,
@@ -744,12 +781,18 @@ impl ChatModel {
         if changes.reset {
             self.entries = transcript.entries().map(|(id, entry)| (id, entry.clone())).collect();
             self.auto_open = None;
+            self.rendered.clear();
+            let renders: Vec<_> = self.entries.iter().map(|(id, entry)| (*id, render_entry(entry))).collect();
+            for (id, render) in renders {
+                self.keep_render(id, render);
+            }
             let old = self.blocks.len();
-            self.blocks = self.entries.iter().flat_map(|(id, entry)| blocks_of(*id, entry, false)).collect();
+            self.blocks = self.entries.iter().flat_map(|(id, entry)| self.draw(*id, entry, false)).collect();
             splices.push(Splice { range: 0..old, count: self.blocks.len() });
         } else {
             if let Some(through) = changes.trimmed_through {
                 self.entries.retain(|(id, _)| *id > through);
+                self.rendered.retain(|id, _| *id > through);
                 let gone = self.blocks.partition_point(|block| block.entry <= through);
                 self.blocks.drain(..gone);
                 if gone > 0 {
@@ -766,7 +809,9 @@ impl ChatModel {
                         continue;
                     }
                     self.entries.push((id, entry.clone()));
-                    self.blocks.extend(blocks_of(id, entry, false));
+                    self.keep_render(id, render_entry(entry));
+                    let fresh = self.draw(id, entry, false);
+                    self.blocks.extend(fresh);
                 }
                 if self.blocks.len() > at {
                     splices.push(Splice { range: at..at, count: self.blocks.len() - at });
@@ -815,30 +860,67 @@ impl ChatModel {
         if !appended {
             *own = source.clone();
         }
+        // An agent message or thought is rendered again whole; the parts
+        // that didn't change keep their cached values.
+        let render = render_entry(&self.entries[index].1).map(|(fresh, panicked)| {
+            let old = self.rendered.get(&id).map_or(&[][..], Vec::as_slice);
+            let same = old.iter().zip(&fresh).take_while(|(old, fresh)| old == fresh).count();
+            let mut parts = old[..same].to_vec();
+            parts.extend(fresh.into_iter().skip(same));
+            (parts, panicked)
+        });
+        self.keep_render(id, render);
         let range = self.entry_blocks(id);
         let open = self.thought_open(id);
         let entry = &self.entries[index].1;
-        // A message's earlier parts don't change: only its last and new
-        // ones are drawn again.
-        let (range, fresh) = match (entry, range.is_empty()) {
-            (Entry::User { .. } | Entry::Agent { .. }, false) => {
+        let (range, fresh) = match entry {
+            // A user message's earlier parts don't change: only its last
+            // and new ones are drawn again.
+            Entry::User { text } if !range.is_empty() => {
                 let last = &self.blocks[range.end - 1];
-                let fresh = blocks_from(id, entry, last.part, last.start, open);
-                (range.end - 1..range.end, fresh)
+                (range.end - 1..range.end, user_blocks(id, text, last.part, last.start))
             }
-            (
-                Entry::User { .. }
-                | Entry::Agent { .. }
-                | Entry::Thought { .. }
-                | Entry::Tool { .. }
-                | Entry::Permission { .. }
-                | Entry::Notice { .. },
-                _,
-            ) => (range, blocks_of(id, entry, open)),
+            // An agent message's items from the first that differs: a
+            // changed part, or the end of its bubble moving.
+            Entry::Agent { .. } => {
+                let fresh = self.draw(id, entry, open);
+                let same = self.blocks[range.clone()].iter().zip(&fresh).take_while(|(old, new)| old == new).count();
+                if same == range.len() && same == fresh.len() {
+                    return None;
+                }
+                (range.start + same..range.end, fresh[same..].to_vec())
+            }
+            Entry::User { .. }
+            | Entry::Thought { .. }
+            | Entry::Tool { .. }
+            | Entry::Permission { .. }
+            | Entry::Notice { .. } => (range, self.draw(id, entry, open)),
         };
         let count = fresh.len();
         self.blocks.splice(range.clone(), fresh);
         Some(Splice { range, count })
+    }
+
+    /// Keeps entry `id`'s rendered parts (`None`: it has none), logging the
+    /// renderer's first panic.
+    fn keep_render(&mut self, id: EntryId, render: Option<(Vec<Part>, bool)>) {
+        match render {
+            Some((parts, panicked)) => {
+                if panicked && !self.render_failed {
+                    self.render_failed = true;
+                    log::warn!("the Markdown renderer panicked on agent entry {id}; showing its text plain");
+                }
+                self.rendered.insert(id, parts);
+            }
+            None => {
+                self.rendered.remove(&id);
+            }
+        }
+    }
+
+    /// The blocks entry `id` is drawn as, from its cached parts.
+    fn draw(&self, id: EntryId, entry: &Entry, thought_open: bool) -> Vec<Block> {
+        blocks_of(id, entry, self.rendered.get(&id).map_or(&[][..], Vec::as_slice), thought_open)
     }
 
     /// The blocks of entry `id`.
@@ -1168,7 +1250,8 @@ impl ChatModel {
                     Some((block.entry, options.iter().map(|o| o.id.clone()).collect()))
                 }
                 BlockBody::Permission { outcome: Some(_), .. }
-                | BlockBody::Text { .. }
+                | BlockBody::UserText { .. }
+                | BlockBody::AgentPart { .. }
                 | BlockBody::Thought { .. }
                 | BlockBody::Tool { .. }
                 | BlockBody::Notice { .. } => None,
@@ -1183,6 +1266,15 @@ impl ChatModel {
             Entry::User { .. } | Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => {
                 None
             }
+        })
+    }
+
+    /// `copy_last_code_block`: the last code block's text, at any depth,
+    /// of the latest agent message that has one (thoughts don't count).
+    pub fn last_code_block(&self) -> Option<&str> {
+        self.entries.iter().rev().filter(|(_, entry)| matches!(entry, Entry::Agent { .. })).find_map(|(id, _)| {
+            let parts = self.rendered.get(id)?;
+            parts.iter().rev().find_map(|part| markdown::last_code(&part.block)).map(|text| text.as_ref())
         })
     }
 
@@ -1265,18 +1357,38 @@ impl ChatModel {
     }
 
     /// The dump's lines for this zone (decision 15), zone `zone`, with the
-    /// conversation `at_end` or away from it.
-    pub fn describe(&self, zone: u64, at_end: bool) -> String {
-        self.lines(Some(zone), Some(at_end))
+    /// conversation `at_end` or away from it; each link's action from what
+    /// `plan` says of its target (`links::plan_here` in Brindle).
+    pub fn describe(&self, zone: u64, at_end: bool, plan: &dyn Fn(&str) -> Plan) -> String {
+        self.lines(Some(zone), Some(at_end), plan)
     }
 
     /// What `--wait-for` matches in an agent zone: the dump's lines,
     /// without the zone's id and the scroll position.
-    pub fn wait_text(&self) -> String {
-        self.lines(None, None)
+    pub fn wait_text(&self, plan: &dyn Fn(&str) -> Plan) -> String {
+        self.lines(None, None, plan)
     }
 
-    fn lines(&self, zone: Option<u64>, at_end: Option<bool>) -> String {
+    /// The `--- block` line of each of entry `id`'s rendered parts, in
+    /// order, each followed by a `--- link` line per link in it.
+    fn part_lines(&self, id: EntryId, plan: &dyn Fn(&str) -> Plan) -> String {
+        let mut out = String::new();
+        for (index, part) in self.rendered.get(&id).into_iter().flatten().enumerate() {
+            let (kind, text) = (markdown::kind_word(&part.block), markdown::shown_text(&part.block));
+            out.push_str(&format!("--- block entry={id} part={index} kind={kind} {text:?}\n"));
+            for (link, text) in markdown::block_links(&part.block) {
+                let action = markdown::link_action(&link.target, plan(&link.target));
+                out.push_str(&format!(
+                    "--- link entry={id} part={index} target={:?} text={text:?} action={}\n",
+                    link.target.as_ref(),
+                    markdown::action_word(&action)
+                ));
+            }
+        }
+        out
+    }
+
+    fn lines(&self, zone: Option<u64>, at_end: Option<bool>, plan: &dyn Fn(&str) -> Plan) -> String {
         let mut out = String::from("--- agent");
         if let Some(zone) = zone {
             out.push_str(&format!(" zone={zone}"));
@@ -1317,6 +1429,7 @@ impl ChatModel {
         }
         for (id, entry) in &self.entries {
             out.push_str(&format!("--- entry {id} {}\n", self.entry_line(*id, entry)));
+            out.push_str(&self.part_lines(*id, plan));
         }
         match &self.queue {
             QueueRow::None => {}
@@ -1528,12 +1641,25 @@ mod tests {
             .blocks()
             .iter()
             .map(|block| match &block.body {
-                BlockBody::Text { text, .. } | BlockBody::Thought { text, .. } | BlockBody::Notice { text, .. } => {
-                    text.to_string()
+                BlockBody::UserText { text } | BlockBody::Notice { text, .. } => text.to_string(),
+                BlockBody::AgentPart { block } => markdown::shown_text(block),
+                BlockBody::Thought { blocks, .. } => {
+                    blocks.iter().map(|block| markdown::shown_text(block)).collect::<Vec<_>>().join("\n\n")
                 }
                 BlockBody::Tool { title, .. } | BlockBody::Permission { title, .. } => title.to_string(),
             })
             .collect()
+    }
+
+    /// The plan Brindle would make on a Linux machine named `thishost`.
+    fn linux(uri: &str) -> Plan {
+        crate::terminal::links::plan(uri, "thishost", false)
+    }
+
+    /// An entry's blocks, rendered as the model renders them.
+    fn drawn(id: EntryId, entry: &Entry, open: bool) -> Vec<Block> {
+        let rendered = render_entry(entry).map(|(parts, _)| parts).unwrap_or_default();
+        blocks_of(id, entry, &rendered, open)
     }
 
     const EVERY_HOLD: [HoldReason; 9] = [
@@ -1607,7 +1733,7 @@ mod tests {
     /// first, keyed by entry and option id.
     #[test]
     fn each_entry_is_drawn_as_its_blocks() {
-        let blocks = blocks_of(EntryId(5), &permission("Run cargo test?"), false);
+        let blocks = drawn(EntryId(5), &permission("Run cargo test?"), false);
         let [Block { entry: EntryId(5), part: 0, last: true, body: BlockBody::Permission { options, outcome: None, .. }, .. }] =
             blocks.as_slice()
         else {
@@ -1616,13 +1742,16 @@ mod tests {
         let ids: Vec<&str> = options.iter().map(|o| o.id.as_ref()).collect();
         assert_eq!(ids, ["allow-once", "reject-once"]);
 
-        let message = blocks_of(EntryId(2), &agent("a\n\nb"), false);
+        let message = drawn(EntryId(2), &agent("a\n\nb"), false);
         assert_eq!(message.iter().map(|b| (b.part, b.start, b.last)).collect::<Vec<_>>(), [(0, 0, false), (1, 3, true)]);
-        assert!(matches!(&message[0].body, BlockBody::Text { speaker: Speaker::Agent, .. }));
-        assert_eq!(blocks_of(EntryId(1), &user(""), false).len(), 1, "an empty message is one block");
+        assert!(matches!(&message[0].body, BlockBody::AgentPart { .. }));
+        let message = drawn(EntryId(2), &user("a\n\nb"), false);
+        assert!(matches!(&message[1].body, BlockBody::UserText { text } if text.as_ref() == "b"));
+        assert_eq!(drawn(EntryId(1), &user(""), false).len(), 1, "an empty message is one block");
+        assert_eq!(drawn(EntryId(1), &agent(""), false).len(), 1, "an empty message is one block");
         let tool = Entry::Tool { call: "c".into(), title: "Read".into(), kind: ToolKind::Read, status: ToolStatus::Pending };
-        assert!(matches!(blocks_of(EntryId(3), &tool, false)[0].body, BlockBody::Tool { kind: ToolKind::Read, .. }));
-        assert!(matches!(blocks_of(EntryId(4), &thought("t"), true)[0].body, BlockBody::Thought { open: true, .. }));
+        assert!(matches!(drawn(EntryId(3), &tool, false)[0].body, BlockBody::Tool { kind: ToolKind::Read, .. }));
+        assert!(matches!(drawn(EntryId(4), &thought("t"), true)[0].body, BlockBody::Thought { open: true, .. }));
     }
 
     /// Decision 8: new entries splice in at the end, a streaming message
@@ -1879,7 +2008,7 @@ mod tests {
             "Fake Agent needs you to log in. Log in through the agent's own command line, then open the profile again."
         );
         assert_eq!((alert.destructive, alert.detail.as_deref()), (false, Some(message)));
-        assert!(zone.model.describe(1, true).contains("--- queued held reason=login-required resend=no \"next\"\n"));
+        assert!(zone.model.describe(1, true, &linux).contains("--- queued held reason=login-required resend=no \"next\"\n"));
     }
 
     /// Decision 13: a version mismatch's `Failed`, then the session's exit,
@@ -1898,7 +2027,7 @@ mod tests {
         let alert = zone.model.alert("fake-acp", "this machine").unwrap();
         assert_eq!(alert.text, format!("Fake can't be used: {message}"));
         assert!(!alert.text.contains("exit"));
-        let dump = zone.model.describe(1, true);
+        let dump = zone.model.describe(1, true, &linux);
         assert!(dump.starts_with(&format!("--- agent zone=1 state=failed message={message:?} turn=idle")), "{dump}");
         assert!(dump.contains(" session=ended\n"), "{dump}");
         assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::Failed));
@@ -2001,7 +2130,7 @@ mod tests {
         zone.feed(&[Event::Answered { id: EntryId(1), outcome: PermissionOutcome::Selected { option: "allow-once".into() } }]);
         assert!(!zone.model.answer(EntryId(1), "allow-once"), "answered");
         assert!(zone.model.pending_permissions().is_empty());
-        assert!(zone.model.describe(1, true).contains("outcome=selected:allow-once"));
+        assert!(zone.model.describe(1, true, &linux).contains("outcome=selected:allow-once"));
     }
 
     /// Decision 10: the shown status is the activity's while live, with
@@ -2084,7 +2213,9 @@ mod tests {
 --- agent zone=1 state=ready name=\"Fake Agent\" turn=working activity=working status=working link=up session=open
 --- entry 1 user \"hi\"
 --- entry 2 agent \"Hello!\"
+--- block entry=2 part=0 kind=paragraph \"Hello!\"
 --- entry 3 thought open=false \"Considering\"
+--- block entry=3 part=0 kind=paragraph \"Considering\"
 --- entry 4 tool call=\"call_1\" kind=read status=completed \"Read main.rs\"
 --- entry 5 permission call=\"call_2\" options=allow-once:\"Allow once\"|reject-once:\"Reject\" outcome=pending \"Run cargo test?\"
 --- entry 6 notice level=warn \"1 line was not an ACP message\"
@@ -2092,8 +2223,8 @@ mod tests {
 --- conversation entries=6 at=end
 --- prompt status=streaming
 ";
-        assert_eq!(zone.model.describe(1, true), expected);
-        let wait = zone.model.wait_text();
+        assert_eq!(zone.model.describe(1, true, &linux), expected);
+        let wait = zone.model.wait_text(&linux);
         assert!(wait.starts_with("--- agent state=ready name=\"Fake Agent\" turn=working"), "{wait}");
         assert!(wait.contains("--- conversation entries=6\n"), "{wait}");
 
@@ -2101,7 +2232,7 @@ mod tests {
         zone.model.set_note("the profile \"Old\" is gone; this tab uses \"Fake\"");
         zone.model.not_started(StartFailure::TooOld { endpoint: "A8".into() });
         zone.model.submit("x", false);
-        let dump = zone.model.describe(2, false);
+        let dump = zone.model.describe(2, false, &linux);
         assert_eq!(
             dump,
             "--- agent zone=2 state=not-started message=\"the terminal server on A8 is too old for agent sessions; \
@@ -2115,14 +2246,14 @@ mod tests {
         held.feed(&[queue(held_slot())]);
         held.model.sent(1, Sent::Prompt);
         held.model.replied(1, Err("the agent isn't ready".into()));
-        let dump = held.model.describe(1, true);
+        let dump = held.model.describe(1, true, &linux);
         assert!(dump.contains("--- queued held reason=stopped:max_tokens resend=yes \"next\"\n"), "{dump}");
         assert!(dump.ends_with("--- prompt status=ready refusal=\"the agent isn't ready\"\n"), "{dump}");
         assert_eq!(held.model.banner("A8"), None);
         held.model.set_link(Link::Reconnecting);
         assert_eq!(held.model.link(), Link::Reconnecting);
         assert_eq!(held.model.banner("A8").as_deref(), Some("reconnecting to A8…"));
-        assert!(held.model.describe(1, true).contains("link=reconnecting"));
+        assert!(held.model.describe(1, true, &linux).contains("link=reconnecting"));
     }
 
     fn held_slot() -> Slot {
@@ -2179,5 +2310,284 @@ mod tests {
         let mut never = Zone::new(None);
         never.model.not_started(StartFailure::NoServer("no helper".into()));
         assert!(!never.model.keeps_session());
+    }
+
+    fn appended(id: u64, text: &str) -> Event {
+        Event::Appended { id: EntryId(id), text: text.into() }
+    }
+
+    /// Entry `id`'s cached parts.
+    fn parts_of(model: &ChatModel, id: u64) -> Vec<Part> {
+        model.rendered.get(&EntryId(id)).cloned().unwrap_or_default()
+    }
+
+    /// The model's blocks are what a fresh model fed the same entries
+    /// whole would draw, and its cache holds exactly the agent messages and
+    /// thoughts, each rendered from its whole text.
+    fn in_step(model: &ChatModel) {
+        let expected: Vec<Block> =
+            model.entries.iter().flat_map(|(id, entry)| drawn(*id, entry, model.thought_open(*id))).collect();
+        assert_eq!(model.blocks, expected);
+        let markdown: Vec<EntryId> = model
+            .entries
+            .iter()
+            .filter(|(_, entry)| matches!(entry, Entry::Agent { .. } | Entry::Thought { .. }))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(model.rendered.keys().copied().collect::<Vec<_>>(), markdown);
+        for (id, entry) in &model.entries {
+            if let Entry::Agent { text } | Entry::Thought { text } = entry {
+                assert_eq!(model.rendered[id], markdown::render(text), "entry {id}");
+            }
+        }
+    }
+
+    const STREAMED: &str = "Intro with [a link](https://example.com) and **bold**.\n\n\
+                            ```rust\nfn main() {\n    println!(\"hi\");\n}\n```\n\
+                            - one\n- [x] two\n\n> quoted\n\n| a | b |\n| - | - |\n| 1 | 2 |\n\nSee [d] — é.\n\n[d]: https://d.example\n";
+
+    /// Decision 5: whatever the chunks, a streamed message ends with the
+    /// parts of its whole text.
+    #[test]
+    fn streaming_at_every_split_point_ends_with_the_whole_texts_parts() {
+        let whole = STREAMED;
+        for split in (1..whole.len()).filter(|at| whole.is_char_boundary(*at)) {
+            let mut zone = Zone::ready();
+            zone.feed(&[added(1, user("hi")), added(2, agent(&whole[..split]))]);
+            zone.feed(&[appended(2, &whole[split..])]);
+            assert_eq!(parts_of(&zone.model, 2), markdown::render(whole), "split at {split}");
+            in_step(&zone.model);
+        }
+        // Character by character.
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, agent(""))]);
+        for c in whole.chars() {
+            zone.feed(&[appended(1, &c.to_string())]);
+        }
+        in_step(&zone.model);
+        assert_eq!(parts_of(&zone.model, 1), markdown::render(whole));
+    }
+
+    /// Decision 5: an unclosed fence is code to the end; its closing fence
+    /// and the text after it add a part, the parts above unchanged.
+    #[test]
+    fn an_unclosed_fence_is_code_and_its_close_adds_a_part() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, agent("Intro\n\n```rust\nfn a() {}\n"))]);
+        let absorbed = zone.feed(&[appended(1, "fn b() {}\n")]);
+        assert_eq!(texts(&zone.model), ["Intro", "fn a() {}\nfn b() {}\n"]);
+        assert_eq!(markdown::kind_word(&parts_of(&zone.model, 1)[1].block), "code:rust");
+        assert_eq!(absorbed.splices, [Splice { range: 1..2, count: 1 }], "the paragraph above stays");
+        let intro = parts_of(&zone.model, 1)[0].block.clone();
+        let absorbed = zone.feed(&[appended(1, "```\nAfter")]);
+        assert_eq!(texts(&zone.model), ["Intro", "fn a() {}\nfn b() {}\n", "After"]);
+        assert_eq!(absorbed.splices, [Splice { range: 1..2, count: 2 }], "the code's bubble no longer ends there");
+        assert!(Arc::ptr_eq(&intro, &parts_of(&zone.model, 1)[0].block));
+        in_step(&zone.model);
+    }
+
+    /// Decision 5: a reference definition that arrives late changes the
+    /// earlier part that uses it, which is spliced from there.
+    #[test]
+    fn a_late_reference_definition_splices_from_the_part_it_changes() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("q")), added(2, agent("Lead.\n\nSee [the docs][d].\n\n"))]);
+        assert_eq!(texts(&zone.model), ["q", "Lead.", "See [the docs][d]."]);
+        let absorbed = zone.feed(&[appended(2, "[d]: https://example.com")]);
+        assert_eq!(texts(&zone.model), ["q", "Lead.", "See the docs."], "the definition isn't shown");
+        assert_eq!(absorbed.splices, [Splice { range: 2..3, count: 1 }]);
+        let RichBlock::Paragraph(inline) = &*parts_of(&zone.model, 2)[1].block else { panic!() };
+        assert_eq!(inline.links()[0].target.as_ref(), "https://example.com");
+        in_step(&zone.model);
+    }
+
+    /// User messages keep step 1's plain parts, cut at blank lines and past
+    /// 4 KiB, and only their last part is drawn again.
+    #[test]
+    fn user_messages_split_as_before() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("**a**\n\nb"))]);
+        assert_eq!(texts(&zone.model), ["**a**", "b"], "plain, asterisks kept");
+        assert!(zone.model.rendered.is_empty());
+        let absorbed = zone.feed(&[appended(1, "c\n\nd")]);
+        assert_eq!(texts(&zone.model), ["**a**", "bc", "d"]);
+        assert_eq!(absorbed.splices, [Splice { range: 1..2, count: 2 }]);
+        let long = format!("{}\nrest", "x".repeat(BLOCK_LIMIT + 10));
+        zone.feed(&[added(2, user(&long))]);
+        assert_eq!(zone.model.blocks().len(), 5);
+    }
+
+    /// Decision 5: a thought is one item holding all its blocks, rendered
+    /// again whole as it grows.
+    #[test]
+    fn a_thought_renders_as_one_block() {
+        let mut zone = Zone::ready();
+        zone.feed(&[turn(TurnState::Working), added(1, thought("Plan:\n\n- a"))]);
+        let absorbed = zone.feed(&[appended(1, "\n- b\n\nDone.")]);
+        assert_eq!(absorbed.splices, [Splice { range: 0..1, count: 1 }]);
+        let [Block { body: BlockBody::Thought { blocks, open: true }, .. }] = zone.model.blocks() else {
+            panic!("{:?}", zone.model.blocks())
+        };
+        let kinds: Vec<String> = blocks.iter().map(|block| markdown::kind_word(block)).collect();
+        assert_eq!(kinds, ["paragraph", "list", "paragraph"]);
+        assert_eq!(markdown::shown_text(&blocks[1]), "- a\n- b");
+        in_step(&zone.model);
+    }
+
+    /// Decision 5: trims and resets keep the cache in step with the
+    /// entries.
+    #[test]
+    fn trims_and_resets_keep_the_cache_in_step() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, agent("one")), added(2, thought("t")), added(3, user("u")), added(4, agent("four"))]);
+        in_step(&zone.model);
+        zone.feed(&[Event::Trimmed { through: EntryId(2), dropped: 2 }]);
+        assert_eq!(zone.model.rendered.keys().copied().collect::<Vec<_>>(), [EntryId(4)]);
+        in_step(&zone.model);
+        zone.replay(&[added(1, agent("again *x*")), added(2, thought("hm")), ready()]);
+        assert_eq!(zone.model.rendered.keys().copied().collect::<Vec<_>>(), [EntryId(1), EntryId(2)]);
+        assert_eq!(texts(&zone.model), ["again x", "hm"]);
+        in_step(&zone.model);
+    }
+
+    /// Decision 4: a renderer panic shows the source as one plain
+    /// paragraph (the walk can't panic, so the guard is checked directly).
+    #[test]
+    fn the_renderer_runs_guarded() {
+        let (parts, panicked) = render_entry(&agent("*a*")).unwrap();
+        assert!(!panicked);
+        assert_eq!(parts, markdown::render("*a*"));
+        assert_eq!(render_entry(&user("*a*")), None);
+        let mut model = ChatModel::new("Fake", None);
+        let plain = vec![Part { range: 0..3, block: Arc::new(RichBlock::Paragraph(Inline::plain("*a*"))) }];
+        model.keep_render(EntryId(1), Some((plain.clone(), true)));
+        assert!(model.render_failed);
+        assert_eq!(model.rendered[&EntryId(1)], plain);
+    }
+
+    /// A Markdown message of at least 256 KiB: prose, lists and a long
+    /// fence.
+    fn long_markdown() -> String {
+        let mut text = String::new();
+        let mut section = 0;
+        while text.len() < 256 * 1024 {
+            section += 1;
+            text.push_str(&format!(
+                "## Section {section}\n\nSome prose with **bold**, a [link](https://example.com/{section}) and `code`,\n\
+                 wrapped onto a second line.\n\n- item one\n- item two\n  - nested {section}\n\n"
+            ));
+            if section == 20 {
+                text.push_str("```rust\n");
+                for line in 0..2_000 {
+                    text.push_str(&format!("let x{line} = {line};\n"));
+                }
+                text.push_str("```\n\n");
+            }
+        }
+        text
+    }
+
+    /// Decision 6's guard (`testing R8`: the rule, not a time): streaming a
+    /// 256 KiB message in 64-byte appends ends with the whole text's parts;
+    /// each absorb splices from the first item whose part changed (or
+    /// whose bubble's end moved) and touches no other entry; and the parts
+    /// it didn't change, and every other entry's, keep their cached values.
+    #[test]
+    fn streaming_a_long_message_re_renders_only_what_changed() {
+        let whole = long_markdown();
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, thought("before")), added(2, agent("")), added(3, user("after"))]);
+        let thought_before = parts_of(&zone.model, 1);
+        let mut at = 0;
+        while at < whole.len() {
+            let mut end = (at + 64).min(whole.len());
+            while !whole.is_char_boundary(end) {
+                end += 1;
+            }
+            let old = parts_of(&zone.model, 2);
+            let items = zone.model.entry_blocks(EntryId(2));
+            let absorbed = zone.feed(&[appended(2, &whole[at..end])]);
+            let new = parts_of(&zone.model, 2);
+            // The first item that must change: a part that differs, or the
+            // last one when the count changed (its bubble's end moved).
+            let differs = old.iter().zip(&new).take_while(|(old, new)| old == new).count();
+            let first = if old.len() == new.len() { differs } else { differs.min(old.len() - 1) };
+            match absorbed.splices.as_slice() {
+                [] => assert_eq!(old, new, "nothing changed at {at}"),
+                [splice] => {
+                    assert_eq!(splice.range.start, items.start + first, "at {at}");
+                    assert_eq!(splice.range.end, items.end, "at {at}: only this entry's items");
+                    assert_eq!(splice.count, new.len() - first, "at {at}");
+                }
+                more => panic!("at {at}: {more:?}"),
+            }
+            for (old, new) in old.iter().zip(&new).take(differs) {
+                assert!(Arc::ptr_eq(&old.block, &new.block), "at {at}: an unchanged part was replaced");
+            }
+            at = end;
+        }
+        assert_eq!(parts_of(&zone.model, 2), markdown::render(&whole));
+        let after = parts_of(&zone.model, 1);
+        assert!(thought_before.iter().zip(&after).all(|(a, b)| Arc::ptr_eq(&a.block, &b.block)), "another entry kept");
+
+        // An absorb that changes nothing leaves the cache and the list alone.
+        let before = parts_of(&zone.model, 2);
+        let absorbed = zone.feed(&[appended(2, ""), turn(TurnState::Working)]);
+        assert!(absorbed.splices.is_empty(), "{:?}", absorbed.splices);
+        let kept = parts_of(&zone.model, 2);
+        assert!(before.len() == kept.len() && before.iter().zip(&kept).all(|(a, b)| Arc::ptr_eq(&a.block, &b.block)));
+        in_step(&zone.model);
+    }
+
+    /// Decision 11: block and link lines follow each agent message's and
+    /// thought's entry line; user messages have none.
+    #[test]
+    fn the_dump_shows_each_part_and_link() {
+        let mut zone = Zone::ready();
+        zone.feed(&[
+            added(1, user("**hi**")),
+            added(2, agent("Try:\n\n```rust\nfn main() {}\n```\nSee [docs](https://example.com) or <mailto:a@example.com> [x](javascript:void).")),
+            added(3, thought("- [ ] check `x`\n- see https://t.example")),
+        ]);
+        let dump = zone.model.describe(1, true, &linux);
+        let expected = "\
+--- entry 1 user \"**hi**\"
+--- entry 2 agent \"Try:\\n\\n```rust\\nfn main() {}\\n```\\nSee [docs](https://example.com) or <mailto:a@example.com> [x](javascript:void).\"
+--- block entry=2 part=0 kind=paragraph \"Try:\"
+--- block entry=2 part=1 kind=code:rust \"fn main() {}\\n\"
+--- block entry=2 part=2 kind=paragraph \"See docs or mailto:a@example.com x.\"
+--- link entry=2 part=2 target=\"https://example.com\" text=\"docs\" action=open
+--- link entry=2 part=2 target=\"mailto:a@example.com\" text=\"mailto:a@example.com\" action=confirm
+--- link entry=2 part=2 target=\"javascript:void\" text=\"x\" action=refuse:scheme
+--- entry 3 thought open=false \"- [ ] check `x`\\n- see https://t.example\"
+--- block entry=3 part=0 kind=list \"- [ ] check x\\n- see https://t.example\"
+--- link entry=3 part=0 target=\"https://t.example\" text=\"https://t.example\" action=open
+--- conversation entries=3 at=end
+";
+        assert!(dump.contains(expected), "{dump}");
+        assert!(!dump.contains("--- block entry=1"), "{dump}");
+        let wait = zone.model.wait_text(&linux);
+        assert!(wait.contains("--- block entry=2 part=1 kind=code:rust \"fn main() {}\\n\"\n"), "{wait}");
+        assert!(wait.contains("--- link entry=2 part=2 target=\"https://example.com\" text=\"docs\" action=open\n"), "{wait}");
+        // The plan is the caller's: Windows refuses a file link with no drive.
+        zone.feed(&[added(4, agent("[f](file:///etc/hosts)"))]);
+        let windows = |uri: &str| crate::terminal::links::plan(uri, "thishost", true);
+        assert!(zone.model.wait_text(&windows).contains("action=refuse:no-drive\n"));
+    }
+
+    /// `copy_last_code_block`: the last code block of the latest agent
+    /// message that has one, nested ones included, thoughts skipped.
+    #[test]
+    fn the_last_code_block() {
+        let mut zone = Zone::ready();
+        assert_eq!(zone.model.last_code_block(), None);
+        zone.feed(&[added(1, agent("no code")), added(2, user("```\nuser\n```"))]);
+        assert_eq!(zone.model.last_code_block(), None, "no agent code");
+        zone.feed(&[added(3, agent("```\na\n```\n\n```\nb\n```"))]);
+        assert_eq!(zone.model.last_code_block(), Some("b\n"));
+        zone.feed(&[added(4, agent("- item\n\n  ```\n  nested\n  ```")), added(5, thought("```\nthought\n```"))]);
+        assert_eq!(zone.model.last_code_block(), Some("nested\n"), "a thought doesn't count");
+        zone.feed(&[added(6, agent("plain again"))]);
+        assert_eq!(zone.model.last_code_block(), Some("nested\n"), "the latest message that has one");
     }
 }

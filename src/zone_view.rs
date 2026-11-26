@@ -23,7 +23,7 @@ use crate::TabKind;
 use crate::agent::Agent;
 use crate::agent::close::{AgentBusy, BusyAgent, ClosePlan, Closing, close_plan};
 use crate::agent::spawn::OpenedBy;
-use crate::agent::view::AgentView;
+use crate::agent::view::{AgentView, ConfirmLink};
 use brindle_ui::FocusStops as _;
 use gpui::Focusable as _;
 use crate::config::{Config, Profile, ProfileKind};
@@ -662,7 +662,7 @@ impl ZoneContent {
             Self::Agent(view) => {
                 let view = view.read(cx);
                 let at_end = view.scroller().read(cx).follow() == brindle_ui::Follow::AtEnd;
-                Some(view.agent().read(cx).model().describe(zone.0, at_end))
+                Some(view.agent().read(cx).model().describe(zone.0, at_end, &crate::terminal::links::plan_here))
             }
         }
     }
@@ -672,7 +672,7 @@ impl ZoneContent {
     pub fn wait_text(&self, cx: &App) -> String {
         match self {
             Self::Terminal(view) => view.read(cx).terminal.read(cx).screen_text(),
-            Self::Agent(view) => view.read(cx).agent().read(cx).model().wait_text(),
+            Self::Agent(view) => view.read(cx).agent().read(cx).model().wait_text(&crate::terminal::links::plan_here),
         }
     }
 
@@ -747,6 +747,8 @@ impl EventEmitter<CloseZoneAsk> for ZoneTreeView {}
 /// A zone's link wasn't opened, passed on to the window (whichever tab the
 /// zone is in: an opener can fail after its tab went to the background).
 impl EventEmitter<LinkFailed> for ZoneTreeView {}
+/// An agent zone's link asks before it opens, passed on to the window.
+impl EventEmitter<ConfirmLink> for ZoneTreeView {}
 
 impl ZoneTreeView {
     /// Creates a `ZoneTreeView` with a single initial zone, which runs on
@@ -854,8 +856,12 @@ impl ZoneTreeView {
                 let events = cx.subscribe_in(&agent, window, move |this, _, event, window, cx| {
                     this.on_zone_terminal_event(id, event, window, cx);
                 });
+                // Its links, as a terminal's: a failure for the config line,
+                // and a link that asks first for the window's confirmation.
+                let link_failed = cx.subscribe(&view, |_, _, failed: &LinkFailed, cx| cx.emit(failed.clone()));
+                let confirm_link = cx.subscribe(&view, |_, _, confirm: &ConfirmLink, cx| cx.emit(confirm.clone()));
                 let title: SharedString = agent.read(cx).title().into();
-                (ZoneContent::Agent(view), title, vec![events])
+                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link])
             }
         };
         let focus = content.focus_handle(cx);

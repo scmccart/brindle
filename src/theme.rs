@@ -333,6 +333,9 @@ impl Theme {
         tokens.border = border.hsla();
         tokens.input = border.hsla();
         tokens.ring = accent.hsla();
+        // Legible on the card is legible on the background too, since the
+        // card sits between the background and the foreground.
+        tokens.link = accent.legible_on(raised, 4.5).hsla();
         tokens.dark = self.is_dark();
         tokens
     }
@@ -776,6 +779,25 @@ mod tests {
         }
     }
 
+    /// Links take the accent, pushed only as far as legibility on the card
+    /// needs: brindle-dark's accent already reads, brindle-light's is too
+    /// light on its card and is darkened.
+    #[test]
+    fn the_link_is_the_accent_made_legible_on_the_card() {
+        let dark = builtin_theme("brindle-dark").unwrap();
+        assert_eq!(css_color(dark.ui_tokens().link), "#e6a756");
+
+        let light = builtin_theme("brindle-light").unwrap();
+        let t = light.ui_tokens();
+        let (accent, link, card) = (Color::hex(0xb56a12), color_of(t.link), color_of(t.card));
+        assert_eq!(light.accent(), accent);
+        assert!(accent.contrast(card) < 4.5, "the case needs an accent too light on the card");
+        assert!(link.contrast(card) >= 4.5, "link contrast {:.2} < 4.5", link.contrast(card));
+        assert!(link.relative_luminance() < accent.relative_luminance(), "{link:?} is not darker than the accent");
+        let mixes: Vec<Color> = (1..=20).map(|i| accent.mix(Color::hex(0x000000), i as f32 / 20.0)).collect();
+        assert!(mixes.contains(&link), "{link:?} is not a mix of the accent towards black");
+    }
+
     #[test]
     fn ui_tokens_are_legible_for_every_builtin() {
         for name in BUILTIN_THEMES {
@@ -788,6 +810,11 @@ mod tests {
                 ("popover_foreground", t.popover_foreground, t.popover, 4.5),
                 ("secondary_foreground", t.secondary_foreground, t.secondary, 4.5),
                 ("accent_foreground", t.accent_foreground, t.accent, 4.5),
+                // An agent message's links, code and labels (agents-markdown).
+                ("link on card", t.link, t.card, 4.5),
+                ("link on background", t.link, t.background, 4.5),
+                ("foreground on muted", t.foreground, t.muted, 4.5),
+                ("muted_foreground on card", t.muted_foreground, t.card, 3.0),
             ];
             for (label, fg, bg, min) in pairs {
                 let ratio = color_of(fg).contrast(color_of(bg));
