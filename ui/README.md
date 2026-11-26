@@ -19,7 +19,12 @@ rule, not a convenience.
 - **Tokens** (`theme.rs`): `Tokens`, shadcn's token set (background/foreground
   pairs for card, popover, primary, secondary, muted, accent and destructive,
   plus border, input, ring and the radius), held in the `UiTheme` global and
-  read through `cx.ui_theme()` (`ActiveTheme`). `Tokens::neutral_light()` and
+  read through `cx.ui_theme()` (`ActiveTheme`), by value: the innermost
+  theme scope's set while one is drawn, else the window's.
+  `cx.window_theme()` reads the window's set whatever the scope (an owner
+  inside a scope keeps its focus ring in it), and `cx.scoped_theme()` the
+  scope's alone, for what a component carries to a tooltip it builds.
+  `Tokens::neutral_light()` and
   `neutral_dark()` are shadcn's neutral sets. Mapping a terminal theme to
   tokens is the app's job. Beside it, the `UiFont` global holds the chrome's
   font family, read through `cx.ui_font()` (`ActiveFont`; GPUI's
@@ -43,7 +48,22 @@ rule, not a convenience.
     pointer outside its view while open
     (`Overlay::new(OverlayKind::NonModal { blocks_outside: true })`, a
     select's menu): an outside press then only requests dismissal and
-    reaches nothing beneath.
+    reaches nothing beneath. `Overlay::tokens(Some(set))` (or `set_tokens`
+    on a kept slot, and `ContextMenu::set_tokens`) draws the view in that
+    set, the scope inside the `deferred` it may be lifted into.
+  - `ThemeScope` (`ThemeScope::new(tokens, child)`), a Brindle addition
+    with no shadcn counterpart (a web page would scope CSS variables on an
+    element): draws `child` with `tokens` as the active set in its layout,
+    prepaint and paint, restoring the outer set after each, so the
+    innermost of nested scopes wins and list items laid out in prepaint
+    follow it too. It swaps the set through the `UiTheme` global's cell, so
+    it notifies no one and redraws nothing outside it. It can't reach a
+    `deferred` child or a tooltip, both drawn after it has ended: a scope
+    goes inside a deferred element (`Overlay::tokens`), and the crate's
+    components carry the scope's set to their tooltips (`Tooltip::tokens`,
+    filled at render by `Button`, `Toggle`, tab triggers, `Badge` and
+    `Response`'s links). `TooltipFor` on a plain element can't, and keeps
+    the window's set.
   - `FocusScope` and `FocusStops`: Tab and shift-Tab cycle through the stops a
     view lists, and never leave it.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
@@ -96,7 +116,9 @@ rule, not a convenience.
       and hides it when the pointer leaves, on a press and on a scroll; the
       shown view hides itself on Escape (`intercept_keystrokes`, which sees
       the key before any binding and lets it go on). A `Tooltip` also
-      renders in place, as the gallery shows its look.
+      renders in place, as the gallery shows its look. `Tooltip::tokens`
+      draws it in a set of its own (see `ThemeScope`), at the window's text
+      size.
     - `TabList` (`TabList::new(id).active(ix).children(triggers)`) and
       `TabTrigger` (`TabTrigger::new(id, label)`): shadcn's tab list and
       triggers, with what a window's tab strip adds. The owner keeps the
@@ -175,9 +197,10 @@ rule, not a convenience.
       it (`text_color`), since a button sets its own. It is a stateful element, so the owner gives it handlers
       (a press, `on_context_menu`); `Card::on_header_bounds` reports where it
       was laid out. `.colors(CardColors { surface, text, muted, border,
-      surround })` takes the owner's colours (a terminal's), each defaulting
+      surround, ring })` takes the owner's colours (a terminal's), each defaulting
       to the card, foreground, muted foreground, border and background
-      tokens. `.ring(true)` draws the focus ring outside the border; the
+      tokens, and the ring to the tokens' focus ring (a card in a theme
+      scope is given the window's). `.ring(true)` draws the focus ring outside the border; the
       owner decides when (`shows_ring`). The card paints the four pieces
       outside its rounded edge in `surround` above its content and below
       its border (`corner_cutouts`), so a content that paints a square

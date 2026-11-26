@@ -32,7 +32,7 @@ use brindle_ui::{
     MenuEntry, MenuEvent, MenuItem, Modality, Overlay, Popover, PopoverContent, Select, SelectEvent, SelectOption,
     Separator,
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
-    ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
+    ThemeScope, ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use brindle_ui::{
     Alert, AlertVariant, BubblePart, Confirmation, ConfirmationAction, ConfirmationState, Message, MessageFrom,
@@ -56,6 +56,153 @@ type Records = Rc<RefCell<HashMap<String, Bounds<Pixels>>>>;
 
 /// Click counts by control name.
 type Counts = Rc<RefCell<HashMap<String, usize>>>;
+
+/// The phases a [`ScopeProbe`] runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    Layout,
+    Prepaint,
+    Paint,
+}
+
+/// What the theme scope section's probes read in the last frame, by probe
+/// name: the active set's background in each phase, in order.
+type ScopeReadings = Rc<RefCell<HashMap<&'static str, Vec<(Phase, Hsla)>>>>;
+
+/// The theme scope section's panel: a few components, a ringed card (its
+/// ring the owner's when given) and a probe. A component, so it reads the
+/// active set when it renders, inside a scope round it.
+#[derive(IntoElement)]
+struct ScopePanel {
+    name: &'static str,
+    ring: Option<Hsla>,
+    readings: ScopeReadings,
+    /// The gallery's context menu, opened by a secondary press on the
+    /// panel in the set the panel is drawn in.
+    menu: Entity<ContextMenu>,
+}
+
+impl RenderOnce for ScopePanel {
+    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let Self { name, ring, readings, menu } = self;
+        let t = cx.ui_theme();
+        let scope = cx.scoped_theme();
+        let id = |part: &str| SharedString::from(format!("scope-{name}-{part}"));
+        div()
+            .id(id("panel"))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(t.background)
+            .text_color(t.foreground)
+            .on_context_menu(move |event, window, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.set_tokens(scope);
+                    menu.open_on_press(event, context_entries(), window, cx);
+                });
+            })
+            .child(div().text_size(px(12.)).text_color(t.muted_foreground).child("Right-click for a menu in this set"))
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Button::new(id("default"), "Default").tooltip_for("A tooltip in this set", None))
+                    .child(Button::new(id("outline"), "Outline").variant(ButtonVariant::Outline)),
+            )
+            .child(
+                Card::new(id("card"))
+                    .w(px(CARD_DEMO_WIDTH))
+                    .h(px(64.))
+                    .ring(true)
+                    .colors(CardColors { ring, ..CardColors::default() })
+                    .header(
+                        CardHeader::new(id("card-header"))
+                            .title("Card, ring on")
+                            .badge(Badge::new("badge", t.muted_foreground).tooltip("The badge's tooltip")),
+                    )
+                    .child(div().px_2().py_1().text_size(px(12.)).child("bg-card")),
+            )
+            .child(ScopeProbe { name, readings })
+    }
+}
+
+/// An empty element that records the active token set's background in each
+/// of its phases (a layout starts the probe's record over).
+struct ScopeProbe {
+    name: &'static str,
+    readings: ScopeReadings,
+}
+
+impl ScopeProbe {
+    fn record(&self, phase: Phase, cx: &App) {
+        let bg = cx.ui_theme().background;
+        let mut readings = self.readings.borrow_mut();
+        let record = readings.entry(self.name).or_default();
+        if phase == Phase::Layout {
+            record.clear();
+        }
+        record.push((phase, bg));
+    }
+}
+
+impl IntoElement for ScopeProbe {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for ScopeProbe {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, ()) {
+        self.record(Phase::Layout, cx);
+        (window.request_layout(gpui::Style::default(), None, cx), ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut Window,
+        cx: &mut App,
+    ) {
+        self.record(Phase::Prepaint, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&gpui::GlobalElementId>,
+        _: Option<&gpui::InspectorElementId>,
+        _: Bounds<Pixels>,
+        _: &mut (),
+        _: &mut (),
+        _: &mut Window,
+        cx: &mut App,
+    ) {
+        self.record(Phase::Paint, cx);
+    }
+}
 
 /// What the command hosts (dialog and popover) confirmed, in order.
 type Confirmed = Rc<RefCell<Vec<String>>>;
@@ -347,6 +494,8 @@ pub struct Gallery {
     handles: HashMap<String, FocusHandle>,
     clicks: Counts,
     records: Records,
+    /// What the theme scope section's probes read, for `theme-scope-phases`.
+    scope_readings: ScopeReadings,
     checked: bool,
     switched: bool,
     /// Each toggle's pressed state, by name (unpressed when missing).
@@ -709,6 +858,7 @@ impl Gallery {
             handles,
             clicks: Counts::default(),
             records: Records::default(),
+            scope_readings: ScopeReadings::default(),
             checked: false,
             switched: true,
             pressed: HashMap::new(),
@@ -815,7 +965,22 @@ impl Gallery {
     /// Opens the context menu with its corner at `at`, as a key or code
     /// would (no pointer gesture).
     pub fn open_context_menu(&mut self, at: Point<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
-        self.context_menu.update(cx, |menu, cx| menu.open(at, context_entries(), window, cx));
+        self.open_context_menu_in(at, None, window, cx);
+    }
+
+    /// [`Gallery::open_context_menu`] with the menu drawn in `tokens`
+    /// (`None`: the window's set).
+    pub fn open_context_menu_in(
+        &mut self,
+        at: Point<Pixels>,
+        tokens: Option<Tokens>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu.update(cx, |menu, cx| {
+            menu.set_tokens(tokens);
+            menu.open(at, context_entries(), window, cx);
+        });
     }
 
     /// The context menu, both dropdowns and what they chose.
@@ -835,7 +1000,10 @@ impl Gallery {
             .text_color(t.muted_foreground)
             .child("Right-click here")
             .on_context_menu(cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                this.context_menu.update(cx, |menu, cx| menu.open_on_press(event, context_entries(), window, cx));
+                this.context_menu.update(cx, |menu, cx| {
+                    menu.set_tokens(None);
+                    menu.open_on_press(event, context_entries(), window, cx)
+                });
             }));
         div()
             .flex()
@@ -1429,7 +1597,10 @@ impl Gallery {
     /// menu already). The tab isn't activated, as a strip may choose to.
     fn tab_menu(&mut self, name: &str, request: &TabContextMenu, window: &mut Window, cx: &mut Context<Self>) {
         self.tab_log.push(format!("{name}:menu:{}", request.index));
-        self.context_menu.update(cx, |menu, cx| menu.open_on_press(&request.event, context_entries(), window, cx));
+        self.context_menu.update(cx, |menu, cx| {
+            menu.set_tokens(None);
+            menu.open_on_press(&request.event, context_entries(), window, cx)
+        });
         cx.notify();
     }
 
@@ -1568,6 +1739,31 @@ impl Gallery {
                     .child(recorded(ring_off, "card:ring-off", records))
                     .child(recorded(ring_on, "card:ring-on", records)),
             )
+    }
+
+    /// A theme scope: the same panel drawn in the window's set and inside a
+    /// `ThemeScope` of the other neutral set (dark on a light window, light
+    /// on a dark one), each with a probe of the active set's three phases.
+    /// The scoped card keeps the window's ring, as an agent zone's does.
+    fn theme_scope_section(&self, cx: &mut Context<Self>) -> Div {
+        let window = cx.ui_theme();
+        let scoped = if self.dark { Tokens::neutral_light() } else { Tokens::neutral_dark() };
+        let readings = &self.scope_readings;
+        let panel = |name: &'static str, ring: Option<Hsla>| ScopePanel {
+            name,
+            ring,
+            readings: readings.clone(),
+            menu: self.context_menu.clone(),
+        };
+        let row = |name: &'static str| div().flex().items_start().gap_4().child(label(name, cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Theme scope", cx))
+            .child(row("Window's set").child(panel("unscoped", None)))
+            .child(row("Scoped").child(ThemeScope::new(scoped, panel("scoped", Some(brindle_ui::focus_ring(&window))))))
+            .child(row("After the scope").child(ScopeProbe { name: "after", readings: readings.clone() }))
     }
 
     /// The AI elements: a conversation over a prompt input, and beside it a
@@ -1976,6 +2172,7 @@ impl Render for Gallery {
             .child(self.toggle_tooltip_section(cx))
             .child(self.tabs_section(cx))
             .child(self.cards_section(cx))
+            .child(self.theme_scope_section(cx))
             .child(self.ai_section(cx))
             .child(self.response_section(cx))
             .child(self.layout_section(cx))
@@ -2933,6 +3130,10 @@ mod check {
         c.run_check("tab-moves-focus-through-the-gallery-and-wraps", check).await;
         let check = theme_switch(&mut c).await;
         c.run_check("theme-switch-redraws-in-dark-tokens", check).await;
+        let check = theme_scope_phases(&mut c).await;
+        c.run_check("theme-scope-phases", check).await;
+        let check = theme_scope_menu(&mut c).await;
+        c.run_check("theme-scope-menu-drawn-in-the-set-it-was-opened-with", check).await;
         let check = button_mouse_click(&mut c).await;
         c.run_check("button-click-counts-focuses-without-ring", check).await;
         let check = button_space_activates_once(&mut c).await;
@@ -3200,6 +3401,57 @@ mod check {
     }
 
     use brindle_ui::Tokens;
+    use crate::Phase;
+
+    /// The theme scope section's probes: inside the scope every phase reads
+    /// the scope's set, beside and after it the window's, and no scope is
+    /// left set once the frame is drawn.
+    async fn theme_scope_phases(c: &mut Checker) -> Check {
+        c.tick().await;
+        let (window, left, readings) =
+            c.with(|gallery, _, cx| (cx.window_theme(), cx.scoped_theme(), gallery.scope_readings.borrow().clone()))?;
+        ensure!(left.is_none(), "a scope's set was left active after the frame: {left:?}");
+        let scoped = if window.dark { Tokens::neutral_light() } else { Tokens::neutral_dark() };
+        for (name, bg) in [("unscoped", window.background), ("scoped", scoped.background), ("after", window.background)] {
+            let expected = vec![(Phase::Layout, bg), (Phase::Prepaint, bg), (Phase::Paint, bg)];
+            let read = readings.get(name).cloned().unwrap_or_default();
+            ensure!(read == expected, "the {name} probe read {read:?}, not {expected:?}");
+        }
+        Ok(())
+    }
+
+    /// The spec's "Menu with a token set": the context menu opened with the
+    /// other neutral set is drawn on that set's popover surface, and opened
+    /// without one on the window's.
+    async fn theme_scope_menu(c: &mut Checker) -> Check {
+        let check = theme_scope_menu_open(c).await;
+        // Closed whatever the outcome (a skipped pixel read leaves it open).
+        c.with(|gallery, window, cx| gallery.close_all(window, cx))?;
+        c.tick().await;
+        check
+    }
+
+    async fn theme_scope_menu_open(c: &mut Checker) -> Check {
+        let window = c.with(|_, _, cx| cx.window_theme())?;
+        let scoped = if window.dark { Tokens::neutral_light() } else { Tokens::neutral_dark() };
+        let at = point(px(200.), px(40.));
+        for (tokens, surface) in [(Some(scoped), scoped.popover), (None, window.popover)] {
+            c.with(move |gallery, window, cx| gallery.open_context_menu_in(at, tokens, window, cx))?;
+            c.tick().await;
+            c.tick().await;
+            let set = c.with(|gallery, _, cx| gallery.context_menu.read(cx).token_set().copied())?;
+            ensure!(set == tokens, "the context menu holds {set:?}, not {tokens:?}");
+            let bounds = menu_bounds(c, Which::Context)?;
+            // Inside the border, in the padding beside the first item.
+            let sample = point(bounds.left() + px(2.5), bounds.top() + px(8.));
+            let shown = c.pixel(sample).await?;
+            let expected = over(surface, surface);
+            ensure!(near(shown, expected), "the menu's surface at {sample:?} is {shown:?}, not {expected:?}");
+            c.with(|gallery, window, cx| gallery.close_all(window, cx))?;
+            c.tick().await;
+        }
+        Ok(())
+    }
 
     async fn button_mouse_click(c: &mut Checker) -> Check {
         let before = c.clicks("behind")?;
