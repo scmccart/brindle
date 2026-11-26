@@ -3340,8 +3340,9 @@ fn tool_line(out: &crate::brindle::Output, entry: u64, want: &str) -> Result {
     Ok(())
 }
 
-/// A diff in a running call's open row: its item and hunk lines, its
-/// added and removed lines in the zone set's diff colours; once the call
+/// A diff in a running call's open row: its item and hunk lines, the
+/// row's summary, its added and removed lines in the zone set's diff
+/// colours; once the call
 /// completes the row closes, and Toggle Tool Details opens it again, where
 /// it stays.
 pub fn tool_diff(ctx: &Ctx) -> Result<Outcome> {
@@ -3358,7 +3359,12 @@ pub fn tool_diff(ctx: &Ctx) -> Result<Outcome> {
 
     let out = started("open").wait_for("open=yes items=1").capture_at(5.0).dump_at(5.5).run()?;
     waited(&out)?;
-    tool_line(&out, 2, "tool call=\"c1\" kind=edit status=in_progress open=yes items=1 \"Edit notes.txt\"")?;
+    // The row's line carries its summary, lines added and removed.
+    tool_line(
+        &out,
+        2,
+        "tool call=\"c1\" kind=edit status=in_progress open=yes items=1 summary=\"+1 \u{2212}1\" \"Edit notes.txt\"",
+    )?;
     let items = out.dump.agent_items(2);
     ensure!(items == ["index=0 kind=diff op=modify path=\"/w/notes.txt\" added=1 removed=1 omitted=0"], "items {items:?}");
     let hunks = out.dump.agent_hunks(2);
@@ -3433,7 +3439,7 @@ pub fn tool_output(ctx: &Ctx) -> Result<Outcome> {
 
     let out = touch_from_shell(started("ended"), &done, true).wait_for("turn=ended:end_turn").dump_at(8.0).run()?;
     waited(&out)?;
-    tool_line(&out, 2, "status=failed open=no items=1")?;
+    tool_line(&out, 2, "status=failed open=no items=1 summary=\"exit 1\"")?;
     let items = out.dump.agent_items(2);
     ensure!(
         items.len() == 1 && items[0].contains(" exit=1 omitted=0 ") && items[0].ends_with("line 200\\nlast\\n\""),

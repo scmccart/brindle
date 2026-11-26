@@ -2758,13 +2758,18 @@ impl ChatModel {
             Entry::User { text } => format!("user {text:?}"),
             Entry::Agent { text } => format!("agent {text:?}"),
             Entry::Thought { text } => format!("thought open={} {text:?}", self.thought_open(id)),
-            Entry::Tool { call, title, kind, status, content, .. } => format!(
-                "tool call={call:?} kind={} status={} open={} items={} {title:?}",
-                tool_kind_word(*kind),
-                tool_status_word(*status),
-                self.tool_state(id, entry).word(),
-                content.len()
-            ),
+            Entry::Tool { call, title, kind, status, content, .. } => {
+                // The row's summary, only when it has one (flag 31), after
+                // `items=` so the `open=… items=N` prefixes still match.
+                let summary = tool::summary(entry).map(|s| format!(" summary={:?}", s.as_ref())).unwrap_or_default();
+                format!(
+                    "tool call={call:?} kind={} status={} open={} items={}{summary} {title:?}",
+                    tool_kind_word(*kind),
+                    tool_status_word(*status),
+                    self.tool_state(id, entry).word(),
+                    content.len()
+                )
+            }
             Entry::Permission { call, title, options, outcome } => {
                 let call = call.as_ref().map(|call| format!(" call={call:?}")).unwrap_or_default();
                 // The agent's order, not the row's (the spec's "Debug hooks
@@ -5264,7 +5269,7 @@ mod tests {
             assert_eq!(row(&zone.model, 2), (RowState::WithPermission, 1), "{policy:?}");
             assert_eq!(shown_with(&zone.model, 3), 1);
             let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
-            assert!(dump.contains("status=in_progress open=permission items=1 \"Edit c1\""), "{dump}");
+            assert!(dump.contains("status=in_progress open=permission items=1 summary=\"+1 \u{2212}1\" \"Edit c1\""), "{dump}");
             assert!(dump.contains("outcome=pending detail=1 \"Write a file\""), "{dump}");
             assert_drawn_afresh(&zone.model);
 
@@ -5327,8 +5332,9 @@ mod tests {
         assert_eq!(shown_with(&zone.model, 23), 1);
     }
 
-    /// Decision 12: the tool line's `open=` and `items=`, and its content's
-    /// lines, escaped onto one line each.
+    /// Decision 12: the tool line's `open=`, `items=` and `summary=` (flag
+    /// 31, only with one), and its content's lines, escaped onto one line
+    /// each.
     #[test]
     fn the_dump_lists_a_tool_calls_content() {
         let mut zone = Zone::ready();
@@ -5348,7 +5354,7 @@ mod tests {
         let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
         let lines: Vec<&str> = dump.lines().filter(|line| line.contains("entry=1") || line.starts_with("--- entry 1")).collect();
         assert_eq!(lines, [
-            "--- entry 1 tool call=\"c1\" kind=edit status=completed open=no items=5 \"Edit c1\"",
+            "--- entry 1 tool call=\"c1\" kind=edit status=completed open=no items=5 summary=\"+1 \u{2212}1 · SIGKILL\" \"Edit c1\"",
             "--- item entry=1 index=0 kind=diff op=modify path=\"/p/main.rs\" added=1 removed=1 omitted=0",
             "--- hunk entry=1 index=0 old=10 new=10 \" fn main() {\\n-    old();\\n+    new();\\n }\"",
             "--- item entry=1 index=1 kind=output command=\"cargo test\" exit=0 omitted=0 \"ok\\n\"",

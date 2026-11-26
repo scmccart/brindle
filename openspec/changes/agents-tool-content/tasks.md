@@ -298,9 +298,9 @@ Before starting, check these:
 
 ## 8. End-to-end and perf cases (fake ACP agent)
 
-- [ ] 8.1 **`agent-tool-diff`**:
+- [x] 8.1 **`agent-tool-diff`**:
   - a diff's item and hunk lines;
-  - the row's summary;
+  - the row's summary (the tool line's ` summary="…"`, flag 31);
   - the row open while the call is in progress (behind a `Gate`) and closed once it completes;
   - `toggle_agent_tool_details` opening it again, and it staying open;
   - a pixel check of the added and removed colours against the `e2e` theme.
