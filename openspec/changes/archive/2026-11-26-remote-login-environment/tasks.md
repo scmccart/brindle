@@ -79,7 +79,7 @@ No client protocol or H1 version changes (design.md decision 8). The relay link 
   - the existing checks still pass.
 
   Verify with `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_REMOTE_E2E_REQUIRED=1 cargo test --test e2e -- remote-agent-login-terminal`, run inside `systemd-run --user --scope` as the e2e memory says, and by seeing it fail on `main`'s `encode` (reverted locally) before 5.1.
-- [ ] 6.2 Integration check:
+- [x] 6.2 Integration check:
   - `cargo test --workspace --locked`;
   - `cargo clippy --locked --workspace --all-targets -- -D warnings`;
   - `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_REMOTE_E2E_REQUIRED=1 cargo test --test e2e -- remote- agent-`.
