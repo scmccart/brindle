@@ -19,7 +19,6 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::actions::*;
-use crate::TabKind;
 use crate::agent::close::{BusyAgent, ClosePlan, Closing, close_plan};
 use crate::agent::login::{self, TerminalLogin};
 use crate::agent::model::LoginZoneEnd;
@@ -28,7 +27,7 @@ use crate::agent::spawn::OpenedBy;
 use crate::agent::view::{AgentView, ConfirmLink};
 use brindle_ui::FocusStops as _;
 use gpui::Focusable as _;
-use crate::config::{Config, Profile, ProfileKind};
+use crate::config::{Config, Profile, ProfileKey, ProfileKind};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
@@ -301,49 +300,134 @@ pub fn can_split_zone(
     }
 }
 
-/// What a split of a tab starts (design.md decision 4): a zone of the
-/// tab's kind, or nothing, and why.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SplitPlan {
-    Terminal,
-    Agent,
+/// Which profile a split that asks for a kind runs (OpenSpec change
+/// `zones-mixed-tabs`, decision 2), as the config has it now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitChoice {
+    /// This profile.
+    Run(ProfileKey),
+    /// One of these, which a palette asks for, in the config's order.
+    Ask(Vec<ProfileKey>),
+    /// None: nothing is split.
     Refused(SplitRefusal),
 }
 
-/// Why a tab can't start a zone of its kind.
+/// Why a split runs no profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitRefusal {
-    /// The tab's profile is gone from the config.
-    ProfileGone,
-    /// The tab's profile, as the config has it now, is of the other kind.
-    ProfileKindChanged,
+    /// The config has no profile of the kind asked for.
+    NoProfileOfKind(ProfileKind),
 }
 
-/// What splitting a tab of kind `tab` starts, `profile` being the kind of
-/// the tab's profile as the config has it now (`None`: gone). A tab starts
-/// a zone of its own kind only, from a profile of that kind.
-pub fn split_plan(tab: TabKind, profile: Option<ProfileKind>) -> SplitPlan {
-    match (tab, profile) {
-        (TabKind::Terminal, Some(ProfileKind::Terminal)) => SplitPlan::Terminal,
-        (TabKind::Agent, Some(ProfileKind::Agent)) => SplitPlan::Agent,
-        (TabKind::Terminal, Some(ProfileKind::Agent)) | (TabKind::Agent, Some(ProfileKind::Terminal)) => {
-            SplitPlan::Refused(SplitRefusal::ProfileKindChanged)
+impl SplitRefusal {
+    /// What the window's notice line says.
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::NoProfileOfKind(ProfileKind::Terminal) => "no terminal profile to split with",
+            Self::NoProfileOfKind(ProfileKind::Agent) => "no agent profile to split with",
         }
-        (TabKind::Terminal | TabKind::Agent, None) => SplitPlan::Refused(SplitRefusal::ProfileGone),
     }
 }
 
-/// A zone header's menu: Split Zone Right, Split Zone Down, a separator and
-/// Close Zone. Each split item is enabled only when the zone can be split
-/// along its axis (`split_right`, `split_down`: [`can_split_zone`] for the
-/// zone's current size); Close Zone always is.
-pub fn zone_menu_rows(split_right: bool, split_down: bool) -> Vec<ActionRow> {
+/// What a split starts beside the zone it splits: a zone of a kind, its
+/// profile chosen by [`split_choice`], or a zone of the profile a palette
+/// chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SplitWith {
+    Kind(ProfileKind),
+    Profile(ProfileKey),
+}
+
+/// Which profile a split asking for `want` runs, `zone` being the index in
+/// `config` of the split zone's own profile (`None`: gone from the config):
+/// the zone's own profile when it is of the kind; else the default profile
+/// when it is; else the only profile of the kind; several: ask which, in
+/// the config's order; none: refused.
+pub fn split_choice(want: ProfileKind, zone: Option<usize>, config: &Config) -> SplitChoice {
+    let of_kind = |ix: &usize| config.profiles.get(*ix).is_some_and(|p| p.kind() == want);
+    let key = |ix: usize| config.profile_key(ix);
+    if let Some(key) = zone.filter(of_kind).and_then(key) {
+        return SplitChoice::Run(key);
+    }
+    if let Some(key) = Some(config.default_profile_index()).filter(of_kind).and_then(key) {
+        return SplitChoice::Run(key);
+    }
+    let mut kind: Vec<ProfileKey> = (0..config.profiles.len()).filter(of_kind).filter_map(key).collect();
+    match kind.len() {
+        0 => SplitChoice::Refused(SplitRefusal::NoProfileOfKind(want)),
+        1 => SplitChoice::Run(kind.remove(0)),
+        _ => SplitChoice::Ask(kind),
+    }
+}
+
+/// The profiles `Split … With Profile…` lists: every one, of either kind
+/// and any host, the default first, then the others in the config's order.
+pub fn split_profile_choices(config: &Config) -> Vec<ProfileKey> {
+    let default = config.default_profile_index();
+    std::iter::once(default)
+        .chain((0..config.profiles.len()).filter(|&ix| ix != default))
+        .filter_map(|ix| config.profile_key(ix))
+        .collect()
+}
+
+/// Where a zone of `profile` started by a split of a zone of `split`
+/// running on `split_host` runs: on the split zone's endpoint when the
+/// profile is its own (names match ignoring case, as profile lookups do),
+/// even when the profile's target has moved since; any other profile
+/// where it says.
+pub fn split_host(split: &Profile, split_host: &Host, profile: &Profile) -> Host {
+    if profile.name.eq_ignore_ascii_case(&split.name) { split_host.clone() } else { Host::of(profile) }
+}
+
+/// The directory a split's new zone starts in: the split zone's, when both
+/// run on one endpoint (`same_host`), whatever the new profile's own
+/// directory; else none, and the new zone's start takes its profile's
+/// directory, else the home directory there. A directory never crosses
+/// endpoints.
+pub fn split_cwd(split_dir: Option<PathBuf>, same_host: bool) -> Option<PathBuf> {
+    split_dir.filter(|_| same_host)
+}
+
+/// What a zone header's menu enables its split items by: whether the zone
+/// can be split along each axis (it isn't a terminal login's zone, and
+/// [`can_split_zone`] for its current size), and whether the config has a
+/// profile of each kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuSplits {
+    pub right: bool,
+    pub down: bool,
+    pub terminal: bool,
+    pub agent: bool,
+}
+
+/// A zone header's menu: the terminal, agent and choose-a-profile splits,
+/// each right then down, a separator and Close Zone. A split item is
+/// enabled only when the zone can be split along its axis and, for a
+/// kind's items, when the config has a profile of that kind (the two that
+/// ask take any); Close Zone always is.
+pub fn zone_menu_rows(splits: MenuSplits) -> Vec<ActionRow> {
+    let MenuSplits { right, down, terminal, agent } = splits;
+    let any = terminal || agent;
     vec![
-        ActionRow::item(SplitZoneRight, split_right),
-        ActionRow::item(SplitZoneDown, split_down),
+        ActionRow::item(SplitTerminalRight, right && terminal),
+        ActionRow::item(SplitTerminalDown, down && terminal),
+        ActionRow::item(SplitAgentRight, right && agent),
+        ActionRow::item(SplitAgentDown, down && agent),
+        ActionRow::item(SplitRightWithProfile, right && any),
+        ActionRow::item(SplitDownWithProfile, down && any),
         ActionRow::Separator,
         ActionRow::item(CloseZone, true),
     ]
+}
+
+/// The split-right and split-down actions of a zone of `kind`, which its
+/// header's buttons run and name in their tooltips: a zone splits as its
+/// own kind.
+pub fn split_actions(kind: ProfileKind) -> (Box<dyn Action>, Box<dyn Action>) {
+    match kind {
+        ProfileKind::Terminal => (Box::new(SplitTerminalRight), Box::new(SplitTerminalDown)),
+        ProfileKind::Agent => (Box::new(SplitAgentRight), Box::new(SplitAgentDown)),
+    }
 }
 
 /// A zone asks its tab's window for its menu: on a secondary press on its
@@ -486,13 +570,26 @@ pub enum ZoneStart {
     Agent(Entity<Agent>),
 }
 
-impl ZoneStart {
-    /// The kind of tab a zone like this one belongs in.
-    pub fn kind(&self) -> TabKind {
-        match self {
-            Self::Terminal(_) => TabKind::Terminal,
-            Self::Agent(_) => TabKind::Agent,
-        }
+/// The profile a zone runs, where, and how it is drawn: what a zone keeps
+/// of its own (OpenSpec change `zones-mixed-tabs`, decision 1).
+#[derive(Clone)]
+pub struct ZoneSpec {
+    /// As the config has it now; kept as last seen once it is deleted.
+    pub profile: Profile,
+    /// Where the zone's session runs. It never changes.
+    pub host: Host,
+    /// The profile's theme, or the preview of it.
+    pub theme: Theme,
+    pub font_size: Option<f32>,
+}
+
+impl ZoneSpec {
+    /// `profile` on `host`, in the profile's theme and font size as
+    /// `config` gives them.
+    pub fn of(profile: Profile, host: Host, config: &Config) -> Self {
+        let theme = config.profile_theme(&profile);
+        let font_size = profile.font_size;
+        Self { profile, host, theme, font_size }
     }
 }
 
@@ -506,6 +603,14 @@ pub enum ZoneContent {
 }
 
 impl ZoneContent {
+    /// The zone's kind, which is what it shows: no other field says it.
+    pub fn kind(&self) -> ProfileKind {
+        match self {
+            Self::Terminal(_) => ProfileKind::Terminal,
+            Self::Agent(_) => ProfileKind::Agent,
+        }
+    }
+
     /// The terminal's view; `None` for an agent zone.
     pub fn terminal_view(&self) -> Option<&Entity<TerminalView>> {
         match self {
@@ -710,6 +815,20 @@ impl ZoneContent {
 
 pub struct Zone {
     pub content: ZoneContent,
+    /// The zone's profile, as the config has it now (by name; a rename in
+    /// the settings dialog follows), else as last seen. Its kind is the
+    /// content's whatever the profile's is now.
+    pub profile: Profile,
+    /// Where its session runs, whatever the profile targets now. It never
+    /// changes.
+    pub host: Host,
+    /// Its profile's theme (or the preview of it), for its terminal or
+    /// agent view and the card round it.
+    pub theme: Theme,
+    /// `theme`'s zone token set (`Theme::zone_tokens`), which an agent zone
+    /// is drawn in, kept beside it so `render` derives nothing.
+    zone_tokens: Tokens,
+    pub font_size: Option<f32>,
     pub title: SharedString,
     pub status: Option<State>,
     /// Its terminal's progress, cached for its header's bar.
@@ -737,24 +856,22 @@ pub fn login_axis(fits_right: bool) -> SplitAxis {
     if fits_right { SplitAxis::Horizontal } else { SplitAxis::Vertical }
 }
 
+/// A split of the active zone wants a profile chosen (OpenSpec change
+/// `zones-mixed-tabs`, decision 2): the window asks which of `profiles` in
+/// a palette, and splits `zone` along `axis` with the one chosen
+/// ([`ZoneTreeView::split_zone`] with [`SplitWith::Profile`]).
+#[derive(Clone, Debug)]
+pub struct SplitAsk {
+    pub zone: ZoneId,
+    pub axis: SplitAxis,
+    pub profiles: Vec<ProfileKey>,
+}
+
+/// A split ran no profile, which the window's notice line says.
+#[derive(Clone, Copy, Debug)]
+pub struct SplitRefused(pub SplitRefusal);
+
 pub struct ZoneTreeView {
-    /// The tab's profile, as the config has it now: what a split runs.
-    pub profile: Profile,
-    /// The endpoint the tab opened on, where its splits start too, whatever
-    /// the profile targets now. It never changes.
-    host: Host,
-    /// What the tab's zones are, fixed when it opens as its host is: a
-    /// split starts a zone of this kind only ([`split_plan`]).
-    kind: TabKind,
-    /// The tab's theme, for its terminals and the cards round them (their
-    /// headers, borders and the gaps between them). The focus ring and the
-    /// status dots stay on the window's tokens and global theme.
-    pub theme: Theme,
-    /// `theme`'s zone token set (`Theme::zone_tokens`), which the tab's
-    /// agent zones are drawn in. Kept beside `theme` so `render` derives
-    /// nothing: `new`, `from_restored` and `set_profile` refresh it.
-    zone_tokens: Tokens,
-    pub font_size_override: Option<f32>,
     tree: ZoneTree,
     zones: HashMap<ZoneId, Zone>,
     active: ZoneId,
@@ -762,6 +879,9 @@ pub struct ZoneTreeView {
     focus_serial: u64,
     shutting_down: bool,
     focus_handle: FocusHandle,
+    /// The zone whose bell or notification the tree passed on last, which
+    /// the window's notification names ([`ZoneTreeView::notifying_profile`]).
+    notifying: Option<ZoneId>,
     /// Where the tree and each zone's header were laid out in the last
     /// frame, in window coordinates, for placing a menu opened from a key.
     /// Recorded while the frame is drawn, so without a notify.
@@ -778,6 +898,8 @@ struct LaidOut {
 impl EventEmitter<TerminalEvent> for ZoneTreeView {}
 impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
 impl EventEmitter<CloseZoneAsk> for ZoneTreeView {}
+impl EventEmitter<SplitAsk> for ZoneTreeView {}
+impl EventEmitter<SplitRefused> for ZoneTreeView {}
 /// A zone's link wasn't opened, passed on to the window (whichever tab the
 /// zone is in: an opener can fail after its tab went to the background).
 impl EventEmitter<LinkFailed> for ZoneTreeView {}
@@ -785,37 +907,28 @@ impl EventEmitter<LinkFailed> for ZoneTreeView {}
 impl EventEmitter<ConfirmLink> for ZoneTreeView {}
 
 impl ZoneTreeView {
-    /// Creates a `ZoneTreeView` with a single initial zone, which runs on
-    /// `host`.
-    pub fn new(
-        profile: Profile,
-        host: Host,
-        theme: Theme,
-        font_size_override: Option<f32>,
-        start: ZoneStart,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    /// Creates a `ZoneTreeView` with a single initial zone, of `spec`.
+    pub fn new(spec: ZoneSpec, start: ZoneStart, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let id = ZoneId(1);
-        let mut this = Self {
-            profile,
-            host,
-            kind: start.kind(),
-            zone_tokens: theme.zone_tokens(),
-            theme,
-            font_size_override,
-            tree: ZoneTree::new(id),
+        let mut this = Self::empty(ZoneTree::new(id), id, 2, cx);
+        Self::unwant_on_release(cx);
+        this.insert_zone(id, spec, start, window, cx);
+        this
+    }
+
+    /// A tree of no zones yet, `tree` its shape.
+    fn empty(tree: ZoneTree, active: ZoneId, next_id: u64, cx: &mut Context<Self>) -> Self {
+        Self {
+            tree,
             zones: HashMap::new(),
-            active: id,
-            next_id: 2,
+            active,
+            next_id,
             focus_serial: 0,
             shutting_down: false,
             focus_handle: cx.focus_handle(),
+            notifying: None,
             laid_out: Rc::default(),
-        };
-        Self::unwant_on_release(cx);
-        this.insert_zone(id, start, window, cx);
-        this
+        }
     }
 
     /// A closed tab can't keep the motion clock running.
@@ -825,45 +938,19 @@ impl ZoneTreeView {
     }
 
     /// Creates a `ZoneTreeView` from a restored split tree and the zones
-    /// started for each leaf, which run on `host`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "both call sites (`Workspace`'s restore and layout tab) already hold each of these as separate values (profile, host, theme, tree, terminals, active zone); a parameter struct would be built only to be taken apart here"
-    )]
+    /// started for each leaf, each of its own profile on its own host.
     pub fn from_restored(
-        profile: Profile,
-        host: Host,
-        theme: Theme,
-        font_size_override: Option<f32>,
         tree: ZoneTree,
-        zones: Vec<(ZoneId, ZoneStart)>,
+        zones: Vec<(ZoneId, ZoneSpec, ZoneStart)>,
         active: ZoneId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let max_id = zones.iter().map(|(id, _)| id.0).max().unwrap_or(1);
-        // The callers start every zone of a tree as one kind
-        // (`layout::group` splits a recorded layout by kind).
-        let kind = zones.first().map_or(TabKind::Terminal, |(_, start)| start.kind());
-        let mut this = Self {
-            profile,
-            host,
-            kind,
-            zone_tokens: theme.zone_tokens(),
-            theme,
-            font_size_override,
-            tree,
-            zones: HashMap::new(),
-            active,
-            next_id: max_id + 1,
-            focus_serial: 0,
-            shutting_down: false,
-            focus_handle: cx.focus_handle(),
-            laid_out: Rc::default(),
-        };
+        let max_id = zones.iter().map(|(id, ..)| id.0).max().unwrap_or(1);
+        let mut this = Self::empty(tree, active, max_id + 1, cx);
         Self::unwant_on_release(cx);
-        for (id, start) in zones {
-            this.insert_zone(id, start, window, cx);
+        for (id, spec, start) in zones {
+            this.insert_zone(id, spec, start, window, cx);
         }
         // Give the recorded active zone the highest focus serial.
         this.focus_serial += 1;
@@ -873,11 +960,13 @@ impl ZoneTreeView {
         this
     }
 
-    /// Puts zone `id` in the tree's map, showing what `start` started, in
-    /// the tab's theme and font size, with the subscriptions its kind has.
-    fn insert_zone(&mut self, id: ZoneId, start: ZoneStart, window: &mut Window, cx: &mut Context<Self>) {
-        let theme = self.theme.clone();
-        let font_size = self.font_size_override;
+    /// Puts zone `id` in the tree's map, showing what `start` started, of
+    /// `spec`'s profile, host, theme and font size, with the subscriptions
+    /// its kind has.
+    fn insert_zone(&mut self, id: ZoneId, spec: ZoneSpec, start: ZoneStart, window: &mut Window, cx: &mut Context<Self>) {
+        let ZoneSpec { profile, host, theme, font_size } = spec;
+        let zone_tokens = theme.zone_tokens();
+        let zone_theme = theme.clone();
         let (content, initial_title, mut subscriptions) = match start {
             ZoneStart::Terminal(terminal) => {
                 terminal.update(cx, |t, _| t.theme = theme);
@@ -889,7 +978,7 @@ impl ZoneTreeView {
                 // Without the process name, which the next refresh reads.
                 let title: SharedString = {
                     let t = terminal.read(cx);
-                    terminal_automatic_title(t.title(), &self.profile.name, LOCAL_PATH_STYLE, None).into()
+                    terminal_automatic_title(t.title(), &profile.name, LOCAL_PATH_STYLE, None).into()
                 };
                 (ZoneContent::Terminal(view), title, vec![events, link_failed])
             }
@@ -920,6 +1009,11 @@ impl ZoneTreeView {
         let (status, progress, badge) = content.status(cx);
         let zone = Zone {
             content,
+            profile,
+            host,
+            theme: zone_theme,
+            zone_tokens,
+            font_size,
             title: initial_title,
             status,
             progress,
@@ -999,31 +1093,39 @@ impl ZoneTreeView {
     }
 
     /// Opens a terminal zone beside agent zone `agent_zone` running `plan`
-    /// on the tab's host, in the agent's directory, with the profile's
-    /// environment and the login's variables over it (decision 9). It is
-    /// the one zone a tab starts of another kind; its program ends with
-    /// the tab or Brindle (a command's terminal, `Closing::Ends`), and it
-    /// takes focus, since the login asks for typing. One per agent zone.
+    /// on that zone's host, in the agent's directory, with its profile's
+    /// environment and the login's variables over it (decision 9), drawn as
+    /// the agent zone is. It isn't a profile's zone: no split starts from
+    /// it, its program ends with the tab or Brindle (a command's terminal,
+    /// `Closing::Ends`), and it takes focus, since the login asks for
+    /// typing. One per agent zone.
     fn open_login_zone(&mut self, agent_zone: ZoneId, plan: TerminalLogin, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.zones.contains_key(&agent_zone) || self.login_zone_of(agent_zone).is_some() {
+        if self.login_zone_of(agent_zone).is_some() {
             return;
         }
+        let Some(zone) = self.zones.get(&agent_zone) else { return };
+        let spec = ZoneSpec {
+            profile: zone.profile.clone(),
+            host: zone.host.clone(),
+            theme: zone.theme.clone(),
+            font_size: zone.font_size,
+        };
         let axis = login_axis(self.fits(agent_zone, SplitAxis::Horizontal, window, cx));
         let cwd = self.zone_working_directory(agent_zone, cx);
         let config: Config = Settings::get(cx).config.clone();
-        let ignore_case = self.host.is_local() && crate::terminal::process::LOCAL_ENV_IGNORES_CASE;
-        let mut profile = self.profile.clone();
+        let ignore_case = spec.host.is_local() && crate::terminal::process::LOCAL_ENV_IGNORES_CASE;
+        let mut profile = spec.profile.clone();
         profile.env = login::overlay(&profile.env, &plan.env, ignore_case);
         let new_id = ZoneId(self.next_id);
         self.next_id += 1;
         if !self.tree.split(agent_zone, axis, new_id) {
             return;
         }
-        let host = self.host.clone();
+        let host = spec.host.clone();
         let command = Some((plan.command, plan.args));
         let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
         self.refresh_zone_title(agent_zone, cx);
-        self.insert_zone(new_id, ZoneStart::Terminal(terminal), window, cx);
+        self.insert_zone(new_id, spec, ZoneStart::Terminal(terminal), window, cx);
         if let Some(zone) = self.zones.get_mut(&new_id) {
             zone.login_for = Some(agent_zone);
         }
@@ -1074,9 +1176,13 @@ impl ZoneTreeView {
                 self.close_zone_by_id(id, window, cx);
             }
             TerminalEvent::Bell | TerminalEvent::Notify(_) | TerminalEvent::Notify99(_) => {
+                self.notifying = Some(id);
                 cx.emit(event.clone());
             }
-            TerminalEvent::Status(_) => {
+            TerminalEvent::Status(notice) => {
+                if notice.is_some() {
+                    self.notifying = Some(id);
+                }
                 if let Some(zone) = self.zones.get_mut(&id) {
                     (zone.status, zone.progress, zone.badge) = zone.content.status(cx);
                 }
@@ -1144,12 +1250,16 @@ impl ZoneTreeView {
         recorded_leaves(self.tree.leaves(), &self.login_zones())
             .into_iter()
             .filter(|id| !unrecorded(id))
-            .map(|id| {
+            .filter_map(|id| {
+                let zone = self.zones.get(&id)?;
                 let record = crate::session::ZoneRecord {
                     cwd: self.zone_working_directory(id, cx),
                     session: self.zone_server_session(id, cx),
+                    profile: zone.profile.name.clone(),
+                    // Where it runs, which its profile may no longer name.
+                    remote: zone.host.target().cloned(),
                 };
-                (id, record)
+                Some((id, record))
             })
             .collect()
     }
@@ -1172,13 +1282,65 @@ impl ZoneTreeView {
     }
 
     /// The active zone's title as [`ZoneTreeView::refresh_titles`] last
-    /// cached it, or the profile name when there is no active zone: the
-    /// tab's automatic title.
+    /// cached it (its program's, else its profile's name): the tab's
+    /// automatic title. Empty with no zone, which only a closing tab has.
     pub fn active_title(&self) -> SharedString {
-        match self.zones.get(&self.active) {
-            Some(zone) => zone.title.clone(),
-            None => self.profile.name.clone().into(),
+        self.zones.get(&self.active).map(|zone| zone.title.clone()).unwrap_or_default()
+    }
+
+    /// The active zone, which the tab takes its profile's look from.
+    pub fn active_zone(&self) -> Option<&Zone> {
+        self.zones.get(&self.active)
+    }
+
+    /// The active zone's theme: the tab face's (`tabs`' "A tab follows its
+    /// active zone"). The default theme with no zone.
+    pub fn active_theme(&self) -> Theme {
+        self.active_zone().map(|zone| zone.theme.clone()).unwrap_or_default()
+    }
+
+    /// The name of the profile of the zone whose bell or notification was
+    /// passed on last, else the active zone's: what the window's
+    /// notification names.
+    pub fn notifying_profile(&self) -> String {
+        self.notifying
+            .and_then(|id| self.zones.get(&id))
+            .or_else(|| self.active_zone())
+            .map(|zone| zone.profile.name.clone())
+            .unwrap_or_default()
+    }
+
+    /// The tree's zones in its order.
+    pub fn zones_in_order(&self) -> Vec<&Zone> {
+        self.tree.leaves().iter().filter_map(|id| self.zones.get(id)).collect()
+    }
+
+    /// The endpoints the tab's zones run on, in the tree's order, each
+    /// once.
+    pub fn hosts(&self) -> Vec<Host> {
+        let mut hosts: Vec<Host> = Vec::new();
+        for zone in self.zones_in_order() {
+            if !hosts.contains(&zone.host) {
+                hosts.push(zone.host.clone());
+            }
         }
+        hosts
+    }
+
+    /// The name of the profile of the first zone on `host`, in the tree's
+    /// order.
+    pub fn profile_on(&self, host: &Host) -> Option<String> {
+        self.zones_in_order().into_iter().find(|zone| zone.host == *host).map(|zone| zone.profile.name.clone())
+    }
+
+    /// The terminal server sessions the zones on `host` show.
+    pub fn sessions_on(&self, host: &Host, cx: &App) -> Vec<crate::session::ServerSession> {
+        self.tree
+            .leaves()
+            .into_iter()
+            .filter(|id| self.zones.get(id).is_some_and(|zone| zone.host == *host))
+            .filter_map(|id| self.zone_server_session(id, cx))
+            .collect()
     }
 
     /// Refreshes cached zone header titles for all zones in this tab.
@@ -1192,9 +1354,8 @@ impl ZoneTreeView {
     }
 
     fn refresh_zone_title(&mut self, id: ZoneId, cx: &App) -> bool {
-        let profile_name = self.profile.name.clone();
         let Some(zone) = self.zones.get_mut(&id) else { return false };
-        let title = zone.content.title(&profile_name, cx);
+        let title = zone.content.title(&zone.profile.name, cx);
         let changed = zone.title != title;
         zone.title = title;
         changed
@@ -1230,15 +1391,28 @@ impl ZoneTreeView {
         describe_zone_badges(self.zones.iter().map(|(id, z)| (*id, z.badge.as_ref())), self.active)
     }
 
-    /// Takes the tab's profile as the config now has it (or the settings
-    /// dialog previews it), with its theme and font size. The host stays.
-    pub fn set_profile(&mut self, profile: Profile, theme: Theme, font_size: Option<f32>, cx: &mut Context<Self>) {
-        self.profile = profile;
-        self.zone_tokens = theme.zone_tokens();
-        self.theme = theme.clone();
-        self.font_size_override = font_size;
-        for zone in self.zones.values() {
-            zone.content.set_profile(&self.profile.name, theme.clone(), font_size, cx);
+    /// Gives each zone the profile `follow` gives its own (the config's
+    /// after a reload or a rename), keeping it where `follow` gives none.
+    /// Hosts stay; the look is [`ZoneTreeView::restyle`]'s.
+    pub fn follow_profiles(&mut self, follow: &dyn Fn(&Profile) -> Option<Profile>) {
+        for zone in self.zones.values_mut() {
+            if let Some(profile) = follow(&zone.profile) {
+                zone.profile = profile;
+            }
+        }
+    }
+
+    /// Draws each zone in the theme and font size `look` gives its own
+    /// profile (the config's, or the settings dialog's preview), an agent
+    /// zone taking its profile's name too (a title that is the profile's
+    /// follows a rename).
+    pub fn restyle(&mut self, look: &dyn Fn(&Profile) -> (Theme, Option<f32>), cx: &mut Context<Self>) {
+        for zone in self.zones.values_mut() {
+            let (theme, font_size) = look(&zone.profile);
+            zone.zone_tokens = theme.zone_tokens();
+            zone.theme = theme.clone();
+            zone.font_size = font_size;
+            zone.content.set_profile(&zone.profile.name, theme, font_size, cx);
         }
         cx.notify();
     }
@@ -1304,7 +1478,12 @@ impl ZoneTreeView {
 
     /// A restore's note for the active zone ([`ZoneContent::note`]).
     pub fn note_active(&self, text: &str, cx: &mut App) {
-        if let Some(zone) = self.zones.get(&self.active) {
+        self.note_zone(self.active, text, cx);
+    }
+
+    /// A restore's note for zone `id` ([`ZoneContent::note`]).
+    pub fn note_zone(&self, id: ZoneId, text: &str, cx: &mut App) {
+        if let Some(zone) = self.zones.get(&id) {
             zone.content.note(text, cx);
         }
     }
@@ -1337,29 +1516,35 @@ impl ZoneTreeView {
         Some(size(px(content_w * rect.w as f32), px(content_h * rect.h as f32)))
     }
 
-    /// What a split of this tab starts, from its profile as the config has
-    /// it now ([`split_plan`]).
-    fn split_plan(&self, cx: &App) -> SplitPlan {
+    /// Which profile a split of zone `id` asking for `want` runs, from the
+    /// config as it is now ([`split_choice`]).
+    fn split_choice(&self, id: ZoneId, want: ProfileKind, cx: &App) -> SplitChoice {
         let config = &Settings::get(cx).config;
-        split_plan(self.kind, config.profile(&self.profile.name).map(Profile::kind))
+        let own = self.zones.get(&id).and_then(|zone| config.profile_index(&zone.profile.name));
+        split_choice(want, own, config)
     }
 
-    /// Whether zone `id` can be split along `axis`: the tab can start a
-    /// zone of its kind ([`split_plan`]) and the zone is big enough, at its
-    /// current size ([`can_split_zone`]). A zone whose size isn't known yet
-    /// is.
-    pub fn can_split(&self, id: ZoneId, axis: SplitAxis, window: &Window, cx: &App) -> bool {
-        match self.split_plan(cx) {
-            SplitPlan::Terminal | SplitPlan::Agent => {}
-            SplitPlan::Refused(_) => return false,
+    /// Whether zone `id` can be split at all: it is there and isn't a
+    /// terminal login's zone, which no split starts from.
+    fn splittable(&self, id: ZoneId) -> bool {
+        self.zones.get(&id).is_some_and(|zone| zone.login_for.is_none())
+    }
+
+    /// Whether a split of zone `id` asking for `want` runs a profile, so its
+    /// item and button aren't disabled: the zone can be split and the config
+    /// has a profile of the kind.
+    fn can_split_with(&self, id: ZoneId, want: ProfileKind, cx: &App) -> bool {
+        match self.split_choice(id, want, cx) {
+            SplitChoice::Run(_) | SplitChoice::Ask(_) => self.splittable(id),
+            SplitChoice::Refused(_) => false,
         }
-        self.fits(id, axis, window, cx)
     }
 
     /// Whether zone `id` is big enough to split along `axis`, at its
     /// current size ([`can_split_zone`]); one whose size isn't known yet is.
     fn fits(&self, id: ZoneId, axis: SplitAxis, window: &Window, cx: &App) -> bool {
-        let metrics = cell_metrics(self.font_size_override, window, cx);
+        let font_size = self.zones.get(&id).and_then(|zone| zone.font_size);
+        let metrics = cell_metrics(font_size, window, cx);
         let padding = px(Settings::get(cx).config.padding);
         let has_header = self.zones.len() >= 2;
         self.zone_outer_size(id, window, cx).is_none_or(|zone_size| {
@@ -1369,8 +1554,7 @@ impl ZoneTreeView {
 
     /// Focuses zone `id`, then asks the window for its header menu at `at`
     /// (from the secondary `press`, if one asked), its split items enabled
-    /// as [`ZoneTreeView::can_split`] says. Focus comes first, so the items
-    /// act on this zone.
+    /// by [`MenuSplits`]. Focus comes first, so the items act on this zone.
     pub fn open_menu(
         &mut self,
         id: ZoneId,
@@ -1383,31 +1567,35 @@ impl ZoneTreeView {
             return;
         }
         self.focus_zone(id, window, cx);
-        let rows = zone_menu_rows(
-            self.can_split(id, SplitAxis::Horizontal, window, cx),
-            self.can_split(id, SplitAxis::Vertical, window, cx),
-        );
+        let splittable = self.splittable(id);
+        let rows = zone_menu_rows(MenuSplits {
+            right: splittable && self.fits(id, SplitAxis::Horizontal, window, cx),
+            down: splittable && self.fits(id, SplitAxis::Vertical, window, cx),
+            terminal: self.can_split_with(id, ProfileKind::Terminal, cx),
+            agent: self.can_split_with(id, ProfileKind::Agent, cx),
+        });
         cx.emit(ZoneMenuRequest { rows, at, press, tokens: self.scope_of(id) });
     }
 
     /// The theme scope zone `id` is drawn in, which its tooltips and header
-    /// menu take too: an agent zone's is the tab theme's zone token set
+    /// menu take too: an agent zone's is its own theme's zone token set
     /// (`agents-zone-theme-scope` decision 3), a terminal zone has none
     /// and keeps the window's set, as does a zone that isn't there.
     fn scope_of(&self, id: ZoneId) -> Option<Tokens> {
-        match &self.zones.get(&id)?.content {
-            ZoneContent::Agent(_) => Some(self.zone_tokens),
+        let zone = self.zones.get(&id)?;
+        match &zone.content {
+            ZoneContent::Agent(_) => Some(zone.zone_tokens),
             ZoneContent::Terminal(_) => None,
         }
     }
 
-    /// Zone `id`'s card colours, and the scope it is drawn in: the tab
+    /// Zone `id`'s card colours, and the scope it is drawn in: its own
     /// theme's card colours on the window's background (`window`, the set
     /// round the cards), and for a zone drawn in a scope, the window's
     /// focus ring, which would otherwise take the scope's.
     fn leaf_look(&self, id: ZoneId, window: &Tokens) -> (CardColors, Option<Tokens>) {
         let scope = self.scope_of(id);
-        let mut colors = self.theme.card_colors();
+        let mut colors = self.zones.get(&id).map_or_else(|| Theme::default().card_colors(), |z| z.theme.card_colors());
         colors.surround = Some(window.background);
         if scope.is_some() {
             colors.ring = Some(brindle_ui::focus_ring(window));
@@ -1426,44 +1614,60 @@ impl ZoneTreeView {
         }
     }
 
-    pub fn split_zone(&mut self, target: ZoneId, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.zones.contains_key(&target) || !self.can_split(target, axis, window, cx) {
+    /// Splits zone `target` along `axis` with a new zone of what `with`
+    /// asks for (OpenSpec change `zones-mixed-tabs`, decisions 2–4). The
+    /// size rule comes first, and a terminal login's zone splits with
+    /// nothing. A kind whose profile needs choosing asks the window
+    /// ([`SplitAsk`]), and one with no profile says so ([`SplitRefused`]).
+    /// The new zone runs where [`split_host`] says, in the directory
+    /// [`split_cwd`] gives, and takes focus.
+    pub fn split_zone(&mut self, target: ZoneId, axis: SplitAxis, with: SplitWith, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.splittable(target) || !self.fits(target, axis, window, cx) {
             return;
         }
-
         let config: Config = Settings::get(cx).config.clone();
-        // A split runs on the tab's host and inherits the target zone's
-        // current working directory there (an agent zone's: the one its
-        // session started in); if unavailable, the spawn falls back to the
-        // profile's cwd or home.
-        let cwd = self.zone_working_directory(target, cx);
-        let plan = self.split_plan(cx);
+        let key = match with {
+            SplitWith::Kind(want) => match self.split_choice(target, want, cx) {
+                SplitChoice::Run(key) => key,
+                SplitChoice::Ask(profiles) => {
+                    cx.emit(SplitAsk { zone: target, axis, profiles });
+                    return;
+                }
+                SplitChoice::Refused(refusal) => {
+                    cx.emit(SplitRefused(refusal));
+                    return;
+                }
+            },
+            SplitWith::Profile(key) => key,
+        };
+        // A profile chosen in a palette may have gone since it opened.
+        let Some(profile) = config.find_profile(&key).map(|ix| config.profiles[ix].clone()) else { return };
+        let Some(split) = self.zones.get(&target) else { return };
+        let host = split_host(&split.profile, &split.host, &profile);
+        // The target zone's working directory (an agent zone's: the one its
+        // session started in) when the new zone runs on its endpoint; else
+        // the spawn takes the profile's directory, or home there.
+        let same_host = split.host == host;
+        let cwd = split_cwd(self.zone_working_directory(target, cx), same_host);
 
         let new_id = ZoneId(self.next_id);
         self.next_id += 1;
         if !self.tree.split(target, axis, new_id) {
             return;
         }
-
-        let host = self.host.clone();
-        let start = match plan {
-            SplitPlan::Terminal => {
-                ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&self.profile, &host, None, cwd, &config, cx)))
+        let start = match profile.kind() {
+            ProfileKind::Terminal => {
+                ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&profile, &host, None, cwd, &config, cx)))
             }
-            SplitPlan::Agent => {
-                ZoneStart::Agent(cx.new(|cx| Agent::spawn(&self.profile, &host, cwd, OpenedBy::Window, None, cx)))
-            }
-            // `can_split` refused this above; should it get here, the tree
-            // loses the leaf it just gained.
-            SplitPlan::Refused(_) => {
-                self.tree.remove(new_id);
-                return;
+            ProfileKind::Agent => {
+                ZoneStart::Agent(cx.new(|cx| Agent::spawn(&profile, &host, cwd, OpenedBy::Window, None, cx)))
             }
         };
+        let spec = ZoneSpec::of(profile, host, &config);
 
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         self.refresh_zone_title(target, cx);
-        self.insert_zone(new_id, start, window, cx);
+        self.insert_zone(new_id, spec, start, window, cx);
         self.refresh_zone_title(new_id, cx);
         self.active = new_id;
         let focus = self.focus_handle(cx);
@@ -1546,12 +1750,39 @@ impl ZoneTreeView {
 
     // ---- action listeners -------------------------------------------------------
 
-    fn split_right(&mut self, _: &SplitZoneRight, window: &mut Window, cx: &mut Context<Self>) {
-        self.split_zone(self.active, SplitAxis::Horizontal, window, cx);
+    fn split_terminal_right(&mut self, _: &SplitTerminalRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_zone(self.active, SplitAxis::Horizontal, SplitWith::Kind(ProfileKind::Terminal), window, cx);
     }
 
-    fn split_down(&mut self, _: &SplitZoneDown, window: &mut Window, cx: &mut Context<Self>) {
-        self.split_zone(self.active, SplitAxis::Vertical, window, cx);
+    fn split_terminal_down(&mut self, _: &SplitTerminalDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_zone(self.active, SplitAxis::Vertical, SplitWith::Kind(ProfileKind::Terminal), window, cx);
+    }
+
+    fn split_agent_right(&mut self, _: &SplitAgentRight, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_zone(self.active, SplitAxis::Horizontal, SplitWith::Kind(ProfileKind::Agent), window, cx);
+    }
+
+    fn split_agent_down(&mut self, _: &SplitAgentDown, window: &mut Window, cx: &mut Context<Self>) {
+        self.split_zone(self.active, SplitAxis::Vertical, SplitWith::Kind(ProfileKind::Agent), window, cx);
+    }
+
+    fn split_right_with_profile(&mut self, _: &SplitRightWithProfile, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_split_profile(self.active, SplitAxis::Horizontal, window, cx);
+    }
+
+    fn split_down_with_profile(&mut self, _: &SplitDownWithProfile, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_split_profile(self.active, SplitAxis::Vertical, window, cx);
+    }
+
+    /// Asks the window which profile to split zone `target` with, offering
+    /// every profile ([`split_profile_choices`]), when the zone can be split
+    /// along `axis`.
+    fn ask_split_profile(&mut self, target: ZoneId, axis: SplitAxis, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.splittable(target) || !self.fits(target, axis, window, cx) {
+            return;
+        }
+        let profiles = split_profile_choices(&Settings::get(cx).config);
+        cx.emit(SplitAsk { zone: target, axis, profiles });
     }
 
     /// Close Zone (its key, the header's ×, the header menu's item): at
@@ -1745,21 +1976,27 @@ impl ZoneTreeView {
                 })
                 .child(control)
         };
-        // A tab that can't start a zone of its kind shows its split
-        // buttons disabled (a zone too small to split finds out on a press,
-        // as before: that needs the font's metrics).
-        let refused = match self.split_plan(cx) {
-            SplitPlan::Terminal | SplitPlan::Agent => false,
-            SplitPlan::Refused(_) => true,
-        };
+        // The split buttons start another zone of this zone's own kind,
+        // disabled where that can't run a profile or the zone is a terminal
+        // login's (a zone too small to split finds out on a press, as
+        // before: that needs the font's metrics).
+        let kind = zone.content.kind();
+        let refused = !self.can_split_with(id, kind, cx);
+        let (right_action, down_action) = split_actions(kind);
+        let with = SplitWith::Kind(kind);
+        let with_down = with.clone();
         let split_right = button("zone-split-right", Icon::Columns2)
             .disabled(refused)
-            .tooltip_with(tip("Split right", Box::new(SplitZoneRight)))
-            .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Horizontal, window, cx)));
+            .tooltip_with(tip("Split right", right_action))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.split_zone(id, SplitAxis::Horizontal, with.clone(), window, cx)
+            }));
         let split_down = button("zone-split-down", Icon::Rows2)
             .disabled(refused)
-            .tooltip_with(tip("Split down", Box::new(SplitZoneDown)))
-            .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Vertical, window, cx)));
+            .tooltip_with(tip("Split down", down_action))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.split_zone(id, SplitAxis::Vertical, with_down.clone(), window, cx)
+            }));
         let close = button("zone-close", Icon::X)
             .tooltip_with(tip("Close zone", Box::new(CloseZone)))
             .on_click(cx.listener(move |this, _, window, cx| this.request_close_zone(id, window, cx)));
@@ -1775,7 +2012,7 @@ impl ZoneTreeView {
         }
         // Its context badge, drawn as the tab face's is.
         if let Some(badge) = &zone.badge {
-            header = header.badge(ui_badge(badge, &self.theme));
+            header = header.badge(ui_badge(badge, &zone.theme));
         }
         let header = header
             .title(title)
@@ -1828,8 +2065,12 @@ impl Render for ZoneTreeView {
                     view.update(cx, |view, cx| view.modifiers_changed(position, e.modifiers, cx));
                 }
             }))
-            .on_action(cx.listener(Self::split_right))
-            .on_action(cx.listener(Self::split_down))
+            .on_action(cx.listener(Self::split_terminal_right))
+            .on_action(cx.listener(Self::split_terminal_down))
+            .on_action(cx.listener(Self::split_agent_right))
+            .on_action(cx.listener(Self::split_agent_down))
+            .on_action(cx.listener(Self::split_right_with_profile))
+            .on_action(cx.listener(Self::split_down_with_profile))
             .on_action(cx.listener(Self::close_active_zone))
             .on_action(cx.listener(Self::open_zone_menu))
             .on_action(cx.listener(Self::focus_left))
@@ -1852,21 +2093,80 @@ mod tests {
     use super::*;
     use gpui::size;
 
-    /// Every (tab kind, profile kind or gone) pair: a tab starts a zone of
-    /// its own kind from a profile of that kind, and nothing otherwise.
+    /// A config of `profiles` (name, agent?), `default` the default's name.
+    fn kinds_config(profiles: &[(&str, bool)], default: Option<&str>) -> Config {
+        let profiles = profiles
+            .iter()
+            .map(|(name, agent)| {
+                let kind = if *agent { "type = \"agent\"\ncommand = \"agent\"\n" } else { "" };
+                format!("[[profiles]]\nname = \"{name}\"\n{kind}\n")
+            })
+            .collect::<String>();
+        let default = default.map(|name| format!("default_profile = \"{name}\"\n")).unwrap_or_default();
+        Config::parse(&format!("{default}{profiles}")).expect("the test config").config
+    }
+
+    fn run(name: &str, nth: usize) -> SplitChoice {
+        SplitChoice::Run(ProfileKey { name: name.into(), nth })
+    }
+
+    /// Each rule of `split_choice`, for each kind: the zone's own profile,
+    /// its profile gone or of the other kind, the default of the kind, the
+    /// only one of the kind, several, none.
     #[test]
-    fn a_split_starts_a_zone_of_the_tabs_kind_only() {
-        let table = [
-            (TabKind::Terminal, Some(ProfileKind::Terminal), SplitPlan::Terminal),
-            (TabKind::Terminal, Some(ProfileKind::Agent), SplitPlan::Refused(SplitRefusal::ProfileKindChanged)),
-            (TabKind::Terminal, None, SplitPlan::Refused(SplitRefusal::ProfileGone)),
-            (TabKind::Agent, Some(ProfileKind::Agent), SplitPlan::Agent),
-            (TabKind::Agent, Some(ProfileKind::Terminal), SplitPlan::Refused(SplitRefusal::ProfileKindChanged)),
-            (TabKind::Agent, None, SplitPlan::Refused(SplitRefusal::ProfileGone)),
-        ];
-        for (tab, profile, plan) in table {
-            assert_eq!(split_plan(tab, profile), plan, "{tab:?} tab, {profile:?} profile");
-        }
+    fn a_split_runs_the_first_profile_its_rules_give() {
+        use ProfileKind::{Agent, Terminal};
+        let config = kinds_config(&[("Shell", false), ("Work", false), ("Claude", true)], Some("Shell"));
+        assert_eq!(split_choice(Terminal, Some(1), &config), run("Work", 0), "the zone's own profile");
+        assert_eq!(split_choice(Agent, Some(2), &config), run("Claude", 0), "an agent zone's own profile");
+        assert_eq!(split_choice(Terminal, None, &config), run("Shell", 0), "its profile gone: the default");
+        assert_eq!(split_choice(Terminal, Some(2), &config), run("Shell", 0), "of the other kind: the default");
+        assert_eq!(split_choice(Agent, Some(0), &config), run("Claude", 0), "the only agent profile");
+        let config = kinds_config(&[("Shell", false), ("Claude", true), ("Codex", true)], Some("Shell"));
+        let keys = |names: &[&str]| names.iter().map(|n| ProfileKey { name: (*n).into(), nth: 0 }).collect();
+        assert_eq!(split_choice(Agent, Some(0), &config), SplitChoice::Ask(keys(&["Claude", "Codex"])), "several");
+        assert_eq!(split_choice(Agent, Some(2), &config), run("Codex", 0), "several, the zone's own first");
+        let config = kinds_config(&[("Claude", true), ("Shell", false), ("Work", false)], Some("Claude"));
+        assert_eq!(split_choice(Terminal, Some(0), &config), SplitChoice::Ask(keys(&["Shell", "Work"])));
+        let config = kinds_config(&[("Shell", false), ("Work", false), ("Claude", true)], Some("Work"));
+        assert_eq!(split_choice(Terminal, Some(2), &config), run("Work", 0), "the default of the kind");
+        let config = kinds_config(&[("Shell", false)], None);
+        assert_eq!(split_choice(Agent, Some(0), &config), SplitChoice::Refused(SplitRefusal::NoProfileOfKind(Agent)));
+        assert_eq!(SplitRefusal::NoProfileOfKind(Agent).text(), "no agent profile to split with");
+        let config = kinds_config(&[("Claude", true)], None);
+        assert_eq!(split_choice(Terminal, Some(0), &config), SplitChoice::Refused(SplitRefusal::NoProfileOfKind(Terminal)));
+    }
+
+    #[test]
+    fn split_with_profile_lists_every_profile_the_default_first() {
+        let config = kinds_config(&[("Shell", false), ("Claude", true), ("Work", false)], Some("Work"));
+        let names: Vec<String> = split_profile_choices(&config).into_iter().map(|key| key.name).collect();
+        assert_eq!(names, ["Work", "Shell", "Claude"]);
+    }
+
+    /// A split of the zone's own profile stays on its endpoint after the
+    /// profile's target moved; another profile runs where it says; a
+    /// directory never crosses endpoints.
+    #[test]
+    fn a_split_runs_where_its_profile_says_and_keeps_a_directory_on_its_host() {
+        let ssh = |host: &str| Config::parse(&format!(
+            "[[profiles]]\nname = \"Remote\"\n[profiles.remote]\ntype = \"ssh\"\nhost = \"{host}\"\n"
+        ))
+        .expect("the test config")
+        .config
+        .profiles
+        .remove(0);
+        let (old, moved) = (ssh("old-host"), ssh("new-host"));
+        let local = Profile { name: "Shell".into(), ..Profile::default() };
+        let on_old = Host::of(&old);
+        assert_eq!(split_host(&old, &on_old, &moved), on_old, "its own profile stays where the zone runs");
+        assert_eq!(split_host(&old, &on_old, &local), Host::Local, "another profile runs where it says");
+        assert_eq!(split_host(&local, &Host::Local, &moved), Host::of(&moved));
+        let here = Some(PathBuf::from("/srv/app"));
+        assert_eq!(split_cwd(here.clone(), true), here, "the same host: the split zone's directory");
+        assert_eq!(split_cwd(here.clone(), Host::Local == on_old), None, "remote to local");
+        assert_eq!(split_cwd(here.clone(), on_old == Host::of(&moved)), None, "between two remotes");
+        assert_eq!(split_cwd(None, true), None);
     }
 
     #[test]
@@ -1956,9 +2256,11 @@ mod tests {
 
     /// The header menu's items, labelled from the actions table, with the
     /// split items disabled where the zone is too small for them (the
-    /// spec's "Too small to split": both disabled, Close Zone enabled).
+    /// spec's "Too small to split": all disabled, Close Zone enabled) and
+    /// a kind's where the config has no profile of it ("No agent profile").
     #[test]
     fn zone_menu_items() {
+        let all = MenuSplits { right: true, down: true, terminal: true, agent: true };
         let menu_of = |rows: Vec<ActionRow>| {
             let shortcuts: Vec<Option<gpui::SharedString>> = rows
                 .iter()
@@ -1966,8 +2268,8 @@ mod tests {
                 .collect();
             ActionMenu::new(rows, &shortcuts)
         };
-        let describe = |right, down| {
-            let menu = menu_of(zone_menu_rows(right, down));
+        let describe = |splits| {
+            let menu = menu_of(zone_menu_rows(splits));
             menu.entries
                 .iter()
                 .map(|e| match e.item() {
@@ -1978,15 +2280,52 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("|")
         };
-        assert_eq!(describe(true, true), "Split Zone Right|Split Zone Down|-|Close Zone");
-        assert_eq!(describe(false, true), "[Split Zone Right]|Split Zone Down|-|Close Zone");
-        assert_eq!(describe(true, false), "Split Zone Right|[Split Zone Down]|-|Close Zone");
-        assert_eq!(describe(false, false), "[Split Zone Right]|[Split Zone Down]|-|Close Zone");
-        let menu = menu_of(zone_menu_rows(true, false));
-        assert!(menu.action(0).is_some_and(|a| a.partial_eq(&SplitZoneRight)));
+        assert_eq!(
+            describe(all),
+            "Split Terminal Right|Split Terminal Down|Split Agent Right|Split Agent Down\
+             |Split Right With Profile…|Split Down With Profile…|-|Close Zone"
+        );
+        assert_eq!(
+            describe(MenuSplits { right: false, ..all }),
+            "[Split Terminal Right]|Split Terminal Down|[Split Agent Right]|Split Agent Down\
+             |[Split Right With Profile…]|Split Down With Profile…|-|Close Zone"
+        );
+        assert_eq!(
+            describe(MenuSplits { down: false, ..all }),
+            "Split Terminal Right|[Split Terminal Down]|Split Agent Right|[Split Agent Down]\
+             |Split Right With Profile…|[Split Down With Profile…]|-|Close Zone"
+        );
+        assert_eq!(
+            describe(MenuSplits { right: false, down: false, ..all }),
+            "[Split Terminal Right]|[Split Terminal Down]|[Split Agent Right]|[Split Agent Down]\
+             |[Split Right With Profile…]|[Split Down With Profile…]|-|Close Zone"
+        );
+        assert_eq!(
+            describe(MenuSplits { agent: false, ..all }),
+            "Split Terminal Right|Split Terminal Down|[Split Agent Right]|[Split Agent Down]\
+             |Split Right With Profile…|Split Down With Profile…|-|Close Zone"
+        );
+        assert_eq!(
+            describe(MenuSplits { terminal: false, ..all }),
+            "[Split Terminal Right]|[Split Terminal Down]|Split Agent Right|Split Agent Down\
+             |Split Right With Profile…|Split Down With Profile…|-|Close Zone"
+        );
+        let menu = menu_of(zone_menu_rows(MenuSplits { down: false, ..all }));
+        assert!(menu.action(0).is_some_and(|a| a.partial_eq(&SplitTerminalRight)));
         assert!(menu.action(1).is_none(), "a disabled split runs nothing");
-        assert!(menu.action(3).is_some_and(|a| a.partial_eq(&CloseZone)));
-        assert_eq!(menu.entries[3].item().and_then(|i| i.shortcut.clone()), Some("ctrl-shift-x".into()));
+        assert!(menu.action(2).is_some_and(|a| a.partial_eq(&SplitAgentRight)));
+        assert!(menu.action(4).is_some_and(|a| a.partial_eq(&SplitRightWithProfile)));
+        assert!(menu.action(7).is_some_and(|a| a.partial_eq(&CloseZone)));
+        assert_eq!(menu.entries[7].item().and_then(|i| i.shortcut.clone()), Some("ctrl-shift-x".into()));
+    }
+
+    /// A zone's header buttons split it as its own kind.
+    #[test]
+    fn a_zones_buttons_split_as_its_kind() {
+        let (right, down) = split_actions(ProfileKind::Terminal);
+        assert!(right.partial_eq(&SplitTerminalRight) && down.partial_eq(&SplitTerminalDown));
+        let (right, down) = split_actions(ProfileKind::Agent);
+        assert!(right.partial_eq(&SplitAgentRight) && down.partial_eq(&SplitAgentDown));
     }
 
     #[test]
@@ -2093,9 +2432,8 @@ mod tests {
         let zone = Zone::new(None, &mut app);
         let agent = zone.agent.clone();
         let profile = Profile::default_shell();
-        let (view, cx) = app.add_window_view(|window, cx| {
-            ZoneTreeView::new(profile, Host::Local, Theme::default(), None, ZoneStart::Agent(agent), window, cx)
-        });
+        let spec = ZoneSpec { profile, host: Host::Local, theme: Theme::default(), font_size: None };
+        let (view, cx) = app.add_window_view(|window, cx| ZoneTreeView::new(spec, ZoneStart::Agent(agent), window, cx));
         let mut zone = zone;
         zone.feed(&[ready()]);
         settle(cx);
@@ -2162,8 +2500,8 @@ mod tests {
             start: impl FnOnce(&mut App) -> ZoneStart,
         ) -> Self {
             let start = app.update(start);
-            let (view, cx) =
-                app.add_window_view(|window, cx| ZoneTreeView::new(profile, Host::Local, theme, None, start, window, cx));
+            let spec = ZoneSpec { profile, host: Host::Local, theme, font_size: None };
+            let (view, cx) = app.add_window_view(|window, cx| ZoneTreeView::new(spec, start, window, cx));
             let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
             let (menus, exited) = (Rc::<RefCell<Vec<Vec<bool>>>>::default(), Rc::new(Cell::new(false)));
             let menu_sets = Rc::<RefCell<Vec<Option<Tokens>>>>::default();
@@ -2199,18 +2537,17 @@ mod tests {
             (scope, colors, menu)
         }
 
-        /// Whether the only zone can split right and down, as
-        /// [`ZoneTreeView::can_split`] says and as its menu shows.
-        fn splits(&mut self) -> (bool, bool, Vec<bool>) {
+        /// Which of the active zone's menu's six split items are enabled.
+        fn splits(&mut self) -> Vec<bool> {
             let view = self.view.clone();
-            let can = self.cx.update(|window, cx| {
-                let view = view.read(cx);
-                let id = view.active;
-                (view.can_split(id, SplitAxis::Horizontal, window, cx), view.can_split(id, SplitAxis::Vertical, window, cx))
-            });
             view.update_in(self.cx, |view, window, cx| view.open_menu(view.active, Point::default(), None, window, cx));
-            let menu = self.menus.borrow_mut().pop().expect("the zone asked for its menu");
-            (can.0, can.1, menu)
+            self.menus.borrow_mut().pop().expect("the zone asked for its menu")
+        }
+
+        /// Whether the active zone's header button splitting it as `kind`
+        /// is enabled.
+        fn button(&mut self, kind: ProfileKind) -> bool {
+            self.view.read_with(self.cx, |view, cx| view.can_split_with(view.active, kind, cx))
         }
 
         fn zones(&mut self) -> usize {
@@ -2218,49 +2555,43 @@ mod tests {
         }
     }
 
-    /// An agent tab whose profile is now a terminal profile, and a terminal
-    /// tab whose profile is gone, refuse splits: `can_split` says no, the
-    /// header menu's split items are disabled, and the split actions do
-    /// nothing. An agent tab of an agent profile can split.
+    /// A zone splits by the config's profiles, not by its own: an agent
+    /// zone whose profile is gone, in a config with the agent profile
+    /// `Other`, has every split enabled (the spec's "Agent tab without its
+    /// agent profile"); with no agent profile in the config its agent
+    /// items and its own button are disabled, and Split Agent Right says
+    /// why on the window's notice line and starts nothing ("No agent
+    /// profile"). Its size isn't known yet, so it fits either way.
     #[test]
-    fn a_tab_refuses_splits_of_the_other_kind_or_a_gone_profile() {
+    fn a_zone_splits_by_the_configs_profiles_not_its_own() {
         use crate::agent::test_support::{Zone, app};
         let mut app = app();
         use_config(
             &mut app,
-            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n",
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Other\"\ntype = \"agent\"\ncommand = \"fake\"\n",
         );
-        let profile = |name: &str| app.update(|cx| Settings::get(cx).config.profile(name).cloned().unwrap());
-        let (shell, fake) = (profile("Shell"), profile("Fake"));
-
-        // An agent tab whose profile (by name) is a terminal profile now.
+        let gone = Profile { name: "Gone".into(), ..Profile::default_shell() };
         let zone = Zone::new(None, &mut app);
         let agent = zone.agent.clone();
-        let mut changed = Tab::new(&mut app, shell, |_| ZoneStart::Agent(agent));
-        assert_eq!(changed.splits(), (false, false, vec![false, false]));
-        changed.view.update_in(changed.cx, |view, window, cx| {
-            view.split_right(&SplitZoneRight, window, cx);
-            view.split_down(&SplitZoneDown, window, cx);
-        });
-        assert_eq!(changed.zones(), 1, "no zone was started");
+        let mut tab = Tab::new(&mut app, gone.clone(), |_| ZoneStart::Agent(agent));
+        assert_eq!(tab.splits(), vec![true; 6]);
+        assert!(tab.button(ProfileKind::Agent) && tab.button(ProfileKind::Terminal));
 
-        // A terminal tab whose profile is gone from the config.
-        let mut gone_profile = Profile::default_shell();
-        gone_profile.name = "Gone".into();
-        let mut gone = Tab::new(&mut app, gone_profile, |cx| {
-            let config = Settings::get(cx).config.clone();
-            ZoneStart::Terminal(cx.new(|cx| Terminal::message("gone", Theme::default(), &config, cx)))
-        });
-        assert_eq!(gone.splits(), (false, false, vec![false, false]));
-        gone.view.update_in(gone.cx, |view, window, cx| view.split_right(&SplitZoneRight, window, cx));
-        assert_eq!(gone.zones(), 1, "no zone was started");
-
-        // An agent tab of an agent profile: its size isn't known yet, so it
-        // can split either way.
+        use_config(&mut app, "[[profiles]]\nname = \"Shell\"\n");
         let zone = Zone::new(None, &mut app);
         let agent = zone.agent.clone();
-        let mut same = Tab::new(&mut app, fake, |_| ZoneStart::Agent(agent));
-        assert_eq!(same.splits(), (true, true, vec![true, true]));
+        let mut tab = Tab::new(&mut app, gone, |_| ZoneStart::Agent(agent));
+        assert_eq!(tab.splits(), vec![true, true, false, false, true, true]);
+        assert!(!tab.button(ProfileKind::Agent), "an agent zone's own button");
+        let refused = Rc::<RefCell<Vec<SplitRefusal>>>::default();
+        let _refused = tab.cx.update(|_, cx| {
+            let refused = refused.clone();
+            cx.subscribe(&tab.view, move |_, SplitRefused(why): &SplitRefused, _| refused.borrow_mut().push(*why))
+        });
+        tab.view.update_in(tab.cx, |view, window, cx| view.split_agent_right(&SplitAgentRight, window, cx));
+        assert_eq!(*refused.borrow(), [SplitRefusal::NoProfileOfKind(ProfileKind::Agent)]);
+        assert_eq!(refused.borrow()[0].text(), "no agent profile to split with");
+        assert_eq!(tab.zones(), 1, "no zone was started");
     }
 
     /// The spec's "A profile theme unlike the window's" and "The ring and
@@ -2288,8 +2619,8 @@ mod tests {
         assert_eq!(menu, Some(light.zone_tokens()));
 
         let dark = crate::theme::builtin_theme("tokyo-night").unwrap();
-        tab.view.update(tab.cx, |view, cx| view.set_profile(Profile::default_shell(), dark.clone(), None, cx));
-        assert_eq!(tab.look(&window).0, Some(dark.zone_tokens()), "set_profile refreshes the set");
+        tab.view.update(tab.cx, |view, cx| view.restyle(&|_| (dark.clone(), None), cx));
+        assert_eq!(tab.look(&window).0, Some(dark.zone_tokens()), "a restyle refreshes the set");
 
         let mut terminal = Tab::themed(&mut app, Profile::default_shell(), light.clone(), |cx| {
             let config = Settings::get(cx).config.clone();
@@ -2455,10 +2786,82 @@ mod tests {
         let agent = zone.agent.clone();
         let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
         let renamed = Profile { name: "Renamed".into(), ..Profile::default_shell() };
-        tab.view.update(tab.cx, |view, cx| view.set_profile(renamed, Theme::default(), None, cx));
+        tab.view.update(tab.cx, |view, cx| {
+            view.follow_profiles(&|_| Some(renamed.clone()));
+            view.restyle(&|_| (Theme::default(), None), cx);
+        });
         settle(tab.cx);
         let title = tab.view.read_with(tab.cx, |view, _| view.zones[&view.active].title.clone());
         assert_eq!(title.as_ref(), "Renamed");
+        assert_eq!(tab.view.read_with(tab.cx, |view, _| view.profile_on(&Host::Local)), Some("Renamed".into()));
+    }
+
+    /// A mixed tab (`zones-mixed-tabs` decisions 1, 5, 6): a terminal zone
+    /// of `Shell` on this machine beside an agent zone of `Fake` on a
+    /// remote. Each zone is drawn in its own profile's theme (only the
+    /// agent zone in a scope), titled by its own profile while its program
+    /// names nothing, and counted on its own endpoint; the tab's theme (its
+    /// face's) is the active zone's, and a reload restyles each zone from
+    /// its own profile.
+    #[test]
+    fn a_mixed_tabs_zones_each_keep_their_own_profile() {
+        use crate::agent::test_support::{Zone, app, settle};
+        use crate::config::RemoteTarget;
+        let mut app = app();
+        let light = crate::theme::builtin_theme("brindle-light").unwrap();
+        let dark = crate::theme::builtin_theme("tokyo-night").unwrap();
+        let window_tokens = app.update(|cx| cx.window_theme());
+        let remote = Host::Remote(RemoteTarget::Ssh {
+            host: "box".into(),
+            user: None,
+            port: None,
+            identity_file: None,
+            ssh_args: Vec::new(),
+            connect_at_launch: false,
+        });
+        let shell = Profile { name: "Shell".into(), ..Profile::default_shell() };
+        let fake = Profile { name: "Fake".into(), ..Profile::default_shell() };
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let terminal = app.update(|cx| {
+            let config = Settings::get(cx).config.clone();
+            cx.new(|cx| Terminal::message("", Theme::default(), &config, cx))
+        });
+        let (z1, z2) = (ZoneId(1), ZoneId(2));
+        let mut tree = ZoneTree::new(z1);
+        tree.split(z1, SplitAxis::Horizontal, z2);
+        let zones = vec![
+            (z1, ZoneSpec { profile: shell, host: Host::Local, theme: dark.clone(), font_size: None }, ZoneStart::Terminal(terminal)),
+            (z2, ZoneSpec { profile: fake, host: remote.clone(), theme: light.clone(), font_size: None }, ZoneStart::Agent(agent)),
+        ];
+        let (view, cx) = app.add_window_view(|window, cx| ZoneTreeView::from_restored(tree, zones, z2, window, cx));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            let (first, first_scope) = view.leaf_look(z1, &window_tokens);
+            let (second, second_scope) = view.leaf_look(z2, &window_tokens);
+            assert_eq!(first.surface, dark.card_colors().surface, "the terminal zone in its profile's theme");
+            assert_eq!(second.surface, light.card_colors().surface, "the agent zone in its profile's theme");
+            assert_eq!((first_scope, second_scope), (None, Some(light.zone_tokens())));
+            assert_eq!(view.active_theme(), light, "the tab's face is the active zone's");
+            let titles: Vec<&str> = view.zones_in_order().iter().map(|zone| zone.title.as_ref()).collect();
+            assert_eq!(titles, ["Shell", "Fake"]);
+            assert_eq!(view.hosts(), [Host::Local, remote.clone()]);
+            assert_eq!(view.profile_on(&Host::Local).as_deref(), Some("Shell"));
+            assert_eq!(view.profile_on(&remote).as_deref(), Some("Fake"));
+            assert_eq!(view.notifying_profile(), "Fake", "nothing notified: the active zone's");
+        });
+        view.update_in(cx, |view, window, cx| view.focus_zone(z1, window, cx));
+        assert_eq!(view.read_with(cx, |view, _| view.active_theme()), dark, "the face follows the active zone");
+
+        // A reload: each zone's profile gives its own look.
+        view.update(cx, |view, cx| {
+            view.restyle(&|profile| (if profile.name == "Shell" { light.clone() } else { dark.clone() }, None), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.leaf_look(z1, &window_tokens).0.surface, light.card_colors().surface);
+            assert_eq!(view.leaf_look(z2, &window_tokens).1, Some(dark.zone_tokens()));
+            assert_eq!(view.active_theme(), light);
+        });
     }
 
     /// An agent zone whose agent exits stays open, its tab with it: the

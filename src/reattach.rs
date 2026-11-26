@@ -109,23 +109,49 @@ pub fn session_profile(info: &SessionInfo, host: &Host, config: &Config, first_t
     }
 }
 
-/// [`sweep`] grouped into tabs ([`crate::layout::group`]) and joined with
-/// [`session_profile`]: the tabs `host`'s first listing opens at a launch,
-/// each with the profile index its active session gives it.
+/// [`sweep`] grouped into tabs ([`crate::layout::group`]): the tabs
+/// `host`'s first listing opens at a launch, of both kinds, each zone with
+/// the profile index [`session_profile`] gives its own session (where the
+/// rule names the first tab's profile, `first_zone_profile`: the profile of
+/// the window's first zone on `host`).
 pub fn swept_tabs(
     listed: Vec<SessionInfo>,
     skip: &[ServerSession],
     host: &Host,
     config: &Config,
-    first_tab_profile: Option<&str>,
-) -> Vec<(LayoutTab, usize)> {
+    first_zone_profile: Option<&str>,
+) -> Vec<LayoutTab<(SessionInfo, usize)>> {
     crate::layout::group(sweep(listed, skip))
         .into_iter()
-        .map(|tab| {
-            let index = session_profile(tab.active(), host, config, first_tab_profile);
-            (tab, index)
-        })
+        .map(|tab| zone_profiles(tab, host, config, first_zone_profile))
         .collect()
+}
+
+/// The profile a restored zone attaches its listed session `info` under:
+/// `recorded`, the profile it resolved to, when that is of the session's
+/// kind, else the one [`session_profile`] gives the session on `host`, so
+/// the session comes back as what it is (OpenSpec change
+/// `zones-mixed-tabs`, decision 8).
+pub fn restored_profile(info: &SessionInfo, recorded: usize, host: &Host, config: &Config) -> usize {
+    if TabKind::of(config.profiles[recorded].kind()) == session_kind(info) {
+        recorded
+    } else {
+        session_profile(info, host, config, None)
+    }
+}
+
+/// `tab`'s zones, each with the profile index [`session_profile`] gives its
+/// own session on `host`, its title kept.
+pub fn zone_profiles(
+    tab: LayoutTab,
+    host: &Host,
+    config: &Config,
+    first_zone_profile: Option<&str>,
+) -> LayoutTab<(SessionInfo, usize)> {
+    tab.map(|info| {
+        let index = session_profile(&info, host, config, first_zone_profile);
+        (info, index)
+    })
 }
 
 /// What a remote endpoint's first listing of the launch attaches as tabs:
@@ -189,18 +215,6 @@ pub fn endpoints_without_tabs(before: &[Host], after: &[Host], eager: &[Host]) -
     left
 }
 
-/// What [`Detached::take_of_kind`] found for a restored zone.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Taken {
-    /// Its session, of the tab's kind: the zone attaches it.
-    Session(Box<SessionInfo>),
-    /// Its session is listed but of the other kind: the zone isn't
-    /// restored, and the session opens as a tab of its own.
-    OtherKind,
-    /// Not listed as detached (or no listing): the zone starts anew.
-    Missing,
-}
-
 /// A GPUI global: what is left to attach. Empty for `--no-restore`
 /// launches, for a Brindle that doesn't own the session state, and where
 /// no terminal server runs (macOS).
@@ -216,17 +230,14 @@ impl Detached {
         Self { sessions }
     }
 
-    /// The listed session a restored zone of a tab of `kind` recorded: same
-    /// id and same key (an empty key never matches, so a reused id is never
-    /// taken for it), when it is of that kind ([`session_kind`]). One of
-    /// the other kind isn't taken: it is left for the launch to attach as a
-    /// tab of its own.
-    pub fn take_of_kind(&mut self, recorded: &ServerSession, kind: TabKind) -> Taken {
-        let Some(ix) = self.position(recorded) else { return Taken::Missing };
-        if session_kind(&self.sessions[ix]) != kind {
-            return Taken::OtherKind;
-        }
-        Taken::Session(Box::new(self.sessions.remove(ix)))
+    /// The listed session a restored zone recorded: same id and same key
+    /// (an empty key never matches, so a reused id is never taken for it),
+    /// of whichever kind; `None` when it isn't listed as detached (or there
+    /// was no listing), and the zone starts anew. The zone attaches it as
+    /// what it is (OpenSpec change `zones-mixed-tabs`, decision 8).
+    pub fn take(&mut self, recorded: &ServerSession) -> Option<SessionInfo> {
+        let ix = self.position(recorded)?;
+        Some(self.sessions.remove(ix))
     }
 
     /// Whether [`Detached::take`] would find `recorded`.
@@ -333,24 +344,20 @@ mod tests {
         SessionInfo { session, key: key.into(), started, ..Default::default() }
     }
 
-    /// What a restored zone of a tab of `kind` takes for `id` and `key`.
-    fn take(detached: &mut Detached, id: u32, key: &str, kind: TabKind) -> Taken {
-        detached.take_of_kind(&ServerSession { id, key: key.into() }, kind)
-    }
-
-    fn taken(session: SessionInfo) -> Taken {
-        Taken::Session(Box::new(session))
+    /// What a restored zone takes for `id` and `key`.
+    fn take(detached: &mut Detached, id: u32, key: &str) -> Option<SessionInfo> {
+        detached.take(&ServerSession { id, key: key.into() })
     }
 
     #[test]
     fn a_zone_takes_only_its_own_session_and_the_rest_come_oldest_first() {
         let mut detached = Detached::new(vec![info(3, "c", 30), info(1, "a", 10), info(2, "", 5), info(4, "d", 10)]);
         // Same id, another key: a session that reused the id.
-        assert_eq!(take(&mut detached, 1, "old", TabKind::Terminal), Taken::Missing);
+        assert_eq!(take(&mut detached, 1, "old"), None);
         // A core that predates keys: never matched.
-        assert_eq!(take(&mut detached, 2, "", TabKind::Terminal), Taken::Missing);
-        assert_eq!(take(&mut detached, 3, "c", TabKind::Terminal), taken(info(3, "c", 30)));
-        assert_eq!(take(&mut detached, 3, "c", TabKind::Terminal), Taken::Missing, "taken once");
+        assert_eq!(take(&mut detached, 2, ""), None);
+        assert_eq!(take(&mut detached, 3, "c"), Some(info(3, "c", 30)));
+        assert_eq!(take(&mut detached, 3, "c"), None, "taken once");
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [2, 1, 4]);
         assert!(detached.take_rest().is_empty());
@@ -372,7 +379,7 @@ mod tests {
             owned(4, "d", 1, OWNER_GRACE_SECS),
             owned(5, "e", 2, 30),
         ]);
-        assert_eq!(take(&mut detached, 5, "e", TabKind::Terminal), taken(owned(5, "e", 2, 30)));
+        assert_eq!(take(&mut detached, 5, "e"), Some(owned(5, "e", 2, 30)));
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [3, 2]);
     }
@@ -385,25 +392,37 @@ mod tests {
         SessionInfo { agent: Some(agent), ..info(session, key, started) }
     }
 
-    /// Task 6.4: over a listing holding both kinds, a restored zone takes
-    /// only a session of its tab's kind. One of the other kind stays, and
-    /// the launch attaches it with the rest, as a tab of its kind.
+    /// Over a listing holding both kinds, a restored zone takes its own
+    /// session whatever its kind (OpenSpec change `zones-mixed-tabs`,
+    /// decision 8): a mixed tab gets each of its sessions back.
     #[test]
-    fn a_restored_zone_takes_only_a_session_of_its_tabs_kind() {
-        let listing = || Detached::new(vec![info(1, "t", 10), agent_info(2, "a", 20)]);
-        let mut detached = listing();
-        assert_eq!(take(&mut detached, 2, "a", TabKind::Agent), taken(agent_info(2, "a", 20)));
-        assert_eq!(take(&mut detached, 1, "t", TabKind::Agent), Taken::OtherKind);
-        let rest = detached.take_rest();
-        assert_eq!(rest, [info(1, "t", 10)], "left for the launch");
-        assert_eq!(session_kind(&rest[0]), TabKind::Terminal);
+    fn a_restored_zone_takes_its_session_of_either_kind() {
+        let mut detached = Detached::new(vec![info(1, "t", 10), agent_info(2, "a", 20)]);
+        let agent = take(&mut detached, 2, "a").expect("the agent session");
+        assert_eq!(session_kind(&agent), TabKind::Agent);
+        let terminal = take(&mut detached, 1, "t").expect("the terminal session");
+        assert_eq!(session_kind(&terminal), TabKind::Terminal);
+        assert!(detached.take_rest().is_empty(), "nothing left for the launch");
+    }
 
-        let mut detached = listing();
-        assert_eq!(take(&mut detached, 2, "a", TabKind::Terminal), Taken::OtherKind);
-        assert_eq!(take(&mut detached, 1, "t", TabKind::Terminal), taken(info(1, "t", 10)));
-        let rest = detached.take_rest();
-        assert_eq!(rest, [agent_info(2, "a", 20)]);
-        assert_eq!(session_kind(&rest[0]), TabKind::Agent);
+    /// A restored zone's listed session attaches under its resolved profile
+    /// when that is of the session's kind, else under the profile the
+    /// sweep's rule gives the session: a zone recorded with `Shell` whose
+    /// session is an agent's comes back as an agent zone of an agent
+    /// profile, never refused.
+    #[test]
+    fn a_restored_session_of_another_kind_takes_the_sweeps_profile() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n",
+        )
+        .unwrap()
+        .config;
+        let terminal = info(1, "t", 10);
+        let agent = agent_info(2, "a", 20);
+        assert_eq!(restored_profile(&terminal, 0, &Host::Local, &config), 0);
+        assert_eq!(restored_profile(&agent, 1, &Host::Local, &config), 1);
+        assert_eq!(restored_profile(&agent, 0, &Host::Local, &config), 1, "an agent session under an agent profile");
+        assert_eq!(restored_profile(&terminal, 1, &Host::Local, &config), 0, "a terminal session under the default");
     }
 
     /// 7.2: a remote endpoint's first listing attaches its detached
@@ -602,21 +621,21 @@ mod tests {
         let skip = [ServerSession { id: 4, key: "d".into() }];
         let tabs: Vec<(u32, usize)> = swept_tabs(listed.clone(), &skip, &a8, &config, Some("B9"))
             .into_iter()
-            .map(|(tab, index)| (tab.active().session, index))
+            .map(|tab| (tab.active().0.session, tab.active().1))
             .collect();
         assert_eq!(tabs, [(1, 1), (2, 1), (3, 2)]);
-        // Where no profile targets the endpoint, the first tab's profile.
+        // Where no profile targets the endpoint, the first zone's profile.
         let tabs: Vec<(u32, usize)> = swept_tabs(listed, &[], &ssh("C3"), &config, Some("B9"))
             .into_iter()
-            .map(|(tab, index)| (tab.active().session, index))
+            .map(|tab| (tab.active().0.session, tab.active().1))
             .collect();
         assert_eq!(tabs, [(4, 3), (1, 3), (2, 3), (3, 3)]);
         assert!(swept_tabs(Vec::new(), &[], &a8, &config, None).is_empty());
     }
 
     /// A remote endpoint's sessions detached with one tab's layout come
-    /// back as that tab, with the profile its active session gives it; one
-    /// a restored zone took is left out of it.
+    /// back as that tab, each zone with the profile its own session gives
+    /// it; one a restored zone took is left out of it.
     #[test]
     fn swept_tabs_regroup_a_recorded_split() {
         let config = profiles();
@@ -633,11 +652,11 @@ mod tests {
         };
         let listed = vec![member(1, "a", "Work"), member(2, "b", "A8"), member(3, "c", "Work"), info(4, "d", 0)];
         let tabs = swept_tabs(listed, &[ServerSession { id: 3, key: "c".into() }], &a8, &config, None);
-        let shapes: Vec<(Vec<u32>, u32, usize)> = tabs
+        let shapes: Vec<(Vec<(u32, usize)>, u32)> = tabs
             .iter()
-            .map(|(tab, index)| (tab.zones.items().iter().map(|s| s.session).collect(), tab.active().session, *index))
+            .map(|tab| (tab.zones.items().iter().map(|(s, ix)| (s.session, *ix)).collect(), tab.active().0.session))
             .collect();
-        assert_eq!(shapes, [(vec![4], 4, 1), (vec![1, 2], 2, 2)]);
+        assert_eq!(shapes, [(vec![(4, 1)], 4), (vec![(1, 1), (2, 2)], 2)]);
     }
 
     /// 7.3: a session of this machine's server opens with the profile it
