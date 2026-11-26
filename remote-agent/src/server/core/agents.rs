@@ -27,6 +27,19 @@
 //!   is in the holder's connection before its bytes.
 //! - **Checkpoints** are `acp::checkpoint`'s encoding; `covers` is the
 //!   stdout fed since the last one ([`crate::acp::lines::Lines::covers`]).
+//!   With change `agents-log-paging` (decision 9) each [`Agent`] keeps
+//!   what its holder stores ([`Stored`]) and the events applied since its
+//!   last checkpoint (`unsaved`), and [`policy::agent_checkpoint_form`]
+//!   says whether the next is whole (`CHECKPOINT_BEGIN`) or a segment of
+//!   those events appended to what is stored (`CHECKPOINT_APPEND`). What
+//!   is stored starts again as unknown, so the next is whole, on an
+//!   adoption, a restart and any holder `ERROR` naming the session.
+//! - **Pages** (decision 5): a replay sends the newest page of the log
+//!   ([`Agent::replay`]), and the attached client's `AGENT_FETCH`es get
+//!   the entries before it as `AGENT_PAGE` frames
+//!   ([`Core::client_agent_fetch`]), refused as
+//!   [`policy::agent_fetch_refusal`] says. A fetch reads the core's log,
+//!   so it is answered whatever the agent's phase.
 //! - **Adopting:** the holder's checkpoint is kept until its tail comes;
 //!   then [`checkpoint::adopt`] rebuilds the session and the tail is fed
 //!   as stdout. A session that exited while no core ran gets its exit once
@@ -75,11 +88,15 @@ use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
 use brindle_remote_protocol::serde_json::Value;
 use brindle_remote_protocol::{RequestId, SessionId};
-use brindle_transcript::{Activity, AgentState, Continuation, Conversation, EntryId, Event};
+use brindle_transcript::{
+    Activity, AgentState, Continuation, Conversation, EntryId, Event, Fetched,
+};
 
 use super::clients::error;
 use super::holders::WaitingSpawn;
-use super::policy::{self, AgentCheckpoint, AgentRequest};
+use super::policy::{
+    self, AgentCheckpoint, AgentRequest, CheckpointForm, FetchView, Stored,
+};
 use super::sessions::{Life, SpawnRequest};
 use super::{Core, log};
 use crate::acp::checkpoint;
@@ -113,6 +130,12 @@ pub(super) struct Agent {
     /// Its checkpoint came out too large to store, so its handling failed
     /// and it isn't checkpointed again (the bounds make this unreachable).
     unstorable: bool,
+    /// What its holder stores of its checkpoint (`agents-log-paging`
+    /// decision 9).
+    stored: Stored,
+    /// The events applied since its last checkpoint, which a segment
+    /// carries; none kept for an `unstorable` session.
+    unsaved: Vec<Event>,
     /// An `AGENT_RESTART` taken while its agent needed a login
     /// (`agents-login` decision 8): the agent is hung up, and its exit
     /// starts this restart. Any other hang-up drops it, and so does an exit
@@ -153,11 +176,21 @@ impl Agent {
 
     /// Its agent is started again ([`Input::Restart`]): the new holder
     /// session's stdout counts from 0, and no stderr tail is kept.
+    /// The new holder session stores nothing yet, so its first checkpoint
+    /// is whole.
     pub(super) fn restarted(&mut self) {
         self.checkpointed = 0;
         self.stderr = None;
         self.wake = None;
         self.login_restart = None;
+        self.forget_stored();
+    }
+
+    /// What its holder stores is no longer known (a holder `ERROR` naming
+    /// the session, or a restart): the next checkpoint is whole.
+    pub(super) fn forget_stored(&mut self) {
+        self.stored = Stored::Unknown;
+        self.unsaved.clear();
     }
 
     /// Whether its agent ended and its conversation can be continued
@@ -193,6 +226,8 @@ impl Agent {
             stderr: None,
             wake: None,
             unstorable: false,
+            stored: Stored::Unknown,
+            unsaved: Vec::new(),
             login_restart: None,
         }
     }
@@ -232,11 +267,31 @@ impl Agent {
         }
     }
 
-    /// The events that rebuild its log, encoded for `TRANSCRIPT`.
-    pub(super) fn replay(&self) -> Vec<Value> {
+    /// The events that rebuild the newest page of its log within `budget`
+    /// bytes of entries ([`brindle_transcript::Transcript::page`]),
+    /// encoded for `TRANSCRIPT`.
+    pub(super) fn replay(&self, budget: usize) -> Vec<Value> {
         match &self.acp {
             Acp::Adopting { .. } => Vec::new(),
-            Acp::Running(acp) => acp.transcript().replay().iter().map(Event::to_value).collect(),
+            Acp::Running(acp) => acp
+                .transcript()
+                .page(budget)
+                .iter()
+                .map(Event::to_value)
+                .collect(),
+        }
+    }
+
+    /// The whole entries before `before` within `budget` bytes, as they
+    /// stand now ([`brindle_transcript::Transcript::fetch`]). One still
+    /// being adopted has none yet (its client waits for its replay).
+    fn fetch(&self, before: EntryId, budget: usize) -> Fetched {
+        match &self.acp {
+            Acp::Adopting { .. } => Fetched {
+                events: Vec::new(),
+                more: false,
+            },
+            Acp::Running(acp) => acp.transcript().fetch(before, budget),
         }
     }
 }
@@ -583,6 +638,51 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// `AGENT_FETCH` from `client` (decision 5): the whole entries before
+    /// `before` within the clamped budget, as `AGENT_PAGE` frames, the last
+    /// saying whether more are earlier; or the `ERROR`
+    /// [`policy::agent_fetch_refusal`] gives. It reads the core's log only,
+    /// so nothing is stepped, checkpointed or sent to the holder.
+    pub(super) fn client_agent_fetch(&mut self, client: Token, fetch: client::AgentFetch) {
+        let client::AgentFetch {
+            req,
+            session: id,
+            before,
+            max_bytes,
+        } = fetch;
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+        let view = self.sessions.get(&id).map(|session| FetchView {
+            kind: session.kind(),
+            attached_here: session.ownership.client() == Some(client),
+            replay_pending: session.pending_replay.is_some(),
+        });
+        if let Some(refusal) = policy::agent_fetch_refusal(id, view, protocol) {
+            return self.send_client(client, error(Some(req), Some(id), refusal.to_string()));
+        }
+        let budget = policy::page_budget(Some(max_bytes));
+        let Some(Fetched { events, more }) = self
+            .sessions
+            .get_mut(&id)
+            .and_then(|session| session.agent())
+            .map(|agent| agent.fetch(EntryId(before), budget))
+        else {
+            return;
+        };
+        let events = events.iter().map(Event::to_value).collect();
+        match client::pack_page(req, id, events, more) {
+            Ok(frames) => {
+                for frame in frames {
+                    self.send_client(client, ToClient::AgentPage(frame));
+                }
+            }
+            Err(failure) => {
+                log!("session {id}: can't send a page of its log: {failure}");
+                let message = format!("the terminal server couldn't send the page: {failure}");
+                self.send_client(client, error(Some(req), Some(id), message));
+            }
+        }
+    }
+
     /// Steps agent session `id` with `input` and applies what it says;
     /// gives the reply to a client's command. Nothing for a session that
     /// isn't a running agent's.
@@ -621,6 +721,9 @@ impl<L: EventLoop> Core<L> {
         let holder = session.holder;
         let agent = session.agent()?;
         agent.wake = wake;
+        if !agent.unstorable {
+            agent.unsaved.extend(events.iter().cloned());
+        }
         let since = match &agent.acp {
             Acp::Running(acp) => acp.lines().covers().saturating_sub(agent.checkpointed),
             Acp::Adopting { .. } => 0,
@@ -630,8 +733,9 @@ impl<L: EventLoop> Core<L> {
         {
             self.send_transcript(client, id, events.iter().map(Event::to_value).collect());
         }
-        if policy::agent_checkpoint_due(AgentCheckpoint::Stepped(checkpoint), since) {
-            self.checkpoint(id);
+        let at = AgentCheckpoint::Stepped(checkpoint);
+        if policy::agent_checkpoint_due(at, since) {
+            self.checkpoint(id, at);
         }
         // Nothing reaches an agent being hung up, or gone.
         if !stdin.is_empty() && live {
@@ -668,14 +772,20 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Checkpoints agent session `id` (its liveness already checked by
-    /// [`Core::checkpoint`]): its encoded state, covering the stdout fed
-    /// since the last one. A state too large to store fails its handling.
-    pub(super) fn agent_checkpoint(&mut self, id: SessionId) {
-        let Some(session) = self.sessions.get_mut(&id) else {
+    /// [`Core::checkpoint`]), due `at`: its encoded state whole, or a
+    /// segment of the events since the last one appended to what its
+    /// holder stores ([`policy::agent_checkpoint_form`]), covering the
+    /// stdout fed since the last one. A state too large to store fails its
+    /// handling.
+    pub(super) fn agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
+        let Some(holder) = self.sessions.get(&id).map(|session| session.holder) else {
             return;
         };
-        let holder = session.holder;
-        let Some(agent) = session.agent() else {
+        let adoption = self
+            .holders
+            .get(&holder)
+            .map_or(policy::Adoption::Drain, |holder| holder.adoption());
+        let Some(agent) = self.sessions.get_mut(&id).and_then(|session| session.agent()) else {
             return;
         };
         let Acp::Running(acp) = &agent.acp else {
@@ -684,18 +794,46 @@ impl<L: EventLoop> Core<L> {
         if agent.unstorable {
             return;
         }
-        match checkpoint::encode(acp) {
-            Ok(bytes) => {
+        let trimmed = agent
+            .unsaved
+            .iter()
+            .any(|event| matches!(event, Event::Trimmed { .. }));
+        let segment = policy::agent_appendable(agent.stored, at, trimmed, adoption)
+            .then(|| checkpoint::encode_segment(acp, &agent.unsaved, agent.stored.next_seq()).ok())
+            .flatten();
+        let segment_len = segment.as_ref().map(|segment| segment.len() as u64);
+        let form = policy::agent_checkpoint_form(agent.stored, at, segment_len, trimmed, adoption);
+        let encoded = match (form, segment) {
+            (CheckpointForm::Append, Some(segment)) => Ok((CheckpointForm::Append, segment)),
+            (CheckpointForm::Append, None) | (CheckpointForm::Whole, _) => {
+                checkpoint::encode(acp).map(|bytes| (CheckpointForm::Whole, bytes))
+            }
+        };
+        match encoded {
+            Ok((form, bytes)) => {
                 let covers = acp.lines().covers();
                 let since = covers.saturating_sub(agent.checkpointed);
                 agent.checkpointed = covers;
-                for message in ToHolder::checkpoint(id, &bytes, since) {
+                agent.unsaved.clear();
+                let len = bytes.len() as u64;
+                let messages = match form {
+                    CheckpointForm::Whole => {
+                        agent.stored = Stored::whole(len);
+                        ToHolder::checkpoint(id, &bytes, since)
+                    }
+                    CheckpointForm::Append => {
+                        agent.stored = agent.stored.appended(len);
+                        ToHolder::checkpoint_append(id, &bytes, since)
+                    }
+                };
+                for message in messages {
                     self.send_holder(holder, message);
                 }
             }
             Err(too_large) => {
                 log!("session {id}: {too_large}; failing its ACP handling");
                 agent.unstorable = true;
+                agent.unsaved = Vec::new();
                 self.agent_step(
                     id,
                     Input::Fault {
@@ -841,7 +979,7 @@ mod tests {
             }
         );
         let events: Vec<Event> = agent
-            .replay()
+            .replay(brindle_transcript::PAGE_BYTES)
             .iter()
             .map(|value| Event::from_value(value).unwrap())
             .collect();
@@ -852,7 +990,7 @@ mod tests {
 
         let adopting = Agent::adopting();
         assert_eq!(adopting.info().activity, AgentActivity::Working);
-        assert!(adopting.replay().is_empty());
+        assert!(adopting.replay(brindle_transcript::PAGE_BYTES).is_empty());
     }
 
     #[test]

@@ -234,7 +234,6 @@ fn encode_within(session: &AgentSession, limit: u64) -> Result<Vec<u8>, TooLarge
 /// consecutive `Appended`s of one entry merged, and the rest of the session
 /// whole. Refused past [`MAX_CHECKPOINT_LEN`] on its own; whether it fits
 /// beside what is stored is the core's to judge.
-#[cfg_attr(not(test), allow(dead_code))] // the core appends from task 3.4
 pub fn encode_segment(
     session: &AgentSession,
     events: &[Event],

@@ -582,7 +582,6 @@ pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
 /// core knows (OpenSpec change `agents-log-paging`, decision 9). Kept on
 /// the core's `Agent` only: a core restart starts again at `Unknown`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) enum Stored {
     /// Nothing written to this holder session yet, an adopted session, a
     /// restarted one, or the holder sent an `ERROR` naming the session:
@@ -593,7 +592,6 @@ pub(super) enum Stored {
     Known { base: u64, appended: u64, seq: u32 },
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 impl Stored {
     /// The sequence number the next segment takes.
     pub(super) fn next_seq(self) -> u32 {
@@ -631,7 +629,6 @@ impl Stored {
 
 /// How a due agent checkpoint is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) enum CheckpointForm {
     /// A header and a base: `CHECKPOINT_BEGIN`, replacing what is stored.
     Whole,
@@ -643,7 +640,6 @@ pub(super) enum CheckpointForm {
 /// stored is known, it isn't a step-down, nothing was trimmed since, and
 /// the holder is of the core's build. Otherwise the checkpoint is whole
 /// whatever the segment's length.
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) fn agent_appendable(
     stored: Stored,
     at: AgentCheckpoint,
@@ -670,7 +666,6 @@ pub(super) fn agent_appendable(
 /// when none was encoded or it was too large), keeps the segments no
 /// larger than the base and the whole blob within
 /// [`MAX_CHECKPOINT_LEN`]; whole otherwise.
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) fn agent_checkpoint_form(
     stored: Stored,
     at: AgentCheckpoint,
@@ -696,7 +691,6 @@ pub(super) fn agent_checkpoint_form(
 /// client `asked` for (`ATTACH.page`, `AGENT_FETCH.max_bytes`), at most
 /// [`PAGE_BYTES`], which is also the budget when it asked nothing
 /// (decision 5). Even 0 gives the newest entry.
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) fn page_budget(asked: Option<u32>) -> usize {
     asked.map_or(PAGE_BYTES, |asked| {
         usize::try_from(asked).map_or(PAGE_BYTES, |asked| asked.min(PAGE_BYTES))
@@ -705,7 +699,6 @@ pub(super) fn page_budget(asked: Option<u32>) -> usize {
 
 /// What [`agent_fetch_refusal`] reads of the session a fetch names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) struct FetchView {
     pub(super) kind: SessionKind,
     /// It is attached to the client that fetches.
@@ -717,7 +710,6 @@ pub(super) struct FetchView {
 
 /// Why an `AGENT_FETCH` is refused; its text is the `ERROR`'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) enum FetchRefusal {
     NeedsAgentProtocol(NeedsAgentProtocol),
     NoSession(SessionId),
@@ -742,7 +734,6 @@ impl fmt::Display for FetchRefusal {
 /// if there is one): only the client it is attached to may, once that
 /// client has its replay (decision 5). A fetch reads the core's log, so
 /// the agent's phase doesn't matter.
-#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
 pub(super) fn agent_fetch_refusal(
     id: SessionId,
     session: Option<FetchView>,
@@ -784,7 +775,6 @@ pub(super) enum AgentRequest {
     Resend,
     Restart,
     Login,
-    #[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.3)
     Fetch,
 }
 

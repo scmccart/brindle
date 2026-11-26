@@ -2049,7 +2049,19 @@ fn a_log_past_16_mib_drops_its_oldest_entries() {
         "the replay starts with {:?}",
         events.first().map(shape)
     );
-    assert_eq!(later.transcript(id), live);
+    // A fresh attach gets the newest page (agents-log-paging): the newest
+    // entries as the live copy holds them, behind a window over the rest.
+    let paged = later.transcript(id);
+    let window = paged.window().expect("a 1 MiB entry passes a page");
+    let held: Vec<_> = paged.entries().map(|(id, entry)| (id, entry.clone())).collect();
+    let newest: Vec<_> = live
+        .entries()
+        .filter(|(id, _)| *id >= window.from)
+        .map(|(id, entry)| (id, entry.clone()))
+        .collect();
+    assert_eq!(held, newest);
+    assert_eq!(window.earlier as usize + held.len(), live.entries().count());
+    assert_eq!(paged.dropped(), dropped);
 }
 
 // 7.5: core restarts.

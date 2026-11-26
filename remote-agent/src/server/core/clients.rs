@@ -350,15 +350,7 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentLogin(login) => {
                 self.client_agent_command(client, AgentCommand::login(login))
             }
-            // TODO(agents-log-paging 3.3): answer with AGENT_PAGE.
-            ToCore::AgentFetch(fetch) => self.send_client(
-                client,
-                error(
-                    Some(fetch.req),
-                    Some(fetch.session),
-                    "this terminal server can't fetch earlier entries yet",
-                ),
-            ),
+            ToCore::AgentFetch(fetch) => self.client_agent_fetch(client, fetch),
         }
     }
 
