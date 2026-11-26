@@ -380,7 +380,19 @@ rule, not a convenience.
     `description` (plain text under its button, wrapping at the
     confirmation's width; any description stacks the actions,
     `actions_stack`, each button at its own width) and be `disabled`
-    (muted, no stop, asking nothing).
+    (muted, no stop, asking nothing). `.tone(ConfirmationTone::Destructive)`
+    marks a request as a risk: while `Requested` it draws a warning icon
+    (lucide `triangle-alert`) before the title, the `destructive_tint`
+    background and a `destructive` border; once answered it draws as the
+    default tone (`confirmation_frame` decides).
+  - `Loader` (`components/loader.rs`): a small spinner, lucide
+    `loader-circle` turned a twelfth of a turn per `step` (of
+    `LOADER_STEPS`), at `rems(0.5)` by default. It asks for no animation
+    frame: the owner moves `step` from a clock of its own and re-renders.
+  - `Shimmer` (`components/shimmer.rs`): one line of muted text with a
+    brighter band at `position` (in characters, `shimmer::levels`), cut
+    with an ellipsis. Like `Loader`, the owner moves the position; no run
+    is dimmer than `muted_foreground`.
   - `Alert`: shadcn's alert (`AlertVariant::{Default, Destructive}`,
     `alert_style`), lucide `circle-alert` by default, with the children as
     the description.
@@ -922,6 +934,18 @@ code comes from there.
   action can carry a description under its button (AI Elements' has
   none), which stacks the actions: an agent's login methods are chosen
   by what each does.
+- **Confirmation's destructive tone** has no AI Elements counterpart: a
+  pending request takes shadcn's destructive Alert look (the icon in the
+  destructive colour, a destructive border) but over `destructive_tint`,
+  the card mixed at most 12 % toward `destructive` while `card_foreground`
+  keeps 4.5:1 and `destructive` 3:1 on it, where shadcn's destructive
+  alert keeps the card background. A tint tells the row apart in a long
+  conversation; answered, it is plain again.
+- **Loader and Shimmer step from the owner's clock** (shadcn's `Spinner`
+  and AI Elements' `Shimmer` animate in CSS): gpui 0.2.2's repeating
+  animation asks for a frame per display frame, and with no view caching
+  each is a whole-window render, so the owner steps them 10 times a
+  second and only while they show.
 - **Alert's title wraps** (shadcn clamps it to one line): an app's titles
   name a failure and its cause and are read whole.
 - **Response reads no markup** (AI Elements' renders Markdown through
@@ -1068,7 +1092,9 @@ background to its corners, and a pair without and with the ring, and the
 AI elements: a conversation (messages on both sides, one in three parts,
 tool rows, copy actions on hover) in a message scroller over a prompt input
 whose submits join it, and beside them a reasoning block, tool rows in
-three states, a permission confirmation and the two alerts, and a response
+three states, a loader and a shimmer moved 10 times a second (still under
+`--check`), a destructive permission confirmation, an answered one and the
+two alerts, and a response
 in an agent's bubble with every block kind (headings, every inline style,
 links with and without tooltips, nested numbered and bulleted lists, task
 marks, a quote, a labelled and an unlabelled code block, a rule, a table

@@ -35,6 +35,12 @@ pub struct Tokens {
     /// Text on a destructive background. shadcn v4 dropped this token and
     /// writes `text-white`; it is kept so the colour comes from the set.
     pub destructive_foreground: Hsla,
+    /// The card tinted towards `destructive`, behind a pending permission
+    /// (a destructive [`Confirmation`](crate::Confirmation)). Not one of
+    /// shadcn's variables: its destructive alert has no tinted background
+    /// in v4. A token, not an alpha computed in the component, so a
+    /// source's legibility checks see the colour drawn.
+    pub destructive_tint: Hsla,
     pub border: Hsla,
     /// The border of form controls.
     pub input: Hsla,
@@ -91,6 +97,7 @@ impl Tokens {
             accent_foreground: hex(0x171717),      // oklch(0.205 0 0)
             destructive: hex(0xe7000b),            // oklch(0.577 0.245 27.325), clamped to sRGB
             destructive_foreground: hex(0xffffff), // text-white
+            destructive_tint: hex(0xfce0e2),       // card 12% towards destructive
             border: hex(0xe5e5e5),                 // oklch(0.922 0 0)
             input: hex(0xe5e5e5),                  // oklch(0.922 0 0)
             ring: hex(0xa1a1a1),                   // oklch(0.708 0 0)
@@ -120,6 +127,7 @@ impl Tokens {
             accent_foreground: hex(0xfafafa),      // oklch(0.985 0 0)
             destructive: hex(0xff6467),            // oklch(0.704 0.191 22.216), clamped to sRGB
             destructive_foreground: hex(0xffffff), // text-white
+            destructive_tint: hex(0x332021),       // card 12% towards destructive
             border: hsla(0., 0., 1., 0.10),        // oklch(1 0 0 / 10%)
             input: hsla(0., 0., 1., 0.15),         // oklch(1 0 0 / 15%)
             ring: hex(0x737373),                   // oklch(0.556 0 0)
@@ -342,6 +350,37 @@ mod tests {
         assert!(!light.dark);
         assert!(dark.dark);
         assert!(light.background.l > 0.5 && dark.background.l < 0.5);
+    }
+
+    /// WCAG contrast of two colours' sRGB bytes.
+    fn contrast(a: Hsla, b: Hsla) -> f64 {
+        let luminance = |c: [u8; 3]| {
+            let lin = |v: u8| {
+                let c = f64::from(v) / 255.;
+                if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+            };
+            0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2])
+        };
+        let (a, b) = (luminance(bytes(a)), luminance(bytes(b)));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// The neutral sets' tint is their card 12% of the way to their
+    /// destructive colour, with the card's text at 4.5:1 on it and the
+    /// destructive colour (the warning icon, the border) at 3:1.
+    #[test]
+    fn the_destructive_tint_is_the_card_twelve_percent_towards_destructive() {
+        for (name, set) in [("light", Tokens::neutral_light()), ("dark", Tokens::neutral_dark())] {
+            let (card, red) = (bytes(set.card), bytes(set.destructive));
+            let mixed: Vec<u8> = (0..3)
+                .map(|i| (f64::from(card[i]) + (f64::from(red[i]) - f64::from(card[i])) * 0.12).round() as u8)
+                .collect();
+            assert_eq!(bytes(set.destructive_tint).to_vec(), mixed, "{name}");
+            let text = contrast(set.card_foreground, set.destructive_tint);
+            assert!(text >= 4.5, "{name}: card_foreground on the tint {text:.2}");
+            let icon = contrast(set.destructive, set.destructive_tint);
+            assert!(icon >= 3.0, "{name}: destructive on the tint {icon:.2}");
+        }
     }
 
     #[test]
