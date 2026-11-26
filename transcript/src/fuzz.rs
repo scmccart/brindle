@@ -210,6 +210,7 @@ fn conversation(rng: &mut XorShift) -> Conversation {
         id: text(rng),
         cwd: text(rng),
         continuation: CONTINUATIONS[rng.below(CONTINUATIONS.len())],
+        title: rng.chance(2).then(|| text(rng)),
     }
 }
 

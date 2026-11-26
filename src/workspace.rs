@@ -1548,7 +1548,8 @@ impl Workspace {
         }
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
-        let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
+        let tab_title = notify::policy::TabTitle::of(tab.manual_title.as_deref(), &tab.title);
+        let (summary, body) = notify::policy::layout(source, title, body, tab_title);
         let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0, program };
         Notifier::send(request, cx);
     }

@@ -582,6 +582,9 @@ fn restore_start(phase: &Map<String, Value>) -> Result<Start, Unreadable> {
             id: text(conversation, "id")?.to_owned(),
             cwd: text(conversation, "cwd")?.to_owned(),
             continuation: restore_continuation(Some(field(conversation, "continuation")?))?,
+            // A start names the session to take up; its title is the
+            // log's (`agents-session-title` decision 3).
+            title: None,
         },
         log: restore_log_kind(text(start, "log")?)?,
     })
@@ -1023,6 +1026,7 @@ mod tests {
                 id: "s1".into(),
                 cwd: "/home/u/src".into(),
                 continuation: Continuation::Load,
+                title: None,
             },
             log,
         }
@@ -1380,6 +1384,63 @@ mod tests {
         assert_eq!(
             restored.transcript.conversation().map(|c| c.id.as_str()),
             Some("s1")
+        );
+    }
+
+    /// The conversation events in a checkpoint's log, as written.
+    fn logged_conversations(bytes: &[u8]) -> Vec<Value> {
+        let (state, _) = state_of(bytes);
+        state["log"]
+            .as_array()
+            .expect("a log")
+            .iter()
+            .filter(|event| event["event"] == "conversation")
+            .map(|event| event["conversation"].clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_titled_conversation_round_trips_with_its_title() {
+        let mut agent = Agent::ready();
+        agent.feed(&update(json!({"sessionUpdate": "session_info_update",
+            "title": "Hello.txt file creation"})));
+        let bytes = encode(&agent.s).expect("it fits");
+        assert_eq!(
+            logged_conversations(&bytes),
+            [json!({"id": "s1", "cwd": "/home/u/src", "continuation": "resume_and_load",
+                "title": "Hello.txt file creation"})]
+        );
+        let restored = agent.round_trip();
+        assert_eq!(restored, agent.s);
+        assert_eq!(
+            restored.transcript.conversation().and_then(|c| c.title.as_deref()),
+            Some("Hello.txt file creation")
+        );
+        // A restored session goes on from the title it kept: the same one
+        // again sends nothing.
+        let mut restored = Agent {
+            s: restored,
+            now: agent.now,
+        };
+        let out = restored.feed(&update(json!({"sessionUpdate": "session_info_update",
+            "title": "Hello.txt file creation"})));
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn a_checkpoint_written_without_titles_reads_unchanged() {
+        let agent = Agent::ready();
+        let bytes = encode(&agent.s).expect("it fits");
+        // An untitled conversation is written as before titles existed.
+        assert_eq!(
+            logged_conversations(&bytes),
+            [json!({"id": "s1", "cwd": "/home/u/src", "continuation": "resume_and_load"})]
+        );
+        let restored = decode(&bytes, agent.now).expect("it reads");
+        assert_eq!(restored, agent.s);
+        assert_eq!(
+            restored.transcript.conversation().map(|c| c.title.clone()),
+            Some(None)
         );
     }
 
@@ -1930,6 +1991,7 @@ mod tests {
             id: "s1".into(),
             cwd: "/w".into(),
             continuation: Continuation::Neither,
+            title: None,
         };
         let fresh = AgentSession::continuing(conversation, "0.3.0".into());
         let bytes = encode(&fresh).expect("it fits");

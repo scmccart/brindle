@@ -205,6 +205,13 @@ pub fn said(text: &str) -> String {
     update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}}))
 }
 
+/// A `send` step of a `session_info_update` naming the conversation
+/// `title`, or clearing its title with `null` for `None` (OpenSpec change
+/// `agents-session-title`).
+pub fn title(title: Option<&str>) -> String {
+    update(json!({"sessionUpdate": "session_info_update", "title": title}))
+}
+
 /// A `send` step of a user message chunk, as an agent's `session/load`
 /// replays one.
 pub fn user_said(text: &str) -> String {

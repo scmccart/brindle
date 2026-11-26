@@ -831,9 +831,11 @@ struct Before {
 /// An agent zone's model.
 #[derive(Debug, Clone)]
 pub struct ChatModel {
-    /// The profile's name, the title until the agent names itself.
+    /// The profile's name, the title until the agent names the
+    /// conversation.
     profile: String,
-    /// The agent's own name, from the last `Ready` that gave one.
+    /// The agent's own name, from the last `Ready` that gave one: the
+    /// failure texts' (`agent_label`), never the title.
     agent_name: Option<String>,
     phase: AgentPhase,
     link: Link,
@@ -992,9 +994,20 @@ impl ChatModel {
         self.refusal.as_deref()
     }
 
-    /// The zone's title: the agent's name from the last `Ready` that gave
-    /// one (kept after it exits or fails), else the profile's.
+    /// The zone's title (OpenSpec change `agents-session-title`, decision
+    /// 5): the title the agent gave the conversation the zone last knew,
+    /// else the profile's name. The agent's own name never titles it.
     pub fn title(&self) -> String {
+        self.conversation
+            .as_ref()
+            .and_then(|conversation| conversation.title.clone())
+            .unwrap_or_else(|| self.profile.clone())
+    }
+
+    /// The agent's name for the failure texts' `{agent}`: its name from the
+    /// last `Ready` that gave one (kept after it exits or fails), else the
+    /// profile's.
+    pub fn agent_label(&self) -> String {
         self.agent_name.clone().unwrap_or_else(|| self.profile.clone())
     }
 
@@ -1842,7 +1855,7 @@ impl ChatModel {
 
     /// The alert for the zone's phase, if any ([`failure_text`]).
     pub fn alert(&self, command: &str, endpoint: &str) -> Option<Alert> {
-        let agent = self.title();
+        let agent = self.agent_label();
         failure_text(&self.phase, self.life, Names { agent: &agent, command, endpoint }, self.logins_usable())
     }
 
@@ -1884,8 +1897,8 @@ impl ChatModel {
 
     /// The notification for a shown status going from `prev` to `next`:
     /// on becoming `blocked`, `done` or `error` from another, never while
-    /// replaying. Titled with the agent's name (else the profile's); the
-    /// body is the permission's title, `Done`, or the failure's words.
+    /// replaying. Titled with the zone's title ([`Self::title`]); the body
+    /// is the permission's title, `Done`, or the failure's words.
     pub fn notice(&self, prev: Option<State>, next: Option<State>, replaying: bool) -> Option<AgentNotice> {
         if replaying || prev == next {
             return None;
@@ -2782,11 +2795,16 @@ mod tests {
         let mut zone = Zone::ready();
         zone.feed(&[turn(TurnState::Working)]);
         let absorbed = zone.feed(&[turn(TurnState::Blocked), added(1, permission("Run cargo test?"))]);
-        assert_eq!(absorbed.notice, Some(AgentNotice { title: "Fake Agent".into(), body: "Run cargo test?".into() }));
+        // The zone's title, not the agent's own name.
+        assert_eq!(absorbed.notice, Some(AgentNotice { title: "Fake".into(), body: "Run cargo test?".into() }));
+        zone.feed(&[titled(Some("Hello.txt file creation"))]);
         let absorbed = zone.feed(&[turn(TurnState::Ended { stop: StopReason::EndTurn })]);
-        assert_eq!(absorbed.notice, Some(AgentNotice { title: "Fake Agent".into(), body: "Done".into() }));
+        assert_eq!(absorbed.notice, Some(AgentNotice { title: "Hello.txt file creation".into(), body: "Done".into() }));
         let absorbed = zone.feed(&[turn(TurnState::Failed { message: "rate limited".into() })]);
-        assert_eq!(absorbed.notice, Some(AgentNotice { title: "Fake Agent".into(), body: "rate limited".into() }));
+        assert_eq!(
+            absorbed.notice,
+            Some(AgentNotice { title: "Hello.txt file creation".into(), body: "rate limited".into() })
+        );
         assert_eq!(zone.feed(&[turn(TurnState::Working)]).notice, None, "working raises none");
 
         let mut unnamed = Zone::new(None);
@@ -2800,19 +2818,58 @@ mod tests {
         assert_eq!(absorbed.notice, None, "a replay raises nothing");
     }
 
-    /// Decision 8: the title is the agent's name from `Ready`, kept after
-    /// it exits, else the profile's.
+    /// `agents-session-title` decision 5: the title is the conversation's
+    /// title, else the profile's name; the agent's own name labels only
+    /// the failure texts.
     #[test]
-    fn the_title_is_the_agents_name_else_the_profiles() {
+    fn the_title_is_the_conversations_else_the_profiles() {
+        use crate::agent::transcript::Continuation;
         let mut zone = Zone::new(None);
         assert_eq!(zone.model.title(), "Fake");
-        assert!(zone.feed(&[ready()]).title_changed);
-        assert_eq!(zone.model.title(), "Fake Agent");
+        assert!(!zone.feed(&[conversation_event(Continuation::Resume), ready()]).title_changed);
+        assert_eq!(zone.model.title(), "Fake", "the agent's own name doesn't title the zone");
+        assert_eq!(zone.model.agent_label(), "Fake Agent");
+        let absorbed = zone.feed(&[titled(Some("Hello.txt file creation"))]);
+        assert!(absorbed.title_changed);
+        assert_eq!(zone.model.title(), "Hello.txt file creation");
+        assert!(!zone.feed(&[titled(Some("Hello.txt file creation"))]).title_changed, "the same title");
+        // An exit keeps the conversation, and with it the title.
         zone.feed(&[agent_state(AgentState::Exited { code: Some(0), stderr: String::new() })]);
-        assert_eq!(zone.model.title(), "Fake Agent");
-        let mut renamed = Zone::new(None);
+        assert_eq!(zone.model.title(), "Hello.txt file creation");
+        assert_eq!(zone.model.agent_label(), "Fake Agent");
+        let absorbed = zone.feed(&[titled(None)]);
+        assert!(absorbed.title_changed);
+        assert_eq!(zone.model.title(), "Fake", "a cleared title brings the profile's name back");
+
+        // A profile rename retitles an untitled zone, and not a titled one.
+        let mut renamed = Zone::ready();
         renamed.model.set_profile_name("Renamed");
         assert_eq!(renamed.model.title(), "Renamed");
+        assert_eq!(renamed.model.agent_label(), "Fake Agent");
+        renamed.feed(&[titled(Some("Named"))]);
+        renamed.model.set_profile_name("Again");
+        assert_eq!(renamed.model.title(), "Named");
+        let unnamed = Zone::new(None);
+        assert_eq!(unnamed.model.agent_label(), "Fake", "no Ready yet: the profile's");
+    }
+
+    /// Decision 5: a respawn into a new server session shows the old
+    /// conversation's title until the new session's (untitled)
+    /// conversation arrives, then the profile's name.
+    #[test]
+    fn a_respawn_falls_back_to_the_profiles_name_once_its_conversation_arrives() {
+        use crate::agent::transcript::Continuation;
+        let mut zone = Zone::new(None);
+        zone.feed(&[conversation_event(Continuation::Resume), ready()]);
+        zone.feed(&[titled(Some("Old"))]);
+        zone.feed(&[agent_state(AgentState::Exited { code: Some(1), stderr: String::new() })]);
+        // The new session's log, replayed from the start: no conversation yet.
+        let absorbed = zone.replay(&[agent_state(AgentState::Starting)]);
+        assert!(!absorbed.title_changed);
+        assert_eq!(zone.model.title(), "Old", "kept while the new log has no conversation");
+        let absorbed = zone.feed(&[conversation_event(Continuation::Resume), ready()]);
+        assert!(absorbed.title_changed);
+        assert_eq!(zone.model.title(), "Fake");
     }
 
     /// Decision 15: the dump's lines, and what `--wait-for` matches.
@@ -3249,7 +3306,15 @@ mod tests {
     // `agents-session-recovery` section 4: continuing a conversation.
 
     fn conversation(continuation: crate::agent::transcript::Continuation) -> Conversation {
-        Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation }
+        Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation, title: None }
+    }
+
+    /// The conversation `sess-1` as the core sends it when the agent
+    /// titles it, or clears its title for `None`.
+    fn titled(title: Option<&str>) -> Event {
+        let conversation =
+            Conversation { title: title.map(str::to_owned), ..conversation(crate::agent::transcript::Continuation::Resume) };
+        Event::Conversation { conversation }
     }
 
     fn conversation_event(continuation: crate::agent::transcript::Continuation) -> Event {
@@ -3490,7 +3555,7 @@ mod tests {
             added(2, user("hi")),
             added(3, agent("Hello!")),
             Event::Conversation {
-                conversation: Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation: Continuation::Resume },
+                conversation: conversation(Continuation::Resume),
             },
             ready(),
         ]

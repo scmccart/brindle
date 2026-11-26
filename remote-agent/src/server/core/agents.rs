@@ -141,6 +141,9 @@ impl Agent {
             cwd: conversation.cwd.clone(),
             // What the new agent offers decides; the reducer reads that.
             continuation: Continuation::Neither,
+            // A new server session starts untitled (`agents-session-title`
+            // decision 3); the agent names it again.
+            title: None,
         };
         Self::with(Acp::Running(Box::new(AgentSession::continuing(
             conversation,
