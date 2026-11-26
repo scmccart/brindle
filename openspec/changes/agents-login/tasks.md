@@ -56,7 +56,7 @@ Lands after `agents-session-recovery` (its `AGENT_RESTART` is used by the termin
 
 ## 9. Integration
 
-- [ ] 9.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e` (under `systemd-run --user --scope`); verify all pass.
+- [x] 9.1 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 BRINDLE_E2E_SWITCHES_REQUIRED=1 cargo test --test e2e` (under `systemd-run --user --scope`); verify all pass.
 - [ ] 9.2 Hand the manual checks from 8.3 to the user with `scripts/run-throwaway.sh` and `scripts/run-throwaway.ps1`; verify the user reports each.
 
 ## Workflow follow-up
