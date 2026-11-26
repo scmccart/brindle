@@ -15,6 +15,7 @@ use gpui::{
 };
 
 mod launch;
+pub mod mark;
 mod notices;
 mod overlays;
 mod previews;
@@ -40,10 +41,11 @@ use crate::picker::{
     KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRef, SessionRow, SessionsModel, SubmitFn,
 };
 use crate::settings::Zoom;
+use crate::motion::Motion;
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, Loader, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
-    TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
+    TabWidth, TextInput, Tokens, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
 use crate::remote::Host;
 use crate::remote::hosts::{HostState, Hosts};
@@ -106,6 +108,10 @@ pub struct Tab {
     /// The most pressing program status (OSC 7501) across the tab's
     /// terminals; see [`Workspace::refresh_status`].
     pub status: Option<State>,
+    /// One of the tab's working zones is an agent zone, so a `working`
+    /// status is drawn as a spinner ([`mark::mark`]); refreshed with
+    /// `status`.
+    pub agent_working: bool,
     /// The most pressing progress (OSC 9;4) across the tab's terminals,
     /// drawn as the bar on its face; refreshed with `status`.
     pub progress: Option<Progress>,
@@ -139,6 +145,7 @@ impl Tab {
             origin,
             bell: false,
             status: None,
+            agent_working: false,
             progress: None,
             badge: None,
             manual_title: None,
@@ -448,6 +455,17 @@ enum MenuFor {
     Zone,
 }
 
+/// The token set a context menu on `on` is drawn in (`None`: the
+/// window's): a zone's menu takes what its request carries, its zone's
+/// theme scope (`ZoneMenuRequest::tokens`), and a tab's menu, opened from
+/// the strip, the window's whatever it was given.
+fn menu_tokens(on: MenuFor, requested: Option<Tokens>) -> Option<Tokens> {
+    match on {
+        MenuFor::Tab(_) => None,
+        MenuFor::Zone => requested,
+    }
+}
+
 /// How long the sessions palette waits for a remote endpoint's listing
 /// before it counts the endpoint as offline.
 #[cfg(any(target_os = "linux", windows))]
@@ -654,6 +672,9 @@ impl Workspace {
                 let MenuEvent::Selected(key) = event;
                 this.context_menu_selected(key, window, cx);
             });
+        // A closed window can't keep the motion clock running.
+        let motion_id = cx.entity_id();
+        cx.on_release(move |_, cx| Motion::want(motion_id, false, cx)).detach();
         let mut this = Self {
             tabs: Vec::new(),
             strip: Tabs::default(),
@@ -1453,7 +1474,8 @@ impl Workspace {
             return;
         }
         let menu = ActionMenu::new(request.rows.clone(), &menu_shortcuts(&request.rows, cx));
-        self.open_context_menu(menu, MenuFor::Zone, request.at, request.press.as_ref(), window, cx);
+        let at = request.at;
+        self.open_context_menu(menu, MenuFor::Zone, request.tokens, at, request.press.as_ref(), window, cx);
     }
 
     fn on_zone_tree_event(
@@ -1536,7 +1558,8 @@ impl Workspace {
         }
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
-        let (summary, body) = notify::policy::layout(source, title, body, &tab.title);
+        let tab_title = notify::policy::TabTitle::of(tab.manual_title.as_deref(), &tab.title);
+        let (summary, body) = notify::policy::layout(source, title, body, tab_title, &tab.profile.name);
         let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0, program };
         Notifier::send(request, cx);
     }
@@ -1546,13 +1569,27 @@ impl Workspace {
     /// records do (a new report, a new prompt, the user typing).
     fn refresh_status(&mut self, ix: usize, cx: &mut Context<Self>) {
         let status = self.tabs[ix].status_summary(cx);
+        let agent_working = self.tabs[ix].zones.read(cx).agent_working();
         let progress = self.tabs[ix].zones.read(cx).progress_summary();
         let badge = self.refresh_badge(ix, cx);
         let tab = &mut self.tabs[ix];
-        if (tab.status, tab.progress) != (status, progress) || badge {
-            (tab.status, tab.progress) = (status, progress);
+        if (tab.status, tab.agent_working, tab.progress) != (status, agent_working, progress) || badge {
+            (tab.status, tab.agent_working, tab.progress) = (status, agent_working, progress);
             cx.notify();
         }
+        self.refresh_motion(cx);
+    }
+
+    /// Each tab's face mark ([`mark::mark`]), in the strip's order.
+    fn face_marks(&self) -> impl Iterator<Item = mark::Mark> + '_ {
+        self.tabs.iter().map(|tab| mark::mark(tab.status, tab.agent_working))
+    }
+
+    /// Wants the motion clock while a tab's face shows a spinner (OpenSpec
+    /// change `agents-zone-attention`, decision 1).
+    fn refresh_motion(&self, cx: &mut Context<Self>) {
+        let spins = self.face_marks().any(mark::Mark::is_spinner);
+        Motion::want(cx.entity_id(), spins, cx);
     }
 
     /// Activates the tab with this id, if it is still open (a notification
@@ -1642,6 +1679,7 @@ impl Workspace {
         let tab = self.tabs.remove(ix);
         let removed = self.strip.removed(&order, id);
         tab.zones.update(cx, |v, cx| v.shutdown_all(cx));
+        self.refresh_motion(cx);
         #[cfg(any(target_os = "linux", windows))]
         {
             let after: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
@@ -1955,17 +1993,23 @@ impl Workspace {
         let Some(ix) = self.tab_ix(id) else { return };
         let rows = tab_menu_rows(ix, self.tabs.len());
         let menu = ActionMenu::new(rows.clone(), &menu_shortcuts(&rows, cx));
-        self.open_context_menu(menu, MenuFor::Tab(id), at, press, window, cx);
+        self.open_context_menu(menu, MenuFor::Tab(id), None, at, press, window, cx);
     }
 
     /// Opens `menu`, for what it is `on`, in the context menu slot at `at`,
-    /// or at the pointer of `press`, replacing any overlay. Focus goes to the
-    /// active tab first: the menu gives it back there on closing, and a
-    /// chosen item's action runs from there.
+    /// or at the pointer of `press`, replacing any overlay, drawn in the
+    /// set [`menu_tokens`] picks from `tokens`. Focus goes to the active tab
+    /// first: the menu gives it back there on closing, and a chosen item's
+    /// action runs from there.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two callers hold each of these apart (a zone's request, a tab's id and press); a struct would be built only to be taken apart here"
+    )]
     fn open_context_menu(
         &mut self,
         menu: ActionMenu,
         on: MenuFor,
+        tokens: Option<Tokens>,
         at: Point<Pixels>,
         press: Option<&MouseDownEvent>,
         window: &mut Window,
@@ -1975,9 +2019,12 @@ impl Workspace {
         self.focus_active_tab(window, cx);
         let entries = menu.entries.clone();
         self.overlay = Overlay::ContextMenu { menu, on };
-        self.context_menu.update(cx, |context_menu, cx| match press {
-            Some(event) => context_menu.open_on_press(event, entries, window, cx),
-            None => context_menu.open(at, entries, window, cx),
+        self.context_menu.update(cx, |context_menu, cx| {
+            context_menu.set_tokens(menu_tokens(on, tokens));
+            match press {
+                Some(event) => context_menu.open_on_press(event, entries, window, cx),
+                None => context_menu.open(at, entries, window, cx),
+            }
         });
         cx.notify();
     }
@@ -2637,6 +2684,10 @@ impl Workspace {
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_badges());
             }
+            out.push_str(&describe_tab_spinners(self.face_marks()));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_spinners());
+            }
             if let Some(view) = view.as_ref() {
                 out.push_str(&view.read(cx).describe_feedback(std::time::Instant::now()));
             }
@@ -2655,6 +2706,10 @@ impl Workspace {
             out.push_str(&describe_tab_badges(self.tabs.iter().map(|tab| tab.badge.as_ref())));
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_badges());
+            }
+            out.push_str(&describe_tab_spinners(self.face_marks()));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_spinners());
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&agent);
@@ -2687,6 +2742,7 @@ impl Workspace {
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.describe(cx)));
         }
+        out.push_str(&describe_motion(Motion::running(cx)));
         out.push_str(&format!("--- focus {}\n", self.describe_focus(window, cx)));
         out
     }
@@ -2762,7 +2818,7 @@ impl Workspace {
     /// and escape. A press on a tab activates it and leaves focus in its
     /// terminal.
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = *cx.ui_theme();
+        let tokens = cx.ui_theme();
         let decorations = window.window_decorations();
         // Windows always shows Brindle's own caption (see `window_control_area`
         // below); GPUI reports server decorations there.
@@ -2800,9 +2856,16 @@ impl Workspace {
                     .close_tooltip(close_tip.clone())
                     .surface(surface)
                     .text_color(text);
-                // The status and bell dots lead the face, before its title.
-                if let Some(state) = tab.status {
-                    trigger = trigger.leading(dot(status_color(state)));
+                // The status and bell dots lead the face, before its title;
+                // an agent's `working` is a spinner at the motion clock's
+                // step, in the working dot's colour.
+                match mark::mark(tab.status, tab.agent_working) {
+                    mark::Mark::None => {}
+                    mark::Mark::Dot(state) => trigger = trigger.leading(dot(status_color(state))),
+                    mark::Mark::Spinner => {
+                        let step = crate::motion::loader_step(Motion::step(cx));
+                        trigger = trigger.leading(Loader::new().step(step).color(status_color(State::Working)));
+                    }
                 }
                 if tab.bell {
                     trigger = trigger.leading(dot(tokens.primary));
@@ -3386,6 +3449,23 @@ fn describe_tab_badges<'a>(tabs: impl IntoIterator<Item = Option<&'a Badge>>) ->
         .enumerate()
         .filter_map(|(ix, badge)| Some(format!("--- badge tab={} {}\n", ix + 1, describe_badge(badge?))))
         .collect()
+}
+
+/// The tabs' spinners, for `--dump-screen-after`: `--- spinner tab=N` for
+/// each tab whose face shows one, numbered from 1 as the `--- tab` lines
+/// are (OpenSpec change `agents-zone-attention`, decision 7).
+fn describe_tab_spinners(marks: impl IntoIterator<Item = mark::Mark>) -> String {
+    marks
+        .into_iter()
+        .enumerate()
+        .filter(|(_, mark)| mark.is_spinner())
+        .map(|(ix, _)| format!("--- spinner tab={}\n", ix + 1))
+        .collect()
+}
+
+/// Whether the window's motion clock runs, for `--dump-screen-after`.
+fn describe_motion(running: bool) -> String {
+    format!("--- motion {}\n", if running { "running" } else { "stopped" })
 }
 
 /// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
@@ -4221,6 +4301,16 @@ mod tests {
     }
 
     #[test]
+    fn tab_spinner_and_motion_lines() {
+        use mark::Mark;
+        let marks = [Mark::Dot(State::Working), Mark::Spinner, Mark::None, Mark::Spinner];
+        assert_eq!(describe_tab_spinners(marks), "--- spinner tab=2\n--- spinner tab=4\n");
+        assert_eq!(describe_tab_spinners([Mark::Dot(State::Done)]), "");
+        assert_eq!(describe_motion(true), "--- motion running\n");
+        assert_eq!(describe_motion(false), "--- motion stopped\n");
+    }
+
+    #[test]
     fn tab_badge_lines_name_the_tabs_with_a_badge() {
         use crate::terminal::context::{Contexts, parse};
         let mut contexts = Contexts::default();
@@ -4258,6 +4348,18 @@ mod tests {
             rows.iter().map(|row| row.action().and_then(|action| tab_keys(&keymap, action))).collect();
         let menu = ActionMenu::new(rows, &shortcuts);
         describe_menu(&menu.entries, None)
+    }
+
+    /// A zone's menu is drawn in the set its request carries (an agent
+    /// zone's scope, or none for a terminal zone), a tab's menu always in
+    /// the window's.
+    #[test]
+    fn a_zone_menu_takes_its_requests_set_and_a_tab_menu_the_windows() {
+        let set = brindle_ui::Tokens::neutral_dark();
+        assert_eq!(menu_tokens(MenuFor::Zone, Some(set)), Some(set));
+        assert_eq!(menu_tokens(MenuFor::Zone, None), None);
+        assert_eq!(menu_tokens(MenuFor::Tab(TabId(1)), Some(set)), None);
+        assert_eq!(menu_tokens(MenuFor::Tab(TabId(1)), None), None);
     }
 
     /// Each tab menu row's action maps to the item that acts on the menu's

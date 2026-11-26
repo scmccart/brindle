@@ -978,6 +978,11 @@ pub struct CardColors {
     /// the content, so a content with a square background stays inside the
     /// rounded border.
     pub surround: Option<Hsla>,
+    /// The focus ring's colour as drawn (a set's [`focus_ring`]): an owner
+    /// that draws the card inside a theme scope gives the window's ring
+    /// here, so the ring stays chrome round the card while the card takes
+    /// the scope's colours.
+    pub ring: Option<Hsla>,
 }
 
 /// A card's resolved look.
@@ -993,8 +998,9 @@ pub struct CardStyle {
     pub border: Hsla,
     /// What the corners outside the rounded border are painted in.
     pub surround: Hsla,
-    /// The focus ring's colour while it shows. Always the tokens', since
-    /// the ring is chrome round the card, not part of it.
+    /// The focus ring's colour while it shows: the active tokens', unless
+    /// the owner gives one (the window's, for a card in a theme scope),
+    /// since the ring is chrome round the card, not part of it.
     pub ring: Hsla,
     pub border_width: Pixels,
     /// `rounded-lg`.
@@ -1009,15 +1015,15 @@ pub struct CardStyle {
 }
 
 impl CardStyle {
-    /// This style with the owner's colours in place of the tokens'. The
-    /// ring keeps the tokens' colour.
+    /// This style with the owner's colours in place of the tokens'.
     pub fn with_colors(mut self, colors: CardColors) -> Self {
-        let CardColors { surface, text, muted, border, surround } = colors;
+        let CardColors { surface, text, muted, border, surround, ring } = colors;
         self.surface = surface.unwrap_or(self.surface);
         self.text = text.unwrap_or(self.text);
         self.muted = muted.unwrap_or(self.muted);
         self.border = border.unwrap_or(self.border);
         self.surround = surround.unwrap_or(self.surround);
+        self.ring = ring.unwrap_or(self.ring);
         self
     }
 
@@ -1773,6 +1779,7 @@ mod tests {
             muted: Some(gpui::rgb(0x737aa2).into()),
             border: Some(gpui::rgb(0x2f3146).into()),
             surround: Some(gpui::rgb(0x16161e).into()),
+            ring: None,
         };
         for t in [Tokens::neutral_light(), Tokens::neutral_dark()] {
             let s = card_style(&t).with_colors(own);
@@ -1785,6 +1792,17 @@ mod tests {
             let border_only = card_style(&t).with_colors(CardColors { border: own.border, ..CardColors::default() });
             assert_eq!(border_only, CardStyle { border: own.border.unwrap(), ..card_style(&t) });
         }
+    }
+
+    /// The spec's "Owner's ring colour": a card styled from a scope's set
+    /// whose owner gives the window set's ring draws its ring in that.
+    #[test]
+    fn card_owner_ring_replaces_the_scopes() {
+        let (scope, window) = (Tokens::neutral_dark(), Tokens::neutral_light());
+        let ring = focus_ring(&window);
+        let s = card_style(&scope).with_colors(CardColors { ring: Some(ring), ..CardColors::default() });
+        assert_eq!(s, CardStyle { ring, ..card_style(&scope) });
+        assert_ne!(s.ring, focus_ring(&scope));
     }
 
     /// The ring is a 3px band just outside the 1px border, its corners the

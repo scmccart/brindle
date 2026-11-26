@@ -17,6 +17,7 @@ mod instance;
 mod latency;
 mod layout;
 mod link_confirm;
+mod motion;
 mod notify;
 mod picker;
 mod primary;
@@ -1675,6 +1676,8 @@ fn main() {
         cx.set_global(settings);
         Settings::apply_ui_theme(cx);
         notify::Notifier::init(cx);
+        // The one stepped clock every spinner and shimmer follows.
+        cx.set_global(motion::Motion::default());
         bind_keys(cx);
         // brindle-ui's keystroke observer: a key sets keyboard modality, so
         // focus rings come back after a click had hidden them.

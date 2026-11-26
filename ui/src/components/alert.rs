@@ -94,7 +94,7 @@ impl ParentElement for Alert {
 
 impl RenderOnce for Alert {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let style = alert_style(self.variant, t);
         // rounded-lg border px-4 py-3 text-sm, a 1rem icon column and
         // gap-x-3 gap-y-0.5.

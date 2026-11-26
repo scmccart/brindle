@@ -42,7 +42,7 @@ use gpui::{
 };
 
 use crate::actions::{PromptStop, PromptSubmit};
-use crate::components::{Button, Textarea, TooltipFor, trigger_label};
+use crate::components::{Button, Textarea, Tooltip, TooltipFor, trigger_label};
 use crate::icon::Icon;
 use crate::style::{ButtonSize, ButtonVariant};
 use crate::text_area::{TextArea, TextAreaEvent};
@@ -436,10 +436,15 @@ impl PromptInput {
                         ),
                     // A disabled button shows no tooltip; its frame says
                     // why it is disabled.
-                    Resend::Unavailable(why) => div()
-                        .id("prompt-queue-resend-frame")
-                        .tooltip_for(why.clone(), None)
-                        .child(resend_button.disabled(true)),
+                    // On a plain element, so the theme scope's set is
+                    // carried by hand, as a component's tooltip carries it.
+                    Resend::Unavailable(why) => {
+                        let (why, scope) = (why.clone(), cx.scoped_theme());
+                        div()
+                            .id("prompt-queue-resend-frame")
+                            .tooltip_with(move |_, _| Tooltip::new(why.clone()).in_scope(scope))
+                            .child(resend_button.disabled(true))
+                    }
                 };
                 vec![
                     resend.debug_selector(|| "prompt-queue-resend".into()).into_any_element(),
@@ -525,8 +530,15 @@ impl Render for PromptInput {
                             .flex()
                             .items_center()
                             .gap_2()
+                            // The reason grows from a zero basis into the
+                            // row's room, so it wraps at the row's width and
+                            // never at a measure of its own that gpui 0.2.2
+                            // may keep from a narrower pass (the wrapping
+                            // text pitfall); the action sits at its end.
                             .child(
                                 div()
+                                    .debug_selector(|| "prompt-reason".into())
+                                    .flex_1()
                                     .min_w_0()
                                     .text_size(rems(0.75))
                                     .text_color(muted)
@@ -800,6 +812,73 @@ mod tests {
         assert_eq!(input.read_with(cx, |input, cx| input.text(cx).to_string()), "draft");
         update(&input, cx, |input, cx| input.set_action(None, cx));
         assert!(input.read_with(cx, |input, _| input.action_stop()).is_none());
+    }
+
+    /// A disabled prompt input showing `CONNECTING` in a host of a given
+    /// width, and a line of the reason's size to measure one line by.
+    struct WidthHost {
+        width: f32,
+        input: Entity<PromptInput>,
+    }
+
+    const CONNECTING: &str = "connecting to the terminal server";
+
+    impl Render for WidthHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .child(div().debug_selector(|| "one-line".into()).text_size(rems(0.75)).child("x"))
+                .child(div().w(px(self.width)).flex().flex_col().child(self.input.clone()))
+        }
+    }
+
+    fn sized(width: f32) -> (Entity<WidthHost>, &'static mut VisualTestContext) {
+        let mut app = test_support::app();
+        let (host, cx) = app.add_window_view(move |_, cx| {
+            let input = cx.new(|cx| {
+                let mut input = PromptInput::new(cx);
+                input.set_status(PromptStatus::Disabled, cx);
+                input.set_reason(Some(CONNECTING.into()), cx);
+                input
+            });
+            WidthHost { width, input }
+        });
+        let cx: &'static mut VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.run_until_parked();
+        (host, cx)
+    }
+
+    /// The spec's "Reason line in a narrow input": at 240px the reason
+    /// wraps at the input's width, holding at least `connecting` (0.6em a
+    /// character in gpui's test text system) on its first line, on at most
+    /// two lines.
+    #[test]
+    fn the_reason_wraps_at_a_narrow_inputs_width() {
+        let (_, cx) = sized(240.);
+        let line = bounds("one-line", cx).expect("drawn");
+        let reason = bounds("prompt-reason", cx).expect("drawn");
+        assert!(reason.size.width >= px("connecting".len() as f32 * 0.6 * 12.), "{reason:?}");
+        assert!(reason.size.height <= line.size.height * 2., "{reason:?} on more than two lines of {line:?}");
+    }
+
+    /// The spec's "After the width changes": drawn at 600px and then at
+    /// 240px, the reason is laid out as a first draw at 240px lays it out.
+    #[test]
+    fn the_reason_follows_a_width_change() {
+        let (_, fresh) = sized(240.);
+        let expected = bounds("prompt-reason", fresh).expect("drawn");
+        let (host, cx) = sized(600.);
+        let wide = bounds("prompt-reason", cx).expect("drawn");
+        assert!(wide.size.width >= expected.size.width, "{wide:?}");
+        cx.update(|_, cx| {
+            host.update(cx, |host, cx| {
+                host.width = 240.;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert_eq!(bounds("prompt-reason", cx), Some(expected));
     }
 
     /// Submitted draws the spinner, and a set text replaces the draft.

@@ -33,11 +33,11 @@ fn events_through_the_sink_reach_the_model_and_the_first_prompt_goes_once() {
     assert_eq!(zone.take_calls(), [Call::Prompt("hello there".into())]);
     assert_eq!(
         drained(&mut terminal_events),
-        [TerminalEvent::Status(None), TerminalEvent::TitleChanged],
-        "ready, and named by the agent"
+        [TerminalEvent::Status(None)],
+        "ready; the agent's own name doesn't retitle the zone"
     );
     zone.agent.read_with(&cx, |agent, _| {
-        assert_eq!(agent.title(), "Fake Agent");
+        assert_eq!(agent.title(), "Fake");
         assert_eq!(agent.status(), Some(State::Idle));
         assert_eq!(agent.model().prompt_status(), model::PromptStatus::Submitted, "the first prompt is in flight");
     });
@@ -49,15 +49,16 @@ fn events_through_the_sink_reach_the_model_and_the_first_prompt_goes_once() {
     settle(&cx);
     let splices = drained(&mut updates);
     assert!(
-        splices.iter().all(|update| matches!(update, AgentUpdate::Splices(_))),
+        splices.iter().all(|update| matches!(update, AgentUpdate::Splices(_) | AgentUpdate::Working(_))),
         "only the list changes: {splices:?}"
     );
+    assert_eq!(splices.last(), Some(&AgentUpdate::Working(Some(model::WorkingRow::Working))), "the working row, last");
     assert_eq!(drained(&mut terminal_events), [TerminalEvent::Status(None)], "working");
     zone.feed(&[Event::Turn { state: TurnState::Ended { stop: crate::agent::transcript::StopReason::EndTurn } }]);
     settle(&cx);
     let events = drained(&mut terminal_events);
     let [TerminalEvent::Status(Some(notice))] = events.as_slice() else { panic!("a done notice: {events:?}") };
-    assert_eq!((notice.source, notice.title.as_str(), notice.body.as_str()), (Source::Agent, "Fake Agent", "Done"));
+    assert_eq!((notice.source, notice.title.as_str(), notice.body.as_str()), (Source::Agent, "Fake", "Done"));
     zone.agent.read_with(&cx, |agent, _| {
         assert_eq!(agent.model().blocks().len(), 2);
         assert_eq!(agent.status(), Some(State::Done));
@@ -178,7 +179,7 @@ fn life_events_and_leaving_the_session() {
 // `agents-session-recovery` 4.3: continuing a conversation.
 
 fn conversation(continuation: Continuation) -> Event {
-    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation };
+    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation, title: None };
     Event::Conversation { conversation }
 }
 

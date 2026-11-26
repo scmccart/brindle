@@ -330,9 +330,12 @@ bus, so nothing opens on the desktop.
 
 CI (`.github/workflows/ci.yml`) checks the new commits' messages, and runs the
 unit tests, a release build, and the end-to-end suite that way on Ubuntu
-26.04, for pushes to `main` and every pull request. The suite is split into
-3 shards that run as separate jobs. A failed shard uploads its
-`target/tmp/e2e/` as an artifact. A Windows job runs the
+26.04, for pushes to `main` and every pull request. One job builds the
+suite and what it runs, and `scripts/e2e-bundle` packs that build as an
+artifact. The suite is split into 3 shards that run as separate jobs, each
+from that one build. A failed shard uploads its `target/tmp/e2e/` as an
+artifact, and `cargo test --test e2e -- --shard K/3` reruns it locally.
+A Windows job runs the
 release build, the unit tests and the harness self-tests on `windows-latest`.
 
 ### Performance

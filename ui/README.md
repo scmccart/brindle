@@ -19,7 +19,12 @@ rule, not a convenience.
 - **Tokens** (`theme.rs`): `Tokens`, shadcn's token set (background/foreground
   pairs for card, popover, primary, secondary, muted, accent and destructive,
   plus border, input, ring and the radius), held in the `UiTheme` global and
-  read through `cx.ui_theme()` (`ActiveTheme`). `Tokens::neutral_light()` and
+  read through `cx.ui_theme()` (`ActiveTheme`), by value: the innermost
+  theme scope's set while one is drawn, else the window's.
+  `cx.window_theme()` reads the window's set whatever the scope (an owner
+  inside a scope keeps its focus ring in it), and `cx.scoped_theme()` the
+  scope's alone, for what a component carries to a tooltip it builds.
+  `Tokens::neutral_light()` and
   `neutral_dark()` are shadcn's neutral sets. Mapping a terminal theme to
   tokens is the app's job. Beside it, the `UiFont` global holds the chrome's
   font family, read through `cx.ui_font()` (`ActiveFont`; GPUI's
@@ -43,7 +48,22 @@ rule, not a convenience.
     pointer outside its view while open
     (`Overlay::new(OverlayKind::NonModal { blocks_outside: true })`, a
     select's menu): an outside press then only requests dismissal and
-    reaches nothing beneath.
+    reaches nothing beneath. `Overlay::tokens(Some(set))` (or `set_tokens`
+    on a kept slot, and `ContextMenu::set_tokens`) draws the view in that
+    set, the scope inside the `deferred` it may be lifted into.
+  - `ThemeScope` (`ThemeScope::new(tokens, child)`), a Brindle addition
+    with no shadcn counterpart (a web page would scope CSS variables on an
+    element): draws `child` with `tokens` as the active set in its layout,
+    prepaint and paint, restoring the outer set after each, so the
+    innermost of nested scopes wins and list items laid out in prepaint
+    follow it too. It swaps the set through the `UiTheme` global's cell, so
+    it notifies no one and redraws nothing outside it. It can't reach a
+    `deferred` child or a tooltip, both drawn after it has ended: a scope
+    goes inside a deferred element (`Overlay::tokens`), and the crate's
+    components carry the scope's set to their tooltips (`Tooltip::tokens`,
+    filled at render by `Button`, `Toggle`, tab triggers, `Badge` and
+    `Response`'s links). `TooltipFor` on a plain element can't, and keeps
+    the window's set.
   - `FocusScope` and `FocusStops`: Tab and shift-Tab cycle through the stops a
     view lists, and never leave it.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
@@ -96,7 +116,9 @@ rule, not a convenience.
       and hides it when the pointer leaves, on a press and on a scroll; the
       shown view hides itself on Escape (`intercept_keystrokes`, which sees
       the key before any binding and lets it go on). A `Tooltip` also
-      renders in place, as the gallery shows its look.
+      renders in place, as the gallery shows its look. `Tooltip::tokens`
+      draws it in a set of its own (see `ThemeScope`), at the window's text
+      size.
     - `TabList` (`TabList::new(id).active(ix).children(triggers)`) and
       `TabTrigger` (`TabTrigger::new(id, label)`): shadcn's tab list and
       triggers, with what a window's tab strip adds. The owner keeps the
@@ -175,9 +197,10 @@ rule, not a convenience.
       it (`text_color`), since a button sets its own. It is a stateful element, so the owner gives it handlers
       (a press, `on_context_menu`); `Card::on_header_bounds` reports where it
       was laid out. `.colors(CardColors { surface, text, muted, border,
-      surround })` takes the owner's colours (a terminal's), each defaulting
+      surround, ring })` takes the owner's colours (a terminal's), each defaulting
       to the card, foreground, muted foreground, border and background
-      tokens. `.ring(true)` draws the focus ring outside the border; the
+      tokens, and the ring to the tokens' focus ring (a card in a theme
+      scope is given the window's). `.ring(true)` draws the focus ring outside the border; the
       owner decides when (`shows_ring`). The card paints the four pieces
       outside its rounded edge in `surround` above its content and below
       its border (`corner_cutouts`), so a content that paints a square
@@ -312,16 +335,19 @@ rule, not a convenience.
     way in (`page_scroll`, pure), and a page down that reaches the end
     follows it (`Follow::after_draw`).
   - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
-    at the end on `muted`, the other side's (`Assistant`) at the start on
-    the card with a border, at most four fifths of the row. A long message
-    drawn as several list items uses `BubblePart::{First, Middle, Last}`,
-    which round, border and pad only the outer edges (`BubblePart::edges`).
+    at the end on `muted`, as wide as its text up to four fifths of the
+    row, the other side's (`Assistant`) at the start on the card with a
+    border, filling the row. A long message drawn as several list items
+    uses `BubblePart::{First, Middle, Last}`, which round, border and pad
+    only the outer edges (`BubblePart::edges`); the other side's parts all
+    fill the row, so their edges line up into one bubble.
     `Message::action(..)` adds an element (a copy button) under a whole
     message or its last part, drawn only while the pointer is over the
     message.
   - `PromptInput` (an entity owning its `TextArea`): a queue row, the
-    `Textarea`, and a toolbar with a reason line (`set_reason`, then an
-    optional small outline action button, `set_action(Some(label))`) and
+    `Textarea`, and a toolbar with a reason line (`set_reason`, wrapping at
+    the room the toolbar gives it, then an optional small outline action
+    button at the end of that room, `set_action(Some(label))`) and
     the submit button, which reads the owner's `PromptStatus`: `Ready` an
     `arrow-up` (disabled while the text is blank), `Submitted` a turning
     `loader-circle` (disabled), `Streaming` a `square` that asks to stop,
@@ -351,9 +377,22 @@ rule, not a convenience.
     through the owner's handle), `on_action(key)`; once `Accepted`,
     `Rejected` or `Cancelled`, the outcome (`check` or `x` and the label,
     `ConfirmationState::outcome`) and no buttons. An action may have a
-    `description` (plain text under its button; any description stacks
-    the actions, `actions_stack`) and be `disabled` (muted, no stop,
-    asking nothing).
+    `description` (plain text under its button, wrapping at the
+    confirmation's width; any description stacks the actions,
+    `actions_stack`, each button at its own width) and be `disabled`
+    (muted, no stop, asking nothing). `.tone(ConfirmationTone::Destructive)`
+    marks a request as a risk: while `Requested` it draws a warning icon
+    (lucide `triangle-alert`) before the title, the `destructive_tint`
+    background and a `destructive` border; once answered it draws as the
+    default tone (`confirmation_frame` decides).
+  - `Loader` (`components/loader.rs`): a small spinner, lucide
+    `loader-circle` turned a twelfth of a turn per `step` (of
+    `LOADER_STEPS`), at `rems(0.5)` by default. It asks for no animation
+    frame: the owner moves `step` from a clock of its own and re-renders.
+  - `Shimmer` (`components/shimmer.rs`): one line of muted text with a
+    brighter band at `position` (in characters, `shimmer::levels`), cut
+    with an ellipsis. Like `Loader`, the owner moves the position; no run
+    is dimmer than `muted_foreground`.
   - `Alert`: shadcn's alert (`AlertVariant::{Default, Destructive}`,
     `alert_style`), lucide `circle-alert` by default, with the children as
     the description.
@@ -384,7 +423,9 @@ rule, not a convenience.
     the owner redraws on its own `on_modifiers_changed`.
   - `CodeBlock` (`components/code_block.rs`): a rounded `border` frame
     whose header, on the surface around it, holds the label in
-    `muted_foreground` and a ghost `IconXs` lucide `copy` button (tooltip
+    `muted_foreground` on one line (`trigger_label`: cut with an ellipsis
+    when it doesn't fit, never wrapped) and a ghost `IconXs` lucide `copy`
+    button that keeps its size (tooltip
     "Copy code", `COPY_CODE`), over the code in the owner's family
     (`.font`) in the foreground on `muted`, keeping its breaks and spaces
     and wrapping long lines (`shown_code` drops the one line break that
@@ -857,6 +898,13 @@ code comes from there.
 - **A change that contains the list's top item resets the offset to that
   item's start** (gpui's `ListState::splice`). An owner splices only the
   items that changed, so a growing last item moves nothing above it.
+- **The other side's message keeps a bubble and fills the row.** AI
+  Elements gives the assistant's content the full width with no bubble
+  around it, and caps only the person's bubble (`max-w-[80%]`), as here.
+  Brindle keeps a bordered bubble on the card behind the other side's
+  content, so a conversation's turns read apart on a zone's card, and
+  makes it fill the row: a message drawn in parts (one list item per
+  block) then has straight edges whatever each part's text.
 - **Hover actions are drawn only while the pointer is over the message**,
   so they take no focus; the owner gives each a keyboard path (an action).
 - **The prompt input's toolbar is under the frame**, not inside it, with
@@ -886,6 +934,18 @@ code comes from there.
   action can carry a description under its button (AI Elements' has
   none), which stacks the actions: an agent's login methods are chosen
   by what each does.
+- **Confirmation's destructive tone** has no AI Elements counterpart: a
+  pending request takes shadcn's destructive Alert look (the icon in the
+  destructive colour, a destructive border) but over `destructive_tint`,
+  the card mixed at most 12 % toward `destructive` while `card_foreground`
+  keeps 4.5:1 and `destructive` 3:1 on it, where shadcn's destructive
+  alert keeps the card background. A tint tells the row apart in a long
+  conversation; answered, it is plain again.
+- **Loader and Shimmer step from the owner's clock** (shadcn's `Spinner`
+  and AI Elements' `Shimmer` animate in CSS): gpui 0.2.2's repeating
+  animation asks for a frame per display frame, and with no view caching
+  each is a whole-window render, so the owner steps them 10 times a
+  second and only while they show.
 - **Alert's title wraps** (shadcn clamps it to one line): an app's titles
   name a failure and its cause and are read whole.
 - **Response reads no markup** (AI Elements' renders Markdown through
@@ -927,6 +987,27 @@ relying on them:
 - The tabs' dark look (shadcn's active pill on `input` at 30% with an
   `input` border) has unit tests of its colours but hasn't been looked at in
   a capture; only the light tokens have.
+
+## Notes for component authors
+
+Two quirks of gpui 0.2.2's text measure, which keeps a text's first
+measure for any later measure without a wrap width in the same layout:
+
+- **Ellipsis pitfall:** `truncate()`/`text_ellipsis` on a flex item cuts
+  nothing (the text keeps its first, natural-width measure). A one-line
+  label that must give way in a flex row uses `trigger_label` (a line clamp
+  of 1 laid over an invisible unwrapped copy), as tab triggers, tool rows
+  and code block labels do.
+- **Wrapping text pitfall:** in a flex row, a text item that may wrap
+  takes its width from the row (`flex_1().min_w_0()`: grow from a zero
+  basis) or has a definite width (`w_full()`, `w(..)`). A one-line label
+  uses `trigger_label`, or `flex_none()` when it must never shrink. A bare
+  `min_w_0()` on a text item with an automatic basis is the defect: its
+  basis comes from its own measure, which can be a narrower one taken
+  earlier in the layout, and the text then wraps at that width (a code
+  block's label measured 0px wide, one letter a line). The same holds for
+  a wrapping text sized to fit in a column (`items_start`): give it the
+  column's width.
 
 ## Wiring an app
 
@@ -1011,7 +1092,9 @@ background to its corners, and a pair without and with the ring, and the
 AI elements: a conversation (messages on both sides, one in three parts,
 tool rows, copy actions on hover) in a message scroller over a prompt input
 whose submits join it, and beside them a reasoning block, tool rows in
-three states, a permission confirmation and the two alerts, and a response
+three states, a loader and a shimmer moved 10 times a second (still under
+`--check`), a destructive permission confirmation, an answered one and the
+two alerts, and a response
 in an agent's bubble with every block kind (headings, every inline style,
 links with and without tooltips, nested numbered and bulleted lists, task
 marks, a quote, a labelled and an unlabelled code block, a rule, a table

@@ -232,7 +232,7 @@ impl SettingsDialog {
     // ---- rendering ----
 
     pub(super) fn render_clipboard(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let muted = t.muted_foreground;
         let state = &self.model.clipboard;
         let editable = state.editable();

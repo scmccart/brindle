@@ -26,18 +26,32 @@ use super::kitty::{Button, Caps};
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const CAPS: Caps = Caps { hints: false, buttons: true };
 
-/// A `ToastGeneric` toast with `title` and `body`, a button per label (its
-/// activation arguments `button=N`) and, when `silent`, no sound, escaped so
-/// markup in them stays text.
+/// The text lines a toast shows a `body` in: one per line, at most two
+/// (`ToastGeneric` shows a title and two text lines), a third and later
+/// joining the second with a space (OpenSpec change
+/// `agents-zone-attention`, decision 6). A body with no line break is one
+/// line, as an OSC source's always is.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn body_lines(body: &str) -> Vec<String> {
+    let mut lines = body.split('\n').map(|line| line.trim_end_matches('\r'));
+    let first = lines.next().unwrap_or_default().to_string();
+    let rest: Vec<&str> = lines.collect();
+    if rest.is_empty() { vec![first] } else { vec![first, rest.join(" ")] }
+}
+
+/// A `ToastGeneric` toast with `title` and `body` (a `<text>` per line,
+/// [`body_lines`]), a button per label (its activation arguments
+/// `button=N`) and, when `silent`, no sound, escaped so markup in them
+/// stays text.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn xml(title: &str, body: &str, buttons: &[String], silent: bool) -> String {
     let escape = |text: &str| {
         text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&apos;")
     };
+    let texts: String = body_lines(body).iter().map(|line| format!("<text>{}</text>", escape(line))).collect();
     let mut xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual>",
-        escape(title),
-        escape(body)
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text>{texts}</binding></visual>",
+        escape(title)
     );
     if !buttons.is_empty() {
         xml.push_str("<actions>");
@@ -222,6 +236,31 @@ mod tests {
             "<toast><visual><binding template=\"ToastGeneric\"><text>make &lt;all&gt; &amp; &quot;go&quot;</text>\
              <text>it&apos;s &lt;/text&gt;&lt;text&gt;done</text></binding></visual></toast>"
         );
+    }
+
+    /// The spec's "A Windows toast": a permission's two body lines are the
+    /// toast's two text lines; a third joins the second; an OSC body, with
+    /// no line break, stays one.
+    #[test]
+    fn a_body_line_is_a_text_line_at_most_two() {
+        let binding = |texts: &str| {
+            format!("<toast><visual><binding template=\"ToastGeneric\"><text>Fake needs permission</text>{texts}</binding></visual></toast>")
+        };
+        assert_eq!(
+            xml("Fake needs permission", "Command: cargo test", &[], false),
+            binding("<text>Command: cargo test</text>")
+        );
+        assert_eq!(
+            xml("Fake needs permission", "Command: cargo test\nReject · Allow once", &[], false),
+            binding("<text>Command: cargo test</text><text>Reject · Allow once</text>")
+        );
+        assert_eq!(
+            xml("Fake needs permission", "Command: cargo test\nReject · Allow once\nmore", &[], false),
+            binding("<text>Command: cargo test</text><text>Reject · Allow once more</text>")
+        );
+        assert_eq!(body_lines("build done"), ["build done"]);
+        assert_eq!(body_lines(""), [""]);
+        assert_eq!(body_lines("a\r\nb"), ["a", "b"]);
     }
 
     #[test]

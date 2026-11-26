@@ -49,7 +49,7 @@ use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
     Absorbed, AfterLogin, CancelLogin, ChatModel, First, Link, LoginChoice, LoginZoneEnd, Offer, ProfileFound, Replied,
-    Sent, Splice, Submit, Unqueue,
+    Sent, Splice, Submit, Unqueue, WorkingRow,
 };
 use crate::agent::shared::AgentShared;
 use crate::agent::sink::{AgentEvent, Feed, Sink, Taker};
@@ -150,6 +150,10 @@ impl Requests for crate::remote::AgentLink {
 pub enum AgentUpdate {
     /// The conversation's blocks changed, in order (`MessageScroller::splice`).
     Splices(Vec<Splice>),
+    /// The working row at the conversation's end changed (OpenSpec change
+    /// `agents-zone-attention`, decision 2), after any splices: the view
+    /// adds, keeps or drops its last item ([`view::working_splice`]).
+    Working(Option<WorkingRow>),
     /// A prompt was taken: the input empties.
     ClearDraft,
     /// Text the user didn't type goes into the input: a first prompt that
@@ -524,9 +528,12 @@ impl Agent {
     /// Hands what the model decided on: the view's splices, the status and
     /// title events, the first prompt's send.
     fn apply_absorbed(&mut self, absorbed: Absorbed, cx: &mut Context<Self>) {
-        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first } = absorbed;
+        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working } = absorbed;
         if !splices.is_empty() {
             cx.emit(AgentUpdate::Splices(splices));
+        }
+        if let Some(working) = working {
+            cx.emit(AgentUpdate::Working(working));
         }
         if status.is_some() {
             let notice = notice.map(|notice| Notice { source: Source::Agent, title: notice.title, body: notice.body });

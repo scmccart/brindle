@@ -331,6 +331,13 @@ pub struct Conversation {
     pub id: String,
     pub cwd: String,
     pub continuation: Continuation,
+    /// The conversation's title, once the agent gave one (ACP's
+    /// `session_info_update`; OpenSpec change `agents-session-title`).
+    /// Never empty: no title is `None`. Left out when unset, so an
+    /// untitled conversation encodes as before titles existed (protocol 4,
+    /// amended in place while unreleased).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// Which of ACP's `session/resume` and `session/load` the agent offered in
@@ -421,8 +428,9 @@ pub enum Event {
         state: AgentState,
     },
     /// The agent's conversation: sent when the agent gives or takes up an
-    /// ACP session, before its `Ready`. It stays through the agent's later
-    /// states, and a later one replaces it.
+    /// ACP session, before its `Ready`, and again when the agent retitles
+    /// it. It stays through the agent's later states, and a later one
+    /// replaces it.
     Conversation {
         conversation: Conversation,
     },
@@ -1236,7 +1244,7 @@ mod tests {
     fn a_replay_folds_back_to_the_same_log() {
         let mut rng = XorShift::new(0x7a5c_0001);
         let mut slots = [0usize; 3];
-        let mut conversations = [0usize; 2];
+        let mut conversations = [0usize; 3];
         let mut lost = 0usize;
         for _ in 0..400 {
             let transcript = random_transcript(&mut rng);
@@ -1245,7 +1253,11 @@ mod tests {
                 Slot::Waiting { .. } => 1,
                 Slot::Held { .. } => 2,
             }] += 1;
-            conversations[usize::from(transcript.conversation().is_some())] += 1;
+            conversations[match transcript.conversation() {
+                None => 0,
+                Some(Conversation { title: None, .. }) => 1,
+                Some(Conversation { title: Some(_), .. }) => 2,
+            }] += 1;
             lost += usize::from(matches!(transcript.agent(), AgentState::Lost { .. }));
             let replay = transcript.replay();
             for event in &replay {
@@ -1270,7 +1282,8 @@ mod tests {
         assert!(slots.iter().all(|&n| n > 0), "slots generated: {slots:?}");
         assert!(
             conversations.iter().all(|&n| n > 0),
-            "logs without and with a conversation: {conversations:?}"
+            "logs without a conversation, with an untitled one and with a titled one: \
+             {conversations:?}"
         );
         assert!(lost > 0, "no log ended with the agent lost");
     }
@@ -1280,7 +1293,43 @@ mod tests {
             id: id.into(),
             cwd: "/home/u/src".into(),
             continuation,
+            title: None,
         }
+    }
+
+    #[test]
+    fn a_titled_conversation_replaces_an_untitled_one_and_a_later_one_clears_it() {
+        let untitled = conversation("s1", Continuation::Resume);
+        let titled = Conversation {
+            title: Some("Hello.txt file creation".into()),
+            ..untitled.clone()
+        };
+        let mut transcript = Transcript::new();
+        for (next, title) in [
+            (&untitled, None),
+            (&titled, Some("Hello.txt file creation")),
+            (&untitled, None),
+        ] {
+            transcript
+                .apply(&Event::Conversation {
+                    conversation: next.clone(),
+                })
+                .unwrap();
+            assert_eq!(
+                transcript.conversation().and_then(|c| c.title.as_deref()),
+                title
+            );
+        }
+        // A replay carries the title.
+        transcript
+            .apply(&Event::Conversation {
+                conversation: titled.clone(),
+            })
+            .unwrap();
+        assert!(transcript.replay().contains(&Event::Conversation {
+            conversation: titled
+        }));
+        assert_eq!(fold(&transcript.replay()), Ok(transcript));
     }
 
     #[test]

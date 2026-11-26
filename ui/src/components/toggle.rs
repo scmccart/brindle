@@ -133,7 +133,7 @@ impl Styled for Toggle {
 
 impl RenderOnce for Toggle {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let style = toggle_style(self.variant, self.size, self.pressed, cx.ui_theme());
+        let style = toggle_style(self.variant, self.size, self.pressed, &cx.ui_theme());
         let (pressed, disabled) = (self.pressed, self.disabled);
         let (focus, on_click) = interaction(disabled, self.focus, self.on_click);
         let focused = focus.as_ref().is_some_and(|handle| handle.is_focused(window));
@@ -185,7 +185,7 @@ impl RenderOnce for Toggle {
             })
             .children(self.icon.map(|icon| icon.size(style.icon_size)))
             .children(self.label);
-        toggle = attach(toggle, tooltip);
+        toggle = attach(toggle, tooltip, cx.scoped_theme());
         // The owner's layout refinements win over the component's. The ring
         // follows the corners they leave.
         toggle.style().refine(&self.style);

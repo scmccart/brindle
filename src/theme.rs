@@ -292,6 +292,9 @@ impl Theme {
             muted: Some(self.card_muted_foreground().hsla()),
             border: Some(self.card_border().hsla()),
             surround: Some(background),
+            // The active tokens' ring; an agent zone, drawn in a theme
+            // scope, sets the window's.
+            ring: None,
         }
     }
 
@@ -302,12 +305,36 @@ impl Theme {
     /// helpers above are inputs to them (`card_border` and
     /// `card_muted_foreground` also colour the zone cards).
     pub fn ui_tokens(&self) -> brindle_ui::Tokens {
-        let bg = self.chrome_background();
-        let fg = self.foreground.legible_on(bg, 4.5);
-        let raised = bg.mix(fg, 0.04);
-        let surface = bg.mix(fg, 0.08);
+        self.tokens_over(self.chrome_background())
+    }
+
+    /// The token set an agent zone drawn in this theme uses: derived as
+    /// [`Theme::ui_tokens`] is, but over the theme's own background, the
+    /// one the zone's card shows, so its `card` and `muted` surfaces are
+    /// faint steps up from what the zone shows rather than from the darker
+    /// chrome (`agents-zone-theme-scope` decision 2).
+    pub fn zone_tokens(&self) -> brindle_ui::Tokens {
+        self.tokens_over(self.background)
+    }
+
+    /// The token derivation both sets share, over `bg`: `card` and
+    /// `popover` are `bg` mixed 4% towards the foreground, `muted` and
+    /// `secondary` 8%, `accent` 12%; the border is `card_border`; primary,
+    /// ring and link come from the accent and destructive from the red.
+    fn tokens_over(&self, bg: Color) -> brindle_ui::Tokens {
+        let base = self.foreground.legible_on(bg, 4.5);
+        let raised = bg.mix(base, 0.04);
+        let surface = bg.mix(base, 0.08);
+        // Text on the muted surface (a code block) must read too: a low
+        // contrast theme's own background (solarized-dark's zone set) can
+        // leave the foreground just short there. The surfaces are mixed
+        // from the unpushed colour, so pushing it doesn't move them.
+        let fg = base.legible_on(surface, 4.5);
         let accent = self.accent();
-        let destructive = self.ansi[1];
+        // The red as a warning icon and border on the card (a pending
+        // permission, `agents-zone-attention`): pushed only when it is
+        // short of 3:1 there (gruvbox-dark's on the darker chrome).
+        let destructive = self.ansi[1].legible_on(raised, 3.0);
         let border = self.card_border();
         let mut tokens = if self.is_dark() {
             brindle_ui::Tokens::neutral_dark()
@@ -325,11 +352,14 @@ impl Theme {
         tokens.secondary = surface.hsla();
         tokens.secondary_foreground = fg.legible_on(surface, 4.5).hsla();
         tokens.muted = surface.hsla();
-        tokens.muted_foreground = self.muted_foreground().legible_on(bg, 3.0).hsla();
+        // On the card too (an agent message's labels), pushed only when the
+        // background's push leaves it short there.
+        tokens.muted_foreground = self.muted_foreground().legible_on(bg, 3.0).legible_on(raised, 3.0).hsla();
         tokens.accent = bg.mix(fg, 0.12).hsla();
         tokens.accent_foreground = fg.legible_on(bg.mix(fg, 0.12), 4.5).hsla();
         tokens.destructive = destructive.hsla();
         tokens.destructive_foreground = destructive.on_color().hsla();
+        tokens.destructive_tint = destructive_tint(raised, fg, destructive).hsla();
         tokens.border = border.hsla();
         tokens.input = border.hsla();
         tokens.ring = accent.hsla();
@@ -339,6 +369,24 @@ impl Theme {
         tokens.dark = self.is_dark();
         tokens
     }
+}
+
+/// How far a destructive tint goes from the card towards the destructive
+/// colour at most (OpenSpec change `agents-zone-attention`, decision 4).
+pub const DESTRUCTIVE_TINT_MAX: f32 = 0.12;
+
+/// The background of a pending permission: `card` mixed towards
+/// `destructive` as far as keeps `text` at 4.5:1 and `destructive` itself
+/// (the warning icon and border) at 3:1 on it, at most
+/// [`DESTRUCTIVE_TINT_MAX`] of the way, in steps of 1%; the card itself
+/// when no step does.
+pub fn destructive_tint(card: Color, text: Color, destructive: Color) -> Color {
+    let steps = (DESTRUCTIVE_TINT_MAX * 100.0).round() as u32;
+    (0..=steps)
+        .rev()
+        .map(|step| card.mix(destructive, step as f32 / 100.0))
+        .find(|tint| text.contrast(*tint) >= 4.5 && destructive.contrast(*tint) >= 3.0)
+        .unwrap_or(card)
 }
 
 const fn palette(colors: [u32; 16]) -> [Color; 16] {
@@ -798,10 +846,102 @@ mod tests {
         assert!(mixes.contains(&link), "{link:?} is not a mix of the accent towards black");
     }
 
+    /// The window set keeps the values it had before its derivation was
+    /// shared with the zone set (`brindle --export-ui-tokens` at e301fad).
+    #[test]
+    fn ui_tokens_keep_their_values() {
+        let cases = [
+            ("brindle-dark", ["#121110", "#1a1918", "#22211f", "#2a2827", "#83807b", "#32302e"]),
+            ("brindle-light", ["#faf7f3", "#f2efeb", "#eae7e3", "#e2dfdb", "#888580", "#dfdbd4"]),
+        ];
+        for (name, [background, card, muted, accent, muted_foreground, border]) in cases {
+            let t = builtin_theme(name).unwrap().ui_tokens();
+            assert_eq!(css_color(t.background), background, "{name}");
+            assert_eq!(css_color(t.card), card, "{name}");
+            assert_eq!(css_color(t.popover), card, "{name}");
+            assert_eq!(css_color(t.muted), muted, "{name}");
+            assert_eq!(css_color(t.secondary), muted, "{name}");
+            assert_eq!(css_color(t.accent), accent, "{name}");
+            assert_eq!(css_color(t.muted_foreground), muted_foreground, "{name}");
+            assert_eq!(css_color(t.border), border, "{name}");
+        }
+    }
+
+    /// The zone set is the window set's derivation over the theme's own
+    /// background: its surfaces are mixes of that background, and its
+    /// accent-derived and red-derived colours match the window set's.
+    #[test]
+    fn zone_tokens_sit_on_the_themes_own_background() {
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            let (zone, window) = (theme.zone_tokens(), theme.ui_tokens());
+            let fg = theme.foreground.legible_on(theme.background, 4.5);
+            assert_eq!(zone.background, theme.background.hsla(), "{name}");
+            assert_eq!(zone.card, theme.background.mix(fg, 0.04).hsla(), "{name}");
+            assert_eq!(zone.popover, zone.card, "{name}");
+            assert_eq!(zone.muted, theme.background.mix(fg, 0.08).hsla(), "{name}");
+            assert_eq!(zone.secondary, zone.muted, "{name}");
+            assert_eq!(zone.accent, theme.background.mix(fg, 0.12).hsla(), "{name}");
+            assert_eq!(zone.border, theme.card_border().hsla(), "{name}");
+            assert_eq!(zone.input, zone.border, "{name}");
+            assert_eq!(color_of(zone.primary), theme.accent(), "{name}");
+            assert_eq!(color_of(zone.ring), theme.accent(), "{name}");
+            let card = theme.background.mix(fg, 0.04);
+            assert_eq!(color_of(zone.destructive), theme.ansi[1].legible_on(card, 3.0), "{name}");
+            assert_eq!(zone.dark, window.dark, "{name}");
+            assert_ne!(zone.background, window.background, "{name}: the zone set is on the chrome background");
+        }
+    }
+
+    /// The spec's scenarios: a background of `#282020` stays the zone
+    /// set's background and is darkened for the window's, and an accent
+    /// of `#7aa2f7` is the zone set's primary and ring.
+    #[test]
+    fn zone_tokens_follow_the_spec_scenarios() {
+        let theme = Theme {
+            background: Color::hex(0x282020),
+            accent: Some(Color::hex(0x7aa2f7)),
+            ..Theme::default()
+        };
+        let zone = theme.zone_tokens();
+        assert_eq!(css_color(zone.background), "#282020");
+        let darkened = Color::hex(0x282020).mix(Color::hex(0x000000), 0.35);
+        assert_eq!(css_color(theme.ui_tokens().background), css_color(darkened.hsla()));
+        assert_eq!(css_color(zone.primary), "#7aa2f7");
+        assert_eq!(css_color(zone.ring), "#7aa2f7");
+    }
+
+    /// The tint goes the whole 12% when that stays legible, stops short
+    /// when it wouldn't, and is the card when no step is.
+    #[test]
+    fn the_destructive_tint_stops_where_it_stays_legible() {
+        let (white, black, red) = (Color::hex(0xffffff), Color::hex(0x0a0a0a), Color::hex(0xe7000b));
+        assert_eq!(destructive_tint(white, black, red), white.mix(red, 0.12));
+        // Mid-grey text on a mid-grey card is never legible: the card.
+        let grey = Color::hex(0x777777);
+        assert_eq!(destructive_tint(grey, Color::hex(0x888888), red), grey);
+        // Text just legible on the card loses it a little way in.
+        let card = Color::hex(0xffffff);
+        let text = Color::hex(0x737373);
+        let tint = destructive_tint(card, text, red);
+        assert!(tint != card.mix(red, 0.12) && text.contrast(tint) >= 4.5, "{tint:?}");
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            for t in [theme.ui_tokens(), theme.zone_tokens()] {
+                let (card, tint) = (color_of(t.card), color_of(t.destructive_tint));
+                let red = color_of(t.destructive);
+                let step = (0..=12).find(|step| card.mix(red, *step as f32 / 100.0) == tint);
+                assert!(step.is_some(), "{name}: {tint:?} isn't the card towards the red");
+            }
+        }
+    }
+
     #[test]
     fn ui_tokens_are_legible_for_every_builtin() {
-        for name in BUILTIN_THEMES {
-            let t = builtin_theme(name).unwrap().ui_tokens();
+        for (name, set, t) in BUILTIN_THEMES.iter().flat_map(|name| {
+            let theme = builtin_theme(name).unwrap();
+            [(*name, "window", theme.ui_tokens()), (*name, "zone", theme.zone_tokens())]
+        }) {
             let pairs = [
                 ("foreground", t.foreground, t.background, 4.5),
                 ("muted_foreground", t.muted_foreground, t.background, 3.0),
@@ -815,10 +955,14 @@ mod tests {
                 ("link on background", t.link, t.background, 4.5),
                 ("foreground on muted", t.foreground, t.muted, 4.5),
                 ("muted_foreground on card", t.muted_foreground, t.card, 3.0),
+                // A pending permission's title, icon and border
+                // (agents-zone-attention).
+                ("card_foreground on destructive_tint", t.card_foreground, t.destructive_tint, 4.5),
+                ("destructive on destructive_tint", t.destructive, t.destructive_tint, 3.0),
             ];
             for (label, fg, bg, min) in pairs {
                 let ratio = color_of(fg).contrast(color_of(bg));
-                assert!(ratio >= min, "{name}: {label} contrast {ratio:.2} < {min}");
+                assert!(ratio >= min, "{name} ({set} set): {label} contrast {ratio:.2} < {min}");
             }
         }
     }

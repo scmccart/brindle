@@ -292,6 +292,7 @@ mod tests {
             id: "sess-1".into(),
             cwd: "/home/u/src".into(),
             continuation: crate::agent::transcript::Continuation::Resume,
+            title: None,
         }
     }
 

@@ -49,6 +49,24 @@ pub mod theme {
     /// terminal theme's colours (`Theme::card_border`), so an `e2e` tab's
     /// cards are drawn in it too.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
+    /// The window set's `muted` token for the `e2e` theme, a code block's
+    /// surface and the person's bubble outside an agent zone:
+    /// `CHROME_BACKGROUND` mixed 8% towards the foreground
+    /// (`Theme::ui_tokens`; `FOREGROUND` is legible on the chrome's
+    /// background as it is).
+    pub const WINDOW_MUTED: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    /// The window set's `card` token for the `e2e` theme, an agent's
+    /// bubble and a permission outside an agent zone: `CHROME_BACKGROUND`
+    /// mixed 4% towards the foreground.
+    pub const WINDOW_CARD: Rgb = Rgb(0x11, 0x14, 0x17);
+    /// The window set's `popover` token for the `e2e` theme, a menu's
+    /// panel: the same mix as its `card`.
+    pub const WINDOW_POPOVER: Rgb = WINDOW_CARD;
+    /// The zone set's `muted` token for the `e2e` theme, an agent zone's
+    /// code block and the person's bubble in an `e2e` tab: `BACKGROUND`
+    /// (the theme's own, `Theme::zone_tokens`) mixed 8% towards the
+    /// foreground.
+    pub const ZONE_MUTED: Rgb = Rgb(0x1e, 0x22, 0x25);
 
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
@@ -74,6 +92,17 @@ pub mod theme {
     /// mixed 45% towards the background (#6a6666, 2.8:1 on it), pushed 5%
     /// towards white to reach 3:1 (`Theme::card_muted_foreground`).
     pub const ALT_CARD_MUTED: Rgb = Rgb(0x71, 0x6e, 0x6e);
+    /// The zone set's `card` token in such a theme, an agent zone's agent
+    /// bubble and permission: `ALT_BACKGROUND` (the theme's own,
+    /// `Theme::zone_tokens`) mixed 4% towards `ALT_FOREGROUND`, which is
+    /// legible on it as it is.
+    pub const ALT_ZONE_CARD: Rgb = Rgb(0x2d, 0x25, 0x25);
+    /// The zone set's `popover` token in such a theme, the zone header's
+    /// menu: the same mix as its `card`.
+    pub const ALT_ZONE_POPOVER: Rgb = ALT_ZONE_CARD;
+    /// The zone set's `muted` token in such a theme, an agent zone's code
+    /// block: `ALT_BACKGROUND` mixed 8% towards `ALT_FOREGROUND`.
+    pub const ALT_ZONE_MUTED: Rgb = Rgb(0x32, 0x2a, 0x2a);
 }
 
 /// The test config, with `theme_name` as the global theme. Its one profile,
@@ -825,8 +854,8 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 9] =
-    ["agent ", "login ", "note ", "entry ", "block ", "link ", "queued ", "conversation ", "prompt "];
+const AGENT_LINES: [&str; 10] =
+    ["agent ", "login ", "note ", "entry ", "block ", "link ", "working ", "queued ", "conversation ", "prompt "];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -871,6 +900,12 @@ pub struct Dump {
     /// then `--- badge zone=ID …` for the active tab's zones), one line
     /// each without the prefix.
     pub badges: Vec<String>,
+    /// The spinners shown in place of a working dot (`--- spinner tab=N`
+    /// for each tab face with one, then `--- spinner zone=ID` for the
+    /// active tab's zone headers), one line each without the prefix.
+    pub spinners: Vec<String>,
+    /// Whether the motion clock runs (`--- motion running|stopped`).
+    pub motion: Option<String>,
     /// The label a mouse copy or paste shows at the pointer, while one isn't
     /// gone (`--- feedback kind=copied|pasted|nothing-to-paste`): the kind.
     pub feedback: Option<String>,
@@ -983,6 +1018,11 @@ impl Dump {
                 dump.contexts.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- badge ") {
                 dump.badges.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- spinner ") {
+                dump.spinners.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- motion ") {
+                dump.motion = Some(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- feedback ") {
                 dump.feedback = rest.strip_prefix("kind=").map(str::to_string);
             } else if let Some(rest) = line.strip_prefix("--- pointer ") {
@@ -1058,6 +1098,11 @@ impl Dump {
             .iter()
             .filter_map(|line| line.strip_prefix("entry ")?.split_once(' ').map(|(_, rest)| rest))
             .collect()
+    }
+
+    /// The working row's text (`--- working "TEXT"`), while it shows.
+    pub fn agent_working(&self) -> Option<String> {
+        self.agent.iter().find_map(|line| unquote(line.strip_prefix("working ")?))
     }
 
     /// Entry `entry`'s parts (`--- block entry=N part=P kind=K "TEXT"`),
@@ -1285,6 +1330,15 @@ pub fn self_test_dump() -> Result {
         dump.badges
     );
     ensure!(dump.screen == ["hi"], "screen after contexts {:?}", dump.screen);
+    // Spinners after the badges, before the screen's text; the motion line
+    // after it, before the focus line, ends the screen.
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- spinner tab=2\n--- spinner zone=3\nhi\n\
+         --- motion running\n--- focus terminal modality=keyboard\n",
+    );
+    ensure!(dump.spinners == ["tab=2", "zone=3"], "spinners {:?}", dump.spinners);
+    ensure!(dump.motion.as_deref() == Some("running"), "motion {:?}", dump.motion);
+    ensure!(dump.screen == ["hi"], "screen beside the spinners and motion {:?}", dump.screen);
     ensure!(dump.pointer.is_none(), "no pointer line: {:?}", dump.pointer);
     ensure!(dump.feedback.is_none(), "no feedback line: {:?}", dump.feedback);
     for kind in ["copied", "pasted", "nothing-to-paste"] {
@@ -1311,10 +1365,12 @@ pub fn self_test_dump() -> Result {
          continue=none:not-ended\n\
          --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n\
          --- block entry=2 part=0 kind=paragraph \"Hello!\"\n\
-         --- link entry=2 part=0 target=\"https://example.com\" text=\"Hello\" action=open\n--- queued waiting \"next\"\n\
+         --- link entry=2 part=0 target=\"https://example.com\" text=\"Hello\" action=open\n--- working \"Working…\"\n\
+         --- queued waiting \"next\"\n\
          --- conversation entries=2 at=end\n--- prompt status=ready\n--- focus other modality=keyboard\n",
     );
-    ensure!(dump.agent.len() == 9, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent.len() == 10, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent_working().as_deref() == Some("Working…"), "working {:?}", dump.agent);
     ensure!(dump.agent_blocks(2) == ["part=0 kind=paragraph \"Hello!\""], "blocks {:?}", dump.agent_blocks(2));
     ensure!(dump.agent_blocks(1).is_empty() && dump.agent_links(1).is_empty(), "entry 1's {:?}", dump.agent);
     ensure!(

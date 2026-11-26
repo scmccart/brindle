@@ -28,21 +28,33 @@ The active token set SHALL be rebuilt at startup, when the config is reloaded, a
 - **THEN** component colours change to the new theme without other action
 
 ### Requirement: Chrome ignores per-tab themes
-The token set SHALL come from the global (window default) theme only. A profile that sets its own theme SHALL change its terminal, not the component tokens.
+The window's token set SHALL come from the global (window default) theme only. A profile that sets its own theme SHALL change its terminal, and its agent zones' token set, not the window's token set.
 
 #### Scenario: Profile theme tab active
 - **WHEN** the active tab's profile sets `theme = "gruvbox-dark"` and the global theme is `tokyo-night`
 - **THEN** component tokens stay derived from `tokyo-night`
 
+#### Scenario: Agent profile theme
+- **WHEN** the active tab is an agent tab whose profile sets `theme = "gruvbox-dark"` and the global theme is `tokyo-night`
+- **THEN** the tab strip, the find bar and every overlay outside the agent zone are drawn with `tokyo-night`'s tokens, and the agent zone with the zone token set of `gruvbox-dark`
+
 ### Requirement: Legible token pairs
-For every built-in theme, the foreground on background, muted foreground on background, primary foreground on primary, destructive foreground on destructive, foreground on muted, link on card, link on background and muted foreground on card pairs SHALL each reach a contrast ratio of at least 4.5:1 (3:1 for muted foreground on background and on card).
+For every built-in theme, in both its window token set and its zone token set, the foreground on background, muted foreground on background, primary foreground on primary, destructive foreground on destructive, foreground on muted, link on card, link on background and muted foreground on card pairs SHALL each reach a contrast ratio of at least 4.5:1 (3:1 for muted foreground on background and on card). The card foreground on the destructive tint (the card with the destructive colour laid over it at the tint's strength) SHALL reach 4.5:1, and the destructive colour on that tint 3:1.
 
 #### Scenario: Every built-in theme
 - **WHEN** tokens are derived from each built-in theme
 - **THEN** every listed pair meets its minimum contrast
 
+#### Scenario: Every built-in theme's zone set
+- **WHEN** zone tokens are derived from each built-in theme
+- **THEN** every listed pair meets its minimum contrast
+
+#### Scenario: A pending permission's text
+- **WHEN** a pending permission row is drawn in any built-in theme
+- **THEN** its title on the tinted background reaches 4.5:1, and its warning icon and border 3:1
+
 ### Requirement: Window chrome uses the tokens
-The tab strip, the find bar, the window border and the drag preview of a tab SHALL take their colours from the active token set: background, border, foreground, muted foreground, accent and primary. They SHALL NOT follow any tab's profile theme. The exceptions SHALL be each tab's face in the strip, active or not, drawn in that tab's terminal colours as the `tabs` capability specifies, and each zone's card and header bar, drawn in that zone's terminal colours as the `zones` capability specifies, with the card's border derived from them. The ring colour and the program status colours SHALL stay those of the tokens and the global theme.
+The tab strip, the find bar, the window border and the drag preview of a tab SHALL take their colours from the active token set: background, border, foreground, muted foreground, accent and primary. They SHALL NOT follow any tab's profile theme. The exceptions SHALL be each tab's face in the strip, active or not, drawn in that tab's terminal colours as the `tabs` capability specifies, each zone's card and header bar, drawn in that zone's terminal colours as the `zones` capability specifies, with the card's border derived from them, and each agent zone's contents and header buttons, drawn in that zone's token set as the `agent-zones` capability specifies. The ring colour and the program status colours SHALL stay those of the tokens and the global theme.
 
 #### Scenario: Profile theme tab active
 - **WHEN** the active tab's profile sets `theme = "gruvbox-dark"` and the global theme is `tokyo-night`
@@ -77,3 +89,14 @@ The token set SHALL have a link colour: the theme's accent, pushed towards black
 #### Scenario: Accent too light
 - **WHEN** the window's default theme is `brindle-light`, whose accent `#b56a12` reads at under 4.5:1 on its card
 - **THEN** the link colour is a darker mix of `#b56a12` that reads at 4.5:1 or more on the card
+
+### Requirement: Zone token sets
+A theme SHALL also give a zone token set, derived as its window token set is but over the theme's own background: its background token SHALL be the theme's background, and its card, muted, accent and border colours mixes of that background and the theme's foreground. Its primary, ring and link SHALL come from the theme's accent and its destructive from the theme's red, as in the window set.
+
+#### Scenario: Background is the theme's
+- **WHEN** zone tokens are derived from a theme whose background is `#282020`
+- **THEN** the zone set's background token is `#282020`, while the window set's is that background mixed towards black
+
+#### Scenario: Accent carries over
+- **WHEN** zone tokens are derived from a theme whose accent is `#7aa2f7`
+- **THEN** the zone set's primary and ring are `#7aa2f7`

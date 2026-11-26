@@ -237,7 +237,7 @@ impl Styled for Card {
 
 impl RenderOnce for Card {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let s = card_style(cx.ui_theme()).with_colors(self.colors);
+        let s = card_style(&cx.ui_theme()).with_colors(self.colors);
         let radius = s.radius.to_pixels(window.rem_size());
         let border = s.border_width;
         let surround = s.surround;

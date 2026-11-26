@@ -32,6 +32,7 @@ use crate::components::menu::{
 };
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::primitives::overlay::Overlay;
+use crate::theme::Tokens;
 
 /// A context menu. One serves any number of targets: each open replaces
 /// what was open.
@@ -60,6 +61,19 @@ impl ContextMenu {
     /// The open menu, to read its entries and highlight.
     pub fn menu(&self) -> Option<&Entity<Menu>> {
         self.overlay.view()
+    }
+
+    /// Draws the menus it opens from now on in `tokens` (`None`: the
+    /// window's set), as [`Overlay::tokens`] does: for a menu opened from a
+    /// part of the window drawn in a theme scope, set before each open,
+    /// since one context menu serves every target.
+    pub fn set_tokens(&mut self, tokens: Option<Tokens>) {
+        self.overlay.set_tokens(tokens);
+    }
+
+    /// The set its menus are drawn in, when not the window's.
+    pub fn token_set(&self) -> Option<&Tokens> {
+        self.overlay.token_set()
     }
 
     /// Opens a menu of `entries` with its corner at `at` (window

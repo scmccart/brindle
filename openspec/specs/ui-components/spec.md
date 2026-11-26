@@ -6,11 +6,15 @@ Give Brindle's interface one shared set of themed components and overlay behavio
 ## Requirements
 
 ### Requirement: Components draw from the active tokens
-Every component SHALL take its colours, corner radius and text sizes only from the active token set: background, foreground, card, popover, primary, secondary, muted, accent, destructive (each with its foreground), border, input, ring and radius. Replacing the active token set SHALL redraw every visible component with the new values, with no other step.
+Every component SHALL take its colours, corner radius and text sizes only from the active token set: background, foreground, card, popover, primary, secondary, muted, accent, destructive (each with its foreground), border, input, ring and radius. The active token set SHALL be that of the innermost theme scope the component is drawn in, else the window's. Replacing the window's token set SHALL redraw every visible component outside a theme scope with the new values, with no other step.
 
 #### Scenario: Switching to dark tokens
 - **WHEN** the gallery shows a default button with the light token set active, and the dark token set is made active
 - **THEN** the button is redrawn in the dark set's primary and primary-foreground colours
+
+#### Scenario: Inside a scope
+- **WHEN** the window's token set is the light one and a default button is drawn inside a theme scope of the dark set
+- **THEN** the button is drawn in the dark set's primary and primary-foreground colours, and a button beside the scope in the light set's
 
 ### Requirement: Built-in neutral token sets
 The component set SHALL provide a light and a dark token set matching shadcn/ui's neutral theme. A dark set's border and input colours SHALL be the foreground at low opacity, as in shadcn/ui.
@@ -416,7 +420,7 @@ A card SHALL be a bordered, rounded surface with an optional header row above it
 - **THEN** its content fills the whole card inside the border
 
 ### Requirement: Card colours and ring
-A card's surface, text, muted text and border colours SHALL come from its owner, and default to the card, foreground, muted foreground and border tokens. The owner SHALL be able to turn the focus ring on, and the ring SHALL be drawn outside the card's border like a control's.
+A card's surface, text, muted text, border and ring colours SHALL come from its owner, and default to the card, foreground, muted foreground, border and ring tokens. The owner SHALL be able to turn the focus ring on, and the ring SHALL be drawn outside the card's border like a control's.
 
 #### Scenario: Default colours
 - **WHEN** a card is drawn without colours from its owner
@@ -429,6 +433,10 @@ A card's surface, text, muted text and border colours SHALL come from its owner,
 #### Scenario: Ring outside the border
 - **WHEN** the owner turns the ring on
 - **THEN** a 3-pixel band in the ring colour is drawn just outside the border, taking no layout room
+
+#### Scenario: Owner's ring colour
+- **WHEN** a card is drawn inside a theme scope, its owner gives it the window set's ring colour, and turns the ring on
+- **THEN** the ring is drawn in the window set's ring colour, not the scope's
 
 ### Requirement: Rounded corners over content
 A card SHALL keep its rounded corners when its content paints to the corners, by painting the area outside the rounded edge in a surround colour given by its owner, above the content and below the border.
@@ -456,11 +464,23 @@ A message scroller SHALL show a list of items of different heights, scrolled to 
 - **THEN** the items in view don't move, and the scroll button shows
 
 ### Requirement: Messages
-A message SHALL show one turn's text in a bubble, aligned to the end for the person and to the start for the other side, the person's in the muted colours and the other's on the card. A message SHALL keep its text's line breaks and wrap long lines, and SHALL be able to carry actions shown while the pointer is over it.
+A message SHALL show one turn's text in a bubble, aligned to the end for the person and to the start for the other side, the person's in the muted colours and the other's on the card. The other side's bubble SHALL fill the width of its row. The person's bubble SHALL be as wide as its text, up to four fifths of the row. A message drawn in parts SHALL give every part the same width, so its parts form one bubble with straight edges. A message SHALL keep its text's line breaks and wrap long lines, and SHALL be able to carry actions shown while the pointer is over it.
 
 #### Scenario: Two sides
 - **WHEN** a person's message and an agent's message are shown
 - **THEN** the person's bubble sits at the end in the muted colours, and the agent's at the start
+
+#### Scenario: The other side fills the row
+- **WHEN** an agent's message holding only the word `ok` is shown in a row 600 pixels wide
+- **THEN** its bubble is as wide as the row
+
+#### Scenario: The person's bubble fits its text
+- **WHEN** a person's message holding only the word `ok` is shown in a row 600 pixels wide
+- **THEN** its bubble is narrower than half the row and sits at the row's end
+
+#### Scenario: Parts of different lengths
+- **WHEN** an agent's message is drawn in two parts, the first the word `short` and the second a paragraph wider than the row
+- **THEN** both parts are as wide as the row, the paragraph wraps inside it, and the two parts' left and right edges line up
 
 ### Requirement: Prompt input
 A prompt input SHALL hold a textarea and a toolbar with a submit button. The owner SHALL give it a status: ready (an arrow; disabled while the text is blank), submitted (a spinner, disabled), streaming (a stop square) or disabled. A press on the submit button, or enter in the textarea, SHALL ask the owner to submit when ready; in streaming, the button SHALL ask the owner to stop.
@@ -499,7 +519,7 @@ A tool row SHALL be one line: an icon the owner chooses, a title cut with an ell
 - **THEN** the title is cut with an ellipsis, and the status badge stays whole
 
 ### Requirement: Confirmations
-A confirmation SHALL show a title and, while requested, one small button per action the owner gives, each a keyboard stop activated by enter or space or a primary click. Once the owner marks it accepted, rejected or cancelled, it SHALL show that outcome with the chosen action's label and no buttons.
+A confirmation SHALL show a title and, while requested, one small button per action the owner gives, each a keyboard stop activated by enter or space or a primary click. Once the owner marks it accepted, rejected or cancelled, it SHALL show that outcome with the chosen action's label and no buttons. An owner SHALL be able to give it the destructive tone, which while requested draws a warning icon in the destructive colour before the title, a background tinted with the destructive colour and a border in it; answered, it SHALL be drawn in the default tone.
 
 #### Scenario: Requested
 - **WHEN** a confirmation is requested with actions `Allow once` and `Reject`
@@ -508,6 +528,14 @@ A confirmation SHALL show a title and, while requested, one small button per act
 #### Scenario: Answered
 - **WHEN** the owner marks a confirmation accepted with `Allow once`
 - **THEN** it shows `Allow once` as the outcome and no buttons
+
+#### Scenario: Destructive tone
+- **WHEN** a requested confirmation has the destructive tone
+- **THEN** it shows the warning icon, the tinted background and the destructive border, and its actions keep the variants the owner gave them
+
+#### Scenario: Destructive tone once answered
+- **WHEN** the owner marks a destructive confirmation rejected with `Reject`
+- **THEN** it shows the outcome in the default tone, with no icon, tint or destructive border
 
 ### Requirement: Alerts
 An alert SHALL be a bordered block with an icon, a title and a description, in the default colours or, for the destructive variant, with its title and icon in the destructive colour. It SHALL take no focus.
@@ -528,11 +556,19 @@ A response SHALL draw a list of blocks the owner gives as plain data: paragraphs
 - **THEN** the items are numbered 3 and 4, and the bulleted list is indented under item 4
 
 ### Requirement: Response code blocks
-A response's code block SHALL draw its text in the owner's code font on the muted surface inside a border, keeping line breaks and spaces, with its label (when it has one) and a copy button above the code. The copy button SHALL be pointer-only, taking no keyboard focus, and SHALL give the owner the block's text; the response SHALL NOT write the clipboard itself.
+A response's code block SHALL draw its text in the owner's code font on the muted surface inside a border, keeping line breaks and spaces, with its label (when it has one) and a copy button above the code. The label SHALL stay on one line: it SHALL NOT wrap, and when it is wider than the room beside the copy button it SHALL be cut with an ellipsis. The copy button SHALL be pointer-only, taking no keyboard focus, and SHALL give the owner the block's text; the response SHALL NOT write the clipboard itself.
 
 #### Scenario: Copy button
 - **WHEN** the user presses a code block's copy button
 - **THEN** the owner is given that block's text, and keyboard focus doesn't move
+
+#### Scenario: A short label inside a message
+- **WHEN** a code block labelled `rust` is drawn inside an agent's message in a row 600 pixels wide
+- **THEN** the label `rust` shows on one line, as wide as its text, above the code
+
+#### Scenario: A label too long for its row
+- **WHEN** a code block's label is wider than the room left beside its copy button
+- **THEN** the label is one line cut with an ellipsis, and the copy button stays whole
 
 ### Requirement: Response links
 A response SHALL draw each link run in the link colour, underlined. A press released over the same link SHALL be reported to the owner with the link and the modifiers held; the response SHALL show a pointing hand over a link only while the modifiers the owner names are held, and a tooltip with the owner's text for a link that has one.
@@ -569,3 +605,62 @@ A confirmation's action MAY carry a description, shown as plain text under its b
 #### Scenario: Action descriptions
 - **WHEN** a confirmation is requested with actions `Log in with Google`, `API Key` described `Use an API key`, and a disabled `Log in from the terminal`
 - **THEN** the three buttons show one under another in that order, `Use an API key` shows under `API Key`, tab from `Log in with Google` reaches `API Key`, and tab from `API Key` leaves the confirmation
+
+### Requirement: Text wraps at its container's width
+A component's text that may wrap SHALL wrap only at the width its container gives it, whatever the text measured before in the same frame and whatever width the container had in the frame before. A one-line label SHALL stay on one line, giving way with an ellipsis rather than wrapping.
+
+#### Scenario: Reason line in a narrow input
+- **WHEN** a prompt input 240 pixels wide shows the reason `connecting to the terminal server`
+- **THEN** the reason wraps at the input's width, its first line holding at least the word `connecting`, and no line holds a single letter
+
+#### Scenario: After the width changes
+- **WHEN** a prompt input showing a reason is drawn 600 pixels wide and then, in the next frame, 240 pixels wide
+- **THEN** the reason wraps at 240 pixels as it would have had it been drawn at that width first
+
+### Requirement: Theme scopes
+An owner SHALL be able to draw a part of its view inside a theme scope with a token set of its own. Every component in that part SHALL take its colours from the scope's set while it is laid out, prepainted and painted, including list items laid out only when they come into view. A scope inside another SHALL win inside it. Entering or leaving a scope SHALL NOT redraw or notify anything outside it, and components outside it SHALL keep the window's set.
+
+#### Scenario: Nested scopes
+- **WHEN** a button is drawn in a scope of set B inside a scope of set A, and another button in A's scope beside it
+- **THEN** the first button is drawn in set B's colours and the second in set A's
+
+#### Scenario: A list item scrolled into view
+- **WHEN** a message scroller inside a scope of the dark set is scrolled so that an item comes into view
+- **THEN** that item's bubble is drawn in the dark set's colours
+
+#### Scenario: Paint-time colours
+- **WHEN** a focused textarea is drawn inside a scope of the dark set with a selection
+- **THEN** its cursor and selection are drawn in the dark set's colours
+
+### Requirement: Tooltips and overlays in a theme scope
+A tooltip on a component drawn inside a theme scope SHALL be drawn in the scope's token set, at the window's text size. An overlay its owner opens with a token set (a menu, a popover) SHALL be drawn in that set; one opened without a set SHALL be drawn in the window's.
+
+#### Scenario: Tooltip inside a scope
+- **WHEN** the pointer rests on a button drawn inside a scope of the dark set while the window's set is the light one
+- **THEN** its tooltip is drawn in the dark set's colours and at the window's text size
+
+#### Scenario: Menu with a token set
+- **WHEN** an owner opens a context menu with the dark set while the window's set is the light one
+- **THEN** the menu's surface, items and highlight are drawn in the dark set's colours
+
+### Requirement: Loaders
+A loader SHALL be a `loader-circle` icon sized like the status dots it stands in for, turned to the step its owner gives, one of 12 steps a turn, so the owner's clock and not the component decides when it moves. It SHALL take no focus and SHALL NOT ask for animation frames itself.
+
+#### Scenario: Owner's step
+- **WHEN** an owner draws a loader at step 3 and then at step 4
+- **THEN** the icon is turned a quarter of a turn, then a twelfth of a turn further
+
+#### Scenario: No frames of its own
+- **WHEN** a loader is drawn and its owner gives no new step
+- **THEN** nothing redraws the window for it
+
+### Requirement: Shimmering text
+A shimmer SHALL draw one line of text in the muted foreground with a lighter band, up to the foreground colour, centred at the position its owner gives, from before the text's start to past its end. Its text SHALL never be dimmer than the muted foreground. It SHALL take no focus and SHALL NOT ask for animation frames itself.
+
+#### Scenario: The band moves with the owner's position
+- **WHEN** an owner draws `Working…` with the band at its start, then at its middle
+- **THEN** the first characters are the lightest, then the middle ones, and the rest are in the muted foreground
+
+#### Scenario: Outside the text
+- **WHEN** the band's position is before the text's start
+- **THEN** every character is in the muted foreground

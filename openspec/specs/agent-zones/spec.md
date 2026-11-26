@@ -77,11 +77,19 @@ A tool call SHALL be shown as one line: an icon for its kind, its title cut to o
 - **THEN** the conversation has one line for `call_1`, which shows completed
 
 ### Requirement: Permission rows
-A permission request SHALL be shown as a row with its title and one button per option the agent offers, labelled with the option's name, allow options before reject options. Choosing an option SHALL send it as the answer. Once answered, the row SHALL show the chosen option, or that the request was cancelled, and offer no buttons.
+A permission request SHALL be shown as a row with its title and one button per option the agent offers, labelled with the option's name, reject options before allow options, each group in the agent's order. Choosing an option SHALL send it as the answer. Once answered, the row SHALL show the chosen option, or that the request was cancelled, and offer no buttons.
+
+#### Scenario: Reject from the keyboard
+- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab and then enter
+- **THEN** the agent receives `Reject`, and the row says `Reject` was chosen
 
 #### Scenario: Allow from the keyboard
-- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab and then enter
+- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab twice and then enter
 - **THEN** the agent receives `Allow once`, and the row says `Allow once` was chosen
+
+#### Scenario: Rejects come first
+- **WHEN** the agent asks permission with options `Always allow`, `Allow once` and `Reject`, in that order
+- **THEN** the row's buttons read `Reject`, `Always allow`, `Allow once`, in that order
 
 #### Scenario: Reject with the pointer
 - **WHEN** a permission row is pending and the user clicks `Reject`
@@ -211,7 +219,7 @@ The `copy_last_agent_message` action SHALL copy the latest agent message's Markd
 - **THEN** the clipboard holds `Run **cargo test** first`, asterisks included
 
 ### Requirement: Agent zone appearance
-An agent zone SHALL be drawn as a card in its profile's theme, as a terminal zone is. Its text SHALL be in the interface font and its code in the terminal's font family, at the profile's font size, else the terminal font size in effect. Its zone header, when the tab has two or more zones, SHALL show its status dot, its title and the split and close buttons.
+An agent zone SHALL be drawn as a card in its profile's theme, as a terminal zone is, and everything inside it (its messages, code blocks, tables, thoughts, tool, permission and login rows, alerts, the prompt input and its queue row, every button, and its header's buttons) SHALL take its colours from that theme's zone token set. Its focus ring, status dot, progress bar and context badge SHALL keep the window's colours. Its text SHALL be in the interface font and its code in the terminal's font family, at the profile's font size, else the terminal font size in effect. Its zone header, when the tab has two or more zones, SHALL show its status dot, its title and the split and close buttons.
 
 #### Scenario: Profile font size
 - **WHEN** an agent profile sets `font_size = 18`
@@ -221,12 +229,44 @@ An agent zone SHALL be drawn as a card in its profile's theme, as a terminal zon
 - **WHEN** the config's terminal font family is `JetBrains Mono` and an agent message holds a code block and inline code
 - **THEN** both are drawn in `JetBrains Mono`, and the message's other text in the interface font
 
+#### Scenario: A profile theme unlike the window's
+- **WHEN** an agent profile sets a dark theme while the global theme is light, and its zone shows a user message, an agent message with a code block, a pending permission and the prompt input
+- **THEN** the bubbles, the code block, the permission row and its buttons, and the prompt input are drawn in the dark theme's zone tokens, and the tab strip in the light theme's tokens
+
+#### Scenario: No profile theme
+- **WHEN** an agent profile sets no theme
+- **THEN** its zone is drawn in the global theme's zone token set, its card's surface and its bubbles' background being mixes of the terminal background the zone shows
+
+#### Scenario: Tooltips and the header menu
+- **WHEN** an agent zone with a dark profile theme in a light window shows the tooltip of a message's copy button, or opens its header menu
+- **THEN** the tooltip and the menu are drawn in the dark theme's zone tokens, at the window's text size
+
+#### Scenario: Window dialogs keep the window's colours
+- **WHEN** closing a busy agent zone with a dark profile theme in a light window opens the close confirmation
+- **THEN** the confirmation is drawn in the light window's tokens
+
+#### Scenario: The ring and the status dot
+- **WHEN** an agent zone with its own theme is the active zone of a tab of two zones, with the ring shown and a working status
+- **THEN** its ring is the window's ring colour and its status dot the global theme's colour for working
+
 ### Requirement: Agent zone title
-An agent zone's title SHALL be the name the agent gave, else its profile's name. A tab whose active zone is an agent zone SHALL take that title, unless it has a manual title.
+An agent zone's title SHALL be its conversation's title once the agent has given one, else its profile's name; the name the agent gave in `initialize` SHALL NOT title it. A tab whose active zone is an agent zone SHALL take that title, unless it has a manual title, which SHALL win over every later conversation title.
 
 #### Scenario: Agent's name
-- **WHEN** the fake ACP agent names itself `Fake Agent` in its answer to `initialize`
-- **THEN** the zone's title and its tab's title are `Fake Agent`
+- **WHEN** a zone of profile `Fake` runs a fake ACP agent that names itself `Fake Agent` in its answer to `initialize`
+- **THEN** the zone's title and its tab's title are `Fake`
+
+#### Scenario: The agent names the conversation
+- **WHEN** that agent then sends `session_info_update` with title `Hello.txt file creation`
+- **THEN** the zone's title and its tab's title are `Hello.txt file creation`
+
+#### Scenario: Title cleared
+- **WHEN** the agent then clears the title with `null`
+- **THEN** the zone's title and its tab's title are `Fake` again
+
+#### Scenario: A renamed tab
+- **WHEN** the user renames the agent's tab `Build`, and the agent then titles its conversation `Hello.txt file creation`
+- **THEN** the tab's title stays `Build`, and the zone's own title is `Hello.txt file creation`
 
 ### Requirement: Agent zone status
 An agent zone SHALL hold its session's activity as a status: `working` (starting, logging in, a turn running), `blocked` (a permission waiting), `done` (a turn ended normally), `error` (a turn ended for a refusal or a limit, or failed; the agent needs a login, failed or exited) or `idle` (a cancelled turn included). The zone header's and tab's dots SHALL show it as a program status record's state.
@@ -584,3 +624,81 @@ An agent started again in its session, after a terminal login or by Continue con
 #### Scenario: Local continue
 - **WHEN** a local agent profile sets `env = { MODEL = "small" }`, its agent exited, and the user presses Continue conversation
 - **THEN** the agent started again runs with `MODEL=small` and Brindle's own environment without the variables Brindle sets only for terminals, as a new zone's agent does
+
+### Requirement: An agent message is one bubble
+An agent message SHALL be drawn as one bubble across the conversation's width, however many Markdown blocks it holds and however long each block's lines are. Its left and right edges SHALL be straight from its first block to its last. A user message SHALL be as wide as its text, up to four fifths of the conversation's width.
+
+#### Scenario: A short paragraph above a long one
+- **WHEN** the agent's message is `Hi.`, a blank line, and a paragraph longer than the zone is wide
+- **THEN** the message's bubble is one rectangle as wide as the conversation, with `Hi.` at its top and the long paragraph wrapped inside it
+
+#### Scenario: A code block in a message
+- **WHEN** the agent's message is a sentence followed by a fenced code block labelled `rust`
+- **THEN** the sentence and the code block are in one bubble with straight edges, and the label `rust` shows on one line above the code
+
+#### Scenario: A short user message
+- **WHEN** the user sends `hi`
+- **THEN** the user's bubble is as wide as `hi` and its padding, at the conversation's end
+
+### Requirement: The prompt's reason line fits its zone
+An agent zone's line under the prompt input (why the prompt is disabled, such as `connecting to the terminal server`) SHALL wrap at the zone's width, in a zone of any width the tab allows and from the first frame after a split.
+
+#### Scenario: Connecting after a split
+- **WHEN** an agent zone is split and the new agent zone shows `connecting to the terminal server` under its prompt input
+- **THEN** the text reads across the zone on as few lines as the zone's width allows, not one letter or one word per line
+
+### Requirement: Pending permission rows look dangerous
+While a permission request is pending, its row SHALL be drawn as a destructive alert: a warning icon before its title, a background tinted with the zone's destructive colour, a border in that colour, its allow options as destructive buttons and its reject options as outline buttons. Once answered or cancelled, the row SHALL be drawn in the conversation's plain style.
+
+#### Scenario: A pending request
+- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`
+- **THEN** the row shows a warning icon, a destructive border and tinted background, `Allow once` as a destructive button and `Reject` as an outline button
+
+#### Scenario: Answered
+- **WHEN** the user chooses `Reject` on that row
+- **THEN** the row shows `Reject` as the outcome, with no warning icon, tint or destructive border
+
+### Requirement: The working row
+While an agent zone's turn is working, its conversation SHALL end with a muted status row that isn't an entry and isn't copied: the title of the turn's newest tool call in progress, else `Working…`, and `Stopping…` while a cancel is under way. The row SHALL NOT show while the turn waits on a permission, and SHALL go when the turn ends or fails. Its text SHALL shimmer while it shows.
+
+#### Scenario: Before the first chunk
+- **WHEN** the user sends `hi` and the agent hasn't answered yet
+- **THEN** the conversation ends with the row `Working…`
+
+#### Scenario: A tool call in progress
+- **WHEN** the agent reports tool call `Read main.rs` as in progress
+- **THEN** the row reads `Read main.rs`, and reads `Working…` again once that call completes
+
+#### Scenario: Waiting on a permission
+- **WHEN** the agent asks permission during the turn
+- **THEN** the conversation ends with the permission row and no working row, and the working row comes back once the request is answered and the turn goes on
+
+#### Scenario: Stopping
+- **WHEN** the user stops a working turn and the agent hasn't answered the cancel yet
+- **THEN** the row reads `Stopping…`
+
+#### Scenario: Gone at the end
+- **WHEN** the agent ends the turn
+- **THEN** the conversation has no working row
+
+### Requirement: A spinner while an agent works
+While an agent zone's status is `working`, its status dot SHALL be drawn as a small spinner: on its zone header when the tab has two or more zones, and on its tab's face when the tab's shown status is `working` and one of the tab's working zones is an agent zone. Other statuses keep their dots, and a terminal's `working` record keeps its dot.
+
+#### Scenario: Scrolled away
+- **WHEN** an agent zone in a tab of two zones is working
+- **THEN** its zone header shows a spinner in place of its status dot
+
+#### Scenario: A background tab
+- **WHEN** an agent in a background tab of one zone is working
+- **THEN** that tab's face shows a spinner, and the green dot once the turn ends normally
+
+### Requirement: Motion only while an agent works
+Spinners and shimmering text SHALL advance in steps, at most 10 a second, from one clock for the whole window. The clock SHALL run only while some agent zone of the window is working, and SHALL NOT wake or redraw the window when none is.
+
+#### Scenario: Stops at the end of the turn
+- **WHEN** the only working agent zone's turn ends
+- **THEN** the window's motion clock stops, and nothing in the window moves until an agent works again
+
+#### Scenario: One clock for many zones
+- **WHEN** two agent zones in different tabs are working
+- **THEN** the window redraws for motion at most 10 times a second, not once per zone

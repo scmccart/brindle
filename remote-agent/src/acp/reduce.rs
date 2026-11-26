@@ -35,6 +35,13 @@
 //!   agent offers; a kept log's load replay is muted (counted, not
 //!   applied), a fresh log's is shown. No continue falls back to
 //!   `session/new`.
+//! - **The agent names the conversation** (OpenSpec change
+//!   `agents-session-title`). A `session_info_update`'s title, made one line
+//!   and bounded by [`session_title`], is the conversation's title: a new
+//!   [`Event::Conversation`] when it changes, applied (and not counted)
+//!   during a muted load too. [`AgentSession`]'s `ready` keeps it for the
+//!   same ACP session, so a restart that continues it keeps the title, and
+//!   a new ACP session starts without one.
 //!
 //! A whole pure module (`fcis` R2, R3; `PURE_MODULES`).
 
@@ -54,7 +61,7 @@ use super::lines::{Lines, Piece};
 use super::rpc::{self, PROTOCOL_VERSION, Purpose, Refusal, Rpc};
 use super::wire::{
     self, AUTH_REQUIRED, Content, ContentKind, Id, Malformed, Message, NotificationKind,
-    OptionKind, RequestKind, RpcError, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
+    OptionKind, Patch, RequestKind, RpcError, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
 };
 
 /// The most the log keeps, encoded (decision 14): past it the oldest
@@ -67,6 +74,11 @@ pub const MAX_PROMPT: usize = 256 * 1024;
 /// How long a run of lines that aren't ACP messages may go without another
 /// before its notice is written.
 pub const BAD_RUN_QUIET: Duration = Duration::from_secs(1);
+
+/// The longest conversation title kept, in characters, `…` included
+/// (`agents-session-title` decision 3): a tab's title, read as characters,
+/// and well under [`TEXT_CHUNK`] however long the agent's title.
+pub const MAX_SESSION_TITLE: usize = 256;
 
 /// Where the agent's ACP conversation is: what the transcript's
 /// [`AgentState`] can't say (which start request is out, the ACP session
@@ -1054,6 +1066,8 @@ impl Step<'_> {
                         id: session,
                         cwd: self.s.cwd.clone(),
                         continuation: login.greeting.continuation,
+                        // `ready` takes the title from the log.
+                        title: None,
                     },
                     log: Log::Kept,
                 }
@@ -1250,7 +1264,16 @@ impl Step<'_> {
             | Phase::Exited
             | Phase::Lost => true,
         };
-        if !own || self.mute() {
+        if !own {
+            return;
+        }
+        // A title is the conversation's state, not its log: a muted load's
+        // replay applies it and doesn't count it, so the agent's latest
+        // title is the one kept.
+        if let Update::SessionInfo { title } = update.update {
+            return self.retitle(&update.session_id, title);
+        }
+        if self.mute() {
             return;
         }
         match update.update {
@@ -1259,8 +1282,32 @@ impl Step<'_> {
             Update::ThoughtChunk(content) => self.chunk(RunKind::Thought, content),
             Update::ToolCall(call) => self.tool_call(call),
             Update::ToolChanged(change) => self.tool_change(change),
-            Update::Ignored { .. } => {}
+            // Applied above.
+            Update::SessionInfo { .. } | Update::Ignored { .. } => {}
         }
+    }
+
+    /// A `session_info_update`'s title for ACP session `session`: the
+    /// conversation again with the new title when it differs, else nothing.
+    /// Before the agent gave the session (no conversation in the log, or
+    /// another session's), it names nothing Brindle knows.
+    fn retitle(&mut self, session: &str, title: Patch<String>) {
+        let title = match title {
+            Patch::Keep => return,
+            Patch::Clear => None,
+            Patch::Set(raw) => session_title(&raw),
+        };
+        let Some(current) = self.s.transcript.conversation() else {
+            return;
+        };
+        if current.id != session || current.title == title {
+            return;
+        }
+        let conversation = Conversation {
+            title,
+            ..current.clone()
+        };
+        self.emit(Event::Conversation { conversation });
     }
 
     fn chunk(&mut self, kind: RunKind, content: Content) {
@@ -1505,7 +1552,7 @@ impl Step<'_> {
                 Ok(initialized) if initialized.protocol_version == PROTOCOL_VERSION => {
                     let (name, version) = initialized.agent.map_or((None, None), |agent| {
                         (
-                            Some(bound(clean(&agent.name))),
+                            Some(agent_name(&agent)),
                             Some(bound(clean(&agent.version))),
                         )
                     });
@@ -1684,6 +1731,8 @@ impl Step<'_> {
                         id: conversation,
                         cwd: self.s.cwd.clone(),
                         continuation: greeting.continuation,
+                        // `ready` takes the title from the log.
+                        title: None,
                     },
                     log,
                 };
@@ -1714,11 +1763,20 @@ impl Step<'_> {
         greeting: Greeting,
         notice: Option<(NoticeLevel, String)>,
     ) {
+        // The same ACP session keeps its title (a login's restart, a
+        // continue by resume or load); a new one has none yet.
+        let title = self
+            .s
+            .transcript
+            .conversation()
+            .filter(|conversation| conversation.id == session)
+            .and_then(|conversation| conversation.title.clone());
         self.emit(Event::Conversation {
             conversation: Conversation {
                 id: session.clone(),
                 cwd: self.s.cwd.clone(),
                 continuation: greeting.continuation,
+                title,
             },
         });
         if let Some((level, text)) = notice {
@@ -2228,6 +2286,58 @@ pub fn clean(text: &str) -> String {
     cleaned
 }
 
+/// The agent's readable name (`agents-session-title` decision 4):
+/// `agentInfo.title` when it is given and not blank, else `agentInfo.name`
+/// (which the npm adapters fill with their package's name), cleaned and
+/// bounded.
+fn agent_name(agent: &wire::AgentInfo) -> String {
+    agent
+        .title
+        .as_deref()
+        .map(|title| bound(clean(title)))
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| bound(clean(&agent.name)))
+}
+
+/// A conversation's title as kept (`agents-session-title` decision 3):
+/// control characters dropped, each run of whitespace (line breaks
+/// included) one space, trimmed, and past [`MAX_SESSION_TITLE`] characters
+/// cut to one fewer and ended with `…`. A title with nothing left is none.
+pub fn session_title(raw: &str) -> Option<String> {
+    let mut title = String::with_capacity(raw.len().min(4 * MAX_SESSION_TITLE));
+    let mut chars = 0usize;
+    let mut gap = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            gap = chars > 0;
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        if gap {
+            title.push(' ');
+            chars += 1;
+            gap = false;
+        }
+        title.push(c);
+        chars += 1;
+        if chars > MAX_SESSION_TITLE {
+            break;
+        }
+    }
+    if chars > MAX_SESSION_TITLE {
+        let cut = title
+            .char_indices()
+            .nth(MAX_SESSION_TITLE - 1)
+            .map_or(title.len(), |(at, _)| at);
+        title.truncate(cut);
+        title.truncate(title.trim_end().len());
+        title.push('…');
+    }
+    (!title.is_empty()).then_some(title)
+}
+
 /// `text` cut to at most [`TEXT_CHUNK`] bytes at a character boundary, for
 /// a field that doesn't grow.
 fn bound(mut text: String) -> String {
@@ -2587,7 +2697,8 @@ mod tests {
         assert_eq!(
             *agent.agent_state(),
             AgentState::Ready {
-                name: Some("fake".into()),
+                // The readable title (`agents-session-title` decision 4).
+                name: Some("Fake".into()),
                 version: Some("1.0".into())
             }
         );
@@ -3797,13 +3908,180 @@ mod tests {
         assert!(agent.notices().is_empty());
     }
 
+    // --- the conversation's title (agents-session-title) ---------------
+
+    fn titled(title: Value) -> String {
+        update(json!({"sessionUpdate": "session_info_update", "title": title}))
+    }
+
+    fn title_of(agent: &Agent) -> Option<&str> {
+        agent
+            .s
+            .transcript()
+            .conversation()
+            .and_then(|conversation| conversation.title.as_deref())
+    }
+
     #[test]
-    fn a_session_info_update_without_a_title_changes_nothing() {
+    fn a_session_title_is_one_line_bounded_and_none_when_blank() {
+        assert_eq!(
+            session_title("Hello.txt file creation").as_deref(),
+            Some("Hello.txt file creation")
+        );
+        assert_eq!(
+            session_title("  Fix\tthe\r\n\n build  \u{7}now\u{1b}[31m ").as_deref(),
+            Some("Fix the build now[31m")
+        );
+        assert_eq!(
+            session_title("a\u{0}b \u{85} c").as_deref(),
+            Some("ab c"),
+            "a control character is dropped; NEL is whitespace"
+        );
+        for blank in ["", "   ", "\n\t\r", "\u{7}\u{1b}", " \u{0} "] {
+            assert_eq!(session_title(blank), None, "{blank:?}");
+        }
+        let exact = "x".repeat(MAX_SESSION_TITLE);
+        assert_eq!(session_title(&exact).as_deref(), Some(exact.as_str()));
+        let long: String = (0..40).map(|n| format!("word{n:03}\n")).collect();
+        assert_eq!(long.chars().count(), 320);
+        let kept = session_title(&format!("{long}{}", "y".repeat(80))).expect("a title");
+        assert_eq!(kept.chars().count(), MAX_SESSION_TITLE);
+        assert!(kept.ends_with('…') && !kept.contains('\n'), "{kept}");
+        let long = "z".repeat(400);
+        let kept = session_title(&long).expect("a title");
+        assert_eq!(kept, format!("{}…", "z".repeat(MAX_SESSION_TITLE - 1)));
+        // A cut inside multi-byte characters lands on a boundary.
+        let wide = "é".repeat(300);
+        let kept = session_title(&wide).expect("a title");
+        assert_eq!(kept, format!("{}…", "é".repeat(MAX_SESSION_TITLE - 1)));
+        // A cut after a space leaves none before the ellipsis.
+        let spaced = format!("{} {}", "a".repeat(MAX_SESSION_TITLE - 2), "b".repeat(10));
+        let kept = session_title(&spaced).expect("a title");
+        assert_eq!(kept, format!("{}…", "a".repeat(MAX_SESSION_TITLE - 2)));
+    }
+
+    #[test]
+    fn a_title_names_the_conversation_and_null_or_blank_clears_it() {
         let mut agent = Agent::ready();
+        let out = agent.feed(&titled(json!("Hello.txt file creation")));
+        assert_eq!(shape(&out.events), ["conversation"]);
+        assert_eq!(title_of(&agent), Some("Hello.txt file creation"));
+        assert_eq!(out.checkpoint, None, "no new checkpoint moment");
+        // The same title again sends nothing, and so does a cleaned one
+        // that comes out the same.
+        assert_eq!(agent.feed(&titled(json!("Hello.txt file creation"))), Output::default());
+        assert_eq!(
+            agent.feed(&titled(json!(" Hello.txt\nfile  creation "))),
+            Output::default()
+        );
+        // No title keeps it.
         let out = agent.feed(&update(
             json!({"sessionUpdate": "session_info_update", "_meta": {"codex": {}}}),
         ));
         assert_eq!(out, Output::default());
+        assert_eq!(title_of(&agent), Some("Hello.txt file creation"));
+        // A number is no title either.
+        assert_eq!(agent.feed(&titled(json!(7))), Output::default());
+        let out = agent.feed(&titled(Value::Null));
+        assert_eq!(shape(&out.events), ["conversation"]);
+        assert_eq!(title_of(&agent), None);
+        assert_eq!(agent.feed(&titled(Value::Null)), Output::default());
+        agent.feed(&titled(json!("Again")));
+        agent.feed(&titled(json!("  \n ")));
+        assert_eq!(title_of(&agent), None, "a blank title clears");
+        // Everything else about the conversation stays.
+        assert_eq!(
+            agent.s.transcript().conversation().map(|c| (c.id.as_str(), c.cwd.as_str())),
+            Some(("s1", "/home/u/src"))
+        );
+    }
+
+    /// The captures' `agentInfo`, verbatim: the readable `title` names the
+    /// agent when given, else `name`.
+    #[test]
+    fn the_agents_name_is_its_title_when_given_else_its_name() {
+        let rows = [
+            (
+                json!({"name": "@agentclientprotocol/codex-acp", "title": "Codex", "version": "2.12.0"}),
+                "Codex",
+            ),
+            (
+                json!({"name": "@agentclientprotocol/claude-agent-acp", "title": "Claude Agent", "version": "0.112.0"}),
+                "Claude Agent",
+            ),
+            (
+                json!({"name": "@zed-industries/claude-code-acp", "title": "Claude Code", "version": "0.16.2"}),
+                "Claude Code",
+            ),
+            (
+                json!({"name": "Antigravity ACP Server", "version": "1.5.16"}),
+                "Antigravity ACP Server",
+            ),
+            (
+                json!({"name": "Copilot", "title": "Copilot", "version": "1.0.115"}),
+                "Copilot",
+            ),
+            // A blank or null title is no title.
+            (json!({"name": "pkg", "title": "  ", "version": "1"}), "pkg"),
+            (json!({"name": "pkg", "title": null, "version": "1"}), "pkg"),
+        ];
+        for (info, name) in rows {
+            let mut agent = Agent::new();
+            agent.step(Input::Spawned);
+            agent.feed(&result(1, json!({"protocolVersion": 1, "agentInfo": info})));
+            agent.feed(&result(2, json!({"sessionId": "s1"})));
+            assert!(
+                matches!(agent.agent_state(), AgentState::Ready { name: Some(n), .. } if n == name),
+                "{info}: {:?}",
+                agent.agent_state()
+            );
+        }
+    }
+
+    #[test]
+    fn a_title_mid_turn_adds_no_entry() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.feed(&said("Hel"));
+        agent.feed(&titled(json!("Greeting")));
+        agent.feed(&said("lo"));
+        assert_eq!(agent.last_entry().1, Entry::Agent { text: "Hello".into() });
+        agent.end(id, "end_turn");
+        assert_eq!(title_of(&agent), Some("Greeting"));
+    }
+
+    #[test]
+    fn a_title_before_the_session_is_given_names_nothing() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&result(
+            1,
+            json!({"protocolVersion": 1, "agentInfo": {"name": "fake", "version": "1.0"}}),
+        ));
+        // `session/new` not answered yet: the session isn't known.
+        assert_eq!(agent.feed(&titled(json!("Early"))), Output::default());
+        agent.feed(&result(2, json!({"sessionId": "s1"})));
+        assert_eq!(title_of(&agent), None);
+        // Another session's title names nothing either.
+        let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "other", "update": {"sessionUpdate": "session_info_update", "title": "Other"}}});
+        assert_eq!(agent.feed(&line.to_string()), Output::default());
+        assert_eq!(title_of(&agent), None);
+    }
+
+    #[test]
+    fn a_title_is_in_the_replay() {
+        let mut agent = Agent::ready();
+        agent.feed(&titled(json!("Hello.txt file creation")));
+        let replay = agent.s.transcript().replay();
+        assert!(replay.iter().any(|event| matches!(
+            event,
+            Event::Conversation { conversation } if conversation.title.as_deref() == Some("Hello.txt file creation")
+        )));
+        let mut fresh = Transcript::new();
+        for event in &replay {
+            fresh.apply(event).expect("a replay folds");
+        }
+        assert_eq!(fresh, *agent.s.transcript());
     }
 
     #[test]
@@ -4402,6 +4680,40 @@ mod tests {
         }
     }
 
+    /// What each captured agent is called and what it named its
+    /// conversation (`agents-session-title`): Codex never names one.
+    #[test]
+    fn every_captured_session_names_its_agent_readably_and_keeps_its_title() {
+        for (name, log) in CAPTURES {
+            let agent = replay(log, |_| {});
+            let (readable, title) = match name.split('-').next() {
+                Some("antigravity") => ("Antigravity ACP Server", Some("Create Hello.txt File")),
+                Some("claude") if name.starts_with("claude-agent") => {
+                    ("Claude Agent", Some("Hello.txt file creation"))
+                }
+                Some("claude") => ("Claude Code", None),
+                Some("codex") => ("Codex", None),
+                Some("copilot") => ("Copilot", Some("Please create a file named hello.txt")),
+                other => panic!("{name}: {other:?}"),
+            };
+            assert!(
+                matches!(agent.agent_state(), AgentState::Ready { name: Some(n), .. } if n == readable),
+                "{name}: {:?}",
+                agent.agent_state()
+            );
+            let kept = title_of(&agent);
+            match title {
+                None => assert_eq!(kept, None, "{name}"),
+                Some(title) => {
+                    let kept = kept.unwrap_or_else(|| panic!("{name}: no title"));
+                    assert!(kept.starts_with(title), "{name}: {kept}");
+                    assert!(kept.chars().count() <= MAX_SESSION_TITLE, "{name}");
+                    assert!(!kept.contains('\n'), "{name}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn copilots_captured_turn_merges_its_thoughts_and_answers_the_rejection_by_kind() {
         let agent = replay(CAPTURES[7].1, |_| {});
@@ -4527,6 +4839,7 @@ mod tests {
             id: "s1".into(),
             cwd: "/home/u/src".into(),
             continuation,
+            title: None,
         }
     }
 
@@ -4812,6 +5125,96 @@ mod tests {
         // A live chunk afterwards is a new entry, not the old run's.
         agent.feed(&said("Back."));
         assert!(matches!(agent.last_entry().1, Entry::Agent { text } if text == "Back."));
+    }
+
+    // The title across restarts (agents-session-title decision 3).
+
+    /// [`Agent::ended`], its conversation titled `Old` before the exit.
+    fn ended_titled() -> Agent {
+        let mut agent = Agent::ready_offering(both());
+        let id = agent.turn("first");
+        agent.feed(&titled(json!("Old")));
+        agent.feed(&said("Done."));
+        agent.end(id, "end_turn");
+        agent.exit();
+        assert_eq!(title_of(&agent), Some("Old"));
+        agent
+    }
+
+    #[test]
+    fn a_resume_of_the_same_session_keeps_its_title() {
+        let mut agent = ended_titled();
+        let id = agent.restart();
+        agent.feed(&initialized(id, both()));
+        let out = agent.feed(&result(id + 1, json!({})));
+        assert_eq!(shape(&out.events), ["conversation", "agent ready"]);
+        assert!(matches!(
+            &out.events[0],
+            Event::Conversation { conversation } if conversation.title.as_deref() == Some("Old")
+        ));
+        assert_eq!(title_of(&agent), Some("Old"));
+    }
+
+    #[test]
+    fn a_muted_load_applies_a_replayed_title_without_counting_it() {
+        let mut agent = ended_titled();
+        let id = agent.restart();
+        agent.feed(&initialized(id, load_only()));
+        assert!(agent.feed(&said("Done.")).events.is_empty());
+        let out = agent.feed(&titled(json!("New")));
+        assert_eq!(shape(&out.events), ["conversation"]);
+        let out = agent.feed(&result(id + 1, json!(null)));
+        assert_eq!(
+            shape(&out.events),
+            ["conversation", "added notice", "agent ready"]
+        );
+        assert_eq!(
+            agent.notices().last().map(String::as_str),
+            Some("conversation continued; the agent's replay of 1 update wasn't shown")
+        );
+        assert_eq!(title_of(&agent), Some("New"));
+    }
+
+    #[test]
+    fn a_login_restart_of_the_same_session_keeps_its_title() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.feed(&titled(json!("Hello.txt file creation")));
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        assert_eq!(agent.step(Input::Restart).reply, Some(Ok(())));
+        let id = agent.restart();
+        agent.feed(&initialized(id, resume_only()));
+        let resume = agent.last("session/resume")["id"].as_u64().expect("an id");
+        agent.feed(&result(resume, json!({})));
+        assert!(matches!(agent.s.phase(), Phase::Ready { .. }));
+        assert_eq!(title_of(&agent), Some("Hello.txt file creation"));
+    }
+
+    #[test]
+    fn a_login_by_a_prompts_demand_keeps_the_title() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.feed(&titled(json!("Named")));
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        agent.login("oauth-personal");
+        agent.feed(&result(agent.authenticate_id(), json!({})));
+        assert!(matches!(agent.s.phase(), Phase::Ready { .. }));
+        assert_eq!(title_of(&agent), Some("Named"));
+    }
+
+    #[test]
+    fn a_new_server_session_starts_untitled_until_the_agent_names_it() {
+        let mut agent = Agent::new();
+        agent.s = AgentSession::continuing(conversation_s1(Continuation::Load), "0.3.0".into());
+        agent.step(Input::Spawned);
+        agent.feed(&initialized(1, both()));
+        // The shown replay's title names no conversation the log has yet.
+        assert_eq!(agent.feed(&titled(json!("Before"))), Output::default());
+        agent.feed(&result(2, json!(null)));
+        assert!(matches!(agent.s.phase(), Phase::Ready { .. }));
+        assert_eq!(title_of(&agent), None);
+        agent.feed(&titled(json!("After")));
+        assert_eq!(title_of(&agent), Some("After"));
     }
 
     #[test]

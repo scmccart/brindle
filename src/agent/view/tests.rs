@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use gpui::{EntityInputHandler as _, FocusHandle, VisualTestContext};
+use gpui::{AnyElement, EntityInputHandler as _, FocusHandle, VisualTestContext, px};
 
 use super::*;
 use crate::agent::test_support::{Call, FAKE_PROFILE, Zone, added, app, ready, set_config, settle, user};
@@ -132,13 +132,112 @@ fn permission() -> Entry {
     }
 }
 
+/// `agents-zone-attention` decision 2: the working row is inserted after
+/// the blocks when it appears, removed from there when it goes, and left
+/// alone otherwise; an allow option is destructive, a reject an outline.
+#[test]
+fn the_working_rows_splice_and_the_permission_variants() {
+    assert_eq!(working_splice(false, true, 4), Some(Splice { range: 4..4, count: 1 }));
+    assert_eq!(working_splice(true, false, 4), Some(Splice { range: 4..5, count: 0 }));
+    assert_eq!(working_splice(false, true, 0), Some(Splice { range: 0..0, count: 1 }));
+    assert_eq!(working_splice(true, true, 4), None, "its text may change, its place doesn't");
+    assert_eq!(working_splice(false, false, 4), None);
+    assert_eq!(permission_variant(PermissionKind::AllowOnce), ButtonVariant::Destructive);
+    assert_eq!(permission_variant(PermissionKind::AllowAlways), ButtonVariant::Destructive);
+    assert_eq!(permission_variant(PermissionKind::RejectOnce), ButtonVariant::Outline);
+    assert_eq!(permission_variant(PermissionKind::RejectAlways), ButtonVariant::Outline);
+}
+
+/// `agents-zone-attention` decisions 1 and 2: the working row is the
+/// scroller's last item after a prompt, follows a tool call in progress,
+/// hides while a permission waits (which is drawn destructive), reads
+/// `Stopping…` while a cancel is on its way and goes at the end, the view
+/// wanting the motion clock exactly while it shows.
+#[test]
+fn the_working_row_ends_the_conversation_while_the_turn_works() {
+    let mut f = Fixture::new();
+    let shown = |f: &mut Fixture| {
+        f.view.read_with(f.cx, |view, cx| {
+            let blocks = view.agent.read(cx).model().blocks().len();
+            let items = view.scroller.read(cx).item_count();
+            assert!(items == blocks || items == blocks + 1, "{items} items for {blocks} blocks");
+            assert_eq!(items == blocks + 1, view.working.is_some(), "the row is the last item exactly while it shows");
+            view.working.as_ref().map(|row| row.text().to_string())
+        })
+    };
+    let running = |f: &mut Fixture| f.cx.update(|_, cx| Motion::running(cx));
+    f.feed(&[ready()]);
+    assert_eq!(shown(&mut f), None);
+    assert!(!running(&mut f));
+    f.feed(&[added(1, user("hi")), working()]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Working…"));
+    assert!(running(&mut f), "the view wants the clock");
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("agent-working").is_some(), "the row is drawn");
+    let tool = |status| Entry::Tool {
+        call: "call_1".into(),
+        title: "Read main.rs".into(),
+        kind: crate::agent::transcript::ToolKind::Read,
+        status,
+    };
+    f.feed(&[added(2, tool(crate::agent::transcript::ToolStatus::InProgress))]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Read main.rs"));
+    f.feed(&[Event::Turn { state: TurnState::Blocked }, added(3, permission())]);
+    assert_eq!(shown(&mut f), None, "the permission row is the call to action");
+    assert!(!running(&mut f));
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("confirmation-destructive").is_some(), "a pending request is drawn as a risk");
+    f.feed(&[
+        Event::Answered {
+            id: EntryId(3),
+            outcome: crate::agent::transcript::PermissionOutcome::Selected { option: "reject-once".into() },
+        },
+        working(),
+    ]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Read main.rs"), "back once answered");
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("confirmation-destructive").is_none(), "answered, it is plain");
+    f.feed(&[Event::Turn { state: TurnState::Cancelling }]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Stopping…"));
+    f.feed(&[ended(StopReason::Cancelled)]);
+    assert_eq!(shown(&mut f), None, "gone at the end");
+    assert!(!running(&mut f), "the view stopped wanting the clock");
+
+    // A view released while its row shows doesn't keep wanting the clock.
+    f.feed(&[added(4, user("again")), working()]);
+    let agent = f.zone.agent.clone();
+    let second = f.cx.update(|window, cx| cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx)));
+    let id = second.entity_id();
+    assert!(f.cx.update(|_, cx| Motion::wants(id, cx)), "a new view of a working zone wants it");
+    drop(second);
+    f.cx.update(|_, _| {});
+    f.cx.run_until_parked();
+    assert!(!f.cx.update(|_, cx| Motion::wants(id, cx)), "released, it no longer wants the clock");
+    assert!(running(&mut f), "the first view still does");
+}
+
+/// The agent's order put allow first: the row turns it round.
+fn permission_allow_first() -> Entry {
+    let option = |id: &str, name: &str, kind| PermissionOption { id: id.into(), name: name.into(), kind };
+    Entry::Permission {
+        call: Some("call_1".into()),
+        title: "Run cargo test?".into(),
+        options: vec![
+            option("allow-once", "Allow once", PermissionKind::AllowOnce),
+            option("reject-once", "Reject", PermissionKind::RejectOnce),
+        ],
+        outcome: None,
+    }
+}
+
 /// Tab walks the prompt, the waiting row's remove, the pending permission's
-/// buttons (allow first) and the stop button, and wraps; with a held row
-/// and no turn, the prompt, send again and discard.
+/// buttons (reject first, `agents-zone-attention` decision 4) and the stop
+/// button, and wraps; with a held row and no turn, the prompt, send again
+/// and discard.
 #[test]
 fn tab_walks_the_prompt_the_row_the_permissions_and_stop() {
     let mut f = Fixture::new();
-    f.feed(&[ready(), added(1, user("hi")), working(), slot(waiting()), added(2, permission())]);
+    f.feed(&[ready(), added(1, user("hi")), working(), slot(waiting()), added(2, permission_allow_first())]);
     let prompt = f.prompt_handle();
     let remove = f.row_stops();
     assert_eq!(remove.len(), 1);
@@ -147,7 +246,7 @@ fn tab_walks_the_prompt_the_row_the_permissions_and_stop() {
         (handle("allow-once"), handle("reject-once"))
     });
     let stop = f.stop_button().expect("a turn runs");
-    assert_eq!(f.tabs(5), [remove[0].clone(), allow, reject, stop, prompt.clone()]);
+    assert_eq!(f.tabs(5), [remove[0].clone(), reject, allow, stop, prompt.clone()]);
     f.cx.simulate_keystrokes("shift-tab");
     assert_eq!(f.focused(), f.stop_button(), "shift-tab goes back");
 
@@ -180,7 +279,7 @@ fn the_focus_line_names_each_stop() {
         names.push(f.cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).unwrap_or_default());
         f.cx.simulate_keystrokes("tab");
     }
-    assert_eq!(names, ["prompt", "queued:remove", "permission:2:allow-once", "permission:2:reject-once", "stop"]);
+    assert_eq!(names, ["prompt", "queued:remove", "permission:2:reject-once", "permission:2:allow-once", "stop"]);
     f.focus_prompt();
     f.feed(&[
         Event::Answered {
@@ -433,7 +532,7 @@ fn the_prompt_state_follows_the_model() {
 // `agents-session-recovery` 5.1: the Continue conversation button.
 
 fn conversation(continuation: Continuation) -> Event {
-    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation };
+    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation, title: None };
     Event::Conversation { conversation }
 }
 
@@ -755,4 +854,76 @@ fn the_login_rows_words() {
     );
     let withheld = MethodOffer::Withheld(Withheld { why: "the login can't be run through `ssh`".into() });
     assert_eq!(words(method_description(&choice(None, withheld))).as_deref(), Some("the login can't be run through `ssh`"));
+}
+
+/// An agent view in a zone's card, as `zone_view.rs` draws one: alone, or
+/// as the first of a horizontal split's two zones.
+struct SplitHost {
+    view: Entity<AgentView>,
+    split: bool,
+}
+
+impl Render for SplitHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let card = |id: usize, child: AnyElement| {
+            brindle_ui::Card::new(("zone", id)).size_full().min_w_0().min_h_0().child(
+                div().id(("agent-zone", id)).size_full().min_w_0().min_h_0().child(child),
+            )
+        };
+        let zone = card(1, self.view.clone().into_any_element());
+        let root = div().w(px(800.)).h(px(500.)).flex().flex_col();
+        if !self.split {
+            return root.child(zone);
+        }
+        let half = |child: AnyElement| div().flex_1().min_w_0().min_h_0().size_full().child(child);
+        root.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(crate::zone_view::ZONE_GAP))
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(half(zone.into_any_element()))
+                .child(half(card(2, div().into_any_element()).into_any_element())),
+        )
+    }
+}
+
+/// The spec's "Connecting after a split" in a view test: a connecting
+/// agent zone's reason line reads across the zone at its full width and,
+/// in the next frame, at half of it: at least as wide as `connecting`
+/// (0.6em a character in gpui's test text system) and at most two of the
+/// lines it takes at full width.
+#[test]
+fn the_connecting_line_reads_across_a_split_zone() {
+    let mut app = app();
+    let zone = Zone::new(None, &mut app);
+    let agent = zone.agent.clone();
+    let (host, cx) = app.add_window_view(|window, cx| {
+        let view = cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx));
+        SplitHost { view, split: false }
+    });
+    settle(cx);
+    let view = host.read_with(cx, |host, _| host.view.clone());
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.prompt.read(cx).reason().map(|reason| reason.to_string())).as_deref(),
+        Some("connecting to the terminal server")
+    );
+    let size = f32::from(view.read_with(cx, |view, cx| view.text_size(cx)));
+    let connecting = px("connecting".len() as f32 * 0.6 * 0.75 * size);
+    let full = cx.debug_bounds("prompt-reason").expect("drawn");
+    assert!(full.size.height < px(2. * 0.75 * size), "at full width the reason isn't one line: {full:?}");
+    assert!(full.size.width >= connecting, "{full:?}");
+    cx.update(|_, cx| {
+        host.update(cx, |host, cx| {
+            host.split = true;
+            cx.notify();
+        })
+    });
+    settle(cx);
+    let half = cx.debug_bounds("prompt-reason").expect("drawn");
+    assert!(half.right() < px(400.), "the reason isn't in the split's first zone: {half:?}");
+    assert!(half.size.width >= connecting, "after the split: {half:?}");
+    assert!(half.size.height <= full.size.height * 2., "after the split: {half:?}, at full width {full:?}");
 }

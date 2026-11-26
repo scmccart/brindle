@@ -26,7 +26,7 @@ use brindle_transcript::{
 use support::fake_agent::{
     AgentScript, Gate, LOAD_ONLY, NEITHER, RESUME_AND_LOAD, RESUME_ONLY, TERMINAL_LOGIN, TWO_LOGINS,
     ask, continuable, initialized, methods, offering_logins, prompts, recorded, responses, said,
-    started, stop, update, user_said,
+    started, stop, title, update, user_said,
 };
 use support::*;
 
@@ -521,6 +521,43 @@ fn a_new_core_adopts_an_agent_session_with_its_conversation() {
         .filter_map(|value| value["method"].as_str().map(str::to_owned))
         .collect();
     assert_eq!(methods, ["initialize", "session/new", "session/prompt", "session/prompt"]);
+}
+
+/// The conversation's title, when the log has one.
+fn title_of(log: &Transcript) -> Option<&str> {
+    log.conversation().and_then(|conversation| conversation.title.as_deref())
+}
+
+/// OpenSpec change `agents-session-title`, task 2.6: the agent names its
+/// conversation mid-turn, the core is killed, and a client of the next core
+/// gets the title in the replay.
+#[test]
+fn a_conversations_title_survives_a_core_kill() {
+    let token = "token-agent-titled";
+    let (mut dir, mut client) = agent_core("agent-titled", &[]);
+    let (mut script, _) = started(&dir.path, "titled");
+    script
+        .step("expect session/prompt")
+        .step(title(Some("Hello.txt\nfile creation")))
+        .step(said("named"))
+        .step(stop("end_turn"));
+    let (id, pid) = spawned(&mut client, &mut dir, detached(&script.write()));
+    let log = client.transcript_until(id, "is ready", ready);
+    assert_eq!(title_of(&log), None, "untitled until the agent names it");
+    client.prompt(id, "go").unwrap();
+    let before = client.transcript_until(id, "has the titled turn's end", |log| {
+        title_of(log).is_some() && ended(1)(log)
+    });
+    assert_eq!(title_of(&before), Some("Hello.txt file creation"), "made one line");
+    // A round trip: the turn's checkpoint is in the holder's connection.
+    listed(&mut client, id);
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (id, pid));
+    let after = client.transcript(id);
+    assert_eq!(title_of(&after), Some("Hello.txt file creation"));
+    assert_eq!(after, before);
 }
 
 #[test]

@@ -392,7 +392,7 @@ impl Combobox {
 
 impl Render for Combobox {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let style = select_style(t);
         let (ring, ring_color) = (t.ring, focus_ring(t));
         let disabled = self.disabled;

@@ -60,7 +60,7 @@ impl Tool {
 
 impl RenderOnce for Tool {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let (text, border) = tool_status_colors(self.status, t);
         // flex w-full items-center gap-2 rounded-md border px-3 py-2
         // text-sm; the badge rounded-full border px-2 text-xs.

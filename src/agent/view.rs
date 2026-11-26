@@ -25,10 +25,10 @@ use gpui::{
 };
 
 use brindle_ui::{
-    Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
-    ConfirmationState, FocusScope, FocusStops, Icon, ItemKey, Message, MessageFrom, MessageScroller, PageDirection,
-    PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning, Resend as UiResend,
-    Response, RichBlock, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
+    ActiveTheme as _, Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
+    ConfirmationState, ConfirmationTone, FocusScope, FocusStops, Icon, ItemKey, Message, MessageFrom, MessageScroller,
+    PageDirection, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
+    Resend as UiResend, Response, RichBlock, Shimmer, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
 
 use crate::actions::{
@@ -39,7 +39,9 @@ use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
     AgentPhase, Block, BlockBody, ChatModel, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow, Resend,
+    Splice, WorkingRow,
 };
+use crate::motion::{self, Motion};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
 use crate::agent::{Agent, AgentUpdate};
 use crate::settings::Settings;
@@ -223,6 +225,25 @@ fn allows(kind: PermissionKind) -> bool {
     }
 }
 
+/// The scroller's change for the working row (OpenSpec change
+/// `agents-zone-attention`, decision 2), the conversation's last item after
+/// the model's `len` blocks: inserted when it appears, removed when it
+/// goes, nothing otherwise. Applied after the model's splices, which all
+/// fall within the blocks.
+pub fn working_splice(before: bool, after: bool, len: usize) -> Option<Splice> {
+    match (before, after) {
+        (false, true) => Some(Splice { range: len..len, count: 1 }),
+        (true, false) => Some(Splice { range: len..len + 1, count: 0 }),
+        (false, false) | (true, true) => None,
+    }
+}
+
+/// A permission option's button: an allow option is destructive while
+/// the request is pending, a reject option an outline (decision 4).
+pub fn permission_variant(kind: PermissionKind) -> ButtonVariant {
+    if allows(kind) { ButtonVariant::Destructive } else { ButtonVariant::Outline }
+}
+
 /// An agent zone's view.
 pub struct AgentView {
     agent: Entity<Agent>,
@@ -241,6 +262,9 @@ pub struct AgentView {
     theme: Theme,
     /// The profile's font size, else the terminal size in effect.
     font_size_override: Option<f32>,
+    /// The working row while it shows, the scroller's last item; the view
+    /// wants the motion clock meanwhile.
+    working: Option<WorkingRow>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -284,7 +308,8 @@ impl AgentView {
             prompt.set_placeholder("Message the agent", cx);
             prompt.set_held_color(theme.ansi[3].hsla(), cx);
         });
-        let count = agent.read(cx).model().blocks().len();
+        let working = agent.read(cx).model().working_row();
+        let count = agent.read(cx).model().blocks().len() + usize::from(working.is_some());
         let view = cx.weak_entity();
         let scroller = cx.new(|cx| MessageScroller::new(count, move |ix, _, cx| render_block(&view, ix, cx), cx));
         let area = prompt.read(cx).area().clone();
@@ -298,7 +323,15 @@ impl AgentView {
             cx.subscribe(&area, |this, _, _: &TextAreaEvent, cx| {
                 this.agent.update(cx, |agent, cx| agent.seen(cx));
             }),
+            // A closed zone can't keep the clock running.
+            cx.on_release({
+                let id = cx.entity_id();
+                move |_, cx| Motion::want(id, false, cx)
+            }),
         ];
+        if working.is_some() {
+            Motion::want(cx.entity_id(), true, cx);
+        }
         let mut this = Self {
             agent,
             scroller,
@@ -309,6 +342,7 @@ impl AgentView {
             cancel_login: cx.focus_handle(),
             theme,
             font_size_override,
+            working,
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
@@ -379,10 +413,14 @@ impl AgentView {
         &self.scroller
     }
 
-    /// Takes the tab's profile's theme (the card's background and text,
-    /// and the held row's warning colour) and font size (`None`: the
-    /// terminal size in effect), as the config now has them or the
-    /// settings dialog previews them.
+    /// Takes the tab's profile's theme (the notices' red and the held
+    /// row's warning colour, the ANSI red and yellow, as there are no
+    /// warning tokens) and font size (`None`: the terminal size in effect),
+    /// as the config now has them or the settings dialog previews them.
+    /// Everything else the zone draws, its root's background and text
+    /// included, takes the theme scope's tokens it is drawn in: the
+    /// theme's zone tokens, which `ZoneTreeView` keeps and wraps the zone
+    /// in.
     pub fn set_profile(&mut self, theme: Theme, font_size_override: Option<f32>, cx: &mut Context<Self>) {
         let held = theme.ansi[3].hsla();
         self.prompt.update(cx, |prompt, cx| prompt.set_held_color(held, cx));
@@ -410,6 +448,15 @@ impl AgentView {
                     scroller.splice(splice.range.clone(), splice.count, cx);
                 }
             }),
+            AgentUpdate::Working(after) => {
+                let len = self.agent.read(cx).model().blocks().len();
+                if let Some(splice) = working_splice(self.working.is_some(), after.is_some(), len) {
+                    self.scroller.update(cx, |scroller, cx| scroller.splice(splice.range, splice.count, cx));
+                }
+                self.working = after.clone();
+                Motion::want(cx.entity_id(), after.is_some(), cx);
+                cx.notify();
+            }
             AgentUpdate::ClearDraft => self.prompt.update(cx, |prompt, cx| prompt.set_text("", cx)),
             AgentUpdate::SetDraft(text) => self.prompt.update(cx, |prompt, cx| prompt.set_text(text, cx)),
             AgentUpdate::SendFirstIfUnchanged(text) => {
@@ -653,6 +700,12 @@ impl AgentView {
 fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::AnyElement {
     let Some(entity) = view.upgrade() else { return div().into_any_element() };
     let this = entity.read(cx);
+    let blocks = this.agent.read(cx).model().blocks().len();
+    if ix == blocks
+        && let Some(row) = &this.working
+    {
+        return working_row(row, Motion::step(cx));
+    }
     let Some(block) = this.agent.read(cx).model().blocks().get(ix).cloned() else { return div().into_any_element() };
     let handles: Vec<(SharedString, FocusHandle)> = this
         .permissions
@@ -665,6 +718,21 @@ fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::
     let body = block_element(view.clone(), &block, &handles, colors, code_font);
     let (top, bottom) = item_padding(&block);
     div().px_3().when(top, |d| d.pt_1()).when(bottom, |d| d.pb_1()).w_full().child(body).into_any_element()
+}
+
+/// The working row (decision 2): its words shimmering at the motion
+/// clock's `step`, muted, padded as a list item.
+fn working_row(row: &WorkingRow, step: u32) -> gpui::AnyElement {
+    let text = row.text();
+    let position = motion::shimmer_position(step, text.chars().count());
+    div()
+        .debug_selector(|| "agent-working".into())
+        .px_3()
+        .py_1()
+        .w_full()
+        .text_size(gpui::rems(0.875))
+        .child(Shimmer::new(text).position(position))
+        .into_any_element()
 }
 
 /// Rich-text `blocks` as a [`Response`] in `code_font`, its links acting
@@ -744,11 +812,14 @@ fn block_element(
                 },
                 Some(PermissionOutcome::Cancelled) => ConfirmationState::Cancelled,
             };
-            let mut confirmation = Confirmation::new(id("permission"), title.clone(), state);
+            // Drawn as a risk while pending; the component draws an
+            // answered one plain whatever its tone.
+            let mut confirmation =
+                Confirmation::new(id("permission"), title.clone(), state).tone(ConfirmationTone::Destructive);
             for option in options.iter().filter(|_| outcome.is_none()) {
-                let mut action = ConfirmationAction::new(option.name.clone()).key(ItemKey::new(option.id.clone())).variant(
-                    if allows(option.kind) { ButtonVariant::Default } else { ButtonVariant::Outline },
-                );
+                let mut action = ConfirmationAction::new(option.name.clone())
+                    .key(ItemKey::new(option.id.clone()))
+                    .variant(permission_variant(option.kind));
                 if let Some((_, handle)) = handles.iter().find(|(own, _)| *own == option.id) {
                     action = action.focus(handle);
                 }
@@ -855,7 +926,10 @@ impl Render for AgentView {
         let login = self.login_row(cx);
         let settings = Settings::get(cx);
         let (size, family) = (self.text_size(cx), settings.ui_font_family());
-        let (bg, fg) = (self.theme.background.hsla(), self.theme.foreground.hsla());
+        // The scope's set (the zone's tokens), one source with the
+        // components inside.
+        let tokens = cx.ui_theme();
+        let (bg, fg) = (tokens.background, tokens.foreground);
         let content = div()
             .key_context("AgentZone")
             .on_action(cx.listener(Self::submit))

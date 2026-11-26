@@ -336,7 +336,7 @@ pub fn close_confirm(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(10.0)
         .run()?;
     ensure!(out.dump.confirm.is_none(), "the confirmation closed: {:?}", out.dump.confirm);
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "only the shell tab is left: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake", "only the shell tab is left: {:?}", out.dump.tabs);
     sessions_listed(ctx, 1)?;
     crate::brindle::hang_up_detached(ctx)?;
     Ok(Outcome::Pass)
@@ -359,7 +359,7 @@ pub fn close_idle(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
     ensure!(out.dump.confirm.is_none(), "nothing asked: {:?}", out.dump.confirm);
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "the agent tab closed: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake", "the agent tab closed: {:?}", out.dump.tabs);
     sessions_listed(ctx, 1)?;
     crate::brindle::hang_up_detached(ctx)?;
     Ok(Outcome::Pass)
@@ -381,7 +381,7 @@ pub fn first_prompt(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
     ensure!(out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello!\""], "entries: {:?}", out.dump.agent);
     ensure!(out.dump.agent_field("state") == Some("ready"), "agent: {:?}", out.dump.agent);
-    ensure!(out.dump.tabs == [("Fake Agent".to_string(), true)], "tabs: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs == [("Fake".to_string(), true)], "tabs: {:?}", out.dump.tabs);
 
     let out = Run::new(ctx, "relaunch").config(&profile).restore().wait_for(&answered()).dump_at(4.0).run()?;
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
@@ -602,8 +602,10 @@ pub fn cancel(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// A permission request blocks the turn (`status=blocked`); tab from the
-/// prompt reaches its buttons, allow first, and enter on one answers it:
-/// the agent gets the option chosen, and the turn goes on to its end.
+/// prompt reaches its buttons, reject first though the agent listed allow
+/// first (`agents-zone-attention` decision 4), and enter on one answers
+/// it: the agent gets the option chosen, and the turn goes on to its end.
+/// The dump's entry line keeps the agent's order.
 pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let profile = Script::ready(&received)
@@ -619,10 +621,10 @@ pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
     let out = started("focus").key("tab").dump_at(5.0).run()?;
     waited(&out)?;
     ensure!(out.dump.agent_field("status") == Some("blocked"), "agent: {:?}", out.dump.agent);
-    ensure!(out.dump.focus_stop.as_deref() == Some("permission:2:allow-once"), "focus: {:?}", out.dump.focus_stop);
+    ensure!(out.dump.focus_stop.as_deref() == Some("permission:2:reject-once"), "focus: {:?}", out.dump.focus_stop);
 
     std::fs::remove_file(&received).ok();
-    let out = started("reject").key("tab").key("tab").key("enter").wait_for("agent \"done\"").dump_at(7.0).run()?;
+    let out = started("reject").key("tab").key("enter").wait_for("agent \"done\"").dump_at(7.0).run()?;
     waited(&out)?;
     agent_has(&out, "entry 2 permission call=\"call_1\" options=allow-once:\"Allow\"|reject-once:\"Reject\" outcome=selected:reject-once")?;
     ensure!(out.dump.agent_field("turn") == Some("ended:end_turn"), "agent: {:?}", out.dump.agent);
@@ -631,6 +633,136 @@ pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
         sent.lines().any(|l| l.contains("\"id\":\"p1\"") && l.contains("\"optionId\":\"reject-once\"")),
         "the agent wasn't answered reject-once: {sent}"
     );
+    Ok(Outcome::Pass)
+}
+
+/// The zone set's `card` token for the `e2e` theme, an agent zone's agent
+/// bubble and an answered permission: `BACKGROUND` (the theme's own,
+/// `Theme::zone_tokens`) mixed 4% towards the foreground.
+const ZONE_CARD: crate::capture::Rgb = crate::capture::Rgb(0x17, 0x1b, 0x1f);
+
+/// The zone set's `destructive_tint` for the `e2e` theme, a pending
+/// permission's background: [`ZONE_CARD`] mixed the most, 12%, towards the
+/// red (`RED`, 4.1:1 on the card, so `destructive` as it is), since the
+/// foreground keeps 8.6:1 and the red 3.7:1 on it (`theme::destructive_tint`).
+const ZONE_DESTRUCTIVE_TINT: crate::capture::Rgb = crate::capture::Rgb(0x2f, 0x1f, 0x23);
+
+/// The working row and the spinners (OpenSpec change
+/// `agents-zone-attention`, decisions 1 to 3): while a tool call is in
+/// progress the zone's last line is `--- working "Read main.rs"`, the tab's
+/// face spins and the motion clock runs; split, the working zone's header
+/// spins too. Once the turn ends (the case opens the gate from a Shell
+/// tab) there is no working line and no spinner, and the clock is stopped.
+pub fn working(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let done = gate(ctx, "done");
+    let tool = |status: &str| {
+        update(&format!(
+            r#"{{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"Read main.rs","kind":"read","status":"{status}"}}"#
+        ))
+    };
+    let profile = Script::ready(&received)
+        .step("expect session/prompt")
+        .step(tool("in_progress"))
+        .step(format!("wait-file {}", done.display()))
+        .step(update(r#"{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed"}"#))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "working")?;
+    let in_progress = "working \"Read main.rs\"";
+    let started = |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for(in_progress);
+
+    let out = started("working").dump_at(5.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_working().as_deref() == Some("Read main.rs"), "working row: {:?}", out.dump.agent);
+    ensure!(out.dump.agent.last().is_some_and(|l| l.starts_with("prompt ")), "agent lines {:?}", out.dump.agent);
+    ensure!(out.dump.spinners == ["tab=1"], "spinners {:?}", out.dump.spinners);
+    ensure!(out.dump.motion.as_deref() == Some("running"), "motion {:?}", out.dump.motion);
+
+    // Split: the new zone is active and idle, the working one's header
+    // spins.
+    let out = started("split").action("split_zone_right").wait_for("conversation entries=0").dump_at(6.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
+    ensure!(out.dump.spinners == ["tab=1", "zone=1"], "spinners {:?}", out.dump.spinners);
+    ensure!(out.dump.motion.as_deref() == Some("running"), "motion {:?}", out.dump.motion);
+
+    let out = started("ended")
+        .action("new_tab")
+        .send(&format!("touch '{}'\r", done.display()))
+        .action("activate_tab_1")
+        .wait_for("turn=ended:end_turn")
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_working().is_none(), "a working row at the end: {:?}", out.dump.agent);
+    ensure!(out.dump.spinners.is_empty(), "spinners at the end {:?}", out.dump.spinners);
+    ensure!(out.dump.motion.as_deref() == Some("stopped"), "motion {:?}", out.dump.motion);
+    Ok(Outcome::Pass)
+}
+
+/// A pending permission is drawn as a risk (OpenSpec change
+/// `agents-zone-attention`, decision 4), in pixels: its row has the zone
+/// set's destructive tint behind its title and the allow button's
+/// destructive fill (the `e2e` theme's red); once allowed (tab, tab,
+/// enter: reject comes first) the row is back on the card's colour.
+pub fn permission_style(ctx: &Ctx) -> Result<Outcome> {
+    use crate::brindle::theme;
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(ask("p1"))
+        .step(r#"expect-response "p1""#)
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, "style")?;
+    let started =
+        |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for("outcome=pending");
+
+    let out = started("pending").capture_at(5.0).dump_at(5.5).run()?;
+    waited(&out)?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    let area = scale * scale;
+    // The title row is the zone's width less its paddings by some 30
+    // logical pixels; the allow button about 60 by 28.
+    let tint = image.count_near(zone, ZONE_DESTRUCTIVE_TINT, TOKEN_NEAR);
+    ensure!(
+        tint as f32 >= 2_000.0 * area,
+        "the tint: {tint} pixels of {} in {zone:?}; found {}",
+        ZONE_DESTRUCTIVE_TINT.hex(),
+        image.summary(zone)
+    );
+    let fill = image.count_near(zone, theme::RED, TOKEN_NEAR);
+    ensure!(
+        fill as f32 >= 500.0 * area,
+        "the allow button's fill: {fill} pixels of {} in {zone:?}; found {}",
+        theme::RED.hex(),
+        image.summary(zone)
+    );
+
+    let out = started("answered")
+        .key("tab")
+        .key("tab")
+        .key("enter")
+        .wait_for("outcome=selected:allow-once")
+        .capture_at(7.0)
+        .dump_at(7.5)
+        .run()?;
+    waited(&out)?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    // Antialiased red edges pass through the tint's colour; a row of it
+    // doesn't.
+    let tint = image.count_near(zone, ZONE_DESTRUCTIVE_TINT, TOKEN_NEAR);
+    ensure!(
+        (tint as f32) < 100.0 * scale * scale,
+        "answered, {tint} pixels of the tint {} remain in {zone:?}; found {}",
+        ZONE_DESTRUCTIVE_TINT.hex(),
+        image.summary(zone)
+    );
+    let card = image.count_near(zone, ZONE_CARD, TOKEN_NEAR);
+    ensure!(card as f32 >= 2_000.0 * scale * scale, "the card: {card} pixels of {}; found {}", ZONE_CARD.hex(), image.summary(zone));
     Ok(Outcome::Pass)
 }
 
@@ -892,6 +1024,342 @@ pub fn markdown_links(ctx: &Ctx) -> Result<Outcome> {
         out.dump.agent_blocks(2)
     );
     Ok(Outcome::Pass)
+}
+
+/// An agent zone's rem in the test config, in logical pixels: the default
+/// font size, which the zone draws its components in.
+const ZONE_REM: f32 = 14.0;
+
+/// `agent-markdown-layout`'s paragraph: longer than the zone is wide.
+const LONG_PARAGRAPH: &str = "This paragraph is much longer than the zone is wide, so it wraps over several lines \
+    inside the bubble rather than widening it past the short line above, and the bubble's right edge stays \
+    straight from that short line down to the code block under it, as one bubble across the conversation's \
+    width should, however long each of its parts happens to be.";
+
+/// A message's parts are one bubble and a code block's label one line
+/// (OpenSpec change `agents-markdown-layout-fixes`): the agent answers
+/// `Hi.`, a paragraph longer than the zone and a `rust` block; in the
+/// capture, the bubble's right border is at one column on every row its
+/// left border spans, one `px_3` inside the card's content edge, with
+/// nothing of the border's colour right of it, and the code block's header
+/// is at most two of the label's lines tall.
+pub fn markdown_layout(ctx: &Ctx) -> Result<Outcome> {
+    use crate::brindle::theme;
+    let answer = format!("Hi.\n\n{LONG_PARAGRAPH}\n\n```rust\nlet x = 1;\n```\n");
+    let profile = answering(ctx, "layout", &answer)?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for(ENDED)
+        .capture_at(6.0)
+        .dump_at(6.5)
+        .run()?;
+    waited(&out)?;
+    let parts = [part(0, "paragraph", "Hi."), part(1, "paragraph", LONG_PARAGRAPH), part(2, "code:rust", "let x = 1;\n")];
+    ensure!(out.dump.agent_blocks(2) == parts, "the message's parts {:#?}", out.dump.agent_blocks(2));
+    let image = out.image.as_ref().ok_or("no capture")?;
+    // The zone's rem is its font size, the default 14px; the label is
+    // 0.75rem at gpui's default line height (the golden ratio).
+    // The zone is drawn in the `e2e` theme's zone set: its border is the
+    // window's, its `muted` the theme's own background's mix.
+    let layout = measure_layout(image, theme::CHROME_BORDER, theme::ZONE_MUTED, ZONE_REM)?;
+    let label_line = 0.75 * ZONE_REM * 1.618 * layout.scale;
+    ensure!(
+        layout.header as f32 <= 2.0 * label_line,
+        "the code block's header is {} px, more than two label lines ({label_line:.1} px each): {layout:?}",
+        layout.header
+    );
+    Ok(Outcome::Pass)
+}
+
+/// What [`markdown_layout`] reads from a capture of one agent zone, in
+/// device pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Layout {
+    /// Device pixels per logical one, from the gap right of the card.
+    scale: f32,
+    /// The card's content edges: the ends of its left and right borders.
+    content: (u32, u32),
+    /// The bubble's rows: its left border's run down the column `px_3`
+    /// inside the card, between its rounded corners.
+    rows: (u32, u32),
+    /// The column of the bubble's right border on every one of `rows`.
+    right: u32,
+    /// A code block's header: from the end of its top border to the first
+    /// row of its `muted` surface.
+    header: u32,
+}
+
+/// Measures an agent zone's capture for [`markdown_layout`], in the
+/// border colour `border` and the code's surface colour `muted`, with the
+/// zone's rem `rem` logical pixels (its font size).
+///
+/// The card's borders are the first and last runs of `border` along the
+/// middle row, and the scale is the gap right of the card over
+/// `ZONE_GAP`. The bubble's left border is the longest run of `border` down
+/// the column `px_3` (0.75rem) inside the card (give or take a pixel); its
+/// right border must be one run over the same rows, `px_3` inside the
+/// card's right edge (give or take a pixel), with no `border` right of it
+/// on those rows. The code block's header runs from the last `border` run
+/// above the longest `muted` run, down the column inside the block's left
+/// border by 6px (past its rounded corner, short of the label's `pl_3`), to
+/// that `muted` run.
+pub(super) fn measure_layout(
+    image: &crate::capture::Image,
+    border: crate::capture::Rgb,
+    muted: crate::capture::Rgb,
+    rem: f32,
+) -> Result<Layout> {
+    const NEAR: u8 = 2;
+    let (px_3, px_4) = (0.75 * rem, rem);
+    let longest = |runs: Vec<(u32, u32)>| runs.into_iter().max_by_key(|&(a, b)| b - a);
+    let mid = image.height / 2;
+    let card = image.runs_in_row(mid, (0, image.width), border, NEAR);
+    let (Some(&(_, left)), Some(&(right_border, after))) = (card.first(), card.last()) else {
+        return Err(format!("no card border along row {mid}: {card:?}"));
+    };
+    ensure!(left < right_border, "one border run along row {mid}: {card:?}");
+    let scale = (image.width - after) as f32 / super::ZONE_GAP;
+    ensure!(scale > 0.0, "no gap right of the card (it ends at {after} of {})", image.width);
+    let dev = |v: f32| (v * scale).round() as u32;
+    let near = |x: u32| x.saturating_sub(1)..=x + 1;
+
+    let at = left + dev(px_3);
+    let rows = near(at)
+        .filter_map(|x| longest(image.runs_in_column(x, (0, image.height), border, NEAR)))
+        .max_by_key(|&(a, b)| b - a)
+        .ok_or_else(|| format!("no bubble border down the columns round {at}"))?;
+    ensure!(rows.1 - rows.0 > dev(40.0), "the bubble's left border {rows:?} is too short to be a message's");
+
+    let expected = right_border - dev(px_3) - dev(1.0);
+    let right = near(expected)
+        .find(|&x| match image.runs_in_column(x, rows, border, NEAR)[..] {
+            [(a, b)] => a <= rows.0 + 1 && b + 1 >= rows.1,
+            _ => false,
+        })
+        .ok_or_else(|| {
+            let found: Vec<_> = near(expected).map(|x| (x, image.runs_in_column(x, rows, border, NEAR))).collect();
+            format!("the bubble's right border isn't one run over its rows {rows:?} round column {expected}: {found:?}")
+        })?;
+    for y in rows.0..rows.1 {
+        let past = image.runs_in_row(y, (right + 2, right_border), border, NEAR);
+        ensure!(past.is_empty(), "row {y} has the border's colour right of the bubble (column {right}): {past:?}");
+    }
+
+    // The bubble's border, its px_4, the block's border, then 6px.
+    let column = left + dev(px_3 + 1.0 + px_4 + 1.0 + 6.0);
+    let surface = longest(image.runs_in_column(column, rows, muted, NEAR))
+        .ok_or_else(|| format!("no code surface down column {column} over {rows:?}"))?;
+    let top = image
+        .runs_in_column(column, (rows.0, surface.0), border, NEAR)
+        .last()
+        .copied()
+        .ok_or_else(|| format!("no code block border above its surface {surface:?} down column {column}"))?;
+    Ok(Layout { scale, content: (left, right_border), rows, right, header: surface.0 - top.1 })
+}
+
+/// [`measure_layout`] on painted captures: one bubble with straight edges
+/// and a code block, and a jagged one.
+pub fn self_test_layout() -> Result {
+    use crate::capture::{Image, Rgb};
+    const BG: Rgb = Rgb(0x10, 0x14, 0x18);
+    const GAP: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    const LINE: Rgb = Rgb(0x25, 0x29, 0x2c);
+    const MUTED: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    // A 200 × 120 window: the card's borders at columns 6 and 193 (a 6px
+    // gap each side), the bubble's at 19 and 180 over rows 20..100, a code
+    // block's top border at row 60 over columns 36..170 and its surface
+    // over rows 70..90.
+    let paint = |jagged: bool| {
+        move |x: u32, y: u32| {
+            let right = if jagged && y < 50 { 100 } else { 180 };
+            let card = x == 6 || x == 193;
+            let bubble = (20..100).contains(&y) && (x == 19 || x == right);
+            let code_top = y == 60 && (36..170).contains(&x);
+            if !(6..=193).contains(&x) {
+                GAP
+            } else if card || bubble || code_top {
+                LINE
+            } else if (70..90).contains(&y) && (36..170).contains(&x) {
+                MUTED
+            } else {
+                BG
+            }
+        }
+    };
+    // At a 16px rem, px_3 is 12px: the borders at 7 + 12 and 193 - 12 - 1.
+    let got = measure_layout(&Image::painted(200, 120, paint(false)), LINE, MUTED, 16.0)?;
+    let want = Layout { scale: 1.0, content: (7, 193), rows: (20, 100), right: 180, header: 9 };
+    ensure!(got == want, "one bubble: {got:?}, want {want:?}");
+    let jagged = measure_layout(&Image::painted(200, 120, paint(true)), LINE, MUTED, 16.0);
+    ensure!(jagged.is_err(), "a jagged bubble measured {jagged:?}");
+    Ok(())
+}
+
+/// `agent-zone-theme`'s profile theme: `e2e-alt`'s foreground and
+/// background with an accent of its own (`ZONE_ACCENT`; `e2e-alt` shares
+/// `e2e`'s, which would hide a primary drawn in the window's), set on the
+/// `Fake` profile `profile` ends with.
+fn zone_theme_config(profile: &str) -> String {
+    use super::zones::ZONE_ACCENT;
+    use crate::brindle::theme::{ALT_BACKGROUND, ALT_FOREGROUND};
+    format!(
+        "{profile}theme = \"e2e-agent\"\n\n[themes.e2e-agent]\nforeground = \"{}\"\nbackground = \"{}\"\naccent = \"{}\"\n",
+        ALT_FOREGROUND.hex(),
+        ALT_BACKGROUND.hex(),
+        ZONE_ACCENT.hex()
+    )
+}
+
+/// How close a pixel must be to a token's colour to count as it here:
+/// the two sets' surfaces are closer than [`Image::count`]'s 24 apart.
+///
+/// [`Image::count`]: crate::capture::Image::count
+const TOKEN_NEAR: u8 = 3;
+
+/// The spec's "A profile theme unlike the window's" (`agents-ui`) and
+/// "Tooltips and overlays in a theme scope" (`ui-components`), in pixels
+/// (OpenSpec change `agents-zone-theme-scope`): an agent zone whose profile
+/// theme isn't the window's draws its components in that theme's zone
+/// set. Its agent bubble and permission (`card`), code block and the
+/// person's bubble (`muted`) and allow button (the profile's accent) show
+/// inside the zone, and the window set's `card` and `muted` and the global
+/// accent don't, while the strip keeps the window's background. Then, split
+/// and with the zone header's menu open, no pixel of the window set's
+/// `popover` is in either zone, and the zone set's is in the active one.
+pub fn zone_theme(ctx: &Ctx) -> Result<Outcome> {
+    use super::zones::ZONE_ACCENT;
+    use crate::brindle::theme;
+    let profile = Script::ready(&ctx.dir.join("theme.jsonl"))
+        .step("expect session/prompt")
+        .step(says("Here:\n\n```rust\nlet x = 1;\n```\n"))
+        .step(ask("p1"))
+        .profile(ctx, "theme")?;
+    let config = zone_theme_config(&profile);
+    let pending = "outcome=pending";
+    let started = |label| Run::new(ctx, label).config(&config).agent("Fake").first_prompt("hi").wait_for(pending);
+
+    let out = started("zone").capture_at(5.0).dump_at(5.5).run()?;
+    waited(&out)?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::ALT_CARD_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    let present = [
+        ("the zone set's card", theme::ALT_ZONE_CARD),
+        ("the zone set's muted", theme::ALT_ZONE_MUTED),
+        ("the profile's accent", ZONE_ACCENT),
+    ];
+    for (what, color) in present {
+        let n = image.count_near(zone, color, TOKEN_NEAR);
+        ensure!(n >= 100, "{what}: {n} pixels of {} in the zone {zone:?}; found {}", color.hex(), image.summary(zone));
+    }
+    for (what, color) in [("the window set's card", theme::WINDOW_CARD), ("the window set's muted", theme::WINDOW_MUTED)] {
+        let n = image.count_near(zone, color, TOKEN_NEAR);
+        ensure!(n <= 2, "{what}: {n} pixels of {} in the zone {zone:?}; found {}", color.hex(), image.summary(zone));
+    }
+    image.expect_none("the window's accent in the zone", zone, theme::ACCENT)?;
+    // The empty caption left of the window controls, as `tab-faces` reads it.
+    let caption = {
+        let right = image.width as f32 / scale - (8.0 + 3.0 * 32.0 + 2.0 * 4.0) - 30.0;
+        logical_rect(scale, [right - 40.0, 12.0, 40.0, 14.0])
+    };
+    let got = image.dominant(caption);
+    ensure!(
+        got.is_some_and(|c| c.near(theme::CHROME_BACKGROUND, 2)),
+        "the strip: dominant {:?} in {caption:?}, want the window's {}; found {}",
+        got.map(crate::capture::Rgb::hex),
+        theme::CHROME_BACKGROUND.hex(),
+        image.summary(caption)
+    );
+
+    let out = started("menu")
+        .action("split_zone_right")
+        .wait_for("conversation entries=0")
+        .wait_for(READY)
+        .modality("pointer")
+        .action("open_zone_menu")
+        .capture_at(8.5)
+        .dump_at(9.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
+    ensure!(!out.dump.menu.is_empty(), "no menu open: focus {:?}", out.dump.focus);
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::ALT_CARD_BORDER)?;
+    for line in &out.dump.zone_list {
+        let rect = parse_zone_rect(line).ok_or_else(|| format!("no rect in the zone line {line:?}"))?;
+        let zone = zone_inner(image, scale, rect);
+        let n = image.count_near(zone, theme::WINDOW_POPOVER, TOKEN_NEAR);
+        ensure!(n <= 2, "the window set's popover: {n} pixels in zone {line:?} ({zone:?}); found {}", image.summary(zone));
+        if line.ends_with(" active") {
+            // The menu's panel is some 240 × 120 logical pixels (about
+            // 20,000 of its colour at scale 1); the empty zone round it
+            // shows next to none.
+            let n = image.count_near(zone, theme::ALT_ZONE_POPOVER, TOKEN_NEAR);
+            ensure!(n >= (10_000.0 * scale * scale) as usize,"the menu: {n} pixels of the zone set's popover in {line:?}; found {}", image.summary(zone));
+        }
+    }
+    Ok(Outcome::Pass)
+}
+
+/// The window's scale, device pixels per logical one, from the gap right
+/// of the rightmost card: the last run of `border` (the card's border)
+/// along the middle row ends `ZONE_GAP` from the window's right edge.
+pub(super) fn window_scale(image: &crate::capture::Image, border: crate::capture::Rgb) -> Result<f32> {
+    let mid = image.height / 2;
+    let runs = image.runs_in_row(mid, (0, image.width), border, 2);
+    let &(_, after) = runs.last().ok_or_else(|| format!("no card border along row {mid}"))?;
+    let scale = (image.width - after) as f32 / super::ZONE_GAP;
+    ensure!(scale > 0.0, "no gap right of the card (it ends at {after} of {})", image.width);
+    Ok(scale)
+}
+
+/// `[x, y, width, height]` logical pixels, in device pixels at `scale`.
+fn logical_rect(scale: f32, [x, y, w, h]: [f32; 4]) -> crate::capture::PxRect {
+    let px = |v: f32| (v * scale).round().max(0.0) as u32;
+    crate::capture::PxRect { x0: px(x), y0: px(y), x1: px(x + w), y1: px(y + h) }
+}
+
+/// A zone's inside, in device pixels: its dump `rect` (`[x, y, width,
+/// height]` in `[0, 1]` of the tab's area, the window below the strip)
+/// less the gap, the card's border and 12px more, clear of the card's
+/// 10px rounded corners and their edge blending.
+pub(super) fn zone_inner(image: &crate::capture::Image, scale: f32, [x, y, w, h]: [f32; 4]) -> crate::capture::PxRect {
+    use super::tabs::STRIP_HEIGHT;
+    const INSET: f32 = super::CARD_INSET + 12.0;
+    let (width, height) = (image.width as f32 / scale, image.height as f32 / scale - STRIP_HEIGHT);
+    let (left, top) = (x * width, STRIP_HEIGHT + y * height);
+    logical_rect(scale, [left + INSET, top + INSET, w * width - 2.0 * INSET, h * height - 2.0 * INSET])
+}
+
+/// A dump zone line's `rect=X,Y,W,H`, as `[x, y, width, height]`.
+pub(super) fn parse_zone_rect(line: &str) -> Option<[f32; 4]> {
+    let rect = line.split(' ').find_map(|word| word.strip_prefix("rect="))?;
+    let values: Vec<f32> = rect.split(',').map(str::parse).collect::<std::result::Result<_, _>>().ok()?;
+    values.try_into().ok()
+}
+
+/// [`window_scale`], [`zone_inner`] and [`parse_zone_rect`] on painted
+/// captures and dump lines.
+pub fn self_test_zone_theme() -> Result {
+    use crate::capture::{Image, PxRect, Rgb};
+    const GAP: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    const LINE: Rgb = Rgb(0x36, 0x2f, 0x2f);
+    // A 400 × 300 window at scale 2: a card's borders at columns 12 and
+    // 387, the gap 12 device pixels right of it.
+    let painted = Image::painted(400, 300, |x, _| if x == 12 || x == 387 { LINE } else { GAP });
+    let scale = window_scale(&painted, LINE)?;
+    ensure!(scale == 2.0, "scale {scale}");
+    // 200 × 150 logical; the tab's area is 200 × 108 below the strip.
+    let got = zone_inner(&painted, scale, [0.5, 0.0, 0.5, 1.0]);
+    let want = PxRect { x0: 238, y0: 122, x1: 362, y1: 262 };
+    ensure!(got == want, "the right zone's inside {got:?}, want {want:?}");
+    ensure!(window_scale(&Image::painted(40, 20, |_, _| GAP), LINE).is_err(), "a scale with no card");
+    ensure!(parse_zone_rect("id=2 rect=0.5,0,0.5,1 active") == Some([0.5, 0.0, 0.5, 1.0]), "a zone line");
+    ensure!(parse_zone_rect("id=1 rect=0,0,1").is_none(), "three values");
+    ensure!(parse_zone_rect("id=1").is_none(), "no rect");
+    Ok(())
 }
 
 /// Split Zone Right in an agent tab opens a second agent zone on the same
@@ -1324,7 +1792,7 @@ pub fn sweep(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(5.0)
         .run()?;
     waited(&out)?;
-    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake Agent".to_string(), true), "tabs: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake".to_string(), true), "tabs: {:?}", out.dump.tabs);
     ensure!(out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello!\""], "entries: {:?}", out.dump.agent);
     ensure!(prompts_sent(&received)? == ["hi"], "sent: {:?}", prompts_sent(&received)?);
     Ok(Outcome::Pass)
@@ -1369,7 +1837,7 @@ pub fn sessions_palette(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(7.0)
         .run()?;
     waited(&out)?;
-    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake Agent".to_string(), true), "tabs: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake".to_string(), true), "tabs: {:?}", out.dump.tabs);
     ensure!(out.dump.agent_field("status") == Some("blocked"), "agent: {:?}", out.dump.agent);
     let out = Run::new(ctx, "kill")
         .config(&profile)
@@ -1397,13 +1865,33 @@ fn agent_listed(ctx: &Ctx) -> Result<bool> {
     Ok(String::from_utf8_lossy(&out.stdout).contains("brindle-fake-acp-agent"))
 }
 
-/// The permission an agent asks for in `agent-notify`.
-const ASKED: &str = "Run cargo test?";
+/// The command an agent asks to run in `agent-notify`.
+const ASKED: &str = "cargo test";
+
+/// A permission notice's body in the log, its two lines joined by a space
+/// (`agents-zone-attention` decision 6): the call's kind and title, then
+/// the options, reject first.
+const ASKED_BODY: &str = "Command: cargo test Reject · Allow";
+
+/// A permission notice's title: the profile's name and what it asks.
+const ASKED_TITLE: &str = "Fake needs permission";
+
+/// `script` starting a tool call `call_1` that runs [`ASKED`], then asking
+/// permission for it with the JSON-RPC id `id`.
+fn asks_to_run(script: Script, id: &str) -> Script {
+    script
+        .step(update(&format!(
+            r#"{{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"{ASKED}","kind":"execute","status":"pending"}}"#
+        )))
+        .step(ask_about(id, ASKED))
+}
 
 /// The notification log's lines for an agent's notice (`source<TAB>title
-/// <TAB>body`): the agent's name, then the tab's title.
-fn agent_notice(body: &str) -> String {
-    format!("agent\tFake Agent — Fake Agent\t{body}")
+/// <TAB>body`): the profile's name, what it asks, and the conversation's
+/// title once the agent names it; the tab's automatic title isn't
+/// repeated (`agents-zone-attention` decision 6).
+fn agent_notice(title: &str, body: &str) -> String {
+    format!("agent\t{title}\t{body}")
 }
 
 /// The lines of a run's notification log; none when it wasn't written.
@@ -1421,9 +1909,10 @@ fn until_logged(log: &Path, text: &str, label: &str) -> String {
 
 /// An agent's notifications (`BRINDLE_NOTIFY_LOG`, source `agent`):
 /// - in a background tab, with the default `when`, a permission request
-///   notifies with its title and a turn that ends normally with `Done`,
-///   each titled `Fake Agent — Fake Agent`; answering the permission in
-///   front raises nothing;
+///   notifies titled `Fake needs permission`, its body the command and
+///   the options, and a turn that ends normally notifies `Done` titled
+///   `Fake`, the profile's name; answering the permission in front raises
+///   nothing;
 /// - with `when = "always"` the same turn in the active tab notifies both,
 ///   and with `notifications.agent = false` it notifies nothing;
 /// - a replay after a quit and relaunch notifies nothing, though it shows
@@ -1431,11 +1920,11 @@ fn until_logged(log: &Path, text: &str, label: &str) -> String {
 pub fn notify(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let (asked, answered) = (gate(ctx, "asked"), gate(ctx, "answered"));
-    let background = Script::ready(&received)
-        .step("expect session/prompt")
-        .step(format!("wait-file {}", asked.display()))
-        .step(ask_about("p1", ASKED))
-        .step(r#"expect-response "p1""#)
+    let background = asks_to_run(
+        Script::ready(&received).step("expect session/prompt").step(format!("wait-file {}", asked.display())),
+        "p1",
+    )
+    .step(r#"expect-response "p1""#)
         .step(format!("wait-file {}", answered.display()))
         .step(says("done"))
         .step(stop("end_turn"))
@@ -1453,21 +1942,20 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
         .action("activate_tab_1")
         .wait_for("outcome=pending")
         .key("tab")
+        .key("tab")
         .key("enter")
         .wait_for("outcome=selected:allow-once")
         .action("activate_tab_2")
         .send(&format!("touch '{}'; {}", answered.display(), until_logged(&log, "Done", "notice-2")))
         .wait_for("notice-2")
-        .dump_at(12.0)
+        .dump_at(14.0)
         .run()?;
     waited(&out)?;
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "the Shell tab in front: {:?}", out.dump.tabs);
-    let want = [agent_notice(ASKED), agent_notice("Done")];
+    let want = [agent_notice(ASKED_TITLE, ASKED_BODY), agent_notice("Fake", "Done")];
     ensure!(notices(&log) == want, "background: notices {:?}, expected {want:?}", notices(&log));
 
-    let in_front = Script::ready(&received)
-        .step("expect session/prompt")
-        .step(ask_about("p1", ASKED))
+    let in_front = asks_to_run(Script::ready(&received).step("expect session/prompt"), "p1")
         .step(r#"expect-response "p1""#)
         .step(says("done"))
         .step(stop("end_turn"))
@@ -1482,18 +1970,17 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
             .first_prompt("hi")
             .wait_for("outcome=pending")
             .key("tab")
+            .key("tab")
             .key("enter")
             .wait_for("agent \"done\"")
             .wait_for("status=done")
-            .dump_at(7.0)
+            .dump_at(8.0)
             .run()?;
         waited(&out)?;
         ensure!(notices(&log) == want, "{label}: notices {:?}, expected {want:?}", notices(&log));
     }
 
-    let pending = Script::ready(&received)
-        .step("expect session/prompt")
-        .step(ask_about("p1", ASKED))
+    let pending = asks_to_run(Script::ready(&received).step("expect session/prompt"), "p1")
         .step(format!("wait-file {}", gate(ctx, "never").display()))
         .profile(ctx, "replay")?;
     let notifications = "\n[notifications]\nwhen = \"always\"\n";
@@ -1510,7 +1997,7 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
         .expect_exit()
         .dump_at(12.0)
         .run()?;
-    ensure!(notices(&live) == [agent_notice(ASKED)], "live: notices {:?}", notices(&live));
+    ensure!(notices(&live) == [agent_notice(ASKED_TITLE, ASKED_BODY)], "live: notices {:?}", notices(&live));
     let out = Run::new(ctx, "replayed")
         .config(&pending)
         .config(notifications)
@@ -1522,6 +2009,130 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
     waited(&out)?;
     ensure!(out.dump.agent_field("status") == Some("blocked"), "replayed: agent {:?}", out.dump.agent);
     ensure!(notices(&replay).is_empty(), "the replay notified: {:?}", notices(&replay));
+    Ok(Outcome::Pass)
+}
+
+/// The title an agent gives its conversation in `agent-session-title`.
+const NAMED: &str = "Hello.txt file creation";
+
+/// A `send` step of a `session_info_update` for `s1` titling the
+/// conversation `title`, or clearing its title for `None`.
+fn titles(title: Option<&str>) -> String {
+    let title = serde_json::to_string(&title).unwrap_or_default();
+    format!(
+        r#"send {{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"session_info_update","title":{title}}}}}}}"#
+    )
+}
+
+/// The agent zone's tab title and its conversation's (OpenSpec change
+/// `agents-session-title`), with an agent whose `initialize` names it
+/// `@fake/acp`, titled `Fake Agent`:
+/// - the tab reads the profile's name, `Fake`, and the zone's dump names
+///   the agent by its readable title;
+/// - after the agent titles its conversation (on the first prompt) the
+///   tab reads the title, and the turn's `Done` notification is titled
+///   with the profile's name and it (`agents-zone-attention` decision 6);
+/// - after the agent clears it (on the second prompt) the tab and the
+///   notification read `Fake` again;
+/// - a tab renamed `Build` through the rename prompt keeps its name after
+///   the agent's title, and the notification adds it after the zone's
+///   title.
+pub fn session_title(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    // Holds the second turn until it shows as working, so its `Done` is a
+    // change of status the typed prompt didn't mark seen.
+    let cleared = gate(ctx, "cleared");
+    let profile = Script(vec![
+        format!("record {}", received.display()),
+        "expect initialize".into(),
+        r#"respond {"protocolVersion":1,"agentInfo":{"name":"@fake/acp","title":"Fake Agent","version":"1.0"}}"#.into(),
+        "expect session/new".into(),
+        r#"respond {"sessionId":"s1"}"#.into(),
+    ])
+    .step("expect session/prompt")
+    .step(titles(Some("Hello.txt\nfile  creation")))
+    .step(says("named"))
+    .step(stop("end_turn"))
+    .step("expect session/prompt")
+    .step(format!("wait-file {}", cleared.display()))
+    .step(titles(None))
+    .step(says("cleared"))
+    .step(stop("end_turn"))
+    .profile(ctx, "titled")?;
+    let always = "\n[notifications]\nwhen = \"always\"\n";
+    let tab = |out: &crate::brindle::Output| out.dump.tabs.first().map(|(title, _)| title.clone()).unwrap_or_default();
+
+    let out = Run::new(ctx, "untitled").config(&profile).agent("Fake").wait_for(READY).dump_at(4.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.tabs == [("Fake".to_string(), true)], "the profile's name: {:?}", out.dump.tabs);
+    ensure!(
+        out.dump.agent.first().is_some_and(|line| line.contains(" name=\"Fake Agent\" ")),
+        "the agent's readable name: {:?}",
+        out.dump.agent
+    );
+
+    let log = ctx.dir.join("titled.notify");
+    let out = Run::new(ctx, "titled")
+        .config(&profile)
+        .config(always)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("agent \"named\"")
+        .wait_for("status=done")
+        .dump_at(5.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(tab(&out) == NAMED, "the conversation's title, on one line: {:?}", out.dump.tabs);
+    ensure!(notices(&log) == [format!("agent\tFake — {NAMED}\tDone")], "titled: notices {:?}", notices(&log));
+
+    let log = ctx.dir.join("cleared.notify");
+    let out = Run::new(ctx, "cleared")
+        .config(&profile)
+        .config(always)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("agent \"named\"")
+        .wait_for("status=done")
+        .send("again")
+        .key("enter")
+        .wait_for(WORKING)
+        .action("new_tab")
+        .send(&format!(
+            "touch '{}'; until [ \"$(grep -c Done '{}')\" -ge 2 ]; do sleep 0.1; done; echo cle\"\"ared-done\r",
+            cleared.display(),
+            log.display()
+        ))
+        .wait_for("cleared-done")
+        .dump_at(10.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "the Shell tab in front: {:?}", out.dump.tabs);
+    ensure!(tab(&out) == "Fake", "the profile's name again: {:?}", out.dump.tabs);
+    let want = [format!("agent\tFake — {NAMED}\tDone"), "agent\tFake\tDone".to_string()];
+    ensure!(notices(&log) == want, "cleared: notices {:?}, expected {want:?}", notices(&log));
+
+    let log = ctx.dir.join("renamed.notify");
+    let out = Run::new(ctx, "renamed")
+        .config(&profile)
+        .config(always)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .wait_for(READY)
+        .action("rename_tab")
+        .send("Build")
+        .action("picker_confirm")
+        .send("hi")
+        .key("enter")
+        .wait_for("agent \"named\"")
+        .wait_for("status=done")
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(tab(&out) == "Build", "the manual title wins: {:?}", out.dump.tabs);
+    let want = [format!("agent\tFake — {NAMED} — Build\tDone")];
+    ensure!(notices(&log) == want, "renamed: notices {:?}, expected {want:?}", notices(&log));
     Ok(Outcome::Pass)
 }
 
@@ -2066,7 +2677,7 @@ pub fn continue_not_restored(ctx: &Ctx) -> Result<Outcome> {
     })?;
     let out = Run::new(ctx, "relaunch").config(&profile).restore().dump_at(4.0).run()?;
     ensure!(out.dump.agent.is_empty(), "an agent zone came back: {:?}", out.dump.agent);
-    ensure!(!out.dump.tabs.iter().any(|(title, _)| title == "Fake Agent"), "tabs: {:?}", out.dump.tabs);
+    ensure!(!out.dump.tabs.iter().any(|(title, _)| title == "Fake"), "tabs: {:?}", out.dump.tabs);
     Ok(Outcome::Pass)
 }
 
@@ -2355,7 +2966,7 @@ pub fn login_close(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     waited(&out)?;
     ensure!(out.dump.confirm.is_none(), "nothing asked: {:?}", out.dump.confirm);
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "the agent tab closed: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake", "the agent tab closed: {:?}", out.dump.tabs);
     sessions_listed(ctx, 1)?;
     crate::brindle::hang_up_detached(ctx)?;
     Ok(Outcome::Pass)

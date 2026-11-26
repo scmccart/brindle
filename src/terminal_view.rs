@@ -794,7 +794,7 @@ impl TerminalView {
             FeedbackKind::Pasted => Icon::ClipboardPaste,
             FeedbackKind::NothingToPaste => Icon::Ban,
         };
-        let style = brindle_ui::tooltip_style(cx.ui_theme());
+        let style = brindle_ui::tooltip_style(&cx.ui_theme());
         // A zero-size trigger 12px right of the pointer, with the box 12px
         // below it.
         let trigger = Bounds {

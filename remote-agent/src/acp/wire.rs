@@ -10,8 +10,9 @@
 //!
 //! - **`session/update`** is dispatched here on its `sessionUpdate` kind,
 //!   never through the crate's `SessionUpdate` enum, which costs the helper
-//!   more than a megabyte (decision 5, check 2). Only chunks, tool calls and
-//!   tool call updates are decoded; every other kind is [`Update::Ignored`].
+//!   more than a megabyte (decision 5, check 2). Only chunks, tool calls,
+//!   tool call updates and `session_info_update`'s title are decoded; every
+//!   other kind is [`Update::Ignored`].
 //! - **The stop reason** is read from the result's `Value`, since the crate's
 //!   `StopReason` has no catch-all: a reason Brindle doesn't know is
 //!   [`StopReason::Other`].
@@ -550,9 +551,23 @@ pub enum Update {
     ToolCall(ToolCall),
     /// `tool_call_update`: the fields that arrived, in no assumed order.
     ToolChanged(ToolChange),
+    /// `session_info_update`: what it says of the conversation's title
+    /// (OpenSpec change `agents-session-title`, decision 2). Its
+    /// `updatedAt` and `_meta` aren't read.
+    SessionInfo { title: Patch<String> },
     /// Any other kind, known (`plan`, `usage_update`,
-    /// `available_commands_update`, `session_info_update`, …) or not.
+    /// `available_commands_update`, …) or not.
     Ignored { kind: String },
+}
+
+/// What an update says of one optional field, ACP's "undefined, null or a
+/// value" (`MaybeUndefined`): left out keeps it, `null` clears it, a value
+/// sets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Patch<T> {
+    Keep,
+    Clear,
+    Set(T),
 }
 
 /// A chunk's content block.
@@ -612,11 +627,28 @@ pub fn session_update(params: &Value) -> Result<SessionUpdate, BadParams> {
         "agent_thought_chunk" => Update::ThoughtChunk(chunk(update)?),
         "tool_call" => Update::ToolCall(tool_call(update)?),
         "tool_call_update" => Update::ToolChanged(tool_change(update)?),
+        "session_info_update" => Update::SessionInfo {
+            title: session_title(update),
+        },
         other => Update::Ignored {
             kind: other.to_owned(),
         },
     };
     Ok(SessionUpdate { session_id, update })
+}
+
+/// A `session_info_update`'s `title`, read by hand: no `title` keeps the
+/// title, `null` clears it, a string sets it, and any other JSON type
+/// keeps it, so one odd field never costs the update (`railway R5`).
+fn session_title(update: &Value) -> Patch<String> {
+    match update.get("title") {
+        None => Patch::Keep,
+        Some(Value::Null) => Patch::Clear,
+        Some(Value::String(title)) => Patch::Set(title.clone()),
+        Some(Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_)) => {
+            Patch::Keep
+        }
+    }
 }
 
 fn chunk(update: &Value) -> Result<Content, BadParams> {
@@ -1100,6 +1132,35 @@ mod tests {
                 kind: "brand_new_kind".into()
             })
         );
+    }
+
+    #[test]
+    fn a_session_info_updates_title_is_kept_cleared_or_set() {
+        let rows = [
+            (json!({"_meta": {"codex": {}}}), Patch::Keep),
+            (json!({"title": null}), Patch::Clear),
+            (
+                json!({"title": "Hello.txt file creation", "updatedAt": "2026-11-25T02:15:11.854Z"}),
+                Patch::Set("Hello.txt file creation".to_owned()),
+            ),
+            (json!({"title": ""}), Patch::Set(String::new())),
+            // Any other type is no title: the update stays.
+            (json!({"title": 7}), Patch::Keep),
+            (json!({"title": ["a"]}), Patch::Keep),
+            (json!({"title": {"text": "a"}}), Patch::Keep),
+            (json!({"title": true}), Patch::Keep),
+        ];
+        for (fields, title) in rows {
+            let mut update = json!({"sessionUpdate": "session_info_update"});
+            for (key, value) in fields.as_object().into_iter().flatten() {
+                update[key] = value.clone();
+            }
+            assert_eq!(
+                session_update(&json!({"sessionId": "s", "update": update})).map(|u| u.update),
+                Ok(Update::SessionInfo { title }),
+                "{fields}"
+            );
+        }
     }
 
     #[test]
@@ -1736,6 +1797,7 @@ mod tests {
                         Update::ThoughtChunk(_) => "thought",
                         Update::ToolCall(_) => "tool call",
                         Update::ToolChanged(_) => "tool changed",
+                        Update::SessionInfo { .. } => "session info",
                         Update::Ignored { .. } => "ignored",
                     });
                 }
@@ -1746,10 +1808,57 @@ mod tests {
             "thought",
             "tool call",
             "tool changed",
+            "session info",
             "ignored",
         ] {
             assert!(seen.contains(&kind), "{kind}");
         }
+    }
+
+    /// Claude, Antigravity and Copilot name the conversation; Codex sends
+    /// `_meta` alone, which keeps the title.
+    #[test]
+    fn the_captured_session_info_updates_set_a_title_but_codexs_keep_it() {
+        let titles = |name: &str| -> Vec<Patch<String>> {
+            let (_, bytes) = CAPTURES
+                .iter()
+                .find(|(capture, _)| *capture == name)
+                .unwrap_or_else(|| panic!("no capture {name}"));
+            decode_capture(bytes)
+                .1
+                .into_iter()
+                .flatten()
+                .filter_map(|line| match line {
+                    Decoded::Update(Update::SessionInfo { title }) => Some(title),
+                    Decoded::Update(_)
+                    | Decoded::Permission(_)
+                    | Decoded::Initialized(_)
+                    | Decoded::NewSession
+                    | Decoded::Stopped(_)
+                    | Decoded::NotBrindles
+                    | Decoded::Ignored
+                    | Decoded::Bad(_) => None,
+                })
+                .collect()
+        };
+        let set = |title: &str| Patch::Set(title.to_owned());
+        assert_eq!(
+            titles("claude-agent-acp-0.112.0-auto"),
+            [set("Hello.txt file creation")]
+        );
+        assert_eq!(
+            titles("antigravity-1.5.16-reject"),
+            [set("Create Hello.txt File")]
+        );
+        let copilot = titles("copilot-1.0.115-reject");
+        assert!(
+            matches!(&copilot[..], [Patch::Set(title)] if title.starts_with("Please create a file named hello.txt")),
+            "{copilot:?}"
+        );
+        assert_eq!(
+            titles("codex-acp-2.12.0-reject"),
+            vec![Patch::Keep; 4]
+        );
     }
 
     #[test]
