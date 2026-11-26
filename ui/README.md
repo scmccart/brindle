@@ -312,16 +312,19 @@ rule, not a convenience.
     way in (`page_scroll`, pure), and a page down that reaches the end
     follows it (`Follow::after_draw`).
   - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
-    at the end on `muted`, the other side's (`Assistant`) at the start on
-    the card with a border, at most four fifths of the row. A long message
-    drawn as several list items uses `BubblePart::{First, Middle, Last}`,
-    which round, border and pad only the outer edges (`BubblePart::edges`).
+    at the end on `muted`, as wide as its text up to four fifths of the
+    row, the other side's (`Assistant`) at the start on the card with a
+    border, filling the row. A long message drawn as several list items
+    uses `BubblePart::{First, Middle, Last}`, which round, border and pad
+    only the outer edges (`BubblePart::edges`); the other side's parts all
+    fill the row, so their edges line up into one bubble.
     `Message::action(..)` adds an element (a copy button) under a whole
     message or its last part, drawn only while the pointer is over the
     message.
   - `PromptInput` (an entity owning its `TextArea`): a queue row, the
-    `Textarea`, and a toolbar with a reason line (`set_reason`, then an
-    optional small outline action button, `set_action(Some(label))`) and
+    `Textarea`, and a toolbar with a reason line (`set_reason`, wrapping at
+    the room the toolbar gives it, then an optional small outline action
+    button at the end of that room, `set_action(Some(label))`) and
     the submit button, which reads the owner's `PromptStatus`: `Ready` an
     `arrow-up` (disabled while the text is blank), `Submitted` a turning
     `loader-circle` (disabled), `Streaming` a `square` that asks to stop,
@@ -351,9 +354,10 @@ rule, not a convenience.
     through the owner's handle), `on_action(key)`; once `Accepted`,
     `Rejected` or `Cancelled`, the outcome (`check` or `x` and the label,
     `ConfirmationState::outcome`) and no buttons. An action may have a
-    `description` (plain text under its button; any description stacks
-    the actions, `actions_stack`) and be `disabled` (muted, no stop,
-    asking nothing).
+    `description` (plain text under its button, wrapping at the
+    confirmation's width; any description stacks the actions,
+    `actions_stack`, each button at its own width) and be `disabled`
+    (muted, no stop, asking nothing).
   - `Alert`: shadcn's alert (`AlertVariant::{Default, Destructive}`,
     `alert_style`), lucide `circle-alert` by default, with the children as
     the description.
@@ -384,7 +388,9 @@ rule, not a convenience.
     the owner redraws on its own `on_modifiers_changed`.
   - `CodeBlock` (`components/code_block.rs`): a rounded `border` frame
     whose header, on the surface around it, holds the label in
-    `muted_foreground` and a ghost `IconXs` lucide `copy` button (tooltip
+    `muted_foreground` on one line (`trigger_label`: cut with an ellipsis
+    when it doesn't fit, never wrapped) and a ghost `IconXs` lucide `copy`
+    button that keeps its size (tooltip
     "Copy code", `COPY_CODE`), over the code in the owner's family
     (`.font`) in the foreground on `muted`, keeping its breaks and spaces
     and wrapping long lines (`shown_code` drops the one line break that
@@ -857,6 +863,13 @@ code comes from there.
 - **A change that contains the list's top item resets the offset to that
   item's start** (gpui's `ListState::splice`). An owner splices only the
   items that changed, so a growing last item moves nothing above it.
+- **The other side's message keeps a bubble and fills the row.** AI
+  Elements gives the assistant's content the full width with no bubble
+  around it, and caps only the person's bubble (`max-w-[80%]`), as here.
+  Brindle keeps a bordered bubble on the card behind the other side's
+  content, so a conversation's turns read apart on a zone's card, and
+  makes it fill the row: a message drawn in parts (one list item per
+  block) then has straight edges whatever each part's text.
 - **Hover actions are drawn only while the pointer is over the message**,
   so they take no focus; the owner gives each a keyboard path (an action).
 - **The prompt input's toolbar is under the frame**, not inside it, with
@@ -927,6 +940,27 @@ relying on them:
 - The tabs' dark look (shadcn's active pill on `input` at 30% with an
   `input` border) has unit tests of its colours but hasn't been looked at in
   a capture; only the light tokens have.
+
+## Notes for component authors
+
+Two quirks of gpui 0.2.2's text measure, which keeps a text's first
+measure for any later measure without a wrap width in the same layout:
+
+- **Ellipsis pitfall:** `truncate()`/`text_ellipsis` on a flex item cuts
+  nothing (the text keeps its first, natural-width measure). A one-line
+  label that must give way in a flex row uses `trigger_label` (a line clamp
+  of 1 laid over an invisible unwrapped copy), as tab triggers, tool rows
+  and code block labels do.
+- **Wrapping text pitfall:** in a flex row, a text item that may wrap
+  takes its width from the row (`flex_1().min_w_0()`: grow from a zero
+  basis) or has a definite width (`w_full()`, `w(..)`). A one-line label
+  uses `trigger_label`, or `flex_none()` when it must never shrink. A bare
+  `min_w_0()` on a text item with an automatic basis is the defect: its
+  basis comes from its own measure, which can be a narrower one taken
+  earlier in the layout, and the text then wraps at that width (a code
+  block's label measured 0px wide, one letter a line). The same holds for
+  a wrapping text sized to fit in a column (`items_start`): give it the
+  column's width.
 
 ## Wiring an app
 

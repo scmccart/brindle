@@ -63,6 +63,14 @@ type Confirmed = Rc<RefCell<Vec<String>>>;
 /// The icon-only button sizes, with their side in rems.
 const ICON_SIZES: [ButtonSize; 3] = [ButtonSize::Icon, ButtonSize::IconSm, ButtonSize::IconXs];
 
+/// The layout section's widths: a conversation's row, and a narrow column
+/// (a split zone's prompt input, a code block's label without room).
+const LAYOUT_ROW: f32 = 360.;
+const LAYOUT_NARROW: f32 = 240.;
+
+/// The narrow prompt input's reason, an agent zone's while it connects.
+const LAYOUT_REASON: &str = "connecting to the terminal server";
+
 /// The window's size: fixed, so the edge cases know where the edges are.
 const WINDOW_SIZE: gpui::Size<Pixels> = size(px(1000.), px(700.));
 
@@ -377,6 +385,9 @@ pub struct Gallery {
     conversation: Entity<MessageScroller>,
     conversation_items: Rc<RefCell<Vec<DemoItem>>>,
     prompt: Entity<PromptInput>,
+    /// The layout section's two narrow disabled prompt inputs: the reason
+    /// `LAYOUT_REASON`, and a one-letter reason to measure it against.
+    narrow_prompts: [Entity<PromptInput>; 2],
     /// What the prompt input asked, in order: `submit:TEXT`, `stop`,
     /// `remove`, `resend`.
     prompt_log: Vec<String>,
@@ -608,6 +619,17 @@ impl Gallery {
             prompt.set_placeholder("Ask anything…", cx);
             prompt
         });
+        // A narrow disabled prompt input with a reason (the layout section),
+        // and one beside it with a one-letter reason to measure against.
+        let mut reason_prompt = |reason: &'static str| {
+            cx.new(move |cx| {
+                let mut prompt = PromptInput::new(cx);
+                prompt.set_status(PromptStatus::Disabled, cx);
+                prompt.set_reason(Some(reason.into()), cx);
+                prompt
+            })
+        };
+        let narrow_prompts = [reason_prompt(LAYOUT_REASON), reason_prompt("x")];
         // Focus starts on the gallery itself, inside its focus scope, so the
         // first Tab reaches the first control.
         let focus = cx.focus_handle();
@@ -713,6 +735,7 @@ impl Gallery {
             conversation,
             conversation_items,
             prompt,
+            narrow_prompts,
             prompt_log: Vec::new(),
             thought_open: false,
             permission: ConfirmationState::Requested,
@@ -1743,6 +1766,81 @@ impl Gallery {
             )))
     }
 
+    /// What the width rules draw: an agent's message in two parts and a
+    /// person's beside them, code blocks' labels in a message and in a
+    /// narrow column, and narrow prompt inputs' reasons. The checks read
+    /// the bounds painted with the platform's fonts.
+    fn layout_section(&self, cx: &mut Context<Self>) -> Div {
+        let records = &self.records;
+        let code = |label: Option<&str>| Code { label: label.map(|l| l.to_string().into()), text: "let x = 1;\n".into() };
+        let block = |id: &'static str, label: Option<&str>| CodeBlock::new(id, code(label)).font("monospace");
+        let parts = div()
+            .w(px(LAYOUT_ROW))
+            .flex()
+            .flex_col()
+            .child(
+                Message::new("layout-short", MessageFrom::Assistant)
+                    .part(BubblePart::First)
+                    .child(recorded(div().child("Short."), "parts:short", records)),
+            )
+            .child(
+                Message::new("layout-long", MessageFrom::Assistant).part(BubblePart::Last).child(recorded(
+                    div().child(
+                        "A paragraph longer than the row is wide, which wraps inside the bubble rather than \
+                         widening it, so both parts keep the row's width and their edges line up.",
+                    ),
+                    "parts:long",
+                    records,
+                )),
+            )
+            .child(Message::new("layout-user", MessageFrom::User).child(recorded(div().child("ok"), "parts:user", records)));
+        let labels = div()
+            .flex()
+            .items_start()
+            .gap_6()
+            // As an agent zone draws a message's code block: a response of
+            // one block in a part of an agent's message.
+            .child(
+                div().w(px(LAYOUT_ROW)).flex().flex_col().children([("rust", Some("rust")), ("none", None)].map(
+                    |(name, label)| {
+                        let response = Response::new(("layout-response", name.len()), [Arc::new(RichBlock::Code(code(label)))])
+                            .code_font("monospace");
+                        Message::new(("layout-code", name.len()), MessageFrom::Assistant)
+                            .child(recorded(response, &format!("label:{name}"), records))
+                    },
+                )),
+            )
+            .child(
+                div()
+                    .w(px(LAYOUT_NARROW))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(recorded(
+                        block("layout-long-label", Some("a-language-label-much-too-long-for-this-column")),
+                        "label:long",
+                        records,
+                    ))
+                    .child(recorded(block("layout-none-narrow", None), "label:none-narrow", records)),
+            );
+        let [reason, reference] = &self.narrow_prompts;
+        let reasons = div()
+            .flex()
+            .items_start()
+            .gap_6()
+            .child(div().w(px(LAYOUT_NARROW)).child(recorded(reason.clone(), "reason:long", records)))
+            .child(div().w(px(LAYOUT_NARROW)).child(recorded(reference.clone(), "reason:x", records)))
+            .child(recorded(div().text_size(rems(0.75)).child("x"), "line:xs", records));
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("Width rules", cx))
+            .child(parts)
+            .child(labels)
+            .child(reasons)
+    }
+
     fn status(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
         let shell = self.shell.read(cx);
@@ -1879,6 +1977,7 @@ impl Render for Gallery {
             .child(self.cards_section(cx))
             .child(self.ai_section(cx))
             .child(self.response_section(cx))
+            .child(self.layout_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -3061,6 +3160,12 @@ mod check {
         c.run_check("response-and-code-block-paint-every-block-kind", check).await;
         let check = code_block_copy_press(&mut c).await;
         c.run_check("code-block-copy-press-reports-the-text-and-keeps-focus", check).await;
+        let check = message_parts_line_up(&mut c).await;
+        c.run_check("message-parts-line-up", check).await;
+        let check = code_block_label_one_line(&mut c).await;
+        c.run_check("code-block-label-one-line", check).await;
+        let check = prompt_reason_wraps(&mut c).await;
+        c.run_check("prompt-reason-wraps", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -5722,6 +5827,74 @@ mod check {
             "the copy button told the gallery {log:?}"
         );
         ensure!(c.focused_name("behind")?, "the press on the copy button moved focus");
+        Ok(())
+    }
+
+    /// Half a pixel, for bounds laid out to the half pixel.
+    const HALF: Pixels = px(0.5);
+
+    /// A pixel: two boxes of one layout at different places can paint a
+    /// pixel apart once snapped. A label's wrapped line adds far more.
+    const SNAPPED: Pixels = px(1.);
+
+    /// The spec's "Parts of different lengths", "The other side fills the
+    /// row" and "The person's bubble fits its text", with the platform's
+    /// fonts: an agent's two parts (`Short.` and a paragraph wider than the
+    /// row) have the row's width and the same edges; the person's `ok` is
+    /// narrower than half the row, at its end.
+    async fn message_parts_line_up(c: &mut Checker) -> Check {
+        let short = c.recorded("parts:short")?;
+        let long = c.recorded("parts:long")?;
+        let user = c.recorded("parts:user")?;
+        // Inside the agent's 1px border and px-4 padding on each side.
+        let inside = px(super::LAYOUT_ROW - 2. * (1. + 16.));
+        ensure!((short.size.width - inside).abs() <= HALF, "the short part is {short:?}, not the row's width");
+        ensure!(
+            (short.left() - long.left()).abs() <= HALF && (short.right() - long.right()).abs() <= HALF,
+            "the parts' edges don't line up: {short:?} over {long:?}"
+        );
+        ensure!(long.size.height > short.size.height, "the long part ({long:?}) didn't wrap");
+        ensure!(user.size.width < px(super::LAYOUT_ROW / 2.), "the person's ok is {user:?}, wider than half the row");
+        ensure!(user.right() > short.right(), "the person's ok ({user:?}) isn't at the row's end ({short:?})");
+        Ok(())
+    }
+
+    /// The spec's "A short label inside a message" and "A label too long
+    /// for its row": a block labelled `rust` in an agent's message, and one
+    /// whose label is wider than its 240px column, are each as tall as a
+    /// block of the same code with no label beside them (whose header is the
+    /// copy button's row), so each label is one line; the long one stays in
+    /// its column.
+    async fn code_block_label_one_line(c: &mut Checker) -> Check {
+        let rust = c.recorded("label:rust")?;
+        let none = c.recorded("label:none")?;
+        let long = c.recorded("label:long")?;
+        let none_narrow = c.recorded("label:none-narrow")?;
+        ensure!(
+            (rust.size.height - none.size.height).abs() <= SNAPPED,
+            "labelled rust it is {rust:?}, unlabelled {none:?}: the label wrapped"
+        );
+        ensure!(
+            (long.size.height - none_narrow.size.height).abs() <= SNAPPED,
+            "with a long label it is {long:?}, unlabelled {none_narrow:?}: the label wrapped"
+        );
+        ensure!(long.size.width <= px(super::LAYOUT_NARROW) + HALF, "the long label pushed the block to {long:?}");
+        Ok(())
+    }
+
+    /// The spec's "Reason line in a narrow input", with the platform's
+    /// fonts: a 240px prompt input's `connecting to the terminal server` is
+    /// at most a line taller than a one-letter reason's input (so on at
+    /// most two lines), and the input stays in its column.
+    async fn prompt_reason_wraps(c: &mut Checker) -> Check {
+        let long = c.recorded("reason:long")?;
+        let short = c.recorded("reason:x")?;
+        let line = c.recorded("line:xs")?;
+        ensure!(
+            long.size.height <= short.size.height + line.size.height + HALF,
+            "the reason's input is {long:?}, more than a line ({line:?}) taller than a one-letter reason's ({short:?})"
+        );
+        ensure!(long.size.width <= px(super::LAYOUT_NARROW) + HALF, "the reason pushed its input to {long:?}");
         Ok(())
     }
 }

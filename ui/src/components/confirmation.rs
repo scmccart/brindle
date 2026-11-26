@@ -178,17 +178,24 @@ impl RenderOnce for Confirmation {
                         let key = action.key;
                         button = button.on_click(move |_, window, cx| on_action(&key, window, cx));
                     }
+                    // Stacked, each action is as wide as the confirmation
+                    // (a definite width), its button at the button's own
+                    // width and its description wrapping at the action's
+                    // (the wrapping text pitfall: never at a measure of its
+                    // own).
                     div()
                         .debug_selector(move || format!("confirmation-action-{ix}"))
                         .flex()
                         .flex_col()
                         .gap_1()
                         .min_w_0()
-                        .child(button)
+                        .when(stacked, |d| d.w_full().items_start())
+                        .child(div().debug_selector(move || format!("confirmation-button-{ix}")).child(button))
                         .when_some(action.description, |d, description| {
                             d.child(
                                 div()
                                     .debug_selector(move || format!("confirmation-description-{ix}"))
+                                    .w_full()
                                     .text_size(rems(0.75))
                                     .text_color(muted)
                                     .whitespace_normal()
@@ -300,6 +307,51 @@ mod tests {
         assert_eq!(*asked.borrow(), [ItemKey::from("key")]);
         cx.simulate_click(third.origin + gpui::point(px(4.), px(4.)), gpui::Modifiers::none());
         assert_eq!(*asked.borrow(), [ItemKey::from("key")], "a disabled action asks nothing");
+    }
+
+    /// Stacked actions in a 240px confirmation, the second with a
+    /// description much longer than that.
+    struct Narrow;
+
+    const LONG: &str = "the login can't be run through `cmd /c`, so run it in a terminal of your own and come back";
+
+    impl Render for Narrow {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .flex()
+                .flex_col()
+                .child(div().debug_selector(|| "one-line".into()).text_size(rems(0.75)).child("x"))
+                .child(
+                    div().w(px(240.)).child(
+                        Confirmation::new("login", "Log in to continue", ConfirmationState::Requested)
+                            .action(ConfirmationAction::new("Log in with Google").key("google"))
+                            .action(ConfirmationAction::new("Terminal").key("terminal").description(LONG)),
+                    ),
+                )
+        }
+    }
+
+    /// A long description wraps at the confirmation's width (inside its
+    /// border and px-4), over several lines, and each button keeps its own
+    /// width.
+    #[test]
+    fn a_long_description_wraps_at_the_confirmations_width() {
+        let mut app = test_support::app();
+        let (_, cx) = app.add_window_view(|_, _| Narrow);
+        cx.run_until_parked();
+        let line = cx.debug_bounds("one-line").expect("drawn");
+        let description = cx.debug_bounds("confirmation-description-1").expect("drawn");
+        let google = cx.debug_bounds("confirmation-button-0").expect("drawn");
+        let terminal = cx.debug_bounds("confirmation-button-1").expect("drawn");
+        let inside = (px(1. + 16.), px(240. - 1. - 16.));
+        assert_eq!((description.left(), description.right()), inside, "{description:?}");
+        assert!(description.size.height >= line.size.height * 3., "{description:?} isn't wrapped");
+        assert!(description.top() >= terminal.bottom(), "{description:?} under {terminal:?}");
+        // Each button at its own width, from the start: Terminal is
+        // narrower than Log in with Google.
+        assert_eq!((google.left(), terminal.left()), (inside.0, inside.0), "{google:?} {terminal:?}");
+        assert!(google.right() < inside.1, "{google:?} stretched");
+        assert!(terminal.size.width < google.size.width, "{terminal:?} {google:?}");
     }
 
     struct Host {
