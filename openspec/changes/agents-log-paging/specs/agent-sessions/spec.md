@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Attach replays the transcript
-A client on protocol 4 SHALL be able to attach a detached agent session. Before any live event the server SHALL send a delimited replay of a page of the log, the turn state and the agent's state as transcript events. The page SHALL hold the newest whole entries up to the page budget (256 KiB of encoded entries, or less when the client's `ATTACH` asks for less), and always at least the newest entry and every entry from the oldest permission request still waiting for an answer. When older entries exist, the replay SHALL say from which entry the page starts and how many entries before it can be fetched. After the replay the client's copy SHALL equal the server's log from the page's first entry on. Attaching follows the ownership and close policy rules of terminal sessions.
+A client on protocol 4 SHALL be able to attach a detached agent session. Before any live event the server SHALL send a delimited replay of a page of the log, the queue slot, the conversation, the turn state and the agent's state as transcript events. The page SHALL hold the newest whole entries up to the page budget (256 KiB of encoded entries, or less when the client's `ATTACH` asks for less), and always at least the newest entry and every entry from the oldest permission request still waiting for an answer. When older entries exist, the replay SHALL say from which entry the page starts and how many entries before it can be fetched. After the replay the client's copy SHALL equal the server's log from the page's first entry on. Attaching follows the ownership and close policy rules of terminal sessions.
 
 #### Scenario: Replay after a turn
 - **WHEN** a session finished a turn while detached, and a client attaches it
@@ -17,7 +17,7 @@ A client on protocol 4 SHALL be able to attach a detached agent session. Before 
 
 #### Scenario: A long conversation sends a page
 - **WHEN** a client attaches a session whose log holds 4 MiB of entries
-- **THEN** the replay holds the newest entries up to 256 KiB, says that the entries before its first one can be fetched and how many there are, and ends with the slot, the turn and the agent's state
+- **THEN** the replay holds the newest entries up to 256 KiB, says that the entries before its first one can be fetched and how many there are, and ends with the slot, the conversation, the turn and the agent's state
 
 #### Scenario: A smaller budget
 - **WHEN** a client attaches a long session asking for a 16 KiB page
@@ -30,6 +30,10 @@ A client on protocol 4 SHALL be able to attach a detached agent session. Before 
 #### Scenario: A waiting permission is always in the page
 - **WHEN** a client attaches a session waiting on a permission request that has 2 MiB of entries after it
 - **THEN** the replay starts at or before the permission request's entry, and the client can answer it
+
+#### Scenario: A titled conversation's page
+- **WHEN** a client attaches a long session whose agent titled its conversation `Hello.txt file creation` near its start
+- **THEN** the replay holds the conversation with that title, however few of the entries the page holds
 
 ### Requirement: The log is bounded
 An agent session's log SHALL stay within 16 MiB in its stored form. When it would pass that, the server SHALL drop the oldest entries whole until the log is within 12 MiB, record how many were dropped, and the session SHALL carry on. Entries that were dropped SHALL NOT be fetched again.
@@ -45,7 +49,7 @@ An agent session's log SHALL stay within 16 MiB in its stored form. When it woul
 ## ADDED Requirements
 
 ### Requirement: Older entries are fetched on demand
-A client that has an agent session attached SHALL be able to ask for the entries before a given entry, with a byte budget no larger than the page budget. The server SHALL answer with the newest whole entries before that entry, up to the budget and at least one when any remains, each in its current state, and SHALL say whether entries before them remain. Only the attached client SHALL be answered; any other request SHALL get an error naming the session.
+A client that has an agent session attached SHALL be able to ask for the entries before a given entry, with a byte budget up to the page budget. The server SHALL answer, whatever the agent's state, with the newest whole entries before it, up to the budget and at least one when any remains, each in its current state, and whether earlier ones remain. Only the attached client, once its replay has ended, SHALL be answered; any other request SHALL get an error naming the session.
 
 #### Scenario: Fetching the page before
 - **WHEN** a client whose replay started at entry 400 asks for the entries before entry 400 with a 256 KiB budget
@@ -54,6 +58,10 @@ A client that has an agent session attached SHALL be able to ask for the entries
 #### Scenario: Fetching back to the start
 - **WHEN** a client keeps fetching the entries before the oldest one it holds until it is told nothing earlier remains
 - **THEN** its copy equals the server's whole log
+
+#### Scenario: An ended agent's conversation
+- **WHEN** an attached agent that offered `session/resume` exits with a long log, and the client fetches the entries before its page
+- **THEN** it receives them, and the session is still kept for its conversation
 
 #### Scenario: Not attached
 - **WHEN** a client that doesn't have an agent session attached asks for its older entries
@@ -74,8 +82,12 @@ The server SHALL keep updating every entry of its log, whether or not the attach
 - **WHEN** a client fetches an older page that holds a tool call still running, and the tool call is then updated
 - **THEN** the client's copy of that entry shows the update
 
+#### Scenario: A fetch after a trim took the page
+- **WHEN** a client has fetched back to entries the server then drops past 16 MiB, and its next fetch is answered after the drop
+- **THEN** it receives no entries and is told nothing earlier remains, and its copy keeps the entries the server still has
+
 ### Requirement: Checkpoints append what changed
-The server SHALL store an agent session's checkpoint as a base and segments appended after it, each segment holding only what changed since the previous checkpoint. It SHALL write the whole checkpoint again when the session moves to another core, after entries were dropped, when the segments together would outgrow the base, and when the holder has no checkpoint for the session it can append to. A core restart or an upgrade SHALL rebuild the same session from the base and its segments.
+The server SHALL store an agent session's checkpoint as a base and segments appended after it, each holding only what changed since the previous checkpoint. It SHALL write it whole again when the session moves to another core, after entries were dropped, when the segments would outgrow the base, when its agent starts again in a new holder session, and when the holder has nothing it can append to. A core restart or an upgrade SHALL rebuild the same session from the base and its segments.
 
 #### Scenario: A message added to a long log
 - **WHEN** an agent session whose log holds 8 MiB adds a 1 KiB agent message and is checkpointed
@@ -88,3 +100,7 @@ The server SHALL store an agent session's checkpoint as a base and segments appe
 #### Scenario: Upgrade
 - **WHEN** the core is upgraded while an agent session has appended segments
 - **THEN** the old core writes the whole checkpoint before it steps down, and the new core carries the conversation on
+
+#### Scenario: Continued in a new holder session
+- **WHEN** an ended agent session is continued, and its new agent's first checkpoint is written
+- **THEN** that checkpoint is whole, and a core killed afterwards rebuilds the session with its earlier entries and their ids

@@ -15,14 +15,29 @@ The conversation SHALL scroll, and SHALL stay at its end while new text arrives 
 - **WHEN** the user has scrolled up to the top of the entries the zone holds, and earlier entries are loaded above them
 - **THEN** the lines in view stay put, and the earlier entries are above them
 
+### Requirement: Replays raise nothing
+Attaching an agent session, at launch or from the sessions palette, SHALL show the newest page of its conversation, with an "Earlier messages" item above it when older entries exist, and its queued or held prompt, and SHALL NOT raise notifications for what the replay holds or for earlier entries fetched afterwards.
+
+#### Scenario: Restored after a finished turn
+- **WHEN** an agent finished a turn while Brindle wasn't running, and Brindle is launched
+- **THEN** the restored zone shows the whole turn and its done status, and no notification appears
+
+#### Scenario: Earlier entries raise nothing
+- **WHEN** the user scrolls up a restored zone and the fetched entries hold a permission request answered long ago and turns that ended
+- **THEN** no notification appears, and the zone's status is unchanged
+
 ## ADDED Requirements
 
 ### Requirement: Earlier messages
-When an agent session has entries before the oldest one its zone holds, the conversation SHALL start with an "Earlier messages" item. When that item scrolls into view, the zone SHALL fetch the entries before its oldest one, showing a spinner on the item until they arrive, then add them above. Fetched entries SHALL stay in the zone until it closes or its session is replayed again. When nothing earlier remains, the item SHALL go.
+When an agent session has entries before the oldest one its zone holds, the conversation SHALL start with an "Earlier messages" item, which takes no focus. When it scrolls into view, the zone SHALL fetch the entries before its oldest one, showing a spinner on the item until they arrive, then add them above. Fetched entries SHALL stay in the zone until it closes or its session is replayed again. When nothing earlier remains, the item SHALL go.
 
 #### Scenario: Scrolling to the top loads more
 - **WHEN** an agent zone shows the newest page of a long conversation and the user scrolls to its top
 - **THEN** the "Earlier messages" item shows a spinner, then the earlier entries appear above the ones the user was reading
+
+#### Scenario: From the keyboard
+- **WHEN** the prompt input has focus and the user presses shift-pageup until the zone's oldest entry is in view, then once more
+- **THEN** the "Earlier messages" item comes into view and the earlier entries are fetched, and focus stays in the prompt input
 
 #### Scenario: Everything loaded
 - **WHEN** the user keeps scrolling up until the zone holds the session's whole log
@@ -39,3 +54,7 @@ When an agent session has entries before the oldest one its zone holds, the conv
 #### Scenario: Reattached
 - **WHEN** a zone that had fetched earlier entries is restored after Brindle restarts
 - **THEN** it shows the newest page again with the "Earlier messages" item, and scrolling up fetches the earlier entries again
+
+#### Scenario: Titled from the first page
+- **WHEN** a zone is restored on a long conversation the agent titled near its start
+- **THEN** the zone's title and its tab's title are the conversation's title before any earlier entry is fetched
