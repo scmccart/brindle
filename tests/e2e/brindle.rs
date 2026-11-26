@@ -854,8 +854,8 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 9] =
-    ["agent ", "login ", "note ", "entry ", "block ", "link ", "queued ", "conversation ", "prompt "];
+const AGENT_LINES: [&str; 10] =
+    ["agent ", "login ", "note ", "entry ", "block ", "link ", "working ", "queued ", "conversation ", "prompt "];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -900,6 +900,12 @@ pub struct Dump {
     /// then `--- badge zone=ID …` for the active tab's zones), one line
     /// each without the prefix.
     pub badges: Vec<String>,
+    /// The spinners shown in place of a working dot (`--- spinner tab=N`
+    /// for each tab face with one, then `--- spinner zone=ID` for the
+    /// active tab's zone headers), one line each without the prefix.
+    pub spinners: Vec<String>,
+    /// Whether the motion clock runs (`--- motion running|stopped`).
+    pub motion: Option<String>,
     /// The label a mouse copy or paste shows at the pointer, while one isn't
     /// gone (`--- feedback kind=copied|pasted|nothing-to-paste`): the kind.
     pub feedback: Option<String>,
@@ -1012,6 +1018,11 @@ impl Dump {
                 dump.contexts.push(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- badge ") {
                 dump.badges.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- spinner ") {
+                dump.spinners.push(rest.to_string());
+            } else if let Some(rest) = line.strip_prefix("--- motion ") {
+                dump.motion = Some(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- feedback ") {
                 dump.feedback = rest.strip_prefix("kind=").map(str::to_string);
             } else if let Some(rest) = line.strip_prefix("--- pointer ") {
@@ -1087,6 +1098,11 @@ impl Dump {
             .iter()
             .filter_map(|line| line.strip_prefix("entry ")?.split_once(' ').map(|(_, rest)| rest))
             .collect()
+    }
+
+    /// The working row's text (`--- working "TEXT"`), while it shows.
+    pub fn agent_working(&self) -> Option<String> {
+        self.agent.iter().find_map(|line| unquote(line.strip_prefix("working ")?))
     }
 
     /// Entry `entry`'s parts (`--- block entry=N part=P kind=K "TEXT"`),
@@ -1314,6 +1330,15 @@ pub fn self_test_dump() -> Result {
         dump.badges
     );
     ensure!(dump.screen == ["hi"], "screen after contexts {:?}", dump.screen);
+    // Spinners after the badges, before the screen's text; the motion line
+    // after it, before the focus line, ends the screen.
+    let dump = Dump::parse(
+        "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- spinner tab=2\n--- spinner zone=3\nhi\n\
+         --- motion running\n--- focus terminal modality=keyboard\n",
+    );
+    ensure!(dump.spinners == ["tab=2", "zone=3"], "spinners {:?}", dump.spinners);
+    ensure!(dump.motion.as_deref() == Some("running"), "motion {:?}", dump.motion);
+    ensure!(dump.screen == ["hi"], "screen beside the spinners and motion {:?}", dump.screen);
     ensure!(dump.pointer.is_none(), "no pointer line: {:?}", dump.pointer);
     ensure!(dump.feedback.is_none(), "no feedback line: {:?}", dump.feedback);
     for kind in ["copied", "pasted", "nothing-to-paste"] {
@@ -1340,10 +1365,12 @@ pub fn self_test_dump() -> Result {
          continue=none:not-ended\n\
          --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n\
          --- block entry=2 part=0 kind=paragraph \"Hello!\"\n\
-         --- link entry=2 part=0 target=\"https://example.com\" text=\"Hello\" action=open\n--- queued waiting \"next\"\n\
+         --- link entry=2 part=0 target=\"https://example.com\" text=\"Hello\" action=open\n--- working \"Working…\"\n\
+         --- queued waiting \"next\"\n\
          --- conversation entries=2 at=end\n--- prompt status=ready\n--- focus other modality=keyboard\n",
     );
-    ensure!(dump.agent.len() == 9, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent.len() == 10, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent_working().as_deref() == Some("Working…"), "working {:?}", dump.agent);
     ensure!(dump.agent_blocks(2) == ["part=0 kind=paragraph \"Hello!\""], "blocks {:?}", dump.agent_blocks(2));
     ensure!(dump.agent_blocks(1).is_empty() && dump.agent_links(1).is_empty(), "entry 1's {:?}", dump.agent);
     ensure!(
