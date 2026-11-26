@@ -72,6 +72,29 @@ An agent zone SHALL offer one slash command of Brindle's own for each session op
 - **WHEN** the agent offers a command named `model` and an option named `Model`
 - **THEN** `/model` in the list is the agent's command, and sending `/model x` sends that text to the agent
 
+### Requirement: Option commands by their long names
+Every option command SHALL also be callable by `brindle:` followed by its name (`/brindle:model`), which SHALL always be Brindle's command whatever commands the agent offers, and SHALL behave as the short name does. The command list SHALL show an option command once: under its long name when the agent offers a command with its short name, or when the word typed starts with `brindle:`, and under its short name otherwise.
+
+#### Scenario: The agent took the short name
+- **WHEN** the agent offers a command named `model` and an option named `Model`, and the user types `/mo`
+- **THEN** the list shows the agent's `/model` and Brindle's `/brindle:model`
+
+#### Scenario: Setting by the long name
+- **WHEN** that user sends `/brindle:model sonnet`
+- **THEN** the agent is asked for `Sonnet`, and receives no prompt
+
+#### Scenario: The long name with no conflict
+- **WHEN** the agent offers no command named `mode` and the user sends `/brindle:mode plan`
+- **THEN** the agent is asked for the plan mode, as `/mode plan` would ask
+
+#### Scenario: Typing the prefix
+- **WHEN** the session has options named `Mode` and `Model` and the user types `/brindle:`
+- **THEN** the list shows `/brindle:mode` and `/brindle:model`
+
+#### Scenario: Listed once
+- **WHEN** the agent offers no command named `mode` and the user types `/mo`
+- **THEN** the list shows `/mode`, and not `/brindle:mode`
+
 ### Requirement: Option commands stay in Brindle
 A prompt that is an option command SHALL be carried out by Brindle, and SHALL NOT be sent to the agent, queued or added to the conversation as a user message. A prompt with more lines after the command's line SHALL NOT be an option command, and SHALL be sent as a prompt.
 

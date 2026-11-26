@@ -11,7 +11,7 @@ ACP v1 has two ways to offer options: session modes (`session/set_mode`), which 
 
 ## What Changes
 
-- **The server keeps the agent's commands and options** as session state beside the conversation: each command's name, description and input hint; each option's name, category (mode, model, thinking level, or the agent's own), and either its choices with the current one or an on/off value. Both are in every replay and survive a detach, a quit, a core restart and an upgrade.
+- **The server keeps the agent's commands and options** as session state beside the conversation: each command's name, description and input hint; each option's name, category (mode, model, thinking level, or the agent's own), and either its choices with the current one or an on/off value. Both are in every replay and survive a detach, a quit, a core restart and an upgrade. They last one run of the agent: when it stops they are emptied, and the agent that continues the conversation fills them again.
 - **Session modes become an option.** For a v1 agent that offers modes and no mode option, the server presents its modes as one option of category `mode` and sets it with `session/set_mode`, inside the v1 module. Brindle sees options only.
 - **So does the older model list.** A v1 agent that offers ACP's unstable model list and no model option gets a model option made from it, set with `session/set_model`, also inside the v1 module. Of the agents captured, that is the deprecated claude-code-acp adapter.
 - **A client can set an option.** A new client message asks the server to set one option to one value; the server checks it against what the agent offered, asks the agent, and the agent's answer becomes the new options. Client protocol 4 is amended, as for the rest of the series.
@@ -39,8 +39,8 @@ None.
 ## Impact
 
 - **`brindle-transcript`** (`transcript/`): `Command`, `SessionOption`, `OptionCategory`, `OptionKind`, `Choice`; `Event::Commands` and `Event::Options`; the transcript's state and replay; new `tests/fixtures/v4/` files (none edited).
-- **`brindle-remote-protocol`** (`remote-protocol/`): a new client message, `AGENT_SET_OPTION`, with its fixtures and fuzzing. Its number is the next free one when the stack is assembled.
-- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms and `acp/v1/`'s decoding of commands, config options, modes and their updates; `session/set_config_option` and `session/set_mode`; the boolean option capability in `initialize`; the reducer's option handling. The checkpoint's format 1 is amended (unreleased).
+- **`brindle-remote-protocol`** (`remote-protocol/`): a new client message, `AGENT_SET_OPTION`, with its fixtures and fuzzing. Its number is 24.
+- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms and `acp/v1/`'s decoding of commands, config options, modes and their updates; `session/set_config_option` and `session/set_mode`; the boolean option capability in `initialize`; the reducer's option handling, including emptying both lists when the agent stops and filling them from a continued agent's answer. The checkpoint's format 2 is amended (unreleased).
 - **`brindle`** (`src/agent/`): the chat model's commands, options and completion; the view's list and footer; two actions in `src/actions.rs`; the options palette.
 - **`brindle-ui`** (`ui/`): `PromptInput` gains a suggestion list and footer items. Its dependency list is unchanged.
 - **Tests:** the existing captures already hold every agent's commands and options; real-role tests through the fake ACP agent; new `agent-command-*` and `agent-option-*` e2e cases.
