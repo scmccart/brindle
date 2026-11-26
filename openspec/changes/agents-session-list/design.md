@@ -2,15 +2,21 @@
 
 ## Context
 
-See proposal.md for why. Facts this design rests on, from the code on `main` at 19368a9 (2026-11-26), the pinned schema crate and the captured agent traffic:
+See proposal.md for why. The design was written against `main` at 124912e and refreshed on 2026-11-26 against 08c2a69 (`zones-mixed-tabs` implemented and archived, PR #149, on top of `agents-tool-content`, #146). Facts this design rests on, from that code, the pinned schema crate and the captured agent traffic:
 
-- **Continuing exists** (`agents-session-recovery`). `SPAWN_AGENT` takes an optional `conversation` (`Conversation { id, cwd, continuation, title }`); the reducer's `Phase::Spawning { start: Start::{New, Continue { conversation, log: Kept | Fresh }} }` sends, after `initialize`, `session/new`, or `session/resume` or `session/load` by `choose(log, offered)`; a zone's `continue_offer` gives `Restart` (the same session) or `Respawn` (a new session the zone resets onto).
-- **A stopped agent's session is kept** while its zone is open (`Life::AgentEnded`), with a Continue conversation button on the prompt input's reason line (`agent stop=continue`), and isn't recorded for restore.
-- **A login** (`agents-login`) can be needed by any start request (`-32000`), and returns to what it interrupted (`AfterLogin`).
-- **ACP v1** (schema crate 1.22.0): `session/list { cwd?, cursor? }` answers `{ sessions: [{ sessionId, cwd, title?, updatedAt? }], nextCursor? }`, offered through `sessionCapabilities.list`. v2 keeps the method. Every captured agent's `initialize` offers it; no capture holds the exchange itself, so task 1.1 captures it.
-- **`zones-mixed-tabs`** gives every zone its own profile and host, the split actions for an agent zone beside any pane, and the palette that asks which profile.
-- **`brindle agent [PROFILE]`** takes `-d` and `-p`; a launch is handed to a running Brindle with its kind, profile, directory and prompt.
-- **Message numbers** at this point: clients' through `AGENT_FETCH` 23, with 24 to 30 planned for `agents-commands`, `agents-prompt-context`, `agents-prompt-images` and `agents-plans`; the core's through `AGENT_PAGE` 43, with 44 planned.
+- **The ACP seam** (`agents-tool-content`, `ports R14`). `remote-agent/src/acp/` is a version-free reducer (`reduce.rs`) over Brindle's own closed forms (`forms.rs`: `Initialized`, `NewSession`, `SessionUpdate`, `Request<'_>`, `Refusal`, …), with one module per ACP version (`v1/{decode,encode}.rs`) behind the closed `Dialect` enum (`dialect.rs`), whose every method is one exhaustive `match self`. `rpc.rs` keeps the outgoing requests by id as `Purpose::{Initialize, NewSession, Prompt, Resume, Load, Authenticate}` and writes each through the session's dialect; `envelope.rs` reads the JSON-RPC envelope. No ACP method or field name appears outside `v1/`.
+- **Continuing exists** (`agents-session-recovery`). `SPAWN_AGENT` takes an optional `conversation` (`client::AgentConversation { id, cwd, … }`); the reducer's `Phase::Spawning { start }` and `Phase::Initializing { start }` carry `Start::{New, Continue { conversation, log: Log::{Kept, Fresh} }}`, and `Step::start` sends, after `initialize`, `session/new` (`Phase::Creating`), or `session/resume` (`Phase::Resuming`) or `session/load` (`Phase::Loading`) by `choose(log, offered) -> Choice`; `Step::continued` reads their answer, `Step::ready` emits `Event::Conversation` and `AgentState::Ready`. `AgentSession::new` and `AgentSession::continuing` build a session; `Greeting { name, version, continuation }` is what `initialize` said. On the client, `src/agent/model.rs`' `continue_offer(phase, life, conversation, profile) -> Offer::{Restart, Respawn { conversation }, None(NoOffer)}` gives what Continue conversation does, the dump's `continue=` word.
+- **A stopped agent's session is kept** while its zone is open (`Life::AgentEnded` in the core), with a Continue conversation button on the prompt input's reason line (`agent stop=continue`), and isn't recorded for restore.
+- **A login** (`agents-login`) can be needed by any start request (`-32000`, `forms::AUTH_REQUIRED`): `Phase::LoginRequired(Login { greeting, message, then: AfterLogin::{Start(Start), Ready { session }} })`, then `Phase::LoggingIn`; `Step::authenticated` returns to what it interrupted.
+- **The core** (`remote-agent/src/server/core/agents.rs`): `client_spawn_agent` (refused by `policy::agent_request_refusal(protocol, AgentRequest::Spawn)` below protocol 4), `client_agent_restart`, `client_agent_command` (every other agent command: `reduce::Command::{Prompt, Unqueue, Resend, Cancel, Answer, Login}`, stepped by `agent_step`, answered `OK` or `ERROR` from `Output::reply: Option<Result<(), Refused>>`) and `client_agent_fetch` (`AGENT_PAGE` frames, answered without a step). `agent_apply` sends a step's events, checkpoints, writes stdin and hangs up, in that order.
+- **The checkpoint** (`acp/checkpoint.rs`, format 2 with a base and segments, `agents-log-paging`): the JSON state's `phase` (`phase_value`, `with_start`, `greeting_value`), the `rpc` (`next_id`, the outgoing purposes, the permissions), the methods, the open outputs. Format 2 is unreleased and amended in place.
+- **The transcript** (`brindle-transcript`): `AgentState::{Starting, Ready { name?, version? }, LoginRequired { message, methods }, LoggingIn { method, name }, Failed, Exited, Lost}`, tagged `agent` (`{"event":"agent","state":{"agent":"starting"}}`); the fixtures are `transcript/tests/fixtures/v4/*.json`, read by `tests/events.rs`' `fixtures()`, and `src/fuzz.rs` draws every state.
+- **ACP v1** (schema crate 1.22.0): `session/list { cwd?, cursor? }` answers `{ sessions: [{ sessionId, cwd, title?, updatedAt? }], nextCursor? }`, offered through `agentCapabilities.sessionCapabilities.list`. v2 keeps the method. Codex's captured `initialize` (`remote-agent/tests/fixtures/acp/codex-acp-2.12.0-*.log`) offers it; no capture holds the exchange itself, so task 1.1 captures it.
+- **`zones-mixed-tabs`** gives every zone its own profile and host (`ZoneSpec`), the split actions for an agent zone beside any pane (`zone_view.rs`' `split_choice(want, zone, config) -> SplitChoice::{Run, Ask, Refused}`, `SplitWith::{Kind, Profile}`, `split_cwd(split_dir, same_host)`), and the palette that asks which profile (`SplitAsk`, `Workspace::open_split_palette`, `PaletteKind::SplitProfile`). The dump's zone lines name each zone's `kind=`, `profile=` and `host=`.
+- **The client's agent zone** (`src/agent/`): `Agent` (`mod.rs`) holds the model and its session through `Requests` (`prompt`, `resend`, `unqueue`, `answer`, `cancel`, `close`, `restart`, `login`, `fetch`, …), opened by `Connect` from `remote::AgentStart::{Spawn, Attach}`; `spawn.rs`' `AgentSpawnRequest { command, args, cwd, env, profile, conversation }` and `directory(profile, host, asked, opened, home)`; `model.rs` holds `AgentPhase`, `ChatModel`, the reason line and `describe` (the dump); `view.rs` draws the zone.
+- **`brindle agent [PROFILE]`** (`src/main.rs`' `AgentLaunch { profile, cwd, prompt }`) takes `-d` and `-p`; a launch is handed to a running Brindle as `instance::Request { kind: Some("agent"), agent: Some(AgentRequest { profile, cwd, prompt }) }`. The request is never versioned: unknown fields are ignored, and `Request::asked` refuses a `kind` it doesn't know by name ("this Brindle (V) can't open KIND tabs; …").
+- **Actions** (`src/actions.rs`' `ACTIONS`): `agent_continue` is listed as "Continue Agent Conversation".
+- **Message numbers** (`remote-protocol/src/client.rs`): one number space for both directions, clients' messages below 32 and the core's from 32 (`WELCOME`). Clients' run through `AGENT_FETCH` 23, with 24 to 30 planned for `agents-commands` (24), `agents-prompt-context` (25, 26), `agents-prompt-images` (27 to 29) and `agents-plans` (30); the core's run through `AGENT_PAGE` 43, with 44 planned for `agents-prompt-context`. So 31 is the last client number below the core's block (decision 9).
 
 The user's decisions (2026-11-26) are in "The user's decisions" below.
 
@@ -31,10 +37,11 @@ The user's decisions (2026-11-26) are in "The user's decisions" below.
 | --- | --- | --- |
 | `AgentState::Choosing` | pure, shared contract | `brindle-transcript` |
 | `AGENT_LIST`, `AGENT_CHOOSE`, `AGENT_CONVERSATIONS`; `SPAWN_AGENT`'s `start` | wire | `brindle-remote-protocol`, `remote-protocol/src/client.rs` |
-| `Listed` (one conversation), `Request::List`, the list capability | pure, plain data | `brindle-remote-agent`, `acp/forms.rs` |
-| ACP v1: `session/list` and its answer | pure | `acp/v1/{decode, encode}.rs` |
-| `Phase::Choosing`, `Start::Choose`, the list and choose steps and their refusals | pure | `acp/reduce.rs` |
-| The handlers | shell (loop handler) | `remote-agent/src/server/core/` |
+| `Listed` (one conversation), `Listing` (a page), `Request::List`, the list capability on `Initialized` | pure, plain data | `brindle-remote-agent`, `acp/forms.rs` |
+| ACP v1: `session/list` and its answer, `sessionCapabilities.list` | pure | `acp/v1/{decode, encode}.rs`, through `Dialect::list_result` |
+| `Phase::Choosing`, `Start::Choose`, `Command::{List, Choose}`, `Purpose::List`, the list and choose steps and their refusals, `Output::listed` | pure | `acp/reduce.rs`, `acp/rpc.rs` |
+| The phase and the list capability in the checkpoint | pure | `acp/checkpoint.rs` |
+| The handlers, `AgentRequest::{List, Choose}` | shell (loop handler), pure policy | `remote-agent/src/server/core/{agents,clients,policy}.rs` |
 | `lister_plan`, `list_dir`, `open_plan`, `latest_plan`, `ago`, the palette's rows, the choosing screen's parts, dump lines | GPUI-free model | `brindle`, `src/agent/model.rs`, `src/workspace/` |
 | The palette, the question, the buttons, the two actions, `-c` and `-r` | shell (entities, launch) | `src/workspace.rs`, `src/agent/view.rs`, `src/actions.rs`, `src/main.rs`, `src/instance.rs` |
 
@@ -49,7 +56,7 @@ No crate reference and no closed dependency list changes (`ports R1`, `R3`).
 ```rust
 pub enum Start { New, Continue { conversation, log }, Choose }
 Phase::Choosing { greeting }          // initialized; no ACP session yet
-AgentState::Choosing                  // JSON {"state":"choosing"}
+AgentState::Choosing { message? }     // JSON {"agent":"choosing"}; a refused choice's message (flag 5)
 ```
 
 - **`AGENT_CHOOSE { req, session, conversation? }`** ends the wait: with an id, the reducer continues that conversation in the session's directory as `Start::Continue { log: Fresh }` does (`session/load` shown, or `session/resume`, by `choose`); with none, it sends `session/new`. Answered `OK` once the request is written, or `ERROR` (`NotChoosing`, `NotAnAgentSession`). The outcome arrives as transcript events, as any start's does.
@@ -64,8 +71,9 @@ AgentState::Choosing                  // JSON {"state":"choosing"}
 - **`AGENT_CONVERSATIONS { req, session, conversations: [{ id, title?, updated? }], next? }`** is the reply, one frame. `ERROR` otherwise: `NotOffered` ("the agent can't list conversations"), `NotReady`, `Busy` (a list is already being answered), the agent's own error in words, or that a login is needed.
 - **Only this directory.** The request carries the session's `cwd` as ACP's filter, and the reducer drops any answer entry whose `cwd` differs, so an agent that ignores the filter still lists one directory.
 - **Bounds:** at most 256 conversations a reply (later ones dropped, with `next` kept so the client can ask on); an id bounded as tool call ids are; a title cleaned to one line and cut at 256 characters, as `agents-session-title` cleans one; `updated` kept as text of at most 64 characters when it is one, else left out. Entries are decoded one by one from the raw JSON, so an unreadable one loses only itself. `cursor` and `next` are opaque strings of at most 1 KiB.
-- **Nothing is kept.** The server holds no list: the reply is built from the agent's answer and forgotten. The pending request is `Rpc` state, checkpointed like any; a core restart in the middle loses the reply, and the client's request fails with the connection's error.
-- **Version seam** (`agents-tool-content`): `session/list` and its field names are named only in a version's module. Until that change lands the decoding sits where the other v1 decoding does, and moves with it.
+- **Nothing is kept.** The server holds no list: the reply is built from the agent's answer and forgotten. The pending request is `Purpose::List { req }` in `Rpc`, holding the client's request id so the answer reaches it as `Output::listed`, which the core sends as `AGENT_CONVERSATIONS` or `ERROR` to the attached client. The checkpoint leaves a pending list out (flag 4): a core restart in the middle loses the reply, the client's request fails with the connection's error, and the agent's late answer is a response to no request, which the reducer ignores.
+- **Whether the agent lists** is read from `initialize` (`Initialized::lists`, from `sessionCapabilities.list`) and kept on the session beside its login methods, and in its checkpoint (a checkpoint without it reads as not offered). It isn't in the transcript: a client learns it from `AGENT_LIST`'s refusal (flag 3).
+- **Version seam** (`agents-tool-content`): `session/list` and its field names are named only in `acp/v1/` (`encode::encode` of `Request::List`, `decode::list_result`), behind `Dialect::list_result`; the reducer sees `forms::Listing`.
 
 ### 3. Who lists (`lister_plan`, pure)
 
@@ -81,7 +89,7 @@ pub fn lister_plan(profile, host, zones: &[ZoneFacts]) -> Lister
 
 ### 4. Which directory (`list_dir`, pure)
 
-The directory listed is the one a new agent zone of that profile would get from the pane the palette was opened from, by `zones-mixed-tabs`' split rule: an agent zone's own directory; a terminal's working directory when it runs on the profile's host; otherwise the profile's directory, else the home directory there. The palette's title names it ("Claude conversations in ~/src/brindle"), so what is listed is never a surprise.
+The directory listed is the one a new agent zone of that profile would get from the pane the palette was opened from, by `zones-mixed-tabs`' split rule (`split_cwd` over the pane's `zone_working_directory`, then `spawn::directory`): an agent zone's own directory; a terminal's working directory when it runs on the profile's host; otherwise the profile's directory, else the home directory there. `list_dir` is that rule as one pure function, which the split then also uses, so the two can't drift. The palette's title names it ("Claude conversations in ~/src/brindle"), so what is listed is never a surprise.
 
 ### 5. Where a choice opens (`open_plan`, pure; the user's rule)
 
@@ -131,11 +139,19 @@ One screen serves every pane that has no conversation running, drawn where the p
 - **`brindle agent [PROFILE] -c`** (`--continue`): the tab's zone starts a chooser in the launch's directory; when it is `Choosing`, the model asks for the first page and `latest_plan(conversations) -> Latest::{Continue(id), None}` takes the first entry. `Continue` chooses it; `None` leaves the zone on the choosing screen with "no earlier conversation in DIR" (the user's decision). An agent that can't list leaves it there with that reason.
 - **`brindle agent [PROFILE] -r`** (`--resume`): the same start, and the palette opens on the zone once it is `Choosing`. A choice is taken `Here`; escape leaves the choosing screen.
 - `-c` and `-r` together are a usage error (status 2). Either may come with `-d`, and with `-p`, whose prompt is sent on the first `Ready`, after the choice.
-- **The hand-off** to a running Brindle carries the choice as an optional field. A running Brindle from before this change doesn't know it; the launch then prints that the running Brindle is older and can't continue a conversation, and exits with status 1, rather than opening a new conversation the user didn't ask for (`command-line`'s "The hand-off across versions").
+- **The hand-off** to a running Brindle carries the choice in the agent fields (`AgentRequest::choose: Some(Last | List)`) under a kind of its own, `agent-choose`, not `agent` (flag 2). The request is never versioned and an older Brindle ignores a field it doesn't know, so under `agent` it would open a new conversation the user didn't ask for; a kind it doesn't know it refuses by name (`Request::asked`), opening nothing. The launch then prints that the running Brindle is older and can't continue a conversation, with that answer, and exits with status 1 (`command-line`'s "The hand-off across versions"). This version reads `agent-choose` as `agent` with the choice.
 
 ### 9. Protocol versions (`process R4`–`R6`)
 
-Client protocol 4 is unreleased and amended in place, as for the rest of the series: `AGENT_LIST` and `AGENT_CHOOSE` take the next two free client numbers when this lands (31 and 32 after `agents-plans`), `AGENT_CONVERSATIONS` the core's next (45 after `agents-prompt-context`); `SPAWN_AGENT` gains `start`; `AgentState` gains `Choosing`. Transcript fixtures pin each message, both forms of `AGENT_CHOOSE` and each refusal; a new `v4/` fixture pins the state; all join the fuzzing. The checkpoint (format 2) gains the phase. Holder protocol H1 3 is untouched.
+Client protocol 4 is unreleased and amended in place, as for the rest of the series. The numbers were settled with the design's author on 2026-11-26, with 24 to 30 and the core's 44 kept for `agents-commands`, `agents-prompt-context`, `agents-prompt-images` and `agents-plans`, which land later (protocol 4 being unreleased, the gap is harmless):
+
+| Message | Number | Direction |
+| --- | ---: | --- |
+| `AGENT_LIST { req, session, cursor? }` | 31 | client → core |
+| `AGENT_CHOOSE { req, session, conversation? }` | 64 | client → core |
+| `AGENT_CONVERSATIONS { req, session, conversations, next? }` | 45 | core → client |
+
+`AGENT_CHOOSE` was to be 32, but the two directions share one number space and 32 is `WELCOME`: 31 is the last client number below the core's block. It opens a second client block at 64, leaving the core 32 to 63 (flag 1). Both client messages join `policy::AgentRequest` (`List`, `Choose`) for the refusal by name below protocol 4. `SPAWN_AGENT` gains `start`; `AgentState` gains `Choosing`. Transcript fixtures pin each message, both forms of `AGENT_CHOOSE` and each refusal; a new `v4/` fixture pins the state; all join the fuzzing. The checkpoint (format 2) gains the phase. Holder protocol H1 3 is untouched.
 
 ### 10. The dump (`testing R2`)
 
@@ -181,6 +197,25 @@ The state word `choosing` joins the agent line's states. The conversations palet
 - **Real roles** (the fake ACP agent, answering `session/list` from its script): a chooser lists and then continues in one process; a list through a ready agent; a choose of none; a chooser closed without a choice leaves no session; paging; a core restart while choosing.
 - **E2E:** `agent-conversations-list`, `agent-conversations-open` (here, split, new tab, already open), `agent-conversations-stopped`, `agent-conversations-cli` (`-c`, `-c` with none, `-r`), `agent-conversations-failures`.
 - **Manual:** a real agent's list, `-c` and `-r` with each agent we can run; pointer presses on the choosing screen's buttons.
+
+### 15. As built
+
+Filled in as the tasks land.
+
+- **The captures (task 1.1).** To be written: each agent's order, whether it honours `cwd`, the form of `updatedAt`, its page size, and whether listing needs a login.
+
+### 16. Flags
+
+The user asked for open questions to be decided and flagged. Each is decided as recommended; the choices in "Choices made here, for review" below stand as written.
+
+1. **`AGENT_CHOOSE` is 64, not 32** (decision 9). 32 is `WELCOME`, in the one number space both directions share, and 24 to 31 are planned or taken. Alternatives: renumber the planned messages (four other designs name theirs), or make choosing a form of another message (it is its own request). Recommend 64, opening a second client block and leaving the core 32 to 63.
+2. **A continuing launch is handed off under its own kind, `agent-choose`** (decision 8). The hand-off is never versioned and an older Brindle ignores unknown fields, so a field alone would make it open a new conversation. Recommend the kind, which an older Brindle refuses by name.
+3. **Whether an agent lists isn't in the transcript** (decision 2): the server keeps it from `initialize`, and a client learns it from `AGENT_LIST`'s `NotOffered` refusal, which the choosing screen and the palette then show. Alternative: a field on `AgentState::Choosing` or the conversation, a wire change for one bit the first list answers anyway.
+4. **A list in flight isn't checkpointed** (decisions 2, 12): its `Purpose::List` holds a client's request id, which means nothing to the clients of a restarted core. The checkpoint leaves it out, and the agent's late answer is a response to no request, ignored.
+5. **A refused choice's message rides on the state**: `AgentState::Choosing { message? }` (JSON `{"agent":"choosing"}` without one), so a zone that goes back to choosing (decision 11) shows the agent's message as its reason, attached late or not. A notice in the log would scroll away, and a choosing zone has no conversation to show it in.
+6. **`updated` is the agent's text**, at most 64 bytes; `ago` reads RFC 3339 (with or without fractional seconds, `Z` or an offset), and shows nothing for anything else.
+7. **`AGENT_CHOOSE` takes any bounded id**: the server keeps no list, so it can't check that the id was listed; an id the agent doesn't know is the agent's refusal, as for any continue.
+8. **A list through a ready agent may run during its turn**: ACP allows concurrent requests, and `Busy` refuses only a second list.
 
 ## The user's decisions
 

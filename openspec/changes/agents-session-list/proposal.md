@@ -1,6 +1,6 @@
 # Proposal
 
-**Depends on:** `agents-session-recovery` (continuing a conversation by its ACP session id: `SPAWN_AGENT`'s `conversation`, the transcript's `Conversation`, the choice of `session/resume` or `session/load`), `agents-login` and `agents-session-title`, implemented and archived; and `zones-mixed-tabs` (a pane of any kind split with an agent zone), implemented and archived before this change.
+**Depends on:** `agents-session-recovery` (continuing a conversation by its ACP session id: `SPAWN_AGENT`'s `conversation`, the transcript's `Conversation`, the choice of `session/resume` or `session/load`), `agents-login`, `agents-session-title`, `agents-log-paging` and `agents-tool-content` (the ACP seam: a version-free reducer, one module per version behind `Dialect`), implemented and archived; and `zones-mixed-tabs` (a pane of any kind split with an agent zone), implemented and archived (PR #149).
 **Next:** none named.
 
 ## Why
@@ -17,7 +17,7 @@ The agents' own tools have two habits for this, `-c` to carry on with the last c
 - **Where the chosen conversation opens.** In the pane itself when the pane has no agent running (a zone whose agent stopped). From a pane with a running agent or a terminal, the palette asks: split right, split down, or a new tab. A conversation already open in a zone is marked, and choosing it shows that zone.
 - **A zone whose agent stopped offers the choice too:** beside Continue conversation it shows Conversations… and New conversation.
 - **`brindle agent PROFILE -c`** (`--continue`) opens a tab that carries on with the last conversation in the directory. **`-r`** (`--resume`) opens a tab on the list. With no earlier conversation, `-c` opens the same choosing screen with the reason, where a new conversation can be started.
-- **Client protocol 4 is amended**: two client messages (list, choose), one reply, one more way to start an agent session, and one more agent state.
+- **Client protocol 4 is amended**: two client messages (list, 31; choose, 64), one reply (45), one more way to start an agent session, and one more agent state. The ACP checkpoint's format 2 is amended with the choosing phase and the list capability.
 
 Not in this change: conversations of other directories; deleting, archiving or renaming a conversation; forking one; searching the list; `-r` or `-c` with a conversation's id; previews of a conversation before it is opened; listing in the sessions palette; remembering the list between uses.
 
@@ -39,8 +39,8 @@ None.
 
 - **`brindle-transcript`** (`transcript/`): `AgentState::Choosing`; a new `tests/fixtures/v4/` file, none edited.
 - **`brindle-remote-protocol`** (`remote-protocol/`): `AGENT_LIST`, `AGENT_CHOOSE` and `AGENT_CONVERSATIONS`; `SPAWN_AGENT`'s optional `start`; fixtures and fuzzing.
-- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms and each version's module for `session/list`; the reducer's `Phase::Choosing` and `Start::Choose`; the core's handlers. The checkpoint's format 2 is amended (unreleased).
-- **`brindle`** (`src/agent/`, `src/workspace.rs`): the pure plans (who lists, which directory, where a choice opens, `-c`'s choice), the palette, the choosing screen, the stopped zone's buttons; two actions in `src/actions.rs`; `-c` and `-r` in `src/main.rs` and the hand-off.
+- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms (`forms.rs`) and `v1/` for `session/list`, behind `Dialect`; the reducer's `Phase::Choosing` and `Start::Choose`; the core's handlers (`server/core/agents.rs`, `policy.rs`). The checkpoint's format 2 is amended (unreleased).
+- **`brindle`** (`src/agent/`, `src/workspace.rs`, `src/zone_view.rs`): the pure plans (who lists, which directory, where a choice opens, `-c`'s choice), the palette, the choosing screen, the stopped zone's buttons; two actions in `src/actions.rs`; `-c` and `-r` in `src/main.rs` and the hand-off (`src/instance.rs`, a new request kind `agent-choose`).
 - **`brindle-ui`**: nothing new; the palette and the prompt input's reason line are used as they are.
 - **Tests:** a capture of each agent answering `session/list`, which no fixture holds yet; real-role tests through the fake ACP agent; new `agent-conversations-*` e2e cases.
 - **Docs:** `README.md`, `docs/code-map.md`, `CLAUDE.md`.

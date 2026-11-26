@@ -1,3 +1,28 @@
+## MODIFIED Requirements
+
+### Requirement: Continuing a conversation
+A zone whose agent exited or was lost with a conversation it can continue SHALL show a Continue conversation button, and the `agent_continue` action (Continue This Conversation) SHALL do the same. Either SHALL start the zone's agent profile's command again with its current arguments and environment on the same session, or in a new session when the server lost it, and the zone SHALL say the agent is starting until it is ready. Nothing SHALL be continued without the user asking.
+
+#### Scenario: Continue after a crash
+- **WHEN** an agent zone's agent exited after one turn, and the user presses Continue conversation
+- **THEN** the zone says the agent is starting, then shows the earlier turn, and the prompt input takes a prompt that reaches the agent
+
+#### Scenario: From the palette
+- **WHEN** an agent zone's agent exited and the user runs Continue This Conversation from the palette
+- **THEN** the conversation is continued as from the button
+
+#### Scenario: Never on its own
+- **WHEN** an agent zone's agent exits and a minute passes
+- **THEN** the agent hasn't been started again
+
+#### Scenario: Replay not shown
+- **WHEN** a zone is continued with an agent that offers only `session/load`
+- **THEN** the conversation shows the earlier turns once, then a notice that the conversation continued and the agent's replay wasn't shown
+
+#### Scenario: Continued in a new session
+- **WHEN** a zone says its session was lost, and the user continues the conversation
+- **THEN** the zone shows a new session's conversation, as the agent replayed it, after a notice that it continues an earlier conversation
+
 ## ADDED Requirements
 
 ### Requirement: The conversations palette
