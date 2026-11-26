@@ -202,6 +202,9 @@ pub fn check_helper(helper: &Path, bin: &Path, default_bin: &Path) -> Result {
     match rule {
         Freshness::Sources => {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+            // scripts/run-throwaway.sh and scripts/linux-helper.ps1 check the
+            // same directories (plus remote-agent/Cargo.toml and Cargo.lock):
+            // change the three lists together.
             let sources = ["remote-agent/src", "remote-protocol/src", "term-core/src", "transcript/src"];
             let newer = sources
                 .iter()
