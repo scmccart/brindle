@@ -1,0 +1,140 @@
+#!/bin/sh
+# Packs the end-to-end suite's build into one tarball, and unpacks it in a
+# job that runs the suite without building it (CI's e2e-build and
+# windows-e2e-build jobs, and the e2e jobs that need them; see CLAUDE.md):
+#
+#   scripts/e2e-bundle pack --suite PATH OUT   # PATH: the compiled e2e test binary
+#   scripts/e2e-bundle unpack FILE
+#
+# Both read RUNNER_OS (Linux or Windows) and GITHUB_WORKSPACE, as a GitHub
+# runner sets them, and work from the repository root. Git Bash runs it on
+# Windows.
+#
+# pack writes OUT, a gzipped tar of the files the suite runs, at their paths
+# under the workspace root: Brindle, the remote helper and the fake ACP agent
+# from target/debug (on Windows with the ConPTY files build.rs copies beside
+# the helper; on Linux with the static fake ACP agent remote-agent-ssh copies
+# into its container), the suite as target/debug/brindle-e2e-suite[.exe],
+# and the stamp target/e2e-bundle.txt (commit=, workspace=, os=). On Linux
+# each binary goes in through objcopy --strip-debug, which keeps the symbol
+# table.
+#
+# unpack refuses a bundle whose stamp names another commit than this
+# checkout's HEAD, another workspace than GITHUB_WORKSPACE (the suite looks
+# for Brindle and the sources at the paths it was compiled with) or another
+# OS. It then extracts it into the repository root with new modification
+# times, so the unpacked files are newer than the checkout's sources and the
+# harness's freshness checks pass: the stamp has proved they were built from
+# them. It prints the stamp and the suite's path.
+#
+# The tarball is read and written through gzip on a pipe, never through
+# tar -f, which GNU tar takes as a remote host for a path like D:\a\...
+set -eu
+
+usage() {
+    echo "usage: scripts/e2e-bundle pack --suite PATH OUT | unpack FILE" >&2
+    echo "  (with RUNNER_OS Linux or Windows, and GITHUB_WORKSPACE, set)" >&2
+    exit 2
+}
+
+# printf, not echo: dash's echo would read a Windows path's backslashes.
+fail() {
+    printf 'e2e-bundle: %s\n' "$*" >&2
+    exit 1
+}
+
+# $1 as an absolute path, read before the script moves to the repository
+# root. A Windows path (D:\..., D:/...) is absolute.
+absolute() {
+    case $1 in
+        /* | [A-Za-z]:*) printf '%s\n' "$1" ;;
+        *) printf '%s\n' "$PWD/$1" ;;
+    esac
+}
+
+[ $# -ge 1 ] || usage
+command=$1
+shift
+
+os=${RUNNER_OS:-}
+case $os in
+    Linux) exe= ;;
+    Windows) exe=.exe ;;
+    *) echo "e2e-bundle: RUNNER_OS is ${os:-unset}, not Linux or Windows" >&2; usage ;;
+esac
+[ -n "${GITHUB_WORKSPACE:-}" ] || { echo "e2e-bundle: GITHUB_WORKSPACE is unset" >&2; usage; }
+
+stamp=target/e2e-bundle.txt
+suite_path=target/debug/brindle-e2e-suite$exe
+
+case $command in
+    pack)
+        [ $# -eq 3 ] && [ "$1" = --suite ] || usage
+        suite=$(absolute "$2")
+        out=$(absolute "$3")
+        cd "$(dirname "$0")/.."
+        case $os in
+            Linux)
+                files="target/debug/brindle target/debug/brindle-remote target/debug/brindle-fake-acp-agent
+                    target/x86_64-unknown-linux-musl/release/brindle-fake-acp-agent"
+                ;;
+            Windows)
+                files="target/debug/brindle.exe target/debug/brindle-remote.exe target/debug/conpty.dll
+                    target/debug/OpenConsole.exe target/debug/brindle-fake-acp-agent.exe"
+                ;;
+        esac
+        [ -f "$suite" ] || fail "the suite $suite is missing"
+        for file in $files; do
+            [ -f "$file" ] || fail "$file is missing: build it first"
+        done
+
+        staging=$(mktemp -d)
+        trap 'rm -rf "$staging"' EXIT
+        # Copies $1 to $2 in the staging directory, stripped on Linux.
+        put() {
+            mkdir -p "$staging/$(dirname "$2")"
+            if [ "$os" = Linux ]; then
+                objcopy --strip-debug "$1" "$staging/$2"
+                chmod 755 "$staging/$2"
+            else
+                cp "$1" "$staging/$2"
+            fi
+        }
+        for file in $files; do
+            put "$file" "$file"
+        done
+        put "$suite" "$suite_path"
+        printf 'commit=%s\nworkspace=%s\nos=%s\n' "$(git rev-parse HEAD)" "$GITHUB_WORKSPACE" "$os" \
+            > "$staging/$stamp"
+
+        # shellcheck disable=SC2086 # a list of paths without spaces
+        (cd "$staging" && tar -cf - $files "$suite_path" "$stamp") | gzip > "$out"
+        cat "$staging/$stamp"
+        ls -l "$out"
+        ;;
+    unpack)
+        [ $# -eq 1 ] || usage
+        file=$(absolute "$1")
+        cd "$(dirname "$0")/.."
+        [ -f "$file" ] || fail "$file is missing"
+        built=$(gzip -dc < "$file" | tar -xOf - "$stamp") || fail "$file holds no $stamp"
+        value() {
+            printf '%s\n' "$built" | sed -n "s/^$1=//p"
+        }
+        head=$(git rev-parse HEAD)
+        [ "$(value commit)" = "$head" ] ||
+            fail "the bundle was built from commit $(value commit), but this checkout is $head"
+        [ "$(value workspace)" = "$GITHUB_WORKSPACE" ] ||
+            fail "the bundle was built in $(value workspace), but this job's workspace is $GITHUB_WORKSPACE (the suite looks for its files at the build's paths)"
+        [ "$(value os)" = "$os" ] ||
+            fail "the bundle was built on $(value os), but this runner is $os"
+
+        # -m: each file gets the extraction time, after the checkout's.
+        gzip -dc < "$file" | tar -xmf -
+        printf '%s\n' "$built"
+        printf 'suite=%s\n' "$suite_path"
+        ;;
+    *)
+        usage
+        ;;
+esac

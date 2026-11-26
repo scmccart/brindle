@@ -1,8 +1,9 @@
 #!/bin/sh
 # Checks .github/workflows/ with actionlint (which runs shellcheck on each
-# `run:` script), configured by .github/actionlint.yaml, and the installer
-# scripts with shellcheck, since a release's install.sh (scripts/get.sh) runs
-# on its own through `curl | sh`:
+# `run:` script), configured by .github/actionlint.yaml, and with shellcheck
+# the installer scripts, since a release's install.sh (scripts/get.sh) runs
+# on its own through `curl | sh`, and scripts/e2e-bundle, which the e2e jobs
+# run:
 #
 #   scripts/lint-workflows            # every workflow
 #   scripts/lint-workflows FILE...    # these workflow files
@@ -22,5 +23,5 @@ fi
 export MSYS_NO_PATHCONV=1
 image=rhysd/actionlint:$ACTIONLINT_VERSION
 docker run --rm -v "$(pwd):/repo" -w /repo --entrypoint shellcheck "$image" \
-    scripts/get.sh scripts/install.sh scripts/uninstall.sh
+    scripts/get.sh scripts/install.sh scripts/uninstall.sh scripts/e2e-bundle
 exec docker run --rm -v "$(pwd):/repo" -w /repo "$image" -no-color "$@"

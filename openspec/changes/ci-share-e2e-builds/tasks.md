@@ -2,7 +2,7 @@
 
 ## 1. The bundle script
 
-- [ ] 1.1 Add `scripts/e2e-bundle` (POSIX sh) with two subcommands.
+- [x] 1.1 Add `scripts/e2e-bundle` (POSIX sh) with two subcommands.
   - `pack --suite PATH OUT` writes design.md's file list for `RUNNER_OS` (Linux or Windows; anything else is a usage error, exit 2). On Linux it strips each binary through `objcopy --strip-debug`, puts the suite at `target/debug/brindle-e2e-suite[.exe]`, and writes the stamp `target/e2e-bundle.txt` (`commit=`, `workspace=`, `os=`).
   - `unpack FILE` checks the stamp against `git rev-parse HEAD`, `GITHUB_WORKSPACE` and `RUNNER_OS`, refusing with both values named on a mismatch. It then extracts with `tar -xzmf` into the workspace root and prints the stamp and the suite path.
 
@@ -12,7 +12,7 @@
   - `unpack` then succeeds, and leaves every listed file newer than `remote-agent/src/fake_acp/script.rs`;
   - `unpack` with `GITHUB_WORKSPACE=/elsewhere` refuses naming both paths, and so does a stamp edited to another commit;
   - `BRINDLE_E2E=1 target/debug/brindle-e2e-suite --self-test` and `--list` match `cargo test --test e2e -- --self-test`/`--list`.
-- [ ] 1.2 Run a few display cases from the unpacked bundle headless: `BRINDLE_E2E=1 scripts/with-xvfb target/debug/brindle-e2e-suite agent-acp agent-cancel local-server-close-zone` (run through `systemd-run --user --scope`, as the memory note on e2e scopes says). Verify: they pass with no helper or fake agent freshness message, as they do under `cargo test --test e2e`.
+- [x] 1.2 Run a few display cases from the unpacked bundle headless: `BRINDLE_E2E=1 scripts/with-xvfb target/debug/brindle-e2e-suite agent-acp agent-cancel local-server-close-zone` (run through `systemd-run --user --scope`, as the memory note on e2e scopes says). Verify: they pass with no helper or fake agent freshness message, as they do under `cargo test --test e2e`.
 
 ## 2. Linux jobs
 
