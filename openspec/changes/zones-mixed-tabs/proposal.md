@@ -36,9 +36,10 @@ None.
 - `tabs`: the tab's title fallback and face follow the active zone.
 - `session-restore`: each zone's profile and host are recorded and restored; swept layouts group both kinds, one terminal server at a time.
 - `profiles`: a profile's appearance and a rename apply to its zones, not to tabs.
-- `ui-theme-tokens`: the chrome ignores per-zone themes.
+- `command-palette`: the split commands listed, by the kinds of profile the config has.
+- `remote-connections`: a split inherits a remote directory only on the same host.
 - `command-line`: the dump's zone lines.
-- `agent-zones`: opening an agent profile is unchanged; a login zone is one of several ways a tab is mixed.
+- `agent-zones`: the split commands the palette lists in an agent zone.
 
 ## Impact
 
