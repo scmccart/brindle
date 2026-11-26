@@ -57,9 +57,9 @@ Before starting:
 
 ## 8. Docs
 
-- [ ] 8.1 Update `README.md` (the Agent tabs section and the launch options), `docs/code-map.md`, and `CLAUDE.md` (the dump's agent states, the palette lines and focus stops, the launch options).
-- [ ] 8.2 Tell `agents-acp-v2` what it inherits: add to its proposal that `session/list` is unchanged in v2 and that a choice continues through its `session/resume`.
-- [ ] 8.3 Add the manual checks to `CLAUDE.md`'s list: each agent's list with titles and times that read right; `brindle agent NAME -c` and `-r` in a project with conversations and in one with none; a conversation chosen from a shell into a split in the same directory; pointer presses on the choosing screen's buttons and on the palette's rows.
+- [x] 8.1 Update `README.md` (the Agent tabs section and the launch options), `docs/code-map.md`, and `CLAUDE.md` (the dump's agent states, the palette lines and focus stops, the launch options).
+- [x] 8.2 Tell `agents-acp-v2` what it inherits: add to its proposal that `session/list` is unchanged in v2 and that a choice continues through its `session/resume`.
+- [x] 8.3 Add the manual checks to `CLAUDE.md`'s list: each agent's list with titles and times that read right; `brindle agent NAME -c` and `-r` in a project with conversations and in one with none; a conversation chosen from a shell into a split in the same directory; pointer presses on the choosing screen's buttons and on the palette's rows.
 
 ## 9. Integration
 
