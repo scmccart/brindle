@@ -24,9 +24,9 @@ Run `cargo test --workspace` and `cargo clippy --locked --workspace --all-target
 
 ## 4. End to end and docs
 
-- [ ] 4.1 Add e2e case `agent-session-title`: a fake agent that names itself `Fake Agent` leaves the tab titled with the profile's name; after a gated `session_info_update` the tab and the dump's zone read the title; a `null` title brings the profile's name back; a tab renamed through the rename prompt keeps its name after another title; verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent-session-title`.
-- [ ] 4.2 Update the agent cases that expected `Fake Agent` as a tab title (`agent-close-idle`, `agent-close-confirm` and others found by `grep -n 'Fake Agent' tests/e2e/cases/agent.rs`) and `agent-notify`'s expected title, then run `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent` and check every agent case passes.
-- [ ] 4.3 Update `docs/code-map.md`'s `brindle-transcript`, ACP client, `agent/` and `notify/` entries (the conversation's title, `session_info_update`, the readable name, `title()` and `agent_label()`, `TabTitle`).
+- [x] 4.1 Add e2e case `agent-session-title`: a fake agent that names itself `Fake Agent` leaves the tab titled with the profile's name; after a gated `session_info_update` the tab and the dump's zone read the title; a `null` title brings the profile's name back; a tab renamed through the rename prompt keeps its name after another title; verify with `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent-session-title`.
+- [x] 4.2 Update the agent cases that expected `Fake Agent` as a tab title (`agent-close-idle`, `agent-close-confirm` and others found by `grep -n 'Fake Agent' tests/e2e/cases/agent.rs`) and `agent-notify`'s expected title, then run `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent` and check every agent case passes.
+- [x] 4.3 Update `docs/code-map.md`'s `brindle-transcript`, ACP client, `agent/` and `notify/` entries (the conversation's title, `session_info_update`, the readable name, `title()` and `agent_label()`, `TabTitle`).
 
 ## Workflow follow-up
 
