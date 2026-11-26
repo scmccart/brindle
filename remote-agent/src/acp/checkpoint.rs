@@ -2,18 +2,36 @@
 //! `agents-sessions`): what the core stores in the session's holder so that
 //! the next core, after a crash or an upgrade, carries on the conversation.
 //!
-//! **The format.** A header, then the JSON state, then the raw bytes of the
-//! stdout line in progress:
+//! **The format** (2, OpenSpec change `agents-log-paging`, design decision
+//! 7): a header, then a base record and any number of segment records, so
+//! the core can append what changed since its last checkpoint
+//! (`CHECKPOINT_APPEND`) instead of rewriting the whole log:
 //!
 //! | bytes | what |
 //! | --- | --- |
 //! | 4 | [`MAGIC`], `BACP` |
-//! | 2 | the format, big-endian: [`FORMAT`] (1) |
+//! | 2 | the format, big-endian: [`FORMAT`] (2) |
+//! | then, repeated | a record |
+//! | 1 | its kind: `B` (the base, first and only once) or `S` (a segment) |
+//! | 4 | its sequence number, big-endian: the base 0, each segment one more |
 //! | 4 | the JSON state's length in bytes, big-endian |
 //! | that many | the JSON state: one object |
-//! | the rest | the partial line's bytes, when [`Partial::Collecting`] |
+//! | 4 | the partial line's length, big-endian (0 unless [`Partial::Collecting`]) |
+//! | that many | the partial line's bytes |
 //!
-//! The state holds the log as the events of [`Transcript::replay`] (the
+//! A segment's state has the base's fields except `log`, which becomes
+//! `events`: the events the session applied since the previous record, in
+//! order, with consecutive `Appended`s of one entry merged up to
+//! [`TEXT_CHUNK`]. Every other field is whole and replaces the previous
+//! record's. [`decode`] folds the base's log, then each segment's events,
+//! and takes the rest from the last record. [`encode`] writes the header
+//! and a base; [`encode_segment`] one segment record.
+//!
+//! Format 1, which builds before this change wrote, is still read: the
+//! header's format, then the JSON state's length (4 bytes, big-endian),
+//! the state, and the rest the partial line's bytes.
+//!
+//! The base's state holds the log as the events of [`Transcript::replay`] (the
 //! queue slot, the turn and the agent's state among them), the ACP version
 //! (`acp`, always 1 here), the [`Phase`] (with the ACP session id once
 //! ready, what a spawn starts or continues, what `initialize` offered, and
@@ -48,7 +66,7 @@ use brindle_remote_protocol::holder::MAX_CHECKPOINT_LEN;
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 use brindle_transcript::{
     AgentState, Continuation, Conversation, Entry, EntryId, Event, LoginMethod, NoticeLevel,
-    Transcript,
+    TEXT_CHUNK, Transcript,
 };
 
 use super::lines::{Lines, Partial};
@@ -63,10 +81,25 @@ use super::wire::Id;
 pub const MAGIC: [u8; 4] = *b"BACP";
 
 /// The format [`encode`] writes and the newest [`decode`] reads.
-pub const FORMAT: u16 = 1;
+pub const FORMAT: u16 = 2;
 
-/// The magic, the format and the state's length.
-const HEADER_LEN: usize = 4 + 2 + 4;
+/// The format before segments, which [`decode`] still reads.
+const FORMAT_1: u16 = 1;
+
+/// The magic and the format.
+const PREFIX_LEN: usize = 4 + 2;
+
+/// Format 1's header: the magic, the format and the state's length.
+const HEADER_LEN: usize = PREFIX_LEN + 4;
+
+/// A format 2 record's kind, sequence number and state length.
+const RECORD_HEADER_LEN: usize = 1 + 4 + 4;
+
+/// A base record's kind.
+const BASE: u8 = b'B';
+
+/// A segment record's kind.
+const SEGMENT: u8 = b'S';
 
 /// What the log of a session whose checkpoint couldn't be read says, and
 /// its agent's failure.
@@ -117,6 +150,14 @@ pub enum Unreadable {
     Entry { name: &'static str, entry: EntryId },
     /// Partial line bytes come with a partial that isn't being collected.
     StrayBytes { len: usize },
+    /// A format 2 checkpoint whose first record isn't a base.
+    NoBase,
+    /// A format 2 record of a kind other than a base first and segments
+    /// after it.
+    RecordKind { kind: u8 },
+    /// A format 2 record whose sequence number isn't the next one: a
+    /// segment was lost.
+    Sequence { expected: u32, found: u32 },
 }
 
 impl fmt::Display for Unreadable {
@@ -126,7 +167,7 @@ impl fmt::Display for Unreadable {
             Self::NotACheckpoint => f.write_str("its checkpoint isn't an agent session's"),
             Self::Format { format } => write!(
                 f,
-                "its checkpoint is in format {format}, and this terminal server reads format {FORMAT}"
+                "its checkpoint is in format {format}, and this terminal server reads formats {FORMAT_1} and {FORMAT}"
             ),
             Self::Truncated => f.write_str("its checkpoint is cut short"),
             Self::NotJson { error } => write!(f, "its checkpoint's state isn't JSON: {error}"),
@@ -155,16 +196,88 @@ impl fmt::Display for Unreadable {
                     "its checkpoint carries {len} bytes of a line it isn't collecting"
                 )
             }
+            Self::NoBase => f.write_str("its checkpoint doesn't start with its base"),
+            Self::RecordKind { kind } => {
+                write!(f, "its checkpoint has a record of unknown kind {kind:#04x}")
+            }
+            Self::Sequence { expected, found } => write!(
+                f,
+                "its checkpoint's record {found} came where record {expected} was due, so a part of it is missing"
+            ),
         }
     }
 }
 
-/// Encodes `session` whole, or refuses past [`MAX_CHECKPOINT_LEN`].
+/// Encodes `session` whole (the header and a base record), or refuses
+/// past [`MAX_CHECKPOINT_LEN`].
 pub fn encode(session: &AgentSession) -> Result<Vec<u8>, TooLarge> {
     encode_within(session, MAX_CHECKPOINT_LEN)
 }
 
 fn encode_within(session: &AgentSession, limit: u64) -> Result<Vec<u8>, TooLarge> {
+    let (mut state, partial) = state_fields(session);
+    let events: Vec<Value> = session
+        .transcript
+        .replay()
+        .iter()
+        .map(Event::to_value)
+        .collect();
+    state.insert("log".into(), Value::Array(events));
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(&FORMAT.to_be_bytes());
+    push_record(&mut out, BASE, 0, &Value::Object(state), partial, limit)?;
+    Ok(out)
+}
+
+/// One segment record, numbered `seq`, to append to a stored checkpoint:
+/// `events`, the events `session` applied since the previous record, with
+/// consecutive `Appended`s of one entry merged, and the rest of the session
+/// whole. Refused past [`MAX_CHECKPOINT_LEN`] on its own; whether it fits
+/// beside what is stored is the core's to judge.
+#[cfg_attr(not(test), allow(dead_code))] // the core appends from task 3.4
+pub fn encode_segment(
+    session: &AgentSession,
+    events: &[Event],
+    seq: u32,
+) -> Result<Vec<u8>, TooLarge> {
+    let (mut state, partial) = state_fields(session);
+    let events: Vec<Value> = merged(events).iter().map(Event::to_value).collect();
+    state.insert("events".into(), Value::Array(events));
+    let mut out = Vec::new();
+    push_record(
+        &mut out,
+        SEGMENT,
+        seq,
+        &Value::Object(state),
+        partial,
+        MAX_CHECKPOINT_LEN,
+    )?;
+    Ok(out)
+}
+
+/// `events` with each run of `Appended`s to one entry merged into as few
+/// as fit [`TEXT_CHUNK`] each: they fold to the same text.
+fn merged(events: &[Event]) -> Vec<Event> {
+    let mut out: Vec<Event> = Vec::with_capacity(events.len());
+    for event in events {
+        if let Event::Appended { id, text } = event
+            && let Some(Event::Appended {
+                id: last_id,
+                text: last,
+            }) = out.last_mut()
+            && last_id == id
+            && last.len() + text.len() <= TEXT_CHUNK
+        {
+            last.push_str(text);
+            continue;
+        }
+        out.push(event.clone());
+    }
+    out
+}
+
+/// Every field of the state but the log, and the partial line's bytes.
+fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
     let (partial, bytes): (Value, &[u8]) = match session.lines.partial() {
         Partial::Collecting(bytes) => (json!({ "partial": "collecting" }), bytes),
         Partial::TooLong { len } => (json!({ "partial": "too_long", "len": len }), &[]),
@@ -174,40 +287,68 @@ fn encode_within(session: &AgentSession, limit: u64) -> Result<Vec<u8>, TooLarge
     if let Some(object) = lines.as_object_mut() {
         object.insert("covers".into(), session.lines.covers().into());
     }
-    let events: Vec<Value> = session
-        .transcript
-        .replay()
-        .iter()
-        .map(Event::to_value)
-        .collect();
-    let mut state = json!({
-        "acp": PROTOCOL_VERSION,
-        "cwd": session.cwd,
-        "version": session.version,
-        "phase": phase_value(&session.phase),
-        "log": events,
-        "rpc": rpc_value(&session.rpc),
-        "run": session.run.map(|run| json!({ "kind": run_kind_name(run.kind), "entry": run.entry.0 })),
-        "tools": session.tools.iter().map(|(call, entry)| (call.clone(), Value::from(entry.0))).collect::<Map<String, Value>>(),
-        "bad_lines": session.bad.map_or(0, |bad| bad.lines),
-        "lines": lines,
-    });
+    let mut state = Map::new();
+    state.insert("acp".into(), PROTOCOL_VERSION.into());
+    state.insert("cwd".into(), session.cwd.clone().into());
+    state.insert("version".into(), session.version.clone().into());
+    state.insert("phase".into(), phase_value(&session.phase));
+    state.insert("rpc".into(), rpc_value(&session.rpc));
+    state.insert(
+        "run".into(),
+        session.run.map_or(Value::Null, |run| {
+            json!({ "kind": run_kind_name(run.kind), "entry": run.entry.0 })
+        }),
+    );
+    state.insert(
+        "tools".into(),
+        Value::Object(
+            session
+                .tools
+                .iter()
+                .map(|(call, entry)| (call.clone(), Value::from(entry.0)))
+                .collect(),
+        ),
+    );
+    state.insert(
+        "bad_lines".into(),
+        session.bad.map_or(0, |bad| bad.lines).into(),
+    );
+    state.insert("lines".into(), lines);
     if !session.methods.is_empty() {
-        state["methods"] = json!(session.methods);
+        state.insert("methods".into(), json!(session.methods));
     }
+    (state, bytes)
+}
+
+/// Appends a format 2 record to `out`, or refuses when `out` would pass
+/// `limit`.
+fn push_record(
+    out: &mut Vec<u8>,
+    kind: u8,
+    seq: u32,
+    state: &Value,
+    partial: &[u8],
+    limit: u64,
+) -> Result<(), TooLarge> {
     let state = state.to_string();
-    let len = HEADER_LEN as u64 + state.len() as u64 + bytes.len() as u64;
+    let len = out.len() as u64
+        + RECORD_HEADER_LEN as u64
+        + state.len() as u64
+        + 4
+        + partial.len() as u64;
     let state_len = u32::try_from(state.len()).map_err(|_| TooLarge { len })?;
+    let partial_len = u32::try_from(partial.len()).map_err(|_| TooLarge { len })?;
     if len > limit {
         return Err(TooLarge { len });
     }
-    let mut out = Vec::with_capacity(HEADER_LEN + state.len() + bytes.len());
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&FORMAT.to_be_bytes());
+    out.reserve(RECORD_HEADER_LEN + state.len() + 4 + partial.len());
+    out.push(kind);
+    out.extend_from_slice(&seq.to_be_bytes());
     out.extend_from_slice(&state_len.to_be_bytes());
     out.extend_from_slice(state.as_bytes());
-    out.extend_from_slice(bytes);
-    Ok(out)
+    out.extend_from_slice(&partial_len.to_be_bytes());
+    out.extend_from_slice(partial);
+    Ok(())
 }
 
 /// A phase as the state's `phase` object. Of the fields
@@ -356,36 +497,136 @@ fn rpc_value(rpc: &Rpc) -> Value {
     json!({ "next_id": rpc.next_id(), "outgoing": outgoing, "permissions": permissions })
 }
 
-/// The session `bytes` encode, or why they don't. A bad-line run comes
-/// back with `now` as its last line's time, so its notice is written a
-/// quiet second after the adoption.
+/// The session `bytes` encode, in format 1 or 2, or why they don't. A
+/// bad-line run comes back with `now` as its last line's time, so its
+/// notice is written a quiet second after the adoption.
 pub fn decode(bytes: &[u8], now: Instant) -> Result<AgentSession, Unreadable> {
-    let header = bytes
-        .get(..HEADER_LEN)
+    let prefix = bytes
+        .get(..PREFIX_LEN)
         .ok_or(Unreadable::Short { len: bytes.len() })?;
-    let (magic, rest) = header.split_at(4);
+    let (magic, format) = prefix.split_at(4);
     if magic != MAGIC {
         return Err(Unreadable::NotACheckpoint);
     }
-    let (format, state_len) = rest.split_at(2);
-    let format = u16::from_be_bytes([format[0], format[1]]);
-    if format != FORMAT {
-        return Err(Unreadable::Format { format });
+    match u16::from_be_bytes([format[0], format[1]]) {
+        FORMAT_1 => decode_1(bytes, now),
+        FORMAT => decode_2(&bytes[PREFIX_LEN..], now),
+        format => Err(Unreadable::Format { format }),
     }
-    let state_len = u32::from_be_bytes([state_len[0], state_len[1], state_len[2], state_len[3]]);
+}
+
+/// Format 1: the state's length, the state, the partial line.
+fn decode_1(bytes: &[u8], now: Instant) -> Result<AgentSession, Unreadable> {
+    let header = bytes
+        .get(..HEADER_LEN)
+        .ok_or(Unreadable::Short { len: bytes.len() })?;
+    let state_len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]);
     let body = &bytes[HEADER_LEN..];
     let state_len = usize::try_from(state_len).map_err(|_| Unreadable::Truncated)?;
     if state_len > body.len() {
         return Err(Unreadable::Truncated);
     }
     let (state, partial) = body.split_at(state_len);
+    let state = state_object(state)?;
+    restore(&state, None, partial, now)
+}
+
+/// Format 2: a base record, then segments in sequence.
+fn decode_2(mut rest: &[u8], now: Instant) -> Result<AgentSession, Unreadable> {
+    let Some(base) = next_record(&mut rest)? else {
+        return Err(Unreadable::NoBase);
+    };
+    match base.kind {
+        BASE => {}
+        SEGMENT => return Err(Unreadable::NoBase),
+        kind => return Err(Unreadable::RecordKind { kind }),
+    }
+    if base.seq != 0 {
+        return Err(Unreadable::Sequence {
+            expected: 0,
+            found: base.seq,
+        });
+    }
+    let mut state = state_object(base.state)?;
+    let mut transcript = restore_log(array(&state, "log")?)?;
+    let mut partial = base.partial;
+    let mut expected: u32 = 1;
+    while let Some(record) = next_record(&mut rest)? {
+        if record.kind != SEGMENT {
+            return Err(Unreadable::RecordKind { kind: record.kind });
+        }
+        if record.seq != expected {
+            return Err(Unreadable::Sequence {
+                expected,
+                found: record.seq,
+            });
+        }
+        expected = expected.saturating_add(1);
+        state = state_object(record.state)?;
+        fold_log(&mut transcript, array(&state, "events")?)?;
+        partial = record.partial;
+    }
+    restore(&state, Some(transcript), partial, now)
+}
+
+/// One format 2 record.
+struct Record<'a> {
+    kind: u8,
+    seq: u32,
+    state: &'a [u8],
+    partial: &'a [u8],
+}
+
+/// The next record of `rest`, taken off it; `None` at its end.
+fn next_record<'a>(rest: &mut &'a [u8]) -> Result<Option<Record<'a>>, Unreadable> {
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    let (kind, bytes) = rest.split_first().ok_or(Unreadable::Truncated)?;
+    let (seq, bytes) = take_u32(bytes)?;
+    let (state_len, bytes) = take_u32(bytes)?;
+    let (state, bytes) = take(bytes, state_len)?;
+    let (partial_len, bytes) = take_u32(bytes)?;
+    let (partial, bytes) = take(bytes, partial_len)?;
+    *rest = bytes;
+    Ok(Some(Record {
+        kind: *kind,
+        seq,
+        state,
+        partial,
+    }))
+}
+
+fn take_u32(bytes: &[u8]) -> Result<(u32, &[u8]), Unreadable> {
+    let (number, rest) = bytes
+        .split_first_chunk::<4>()
+        .ok_or(Unreadable::Truncated)?;
+    Ok((u32::from_be_bytes(*number), rest))
+}
+
+fn take(bytes: &[u8], len: u32) -> Result<(&[u8], &[u8]), Unreadable> {
+    let len = usize::try_from(len).map_err(|_| Unreadable::Truncated)?;
+    if len > bytes.len() {
+        return Err(Unreadable::Truncated);
+    }
+    Ok(bytes.split_at(len))
+}
+
+/// A state's bytes as its JSON object.
+fn state_object(state: &[u8]) -> Result<Map<String, Value>, Unreadable> {
     let state: Value = serde_json::from_slice(state).map_err(|error| Unreadable::NotJson {
         error: error.to_string(),
     })?;
-    let state = state.as_object().ok_or(Unreadable::NotJson {
-        error: "not an object".into(),
-    })?;
-    restore(state, partial, now)
+    match state {
+        Value::Object(object) => Ok(object),
+        Value::Null
+        | Value::Bool(_)
+        | Value::Number(_)
+        | Value::String(_)
+        | Value::Array(_) => Err(Unreadable::NotJson {
+            error: "not an object".into(),
+        }),
+    }
 }
 
 /// A field of `object`.
@@ -438,8 +679,11 @@ fn pair<'a>(value: &'a Value, name: &'static str) -> Result<(&'a Value, &'a Valu
     }
 }
 
+/// The session `state` holds, its log folded already (format 2) or read
+/// from its `log` field (format 1).
 fn restore(
     state: &Map<String, Value>,
+    transcript: Option<Transcript>,
     partial: &[u8],
     now: Instant,
 ) -> Result<AgentSession, Unreadable> {
@@ -450,7 +694,10 @@ fn restore(
     let cwd = text(state, "cwd")?.to_owned();
     let version = text(state, "version")?.to_owned();
     let phase = restore_phase(object(field(state, "phase")?, "phase")?)?;
-    let transcript = restore_log(array(state, "log")?)?;
+    let transcript = match transcript {
+        Some(transcript) => transcript,
+        None => restore_log(array(state, "log")?)?,
+    };
     let rpc = restore_rpc(object(field(state, "rpc")?, "rpc")?)?;
     let run = field(state, "run")?;
     let run = if run.is_null() {
@@ -637,6 +884,12 @@ fn restore_log_kind(log: &str) -> Result<Log, Unreadable> {
 /// The log the replayed events fold into.
 fn restore_log(events: &[Value]) -> Result<Transcript, Unreadable> {
     let mut transcript = Transcript::new();
+    fold_log(&mut transcript, events)?;
+    Ok(transcript)
+}
+
+/// Folds a record's events onto `transcript`.
+fn fold_log(transcript: &mut Transcript, events: &[Value]) -> Result<(), Unreadable> {
     for value in events {
         let event = Event::from_value(value).map_err(|error| Unreadable::Log {
             error: error.to_string(),
@@ -645,7 +898,7 @@ fn restore_log(events: &[Value]) -> Result<Transcript, Unreadable> {
             error: error.to_string(),
         })?;
     }
-    Ok(transcript)
+    Ok(())
 }
 
 fn restore_rpc(parts: &Map<String, Value>) -> Result<Rpc, Unreadable> {
@@ -1561,52 +1814,54 @@ mod tests {
             let mut agent = Agent::ready();
             agent.s.lines = Lines::restore(partial, 9_000_100);
             let bytes = encode(&agent.s).expect("it fits");
-            let state_len = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-            assert_eq!(bytes.len(), HEADER_LEN + state_len, "no line bytes follow");
+            assert_eq!(bytes[bytes.len() - 4..], [0, 0, 0, 0], "no line bytes follow");
+            assert!(state_of(&bytes).1.is_empty());
             assert_eq!(decode(&bytes, agent.now).expect("it reads"), agent.s);
         }
     }
 
     #[test]
-    fn the_header_is_the_magic_format_1_and_the_states_length() {
+    fn the_header_is_the_magic_and_format_2_then_a_base_record() {
         let bytes = encode(&Agent::new().s).expect("it fits");
         assert_eq!(&bytes[..4], b"BACP");
-        assert_eq!(&bytes[4..6], &[0, 1]);
-        let state_len = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-        let state: Value = serde_json::from_slice(&bytes[HEADER_LEN..HEADER_LEN + state_len])
-            .expect("the state is JSON");
+        assert_eq!(&bytes[4..6], &[0, 2]);
+        assert_eq!(bytes[6], b'B');
+        assert_eq!(&bytes[7..11], &[0, 0, 0, 0], "the base is record 0");
+        let (state, partial) = state_of(&bytes);
         assert_eq!(state["acp"], 1);
         assert_eq!(state["phase"], json!({"phase": "spawning"}));
+        assert!(partial.is_empty());
     }
 
     #[test]
     fn a_state_with_fields_it_doesnt_know_still_reads() {
         let agent = Agent::busy();
-        let bytes = encode(&agent.s).expect("it fits");
-        let state_len = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-        let mut state: Value =
-            serde_json::from_slice(&bytes[HEADER_LEN..HEADER_LEN + state_len]).expect("JSON");
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
         state["later"] = json!({"added": true});
-        let rebuilt = rebuild(&state, &bytes[HEADER_LEN + state_len..]);
+        let rebuilt = rebuild(&state, &partial);
         assert_eq!(decode(&rebuilt, agent.now).expect("it reads"), agent.s);
     }
 
-    /// A checkpoint of `state` and the line bytes `partial`.
+    /// A format 1 checkpoint of `state` and the line bytes `partial`, as
+    /// builds before format 2 wrote them (still read).
     fn rebuild(state: &Value, partial: &[u8]) -> Vec<u8> {
         let state = state.to_string();
         let mut out = MAGIC.to_vec();
-        out.extend_from_slice(&FORMAT.to_be_bytes());
+        out.extend_from_slice(&FORMAT_1.to_be_bytes());
         out.extend_from_slice(&(state.len() as u32).to_be_bytes());
         out.extend_from_slice(state.as_bytes());
         out.extend_from_slice(partial);
         out
     }
 
+    /// A format 2 checkpoint's base record's state and line bytes.
     fn state_of(bytes: &[u8]) -> (Value, Vec<u8>) {
-        let state_len = u32::from_be_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
-        let state =
-            serde_json::from_slice(&bytes[HEADER_LEN..HEADER_LEN + state_len]).expect("JSON");
-        (state, bytes[HEADER_LEN + state_len..].to_vec())
+        assert_eq!(&bytes[4..6], &FORMAT.to_be_bytes());
+        let mut rest = &bytes[PREFIX_LEN..];
+        let base = next_record(&mut rest).expect("a record").expect("a base");
+        assert_eq!(base.kind, BASE);
+        let state = serde_json::from_slice(base.state).expect("JSON");
+        (state, base.partial.to_vec())
     }
 
     #[test]
@@ -1651,16 +1906,17 @@ mod tests {
     fn a_full_log_a_full_partial_line_and_a_full_prompt_fit_in_64_mib() {
         let mut agent = Agent::ready();
         agent.prompt("go");
-        // Entries of text that escapes to twice its length, past the log's
-        // bound: the reducer trims it to 16 MiB encoded. Agent and thought
-        // chunks alternate, so each is an entry of its own.
+        // Entries of text that escapes to twice its length, up to just
+        // below the log's bound (16 MiB encoded), where it is largest.
+        // Agent and thought chunks alternate, so each is an entry of its own.
         let piece = "\"".repeat(32 * 1024);
         let thought = update(json!({"sessionUpdate": "agent_thought_chunk",
             "content": {"type": "text", "text": piece}}));
-        for _ in 0..(reduce::LOG_LIMIT / (4 * piece.len())) + 4 {
+        while agent.s.transcript.encoded_len() <= reduce::LOG_LIMIT - 300 * 1024 {
             agent.feed(&chunk(&piece));
             agent.feed(&thought);
         }
+        assert_eq!(agent.s.transcript.dropped(), 0, "no trim yet");
         assert!(agent.s.transcript.encoded_len() <= reduce::LOG_LIMIT);
         assert!(agent.s.transcript.encoded_len() > reduce::LOG_LIMIT - 512 * 1024);
         agent.prompt(&"q".repeat(reduce::MAX_PROMPT));
@@ -1713,12 +1969,13 @@ mod tests {
     #[test]
     fn a_newer_format_is_adopted_as_a_conversation_that_could_not_be_restored() {
         let mut bytes = encode(&Agent::busy().s).expect("it fits");
-        bytes[4..6].copy_from_slice(&2u16.to_be_bytes());
+        bytes[4..6].copy_from_slice(&3u16.to_be_bytes());
         let adopted = adopt(&bytes, false, "/home/u/src", "0.3.0", Instant::now());
-        assert_eq!(adopted.restored, Err(Unreadable::Format { format: 2 }));
+        assert_eq!(adopted.restored, Err(Unreadable::Format { format: 3 }));
         assert_not_restored(&adopted);
         let entries = entries(&adopted.session);
-        assert!(matches!(&entries[0], Entry::Notice { text, .. } if text.contains("format 2")));
+        assert!(matches!(&entries[0], Entry::Notice { text, .. }
+            if text.contains("format 3") && text.contains("reads formats 1 and 2")));
     }
 
     #[test]
@@ -2047,6 +2304,356 @@ mod tests {
         ));
     }
 
+    // --- format 2: segments (agents-log-paging decision 7) ----------------
+
+    /// A stored checkpoint the core appends to, as the holder keeps it.
+    struct Stored {
+        bytes: Vec<u8>,
+        seq: u32,
+        unsaved: Vec<Event>,
+    }
+
+    impl Stored {
+        fn whole(session: &AgentSession) -> Self {
+            Self {
+                bytes: encode(session).expect("it fits"),
+                seq: 0,
+                unsaved: Vec::new(),
+            }
+        }
+
+        /// Notes what a step applied, as the core keeps `unsaved`.
+        fn saw(&mut self, out: Output) -> Output {
+            self.unsaved.extend(out.events.iter().cloned());
+            out
+        }
+
+        fn append(&mut self, session: &AgentSession) {
+            self.seq += 1;
+            let segment = encode_segment(session, &self.unsaved, self.seq).expect("it fits");
+            self.bytes.extend_from_slice(&segment);
+            self.unsaved.clear();
+        }
+
+        fn decode(&self, now: Instant) -> AgentSession {
+            decode(&self.bytes, now).expect("it reads")
+        }
+    }
+
+    #[test]
+    fn a_base_and_three_segments_decode_to_the_live_session_the_last_record_winning() {
+        let mut agent = Agent::ready();
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.prompt("first"));
+        stored.saw(agent.feed(&chunk("Working on ")));
+        stored.saw(agent.feed(&chunk("it")));
+        stored.append(&agent.s);
+        stored.saw(agent.feed(&update(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "Write", "kind": "edit", "status": "pending"}),
+        )));
+        stored.saw(agent.feed(&permission(json!("p1"))));
+        stored.saw(agent.prompt("second"));
+        stored.saw(agent.feed(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/up"));
+        stored.append(&agent.s);
+        assert_eq!(stored.decode(agent.now), agent.s);
+        assert_eq!(stored.decode(agent.now).rpc.permissions().len(), 1);
+        // The partial line completes, the turn ends and the permission goes:
+        // the last record's partial, phase and requests win.
+        stored.saw(agent.feed(b"date\",\"params\":{\"sessionId\":\"s1\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\" done\"}}}}\n"));
+        stored.saw(agent.feed(&result(3, json!({"stopReason": "end_turn"}))));
+        agent.s.methods = creating().s.methods;
+        stored.append(&agent.s);
+        assert_eq!(stored.seq, 3);
+        let decoded = stored.decode(agent.now);
+        assert_eq!(decoded, agent.s);
+        assert!(matches!(decoded.lines.partial(), Partial::Collecting(bytes) if bytes.is_empty()));
+        assert_eq!(decoded.methods.len(), 2);
+    }
+
+    #[test]
+    fn a_segment_written_while_logging_in_round_trips() {
+        let mut agent = creating();
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.feed(&auth_error(2, "Authentication required")));
+        stored.append(&agent.s);
+        assert!(matches!(stored.decode(agent.now).phase, Phase::LoginRequired(_)));
+        assert_eq!(stored.decode(agent.now), agent.s);
+        stored.saw(login_cmd(&mut agent, "oauth-personal"));
+        stored.append(&agent.s);
+        assert!(matches!(stored.decode(agent.now).phase, Phase::LoggingIn { .. }));
+        assert_eq!(stored.decode(agent.now), agent.s);
+    }
+
+    #[test]
+    fn a_segment_written_during_a_muted_load_round_trips() {
+        let mut agent = Agent::ready();
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.prompt("first"));
+        stored.saw(agent.feed(&chunk("Done.")));
+        stored.saw(agent.feed(&result(3, json!({"stopReason": "end_turn"}))));
+        stored.saw(agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"",
+        }));
+        stored.append(&agent.s);
+        stored.saw(agent.step(Input::Restart));
+        stored.saw(agent.step(Input::Spawned));
+        stored.saw(agent.feed(&result(
+            4,
+            json!({"protocolVersion": 1, "agentCapabilities": {"loadSession": true}}),
+        )));
+        stored.saw(agent.feed(&chunk("replayed")));
+        stored.saw(agent.feed(&permission(json!(9))));
+        stored.append(&agent.s);
+        let decoded = stored.decode(agent.now);
+        assert!(matches!(
+            decoded.phase,
+            Phase::Loading {
+                replay: Replay::Muted { updates: 1 },
+                ..
+            }
+        ));
+        assert_eq!(decoded, agent.s);
+    }
+
+    #[test]
+    fn a_segment_written_after_a_retitle_round_trips_with_the_title() {
+        let mut agent = Agent::ready();
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.feed(&update(json!({"sessionUpdate": "session_info_update",
+            "title": "Hello.txt file creation"}))));
+        stored.append(&agent.s);
+        let decoded = stored.decode(agent.now);
+        assert_eq!(decoded, agent.s);
+        assert_eq!(
+            decoded.transcript.conversation().and_then(|c| c.title.as_deref()),
+            Some("Hello.txt file creation")
+        );
+    }
+
+    #[test]
+    fn appended_text_is_merged_per_entry_within_a_chunk_and_folds_the_same() {
+        let a = EntryId(1);
+        let b = EntryId(2);
+        let appended = |id, text: &str| Event::Appended {
+            id,
+            text: text.into(),
+        };
+        let events = [
+            appended(a, "one "),
+            appended(a, "two"),
+            appended(b, "x"),
+            appended(a, "three"),
+        ];
+        assert_eq!(
+            merged(&events),
+            [appended(a, "one two"), appended(b, "x"), appended(a, "three")]
+        );
+        let half = "y".repeat(TEXT_CHUNK / 2 + 1);
+        assert_eq!(
+            merged(&[appended(a, &half), appended(a, &half)]).len(),
+            2,
+            "a merge never passes TEXT_CHUNK"
+        );
+        // A run of chunks makes a segment of a few events that folds to the
+        // same text.
+        let mut agent = Agent::ready();
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.prompt("go"));
+        for n in 0..200 {
+            stored.saw(agent.feed(&chunk(&format!("piece {n} "))));
+        }
+        let unsaved = stored.unsaved.len();
+        stored.append(&agent.s);
+        let mut rest = &stored.bytes[PREFIX_LEN..];
+        next_record(&mut rest).expect("a base");
+        let segment = next_record(&mut rest).expect("a record").expect("a segment");
+        let state: Value = serde_json::from_slice(segment.state).expect("JSON");
+        let written = state["events"].as_array().expect("events").len();
+        assert!(written < unsaved / 10, "{written} of {unsaved}");
+        assert_eq!(stored.decode(agent.now), agent.s);
+    }
+
+    /// A format 2 record of `kind`, numbered `seq`, with the state `state`.
+    fn record(kind: u8, seq: u32, state: &Value) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_record(&mut out, kind, seq, state, &[], MAX_CHECKPOINT_LEN).expect("it fits");
+        out
+    }
+
+    #[test]
+    fn a_format_2_checkpoint_out_of_order_or_cut_short_is_adopted_as_not_restored() {
+        let agent = Agent::ready();
+        let base = encode(&agent.s).expect("it fits");
+        let (state, _) = state_of(&base);
+        let mut segment_state = state.clone();
+        if let Some(object) = segment_state.as_object_mut() {
+            object.remove("log");
+            object.insert("events".into(), json!([]));
+        }
+        let header = base[..PREFIX_LEN].to_vec();
+        let joined = |parts: &[&[u8]]| parts.concat();
+        let segment = |seq| record(SEGMENT, seq, &segment_state);
+        let cases: Vec<(Vec<u8>, Unreadable)> = vec![
+            (header.clone(), Unreadable::NoBase),
+            (joined(&[&header, &segment(0)]), Unreadable::NoBase),
+            (
+                joined(&[&header, &record(b'X', 0, &state)]),
+                Unreadable::RecordKind { kind: b'X' },
+            ),
+            (
+                joined(&[&base, &record(BASE, 1, &state)]),
+                Unreadable::RecordKind { kind: BASE },
+            ),
+            (
+                joined(&[&header, &record(BASE, 1, &state)]),
+                Unreadable::Sequence {
+                    expected: 0,
+                    found: 1,
+                },
+            ),
+            (
+                joined(&[&base, &segment(2)]),
+                Unreadable::Sequence {
+                    expected: 1,
+                    found: 2,
+                },
+            ),
+            (
+                joined(&[&base, &segment(1)[..7]]),
+                Unreadable::Truncated,
+            ),
+            (base[..base.len() - 1].to_vec(), Unreadable::Truncated),
+        ];
+        for (bytes, why) in cases {
+            let adopted = adopt(&bytes, false, "/home/u/src", "0.3.0", agent.now);
+            assert_eq!(adopted.restored, Err(why));
+            assert_not_restored(&adopted);
+        }
+        // The segment itself reads.
+        let fine = joined(&[&base, &segment(1)]);
+        assert_eq!(decode(&fine, agent.now), Ok(agent.s.clone()));
+    }
+
+    #[test]
+    fn the_new_refusals_read_as_what_went_wrong() {
+        assert_eq!(
+            Unreadable::NoBase.to_string(),
+            "its checkpoint doesn't start with its base"
+        );
+        assert_eq!(
+            Unreadable::RecordKind { kind: b'X' }.to_string(),
+            "its checkpoint has a record of unknown kind 0x58"
+        );
+        assert_eq!(
+            Unreadable::Sequence {
+                expected: 2,
+                found: 3
+            }
+            .to_string(),
+            "its checkpoint's record 3 came where record 2 was due, so a part of it is missing"
+        );
+    }
+
+    #[test]
+    fn a_format_1_checkpoint_with_a_title_and_a_login_still_adopts() {
+        let mut agent = Agent::ready();
+        agent.s.methods = creating().s.methods;
+        agent.feed(&update(json!({"sessionUpdate": "session_info_update",
+            "title": "Hello.txt file creation"})));
+        assert_eq!(agent.prompt("hi").reply, Some(Ok(())));
+        agent.feed(&auth_error(3, "expired"));
+        let (state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let format_1 = rebuild(&state, &partial);
+        assert_eq!(&format_1[4..6], &[0, 1]);
+        let adopted = adopt(&format_1, false, "/home/u/src", "0.3.0", agent.now);
+        assert_eq!(adopted.restored, Ok(()));
+        assert_eq!(adopted.session, agent.s);
+        assert!(matches!(adopted.session.phase, Phase::LoginRequired(_)));
+    }
+
+    #[test]
+    fn a_small_sessions_format_2_bytes_are_pinned() {
+        let session = AgentSession::new("/w".into(), "0.3.0".into());
+        let bytes = encode(&session).expect("it fits");
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, PINNED);
+        assert_eq!(decode(&bytes, Instant::now()), Ok(session));
+    }
+
+    /// `BACP`, format 2, a base record numbered 0 with the state's length,
+    /// the state, and no partial line.
+    const PINNED: &str = concat!(
+        "4241435000024200000000000001267b22616370223a312c22637764223a222f77222c2276657273",
+        "696f6e223a22302e332e30222c227068617365223a7b227068617365223a22737061776e696e6722",
+        "7d2c22727063223a7b226e6578745f6964223a312c226f7574676f696e67223a5b5d2c227065726d",
+        "697373696f6e73223a5b5d7d2c2272756e223a6e756c6c2c22746f6f6c73223a7b7d2c226261645f",
+        "6c696e6573223a302c226c696e6573223a7b227061727469616c223a22636f6c6c656374696e6722",
+        "2c22636f76657273223a307d2c226c6f67223a5b7b226576656e74223a227475726e222c22737461",
+        "7465223a7b227475726e223a2269646c65227d7d2c7b226576656e74223a226167656e74222c2273",
+        "74617465223a7b226167656e74223a227374617274696e67227d7d5d7d00000000",
+    );
+
+    /// Random reducer steps checkpointed at random points, whole or
+    /// appended: what the holder stores always decodes to the live session.
+    #[test]
+    fn random_steps_checkpointed_whole_or_appended_decode_to_the_live_session() {
+        let mut rng = XorShift(0x5eed_5e9e_0000_0002);
+        for _ in 0..300 {
+            let mut agent = Agent::ready();
+            let mut stored = Stored::whole(&agent.s);
+            let mut prompt_id = None;
+            for _ in 0..40 {
+                let out = match rng.below(12) {
+                    0 => {
+                        let out = agent.prompt("go on");
+                        if let Some(id) = sent(&out.stdin).first().and_then(|m| m["id"].as_u64()) {
+                            prompt_id = Some(id);
+                        }
+                        out
+                    }
+                    1 | 2 => agent.feed(&chunk(&"text ".repeat(1 + rng.below(30)))),
+                    3 => agent.feed(&update(json!({"sessionUpdate": "agent_thought_chunk",
+                        "content": {"type": "text", "text": "hmm"}}))),
+                    4 => {
+                        let call = format!("c{}", rng.below(4));
+                        agent.feed(&update(json!({"sessionUpdate": "tool_call",
+                            "toolCallId": call, "title": "Run", "kind": "execute",
+                            "status": "pending"})))
+                    }
+                    5 => {
+                        let call = format!("c{}", rng.below(4));
+                        agent.feed(&update(json!({"sessionUpdate": "tool_call_update",
+                            "toolCallId": call, "status": "completed"})))
+                    }
+                    6 => agent.feed(&permission(json!(format!("p{}", rng.below(100))))),
+                    7 => match prompt_id.take() {
+                        Some(id) => agent.feed(&result(id, json!({"stopReason": "end_turn"}))),
+                        None => agent.step(Input::Command(Command::Cancel)),
+                    },
+                    8 => agent.feed(&update(json!({"sessionUpdate": "session_info_update",
+                        "title": format!("title {}", rng.below(3))}))),
+                    9 => {
+                        let line = chunk("split");
+                        let at = rng.below(line.len());
+                        agent.feed(&line[..at])
+                    }
+                    10 => agent.feed(b"not json\n"),
+                    _ => agent.step(Input::Command(Command::Unqueue)),
+                };
+                stored.saw(out);
+                match rng.below(5) {
+                    0 => stored = Stored::whole(&agent.s),
+                    1 | 2 => stored.append(&agent.s),
+                    _ => {}
+                }
+            }
+            stored.append(&agent.s);
+            assert_eq!(stored.decode(agent.now), agent.s);
+        }
+    }
+
     // --- fuzz -----------------------------------------------------------
 
     #[test]
@@ -2054,19 +2661,31 @@ mod tests {
         let mut rng = XorShift(0x5eed_ac01_c4ec_0001);
         let now = Instant::now();
         let valid = encode(&Agent::busy().s).expect("it fits");
+        // A base and two segments, so mutations reach format 2's records.
+        let segmented = {
+            let mut agent = Agent::ready();
+            let mut stored = Stored::whole(&agent.s);
+            stored.saw(agent.prompt("first"));
+            stored.saw(agent.feed(&chunk("Working")));
+            stored.append(&agent.s);
+            stored.saw(agent.feed(&permission(json!("p1"))));
+            stored.append(&agent.s);
+            stored.bytes
+        };
         for round in 0..3000 {
+            let valid = if round % 3 == 0 { &segmented } else { &valid };
             let bytes: Vec<u8> = match round % 4 {
                 // Random bytes, sometimes behind a good header.
                 0 => (0..rng.below(64)).map(|_| rng.next() as u8).collect(),
                 1 => {
-                    let mut bytes = valid[..HEADER_LEN].to_vec();
+                    let mut bytes = valid[..PREFIX_LEN + rng.below(RECORD_HEADER_LEN)].to_vec();
                     bytes.extend((0..rng.below(256)).map(|_| rng.next() as u8));
                     bytes
                 }
                 // A valid checkpoint cut short or with bytes flipped.
                 2 => valid[..rng.below(valid.len())].to_vec(),
                 _ => {
-                    let mut bytes = valid.clone();
+                    let mut bytes = valid.to_vec();
                     for _ in 0..1 + rng.below(4) {
                         let at = rng.below(bytes.len());
                         bytes[at] ^= 1 << rng.below(8);

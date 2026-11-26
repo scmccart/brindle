@@ -25,14 +25,19 @@
 //!   `agents-session-recovery`: what an agent's end does ([`end_fate`]),
 //!   what a client's leaving and a `DETACH` do to an ended one
 //!   ([`ended_gone_fate`], [`detach_ends`]), and which `AGENT_RESTART`s are
-//!   refused ([`restart_refusal`]).
+//!   refused ([`restart_refusal`]). With change `agents-log-paging`: how
+//!   a checkpoint is written, whole or appended to what the holder stores
+//!   ([`Stored`], [`agent_checkpoint_form`]), the budget of a replay's or
+//!   a fetch's page ([`page_budget`]), and which `AGENT_FETCH`es are
+//!   refused ([`agent_fetch_refusal`]).
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{Hello, Policy};
-use brindle_remote_protocol::holder::SpawnMode;
+use brindle_remote_protocol::holder::{MAX_CHECKPOINT_LEN, SpawnMode};
+use brindle_transcript::PAGE_BYTES;
 
 use super::clients::ClientToken;
 use super::sessions::{CHECKPOINT_AFTER, Life, Ownership};
@@ -573,6 +578,192 @@ pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
     }
 }
 
+/// What an agent session's holder stores of its checkpoint, as far as the
+/// core knows (OpenSpec change `agents-log-paging`, decision 9). Kept on
+/// the core's `Agent` only: a core restart starts again at `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) enum Stored {
+    /// Nothing written to this holder session yet, an adopted session, a
+    /// restarted one, or the holder sent an `ERROR` naming the session:
+    /// only a whole checkpoint is safe.
+    Unknown,
+    /// A base of `base` bytes (header included), then `appended` bytes of
+    /// segments, the last numbered `seq`.
+    Known { base: u64, appended: u64, seq: u32 },
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+impl Stored {
+    /// The sequence number the next segment takes.
+    pub(super) fn next_seq(self) -> u32 {
+        match self {
+            Self::Unknown => 1,
+            Self::Known { seq, .. } => seq.saturating_add(1),
+        }
+    }
+
+    /// After a whole checkpoint of `len` bytes.
+    pub(super) fn whole(len: u64) -> Self {
+        Self::Known {
+            base: len,
+            appended: 0,
+            seq: 0,
+        }
+    }
+
+    /// After a segment of `len` bytes is appended; `Unknown` stays so.
+    pub(super) fn appended(self, len: u64) -> Self {
+        match self {
+            Self::Unknown => Self::Unknown,
+            Self::Known {
+                base,
+                appended,
+                seq,
+            } => Self::Known {
+                base,
+                appended: appended.saturating_add(len),
+                seq: seq.saturating_add(1),
+            },
+        }
+    }
+}
+
+/// How a due agent checkpoint is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) enum CheckpointForm {
+    /// A header and a base: `CHECKPOINT_BEGIN`, replacing what is stored.
+    Whole,
+    /// One segment record: `CHECKPOINT_APPEND`, added to what is stored.
+    Append,
+}
+
+/// Whether a segment is worth encoding for a checkpoint due `at`: what is
+/// stored is known, it isn't a step-down, nothing was trimmed since, and
+/// the holder is of the core's build. Otherwise the checkpoint is whole
+/// whatever the segment's length.
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) fn agent_appendable(
+    stored: Stored,
+    at: AgentCheckpoint,
+    trimmed: bool,
+    holder: Adoption,
+) -> bool {
+    let known = match stored {
+        Stored::Unknown => false,
+        Stored::Known { .. } => true,
+    };
+    let stepping_down = match at {
+        AgentCheckpoint::StepDown => true,
+        AgentCheckpoint::Stepped(_) | AgentCheckpoint::Detach => false,
+    };
+    let own_build = match holder {
+        Adoption::Keep => true,
+        Adoption::Drain => false,
+    };
+    known && !stepping_down && !trimmed && own_build
+}
+
+/// How an agent checkpoint due `at` is written (decision 9): appended
+/// when [`agent_appendable`] and the segment, `segment_len` bytes (`None`
+/// when none was encoded or it was too large), keeps the segments no
+/// larger than the base and the whole blob within
+/// [`MAX_CHECKPOINT_LEN`]; whole otherwise.
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) fn agent_checkpoint_form(
+    stored: Stored,
+    at: AgentCheckpoint,
+    segment_len: Option<u64>,
+    trimmed: bool,
+    holder: Adoption,
+) -> CheckpointForm {
+    if !agent_appendable(stored, at, trimmed, holder) {
+        return CheckpointForm::Whole;
+    }
+    let (Stored::Known { base, appended, .. }, Some(segment)) = (stored, segment_len) else {
+        return CheckpointForm::Whole;
+    };
+    let segments = appended.saturating_add(segment);
+    if segments > base || base.saturating_add(segments) > MAX_CHECKPOINT_LEN {
+        CheckpointForm::Whole
+    } else {
+        CheckpointForm::Append
+    }
+}
+
+/// The page a replay or a fetch sends, in bytes of entries: what the
+/// client `asked` for (`ATTACH.page`, `AGENT_FETCH.max_bytes`), at most
+/// [`PAGE_BYTES`], which is also the budget when it asked nothing
+/// (decision 5). Even 0 gives the newest entry.
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) fn page_budget(asked: Option<u32>) -> usize {
+    asked.map_or(PAGE_BYTES, |asked| {
+        usize::try_from(asked).map_or(PAGE_BYTES, |asked| asked.min(PAGE_BYTES))
+    })
+}
+
+/// What [`agent_fetch_refusal`] reads of the session a fetch names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) struct FetchView {
+    pub(super) kind: SessionKind,
+    /// It is attached to the client that fetches.
+    pub(super) attached_here: bool,
+    /// That client still waits for its replay (an adoption's rebuild
+    /// included).
+    pub(super) replay_pending: bool,
+}
+
+/// Why an `AGENT_FETCH` is refused; its text is the `ERROR`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) enum FetchRefusal {
+    NeedsAgentProtocol(NeedsAgentProtocol),
+    NoSession(SessionId),
+    NotAgent(SessionId),
+    NotAttached(SessionId),
+    ReplayPending(SessionId),
+}
+
+impl fmt::Display for FetchRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NeedsAgentProtocol(refusal) => refusal.fmt(f),
+            Self::NoSession(id) => write!(f, "no session {id}"),
+            Self::NotAgent(id) => write!(f, "session {id} isn't an agent session"),
+            Self::NotAttached(id) => write!(f, "session {id} isn't attached to this client"),
+            Self::ReplayPending(id) => write!(f, "session {id}'s replay hasn't ended"),
+        }
+    }
+}
+
+/// Why a client on `protocol` can't fetch from session `id` (`session`,
+/// if there is one): only the client it is attached to may, once that
+/// client has its replay (decision 5). A fetch reads the core's log, so
+/// the agent's phase doesn't matter.
+#[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.2-3.4)
+pub(super) fn agent_fetch_refusal(
+    id: SessionId,
+    session: Option<FetchView>,
+    protocol: u32,
+) -> Option<FetchRefusal> {
+    if let Some(refusal) = agent_request_refusal(protocol, AgentRequest::Fetch) {
+        return Some(FetchRefusal::NeedsAgentProtocol(refusal));
+    }
+    let Some(session) = session else {
+        return Some(FetchRefusal::NoSession(id));
+    };
+    match session.kind {
+        SessionKind::Terminal => return Some(FetchRefusal::NotAgent(id)),
+        SessionKind::Agent => {}
+    }
+    if !session.attached_here {
+        return Some(FetchRefusal::NotAttached(id));
+    }
+    session.replay_pending.then_some(FetchRefusal::ReplayPending(id))
+}
+
 /// Why a `SPAWN_AGENT` of `command` is refused before anything starts: an
 /// agent session has no login-shell default, so it needs a command.
 pub(super) fn agent_spawn_refusal(command: &str) -> Option<&'static str> {
@@ -593,6 +784,8 @@ pub(super) enum AgentRequest {
     Resend,
     Restart,
     Login,
+    #[cfg_attr(not(test), allow(dead_code))] // until the core uses it (agents-log-paging 3.3)
+    Fetch,
 }
 
 impl AgentRequest {
@@ -606,6 +799,7 @@ impl AgentRequest {
             Self::Resend => "AGENT_RESEND",
             Self::Restart => "AGENT_RESTART",
             Self::Login => "AGENT_LOGIN",
+            Self::Fetch => "AGENT_FETCH",
         }
     }
 }
@@ -1346,6 +1540,7 @@ mod tests {
             (AgentRequest::Resend, "AGENT_RESEND needs client protocol 4"),
             (AgentRequest::Restart, "AGENT_RESTART needs client protocol 4"),
             (AgentRequest::Login, "AGENT_LOGIN needs client protocol 4"),
+            (AgentRequest::Fetch, "AGENT_FETCH needs client protocol 4"),
         ];
         for (request, text) in cases {
             for protocol in 1..AGENT_PROTOCOL {
@@ -1463,5 +1658,244 @@ mod tests {
         assert!(!foreground_changed(Some(&vim), &vim));
         assert!(foreground_changed(Some(&vim), &moved));
         assert!(foreground_changed(None, &Foreground::default()));
+    }
+
+    // agents-log-paging 2.3: how a checkpoint is written, pages, fetches.
+
+    const KNOWN: Stored = Stored::Known {
+        base: 1000,
+        appended: 400,
+        seq: 3,
+    };
+    const STEPPED: AgentCheckpoint = AgentCheckpoint::Stepped(None);
+
+    #[test]
+    fn a_checkpoint_is_appended_to_a_known_base_by_a_holder_of_the_cores_build() {
+        assert_eq!(
+            agent_checkpoint_form(KNOWN, STEPPED, Some(100), false, Adoption::Keep),
+            CheckpointForm::Append
+        );
+        assert_eq!(
+            agent_checkpoint_form(KNOWN, AgentCheckpoint::Detach, Some(600), false, Adoption::Keep),
+            CheckpointForm::Append,
+            "segments as large as the base still append"
+        );
+        assert_eq!(KNOWN.next_seq(), 4);
+        assert_eq!(
+            KNOWN.appended(100),
+            Stored::Known {
+                base: 1000,
+                appended: 500,
+                seq: 4
+            }
+        );
+        assert_eq!(
+            Stored::whole(77),
+            Stored::Known {
+                base: 77,
+                appended: 0,
+                seq: 0
+            }
+        );
+        assert_eq!(Stored::Unknown.next_seq(), 1);
+        assert_eq!(Stored::Unknown.appended(5), Stored::Unknown);
+    }
+
+    #[test]
+    fn each_reason_to_write_a_checkpoint_whole() {
+        let whole = |stored: Stored,
+                     at: AgentCheckpoint,
+                     segment: Option<u64>,
+                     trimmed: bool,
+                     holder: Adoption| {
+            assert_eq!(
+                agent_checkpoint_form(stored, at, segment, trimmed, holder),
+                CheckpointForm::Whole,
+                "{stored:?} {at:?} {segment:?} {trimmed} {holder:?}"
+            );
+        };
+        // Unknown: new, adopted, restarted, or after a holder's ERROR.
+        whole(Stored::Unknown, STEPPED, Some(1), false, Adoption::Keep);
+        // A step-down: the next core adopts one compact base.
+        whole(KNOWN, AgentCheckpoint::StepDown, Some(1), false, Adoption::Keep);
+        // A trim since the last checkpoint compacts it.
+        whole(KNOWN, STEPPED, Some(1), true, Adoption::Keep);
+        // The segments would outgrow the base.
+        whole(KNOWN, STEPPED, Some(601), false, Adoption::Keep);
+        // The blob would pass 64 MiB.
+        let big = Stored::Known {
+            base: MAX_CHECKPOINT_LEN / 2,
+            appended: MAX_CHECKPOINT_LEN / 2 - 10,
+            seq: 9,
+        };
+        whole(big, STEPPED, Some(11), false, Adoption::Keep);
+        assert_eq!(
+            agent_checkpoint_form(big, STEPPED, Some(10), false, Adoption::Keep),
+            CheckpointForm::Append,
+            "exactly 64 MiB still appends"
+        );
+        // A segment too large to encode, or none encoded.
+        whole(KNOWN, STEPPED, None, false, Adoption::Keep);
+        // A draining holder of another build.
+        whole(KNOWN, STEPPED, Some(1), false, Adoption::Drain);
+        assert!(!agent_appendable(KNOWN, STEPPED, false, Adoption::Drain));
+        assert!(agent_appendable(KNOWN, STEPPED, false, Adoption::Keep));
+    }
+
+    #[test]
+    fn a_page_is_at_most_256_kib_and_that_when_unasked() {
+        assert_eq!(PAGE_BYTES, 256 * 1024);
+        assert_eq!(page_budget(None), PAGE_BYTES);
+        assert_eq!(page_budget(Some(16_384)), 16_384);
+        assert_eq!(page_budget(Some(u32::MAX)), PAGE_BYTES);
+        assert_eq!(page_budget(Some(0)), 0);
+    }
+
+    #[test]
+    fn each_fetch_refusal_and_its_text() {
+        let view = |kind, attached_here, replay_pending| FetchView {
+            kind,
+            attached_here,
+            replay_pending,
+        };
+        let refused = |session, protocol| agent_fetch_refusal(2, session, protocol).map(|r| r.to_string());
+        let ready = view(SessionKind::Agent, true, false);
+        assert_eq!(refused(Some(ready), 4), None);
+        assert_eq!(
+            refused(Some(ready), 3).as_deref(),
+            Some("AGENT_FETCH needs client protocol 4")
+        );
+        assert_eq!(refused(None, 4).as_deref(), Some("no session 2"));
+        assert_eq!(
+            refused(Some(view(SessionKind::Terminal, true, false)), 4).as_deref(),
+            Some("session 2 isn't an agent session")
+        );
+        assert_eq!(
+            refused(Some(view(SessionKind::Agent, false, false)), 4).as_deref(),
+            Some("session 2 isn't attached to this client")
+        );
+        assert_eq!(
+            refused(Some(view(SessionKind::Agent, true, true)), 4).as_deref(),
+            Some("session 2's replay hasn't ended")
+        );
+    }
+
+    /// Drives a reducer session the way the core does: checkpoints when
+    /// [`agent_checkpoint_due`] says, written as [`agent_checkpoint_form`]
+    /// says, counting the bytes the holder is sent.
+    struct Checkpointing {
+        session: crate::acp::reduce::AgentSession,
+        stored: Stored,
+        unsaved: Vec<brindle_transcript::Event>,
+        since: u64,
+        written: u64,
+        wholes_after_trims: u64,
+        now: Instant,
+    }
+
+    impl Checkpointing {
+        fn step(&mut self, input: crate::acp::reduce::Input<'_>) -> crate::acp::reduce::Output {
+            let fed = match &input {
+                crate::acp::reduce::Input::Stdout(bytes) => bytes.len() as u64,
+                _ => 0,
+            };
+            let out = crate::acp::reduce::step(&mut self.session, input, self.now);
+            self.since += fed;
+            self.unsaved.extend(out.events.iter().cloned());
+            let at = AgentCheckpoint::Stepped(out.checkpoint);
+            if agent_checkpoint_due(at, self.since) {
+                self.checkpoint(at);
+            }
+            out
+        }
+
+        fn checkpoint(&mut self, at: AgentCheckpoint) {
+            use crate::acp::checkpoint::{encode, encode_segment};
+            let trimmed = self
+                .unsaved
+                .iter()
+                .any(|event| matches!(event, brindle_transcript::Event::Trimmed { .. }));
+            let segment = agent_appendable(self.stored, at, trimmed, Adoption::Keep)
+                .then(|| encode_segment(&self.session, &self.unsaved, self.stored.next_seq()).ok())
+                .flatten();
+            let len = segment.as_ref().map(|segment| segment.len() as u64);
+            match agent_checkpoint_form(self.stored, at, len, trimmed, Adoption::Keep) {
+                CheckpointForm::Whole => {
+                    let bytes = encode(&self.session).expect("it fits");
+                    self.written += bytes.len() as u64;
+                    self.stored = Stored::whole(bytes.len() as u64);
+                    if trimmed {
+                        self.wholes_after_trims += 1;
+                    }
+                }
+                CheckpointForm::Append => {
+                    let len = len.expect("an append has its segment");
+                    self.written += len;
+                    self.stored = self.stored.appended(len);
+                }
+            }
+            self.unsaved.clear();
+            self.since = 0;
+        }
+    }
+
+    fn json_line(value: brindle_remote_protocol::serde_json::Value) -> Vec<u8> {
+        let mut line = value.to_string().into_bytes();
+        line.push(b'\n');
+        line
+    }
+
+    /// Decision 9's cost: through a 64 MiB conversation, appending writes
+    /// under 4x the log bytes added, plus one base per trim, where writing
+    /// whole at every moment would copy the log again each time.
+    #[test]
+    fn checkpoints_of_a_64_mib_conversation_write_a_small_multiple_of_what_it_added() {
+        use brindle_remote_protocol::serde_json::json;
+        use crate::acp::reduce::{AgentSession, Command, Input, LOG_LIMIT};
+        let mut core = Checkpointing {
+            session: AgentSession::new("/w".into(), "0.3.0".into()),
+            stored: Stored::Unknown,
+            unsaved: Vec::new(),
+            since: 0,
+            written: 0,
+            wholes_after_trims: 0,
+            now: Instant::now(),
+        };
+        core.step(Input::Spawned);
+        core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": 1,
+            "result": {"protocolVersion": 1}}))));
+        core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": 2,
+            "result": {"sessionId": "s1"}}))));
+        let text = "x".repeat(64 * 1024);
+        let chunk = json_line(json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s1", "update": {"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text}}}}));
+        let mut added: u64 = 0;
+        for _ in 0..64 {
+            let out = core.step(Input::Command(Command::Prompt { text: "go on".into() }));
+            assert_eq!(out.reply, Some(Ok(())));
+            let sent: brindle_remote_protocol::serde_json::Value =
+                brindle_remote_protocol::serde_json::from_slice(
+                    out.stdin.split(|b| *b == b'\n').next().expect("a line"),
+                )
+                .expect("JSON");
+            let id = sent["id"].as_u64().expect("the prompt's id");
+            for _ in 0..16 {
+                core.step(Input::Stdout(&chunk));
+                added += text.len() as u64;
+            }
+            core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": id,
+                "result": {"stopReason": "end_turn"}}))));
+        }
+        assert!(added >= 64 * 1024 * 1024);
+        assert!(core.session.transcript().dropped() > 0, "the log was trimmed");
+        assert!(core.wholes_after_trims > 0);
+        let bound = 4 * added + core.wholes_after_trims * LOG_LIMIT as u64;
+        assert!(
+            core.written < bound,
+            "{} bytes written for {added} added and {} trims (bound {bound})",
+            core.written,
+            core.wholes_after_trims
+        );
     }
 }

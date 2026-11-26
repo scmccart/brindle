@@ -65,8 +65,15 @@ use super::wire::{
 };
 
 /// The most the log keeps, encoded (decision 14): past it the oldest
-/// entries are dropped whole, with a `Trimmed` event.
+/// entries are dropped whole, with a `Trimmed` event, down to
+/// [`LOG_TRIM_TO`].
 pub const LOG_LIMIT: usize = 16 * 1024 * 1024;
+
+/// What a trim leaves the log at, encoded: a low mark below [`LOG_LIMIT`],
+/// so a long conversation trims once per 4 MiB rather than once per entry,
+/// and each trim's whole checkpoint is rare (OpenSpec change
+/// `agents-log-paging`, decision 6).
+pub const LOG_TRIM_TO: usize = 12 * 1024 * 1024;
 
 /// The longest prompt taken, in bytes of UTF-8 (decision 10).
 pub const MAX_PROMPT: usize = 256 * 1024;
@@ -2165,14 +2172,15 @@ impl Step<'_> {
 
     // --- the log's bound ------------------------------------------------
 
-    /// Drops the oldest entries past [`LOG_LIMIT`] (decision 14), and what
-    /// pointed at them: the tool ids, the chunk run, and a permission
-    /// request still waiting, which is answered `cancelled`.
+    /// Once the log passes [`LOG_LIMIT`] (decision 14), drops the oldest
+    /// entries down to [`LOG_TRIM_TO`], and what pointed at them: the tool
+    /// ids, the chunk run, and a permission request still waiting, which is
+    /// answered `cancelled`.
     fn trim(&mut self) {
         if self.s.transcript.encoded_len() <= LOG_LIMIT {
             return;
         }
-        let Some(event) = self.s.transcript.trim_to(LOG_LIMIT) else {
+        let Some(event) = self.s.transcript.trim_to(LOG_TRIM_TO) else {
             return;
         };
         let through = match &event {
@@ -4387,12 +4395,32 @@ mod tests {
         let mut agent = Agent::ready();
         agent.turn("one");
         let outs = fill(&mut agent);
-        let trimmed: Vec<&Event> = outs
+        // One trim for the crossing, down to the low mark, not one per
+        // entry past the limit.
+        let trims: Vec<usize> = outs
             .iter()
-            .flat_map(|out| &out.events)
-            .filter(|event| matches!(event, Event::Trimmed { .. }))
+            .enumerate()
+            .filter(|(_, out)| {
+                out.events
+                    .iter()
+                    .any(|event| matches!(event, Event::Trimmed { .. }))
+            })
+            .map(|(n, _)| n)
             .collect();
-        assert!(!trimmed.is_empty());
+        assert_eq!(trims.len(), 1, "{trims:?}");
+        let mut at_trim = Agent::ready();
+        at_trim.turn("one");
+        let text = "x".repeat(1024 * 1024);
+        for n in 0..=trims[0] {
+            let kind = if n % 2 == 0 {
+                "agent_message_chunk"
+            } else {
+                "agent_thought_chunk"
+            };
+            at_trim.feed(&chunk(kind, &text));
+        }
+        assert!(at_trim.s.transcript.encoded_len() <= LOG_TRIM_TO);
+        assert!(at_trim.s.transcript.encoded_len() > LOG_TRIM_TO - 2 * 1024 * 1024);
         assert!(agent.s.transcript.encoded_len() <= LOG_LIMIT);
         assert!(agent.s.transcript.dropped() > 0);
         let replay = agent.s.transcript.replay();
@@ -4422,6 +4450,59 @@ mod tests {
         assert!(agent.s.rpc().permissions().is_empty());
         assert!(agent.s.tools.is_empty());
         assert_eq!(*agent.turn_state(), TurnState::Working);
+    }
+
+    /// The client's copy and a checkpoint's segments fold what the reducer
+    /// emits, so the log changes only through `Output.events`
+    /// (`agents-log-paging` decision 6). `Agent::step` checks the client's
+    /// fold after every step; this folds from a base taken mid-session
+    /// across every kind of change: a turn, a tool call and a permission,
+    /// a retitle, a login demanded, an exit and a restart, and a muted load.
+    #[test]
+    fn the_log_changes_only_through_the_events_a_step_emits() {
+        let mut agent = Agent::ready_offering(both());
+        agent.turn("zero");
+        let mut copy = Transcript::new();
+        for event in agent.s.transcript().replay() {
+            copy.apply(&event).expect("the replay folds");
+        }
+        let from = agent.events.len();
+        let id = agent.prompt_id();
+        agent.feed(&tool_call("call_1", "Write", "pending"));
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        agent.cmd(Command::Answer {
+            entry,
+            option: Some("allow".into()),
+        });
+        agent.feed(&tool_update("call_1", "completed"));
+        agent.feed(&said("Done."));
+        agent.end(id, "end_turn");
+        agent.feed(&update(
+            json!({"sessionUpdate": "session_info_update", "title": "A title"}),
+        ));
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.feed(&error(id, AUTH_REQUIRED, "Authentication required"));
+        assert!(matches!(agent.agent_state(), AgentState::LoginRequired { .. }));
+        agent.exit();
+        let id = agent.restart();
+        agent.feed(&initialized(id, load_only()));
+        agent.feed(&said("replayed"));
+        agent.feed(&permission(json!(7), "call_2", &ALLOW_REJECT));
+        let load = agent.last("session/load")["id"].as_u64().expect("an id");
+        agent.feed(&result(load, json!({})));
+        assert!(
+            agent
+                .notices()
+                .iter()
+                .any(|notice| notice.contains("wasn't shown")),
+            "{:?}",
+            agent.notices()
+        );
+        for event in &agent.events[from..] {
+            copy.apply(event).expect("each event folds");
+        }
+        assert_eq!(&copy, agent.s.transcript());
     }
 
     // --- activity (decision 15's table, row by row) ---------------------
