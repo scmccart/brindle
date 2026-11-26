@@ -1182,7 +1182,8 @@ impl Dump {
     /// header line): its index among the rows the dump lists, from 0, or
     /// `None` when nothing is highlighted.
     pub fn palette_highlighted(&self) -> Result<Option<usize>> {
-        let header = self.palette.first().filter(|line| line.starts_with("list ")).ok_or("no palette list in the dump")?;
+        // The conversations palette's own line may come first.
+        let header = self.palette.iter().find(|line| line.starts_with("list ")).ok_or("no palette list in the dump")?;
         // The query is quoted and may hold spaces, so the field is the last one.
         let field = header.rsplit_once(" highlighted=").ok_or_else(|| format!("no highlighted= on {header:?}"))?.1;
         match field {
@@ -1501,6 +1502,13 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.palette.len() == 4, "the rows after the header {:?}", dump.palette);
     let dump = Dump::parse("--- palette list query=\"\" highlighted=none\nA8  listing sessions…\n");
     ensure!(dump.palette_highlighted() == Ok(None), "highlighted {:?}", dump.palette_highlighted());
+    // The conversations palette's line comes before its list (`agents-session-list`).
+    let dump = Dump::parse(
+        "--- palette conversations profile=\"Fake\" dir=\"~/src\" state=listed more=no\n\
+         --- palette list query=\"\" highlighted=1\nFirst\nUntitled c2\n",
+    );
+    ensure!(dump.palette_highlighted() == Ok(Some(1)), "highlighted {:?}", dump.palette_highlighted());
+    ensure!(dump.palette.len() == 4 && dump.palette[3] == "Untitled c2", "palette {:?}", dump.palette);
     ensure!(Dump::parse("--- palette prompt \"Name\" text=\"\"\n").palette_highlighted().is_err(), "a prompt has no list");
     ensure!(Dump::parse("nothing").palette_highlighted().is_err(), "no palette, no highlight");
     let line = "--- settings section=Profiles mode=editor name=\"Shell\" field=\"Theme\" theme=\"e2e-alt\" default=true invalid=[] can_save=true error=None\n";

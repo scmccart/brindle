@@ -37,23 +37,23 @@ Before starting:
 ## 5. The zone and the workspace
 
 - [x] 5.1 Add `agent_conversations` and `agent_continue_conversation` to `ACTIONS` in `src/actions.rs` (no default keys), listed as design decision 7 says, and rename `agent_continue`'s palette name to "Continue This Conversation"; verify with unit tests of the palette's listing in a shell, in an agent zone, with no agent profile and in a stopped zone.
-- [ ] 5.2 Build the palette in `src/workspace.rs` (a `PaletteKind` of its own beside `SplitProfile`): the profile question when several, the chooser's start and the list request off the UI thread (`process R13`), "More…", escape closing a chooser that was started for it, and closing it with the window and on quit.
-- [ ] 5.3 Carry out a choice by `open_plan`: show the zone that has it; take it in the zone (`AGENT_CHOOSE`, or a stopped zone reset onto the new session with the old one closed); or ask, then split with the profile through `SplitWith::Profile` or open a tab, the new zone attaching the chooser or starting a continuing session.
-- [ ] 5.4 Draw the choosing screen and a stopped zone's buttons in `src/agent/view.rs`, as keyboard stops after the existing one, wired to the palette and to New conversation.
-- [ ] 5.5 Leave a choosing zone out of the session state and the detached layout, and end its session on quit, as an ended agent's is.
+- [x] 5.2 Build the palette in `src/workspace.rs` (a `PaletteKind` of its own beside `SplitProfile`): the profile question when several, the chooser's start and the list request off the UI thread (`process R13`), "More…", escape closing a chooser that was started for it, and closing it with the window and on quit.
+- [x] 5.3 Carry out a choice by `open_plan`: show the zone that has it; take it in the zone (`AGENT_CHOOSE`, or a stopped zone reset onto the new session with the old one closed); or ask, then split with the profile through `SplitWith::Profile` or open a tab, the new zone attaching the chooser or starting a continuing session.
+- [x] 5.4 Draw the choosing screen and a stopped zone's buttons in `src/agent/view.rs`, as keyboard stops after the existing one, wired to the palette and to New conversation.
+- [x] 5.5 Leave a choosing zone out of the session state and the detached layout, and end its session on quit, as an ended agent's is.
 
 ## 6. The command line
 
 - [x] 6.1 Parse `-c/--continue` and `-r/--resume` under `agent` in `src/main.rs` (`AgentLaunch::choose`), with their usage errors; carry the choice in `instance::AgentRequest::choose` under the kind `agent-choose`, and turn an older Brindle's refusal of that kind into the message and status 1; verify with unit tests of the parser, of the hand-off's encoding and of `Request::asked` for both kinds.
-- [ ] 6.2 Start the tab's zone as a chooser; for `-c` ask for the first page and apply `latest_plan`; for `-r` open the palette on the zone once it is choosing; `-p` sent on the first `Ready`.
+- [x] 6.2 Start the tab's zone as a chooser; for `-c` ask for the first page and apply `latest_plan`; for `-r` open the palette on the zone once it is choosing; `-p` sent on the first `Ready`.
 
 ## 7. End-to-end cases (fake ACP agent)
 
-- [ ] 7.1 `agent-conversations-list`: the palette from an agent zone and from a shell, its title, rows, an untitled row, "More…", the empty directory, and a second agent profile's question.
-- [ ] 7.2 `agent-conversations-open`: from a shell, Split Right and New Tab; from a running agent zone, the question; a conversation already open showing its zone; escape at the question returning to the list; one spawn of the agent's command for a list and its choice.
-- [ ] 7.3 `agent-conversations-stopped`: an exited agent's zone shows the three buttons; Conversations… and a choice replace it in place; New conversation starts over; a profile removed from the config offers none.
-- [ ] 7.4 `agent-conversations-cli`: `-c` continuing the first listed conversation; `-c` with none showing the choosing screen and its reason, then New conversation; `-r` opening the list, a choice taken in the tab, and escape leaving the choosing screen; `-c -r` as a usage error; a quit while choosing leaving nothing to restore.
-- [ ] 7.5 `agent-conversations-failures`: an agent without a list; an agent's error on `session/list`; a refused continue returning a choosing zone to the choosing screen.
+- [x] 7.1 `agent-conversations-list`: the palette from an agent zone and from a shell, its title, rows, an untitled row, "More…", the empty directory, and a second agent profile's question.
+- [x] 7.2 `agent-conversations-open`: from a shell, Split Right and New Tab; from a running agent zone, the question; a conversation already open showing its zone; escape at the question returning to the list; one spawn of the agent's command for a list and its choice.
+- [x] 7.3 `agent-conversations-stopped`: an exited agent's zone shows the three buttons; Conversations… and a choice replace it in place; New conversation starts over; a profile removed from the config offers none.
+- [x] 7.4 `agent-conversations-cli`: `-c` continuing the first listed conversation; `-c` with none showing the choosing screen and its reason, then New conversation; `-r` opening the list, a choice taken in the tab, and escape leaving the choosing screen; `-c -r` as a usage error; a quit while choosing leaving nothing to restore.
+- [x] 7.5 `agent-conversations-failures`: an agent without a list; an agent's error on `session/list`; a refused continue returning a choosing zone to the choosing screen.
 
 ## 8. Docs
 
@@ -64,6 +64,6 @@ Before starting:
 ## 9. Integration
 
 - [ ] 9.1 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests, the release build and the e2e suite under `scripts/with-xvfb` in a systemd scope; `openspec validate agents-session-list --strict`.
-- [ ] 9.2 The PR's CI: every job, the three e2e shards and the archive jobs; a `windows-agent-*` case with `-c` on the Windows runner.
+- [ ] 9.2 The PR's CI: every job, the three e2e shards and the archive jobs; a `windows-agent-*` case with `-c` on the Windows runner (written as `windows-agent-continue-latest`; needs windows-e2e).
 - [ ] 9.3 Archive the change in the implementation PR, checking the MODIFIED blocks against the main specs first.
 - [ ] 9.4 Hand the manual checks to the user, with `scripts/run-throwaway.sh` and real agent profiles.

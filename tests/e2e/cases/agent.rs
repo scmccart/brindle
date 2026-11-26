@@ -134,7 +134,7 @@ const WORKING: &str = "turn=working";
 
 /// Waits until the case server lists `count` sessions, which shows that
 /// closed agents ended rather than being left detached.
-fn sessions_listed(ctx: &Ctx, count: usize) -> Result {
+pub(super) fn sessions_listed(ctx: &Ctx, count: usize) -> Result {
     ctx.scale().eventually(10.0, &format!("{count} listed sessions"), || {
         crate::brindle::listed_sessions(ctx).is_ok_and(|listed| listed.len() == count)
     })
@@ -523,7 +523,7 @@ fn touch_from_shell<'a>(run: Run<'a>, gate: &Path, first: bool) -> Run<'a> {
 
 /// The steps that run `command` from a Shell tab, as [`touch_from_shell`]
 /// does, so it runs after the steps before.
-fn from_shell<'a>(run: Run<'a>, command: &str, first: bool) -> Run<'a> {
+pub(super) fn from_shell<'a>(run: Run<'a>, command: &str, first: bool) -> Run<'a> {
     let run = if first { run.action("new_tab") } else { run.action("activate_tab_2") };
     run.send(&format!("{command}\r")).action("activate_tab_1")
 }
@@ -2484,7 +2484,7 @@ fn loaded(received: &Path) -> Script {
 /// Writes `first` as the profile's `agent.script` and `next` beside it,
 /// closes `gate`, and gives the `Fake` profile and the shell command that
 /// puts `next` in `first`'s place, then runs `then` (opening a gate).
-fn continued(ctx: &Ctx, first: Script, next: Script, then: &str) -> Result<(String, String)> {
+pub(super) fn continued(ctx: &Ctx, first: Script, next: Script, then: &str) -> Result<(String, String)> {
     let next = next.write(ctx, "next")?;
     let profile = first.profile(ctx, "agent")?;
     let current = ctx.dir.join("agent.script");
@@ -2492,7 +2492,7 @@ fn continued(ctx: &Ctx, first: Script, next: Script, then: &str) -> Result<(Stri
 }
 
 /// `touch` of `gate`, closed first.
-fn touch(gate: &Path) -> String {
+pub(super) fn touch(gate: &Path) -> String {
     std::fs::remove_file(gate).ok();
     format!("touch '{}'", gate.display())
 }

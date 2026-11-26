@@ -3053,7 +3053,14 @@ impl Workspace {
     /// What `--wait-for` matches in the active zone: the terminal's visible
     /// screen text, or the agent zone's dump lines.
     pub fn active_screen_text(&self, cx: &App) -> Option<String> {
-        Some(self.active_tab()?.zones.read(cx).active_content()?.wait_text(cx))
+        let mut text = self.active_tab()?.zones.read(cx).active_content()?.wait_text(cx);
+        // The conversations palette's line too (`agents-session-list`), so a
+        // step can wait for its list.
+        if let Overlay::Palette { kind: PaletteKind::Conversations(palette), .. } = &self.overlay {
+            text.push('\n');
+            text.push_str(&palette.model.describe());
+        }
+        Some(text)
     }
 
     /// Debug hook for `--dump-screen-after`.

@@ -602,7 +602,12 @@ impl ConversationsModel {
             ListState::Failed(_) => "failed",
         };
         let more = if page_has_more(&self.more) { "yes" } else { "no" };
-        format!("--- palette conversations profile={:?} dir={:?} state={state} more={more}\n", self.profile, self.dir)
+        // A failure's words, which the palette shows in place of rows.
+        let why = match &self.state {
+            ListState::Failed(why) => format!(" why={why:?}"),
+            ListState::Starting | ListState::Listing | ListState::Listed => String::new(),
+        };
+        format!("--- palette conversations profile={:?} dir={:?} state={state} more={more}{why}\n", self.profile, self.dir)
     }
 }
 
@@ -841,7 +846,7 @@ mod tests {
         let mut failed = ConversationsModel::new("Claude", "~", false);
         failed.failed("the agent can't list conversations");
         assert_eq!(failed.empty_text().as_deref(), Some("the agent can't list conversations"));
-        assert!(failed.describe().contains("state=failed"));
+        assert!(failed.describe().ends_with("state=failed more=no why=\"the agent can't list conversations\"\n"));
         let quoted = ConversationsModel::new("A \"b\"", "~/x", false);
         assert!(quoted.describe().contains(r#"profile="A \"b\"""#), "escaped: {}", quoted.describe());
     }

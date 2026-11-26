@@ -244,6 +244,7 @@ Flags from the client's build (sections 4 to 6), for the design's author:
 22. **The question has one `splits` bit**: Split Right and Split Down are both enabled when the pane fits either way, and a split that then doesn't fit says so on the config line ("the zone can't be split now; the conversation wasn't opened"), closing the chooser. Alternative: a bit per axis in `Stage::Ask`.
 23. **A conversation chosen through a running zone's agent starts with `SPAWN_AGENT` and the conversation** in the listed directory, or, when this machine can't say it (another host's home), in the spawn's own directory.
 24. **The profile question's title is "Continue a conversation of…"**, and with no agent profile `agent_continue_conversation` does nothing (it isn't listed then).
+25. **A list's refusal drops the core's `session N: ` prefix** before the palette shows it and before it is compared with `LIST_NOT_OFFERED` (the comparison never matched with the prefix, so an agent without a list wasn't marked). Other refusals keep the prefix as before. The palette's dump line adds ` why="…"` on `state=failed`, and `--wait-for` matches the palette's line, so a case can wait for a list. Alternative: the core sends list refusals without the prefix.
 
 ## The user's decisions
 

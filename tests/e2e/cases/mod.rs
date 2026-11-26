@@ -12,6 +12,7 @@ mod clipboard;
 mod cli;
 mod colors;
 mod commands;
+mod conversations;
 mod dump;
 mod fonts;
 mod input;
@@ -334,6 +335,11 @@ fn unix() -> Vec<Case> {
         display("agent-continue-profile-gone", agent::continue_profile_gone).needs_fake_agent(),
         display("agent-continue-refused", agent::continue_refused).needs_fake_agent(),
         display("agent-continue-not-restored", agent::continue_not_restored).needs_fake_agent(),
+        display("agent-conversations-list", conversations::list).needs_fake_agent(),
+        display("agent-conversations-open", conversations::open).needs_fake_agent(),
+        display("agent-conversations-stopped", conversations::stopped).needs_fake_agent(),
+        display("agent-conversations-cli", conversations::cli).needs_fake_agent(),
+        display("agent-conversations-failures", conversations::failures).needs_fake_agent(),
     ]
 }
 

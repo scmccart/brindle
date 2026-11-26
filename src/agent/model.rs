@@ -495,6 +495,15 @@ const LOGGING_IN: &str = "the agent is logging in";
 /// A choosing agent's reason line (`agents-session-list` decision 6).
 const CHOOSING: &str = "choose a conversation, or start a new one";
 
+/// A core refusal's words without the `session N: ` it starts with, for a
+/// list's failure, which the palette shows in place of rows.
+fn without_session(why: &str) -> &str {
+    why.strip_prefix("session ")
+        .and_then(|rest| rest.split_once(": "))
+        .filter(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(why, |(_, words)| words)
+}
+
 /// Whether a held prompt can be sent again, for the phase and the
 /// session's life: only to a ready agent whose session is open.
 fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
@@ -1362,6 +1371,7 @@ impl ChatModel {
     /// palette's is handed on; a launch's becomes the screen's reason. A
     /// list the agent can't answer at all marks it.
     fn list_refused(&mut self, purpose: ListFor, why: String) -> ListDone {
+        let why = without_session(&why).to_owned();
         if why == crate::remote::protocol::client::LIST_NOT_OFFERED {
             self.choosing.unlisted = true;
         }
@@ -5861,6 +5871,25 @@ mod tests {
         exited.feed(&[agent_state(AgentState::Exited { code: Some(2), stderr: String::new() })]);
         assert_eq!(exited.model.zone_run(), ZoneRun::Stopped);
         assert_eq!(exited.model.lister_state("f", "A8"), ListerState::Failed("Fake exited with status 2".into()));
+    }
+
+    /// A list's refusal loses the core's `session N: `, and the agent that
+    /// can't list is marked so from it.
+    #[test]
+    fn a_lists_refusal_keeps_the_agents_words() {
+        assert_eq!(without_session("session 12: the index is locked"), "the index is locked");
+        assert_eq!(without_session("session x: kept"), "session x: kept");
+        assert_eq!(without_session("session : kept"), "session : kept");
+        assert_eq!(without_session("no prefix: kept"), "no prefix: kept");
+        let mut zone = chooser(None);
+        zone.feed(&[choosing(None)]);
+        zone.model.sent(7, Sent::List(ListFor::Palette));
+        let why = format!("session 3: {}", crate::remote::protocol::client::LIST_NOT_OFFERED);
+        let replied = zone.model.replied(7, Err(why));
+        let words = crate::remote::protocol::client::LIST_NOT_OFFERED;
+        assert_eq!(replied, Replied::Listed(ListDone::Palette(Err(words.into()))));
+        // Marked: New conversation alone.
+        assert_eq!(zone.model.zone_choices(&found(&zone.model)), [ZoneChoice::New]);
     }
 
     /// The palette's list is handed on, page or refusal; a choice can go
