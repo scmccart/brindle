@@ -2113,6 +2113,14 @@ impl Script {
             .step(r#"respond-error -32000 "run fake login""#)
     }
 
+    /// The agent writes its environment to `env` first (`record-env`),
+    /// whatever its arguments: the step leads the steps played when no
+    /// `args` section matches.
+    pub(super) fn recording_env(mut self, env: &Path) -> Self {
+        self.0.insert(0, format!("record-env {}", env.display()));
+        self
+    }
+
     /// The login's `session/new`, then a turn answering [`HELLO`].
     pub(super) fn then_hello(self) -> Self {
         self.step("expect session/new")

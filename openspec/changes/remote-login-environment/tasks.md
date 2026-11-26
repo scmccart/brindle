@@ -68,7 +68,7 @@ No client protocol or H1 version changes (design.md decision 8). The relay link 
 
 ## 6. End-to-end
 
-- [ ] 6.1 Extend `remote-agent-login-terminal` (`tests/e2e/cases/remote.rs`):
+- [x] 6.1 Extend `remote-agent-login-terminal` (`tests/e2e/cases/remote.rs`):
   - before connecting, append `export BRINDLE_E2E_PROFILE=1` to the fixture's `/root/.profile`, and `export BRINDLE_E2E_BASHRC=1` and `export PATH=/root/.local/agent-bin:$PATH` to `/root/.bashrc`;
   - copy the static fake agent only to `/root/.local/agent-bin/brindle-fake-acp-agent`, and name it bare in the profile's command;
   - start both agent scripts with `record-env` (`/root/first.env`, `/root/second.env`).
