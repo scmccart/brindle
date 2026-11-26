@@ -49,6 +49,11 @@ pub mod theme {
     /// terminal theme's colours (`Theme::card_border`), so an `e2e` tab's
     /// cards are drawn in it too.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
+    /// The `muted` token for the `e2e` theme, a code block's surface and
+    /// the person's bubble: `CHROME_BACKGROUND` mixed 8% towards the
+    /// foreground (`Theme::ui_tokens`; `FOREGROUND` is legible on the
+    /// chrome's background as it is).
+    pub const MUTED: Rgb = Rgb(0x19, 0x1b, 0x1e);
 
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);

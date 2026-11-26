@@ -894,6 +894,175 @@ pub fn markdown_links(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// An agent zone's rem in the test config, in logical pixels: the default
+/// font size, which the zone draws its components in.
+const ZONE_REM: f32 = 14.0;
+
+/// `agent-markdown-layout`'s paragraph: longer than the zone is wide.
+const LONG_PARAGRAPH: &str = "This paragraph is much longer than the zone is wide, so it wraps over several lines \
+    inside the bubble rather than widening it past the short line above, and the bubble's right edge stays \
+    straight from that short line down to the code block under it, as one bubble across the conversation's \
+    width should, however long each of its parts happens to be.";
+
+/// A message's parts are one bubble and a code block's label one line
+/// (OpenSpec change `agents-markdown-layout-fixes`): the agent answers
+/// `Hi.`, a paragraph longer than the zone and a `rust` block; in the
+/// capture, the bubble's right border is at one column on every row its
+/// left border spans, one `px_3` inside the card's content edge, with
+/// nothing of the border's colour right of it, and the code block's header
+/// is at most two of the label's lines tall.
+pub fn markdown_layout(ctx: &Ctx) -> Result<Outcome> {
+    use crate::brindle::theme;
+    let answer = format!("Hi.\n\n{LONG_PARAGRAPH}\n\n```rust\nlet x = 1;\n```\n");
+    let profile = answering(ctx, "layout", &answer)?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for(ENDED)
+        .capture_at(6.0)
+        .dump_at(6.5)
+        .run()?;
+    waited(&out)?;
+    let parts = [part(0, "paragraph", "Hi."), part(1, "paragraph", LONG_PARAGRAPH), part(2, "code:rust", "let x = 1;\n")];
+    ensure!(out.dump.agent_blocks(2) == parts, "the message's parts {:#?}", out.dump.agent_blocks(2));
+    let image = out.image.as_ref().ok_or("no capture")?;
+    // The zone's rem is its font size, the default 14px; the label is
+    // 0.75rem at gpui's default line height (the golden ratio).
+    let layout = measure_layout(image, theme::CHROME_BORDER, theme::MUTED, ZONE_REM)?;
+    let label_line = 0.75 * ZONE_REM * 1.618 * layout.scale;
+    ensure!(
+        layout.header as f32 <= 2.0 * label_line,
+        "the code block's header is {} px, more than two label lines ({label_line:.1} px each): {layout:?}",
+        layout.header
+    );
+    Ok(Outcome::Pass)
+}
+
+/// What [`markdown_layout`] reads from a capture of one agent zone, in
+/// device pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct Layout {
+    /// Device pixels per logical one, from the gap right of the card.
+    scale: f32,
+    /// The card's content edges: the ends of its left and right borders.
+    content: (u32, u32),
+    /// The bubble's rows: its left border's run down the column `px_3`
+    /// inside the card, between its rounded corners.
+    rows: (u32, u32),
+    /// The column of the bubble's right border on every one of `rows`.
+    right: u32,
+    /// A code block's header: from the end of its top border to the first
+    /// row of its `muted` surface.
+    header: u32,
+}
+
+/// Measures an agent zone's capture for [`markdown_layout`], in the
+/// border colour `border` and the code's surface colour `muted`, with the
+/// zone's rem `rem` logical pixels (its font size).
+///
+/// The card's borders are the first and last runs of `border` along the
+/// middle row, and the scale is the gap right of the card over
+/// `ZONE_GAP`. The bubble's left border is the longest run of `border` down
+/// the column `px_3` (0.75rem) inside the card (give or take a pixel); its
+/// right border must be one run over the same rows, `px_3` inside the
+/// card's right edge (give or take a pixel), with no `border` right of it
+/// on those rows. The code block's header runs from the last `border` run
+/// above the longest `muted` run, down the column inside the block's left
+/// border by 6px (past its rounded corner, short of the label's `pl_3`), to
+/// that `muted` run.
+pub(super) fn measure_layout(
+    image: &crate::capture::Image,
+    border: crate::capture::Rgb,
+    muted: crate::capture::Rgb,
+    rem: f32,
+) -> Result<Layout> {
+    const NEAR: u8 = 2;
+    let (px_3, px_4) = (0.75 * rem, rem);
+    let longest = |runs: Vec<(u32, u32)>| runs.into_iter().max_by_key(|&(a, b)| b - a);
+    let mid = image.height / 2;
+    let card = image.runs_in_row(mid, (0, image.width), border, NEAR);
+    let (Some(&(_, left)), Some(&(right_border, after))) = (card.first(), card.last()) else {
+        return Err(format!("no card border along row {mid}: {card:?}"));
+    };
+    ensure!(left < right_border, "one border run along row {mid}: {card:?}");
+    let scale = (image.width - after) as f32 / super::ZONE_GAP;
+    ensure!(scale > 0.0, "no gap right of the card (it ends at {after} of {})", image.width);
+    let dev = |v: f32| (v * scale).round() as u32;
+    let near = |x: u32| x.saturating_sub(1)..=x + 1;
+
+    let at = left + dev(px_3);
+    let rows = near(at)
+        .filter_map(|x| longest(image.runs_in_column(x, (0, image.height), border, NEAR)))
+        .max_by_key(|&(a, b)| b - a)
+        .ok_or_else(|| format!("no bubble border down the columns round {at}"))?;
+    ensure!(rows.1 - rows.0 > dev(40.0), "the bubble's left border {rows:?} is too short to be a message's");
+
+    let expected = right_border - dev(px_3) - dev(1.0);
+    let right = near(expected)
+        .find(|&x| match image.runs_in_column(x, rows, border, NEAR)[..] {
+            [(a, b)] => a <= rows.0 + 1 && b + 1 >= rows.1,
+            _ => false,
+        })
+        .ok_or_else(|| {
+            let found: Vec<_> = near(expected).map(|x| (x, image.runs_in_column(x, rows, border, NEAR))).collect();
+            format!("the bubble's right border isn't one run over its rows {rows:?} round column {expected}: {found:?}")
+        })?;
+    for y in rows.0..rows.1 {
+        let past = image.runs_in_row(y, (right + 2, right_border), border, NEAR);
+        ensure!(past.is_empty(), "row {y} has the border's colour right of the bubble (column {right}): {past:?}");
+    }
+
+    // The bubble's border, its px_4, the block's border, then 6px.
+    let column = left + dev(px_3 + 1.0 + px_4 + 1.0 + 6.0);
+    let surface = longest(image.runs_in_column(column, rows, muted, NEAR))
+        .ok_or_else(|| format!("no code surface down column {column} over {rows:?}"))?;
+    let top = image
+        .runs_in_column(column, (rows.0, surface.0), border, NEAR)
+        .last()
+        .copied()
+        .ok_or_else(|| format!("no code block border above its surface {surface:?} down column {column}"))?;
+    Ok(Layout { scale, content: (left, right_border), rows, right, header: surface.0 - top.1 })
+}
+
+/// [`measure_layout`] on painted captures: one bubble with straight edges
+/// and a code block, and a jagged one.
+pub fn self_test_layout() -> Result {
+    use crate::capture::{Image, Rgb};
+    const BG: Rgb = Rgb(0x10, 0x14, 0x18);
+    const GAP: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    const LINE: Rgb = Rgb(0x25, 0x29, 0x2c);
+    const MUTED: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    // A 200 × 120 window: the card's borders at columns 6 and 193 (a 6px
+    // gap each side), the bubble's at 19 and 180 over rows 20..100, a code
+    // block's top border at row 60 over columns 36..170 and its surface
+    // over rows 70..90.
+    let paint = |jagged: bool| {
+        move |x: u32, y: u32| {
+            let right = if jagged && y < 50 { 100 } else { 180 };
+            let card = x == 6 || x == 193;
+            let bubble = (20..100).contains(&y) && (x == 19 || x == right);
+            let code_top = y == 60 && (36..170).contains(&x);
+            if !(6..=193).contains(&x) {
+                GAP
+            } else if card || bubble || code_top {
+                LINE
+            } else if (70..90).contains(&y) && (36..170).contains(&x) {
+                MUTED
+            } else {
+                BG
+            }
+        }
+    };
+    // At a 16px rem, px_3 is 12px: the borders at 7 + 12 and 193 - 12 - 1.
+    let got = measure_layout(&Image::painted(200, 120, paint(false)), LINE, MUTED, 16.0)?;
+    let want = Layout { scale: 1.0, content: (7, 193), rows: (20, 100), right: 180, header: 9 };
+    ensure!(got == want, "one bubble: {got:?}, want {want:?}");
+    let jagged = measure_layout(&Image::painted(200, 120, paint(true)), LINE, MUTED, 16.0);
+    ensure!(jagged.is_err(), "a jagged bubble measured {jagged:?}");
+    Ok(())
+}
+
 /// Split Zone Right in an agent tab opens a second agent zone on the same
 /// profile, with a session of its own, focused; the first keeps its turn.
 pub fn split(ctx: &Ctx) -> Result<Outcome> {

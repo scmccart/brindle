@@ -114,6 +114,19 @@ impl Image {
         std::fs::write(path, out)
     }
 
+    /// A `width` × `height` image whose pixel at (x, y) is `paint(x, y)`,
+    /// for the self-tests of the cases' measures.
+    pub fn painted(width: u32, height: u32, paint: impl Fn(u32, u32) -> Rgb) -> Image {
+        let mut data = Vec::with_capacity((width * height * 3) as usize);
+        for y in 0..height {
+            for x in 0..width {
+                let c = paint(x, y);
+                data.extend_from_slice(&[c.0, c.1, c.2]);
+            }
+        }
+        Image { width, height, data }
+    }
+
     /// The whole image, as a rectangle.
     pub fn all(&self) -> PxRect {
         PxRect { x0: 0, y0: 0, x1: self.width, y1: self.height }
