@@ -913,6 +913,10 @@ the editing is the crate's own, so these are differences from a browser's:
 - **Up at the first row and down at the last go to the owner** (a browser
   moves to the text's start or end); with shift they extend the selection
   to the start or end, as a browser does.
+- **No ctrl-shift-e.** `Input`'s extra select-to-end key isn't a text
+  area's (shift-end is). Reason: Brindle's prompt input is a text area in
+  an agent zone, where ctrl-shift-e is the zone's Split Terminal Right, and
+  the text area's binding, nearer the focus, would take it.
 - **Read-only, not disabled:** `set_read_only` keeps the text, takes no
   edits and draws it at half opacity with no caret.
   Reason: a prompt input shows its draft while it can't send.

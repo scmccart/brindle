@@ -950,9 +950,13 @@ mod tests {
             key: key.into(),
             key_char: None,
         };
-        let zone_ctx: Vec<KeyContext> =
-            ["Workspace", "ZoneTree", "Terminal"].iter().map(|c| KeyContext::parse(c).unwrap()).collect();
-        for (press, expected) in [
+        let parse = |stack: &[&str]| -> Vec<KeyContext> { stack.iter().map(|c| KeyContext::parse(c).unwrap()).collect() };
+        // A terminal zone, and an agent zone's prompt input (its text area
+        // focused), which binds none of the zone's keys itself
+        // (`zones-mixed-tabs`: ctrl-shift-e isn't a text area's select-to-end).
+        let terminal = parse(&["Workspace", "ZoneTree", "Terminal"]);
+        let prompt = parse(&["Workspace", "ZoneTree", "AgentZone", "Owner", "PromptInput", "TextArea"]);
+        let keys = [
             (ctrl_shift("e"), &SplitTerminalRight as &dyn Action),
             (ctrl_shift("o"), &SplitTerminalDown as &dyn Action),
             (ctrl_shift_alt("e"), &SplitAgentRight as &dyn Action),
@@ -962,10 +966,12 @@ mod tests {
             (alt("right"), &FocusZoneRight as &dyn Action),
             (alt("up"), &FocusZoneUp as &dyn Action),
             (alt("down"), &FocusZoneDown as &dyn Action),
-        ] {
-            let (bindings, pending) = keymap.bindings_for_input(&[press], &zone_ctx);
+        ];
+        for (zone_ctx, (press, expected)) in [&terminal, &prompt].into_iter().flat_map(|c| keys.iter().map(move |k| (c, k))) {
+            let (bindings, pending) = keymap.bindings_for_input(std::slice::from_ref(press), zone_ctx);
             assert!(!pending);
-            assert!(bindings[0].action().partial_eq(expected));
+            let first = bindings[0].action();
+            assert!(first.partial_eq(*expected), "{press} in {zone_ctx:?}: {}", first.name());
         }
     }
 
