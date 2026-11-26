@@ -3015,3 +3015,99 @@ fn a_continued_sessions_first_checkpoint_is_whole_and_keeps_its_earlier_entries(
     let log = client.transcript_until(id, "is ready", ready);
     assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: second"]);
 }
+
+#[test]
+fn a_fetch_read_with_its_attach_is_refused_until_the_replay_ends() {
+    let (mut dir, mut client) = agent_core("agent-page-pending", &[]);
+    let (mut script, _) = started(&dir.path, "page-pending");
+    script.step("expect session/prompt").step(said("hello")).step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "hi").unwrap();
+    let live = client.transcript_until(id, "has the turn", ended(1));
+    client.detach(id);
+
+    // The attach makes this client the session's owner, so its replay
+    // waits for the new meta to reach the holder's socket, which the core
+    // writes only after it has read both messages.
+    let mut later = TestClient::hello(&dir.path, "later");
+    let (answer, _) = later.attach_agent_and_fetch(id, 1, 1024);
+    let refusal = answer.expect_err("a fetch before the replay ends");
+    assert_eq!(refusal.session, Some(id));
+    assert_eq!(refusal.message, format!("session {id}'s replay hasn't ended"));
+    assert_eq!(later.transcript(id), live);
+    assert_eq!(later.fetch(id, 1, 1024).unwrap(), (Vec::new(), false), "answered once it has");
+}
+
+/// The records of the checkpoint the session's holder stores, read by a
+/// test core that adopts it once the client's core is killed.
+fn stored_records(dir: &TempDir, client: &mut TestClient, id: SessionId) -> Vec<(char, u32)> {
+    kill(client.core_pid());
+    assert!(client.closes());
+    let mut core = TestCore::connect_to(dir);
+    let adopted = core.hello(77);
+    let blob = adopted.checkpoints.get(&id).expect("the session's checkpoint");
+    checkpoint_records(blob)
+}
+
+#[test]
+fn checkpoints_are_appended_to_the_holders_base_and_adopted_as_one_blob() {
+    let token = "token-agent-page-append";
+    let (mut dir, mut client) = agent_core("agent-page-append", &[]);
+    let (mut script, _) = started(&dir.path, "page-append");
+    script.step("expect session/prompt");
+    long_reply(&mut script, 16, MESSAGE_BYTES);
+    script
+        .step(stop("end_turn"))
+        .step("expect session/prompt")
+        .step(said("short"))
+        .step(stop("end_turn"))
+        .step("expect session/prompt");
+    let third = script.reached();
+    let gate = script.gate();
+    script.step(said("third")).step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", |log| {
+        said_all(16)(log) && *log.turn() == end(StopReason::EndTurn)
+    });
+
+    // The next core knows nothing of what the holder stores, so its first
+    // checkpoint is a base of the whole 1 MiB log; the second turn's are
+    // far smaller, so they are appended to it.
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    client.reconnect_replay();
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the second turn", |log| {
+        says(log).contains(&"agent: short".to_owned()) && *log.turn() == end(StopReason::EndTurn)
+    });
+    client.prompt(id, "three").unwrap();
+    // The agent read the prompt, so the holder has every checkpoint the
+    // core queued before its bytes.
+    reaches(&third);
+    let records = stored_records(&dir, &mut client, id);
+    assert_eq!(records.first(), Some(&('B', 0)), "{records:?}");
+    assert!(records.len() >= 2, "no segment was appended: {records:?}");
+    for (at, record) in records.iter().enumerate().skip(1) {
+        assert_eq!(*record, ('S', at as u32), "{records:?}");
+    }
+
+    // The base and its segments adopt as the log they were written from.
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, token);
+    dir.track(client.core_pid());
+    client.reconnect_replay();
+    assert!(client.transcript(id).window().is_some(), "a 1 MiB log is paged");
+    gate.open();
+    client.transcript_until(id, "has the third turn", |log| {
+        says(log).contains(&"agent: third".to_owned()) && *log.turn() == end(StopReason::EndTurn)
+    });
+    let whole = client.fetch_to_start(id);
+    assert_contiguous_from_1(&whole);
+    let said = says(&whole);
+    assert_eq!(said.len(), 1 + 16 + 4, "{said:?}");
+    assert_eq!(said[0], "user: one");
+    assert!(said[1..17].iter().all(|line| line.starts_with("agent: 0")), "{said:?}");
+    assert_eq!(said[17..], ["user: two", "agent: short", "user: three", "agent: third"]);
+}

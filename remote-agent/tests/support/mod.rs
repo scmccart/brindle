@@ -544,6 +544,33 @@ pub fn assert_hung_up(session: SessionId, code: Option<i32>) {
     assert!(code.is_some(), "session {session} ended with no code");
 }
 
+/// The records of an agent checkpoint of format 2 (`BACP`, `u16` 2, then
+/// each record's kind, sequence number, JSON state and partial line; see
+/// `acp/checkpoint.rs`), as `(kind, seq)`: what a holder stores of a base
+/// and the segments appended to it, read without decoding the states.
+#[track_caller]
+pub fn checkpoint_records(blob: &[u8]) -> Vec<(char, u32)> {
+    let (header, mut rest) = blob.split_at(6);
+    assert_eq!(header, b"BACP\x00\x02", "not a format 2 checkpoint");
+    let take = |len: usize, rest: &mut &[u8]| -> Vec<u8> {
+        assert!(rest.len() >= len, "a record runs past the end");
+        let (taken, left) = rest.split_at(len);
+        *rest = left;
+        taken.to_vec()
+    };
+    let mut records = Vec::new();
+    while !rest.is_empty() {
+        let kind = take(1, &mut rest)[0] as char;
+        let seq = u32::from_be_bytes(take(4, &mut rest).try_into().unwrap());
+        for _ in 0..2 {
+            let len = u32::from_be_bytes(take(4, &mut rest).try_into().unwrap());
+            take(len as usize, &mut rest);
+        }
+        records.push((kind, seq));
+    }
+    records
+}
+
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
         || haystack
@@ -1369,6 +1396,52 @@ impl TestClient {
         kept.extend(self.backlog.drain(..));
         self.backlog = kept.into();
         result
+    }
+
+    /// `ATTACH` (which gives the session this client's token as its owner,
+    /// so its replay waits for the new meta to reach the holder's socket)
+    /// and an `AGENT_FETCH` written in one write, so the core reads both
+    /// before its next flush: gives the fetch's answer, read before the
+    /// replay, and the replay's start once it has ended.
+    pub fn attach_agent_and_fetch(
+        &mut self,
+        session: SessionId,
+        before: u64,
+        max_bytes: u32,
+    ) -> (Result<(), client::ErrorMessage>, client::ReplayStart) {
+        let attach = self.take_req();
+        let fetch = self.take_req();
+        let mut bytes = Vec::new();
+        for message in [
+            client::ToCore::Attach(client::Attach { req: attach, session, cols: 0, rows: 0, page: None }),
+            client::ToCore::AgentFetch(client::AgentFetch { req: fetch, session, before, max_bytes }),
+        ] {
+            message.encode().unwrap().write_to(&mut bytes).unwrap();
+        }
+        io::Write::write_all(&mut self.stream, &bytes).unwrap();
+        let mut kept = Vec::new();
+        let mut answer = None;
+        let mut start = None;
+        loop {
+            match self.recv() {
+                ToClient::Error(error) if error.req == Some(fetch) => answer = Some(Err(error)),
+                ToClient::AgentPage(page) if page.req == fetch => {
+                    if page.last.is_some() {
+                        answer = Some(Ok(()));
+                    }
+                }
+                ToClient::ReplayStart(replay) if replay.req == Some(attach) => {
+                    assert!(answer.is_some(), "the replay started before the fetch was answered");
+                    start = Some(replay);
+                }
+                ToClient::Transcript(transcript) if transcript.session == session => {}
+                ToClient::ReplayEnd(end) if end.session == session => break,
+                other => kept.push(other),
+            }
+        }
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        (answer.expect("the fetch's answer"), start.expect("the replay's start"))
     }
 
     /// Fetches the pages before the session's log's window, a whole page
