@@ -39,7 +39,7 @@ Run `cargo test --workspace` and `cargo clippy --locked --workspace --all-target
 
 ## 5. Integration
 
-- [ ] 5.1 Run the whole suite headless and check every agent case passes: `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent`, inside `systemd-run --user --scope` when run from a Brindle tab.
+- [x] 5.1 Run the whole suite headless and check every agent case passes: `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent`, inside `systemd-run --user --scope` when run from a Brindle tab. (CI run 45769110154: the three e2e shards passed with every agent case.)
 - [x] 5.2 Hand the manual checks to the user: the spinner and shimmer at 10 steps a second, the destructive row in brindle-light, brindle-dark and solarized-dark, and a real permission notification on Windows (toast) and on Linux (D-Bus) showing both body lines, through `scripts/run-throwaway.sh` / `run-throwaway.ps1`.
 
 ## Workflow follow-up
