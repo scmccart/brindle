@@ -182,6 +182,7 @@ pub enum DiffLine { Context(String), Added(String), Removed(String) }
 pub struct Output {
     pub command: Option<String>, pub cwd: Option<String>,
     pub text: String, pub omitted: u64,     // bytes dropped from the start
+    pub partial: bool,                      // the kept text starts mid-line (flag 19)
     pub exit: Option<Exit>,
 }
 pub enum Exit { Code { code: i32 }, Signal { name: String } }
@@ -365,6 +366,19 @@ By the rule the user set on 2026-11-25 (read the convention when a capture shows
 - v2's agent-owned terminals use the same map (decision 9), so it is in the reducer, not in `v1/`.
 
 Task 1.1 still captures the Claude adapter's, Antigravity's and Copilot's allowed commands, to record how each delivers output and confirm the text-block path. It also records which agents call `terminal/create` when `clientCapabilities.terminal` is offered, as evidence for `agents-client-terminals`.
+
+**As built: the task 1.1 captures (2026-11-26).** Each agent was asked to change `apple` to `banana` on line 3 of an existing `notes.txt` and to run `seq 1 4`, every permission allowed, once with today's `initialize` and once also offering `clientCapabilities.terminal: true`. The logs are `remote-agent/tests/fixtures/acp/{antigravity-1.5.16,claude-agent-acp-0.112.0,codex-acp-2.12.0}-edit-run[-terminal].log`, scrubbed as the earlier ones.
+
+| Agent | The edit | The command's output | `terminal/create` |
+| --- | --- | --- | --- |
+| claude-agent-acp 0.112 (Haiku) | a `diff` on a `tool_call_update` before the permission and again on the request and the completing update; `oldText` and `newText` are the **replaced fragment** (`"an apple a day"`), not the file, so the hunk's line numbers count from the fragment. Its own `_meta.claudeCode.toolResponse.structuredPatch` holds the file's hunks, which Brindle doesn't read | a text block, ```` ```console ```` fenced, on the completing update; before it a text block of the command's description, replaced by the output. `rawOutput` repeats the text | never |
+| antigravity 1.5.16 | the request's `toolCall` holds a fragment `diff` (both texts present); the completing `tool_call_update` holds a `diff` of the **whole file** (`oldText` and `newText`) | a text block on the completing update: a header (`Created At`, `Completed At`, `Command exited with code 0.`, `Command output:`) then the output with `\r\n` line ends; `rawOutput` is `{output, exit_code}` | never |
+| codex-acp 2.12 | no diff: it edited through the shell (`python3 -c …` in one run, `sed -i` in the other) | `_meta.terminal_info` on the `tool_call` (with `terminal` content), then `terminal_output_delta` and `terminal_exit` on the completing update, as in the reject capture. Its file read (`kind: read`, `exec_command`) sends a `terminal_output_delta` for a terminal no `terminal_info` or `terminal` item opened | never, though offered |
+| copilot 1.0.116 | not captured: its `session/new` failed with "GitHub CLI token lookup timed out after 5 seconds" in the capture's environment (twice) | | |
+
+- No agent called `terminal/create`, so `agents-client-terminals` has no agent to test against today.
+- Every new log replays through the reducer with no fault (`every_captured_session_reduces_with_no_fault_and_the_clients_fold_agreeing`), and every line decodes (`every_line_of_the_real_agents_captures_decodes`).
+- No agent delivers output a third way: Codex through `_meta`, the others as a text block. Flags 16 to 18 in decision 17 follow from the table.
 
 **The `terminal` client capability stays unoffered here** (user, 2026-11-25). It is ACP v1's way for the agent to have the client run a command (`terminal/create`, `terminal/output`, `terminal/wait_for_exit`, `terminal/kill`, `terminal/release`). That changes who runs the command and what an agent can make the server do, and v2 has no such methods.
 
@@ -604,6 +618,13 @@ The user's decisions of 2026-11-25 all still fit (next section). These choices a
 13. **A perf case `agent-tool-output`** sits in `tests/perf/agent.rs` beside `agent-markdown-stream` and `agent-attach-long`. The fake agent streams 1 MiB of output in 4 KiB `_meta` deltas into an open row, timed from the gate to the last line shown (`testing R14`). Recommend: add. It is the check on "a long output costs the view only what is on screen".
 14. **`v1/decode.rs` decodes a tool call's fields by hand around the crate.** The crate decodes the update with `content`, `locations`, `rawInput`, `rawOutput` and `_meta` taken out, and items one at a time. Recommend: accept. It is decision 3's "one unreadable item loses only itself", which today's whole-update decode breaks.
 15. **The move also takes `continued`'s `"session/load"` method check** into the dialect, which the first design didn't list. Recommend: accept, since R14 forbids method names outside `v1/`.
+
+Flags added while implementing (2026-11-26, sections 1–4):
+
+16. **Output for a terminal nothing opened opens one.** Codex's file read sends `terminal_output_delta` with no `terminal_info` and no `terminal` item (decision 6's As built). An `Appended` (or `Exited`) for an unknown terminal id opens an output at the end of the update's own tool call, with no command or `cwd`, rather than dropping the text. Recommend: accept; dropping it would lose the only place the read's result shows.
+17. **A fragment diff's line numbers count from the fragment.** The Claude adapter's `oldText`/`newText`, and Antigravity's in its permission request, are the replaced text alone, so `diff::hunks` numbers the lines from 1 within it. The row shows them as given; the file's own numbers are only in agent-private `_meta`, which decision 6 doesn't read. Recommend: accept, and note it in the dump's docs; a later change can hide numbers for a change the reducer can't place.
+18. **Copilot's edit and command aren't captured.** Its `session/new` failed in the capture's environment (a GitHub CLI token lookup timeout), and the capture wasn't retried with the token passed in. Copilot's tool content is therefore read from the reject capture only (`rawInput` as a patch, no content items). Recommend: capture it by hand before the PR, with the user's go-ahead.
+19. **An output's kept text tracks whether it starts mid-line** (`Output.partial`, omitted when false). Without it, "folding `a` then `b` equals folding `a + b`" fails when a line longer than `ITEM_LIMIT` was cut at a character boundary and a later piece then ends it: the whole-text fold drops the cut line's tail, a piecewise fold can't tell it was cut. The property test found the case by construction. Recommend: accept; it is one boolean in protocol 4's (unreleased) output item, and the zone can show it as "the start of this line isn't kept".
 
 ## The user's decisions
 

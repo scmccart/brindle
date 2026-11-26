@@ -174,11 +174,8 @@ fn the_working_row_ends_the_conversation_while_the_turn_works() {
     assert!(running(&mut f), "the view wants the clock");
     f.cx.run_until_parked();
     assert!(f.cx.debug_bounds("agent-working").is_some(), "the row is drawn");
-    let tool = |status| Entry::Tool {
-        call: "call_1".into(),
-        title: "Read main.rs".into(),
-        kind: crate::agent::transcript::ToolKind::Read,
-        status,
+    let tool = |status| {
+        Entry::tool("call_1".into(), "Read main.rs".into(), crate::agent::transcript::ToolKind::Read, status)
     };
     f.feed(&[added(2, tool(crate::agent::transcript::ToolStatus::InProgress))]);
     assert_eq!(shown(&mut f).as_deref(), Some("Read main.rs"));

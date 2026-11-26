@@ -105,13 +105,21 @@ fn entry(rng: &mut XorShift) -> Entry {
         1 => Entry::Agent { text: text(rng) },
         2 => Entry::Thought { text: text(rng) },
         3 => Entry::Tool {
-            call: text(rng),
+            // A few calls, so permissions name them.
+            call: CALLS[rng.below(CALLS.len())].into(),
             title: text(rng),
             kind: TOOL_KINDS[rng.below(TOOL_KINDS.len())],
             status: TOOL_STATUSES[rng.below(TOOL_STATUSES.len())],
+            content: (0..rng.below(4)).map(|_| tool_item(rng)).collect(),
+            more: rng.below(3) as u32,
+            locations: locations(rng),
+            input: rng.chance(2).then(|| text(rng)),
+            result: rng.chance(3).then(|| text(rng)),
         },
         4 => Entry::Permission {
-            call: rng.chance(2).then(|| text(rng)),
+            call: rng
+                .chance(2)
+                .then(|| CALLS[rng.below(CALLS.len())].to_string()),
             title: text(rng),
             options: (0..rng.below(4))
                 .map(|_| PermissionOption {
@@ -127,6 +135,95 @@ fn entry(rng: &mut XorShift) -> Entry {
             text: text(rng),
         },
     }
+}
+
+const CALLS: [&str; 3] = ["call_1", "call_2", "call \"3\""];
+
+fn diff_line(rng: &mut XorShift) -> DiffLine {
+    match rng.below(3) {
+        0 => DiffLine::Context(text(rng)),
+        1 => DiffLine::Added(text(rng)),
+        _ => DiffLine::Removed(text(rng)),
+    }
+}
+
+fn file_op(rng: &mut XorShift) -> FileOp {
+    match rng.below(6) {
+        0 => FileOp::Add,
+        1 => FileOp::Delete,
+        2 => FileOp::Modify,
+        3 => FileOp::Move { from: text(rng) },
+        4 => FileOp::Copy { from: text(rng) },
+        _ => FileOp::Other { name: text(rng) },
+    }
+}
+
+fn exit(rng: &mut XorShift) -> Exit {
+    if rng.chance(2) {
+        Exit::Code {
+            code: rng.next() as i32,
+        }
+    } else {
+        Exit::Signal { name: text(rng) }
+    }
+}
+
+/// Output text with lines, sometimes past [`ITEM_LIMIT`] so the fold drops
+/// its start.
+fn output_text(rng: &mut XorShift) -> String {
+    if rng.chance(6) {
+        let line: String = (0..rng.below(200)).map(|_| CHARS[rng.below(CHARS.len())]).collect();
+        let mut text = String::new();
+        while text.len() < ITEM_LIMIT + rng.below(ITEM_LIMIT) {
+            text.push_str(&line);
+            if rng.chance(3) {
+                text.push('\n');
+            }
+        }
+        return text;
+    }
+    text(rng)
+}
+
+pub(crate) fn tool_item(rng: &mut XorShift) -> ToolItem {
+    match rng.below(3) {
+        0 => ToolItem::Text {
+            text: text(rng),
+            cut: rng.chance(4),
+        },
+        1 => ToolItem::Diff(FileChange {
+            op: file_op(rng),
+            path: text(rng),
+            hunks: (0..rng.below(3))
+                .map(|_| Hunk {
+                    old_start: rng.below(100) as u32,
+                    new_start: rng.below(100) as u32,
+                    lines: (0..rng.below(5)).map(|_| diff_line(rng)).collect(),
+                })
+                .collect(),
+            omitted: rng.below(3) as u32,
+        }),
+        _ => {
+            // An output as the fold leaves one: start empty, append.
+            let mut output = Output {
+                command: rng.chance(2).then(|| text(rng)),
+                cwd: rng.chance(2).then(|| text(rng)),
+                ..Output::default()
+            };
+            output.append(&output_text(rng));
+            output.exit = rng.chance(2).then(|| exit(rng));
+            ToolItem::Output(output)
+        }
+    }
+}
+
+fn locations(rng: &mut XorShift) -> Vec<Location> {
+    (0..rng.below(3))
+        .map(|_| Location {
+            path: text(rng),
+            line: rng.chance(2).then(|| rng.below(1000) as u32),
+        })
+        .collect()
 }
 
 fn slot(rng: &mut XorShift) -> Slot {
@@ -214,10 +311,27 @@ fn conversation(rng: &mut XorShift) -> Conversation {
     }
 }
 
+fn tool_changed(rng: &mut XorShift, id: EntryId) -> Event {
+    Event::ToolChanged {
+        id,
+        title: rng.chance(2).then(|| text(rng)),
+        kind: rng
+            .chance(2)
+            .then(|| TOOL_KINDS[rng.below(TOOL_KINDS.len())]),
+        status: rng
+            .chance(2)
+            .then(|| TOOL_STATUSES[rng.below(TOOL_STATUSES.len())]),
+        locations: rng.chance(3).then(|| locations(rng)),
+        input: rng.chance(3).then(|| rng.chance(2).then(|| text(rng))),
+        result: rng.chance(3).then(|| rng.chance(2).then(|| text(rng))),
+        more: rng.chance(4).then(|| rng.below(3) as u32),
+    }
+}
+
 /// Any event, with ids near the log's, valid or not.
 fn event(rng: &mut XorShift, near: u64) -> Event {
     let id = EntryId(near.saturating_sub(3) + rng.below(6) as u64);
-    match rng.below(10) {
+    match rng.below(12) {
         0 => Event::Added {
             id,
             entry: entry(rng),
@@ -226,15 +340,17 @@ fn event(rng: &mut XorShift, near: u64) -> Event {
             id,
             text: text(rng),
         },
-        2 => Event::ToolChanged {
+        2 => tool_changed(rng, id),
+        10 => Event::ToolItems {
             id,
-            title: rng.chance(2).then(|| text(rng)),
-            kind: rng
-                .chance(2)
-                .then(|| TOOL_KINDS[rng.below(TOOL_KINDS.len())]),
-            status: rng
-                .chance(2)
-                .then(|| TOOL_STATUSES[rng.below(TOOL_STATUSES.len())]),
+            from: rng.below(5) as u32,
+            items: (0..rng.below(3)).map(|_| tool_item(rng)).collect(),
+        },
+        11 => Event::ToolOutput {
+            id,
+            item: rng.below(4) as u32,
+            text: output_text(rng),
+            exit: rng.chance(3).then(|| exit(rng)),
         },
         3 => Event::Answered {
             id,
@@ -293,18 +409,33 @@ fn step(rng: &mut XorShift, transcript: &mut Transcript) -> Option<Event> {
             }
         }
         4 => {
-            let (id, _) = ids
+            let tools: Vec<&(EntryId, Entry)> = ids
                 .iter()
-                .find(|(_, entry)| matches!(entry, Entry::Tool { .. }))?;
-            Event::ToolChanged {
-                id: *id,
-                title: rng.chance(2).then(|| text(rng)),
-                kind: rng
-                    .chance(2)
-                    .then(|| TOOL_KINDS[rng.below(TOOL_KINDS.len())]),
-                status: rng
-                    .chance(2)
-                    .then(|| TOOL_STATUSES[rng.below(TOOL_STATUSES.len())]),
+                .filter(|(_, entry)| matches!(entry, Entry::Tool { .. }))
+                .collect();
+            let (id, entry) = tools.get(rng.below(tools.len()))?;
+            let Entry::Tool { content, .. } = entry else {
+                return None;
+            };
+            let outputs: Vec<usize> = content
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| matches!(item, ToolItem::Output(_)))
+                .map(|(index, _)| index)
+                .collect();
+            match rng.below(3) {
+                0 => tool_changed(rng, *id),
+                1 => Event::ToolItems {
+                    id: *id,
+                    from: rng.below(content.len() + 1) as u32,
+                    items: (0..rng.below(3)).map(|_| tool_item(rng)).collect(),
+                },
+                _ => Event::ToolOutput {
+                    id: *id,
+                    item: *outputs.get(rng.below(outputs.len()))? as u32,
+                    text: output_text(rng),
+                    exit: rng.chance(3).then(|| exit(rng)),
+                },
             }
         }
         5 => {
@@ -407,6 +538,34 @@ const WORDS: &[&str] = &[
     "window",
     "from",
     "earlier",
+    "tool_items",
+    "tool_output",
+    "item",
+    "items",
+    "diff",
+    "output",
+    "hunks",
+    "old_start",
+    "new_start",
+    "lines",
+    " a",
+    "+b",
+    "-c",
+    "op",
+    "modify",
+    "move",
+    "path",
+    "omitted",
+    "partial",
+    "exit",
+    "signal",
+    "locations",
+    "line",
+    "input",
+    "result",
+    "more",
+    "cut",
+    "content",
 ];
 
 fn random_json(rng: &mut XorShift, depth: usize) -> Value {
@@ -604,6 +763,7 @@ fn fetch_to_start(rng: &mut XorShift, server: &Transcript, copy: &mut Transcript
 fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
     let mut rng = XorShift::new(0x7e57_0003);
     let mut paged = 0usize;
+    let mut tools = 0usize;
     for _ in 0..LOGS {
         let log = random_transcript(&mut rng);
         for budget in budgets(&mut rng, &log) {
@@ -612,10 +772,32 @@ fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
             let from = held_from(&copy);
             assert_eq!(copy, log.suffix(from));
             paged += usize::from(copy.window().is_some());
-            // Every pending permission and the newest entry are held.
+            // Every pending permission, the tool entry each names and the
+            // newest entry are held.
+            let mut lowest = None;
             for (id, entry) in log.entries() {
-                if matches!(entry, Entry::Permission { outcome: None, .. }) {
+                if let Entry::Permission {
+                    outcome: None,
+                    call,
+                    ..
+                } = entry
+                {
                     assert!(copy.entry(id).is_some(), "pending permission {id}");
+                    lowest = lowest.min(Some(id)).or(Some(id));
+                    let tool = call.as_ref().and_then(|call| {
+                        log.entries()
+                            .take_while(|(before, _)| *before < id)
+                            .filter(|(_, entry)| {
+                                matches!(entry, Entry::Tool { call: own, .. } if own == call)
+                            })
+                            .last()
+                            .map(|(tool, _)| tool)
+                    });
+                    if let Some(tool) = tool {
+                        assert!(copy.entry(tool).is_some(), "permission {id}'s tool {tool}");
+                        lowest = lowest.min(Some(tool));
+                        tools += 1;
+                    }
                 }
             }
             assert_eq!(
@@ -629,19 +811,16 @@ fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
                 (copy.slot(), copy.turn(), copy.agent(), copy.conversation()),
                 (log.slot(), log.turn(), log.agent(), log.conversation())
             );
-            let oldest_pending = log.entries().find_map(|(id, entry)| {
-                matches!(entry, Entry::Permission { outcome: None, .. }).then_some(id)
-            });
             if copy.encoded_len() > budget {
                 assert!(
-                    copy.entries().count() == 1
-                        || copy.entries().next().map(|(id, _)| id) == oldest_pending,
+                    copy.entries().count() == 1 || copy.entries().next().map(|(id, _)| id) == lowest,
                     "a page past its budget of {budget}"
                 );
             }
         }
     }
     assert!(paged > LOGS / 2, "only {paged} pages had a window");
+    assert!(tools > LOGS / 20, "only {tools} pending permissions named a tool entry");
 }
 
 #[test]

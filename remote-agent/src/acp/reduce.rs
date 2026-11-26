@@ -1379,12 +1379,7 @@ impl Step<'_> {
     }
 
     fn add_tool(&mut self, call: String, title: String, kind: ToolKind, status: ToolStatus) {
-        let entry = self.add(Entry::Tool {
-            call: call.clone(),
-            title,
-            kind,
-            status,
-        });
+        let entry = self.add(Entry::tool(call.clone(), title, kind, status));
         self.s.tools.insert(call, entry);
     }
 
@@ -1417,6 +1412,10 @@ impl Step<'_> {
             title,
             kind,
             status,
+            locations: None,
+            input: None,
+            result: None,
+            more: None,
         });
     }
 
@@ -2188,6 +2187,8 @@ impl Step<'_> {
             Event::Added { .. }
             | Event::Appended { .. }
             | Event::ToolChanged { .. }
+            | Event::ToolItems { .. }
+            | Event::ToolOutput { .. }
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
@@ -2607,6 +2608,8 @@ mod tests {
                 Event::Added { entry, .. } => format!("added {}", entry_kind(entry)),
                 Event::Appended { .. } => "appended".into(),
                 Event::ToolChanged { .. } => "tool changed".into(),
+                Event::ToolItems { .. } => "tool items".into(),
+                Event::ToolOutput { .. } => "tool output".into(),
                 Event::Answered { .. } => "answered".into(),
                 Event::Queue { slot } => match slot {
                     Slot::Empty => "queue empty".into(),
@@ -2832,6 +2835,8 @@ mod tests {
             Event::Added { .. }
             | Event::Appended { .. }
             | Event::ToolChanged { .. }
+            | Event::ToolItems { .. }
+            | Event::ToolOutput { .. }
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
@@ -3711,17 +3716,21 @@ mod tests {
                 id: EntryId(2),
                 title: None,
                 kind: None,
-                status: Some(ToolStatus::Completed)
+                status: Some(ToolStatus::Completed),
+                locations: None,
+                input: None,
+                result: None,
+                more: None,
             }]
         );
         assert_eq!(
             agent.last_entry().1,
-            Entry::Tool {
-                call: "call_1".into(),
-                title: "Write a file".into(),
-                kind: ToolKind::Edit,
-                status: ToolStatus::Completed
-            }
+            Entry::tool(
+                "call_1".into(),
+                "Write a file".into(),
+                ToolKind::Edit,
+                ToolStatus::Completed
+            )
         );
     }
 
@@ -3747,6 +3756,8 @@ mod tests {
                 Event::ToolChanged { status, .. } => *status,
                 Event::Added { .. }
                 | Event::Appended { .. }
+                | Event::ToolItems { .. }
+                | Event::ToolOutput { .. }
                 | Event::Answered { .. }
                 | Event::Queue { .. }
                 | Event::Turn { .. }
@@ -3802,12 +3813,12 @@ mod tests {
         agent.feed(&tool_update("call_9", "in_progress"));
         assert_eq!(
             agent.last_entry().1,
-            Entry::Tool {
-                call: "call_9".into(),
-                title: "call_9".into(),
-                kind: ToolKind::Other,
-                status: ToolStatus::InProgress
-            }
+            Entry::tool(
+                "call_9".into(),
+                "call_9".into(),
+                ToolKind::Other,
+                ToolStatus::InProgress
+            )
         );
     }
 
@@ -4596,7 +4607,7 @@ mod tests {
 
     // --- the captured sessions ------------------------------------------
 
-    const CAPTURES: [(&str, &[u8]); 8] = [
+    const CAPTURES: [(&str, &[u8]); 14] = [
         (
             "antigravity-1.5.16-reject",
             include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-reject.log"),
@@ -4628,6 +4639,35 @@ mod tests {
         (
             "copilot-1.0.115-reject",
             include_bytes!("../../tests/fixtures/acp/copilot-1.0.115-reject.log"),
+        ),
+        // `agents-tool-content` task 1.1: an allowed edit of an existing
+        // file and an allowed `seq 1 4`, with today's `initialize` and once
+        // more offering `clientCapabilities.terminal`.
+        (
+            "antigravity-1.5.16-edit-run",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run.log"),
+        ),
+        (
+            "antigravity-1.5.16-edit-run-terminal",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run-terminal.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-edit-run",
+            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-edit-run-terminal",
+            include_bytes!(
+                "../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run-terminal.log"
+            ),
+        ),
+        (
+            "codex-acp-2.12.0-edit-run",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run.log"),
+        ),
+        (
+            "codex-acp-2.12.0-edit-run-terminal",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run-terminal.log"),
         ),
     ];
 
@@ -4766,12 +4806,22 @@ mod tests {
     }
 
     /// What each captured agent is called and what it named its
-    /// conversation (`agents-session-title`): Codex never names one.
+    /// conversation (`agents-session-title`): Codex named one only in the
+    /// later captures, with its prompt.
     #[test]
     fn every_captured_session_names_its_agent_readably_and_keeps_its_title() {
         for (name, log) in CAPTURES {
             let agent = replay(log, |_| {});
+            let edit_run = name.contains("-edit-run");
             let (readable, title) = match name.split('-').next() {
+                Some("antigravity") if edit_run => {
+                    ("Antigravity ACP Server", Some("Edit Notes File And Run Seq"))
+                }
+                Some("claude") if edit_run => ("Claude Agent", Some("Notes.txt apple to banana edit")),
+                Some("codex") if edit_run => (
+                    "Codex",
+                    Some("In the current working directory there is a file named notes.txt."),
+                ),
                 Some("antigravity") => ("Antigravity ACP Server", Some("Create Hello.txt File")),
                 Some("claude") if name.starts_with("claude-agent") => {
                     ("Claude Agent", Some("Hello.txt file creation"))

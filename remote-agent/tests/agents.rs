@@ -648,6 +648,8 @@ fn shape(event: &Event) -> String {
         },
         Event::Appended { text, .. } => format!("appended {text}"),
         Event::ToolChanged { .. } => "tool changed".into(),
+        Event::ToolItems { from, items, .. } => format!("tool items {from} {}", items.len()),
+        Event::ToolOutput { text, .. } => format!("tool output {text}"),
         Event::Answered { outcome, .. } => format!("answered {outcome:?}"),
         Event::Queue { slot } => match slot {
             Slot::Empty => "queue empty".into(),
@@ -941,12 +943,12 @@ fn a_tool_call_is_one_entry_updated_by_its_id() {
     let tools: Vec<&Entry> = log.entries().map(|(_, entry)| entry).filter(|entry| matches!(entry, Entry::Tool { .. })).collect();
     assert_eq!(
         tools,
-        [&Entry::Tool {
-            call: "call_1".into(),
-            title: "Edit main.rs".into(),
-            kind: ToolKind::Edit,
-            status: ToolStatus::Completed,
-        }]
+        [&Entry::tool(
+            "call_1".into(),
+            "Edit main.rs".into(),
+            ToolKind::Edit,
+            ToolStatus::Completed,
+        )]
     );
 }
 
@@ -1954,6 +1956,8 @@ fn kind(event: &Event) -> &'static str {
         Event::Added { .. } => "added",
         Event::Appended { .. } => "appended",
         Event::ToolChanged { .. } => "tool_changed",
+        Event::ToolItems { .. } => "tool_items",
+        Event::ToolOutput { .. } => "tool_output",
         Event::Answered { .. } => "answered",
         Event::Queue { .. } => "queue",
         Event::Turn { .. } => "turn",

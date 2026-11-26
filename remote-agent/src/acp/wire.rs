@@ -1249,7 +1249,7 @@ mod tests {
 
     /// The captured sessions (task 1.2 and the later captures), each line
     /// `c>a` or `a>c`, a tab, then the line as sent.
-    const CAPTURES: [(&str, &[u8]); 10] = [
+    const CAPTURES: [(&str, &[u8]); 16] = [
         (
             "antigravity-1.5.16-reject",
             include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-reject.log"),
@@ -1289,6 +1289,33 @@ mod tests {
         (
             "handwritten-unknown-values",
             include_bytes!("../../tests/fixtures/acp/handwritten-unknown-values.log"),
+        ),
+        // `agents-tool-content` task 1.1.
+        (
+            "antigravity-1.5.16-edit-run",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run.log"),
+        ),
+        (
+            "antigravity-1.5.16-edit-run-terminal",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run-terminal.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-edit-run",
+            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-edit-run-terminal",
+            include_bytes!(
+                "../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run-terminal.log"
+            ),
+        ),
+        (
+            "codex-acp-2.12.0-edit-run",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run.log"),
+        ),
+        (
+            "codex-acp-2.12.0-edit-run-terminal",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run-terminal.log"),
         ),
     ];
 
@@ -1417,10 +1444,17 @@ mod tests {
                 }
             }
             assert_eq!((kinds.0, kinds.1, kinds.2), (1, 1, 1), "{name}");
-            let asks = !name.ends_with("-auto") && !name.ends_with("-trusted-workspace");
-            assert_eq!(kinds.3, usize::from(asks), "{name}: permission requests");
+            // The edit-run captures: Antigravity asks for the edit and the
+            // command, Claude for the edit alone, Codex for neither.
+            let asks = match name {
+                n if n.ends_with("-auto") || n.ends_with("-trusted-workspace") => 0,
+                n if n.starts_with("antigravity") && n.contains("-edit-run") => 2,
+                n if n.starts_with("codex") && n.contains("-edit-run") => 0,
+                _ => 1,
+            };
+            assert_eq!(kinds.3, asks, "{name}: permission requests");
         }
-        assert_eq!(lines, 310);
+        assert_eq!(lines, 310 + 323);
     }
 
     /// What each captured agent's `initialize` offers for continuing a
@@ -1446,6 +1480,12 @@ mod tests {
                 ("claude-code-acp-0.16.2-reject", Continuation::ResumeAndLoad),
                 ("codex-acp-2.12.0-reject", Continuation::ResumeAndLoad),
                 ("copilot-1.0.115-reject", Continuation::Load),
+                ("antigravity-1.5.16-edit-run", Continuation::ResumeAndLoad),
+                ("antigravity-1.5.16-edit-run-terminal", Continuation::ResumeAndLoad),
+                ("claude-agent-acp-0.112.0-edit-run", Continuation::ResumeAndLoad),
+                ("claude-agent-acp-0.112.0-edit-run-terminal", Continuation::ResumeAndLoad),
+                ("codex-acp-2.12.0-edit-run", Continuation::ResumeAndLoad),
+                ("codex-acp-2.12.0-edit-run-terminal", Continuation::ResumeAndLoad),
             ]
         );
     }
@@ -1552,10 +1592,20 @@ mod tests {
                 for advertised in [true, false] {
                     let read = auth_methods(&answer, advertised);
                     let expected: Vec<&str> = match *name {
-                        "antigravity-1.5.16-auth-terminal" if advertised => {
+                        // Those answering an `initialize` that offered
+                        // `auth.terminal`.
+                        n if n.starts_with("antigravity")
+                            && (n.ends_with("-auth-terminal") || n.contains("-edit-run"))
+                            && advertised =>
+                        {
                             antigravity.iter().copied().chain(["terminal-login"]).collect()
                         }
                         n if n.starts_with("antigravity") => antigravity.to_vec(),
+                        // 0.112's two terminal logins, offered to the later
+                        // `initialize` only.
+                        n if n.starts_with("claude-agent-acp") && n.contains("-edit-run") && advertised => {
+                            vec!["claude-ai-login", "console-login"]
+                        }
                         n if n.starts_with("claude-agent-acp") => Vec::new(),
                         n if n.starts_with("claude-code-acp") => vec!["claude-login"],
                         n if n.starts_with("codex") => vec!["api-key", "chat-gpt"],
@@ -1563,7 +1613,16 @@ mod tests {
                         n => panic!("{n}: an initialize answer this test doesn't expect"),
                     };
                     assert_eq!(ids(&read), expected, "{name} ({advertised})");
-                    let dropped = usize::from(*name == "antigravity-1.5.16-auth-terminal" && !advertised);
+                    let dropped = match *name {
+                        _ if advertised => 0,
+                        n if n.starts_with("antigravity")
+                            && (n.ends_with("-auth-terminal") || n.contains("-edit-run")) =>
+                        {
+                            1
+                        }
+                        n if n.starts_with("claude-agent-acp") && n.contains("-edit-run") => 2,
+                        _ => 0,
+                    };
                     assert_eq!((read.dropped, read.cut), (dropped, 0), "{name} ({advertised})");
                     // `initialize` itself still reads.
                     assert!(initialize_result(&answer).is_ok(), "{name}");
@@ -1571,7 +1630,7 @@ mod tests {
                 seen.push(*name);
             }
         }
-        assert_eq!(seen.len(), 12, "{seen:?}");
+        assert_eq!(seen.len(), 18, "{seen:?}");
     }
 
     #[test]

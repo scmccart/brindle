@@ -84,12 +84,27 @@ pub enum Entry {
     Agent { text: String },
     /// What the agent thought aloud.
     Thought { text: String },
-    /// A tool call, by the agent's id for it. Its content isn't kept.
+    /// A tool call, by the agent's id for it, with its content (OpenSpec
+    /// change `agents-tool-content`): the items in the agent's order, the
+    /// count of items dropped past [`MAX_ITEMS`] or [`CALL_LIMIT`], the
+    /// files it works on, and its raw input and result as text. Each is
+    /// left out when unset, so a tool call without content encodes as
+    /// before content existed.
     Tool {
         call: String,
         title: String,
         kind: ToolKind,
         status: ToolStatus,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<ToolItem>,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        more: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        locations: Vec<Location>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
     },
     /// A permission request and, once answered, its outcome. `call` is the
     /// tool call it asks about, when the agent named one.
@@ -108,6 +123,21 @@ pub enum Entry {
 }
 
 impl Entry {
+    /// A tool call entry with no content.
+    pub fn tool(call: String, title: String, kind: ToolKind, status: ToolStatus) -> Self {
+        Self::Tool {
+            call,
+            title,
+            kind,
+            status,
+            content: Vec::new(),
+            more: 0,
+            locations: Vec::new(),
+            input: None,
+            result: None,
+        }
+    }
+
     /// The text that [`Event::Appended`] grows, for the kinds that have one.
     fn text_mut(&mut self) -> Option<&mut String> {
         match self {
@@ -147,6 +177,264 @@ pub enum ToolStatus {
     InProgress,
     Completed,
     Failed,
+}
+
+/// The most text one tool content item holds (a [`ToolItem::Text`]'s text,
+/// a [`FileChange`]'s lines, an [`Output`]'s text; OpenSpec change
+/// `agents-tool-content`, design decision 5). Equal to [`TEXT_CHUNK`], so
+/// any one item fits one event.
+pub const ITEM_LIMIT: usize = TEXT_CHUNK;
+
+/// The most content items a tool call keeps; later ones are counted in its
+/// `more`.
+pub const MAX_ITEMS: usize = 32;
+
+/// The most text a tool call's items hold together; later items are
+/// counted in its `more`.
+pub const CALL_LIMIT: usize = 256 * 1024;
+
+/// The most text each of a tool call's raw input and raw result keeps.
+pub const RAW_LIMIT: usize = 16 * 1024;
+
+/// The most locations a tool call keeps.
+pub const MAX_LOCATIONS: usize = 32;
+
+/// One item of a tool call's content, in Brindle's own form: no ACP
+/// version is named in it (design decision 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "item", rename_all = "snake_case")]
+pub enum ToolItem {
+    /// Markdown source; `cut` when its end was dropped at [`ITEM_LIMIT`].
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        cut: bool,
+    },
+    /// One file's change.
+    Diff(FileChange),
+    /// One command's output.
+    Output(Output),
+}
+
+impl ToolItem {
+    /// The item's text, as [`ITEM_LIMIT`] and [`CALL_LIMIT`] count it.
+    pub fn text_len(&self) -> usize {
+        match self {
+            Self::Text { text, .. } => text.len(),
+            Self::Diff(change) => change.text_len(),
+            Self::Output(output) => output.text.len(),
+        }
+    }
+}
+
+/// One file's change: its operation, its path and its changed lines as
+/// hunks. A change with no hunks is valid (a binary file, a move with no
+/// edit). `omitted` counts the lines not kept past [`ITEM_LIMIT`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileChange {
+    #[serde(flatten)]
+    pub op: FileOp,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<Hunk>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub omitted: u32,
+}
+
+impl FileChange {
+    /// The kept lines' text together.
+    pub fn text_len(&self) -> usize {
+        self.hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .map(|line| line.text().len())
+            .sum()
+    }
+}
+
+/// What a file change does. Only a move or copy has a second path; an
+/// operation a later ACP adds keeps its name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum FileOp {
+    Add,
+    Delete,
+    Modify,
+    Move { from: String },
+    Copy { from: String },
+    Other { name: String },
+}
+
+/// A run of changed lines with their context: where it starts in the old
+/// and the new file (1-based), and its lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Hunk {
+    pub old_start: u32,
+    pub new_start: u32,
+    pub lines: Vec<DiffLine>,
+}
+
+/// One line of a hunk, without its line break. It encodes as one JSON
+/// string whose first character is its sign: a space, `+` or `-`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffLine {
+    Context(String),
+    Added(String),
+    Removed(String),
+}
+
+impl DiffLine {
+    /// The line's text, without its sign.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Context(text) | Self::Added(text) | Self::Removed(text) => text,
+        }
+    }
+}
+
+impl Serialize for DiffLine {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (sign, text) = match self {
+            Self::Context(text) => (' ', text),
+            Self::Added(text) => ('+', text),
+            Self::Removed(text) => ('-', text),
+        };
+        let mut line = String::with_capacity(text.len() + 1);
+        line.push(sign);
+        line.push_str(text);
+        serializer.serialize_str(&line)
+    }
+}
+
+impl<'de> Deserialize<'de> for DiffLine {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let line = String::deserialize(deserializer)?;
+        let mut chars = line.chars();
+        let sign = chars.next();
+        let text = chars.as_str().to_string();
+        match sign {
+            Some(' ') => Ok(Self::Context(text)),
+            Some('+') => Ok(Self::Added(text)),
+            Some('-') => Ok(Self::Removed(text)),
+            Some(other) => Err(serde::de::Error::custom(format!(
+                "a diff line starts with a space, + or -, not {other:?}"
+            ))),
+            None => Err(serde::de::Error::custom("a diff line can't be empty")),
+        }
+    }
+}
+
+/// One command's output, as plain text. `omitted` counts the bytes dropped
+/// from its start past [`ITEM_LIMIT`]; `partial` says the kept text starts
+/// inside a line whose start was dropped, which the fold needs to keep
+/// whole lines the same however the output was split.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Output {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub omitted: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub partial: bool,
+    /// How the command ended; `None` while it runs, or when it never said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit: Option<Exit>,
+}
+
+impl Output {
+    /// Appends `text` and keeps the longest suffix within [`ITEM_LIMIT`]
+    /// (design decision 8): whole lines are dropped from the start, and a
+    /// single line longer than the limit keeps its last bytes, cut at a
+    /// character boundary. Appending `a` then `b` gives what appending
+    /// `a + b` does. Returns the bytes dropped, for the entry's size.
+    fn append(&mut self, text: &str) -> String {
+        self.text.push_str(text);
+        let cut = self.cut();
+        if cut == 0 {
+            return String::new();
+        }
+        let partial = self.text.as_bytes().get(cut - 1) != Some(&b'\n');
+        let dropped: String = self.text.drain(..cut).collect();
+        self.omitted = self.omitted.saturating_add(dropped.len() as u64);
+        self.partial = partial;
+        dropped
+    }
+
+    /// Where the kept text starts: the first line start at or after the
+    /// limit's reach, or failing one the first character boundary there.
+    /// The text's own start is a line start unless it is `partial`.
+    fn cut(&self) -> usize {
+        let text = &self.text;
+        let low = text.len().saturating_sub(ITEM_LIMIT);
+        if low == 0 && !self.partial {
+            return 0;
+        }
+        if low > 0 && text.as_bytes().get(low - 1) == Some(&b'\n') {
+            return low;
+        }
+        // The first character boundary from `low`: a line break is one
+        // byte, so none is skipped.
+        let boundary = (low..=text.len())
+            .find(|&at| text.is_char_boundary(at))
+            .unwrap_or(text.len());
+        match text.get(boundary..).and_then(|rest| rest.find('\n')) {
+            Some(at) if boundary + at + 1 < text.len() => boundary + at + 1,
+            Some(_) | None => boundary,
+        }
+    }
+}
+
+/// How a command ended: an exit code, or a signal by name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "exit", rename_all = "snake_case")]
+pub enum Exit {
+    Code { code: i32 },
+    Signal { name: String },
+}
+
+/// A file a tool call works on, and its line when the agent gave one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Location {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+}
+
+/// A field that a change event leaves out when unchanged, sends as `null`
+/// when cleared and as its value when set.
+mod change {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, T: Serialize>(
+        value: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match value {
+            Some(inner) => inner.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(deserializer).map(Some)
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 /// How a notice reads.
@@ -410,7 +698,9 @@ pub enum Event {
         id: EntryId,
         text: String,
     },
-    /// A tool call's fields that changed.
+    /// A tool call's fields that changed. `locations` replaces the list
+    /// whole; `input` and `result` are left out when unchanged, `null` when
+    /// cleared.
     ToolChanged {
         id: EntryId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -419,6 +709,33 @@ pub enum Event {
         kind: Option<ToolKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         status: Option<ToolStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        locations: Option<Vec<Location>>,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "change")]
+        input: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none", with = "change")]
+        result: Option<Option<String>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        more: Option<u32>,
+    },
+    /// A tool call's content from item `from` on is replaced by `items`: a
+    /// replaced list is `from: 0`, an appended item `from` the length, and
+    /// `from: 0` with no items clears it.
+    ToolItems {
+        id: EntryId,
+        from: u32,
+        #[serde(default)]
+        items: Vec<ToolItem>,
+    },
+    /// More text for a tool call's output item, and how its command ended
+    /// once it did. The fold keeps the text's longest suffix within
+    /// [`ITEM_LIMIT`].
+    ToolOutput {
+        id: EntryId,
+        item: u32,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        exit: Option<Exit>,
     },
     /// A permission request's outcome.
     Answered {
@@ -512,8 +829,13 @@ pub enum FoldError {
     UnknownEntry { id: EntryId },
     /// An `Appended` for an entry with no text to grow.
     NotAppendable { id: EntryId },
-    /// A `ToolChanged` for an entry that isn't a tool call.
+    /// A `ToolChanged`, `ToolItems` or `ToolOutput` for an entry that isn't
+    /// a tool call.
     NotATool { id: EntryId },
+    /// A `ToolItems` whose `from` is past the end of the content.
+    ItemsOutOfRange { id: EntryId, from: u32, len: u32 },
+    /// A `ToolOutput` for an item that is missing or isn't an output.
+    NotAnOutput { id: EntryId, item: u32 },
     /// An `Answered` for an entry that isn't a permission request.
     NotAPermission { id: EntryId },
     /// An `Answered` for a permission request that already has an outcome.
@@ -552,6 +874,13 @@ impl fmt::Display for FoldError {
             Self::UnknownEntry { id } => write!(f, "there is no entry {id}"),
             Self::NotAppendable { id } => write!(f, "entry {id} has no text to append to"),
             Self::NotATool { id } => write!(f, "entry {id} isn't a tool call"),
+            Self::ItemsOutOfRange { id, from, len } => write!(
+                f,
+                "tool call {id}'s content was replaced from item {from}, but it has {len}"
+            ),
+            Self::NotAnOutput { id, item } => {
+                write!(f, "tool call {id} has no output item {item}")
+            }
             Self::NotAPermission { id } => write!(f, "entry {id} isn't a permission request"),
             Self::AlreadyAnswered { id } => {
                 write!(f, "permission request {id} was already answered")
@@ -740,12 +1069,20 @@ impl Transcript {
                 title,
                 kind,
                 status,
+                locations,
+                input,
+                result,
+                more,
             } => {
                 let kept = self.kept_mut(*id)?;
                 let Entry::Tool {
                     title: own_title,
                     kind: own_kind,
                     status: own_status,
+                    locations: own_locations,
+                    input: own_input,
+                    result: own_result,
+                    more: own_more,
                     ..
                 } = &mut kept.entry
                 else {
@@ -760,7 +1097,64 @@ impl Transcript {
                 if let Some(status) = status {
                     *own_status = *status;
                 }
+                if let Some(locations) = locations {
+                    own_locations.clone_from(locations);
+                }
+                if let Some(input) = input {
+                    own_input.clone_from(input);
+                }
+                if let Some(result) = result {
+                    own_result.clone_from(result);
+                }
+                if let Some(more) = more {
+                    *own_more = *more;
+                }
                 self.resize_entry(*id);
+            }
+            Event::ToolItems { id, from, items } => {
+                let kept = self.kept_mut(*id)?;
+                let Entry::Tool { content, .. } = &mut kept.entry else {
+                    return Err(FoldError::NotATool { id: *id });
+                };
+                let len = u32::try_from(content.len()).unwrap_or(u32::MAX);
+                if *from > len {
+                    return Err(FoldError::ItemsOutOfRange {
+                        id: *id,
+                        from: *from,
+                        len,
+                    });
+                }
+                content.truncate(*from as usize);
+                content.extend(items.iter().cloned());
+                self.resize_entry(*id);
+            }
+            Event::ToolOutput {
+                id,
+                item,
+                text,
+                exit,
+            } => {
+                let kept = self.kept_mut(*id)?;
+                let Entry::Tool { content, .. } = &mut kept.entry else {
+                    return Err(FoldError::NotATool { id: *id });
+                };
+                let Some(ToolItem::Output(output)) = content.get_mut(*item as usize) else {
+                    return Err(FoldError::NotAnOutput { id: *id, item: *item });
+                };
+                let before = output_fields_len(output);
+                let dropped = output.append(text);
+                if let Some(exit) = exit {
+                    output.exit = Some(exit.clone());
+                }
+                let after = output_fields_len(output);
+                // Grown by the text and shrunk by what was dropped, with no
+                // re-encode per piece; `omitted`, `partial` and `exit` are
+                // measured alone.
+                let old = kept.size;
+                let size = (old + escaped_len(text) + after)
+                    .saturating_sub(escaped_len(&dropped) + before);
+                kept.size = size;
+                self.size = self.size.saturating_sub(old) + size;
             }
             Event::Answered { id, outcome } => {
                 let kept = self.kept_mut(*id)?;
@@ -948,16 +1342,31 @@ impl Transcript {
     /// [`Transcript::replay`] cut at a start entry (design decision 3): the
     /// newest whole entries whose encoded lengths add up to at most
     /// `budget`, always the newest one, reaching back to the oldest pending
-    /// permission; then a `Window` naming how many kept entries precede
-    /// them. Everything that isn't an entry (the slot, the conversation,
-    /// the turn, the agent's state) is in every page. A log that fits the
-    /// budget pages as its `replay()`.
+    /// permission and to the tool call each pending permission names (the
+    /// newest tool entry with that call before it; OpenSpec change
+    /// `agents-tool-content`, design decision 15); then a `Window` naming
+    /// how many kept entries precede them. Everything that isn't an entry
+    /// (the slot, the conversation, the turn, the agent's state) is in
+    /// every page. A log that fits the budget pages as its `replay()`.
     pub fn page(&self, budget: usize) -> Vec<Event> {
         let mut start = self.entries.len() - self.newest_within(self.entries.len(), budget);
-        if let Some(pending) = self.entries.iter().position(|kept| {
-            matches!(kept.entry, Entry::Permission { outcome: None, .. })
-        }) {
-            start = start.min(pending);
+        for (index, kept) in self.entries.iter().enumerate() {
+            let Entry::Permission {
+                outcome: None,
+                call,
+                ..
+            } = &kept.entry
+            else {
+                continue;
+            };
+            start = start.min(index);
+            if let Some(call) = call
+                && let Some(tool) = self.entries.range(..index).rposition(|kept| {
+                    matches!(&kept.entry, Entry::Tool { call: own, .. } if own == call)
+                })
+            {
+                start = start.min(tool);
+            }
         }
         self.replay_from(start)
     }
@@ -1006,6 +1415,8 @@ impl Transcript {
             Event::Added { id, .. } => Some(*id),
             Event::Appended { .. }
             | Event::ToolChanged { .. }
+            | Event::ToolItems { .. }
+            | Event::ToolOutput { .. }
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
@@ -1172,13 +1583,35 @@ impl Transcript {
     }
 }
 
+/// The encoded length of an output's fields that `ToolOutput` changes other
+/// than its text: `omitted`, `partial` and `exit`, each with its comma,
+/// none when unset (every one follows the item's tag and its text).
+fn output_fields_len(output: &Output) -> usize {
+    let omitted = if output.omitted == 0 {
+        0
+    } else {
+        ",\"omitted\":".len() + output.omitted.to_string().len()
+    };
+    let partial = if output.partial {
+        ",\"partial\":true".len()
+    } else {
+        0
+    };
+    let exit = output.exit.as_ref().map_or(0, |exit| {
+        ",\"exit\":".len() + serde_json::to_vec(exit).map_or(0, |bytes| bytes.len())
+    });
+    omitted + partial + exit
+}
+
 /// The entry a change to an existing entry names: the events a paged copy
 /// ignores below its window.
 fn entry_change(event: &Event) -> Option<EntryId> {
     match event {
-        Event::Appended { id, .. } | Event::ToolChanged { id, .. } | Event::Answered { id, .. } => {
-            Some(*id)
-        }
+        Event::Appended { id, .. }
+        | Event::ToolChanged { id, .. }
+        | Event::ToolItems { id, .. }
+        | Event::ToolOutput { id, .. }
+        | Event::Answered { id, .. } => Some(*id),
         Event::Added { .. }
         | Event::Queue { .. }
         | Event::Turn { .. }
@@ -1218,7 +1651,42 @@ fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
                 });
             }
         }
-        Entry::Tool { .. } | Entry::Notice { .. } => events.push(Event::Added {
+        Entry::Tool {
+            call,
+            title,
+            kind,
+            status,
+            content,
+            more,
+            locations,
+            input,
+            result,
+        } => {
+            // The entry without its content, then one item per event, so
+            // any one event stays within a frame.
+            events.push(Event::Added {
+                id,
+                entry: Entry::Tool {
+                    call: call.clone(),
+                    title: title.clone(),
+                    kind: *kind,
+                    status: *status,
+                    content: Vec::new(),
+                    more: *more,
+                    locations: locations.clone(),
+                    input: input.clone(),
+                    result: result.clone(),
+                },
+            });
+            events.extend(content.iter().enumerate().map(|(index, item)| {
+                Event::ToolItems {
+                    id,
+                    from: u32::try_from(index).unwrap_or(u32::MAX),
+                    items: vec![item.clone()],
+                }
+            }));
+        }
+        Entry::Notice { .. } => events.push(Event::Added {
             id,
             entry: entry.clone(),
         }),
@@ -1290,11 +1758,30 @@ mod tests {
     }
 
     fn tool(call: &str) -> Entry {
-        Entry::Tool {
-            call: call.into(),
-            title: "Read notes.md".into(),
-            kind: ToolKind::Read,
-            status: ToolStatus::Pending,
+        Entry::tool(
+            call.into(),
+            "Read notes.md".into(),
+            ToolKind::Read,
+            ToolStatus::Pending,
+        )
+    }
+
+    /// A `ToolChanged` of the title, kind and status alone.
+    fn changed(
+        id: u64,
+        title: Option<&str>,
+        kind: Option<ToolKind>,
+        status: Option<ToolStatus>,
+    ) -> Event {
+        Event::ToolChanged {
+            id: EntryId(id),
+            title: title.map(Into::into),
+            kind,
+            status,
+            locations: None,
+            input: None,
+            result: None,
+            more: None,
         }
     }
 
@@ -1349,38 +1836,28 @@ mod tests {
     fn a_tool_changes_by_id_and_only_in_the_fields_given() {
         let mut transcript = fold(&[added(1, tool("call_1")), added(2, tool("call_2"))]).unwrap();
         transcript
-            .apply(&Event::ToolChanged {
-                id: EntryId(2),
-                title: None,
-                kind: None,
-                status: Some(ToolStatus::Completed),
-            })
+            .apply(&changed(2, None, None, Some(ToolStatus::Completed)))
             .unwrap();
         transcript
-            .apply(&Event::ToolChanged {
-                id: EntryId(1),
-                title: Some("Edit notes.md".into()),
-                kind: Some(ToolKind::Edit),
-                status: None,
-            })
+            .apply(&changed(1, Some("Edit notes.md"), Some(ToolKind::Edit), None))
             .unwrap();
         assert_eq!(
             transcript.entry(EntryId(1)),
-            Some(&Entry::Tool {
-                call: "call_1".into(),
-                title: "Edit notes.md".into(),
-                kind: ToolKind::Edit,
-                status: ToolStatus::Pending,
-            })
+            Some(&Entry::tool(
+                "call_1".into(),
+                "Edit notes.md".into(),
+                ToolKind::Edit,
+                ToolStatus::Pending,
+            ))
         );
         assert_eq!(
             transcript.entry(EntryId(2)),
-            Some(&Entry::Tool {
-                call: "call_2".into(),
-                title: "Read notes.md".into(),
-                kind: ToolKind::Read,
-                status: ToolStatus::Completed,
-            })
+            Some(&Entry::tool(
+                "call_2".into(),
+                "Read notes.md".into(),
+                ToolKind::Read,
+                ToolStatus::Completed,
+            ))
         );
     }
 
@@ -1506,12 +1983,7 @@ mod tests {
                 FoldError::NotAppendable { id: EntryId(4) },
             ),
             (
-                Event::ToolChanged {
-                    id: EntryId(3),
-                    title: None,
-                    kind: None,
-                    status: Some(ToolStatus::Failed),
-                },
+                changed(3, None, None, Some(ToolStatus::Failed)),
                 FoldError::NotATool { id: EntryId(3) },
             ),
             (
@@ -2003,12 +2475,12 @@ mod tests {
                 text: "\n\u{1}\\é".into(),
             },
             added(2, tool("call_1")),
-            Event::ToolChanged {
-                id: EntryId(2),
-                title: Some("a longer title than before".into()),
-                kind: None,
-                status: Some(ToolStatus::InProgress),
-            },
+            changed(
+                2,
+                Some("a longer title than before"),
+                None,
+                Some(ToolStatus::InProgress),
+            ),
             added(3, permission()),
         ])
         .unwrap();
@@ -2029,12 +2501,12 @@ mod tests {
     fn events_encode_as_tagged_objects() {
         let event = Event::Added {
             id: EntryId(3),
-            entry: Entry::Tool {
-                call: "call_1".into(),
-                title: "Read".into(),
-                kind: ToolKind::SwitchMode,
-                status: ToolStatus::InProgress,
-            },
+            entry: Entry::tool(
+                "call_1".into(),
+                "Read".into(),
+                ToolKind::SwitchMode,
+                ToolStatus::InProgress,
+            ),
         };
         assert_eq!(
             event.to_value(),
@@ -2055,13 +2527,7 @@ mod tests {
         );
         // Unset optional fields are left out.
         assert_eq!(
-            Event::ToolChanged {
-                id: EntryId(1),
-                title: None,
-                kind: None,
-                status: None
-            }
-            .to_value(),
+            changed(1, None, None, None).to_value(),
             serde_json::json!({"event": "tool_changed", "id": 1})
         );
     }
@@ -2304,12 +2770,7 @@ mod tests {
         let before = copy.clone();
         for event in [
             appended(2, "more"),
-            Event::ToolChanged {
-                id: EntryId(1),
-                title: None,
-                kind: None,
-                status: Some(ToolStatus::Completed),
-            },
+            changed(1, None, None, Some(ToolStatus::Completed)),
             Event::Answered {
                 id: EntryId(4),
                 outcome: PermissionOutcome::Cancelled,
@@ -2505,12 +2966,7 @@ mod tests {
             server.apply(&added(id, agent("z"))).unwrap();
         }
         server
-            .apply(&Event::ToolChanged {
-                id: EntryId(4),
-                title: None,
-                kind: None,
-                status: Some(ToolStatus::Completed),
-            })
+            .apply(&changed(4, None, None, Some(ToolStatus::Completed)))
             .unwrap();
         server
             .apply(&Event::Answered {
@@ -2694,5 +3150,561 @@ mod tests {
         ] {
             assert_eq!(error.to_string(), text);
         }
+    }
+
+    // Tool content (OpenSpec change `agents-tool-content`).
+
+    fn text_item(text: &str) -> ToolItem {
+        ToolItem::Text {
+            text: text.into(),
+            cut: false,
+        }
+    }
+
+    fn output_item(command: Option<&str>) -> ToolItem {
+        ToolItem::Output(Output {
+            command: command.map(Into::into),
+            ..Output::default()
+        })
+    }
+
+    fn diff_item() -> ToolItem {
+        ToolItem::Diff(FileChange {
+            op: FileOp::Modify,
+            path: "/p/main.rs".into(),
+            hunks: vec![Hunk {
+                old_start: 10,
+                new_start: 10,
+                lines: vec![
+                    DiffLine::Context("fn main() {".into()),
+                    DiffLine::Removed("    old();".into()),
+                    DiffLine::Added("    new();".into()),
+                ],
+            }],
+            omitted: 0,
+        })
+    }
+
+    /// `tool(call)` with this content and raw input.
+    fn tool_with(call: &str, items: Vec<ToolItem>, raw_input: Option<&str>) -> Entry {
+        let mut entry = tool(call);
+        if let Entry::Tool { content, input, .. } = &mut entry {
+            *content = items;
+            *input = raw_input.map(Into::into);
+        }
+        entry
+    }
+
+    fn items(id: u64, from: u32, items: Vec<ToolItem>) -> Event {
+        Event::ToolItems {
+            id: EntryId(id),
+            from,
+            items,
+        }
+    }
+
+    fn output(id: u64, item: u32, text: &str, exit: Option<Exit>) -> Event {
+        Event::ToolOutput {
+            id: EntryId(id),
+            item,
+            text: text.into(),
+            exit,
+        }
+    }
+
+    fn content_of(transcript: &Transcript, id: u64) -> Vec<ToolItem> {
+        match transcript.entry(EntryId(id)) {
+            Some(Entry::Tool { content, .. }) => content.clone(),
+            other => panic!("entry {id} is {other:?}"),
+        }
+    }
+
+    fn measured(transcript: &Transcript) -> usize {
+        transcript
+            .entries()
+            .map(|(_, entry)| serde_json::to_vec(entry).unwrap().len())
+            .sum()
+    }
+
+    #[test]
+    fn each_tool_content_form_round_trips() {
+        let entry = Entry::Tool {
+            call: "c1".into(),
+            title: "Edit main.rs".into(),
+            kind: ToolKind::Edit,
+            status: ToolStatus::Completed,
+            content: vec![
+                text_item("done"),
+                ToolItem::Text {
+                    text: "cut".into(),
+                    cut: true,
+                },
+                diff_item(),
+                ToolItem::Diff(FileChange {
+                    op: FileOp::Move { from: "/p/a".into() },
+                    path: "/p/b".into(),
+                    hunks: Vec::new(),
+                    omitted: 3,
+                }),
+                ToolItem::Diff(FileChange {
+                    op: FileOp::Other { name: "chmod".into() },
+                    path: "/p/c".into(),
+                    hunks: Vec::new(),
+                    omitted: 0,
+                }),
+                ToolItem::Output(Output {
+                    command: Some("cargo test".into()),
+                    cwd: Some("/p".into()),
+                    text: "ok\n".into(),
+                    omitted: 12,
+                    partial: true,
+                    exit: Some(Exit::Code { code: 0 }),
+                }),
+                ToolItem::Output(Output {
+                    exit: Some(Exit::Signal { name: "KILL".into() }),
+                    ..Output::default()
+                }),
+            ],
+            more: 2,
+            locations: vec![Location {
+                path: "/p/main.rs".into(),
+                line: Some(10),
+            }],
+            input: Some("{\"path\":\"/p\"}".into()),
+            result: Some("ok".into()),
+        };
+        let events = [
+            added(1, entry),
+            items(1, 0, vec![diff_item()]),
+            output(1, 2, "more\n", Some(Exit::Code { code: 1 })),
+            Event::ToolChanged {
+                id: EntryId(1),
+                title: None,
+                kind: None,
+                status: None,
+                locations: Some(Vec::new()),
+                input: Some(None),
+                result: Some(Some("r".into())),
+                more: Some(0),
+            },
+        ];
+        for event in events {
+            let value = event.to_value();
+            assert_eq!(Event::from_value(&value), Ok(event.clone()), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_diff_line_is_one_string_with_its_sign_first() {
+        let value = serde_json::to_value(diff_item()).unwrap();
+        assert_eq!(
+            value["lines"],
+            serde_json::Value::Null,
+            "the lines are in the hunks"
+        );
+        assert_eq!(
+            value["hunks"][0]["lines"],
+            serde_json::json!([" fn main() {", "-    old();", "+    new();"])
+        );
+        assert_eq!(value["item"], "diff");
+        assert_eq!(value["op"], "modify");
+        for bad in ["x", "", "*a"] {
+            let event = serde_json::json!({
+                "event": "tool_items", "id": 1, "from": 0,
+                "items": [{"item": "diff", "op": "add", "path": "/p",
+                           "hunks": [{"old_start": 1, "new_start": 1, "lines": [bad]}]}],
+            });
+            let error = Event::from_value(&event).unwrap_err();
+            assert!(error.to_string().contains("diff line"), "{bad:?}: {error}");
+        }
+        // A sign alone is an empty line.
+        let line: DiffLine = serde_json::from_value(serde_json::json!("+")).unwrap();
+        assert_eq!(line, DiffLine::Added(String::new()));
+    }
+
+    #[test]
+    fn a_tool_call_without_content_encodes_as_before_content_existed() {
+        let value = added(4, tool("call_1")).to_value();
+        assert_eq!(
+            value,
+            serde_json::json!({"event": "added", "id": 4, "entry": {
+                "type": "tool", "call": "call_1", "title": "Read notes.md",
+                "kind": "read", "status": "pending"}})
+        );
+        assert_eq!(
+            changed(4, None, None, Some(ToolStatus::Completed)).to_value(),
+            serde_json::json!({"event": "tool_changed", "id": 4, "status": "completed"})
+        );
+    }
+
+    #[test]
+    fn decoding_refuses_bad_tool_content_and_ignores_unknown_fields_in_it() {
+        for value in [
+            serde_json::json!({"event": "tool_items", "id": 1, "from": 0,
+                               "items": [{"item": "picture"}]}),
+            serde_json::json!({"event": "tool_items", "id": 1, "from": -1, "items": []}),
+            serde_json::json!({"event": "tool_items", "id": 1, "from": 0,
+                               "items": [{"item": "diff", "op": "teleport", "path": "/p"}]}),
+            serde_json::json!({"event": "tool_items", "id": 1, "from": 0,
+                               "items": [{"item": "diff", "op": "move", "path": "/p"}]}),
+            serde_json::json!({"event": "tool_output", "id": 1, "item": 0}),
+            serde_json::json!({"event": "tool_output", "id": 1, "item": 0, "text": "",
+                               "exit": {"exit": "eaten"}}),
+            serde_json::json!({"event": "tool_changed", "id": 1, "locations": [{"line": 3}]}),
+        ] {
+            let error = Event::from_value(&value).unwrap_err();
+            assert!(!error.to_string().is_empty(), "{value}");
+        }
+        assert_eq!(
+            Event::from_value(&serde_json::json!({
+                "event": "tool_output", "id": 1, "item": 0, "text": "a", "later": 1,
+                "exit": {"exit": "code", "code": 2, "later": true},
+            })),
+            Ok(output(1, 0, "a", Some(Exit::Code { code: 2 })))
+        );
+    }
+
+    #[test]
+    fn tool_items_replace_from_their_index_and_refuse_past_the_end() {
+        let mut transcript = fold(&[added(1, tool("c1")), added(2, agent("a"))]).unwrap();
+        transcript
+            .apply(&items(1, 0, vec![text_item("a"), text_item("b")]))
+            .unwrap();
+        assert_eq!(content_of(&transcript, 1), [text_item("a"), text_item("b")]);
+        // Appended at the length.
+        transcript.apply(&items(1, 2, vec![diff_item()])).unwrap();
+        assert_eq!(content_of(&transcript, 1).len(), 3);
+        // Replaced from 1.
+        transcript.apply(&items(1, 1, vec![text_item("c")])).unwrap();
+        assert_eq!(content_of(&transcript, 1), [text_item("a"), text_item("c")]);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+        // Cleared.
+        transcript.apply(&items(1, 0, Vec::new())).unwrap();
+        assert_eq!(content_of(&transcript, 1), []);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+
+        transcript.apply(&items(1, 0, vec![output_item(None)])).unwrap();
+        let base = transcript.clone();
+        for (event, error) in [
+            (
+                items(1, 2, vec![text_item("x")]),
+                FoldError::ItemsOutOfRange {
+                    id: EntryId(1),
+                    from: 2,
+                    len: 1,
+                },
+            ),
+            (
+                items(2, 0, Vec::new()),
+                FoldError::NotATool { id: EntryId(2) },
+            ),
+            (
+                output(2, 0, "x", None),
+                FoldError::NotATool { id: EntryId(2) },
+            ),
+            (
+                output(1, 1, "x", None),
+                FoldError::NotAnOutput {
+                    id: EntryId(1),
+                    item: 1,
+                },
+            ),
+            (items(9, 0, Vec::new()), FoldError::UnknownEntry { id: EntryId(9) }),
+        ] {
+            let mut copy = base.clone();
+            assert_eq!(copy.apply(&event), Err(error.clone()), "{event:?}");
+            assert_eq!(copy, base, "{event:?} changed the log");
+            assert!(!error.to_string().is_empty());
+        }
+        let mut copy = fold(&[added(1, tool("c1"))]).unwrap();
+        copy.apply(&items(1, 0, vec![text_item("t")])).unwrap();
+        let base = copy.clone();
+        assert_eq!(
+            copy.apply(&output(1, 0, "x", None)),
+            Err(FoldError::NotAnOutput {
+                id: EntryId(1),
+                item: 0
+            })
+        );
+        assert_eq!(copy, base);
+    }
+
+    #[test]
+    fn tool_changed_sets_clears_and_keeps_the_new_fields() {
+        let mut transcript = fold(&[added(1, tool("c1"))]).unwrap();
+        let location = Location {
+            path: "/p".into(),
+            line: None,
+        };
+        transcript
+            .apply(&Event::ToolChanged {
+                id: EntryId(1),
+                title: None,
+                kind: None,
+                status: None,
+                locations: Some(vec![location.clone()]),
+                input: Some(Some("in".into())),
+                result: Some(Some("out".into())),
+                more: Some(4),
+            })
+            .unwrap();
+        transcript
+            .apply(&Event::ToolChanged {
+                id: EntryId(1),
+                title: None,
+                kind: None,
+                status: None,
+                locations: None,
+                input: Some(None),
+                result: None,
+                more: None,
+            })
+            .unwrap();
+        let Some(Entry::Tool {
+            locations,
+            input,
+            result,
+            more,
+            ..
+        }) = transcript.entry(EntryId(1))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (locations, input, result, more),
+            (&vec![location], &None, &Some("out".into()), &4)
+        );
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+    }
+
+    #[test]
+    fn output_appends_and_keeps_whole_lines_within_the_limit() {
+        let mut transcript = fold(&[
+            added(1, tool("c1")),
+            items(1, 0, vec![text_item("t"), output_item(Some("seq"))]),
+        ])
+        .unwrap();
+        transcript.apply(&output(1, 1, "1\n2\n", None)).unwrap();
+        transcript
+            .apply(&output(1, 1, "3\n", Some(Exit::Code { code: 0 })))
+            .unwrap();
+        let ToolItem::Output(kept) = &content_of(&transcript, 1)[1] else {
+            panic!()
+        };
+        assert_eq!(
+            (kept.text.as_str(), kept.omitted, kept.partial, &kept.exit),
+            ("1\n2\n3\n", 0, false, &Some(Exit::Code { code: 0 }))
+        );
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+
+        // Past the limit: whole lines go from the start.
+        let line = format!("{}\n", "x".repeat(99));
+        let mut transcript = fold(&[added(1, tool("c1")), items(1, 0, vec![output_item(None)])])
+            .unwrap();
+        let lines = ITEM_LIMIT / 100 + 10;
+        transcript
+            .apply(&output(1, 0, &line.repeat(lines), None))
+            .unwrap();
+        let ToolItem::Output(kept) = &content_of(&transcript, 1)[0] else {
+            panic!()
+        };
+        assert_eq!(kept.text, line.repeat(ITEM_LIMIT / 100));
+        assert_eq!(kept.omitted, (line.len() * (lines - ITEM_LIMIT / 100)) as u64);
+        assert!(!kept.partial);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+
+        // A single line past the limit keeps its last bytes, at a
+        // character boundary.
+        let mut transcript = fold(&[added(1, tool("c1")), items(1, 0, vec![output_item(None)])])
+            .unwrap();
+        let long = format!("a{}", "é".repeat(ITEM_LIMIT));
+        transcript.apply(&output(1, 0, &long, None)).unwrap();
+        let ToolItem::Output(kept) = &content_of(&transcript, 1)[0] else {
+            panic!()
+        };
+        assert_eq!(kept.text, "é".repeat(ITEM_LIMIT / 2));
+        assert_eq!(kept.omitted as usize, long.len() - ITEM_LIMIT);
+        assert!(kept.partial);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+        // Its line ends, and the next one drops what was left of it.
+        transcript.apply(&output(1, 0, "\nnext", None)).unwrap();
+        let ToolItem::Output(kept) = &content_of(&transcript, 1)[0] else {
+            panic!()
+        };
+        assert_eq!(kept.text, "next");
+        assert!(!kept.partial);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+    }
+
+    /// Folding `ToolOutput(a)` then `ToolOutput(b)` equals folding
+    /// `ToolOutput(a + b)` (design decision 8), which the checkpoint's
+    /// merge relies on: random texts, split at random points.
+    #[test]
+    fn output_appended_in_pieces_folds_as_appended_whole() {
+        const PIECES: &[&str] = &["a", "bc", "\n", "é", "🦀", "\"", "\\", "\t", "line\n"];
+        let mut rng = XorShift::new(0x7e57_00a1);
+        for round in 0..1000 {
+            // Some texts reach past the limit, with long lines or none.
+            let target = if round % 3 == 0 {
+                ITEM_LIMIT + rng.below(2 * ITEM_LIMIT)
+            } else {
+                rng.below(300)
+            };
+            let newlines = rng.below(4) > 0;
+            let mut text = String::new();
+            while text.len() < target {
+                let piece = PIECES[rng.below(PIECES.len())];
+                if piece.contains('\n') && !newlines {
+                    continue;
+                }
+                text.push_str(&piece.repeat(1 + rng.below(if target > 300 { 200 } else { 2 })));
+                // Long runs without a line break.
+                if rng.below(50) == 0 {
+                    text.push_str(&"z".repeat(rng.below(ITEM_LIMIT + 64)));
+                }
+            }
+            let start = [added(1, tool("c1")), items(1, 0, vec![output_item(None)])];
+            let whole = {
+                let mut transcript = fold(&start).unwrap();
+                transcript.apply(&output(1, 0, &text, None)).unwrap();
+                transcript
+            };
+            let mut pieces = fold(&start).unwrap();
+            let mut rest = text.as_str();
+            while !rest.is_empty() {
+                let mut cut = 1 + rng.below(rest.len());
+                while !rest.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                let (piece, after) = rest.split_at(cut);
+                pieces.apply(&output(1, 0, piece, None)).unwrap();
+                rest = after;
+            }
+            assert_eq!(pieces, whole, "round {round}");
+            assert_eq!(whole.encoded_len(), measured(&whole));
+        }
+    }
+
+    #[test]
+    fn a_tool_entry_replays_without_content_then_one_item_per_event() {
+        let entry = tool_with(
+            "c1",
+            vec![text_item("a"), diff_item(), output_item(Some("ls"))],
+            Some("in"),
+        );
+        let transcript = fold(&[added(1, entry)]).unwrap();
+        let replay = transcript.replay();
+        assert_eq!(
+            replay[..4],
+            [
+                added(1, tool_with("c1", Vec::new(), Some("in"))),
+                items(1, 0, vec![text_item("a")]),
+                items(1, 1, vec![diff_item()]),
+                items(1, 2, vec![output_item(Some("ls"))]),
+            ]
+        );
+        assert_eq!(fold(&replay), Ok(transcript));
+    }
+
+    #[test]
+    fn the_log_trims_large_tool_entries_whole() {
+        let big = ToolItem::Text {
+            text: "t".repeat(ITEM_LIMIT),
+            cut: true,
+        };
+        let mut events = Vec::new();
+        for id in 1..=40u64 {
+            events.push(added(id, tool("c1")));
+            events.push(items(id, 0, vec![big.clone(), big.clone(), big.clone()]));
+        }
+        let mut transcript = fold(&events).unwrap();
+        let entry = transcript.encoded_len() / 40;
+        assert!(entry > 3 * ITEM_LIMIT);
+        let trimmed = transcript.trim_to(12 * entry).unwrap();
+        assert_eq!(
+            trimmed,
+            Event::Trimmed {
+                through: EntryId(28),
+                dropped: 28
+            }
+        );
+        assert_eq!(transcript.entries().count(), 12);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
+        assert_eq!(fold(&transcript.replay()), Ok(transcript));
+    }
+
+    #[test]
+    fn a_paged_copy_ignores_tool_content_below_its_window() {
+        let mut server = fold(&[added(1, tool("c1")), items(1, 0, vec![output_item(None)])])
+            .unwrap();
+        for id in 2..=8 {
+            server.apply(&added(id, agent(&"x".repeat(10)))).unwrap();
+        }
+        let mut copy = fold(&server.replay_from(4)).unwrap();
+        let before = copy.clone();
+        for event in [items(1, 0, vec![text_item("t")]), output(1, 0, "x", None)] {
+            assert_eq!(copy.apply(&event), Ok(()), "{event:?}");
+            assert_eq!(copy, before, "{event:?} changed nothing");
+        }
+    }
+
+    /// A log of a tool call `call`, entries of `filler` bytes, then a
+    /// permission for `call`, answered or not.
+    fn permission_after(call: &str, filler: u64, outcome: Option<PermissionOutcome>) -> Transcript {
+        let mut events = vec![
+            added(1, agent("before")),
+            added(2, tool_with(call, vec![diff_item()], None)),
+        ];
+        let chunk = 64 * 1024;
+        let count = filler / chunk as u64;
+        for id in 3..3 + count {
+            events.push(added(id, agent(&"y".repeat(chunk))));
+        }
+        // `permission()` names call_1.
+        let asked = 3 + count;
+        events.push(added(asked, permission()));
+        if let Some(outcome) = outcome {
+            events.push(Event::Answered {
+                id: EntryId(asked),
+                outcome,
+            });
+        }
+        events.push(added(asked + 1, agent("after")));
+        fold(&events).unwrap()
+    }
+
+    #[test]
+    fn a_waiting_permissions_tool_call_far_back_starts_the_page() {
+        let server = permission_after("call_1", 2 * 1024 * 1024, None);
+        let copy = fold(&server.page(PAGE_BYTES)).unwrap();
+        assert_eq!(copy.window().map(|window| window.from), Some(EntryId(2)));
+        assert_eq!(copy, server.suffix(EntryId(2)));
+        assert_eq!(content_of(&copy, 2), [diff_item()]);
+    }
+
+    #[test]
+    fn an_answered_permissions_tool_call_doesnt_widen_the_page() {
+        let server = permission_after(
+            "call_1",
+            2 * 1024 * 1024,
+            Some(PermissionOutcome::Cancelled),
+        );
+        let plain = fold(&server.page(PAGE_BYTES)).unwrap();
+        assert!(plain.window().unwrap().from > EntryId(30));
+    }
+
+    #[test]
+    fn a_permission_naming_a_call_the_log_doesnt_hold_pages_as_before() {
+        let server = permission_after("call_9", 2 * 1024 * 1024, None);
+        let copy = fold(&server.page(PAGE_BYTES)).unwrap();
+        // The budget's newest entries, the permission among them, as before:
+        // not the tool call of another id.
+        let permission = server
+            .entries()
+            .find(|(_, entry)| matches!(entry, Entry::Permission { .. }))
+            .map(|(id, _)| id)
+            .unwrap();
+        let from = copy.window().unwrap().from;
+        assert!(from > EntryId(30) && from <= permission, "{from}");
     }
 }

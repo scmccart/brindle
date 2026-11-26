@@ -154,6 +154,8 @@ impl AgentShared {
             Event::Appended { id, .. } => self.transcript.entry(*id).map(text_len),
             Event::Added { .. }
             | Event::ToolChanged { .. }
+            | Event::ToolItems { .. }
+            | Event::ToolOutput { .. }
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
@@ -170,7 +172,12 @@ impl AgentShared {
         match event {
             Event::Added { id, .. } => changes.added(*id),
             Event::Appended { id, .. } => changes.appended(*id, before.unwrap_or(0)),
-            Event::ToolChanged { id, .. } | Event::Answered { id, .. } => changes.replaced(*id),
+            // Tool content redraws its row whole until the detail has its
+            // own blocks (`agents-tool-content` task 5.2).
+            Event::ToolChanged { id, .. }
+            | Event::ToolItems { id, .. }
+            | Event::ToolOutput { id, .. }
+            | Event::Answered { id, .. } => changes.replaced(*id),
             Event::Queue { .. } => changes.slot_changed = true,
             // The conversation decides whether a continue is offered.
             Event::Turn { .. } | Event::Agent { .. } | Event::Conversation { .. } => changes.turn_or_agent = true,
@@ -248,7 +255,7 @@ mod tests {
     }
 
     fn tool() -> Entry {
-        Entry::Tool { call: "call_1".into(), title: "Read main.rs".into(), kind: ToolKind::Read, status: ToolStatus::Pending }
+        Entry::tool("call_1".into(), "Read main.rs".into(), ToolKind::Read, ToolStatus::Pending)
     }
 
     /// Every event kind folds, and each says what changed.
@@ -271,7 +278,16 @@ mod tests {
         let next = [
             Event::Appended { id: EntryId(2), text: "lo".into() },
             Event::Appended { id: EntryId(2), text: "!".into() },
-            Event::ToolChanged { id: EntryId(4), title: None, kind: None, status: Some(ToolStatus::Completed) },
+            Event::ToolChanged {
+                id: EntryId(4),
+                title: None,
+                kind: None,
+                status: Some(ToolStatus::Completed),
+                locations: None,
+                input: None,
+                result: None,
+                more: None,
+            },
             Event::Answered { id: EntryId(5), outcome: PermissionOutcome::Selected { option: "allow-once".into() } },
             Event::Queue { slot: Slot::Waiting { text: "next".into() } },
             Event::Turn { state: TurnState::Working },

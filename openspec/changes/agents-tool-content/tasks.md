@@ -16,7 +16,7 @@ Before starting, check these:
 
 ## 1. Captures and shared contracts
 
-- [ ] 1.1 **Capture real ACP v1 agents.**
+- [x] 1.1 **Capture real ACP v1 agents.**
   - Capture the agents already in `remote-agent/tests/fixtures/acp/` that can be run (Claude adapter, Antigravity, Copilot, Codex), with today's `initialize`, which offers `{"auth":{"terminal":true}}`. Each does two things:
     - an allowed edit of an existing file;
     - an allowed shell command printing several lines.
@@ -25,25 +25,26 @@ Before starting, check these:
   - Record in design.md, under a new "As built" note in decision 6, what each agent sends for the diff and the output, and which called `terminal/create`.
   - Codex's `_meta` delivery is already captured (`codex-acp-2.12.0-reject.log`, flag 1). If an agent turns out to deliver output a third way, raise it before writing its mapping.
   - Verify: the new logs replay through the existing capture replay test in `reduce.rs` with no panic.
-- [ ] 1.2 **Add the forms to `brindle-transcript`** (`transcript/src/lib.rs`).
+  - Done without Copilot, whose `session/new` failed in the capture environment (decision 17, flag 18).
+- [x] 1.2 **Add the forms to `brindle-transcript`** (`transcript/src/lib.rs`).
   - The types: `ToolItem`, `FileChange`, `FileOp`, `Hunk`, `DiffLine` (one string per line, the sign first), `Output`, `Exit` and `Location`.
   - `Entry::Tool` gains `content`, `more`, `locations`, `input` and `result`, each `#[serde(default, skip_serializing_if = …)]`. Drop its "Its content isn't kept" doc line.
   - `Event::ToolChanged` gains `locations`, `input`, `result` and `more`.
   - Add `Event::ToolItems` and `Event::ToolOutput`.
   - Add the constants `ITEM_LIMIT`, `MAX_ITEMS`, `CALL_LIMIT`, `RAW_LIMIT` and `MAX_LOCATIONS`.
-  - Re-export what the app uses from `src/agent/transcript.rs`.
+  - Re-export what the app uses from `src/agent/transcript.rs`. (Done in section 5, where the app first uses them.)
   - Verify with unit tests:
     - each form round-trips;
     - a `DiffLine` with another first character, or none, is a `DecodeError`;
     - `decoding_refuses_what_isnt_an_event_and_ignores_unknown_fields` covers the new kinds;
     - every existing `tests/fixtures/v4/` file, `added-tool.json` and `tool-changed-*.json` among them, still passes unedited.
-- [ ] 1.3 **Write the new forms' fixtures** as new files in `transcript/tests/fixtures/v4/`:
+- [x] 1.3 **Write the new forms' fixtures** as new files in `transcript/tests/fixtures/v4/`:
   - a tool entry with each item kind;
   - `tool-items-replaced`, `-appended` and `-cleared`;
   - `tool-output` and `tool-output-exit`;
   - `tool-changed-locations`, `-input`, `-result` and `-more`.
   - Verify: the fixture tests write them once and read them back, and `git diff --stat` shows additions only in that directory.
-- [ ] 1.4 **Add the fold for the new events** in `Transcript::apply`.
+- [x] 1.4 **Add the fold for the new events** in `Transcript::apply`.
   - `ToolItems`: truncate to `from`, then extend. Past the end is `FoldError::ItemsOutOfRange`.
   - `ToolOutput`: append, then keep the longest suffix within `ITEM_LIMIT` (whole lines dropped from the start, a single over-long line keeping its last bytes at a character boundary), adding the dropped bytes to `omitted`. A missing or other item is `FoldError::NotAnOutput`. The kept size grows by `escaped_len` and shrinks by the dropped text's.
   - The new `ToolChanged` fields, through `resize_entry`.
@@ -56,7 +57,7 @@ Before starting, check these:
     - the `LOG_LIMIT` trim over large tool entries;
     - `fuzz::random_transcript` generating tool content, so the paging laws in `fuzz.rs` (page, fetch, prepend, live events below the window) run over it;
     - a paged copy ignoring `ToolItems` and `ToolOutput` below its window.
-- [ ] 1.5 **Make `Transcript::page` reach waiting permissions' tool calls** (design decision 15). It lowers the start to the newest `Entry::Tool` with the `call` that each permission with no outcome names, before that permission.
+- [x] 1.5 **Make `Transcript::page` reach waiting permissions' tool calls** (design decision 15). It lowers the start to the newest `Entry::Tool` with the `call` that each permission with no outcome names, before that permission.
   - Verify with unit tests:
     - a waiting permission whose tool entry is 2 MiB of entries before it starts the page at the tool entry;
     - an answered permission's tool entry doesn't widen the page;

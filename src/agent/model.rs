@@ -2402,7 +2402,7 @@ impl ChatModel {
             Entry::User { text } => format!("user {text:?}"),
             Entry::Agent { text } => format!("agent {text:?}"),
             Entry::Thought { text } => format!("thought open={} {text:?}", self.thought_open(id)),
-            Entry::Tool { call, title, kind, status } => {
+            Entry::Tool { call, title, kind, status, .. } => {
                 format!("tool call={call:?} kind={} status={} {title:?}", tool_kind_word(*kind), tool_status_word(*status))
             }
             Entry::Permission { call, title, options, outcome } => {
@@ -2550,6 +2550,20 @@ mod tests {
 
     fn added(id: u64, entry: Entry) -> Event {
         Event::Added { id: EntryId(id), entry }
+    }
+
+    /// Tool call `id` completed, its other fields unchanged.
+    fn tool_completed(id: u64) -> Event {
+        Event::ToolChanged {
+            id: EntryId(id),
+            title: None,
+            kind: None,
+            status: Some(ToolStatus::Completed),
+            locations: None,
+            input: None,
+            result: None,
+            more: None,
+        }
     }
 
     fn user(text: &str) -> Entry {
@@ -2729,7 +2743,7 @@ mod tests {
         assert!(matches!(&message[1].body, BlockBody::UserText { text } if text.as_ref() == "b"));
         assert_eq!(drawn(EntryId(1), &user(""), false).len(), 1, "an empty message is one block");
         assert_eq!(drawn(EntryId(1), &agent(""), false).len(), 1, "an empty message is one block");
-        let tool = Entry::Tool { call: "c".into(), title: "Read".into(), kind: ToolKind::Read, status: ToolStatus::Pending };
+        let tool = Entry::tool("c".into(), "Read".into(), ToolKind::Read, ToolStatus::Pending);
         assert!(matches!(drawn(EntryId(3), &tool, false)[0].body, BlockBody::Tool { kind: ToolKind::Read, .. }));
         assert!(matches!(drawn(EntryId(4), &thought("t"), true)[0].body, BlockBody::Thought { open: true, .. }));
     }
@@ -3194,7 +3208,7 @@ mod tests {
     #[test]
     fn the_working_row_follows_the_turn() {
         let tool = |id: u64, call: &str, title: &str, status| {
-            added(id, Entry::Tool { call: call.into(), title: title.into(), kind: ToolKind::Read, status })
+            added(id, Entry::tool(call.into(), title.into(), ToolKind::Read, status))
         };
         let mut zone = Zone::ready();
         assert_eq!(zone.model.working_row(), None, "idle");
@@ -3204,7 +3218,7 @@ mod tests {
         let absorbed = zone.feed(&[tool(2, "c1", "Read main.rs", ToolStatus::InProgress)]);
         assert_eq!(absorbed.working, Some(Some(WorkingRow::Tool { title: "Read main.rs".into() })));
         assert_eq!(zone.model.working_row().unwrap().text(), "Read main.rs");
-        let absorbed = zone.feed(&[Event::ToolChanged { id: EntryId(2), title: None, kind: None, status: Some(ToolStatus::Completed) }]);
+        let absorbed = zone.feed(&[tool_completed(2)]);
         assert_eq!(absorbed.working, Some(Some(WorkingRow::Working)), "a completed call");
         // The newest of two in progress.
         zone.feed(&[tool(3, "c2", "First", ToolStatus::InProgress), tool(4, "c3", "Second", ToolStatus::InProgress)]);
@@ -3315,7 +3329,7 @@ mod tests {
     #[test]
     fn a_permission_notice_gives_the_context() {
         let tool = |call: &str, kind| {
-            added(2, Entry::Tool { call: call.into(), title: "cargo test".into(), kind, status: ToolStatus::Pending })
+            added(2, Entry::tool(call.into(), "cargo test".into(), kind, ToolStatus::Pending))
         };
         let asking = |id: u64, call: &str, title: &str| {
             added(
@@ -3412,8 +3426,8 @@ mod tests {
             turn(TurnState::Working),
             added(2, agent("Hello!")),
             added(3, thought("Considering")),
-            added(4, Entry::Tool { call: "call_1".into(), title: "Read main.rs".into(), kind: ToolKind::Read, status: ToolStatus::Pending }),
-            Event::ToolChanged { id: EntryId(4), title: None, kind: None, status: Some(ToolStatus::Completed) },
+            added(4, Entry::tool("call_1".into(), "Read main.rs".into(), ToolKind::Read, ToolStatus::Pending)),
+            tool_completed(4),
             added(5, permission("Run cargo test?")),
             added(6, Entry::Notice { level: NoticeLevel::Warning, text: "1 line was not an ACP message".into() }),
             queue(waiting()),
@@ -4520,7 +4534,7 @@ mod tests {
             ready(),
             added(1, user("go")),
             turn(TurnState::Working),
-            added(2, Entry::Tool { call: "c1".into(), title: "cargo build".into(), kind: ToolKind::Execute, status: ToolStatus::InProgress }),
+            added(2, Entry::tool("c1".into(), "cargo build".into(), ToolKind::Execute, ToolStatus::InProgress)),
         ];
         for n in 0..20 {
             events.push(added(n + 3, agent(&"y".repeat(20 * 1024))));
