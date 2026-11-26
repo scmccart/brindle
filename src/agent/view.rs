@@ -26,7 +26,7 @@ use gpui::{
 
 use brindle_ui::{
     ActiveTheme as _, Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
-    ConfirmationState, ConfirmationTone, FocusScope, FocusStops, Icon, ItemKey, Message, MessageFrom, MessageScroller,
+    ConfirmationState, ConfirmationTone, FocusScope, FocusStops, Icon, ItemKey, Loader, Message, MessageFrom, MessageScroller,
     PageDirection, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
     Resend as UiResend, Response, RichBlock, Shimmer, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
@@ -38,8 +38,8 @@ use crate::actions::{
 use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
-    AgentPhase, Block, BlockBody, ChatModel, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow, Resend,
-    Splice, WorkingRow,
+    AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow,
+    Resend, Splice, WorkingRow,
 };
 use crate::motion::{self, Motion};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
@@ -265,6 +265,10 @@ pub struct AgentView {
     /// The working row while it shows, the scroller's last item; the view
     /// wants the motion clock meanwhile.
     working: Option<WorkingRow>,
+    /// The Earlier row as the model last gave it (OpenSpec change
+    /// `agents-log-paging` decision 11): the scroller's top row while there
+    /// is one; the view wants the motion clock while it loads.
+    earlier: Earlier,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -311,7 +315,18 @@ impl AgentView {
         let working = agent.read(cx).model().working_row();
         let count = agent.read(cx).model().blocks().len() + usize::from(working.is_some());
         let view = cx.weak_entity();
-        let scroller = cx.new(|cx| MessageScroller::new(count, move |ix, _, cx| render_block(&view, ix, cx), cx));
+        let (top, told) = (view.clone(), view.clone());
+        let scroller = cx.new(|cx| {
+            MessageScroller::new(count, move |ix, _, cx| render_block(&view, ix, cx), cx)
+                .with_top_row(move |_, cx| earlier_row(&top, cx))
+                // The row came into view, or went: a fetch may be due.
+                .on_top_row_view(move |in_view, cx| {
+                    told.update(cx, |this, cx| {
+                        this.agent.update(cx, |agent, cx| agent.fetch_if_due(in_view, !in_view, cx));
+                    })
+                    .ok();
+                })
+        });
         let area = prompt.read(cx).area().clone();
         let subscriptions = vec![
             cx.subscribe_in(&agent, window, |this, _, update: &AgentUpdate, _, cx| this.on_update(update, cx)),
@@ -329,9 +344,6 @@ impl AgentView {
                 move |_, cx| Motion::want(id, false, cx)
             }),
         ];
-        if working.is_some() {
-            Motion::want(cx.entity_id(), true, cx);
-        }
         let mut this = Self {
             agent,
             scroller,
@@ -343,10 +355,42 @@ impl AgentView {
             theme,
             font_size_override,
             working,
+            earlier: Earlier::None,
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
+        this.follow_earlier(cx);
+        this.refresh_motion(cx);
         this
+    }
+
+    /// Wants the motion clock while the working row shows or the Earlier
+    /// row loads.
+    fn refresh_motion(&self, cx: &mut Context<Self>) {
+        let loading = match self.earlier {
+            Earlier::Loading { .. } => true,
+            Earlier::None | Earlier::Available { .. } | Earlier::Failed { .. } => false,
+        };
+        Motion::want(cx.entity_id(), self.working.is_some() || loading, cx);
+    }
+
+    /// The model's Earlier row: the scroller shows it while there is one
+    /// and draws it again when it changes; while it shows in view, a fetch
+    /// may be due (a page that left it in view, a reconnect's replay).
+    fn follow_earlier(&mut self, cx: &mut Context<Self>) {
+        let earlier = self.agent.read(cx).model().earlier().clone();
+        if earlier != self.earlier {
+            let shown = earlier != Earlier::None;
+            self.scroller.update(cx, |scroller, cx| {
+                scroller.show_top_row(shown, cx);
+                scroller.refresh_top_row(cx);
+            });
+            self.earlier = earlier;
+            self.refresh_motion(cx);
+        }
+        if self.scroller.read(cx).top_row_in_view() {
+            self.agent.update(cx, |agent, cx| agent.fetch_if_due(true, true, cx));
+        }
     }
 
     pub fn agent(&self) -> &Entity<Agent> {
@@ -454,7 +498,7 @@ impl AgentView {
                     self.scroller.update(cx, |scroller, cx| scroller.splice(splice.range, splice.count, cx));
                 }
                 self.working = after.clone();
-                Motion::want(cx.entity_id(), after.is_some(), cx);
+                self.refresh_motion(cx);
                 cx.notify();
             }
             AgentUpdate::ClearDraft => self.prompt.update(cx, |prompt, cx| prompt.set_text("", cx)),
@@ -487,6 +531,7 @@ impl AgentView {
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let before = self.stops(cx);
         self.refresh(cx);
+        self.follow_earlier(cx);
         let after = self.stops(cx);
         let focused = window.focused(cx);
         if focused.as_ref().is_some_and(|focused| before.contains(focused) && !after.contains(focused)) {
@@ -718,6 +763,50 @@ fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::
     let body = block_element(view.clone(), &block, &handles, colors, code_font);
     let (top, bottom) = item_padding(&block);
     div().px_3().when(top, |d| d.pt_1()).when(bottom, |d| d.pb_1()).w_full().child(body).into_any_element()
+}
+
+/// The Earlier row's words.
+const EARLIER_MESSAGES: &str = "Earlier messages";
+
+/// The Earlier row (OpenSpec change `agents-log-paging` decision 11), the
+/// scroller's top row, in the zone's tokens: "Earlier messages", with the
+/// stepped loader while a page is on its way; after a failure, why,
+/// pressable to ask again. It takes no focus: shift-pageup scrolls it into
+/// view, which asks.
+fn earlier_row(view: &WeakEntity<AgentView>, cx: &mut App) -> gpui::AnyElement {
+    let Some(entity) = view.upgrade() else { return div().into_any_element() };
+    let this = entity.read(cx);
+    let (earlier, agent) = (this.earlier.clone(), this.agent.downgrade());
+    let tokens = cx.ui_theme();
+    let row = div()
+        .debug_selector(|| "agent-earlier".into())
+        .px_3()
+        .py_2()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .text_size(gpui::rems(0.875))
+        .text_color(tokens.muted_foreground);
+    match earlier {
+        Earlier::None => row.into_any_element(),
+        Earlier::Available { .. } => row.child(EARLIER_MESSAGES).into_any_element(),
+        Earlier::Loading { .. } => row
+            .child(Loader::new().step(motion::loader_step(Motion::step(cx))).color(tokens.muted_foreground))
+            .child(EARLIER_MESSAGES)
+            .into_any_element(),
+        Earlier::Failed { why, .. } => row
+            .id("agent-earlier")
+            .cursor_pointer()
+            .whitespace_normal()
+            .text_color(tokens.destructive)
+            .child(format!("Earlier messages couldn't be loaded: {why}"))
+            .on_click(move |_, _, cx| {
+                agent.update(cx, |agent, cx| agent.retry_fetch(cx)).ok();
+            })
+            .into_any_element(),
+    }
 }
 
 /// The working row (decision 2): its words shimmering at the motion

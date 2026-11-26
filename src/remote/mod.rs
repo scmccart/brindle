@@ -98,7 +98,6 @@ impl AgentLink {
     /// (`AGENT_FETCH`, OpenSpec change `agents-log-paging`), as
     /// [`AgentLink::prompt`]: the sink folds the page in front before the
     /// reply comes; while the link is down the reply is its failure.
-    #[allow(dead_code)] // until the zone fetches (agents-log-paging 5.5)
     pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<protocol::RequestId> {
         self.0.fetch(before, max_bytes)
     }

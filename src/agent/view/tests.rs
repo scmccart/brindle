@@ -927,3 +927,60 @@ fn the_connecting_line_reads_across_a_split_zone() {
     assert!(half.size.width >= connecting, "after the split: {half:?}");
     assert!(half.size.height <= full.size.height * 2., "after the split: {half:?}, at full width {full:?}");
 }
+
+/// OpenSpec change `agents-log-paging` task 5.5: a zone attached with a
+/// page shows the Earlier row above its first block; scrolled into view it
+/// asks for the page before the window, and while that is on its way, with
+/// no agent working, the view wants the motion clock for the row's loader;
+/// the page goes in front and the clock stops.
+#[test]
+fn the_earlier_row_fetches_in_view_and_spins_until_the_page_comes() {
+    use crate::agent::transcript::{PAGE_BYTES, Transcript};
+    let mut f = Fixture::new();
+    let mut server = Transcript::new();
+    let mut events = vec![ready(), added(1, user("go"))];
+    for n in 0..40 {
+        events.push(added(n + 2, Entry::Agent { text: format!("{n} {}", "x".repeat(20 * 1024)) }));
+    }
+    events.push(ended(StopReason::EndTurn));
+    for event in &events {
+        server.apply(event).unwrap();
+    }
+    f.zone.sink.replay(true);
+    f.zone.sink.transcript(server.page(PAGE_BYTES).iter().map(Event::to_value).collect()).unwrap();
+    f.zone.sink.replay(false);
+    f.settle();
+    let window = f.zone.shared.lock().transcript().window().expect("800 KiB is paged");
+    let (from, count) = (window.from, window.earlier);
+    let earlier = |f: &mut Fixture| f.view.read_with(f.cx, |view, _| view.earlier.clone());
+    let running = |f: &mut Fixture| f.cx.update(|_, cx| Motion::running(cx));
+    assert_eq!(earlier(&mut f), Earlier::Available { count });
+    assert!(!running(&mut f));
+    let fetches = |f: &mut Fixture| f.zone.take_calls().into_iter().filter(|call| matches!(call, Call::Fetch(..))).count();
+    assert_eq!(fetches(&mut f), 0, "the row isn't in view at the end");
+
+    // Paged up to the row, the zone asks for the page before the window.
+    for _ in 0..40 {
+        if matches!(earlier(&mut f), Earlier::Loading { .. }) {
+            break;
+        }
+        f.view.update(f.cx, |view, cx| view.page(PageDirection::Up, cx));
+        f.cx.run_until_parked();
+    }
+    let Earlier::Loading { request, .. } = earlier(&mut f) else { panic!("no fetch: {:?}", earlier(&mut f)) };
+    let calls = f.zone.calls.borrow().clone();
+    assert!(calls.contains(&Call::Fetch(from.0, PAGE_BYTES as u32)), "{calls:?}");
+    assert!(running(&mut f), "the loader turns while the page is on its way");
+    assert!(f.cx.debug_bounds("agent-earlier").is_some(), "the row is drawn");
+
+    // The page, then its reply: in front, and the clock stops.
+    let blocks = |f: &mut Fixture| f.view.read_with(f.cx, |view, cx| view.agent.read(cx).model().blocks().len());
+    let before = blocks(&mut f);
+    let fetched = server.fetch(from, PAGE_BYTES);
+    f.zone.sink.page(request, fetched.events.iter().map(Event::to_value).collect(), Some(fetched.more)).unwrap();
+    f.zone.sink.reply(request, Ok(()));
+    f.settle();
+    assert!(blocks(&mut f) > before, "the page went in front");
+    assert!(matches!(earlier(&mut f), Earlier::Available { count: left } if left < count) || earlier(&mut f) == Earlier::None);
+    assert!(!running(&mut f), "no agent works and nothing loads");
+}

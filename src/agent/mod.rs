@@ -48,8 +48,8 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, First, Link, LoginChoice, LoginZoneEnd, Offer, ProfileFound, Replied,
-    Sent, Splice, Submit, Unqueue, WorkingRow,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, Link, LoginChoice, LoginZoneEnd, Offer, ProfileFound,
+    Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
 };
 use crate::agent::shared::AgentShared;
 use crate::agent::sink::{AgentEvent, Feed, Sink, Taker};
@@ -83,6 +83,9 @@ pub trait Requests {
     fn restart(&self, request: AgentRestartRequest) -> Option<RequestId>;
     /// Logs the agent in with its login method `method` (`AGENT_LOGIN`).
     fn login(&self, method: &str) -> Option<RequestId>;
+    /// Asks for the entries before `before`, within `max_bytes`
+    /// (`AGENT_FETCH`): the page comes as a change before the reply.
+    fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId>;
 }
 
 /// Opens an agent zone's session on a host (`remote::agent_link`), or a
@@ -140,6 +143,10 @@ impl Requests for crate::remote::AgentLink {
 
     fn login(&self, method: &str) -> Option<RequestId> {
         crate::remote::AgentLink::login(self, method)
+    }
+
+    fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+        crate::remote::AgentLink::fetch(self, before, max_bytes)
     }
 }
 
@@ -685,6 +692,31 @@ impl Agent {
             cx.emit(TerminalEvent::Status(None));
             cx.notify();
         }
+    }
+
+    /// The Earlier row is in view (`row_in_view`), and was in the frame
+    /// before (`was_in_view`): asks for the page before the window when the
+    /// model says so (OpenSpec change `agents-log-paging` decision 11).
+    pub fn fetch_if_due(&mut self, row_in_view: bool, was_in_view: bool, cx: &mut Context<Self>) {
+        if let Some(fetch) = self.model.fetch_due(row_in_view, was_in_view) {
+            self.send_fetch(fetch, cx);
+        }
+    }
+
+    /// A press on the Earlier row after a failed fetch: asks again.
+    pub fn retry_fetch(&mut self, cx: &mut Context<Self>) {
+        if let Some(fetch) = self.model.retry() {
+            self.send_fetch(fetch, cx);
+        }
+    }
+
+    fn send_fetch(&mut self, fetch: Fetch, cx: &mut Context<Self>) {
+        let max_bytes = u32::try_from(fetch.max_bytes).unwrap_or(u32::MAX);
+        match self.requests.as_ref().and_then(|requests| requests.fetch(fetch.before.0, max_bytes)) {
+            Some(request) => self.model.fetching(request),
+            None => self.model.fetch_unsent(),
+        }
+        cx.notify();
     }
 
     /// A thought's trigger.

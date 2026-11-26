@@ -58,6 +58,7 @@ pub enum Call {
     Layout(Option<serde_json::Value>),
     Restart(AgentRestartRequest),
     Login(String),
+    Fetch(u64, u32),
 }
 
 pub type Calls = Rc<RefCell<Vec<Call>>>;
@@ -127,6 +128,10 @@ impl Requests for FakeRequests {
 
     fn login(&self, method: &str) -> Option<RequestId> {
         self.record(Call::Login(method.to_string()))
+    }
+
+    fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+        self.record(Call::Fetch(before, max_bytes))
     }
 }
 

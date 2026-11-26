@@ -240,6 +240,9 @@ impl MessageScroller {
         self.state.splice(self.list_ix(old.start)..self.list_ix(old.end), count);
         if anchor {
             self.state.scroll_to(ListOffset { item_ix: self.list_ix(count), offset_in_item: px(0.) });
+            // The row is above the view now; the next frame says so again
+            // only if it shows.
+            self.top_in_view = false;
         }
         cx.notify();
     }

@@ -8,7 +8,8 @@
 
 pub use brindle_transcript::{
     Activity, AgentState, Conversation, Entry, EntryId, Event, HoldReason, LoginKind, LoginMethod, NoticeLevel,
-    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState,
+    PAGE_BYTES, PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript,
+    TurnState, Window,
 };
 
 /// What the zone's tests build conversations with; the zone itself reads
