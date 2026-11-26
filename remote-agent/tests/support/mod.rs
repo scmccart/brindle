@@ -1274,13 +1274,24 @@ impl TestClient {
         command: &str,
         args: &[&str],
     ) -> Result<(), client::ErrorMessage> {
+        self.restart_in(session, command, args, base_env())
+    }
+
+    /// `AGENT_RESTART` of `command args` with exactly `env`.
+    pub fn restart_in(
+        &mut self,
+        session: SessionId,
+        command: &str,
+        args: &[&str],
+        env: BTreeMap<String, String>,
+    ) -> Result<(), client::ErrorMessage> {
         let req = self.take_req();
         self.send(client::ToCore::AgentRestart(client::AgentRestart {
             req,
             session,
             command: command.into(),
             args: args.iter().map(|arg| arg.to_string()).collect(),
-            env: base_env(),
+            env,
         }));
         self.agent_reply(req)
     }

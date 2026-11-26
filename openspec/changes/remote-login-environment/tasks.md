@@ -9,15 +9,15 @@ No client protocol or H1 version changes (design.md decision 8). The relay link 
 
 ## 2. Pure code in the helper
 
-- [ ] 2.1 New `remote-agent/src/server/login_env.rs`, ungated, with a lint-only `cfg_attr(not(target_os = "linux"), allow(dead_code))`. It holds `invocation(shell, helper)` per design.md decision 3's table (positional `$0` for the POSIX family, fish's quoting, `Unsupported`, `NoShell`) and `LoginEnvFailure` with `text()`. Unit tests: each named shell by file name (`/usr/bin/zsh`, `/bin/busybox`), a helper path with spaces, `'` and `\`, `tcsh`, `nu`, `""`, and every failure's text. Verify with `cargo test -p brindle-remote-agent server::login_env`.
-- [ ] 2.2 In `login_env.rs`, add:
+- [x] 2.1 New `remote-agent/src/server/login_env.rs`, ungated, with a lint-only `cfg_attr(not(target_os = "linux"), allow(dead_code))`. It holds `invocation(shell, helper)` per design.md decision 3's table (positional `$0` for the POSIX family, fish's quoting, `Unsupported`, `NoShell`) and `LoginEnvFailure` with `text()`. Unit tests: each named shell by file name (`/usr/bin/zsh`, `/bin/busybox`), a helper path with spaces, `'` and `\`, `tcsh`, `nu`, `""`, and every failure's text. Verify with `cargo test -p brindle-remote-agent server::login_env`.
+- [x] 2.2 In `login_env.rs`, add:
   - `encode_dump(vars)`: `NAME=VALUE\0` records and the empty terminator;
   - `parse_dump(bytes)`: complete, incomplete or too large, with at most 256 KiB and 4096 variables, and non-UTF-8, empty-name and no-`=` records dropped;
   - `captured(own, dump)`: `_`, `SHLVL`, `PWD` and `OLDPWD` taken from `own`;
   - `with_basics(env, passwd)`: `HOME`, `USER`, `LOGNAME` and `SHELL` filled only when unset or empty.
 
   Unit tests for each case, plus an encode-then-parse round trip. Verify with `cargo test -p brindle-remote-agent server::login_env`.
-- [ ] 2.3 Add `remote-agent/src/server/login_env.rs` to fcis's "Whole pure modules" table and to `PURE_MODULES` in `tests/architecture.rs`. Verify with `cargo test -p brindle --test architecture`.
+- [x] 2.3 Add `remote-agent/src/server/login_env.rs` to fcis's "Whole pure modules" table and to `PURE_MODULES` in `tests/architecture.rs`. Verify with `cargo test -p brindle --test architecture`.
 
 ## 3. Pure code in Brindle
 
@@ -33,15 +33,15 @@ No client protocol or H1 version changes (design.md decision 8). The relay link 
 
 ## 4. The helper's shell
 
-- [ ] 4.1 Extend `pty::passwd_entry` (`remote-agent/src/pty/unix.rs`) to return the user name with the shell and home. In `Reached::host`, the relay's own environment goes through `login_env::with_basics` before it is sent. Verify with `cargo test -p brindle-remote-agent`, and in `remote-agent/tests/relay.rs` with a relay started with `HOME` and `SHELL` removed from its environment: its `RELAY_HOST.env` has both from passwd.
-- [ ] 4.2 Add the hidden `login-env` role in `remote-agent/src/main.rs`, declared under `target_os = "linux"` beside `relay`. It refuses arguments, writes `encode_dump(vars_os())` to fd 3 and exits 0, and it is left out of the usage text. Verify with a real-role test in `remote-agent/tests/relay.rs`: run `brindle-remote login-env` with fd 3 a pipe and a set environment, then parse the pipe with `login_env::parse_dump`. With no fd 3, the role exits non-zero.
-- [ ] 4.3 In `server/relay.rs`, `relay [--login-environment]` (any other argument is a usage error) starts the capture thread after the marker, per decision 3's process rules:
+- [x] 4.1 Extend `pty::passwd_entry` (`remote-agent/src/pty/unix.rs`) to return the user name with the shell and home. In `Reached::host`, the relay's own environment goes through `login_env::with_basics` before it is sent. Verify with `cargo test -p brindle-remote-agent`, and in `remote-agent/tests/relay.rs` with a relay started with `HOME` and `SHELL` removed from its environment: its `RELAY_HOST.env` has both from passwd.
+- [x] 4.2 Add the hidden `login-env` role in `remote-agent/src/main.rs`, declared under `target_os = "linux"` beside `relay`. It refuses arguments, writes `encode_dump(vars_os())` to fd 3 and exits 0, and it is left out of the usage text. Verify with a real-role test in `remote-agent/tests/relay.rs`: run `brindle-remote login-env` with fd 3 a pipe and a set environment, then parse the pipe with `login_env::parse_dump`. With no fd 3, the role exits non-zero.
+- [x] 4.3 In `server/relay.rs`, `relay [--login-environment]` (any other argument is a usage error) starts the capture thread after the marker, per decision 3's process rules:
   - the invocation;
   - stdin and stdout `/dev/null`, stderr a pipe with 4 KiB kept, fd 3 the dump pipe;
   - `setsid`, the home directory, and the filled environment.
 
   It joins the capture before `server.connect()`, at most 10 s after the capture started (`BRINDLE_TEST_RELAY_LOGIN_ENV_MS` overrides this). On timeout it sends `SIGKILL` to the process group and reaps the shell on a thread. It sets `RelayHost.login`, and writes one `core.log` line on failure with no values in it. Update the module doc's step list. Verify with 4.4's tests.
-- [ ] 4.4 Add real-role tests in `remote-agent/tests/relay.rs`, each with a private `HOME`, `SHELL=/bin/sh` and its own `.profile`:
+- [x] 4.4 Add real-role tests in `remote-agent/tests/relay.rs`, each with a private `HOME`, `SHELL=/bin/sh` and its own `.profile`:
   - captured: `.profile` prints to stdout and stderr, exports `RELAY_LOGIN_VAR=1` and leaves `sleep 30 &` holding fd 3. `login` is `Captured` with the variable, `env` lacks it, a session through the relay round-trips, and the relay's stdout held only the marker and frames.
   - timed out: `.profile` runs `sleep 60`, with `BRINDLE_TEST_RELAY_LOGIN_ENV_MS=300`. `Failed` arrives within a bound, no process of that group remains, `core.log` names it, and the relay still relays.
   - a missing shell (`SHELL=/bin/relay-test-shell`);
@@ -49,8 +49,8 @@ No client protocol or H1 version changes (design.md decision 8). The relay link 
   - not asked: existing tests unchanged, with `login` absent.
 
   Verify with `cargo test -p brindle-remote-agent --test relay`.
-- [ ] 4.5 Add a real-role test in `remote-agent/tests/agents.rs`: an `AGENT_RESTART` with `env = {HOME=/x, ONLY=1}` runs the fake agent, whose `record-env` file holds exactly those variables. That shows the core adds nothing. Verify with `cargo test -p brindle-remote-agent --test agents`.
-- [ ] 4.6 Update `docs/code-map.md`'s relay entry and the terminal server's management or roles entry: the capture, its limit and switch, the `login-env` role, and the passwd basics. Verify by reading the entries against 4.1–4.3.
+- [x] 4.5 Add a real-role test in `remote-agent/tests/agents.rs`: an `AGENT_RESTART` with `env = {HOME=/x, ONLY=1}` runs the fake agent, whose `record-env` file holds exactly those variables. That shows the core adds nothing. Verify with `cargo test -p brindle-remote-agent --test agents`.
+- [x] 4.6 Update `docs/code-map.md`'s relay entry and the terminal server's management or roles entry: the capture, its limit and switch, the `login-env` role, and the passwd basics. Verify by reading the entries against 4.1–4.3.
 
 ## 5. Brindle's shell
 

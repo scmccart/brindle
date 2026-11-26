@@ -243,6 +243,18 @@ No exception is needed. The design relies on these rules:
 - `railway R3` and `types R2`: `start_of` has no wildcard.
 - `types R1`, `R6` and `R7`: `Login::NotAsked` is a variant, parsed at the boundary.
 
+## As built (2026-11-25)
+
+The smallest fixes where the design met the code:
+- **`busybox`** as `SHELL` is run as `busybox sh -l -i -c …`, since a multi-call binary takes the applet's name first. `ash`, the usual Alpine `SHELL`, is in the POSIX family as designed.
+- **The failure's stderr line** is the last line that says something, not the first, and the kept 4 KiB are the last ones. An interactive bash with no terminal always starts its stderr with "cannot set terminal process group" and "no job control in this shell", so the first line would never name the cause. An rc's `exec tmux` then reads "…before printing it: open terminal failed: not a terminal". This answers the Open Question for bash; busybox's warnings are handled the same way. The quoted line is cut to 300 characters.
+- **`TooLarge`'s text** names both bounds: "it was larger than 256 KiB or had more than 4096 variables".
+- **A test's limit** is shown in milliseconds when it isn't whole seconds ("it took longer than 300 ms").
+- **The capture's process** is the relay's own Linux seam code: a `poll` over the dump pipe, the stderr pipe and an exit pipe that the reaper thread closes once `wait` returns. When the shell has exited, both pipes are drained before the outcome is decided, so a dump written just before the exit is never lost to a race with the reaper.
+- **The missing-shell test** names `/nonexistent/relay-test/bash`. A name that isn't in decision 3's table, such as the planned `/bin/relay-test-shell`, is `Unsupported` before it is looked for.
+- **4.2's role test** parses the dump by hand, since the helper is a binary crate and its tests can't name `login_env`. The parser's own cases are `login_env`'s unit tests.
+- **4.5's test** is Linux-only (`cfg(target_os = "linux")`), as remote endpoints are: a Windows program needs more than two variables to start.
+
 ## Risks / Trade-offs
 
 - [Startup files run once more per connection, with their side effects (an `ssh-agent` per connect, a `fortune`)] → Each SSH login does the same, and the output is discarded. A user can guard with `[ -t 0 ]`.

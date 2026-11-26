@@ -1,6 +1,8 @@
 //! `brindle-remote relay` (tasks 4.1 and 4.2): reaching or starting the
 //! core, `RELAY_HOST` and `RELAY_ERROR`, a client's sessions through it, and
-//! the link's liveness. Upgrades through a relay are in `upgrade.rs`.
+//! the link's liveness; and (`remote-login-environment`) the login shell's
+//! environment, the passwd basics and the `login-env` role. Upgrades
+//! through a relay are in `upgrade.rs`.
 //!
 //! Linux only, as relays are. Each relay's stdio is a socket pair whose other
 //! end the test holds, as `ssh` would.
@@ -16,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::Frame;
 use brindle_remote_protocol::client::{self, ToClient};
-use brindle_remote_protocol::relay::RelayMessage;
+use brindle_remote_protocol::relay::{LoginEnv, RelayMessage};
 use brindle_remote_protocol::serde_json::json;
 use brindle_transcript::{AgentState, Entry, HoldReason, Slot, StopReason, TurnState};
 
@@ -81,6 +83,8 @@ fn a_relay_starts_the_core_reports_its_host_and_relays_a_session() {
     assert_eq!(host.shell, "/bin/relay-test-shell");
     assert_eq!(host.home, home);
     assert_eq!(host.server_dir, home);
+    // Not asked for, so no login shell ran.
+    assert_eq!(host.login, None);
 
     let (echo, pid) = client.spawn(programs::echoer());
     dir.track(parent(pid).unwrap());
@@ -423,4 +427,232 @@ fn a_relay_that_cant_reach_a_core_says_why() {
     );
     assert!(!relay.exits_within(TIMEOUT, "the relay's exit after RELAY_ERROR").success());
     assert!(!core_listens(&long));
+}
+
+/// A home of the test's own under `dir`, with `profile` as its `.profile`.
+fn login_home(dir: &TempDir, profile: &str) -> String {
+    let home = dir.path.join("home");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join(".profile"), profile).unwrap();
+    home.display().to_string()
+}
+
+/// A relay started with `--login-environment`, its `HOME` and `SHELL` as
+/// given, and `env` on top.
+fn login_relay(dir: &TempDir, home: &str, shell: &str, env: &[(&str, &str)]) -> Relay {
+    let mut all = vec![("HOME", home), ("SHELL", shell)];
+    all.extend_from_slice(env);
+    Relay::start_with(Path::new(BIN), &dir.path, &["--login-environment"], &all, &[])
+}
+
+/// The process ids in the process group `group`.
+fn group_members(group: u32) -> Vec<u32> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                // pgrp is the third field after the command's `)`.
+                stat.rfind(')').and_then(|end| stat[end + 1..].split_whitespace().nth(2))
+                    == Some(group.to_string().as_str())
+            }) && alive(pid)
+        })
+        .collect()
+}
+
+/// A number a startup file wrote to `path`, once it has.
+fn written_pid(path: &Path) -> u32 {
+    until("a startup file's pid", TIMEOUT, || {
+        fs::read_to_string(path).ok()?.trim().parse().ok()
+    })
+}
+
+/// `remote-login-environment` 4.4: a noisy `.profile` that exports a variable and
+/// leaves a program holding the dump pipe. The relay reports the login
+/// environment without waiting for that program, nothing the profile
+/// printed reaches the link, and the relay relays.
+#[test]
+fn a_relay_reports_the_login_shells_environment_without_its_noise() {
+    let mut dir = TempDir::new("relay-login");
+    let home = login_home(
+        &dir,
+        "echo profile-out\necho profile-err >&2\nexport RELAY_LOGIN_VAR=1\n\
+         sleep 30 &\necho $! > \"$HOME/sleep.pid\"\n",
+    );
+    let mut relay = login_relay(&dir, &home, "/bin/sh", &[]);
+    // Nothing came before the marker (`Relay::first`), and the frames after
+    // it decode.
+    let host = relay.host();
+    dir.track(host.core_pid);
+    let sleep = written_pid(&Path::new(&home).join("sleep.pid"));
+    dir.track(sleep);
+
+    let Some(LoginEnv::Captured(login)) = &host.login else {
+        panic!("expected a captured login environment, got {:?}", host.login);
+    };
+    assert_eq!(login.get("RELAY_LOGIN_VAR").map(String::as_str), Some("1"));
+    assert_eq!(login.get("HOME"), Some(&home));
+    assert!(!host.env.contains_key("RELAY_LOGIN_VAR"));
+    // The variables the shell set for itself are the relay's own.
+    for name in ["SHLVL", "PWD", "OLDPWD", "_"] {
+        assert_eq!(login.get(name), host.env.get(name), "{name}");
+    }
+    // The program the profile left running still holds the pipe.
+    assert!(alive(sleep));
+
+    let mut client = relay.client("r");
+    let (echo, pid) = client.spawn(programs::echoer());
+    dir.track(parent(pid).unwrap());
+    say(&mut client, echo, "after the login shell");
+}
+
+/// `remote-login-environment` 4.4: a `.profile` that never finishes. The relay
+/// reports it took too long, the shell's process group is gone, `core.log`
+/// says why, and the relay relays.
+#[test]
+fn a_login_shell_that_takes_too_long_is_ended_and_reported() {
+    let mut dir = TempDir::new("relay-login-slow");
+    let home = login_home(&dir, "echo $$ > \"$HOME/shell.pid\"\nsleep 60\n");
+    let started = Instant::now();
+    let mut relay = login_relay(
+        &dir,
+        &home,
+        "/bin/sh",
+        &[("BRINDLE_TEST_RELAY_LOGIN_ENV_MS", "300")],
+    );
+    let host = relay.host();
+    dir.track(host.core_pid);
+    assert!(
+        started.elapsed() < limit(Duration::from_secs(10)),
+        "RELAY_HOST took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        host.login,
+        Some(LoginEnv::Failed("it took longer than 300 ms".into()))
+    );
+    let shell = written_pid(&Path::new(&home).join("shell.pid"));
+    assert!(
+        eventually(TIMEOUT, || group_members(shell).is_empty()),
+        "left running: {:?}",
+        group_members(shell)
+    );
+    let logs = dir.logs();
+    assert!(
+        logs.lines().any(|line| line.contains("relay[")
+            && line.contains("the login shell's environment wasn't read: it took longer than 300 ms")),
+        "{logs}"
+    );
+
+    let mut client = relay.client("r");
+    let (echo, pid) = client.spawn(programs::echoer());
+    dir.track(parent(pid).unwrap());
+    say(&mut client, echo, "after the timeout");
+}
+
+/// `remote-login-environment` 4.4: a shell that isn't there, and one Brindle
+/// can't run as an interactive login shell (named, never run), are
+/// failures with their reason, and the relay relays.
+#[test]
+fn a_missing_or_unsupported_login_shell_is_reported() {
+    for (shell, reason) in [
+        // A name Brindle runs, so it is tried: one it doesn't know is
+        // unsupported before it is looked for.
+        (
+            "/nonexistent/relay-test/bash",
+            "the login shell /nonexistent/relay-test/bash couldn't start: ",
+        ),
+        (
+            "/bin/tcsh",
+            "SHELL is /bin/tcsh, which can't be run as an interactive login shell to read it",
+        ),
+    ] {
+        let mut dir = TempDir::new("relay-login-shell");
+        let home = login_home(&dir, "");
+        let mut relay = login_relay(&dir, &home, shell, &[]);
+        let host = relay.host();
+        dir.track(host.core_pid);
+        let Some(LoginEnv::Failed(text)) = &host.login else {
+            panic!("{shell}: expected a failed login environment, got {:?}", host.login);
+        };
+        assert!(text.starts_with(reason), "{shell}: {text}");
+        let mut client = relay.client("r");
+        let (echo, pid) = client.spawn(programs::echoer());
+        dir.track(parent(pid).unwrap());
+        say(&mut client, echo, "without a login shell");
+    }
+}
+
+/// `remote-login-environment` 4.1: an endpoint that sets no `HOME` or `SHELL` (as
+/// `docker exec` may not) gets them, `USER` and `LOGNAME` from the passwd
+/// entry, and no login environment is reported when none was asked for.
+#[test]
+fn a_relays_environment_gets_the_passwd_basics() {
+    // SAFETY: the passwd entry is read before any other call could reuse
+    // its static buffer; the test's threads don't call getpw*.
+    let (name, home, shell) = unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        assert!(!entry.is_null(), "no passwd entry for this user");
+        let field = |field: *const libc::c_char| {
+            std::ffi::CStr::from_ptr(field).to_string_lossy().into_owned()
+        };
+        (field((*entry).pw_name), field((*entry).pw_dir), field((*entry).pw_shell))
+    };
+    let mut dir = TempDir::new("relay-basics");
+    let mut relay = Relay::start_with(
+        Path::new(BIN),
+        &dir.path,
+        &[],
+        &[("USER", "")],
+        &["HOME", "SHELL", "LOGNAME"],
+    );
+    let host = relay.host();
+    dir.track(host.core_pid);
+    assert_eq!(host.login, None);
+    let get = |name: &str| host.env.get(name).map(String::as_str);
+    assert_eq!(get("HOME"), Some(home.as_str()));
+    assert_eq!(get("SHELL"), Some(shell.as_str()));
+    assert_eq!(get("USER"), Some(name.as_str()));
+    assert_eq!(get("LOGNAME"), Some(name.as_str()));
+    assert_eq!(host.shell, shell);
+}
+
+/// `remote-login-environment` 4.2: the hidden role writes its environment to fd 3
+/// as `NAME=VALUE` records and an empty one, and refuses to run without fd
+/// 3 or with arguments.
+#[test]
+fn the_login_env_role_writes_its_environment_to_fd_3() {
+    // `3>&1`: fd 3 is the shell's stdout, which the test reads.
+    let output = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec \"$0\" login-env 3>&1 1>/dev/null", BIN])
+        .env_clear()
+        .env("ROLE_TEST", "a b=c")
+        .env("EMPTY", "")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let records: Vec<&[u8]> = output.stdout.split(|&byte| byte == 0).collect();
+    let end = records
+        .iter()
+        .position(|record| record.is_empty())
+        .expect("a terminator");
+    let vars: Vec<&str> = records[..end]
+        .iter()
+        .map(|record| std::str::from_utf8(record).unwrap())
+        .collect();
+    assert!(vars.contains(&"ROLE_TEST=a b=c"), "{vars:?}");
+    assert!(vars.contains(&"EMPTY="), "{vars:?}");
+    // Nothing after the terminator but the end of the last record.
+    assert_eq!(&output.stdout[output.stdout.len() - 2..], b"\0\0");
+
+    for script in ["exec \"$0\" login-env 3>&-", "exec \"$0\" login-env extra 3>/dev/null"] {
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", script, BIN])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "{script}: {status}");
+    }
 }

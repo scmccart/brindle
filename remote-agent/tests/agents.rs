@@ -2323,6 +2323,33 @@ fn a_load_only_agent_continues_with_its_replay_muted() {
     );
 }
 
+/// `remote-login-environment` 4.5: a restarted agent runs with exactly the
+/// environment its `AGENT_RESTART` carries; the core adds nothing, so the
+/// endpoint's environment is the client's to merge. Linux, as remote
+/// endpoints are (a Windows program needs more than two variables to start).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_restarted_agent_gets_exactly_the_restarts_environment() {
+    let (mut dir, mut client) = agent_core("agent-continue-env", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "env", LOAD_ONLY);
+
+    let env_file = dir.path.join("restart.env");
+    let (mut again, _) = initialized(&dir.path, "env-again", LOAD_ONLY);
+    again
+        .step(format!("record-env {}", env_file.display()))
+        .step("expect session/load")
+        .step("respond {}");
+    let script = again.write().display().to_string();
+    let env = std::collections::BTreeMap::from([
+        ("HOME".to_string(), "/x".to_string()),
+        ("ONLY".to_string(), "1".to_string()),
+    ]);
+    client.restart_in(id, FAKE_AGENT, &[&script], env).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    let recorded = std::fs::read_to_string(&env_file).expect("the restarted agent's environment");
+    assert_eq!(recorded.lines().collect::<Vec<_>>(), ["HOME=/x", "ONLY=1"]);
+}
+
 #[test]
 fn a_holder_killed_under_a_continuable_agent_leaves_it_to_continue() {
     let (mut dir, mut client) = agent_core("agent-continue-holder", &[]);
