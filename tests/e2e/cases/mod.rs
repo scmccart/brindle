@@ -297,6 +297,7 @@ fn unix() -> Vec<Case> {
         display("agent-sweep", agent::sweep).needs_fake_agent(),
         display("agent-sessions-palette", agent::sessions_palette).needs_fake_agent(),
         display("agent-notify", agent::notify).needs_fake_agent(),
+        display("agent-session-title", agent::session_title).needs_fake_agent(),
         // The agent profile is only listed: its agent never runs.
         display("agent-settings-profiles", agent::settings_profiles),
         needing("agent-broken", &[TestSwitch::SinkPanic], agent::broken).needs_fake_agent(),

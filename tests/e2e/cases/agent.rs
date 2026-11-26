@@ -336,7 +336,7 @@ pub fn close_confirm(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(10.0)
         .run()?;
     ensure!(out.dump.confirm.is_none(), "the confirmation closed: {:?}", out.dump.confirm);
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "only the shell tab is left: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake", "only the shell tab is left: {:?}", out.dump.tabs);
     sessions_listed(ctx, 1)?;
     crate::brindle::hang_up_detached(ctx)?;
     Ok(Outcome::Pass)
@@ -359,7 +359,7 @@ pub fn close_idle(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
     ensure!(out.dump.confirm.is_none(), "nothing asked: {:?}", out.dump.confirm);
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "the agent tab closed: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake", "the agent tab closed: {:?}", out.dump.tabs);
     sessions_listed(ctx, 1)?;
     crate::brindle::hang_up_detached(ctx)?;
     Ok(Outcome::Pass)
@@ -381,7 +381,7 @@ pub fn first_prompt(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
     ensure!(out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello!\""], "entries: {:?}", out.dump.agent);
     ensure!(out.dump.agent_field("state") == Some("ready"), "agent: {:?}", out.dump.agent);
-    ensure!(out.dump.tabs == [("Fake Agent".to_string(), true)], "tabs: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs == [("Fake".to_string(), true)], "tabs: {:?}", out.dump.tabs);
 
     let out = Run::new(ctx, "relaunch").config(&profile).restore().wait_for(&answered()).dump_at(4.0).run()?;
     ensure!(out.dump.wait_timeouts.is_empty(), "waits that gave up: {:?}", out.dump.wait_timeouts);
@@ -1660,7 +1660,7 @@ pub fn sweep(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(5.0)
         .run()?;
     waited(&out)?;
-    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake Agent".to_string(), true), "tabs: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake".to_string(), true), "tabs: {:?}", out.dump.tabs);
     ensure!(out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello!\""], "entries: {:?}", out.dump.agent);
     ensure!(prompts_sent(&received)? == ["hi"], "sent: {:?}", prompts_sent(&received)?);
     Ok(Outcome::Pass)
@@ -1705,7 +1705,7 @@ pub fn sessions_palette(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(7.0)
         .run()?;
     waited(&out)?;
-    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake Agent".to_string(), true), "tabs: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1] == ("Fake".to_string(), true), "tabs: {:?}", out.dump.tabs);
     ensure!(out.dump.agent_field("status") == Some("blocked"), "agent: {:?}", out.dump.agent);
     let out = Run::new(ctx, "kill")
         .config(&profile)
@@ -1737,9 +1737,11 @@ fn agent_listed(ctx: &Ctx) -> Result<bool> {
 const ASKED: &str = "Run cargo test?";
 
 /// The notification log's lines for an agent's notice (`source<TAB>title
-/// <TAB>body`): the agent's name, then the tab's title.
+/// <TAB>body`): the zone's title, the profile's name until the agent
+/// names the conversation; the tab's automatic title isn't repeated
+/// (`agents-session-title` decision 6).
 fn agent_notice(body: &str) -> String {
-    format!("agent\tFake Agent — Fake Agent\t{body}")
+    format!("agent\tFake\t{body}")
 }
 
 /// The lines of a run's notification log; none when it wasn't written.
@@ -1758,7 +1760,7 @@ fn until_logged(log: &Path, text: &str, label: &str) -> String {
 /// An agent's notifications (`BRINDLE_NOTIFY_LOG`, source `agent`):
 /// - in a background tab, with the default `when`, a permission request
 ///   notifies with its title and a turn that ends normally with `Done`,
-///   each titled `Fake Agent — Fake Agent`; answering the permission in
+///   each titled `Fake`, the profile's name; answering the permission in
 ///   front raises nothing;
 /// - with `when = "always"` the same turn in the active tab notifies both,
 ///   and with `notifications.agent = false` it notifies nothing;
@@ -1858,6 +1860,130 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
     waited(&out)?;
     ensure!(out.dump.agent_field("status") == Some("blocked"), "replayed: agent {:?}", out.dump.agent);
     ensure!(notices(&replay).is_empty(), "the replay notified: {:?}", notices(&replay));
+    Ok(Outcome::Pass)
+}
+
+/// The title an agent gives its conversation in `agent-session-title`.
+const NAMED: &str = "Hello.txt file creation";
+
+/// A `send` step of a `session_info_update` for `s1` titling the
+/// conversation `title`, or clearing its title for `None`.
+fn titles(title: Option<&str>) -> String {
+    let title = serde_json::to_string(&title).unwrap_or_default();
+    format!(
+        r#"send {{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"session_info_update","title":{title}}}}}}}"#
+    )
+}
+
+/// The agent zone's tab title and its conversation's (OpenSpec change
+/// `agents-session-title`), with an agent whose `initialize` names it
+/// `@fake/acp`, titled `Fake Agent`:
+/// - the tab reads the profile's name, `Fake`, and the zone's dump names
+///   the agent by its readable title;
+/// - after the agent titles its conversation (on the first prompt) the
+///   tab reads the title, and the turn's `Done` notification is titled
+///   with it alone;
+/// - after the agent clears it (on the second prompt) the tab and the
+///   notification read `Fake` again;
+/// - a tab renamed `Build` through the rename prompt keeps its name after
+///   the agent's title, and the notification adds it after the zone's
+///   title.
+pub fn session_title(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    // Holds the second turn until it shows as working, so its `Done` is a
+    // change of status the typed prompt didn't mark seen.
+    let cleared = gate(ctx, "cleared");
+    let profile = Script(vec![
+        format!("record {}", received.display()),
+        "expect initialize".into(),
+        r#"respond {"protocolVersion":1,"agentInfo":{"name":"@fake/acp","title":"Fake Agent","version":"1.0"}}"#.into(),
+        "expect session/new".into(),
+        r#"respond {"sessionId":"s1"}"#.into(),
+    ])
+    .step("expect session/prompt")
+    .step(titles(Some("Hello.txt\nfile  creation")))
+    .step(says("named"))
+    .step(stop("end_turn"))
+    .step("expect session/prompt")
+    .step(format!("wait-file {}", cleared.display()))
+    .step(titles(None))
+    .step(says("cleared"))
+    .step(stop("end_turn"))
+    .profile(ctx, "titled")?;
+    let always = "\n[notifications]\nwhen = \"always\"\n";
+    let tab = |out: &crate::brindle::Output| out.dump.tabs.first().map(|(title, _)| title.clone()).unwrap_or_default();
+
+    let out = Run::new(ctx, "untitled").config(&profile).agent("Fake").wait_for(READY).dump_at(4.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.tabs == [("Fake".to_string(), true)], "the profile's name: {:?}", out.dump.tabs);
+    ensure!(
+        out.dump.agent.first().is_some_and(|line| line.contains(" name=\"Fake Agent\" ")),
+        "the agent's readable name: {:?}",
+        out.dump.agent
+    );
+
+    let log = ctx.dir.join("titled.notify");
+    let out = Run::new(ctx, "titled")
+        .config(&profile)
+        .config(always)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("agent \"named\"")
+        .wait_for("status=done")
+        .dump_at(5.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(tab(&out) == NAMED, "the conversation's title, on one line: {:?}", out.dump.tabs);
+    ensure!(notices(&log) == [format!("agent\t{NAMED}\tDone")], "titled: notices {:?}", notices(&log));
+
+    let log = ctx.dir.join("cleared.notify");
+    let out = Run::new(ctx, "cleared")
+        .config(&profile)
+        .config(always)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("agent \"named\"")
+        .wait_for("status=done")
+        .send("again")
+        .key("enter")
+        .wait_for(WORKING)
+        .action("new_tab")
+        .send(&format!(
+            "touch '{}'; until [ \"$(grep -c Done '{}')\" -ge 2 ]; do sleep 0.1; done; echo cle\"\"ared-done\r",
+            cleared.display(),
+            log.display()
+        ))
+        .wait_for("cleared-done")
+        .dump_at(10.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "the Shell tab in front: {:?}", out.dump.tabs);
+    ensure!(tab(&out) == "Fake", "the profile's name again: {:?}", out.dump.tabs);
+    let want = [format!("agent\t{NAMED}\tDone"), "agent\tFake\tDone".to_string()];
+    ensure!(notices(&log) == want, "cleared: notices {:?}, expected {want:?}", notices(&log));
+
+    let log = ctx.dir.join("renamed.notify");
+    let out = Run::new(ctx, "renamed")
+        .config(&profile)
+        .config(always)
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().unwrap())
+        .agent("Fake")
+        .wait_for(READY)
+        .action("rename_tab")
+        .send("Build")
+        .action("picker_confirm")
+        .send("hi")
+        .key("enter")
+        .wait_for("agent \"named\"")
+        .wait_for("status=done")
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(tab(&out) == "Build", "the manual title wins: {:?}", out.dump.tabs);
+    let want = [format!("agent\t{NAMED} — Build\tDone")];
+    ensure!(notices(&log) == want, "renamed: notices {:?}, expected {want:?}", notices(&log));
     Ok(Outcome::Pass)
 }
 
@@ -2402,7 +2528,7 @@ pub fn continue_not_restored(ctx: &Ctx) -> Result<Outcome> {
     })?;
     let out = Run::new(ctx, "relaunch").config(&profile).restore().dump_at(4.0).run()?;
     ensure!(out.dump.agent.is_empty(), "an agent zone came back: {:?}", out.dump.agent);
-    ensure!(!out.dump.tabs.iter().any(|(title, _)| title == "Fake Agent"), "tabs: {:?}", out.dump.tabs);
+    ensure!(!out.dump.tabs.iter().any(|(title, _)| title == "Fake"), "tabs: {:?}", out.dump.tabs);
     Ok(Outcome::Pass)
 }
 
@@ -2691,7 +2817,7 @@ pub fn login_close(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     waited(&out)?;
     ensure!(out.dump.confirm.is_none(), "nothing asked: {:?}", out.dump.confirm);
-    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake Agent", "the agent tab closed: {:?}", out.dump.tabs);
+    ensure!(out.dump.tabs.len() == 1 && out.dump.tabs[0].0 != "Fake", "the agent tab closed: {:?}", out.dump.tabs);
     sessions_listed(ctx, 1)?;
     crate::brindle::hang_up_detached(ctx)?;
     Ok(Outcome::Pass)
