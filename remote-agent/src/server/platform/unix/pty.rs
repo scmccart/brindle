@@ -81,6 +81,13 @@ pub struct Exit {
 }
 
 impl Program {
+    /// The program `child`, which leads a session and process group of its
+    /// own (`setsid` before its exec), for `piped`'s spawn.
+    pub(super) fn of(child: Child) -> Self {
+        let pid = child.id() as libc::pid_t;
+        Self { child, pid }
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid as u32
     }
@@ -172,11 +179,5 @@ pub fn program_name(request: &PtyCommand) -> OsString {
 /// Opens a PTY and starts `request`'s program on it.
 pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
     let spawned = pty::spawn(request)?;
-    Ok((
-        Pty(spawned.master),
-        Program {
-            child: spawned.child,
-            pid: spawned.pid,
-        },
-    ))
+    Ok((Pty(spawned.master), Program::of(spawned.child)))
 }

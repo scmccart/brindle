@@ -88,6 +88,12 @@ const BUSY_LIMIT: Duration = HELLO_LIMIT;
 /// How long a remote endpoint's core keeps this client's `kill` sessions
 /// after a relay link drops, for the reconnect to get them back.
 const RELAY_LINGER_SECS: u32 = 300;
+
+/// The client protocols Brindle offers: 1 to 3. Protocol 4 adds agent
+/// sessions, which Brindle doesn't show yet (`agents-sessions` section 8
+/// lifts this), so it never negotiates a version whose sessions it would
+/// list or attach without being able to show them.
+const BRINDLE_PROTOCOLS: client::VersionRange = client::VersionRange::new(1, 3);
 /// How long an exiting Brindle waits, at most, for its connections to write
 /// what its closing tabs sent ([`flush`]). Writing to a link that is up
 /// takes far less.
@@ -666,8 +672,8 @@ pub fn start_core(endpoint: &Endpoint) -> Result<()> {
 /// `/proc`.
 fn hello_message(token: &str, relay: bool) -> Hello {
     Hello {
-        min: client::PROTOCOLS.min,
-        max: client::PROTOCOLS.max,
+        min: BRINDLE_PROTOCOLS.min,
+        max: BRINDLE_PROTOCOLS.max,
         client_version: format!("brindle {}", env!("CARGO_PKG_VERSION")),
         client_token: token.to_string(),
         linger_secs: if relay { RELAY_LINGER_SECS } else { 0 },
@@ -1000,7 +1006,7 @@ mod tests {
         assert!(try_connect(&endpoint).unwrap().is_none(), "no core yet");
 
         let connected = connect(&endpoint, "real-1").unwrap();
-        assert_eq!(connected.welcome.protocol, client::PROTOCOLS.max);
+        assert_eq!(connected.welcome.protocol, BRINDLE_PROTOCOLS.max);
         let core = connected.welcome.pid;
         assert_ne!(core, std::process::id());
         // The core runs from its per-build copy, not from the helper.
@@ -1313,8 +1319,16 @@ mod tests {
         assert_eq!((local.linger_secs, local.process_info), (0, false));
         let relay = hello_message("tok", true);
         assert_eq!((relay.linger_secs, relay.process_info), (300, true));
-        assert_eq!((relay.min, relay.max), (client::PROTOCOLS.min, client::PROTOCOLS.max));
+        assert_eq!((relay.min, relay.max), (BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max));
         assert_eq!(relay.client_token, "tok");
+    }
+
+    #[test]
+    fn brindle_offers_no_protocol_with_agent_sessions_yet() {
+        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (1, 3));
+        const { assert!(BRINDLE_PROTOCOLS.max < client::PROTOCOLS.max, "the codec knows protocol 4") };
+        let hello = hello_message("tok", false);
+        assert_eq!(hello.max, 3);
     }
 
     #[test]

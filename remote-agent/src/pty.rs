@@ -15,7 +15,7 @@ use std::time::Duration;
     windows,
     allow(dead_code, reason = "only the Linux PTY starts a login shell")
 )]
-mod program;
+pub(crate) mod program;
 #[cfg_attr(
     windows,
     allow(dead_code, reason = "only the Linux core reads /proc")

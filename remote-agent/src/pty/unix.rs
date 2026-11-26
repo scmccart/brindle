@@ -17,7 +17,6 @@ use super::stat::{STAT_PGRP, STAT_TPGID, parse_stat_field};
 use super::{Foreground, PtyCommand};
 
 pub struct SpawnedPty {
-    pub pid: libc::pid_t,
     pub child: Child,
     /// The PTY master, non-blocking: session input goes in, output and the
     /// process queries come from it.
@@ -83,8 +82,7 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
     }
 
     let child = command.spawn()?;
-    let pid = child.id() as libc::pid_t;
-    Ok(SpawnedPty { pid, child, master })
+    Ok(SpawnedPty { child, master })
 }
 
 /// For a forked child, before its exec: gives every signal from 1 to
@@ -97,7 +95,7 @@ pub fn spawn(request: &PtyCommand) -> io::Result<SpawnedPty> {
 /// after it ends.
 ///
 /// Makes only async-signal-safe calls, as `pre_exec` needs.
-fn default_signals(last: libc::c_int) -> io::Result<()> {
+pub fn default_signals(last: libc::c_int) -> io::Result<()> {
     for signal in 1..=last {
         if signal == libc::SIGKILL || signal == libc::SIGSTOP {
             continue;
@@ -125,16 +123,20 @@ fn command_for(request: &PtyCommand, program: OsString) -> Command {
         command.env_clear();
     }
     command.args(request.args).envs(request.env);
-    if let Some(cwd) = request.cwd {
-        // A directory that does not exist here (a path inherited from a
-        // different host, or since deleted) starts the session in $HOME.
-        let home = home_dir(request.env);
-        let wanted = expand_home(cwd, home.as_deref());
-        if let Some(dir) = start_dir(&wanted, home.as_deref(), |path| path.is_dir()) {
-            command.current_dir(dir);
-        }
+    if let Some(dir) = request.cwd.and_then(|cwd| start_directory(cwd, request.env)) {
+        command.current_dir(dir);
     }
     command
+}
+
+/// The directory a session asking for `cwd` starts in, `~` expanded with
+/// the environment `env`'s home ([`start_dir`]). A directory that does not
+/// exist here (a path inherited from a different host, or since deleted)
+/// starts the session in `$HOME`; `None` leaves it in this process's.
+pub fn start_directory(cwd: &str, env: &BTreeMap<String, String>) -> Option<PathBuf> {
+    let home = home_dir(env);
+    let wanted = expand_home(cwd, home.as_deref());
+    start_dir(&wanted, home.as_deref(), |path| path.is_dir())
 }
 
 /// The home directory: the environment's ([`home_from_env`]), else the

@@ -20,7 +20,11 @@ use std::time::Duration;
 
 use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, ReplayStart};
+use brindle_remote_protocol::holder as h1;
+use brindle_remote_protocol::serde_json::json;
+use brindle_transcript::{AgentState, Entry, HoldReason, Slot, StopReason, TurnState};
 
+use support::fake_agent::{ask, prompts, responses, said, started, stop};
 use support::programs::{self, ENTER, say};
 #[cfg(unix)]
 use support::relay::Relay;
@@ -310,9 +314,9 @@ fn a_failing_check_leaves_the_core_running_with_the_reason_in_its_log() {
         .welcome
         .unwrap()
         .holder_protocols;
-    assert_eq!(in_use, [2]);
+    assert_eq!(in_use, [3]);
 
-    let passed = cli(&dir.path, &["check", "--holder-protocols", "1,2"]);
+    let passed = cli(&dir.path, &["check", "--holder-protocols", "1,2,3"]);
     assert!(passed.status.success(), "{passed:?}");
     assert!(passed.stdout.is_empty() && passed.stderr.is_empty());
 
@@ -499,4 +503,159 @@ fn an_older_or_equal_relay_leaves_the_core_alone() {
         !logs.contains("upgrading the core") && !logs.contains("upgrade: client"),
         "{logs}"
     );
+}
+
+// Agent sessions (OpenSpec change `agents-sessions`, task 7.5).
+
+fn agent_ready(log: &Transcript) -> bool {
+    matches!(log.agent(), AgentState::Ready { .. })
+}
+
+/// The log's user and agent entries, as `user: …` and `agent: …`.
+fn says(log: &Transcript) -> Vec<String> {
+    log.entries()
+        .filter_map(|(_, entry)| match entry {
+            Entry::User { text } => Some(format!("user: {text}")),
+            Entry::Agent { text } => Some(format!("agent: {text}")),
+            Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
+        })
+        .collect()
+}
+
+/// A core in a fresh directory and a client `a` of it.
+fn agent_core(tag: &str) -> (TempDir, TestClient) {
+    let mut dir = TempDir::new(tag);
+    start_core(&dir.path, &[]).unwrap();
+    let client = TestClient::hello(&dir.path, "a");
+    dir.track(client.core_pid());
+    (dir, client)
+}
+
+/// The client's core steps down and the next one starts; gives client `a`
+/// of it, back with its session's replay.
+fn upgraded(dir: &mut TempDir, client: &mut TestClient, session: SessionId, pid: u32) -> TestClient {
+    step_down(client);
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "a");
+    dir.track(client.core_pid());
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (session, pid));
+    client
+}
+
+#[test]
+fn a_held_prompt_survives_an_upgrade_and_is_sent_again() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-held");
+    let (mut script, record) = started(&dir.path, "held");
+    script.step("expect session/prompt");
+    let gate = script.gate();
+    script
+        .step(stop("max_tokens"))
+        .step("expect session/prompt")
+        .step(said("sent again"))
+        .step(stop("end_turn"));
+    let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+    dir.track(pid);
+    client.transcript_until(id, "is ready", agent_ready);
+    client.prompt(id, "one").unwrap();
+    client.prompt(id, "two").unwrap();
+    gate.open();
+    let hold = Slot::Held {
+        text: "two".into(),
+        reason: HoldReason::Stopped { stop: StopReason::MaxTokens },
+    };
+    let before = client.transcript_until(id, "holds the prompt", |log| *log.slot() == hold);
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    assert_eq!(client.transcript(id), before);
+    client.resend(id).unwrap();
+    let log = client.transcript_until(id, "has its turn's end", |log| {
+        says(log).contains(&"agent: sent again".to_owned()) && matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
+    });
+    assert_eq!(*log.slot(), Slot::Empty);
+    assert_eq!(prompts(&record), ["one", "two"]);
+}
+
+#[test]
+fn a_pending_permission_survives_an_upgrade_and_is_answered_with_the_agents_id() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-permission");
+    let (mut script, record) = started(&dir.path, "permission");
+    script
+        .step("expect session/prompt")
+        .step(ask("the-agents-own-id"))
+        .step(r#"expect-response "the-agents-own-id""#)
+        .step(said("allowed"))
+        .step(stop("end_turn"));
+    let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+    dir.track(pid);
+    client.transcript_until(id, "is ready", agent_ready);
+    client.prompt(id, "write").unwrap();
+    client.transcript_until(id, "waits on the permission", |log| *log.turn() == TurnState::Blocked);
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    let log = client.transcript(id);
+    assert_eq!(*log.turn(), TurnState::Blocked);
+    let entry = log
+        .entries()
+        .find_map(|(entry, kept)| matches!(kept, Entry::Permission { outcome: None, .. }).then_some(entry.0))
+        .expect("the permission request, still pending");
+    client.answer(id, entry, Some("allow-once")).unwrap();
+    let answer = until("the agent is answered", TIMEOUT, || responses(&record).pop());
+    assert_eq!(answer["id"], json!("the-agents-own-id"));
+    assert_eq!(answer["result"]["outcome"], json!({"outcome": "selected", "optionId": "allow-once"}));
+    client.transcript_until(id, "has the turn's end", |log| {
+        matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
+    });
+}
+
+/// An H1 2 core (the test's: an older build after a downgrade) isn't
+/// shown the agent session, which runs on and comes back, with what its
+/// agent said meanwhile, to the next core that speaks H1 3.
+#[test]
+fn an_older_core_isnt_shown_an_agent_session_and_a_newer_one_gets_it_back() {
+    let (mut dir, mut client) = agent_core("agent-older-core");
+    let (mut script, _) = started(&dir.path, "older-core");
+    script.step("expect session/prompt").step(said("before"));
+    let gate = script.gate();
+    script.step(said(" and after")).step(stop("end_turn"));
+    let finished = script.reached();
+    let spawn = client::SpawnAgent { policy: client::Policy::Detach, ..client_agent(&script.write()) };
+    let (id, pid) = client.spawn_agent(spawn);
+    dir.track(pid);
+    client.transcript_until(id, "is ready", agent_ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "has the turn's start", |log| says(log).contains(&"agent: before".to_owned()));
+    kill(client.core_pid());
+    assert!(client.closes());
+
+    let mut older = TestCore::connect_to(&dir);
+    let adopted = older.hello_up_to(2, 2);
+    assert_eq!(adopted.welcome().protocol, 2);
+    assert!(adopted.welcome().sessions.is_empty(), "{:?}", adopted.welcome().sessions);
+    gate.open();
+    assert!(eventually(TIMEOUT, || finished.exists()), "the agent didn't finish its turn");
+    // A round trip: the holder read what the agent wrote, and sent none.
+    older.hang_up(99);
+    loop {
+        match older.recv() {
+            h1::ToCore::Error(error) if error.session == Some(99) => break,
+            h1::ToCore::Output(data) => assert_ne!(data.session, id, "{data:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    start_core(&dir.path, &[]).unwrap();
+    for message in older.until_closed() {
+        if let h1::ToCore::Output(data) = message {
+            assert_ne!(data.session, id, "the older core was sent its output");
+        }
+    }
+    let mut client = TestClient::hello(&dir.path, "a");
+    dir.track(client.core_pid());
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (id, pid));
+    let log = client.transcript_until(id, "has the turn's end", |log| {
+        matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
+    });
+    assert_eq!(says(&log), ["user: go", "agent: before and after"]);
 }

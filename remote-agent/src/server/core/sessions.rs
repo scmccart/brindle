@@ -56,11 +56,15 @@ use brindle_remote_protocol::holder::{self as h1, HeldSession, MetaFault, Sessio
 use brindle_remote_protocol::{RequestId, SessionId};
 use brindle_term_core::emulator;
 
+use super::agents::Agent;
 use super::clients::{ClientToken, error};
 use super::holders::WaitingSpawn;
-use super::policy::{self, ExitFate, Fate, GraceFate, SessionView};
+use super::policy::{
+    self, AgentCheckpoint, ExitFate, Fate, GraceFate, SessionKind, SessionView,
+};
 use super::screen::Screen;
 use super::{Core, log};
+use crate::acp::reduce::Input;
 use crate::pty::Foreground;
 use crate::server::event_loop::{EventLoop, Token};
 
@@ -88,15 +92,55 @@ fn is_due(since: u64, behind: bool) -> bool {
     since > after
 }
 
+/// What a client asked to start: a terminal (`SPAWN`) or an agent
+/// (`SPAWN_AGENT`, protocol 4, with the absolute directory the core
+/// resolved for it, which its `session/new` gets and `LIST` shows).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SpawnRequest {
+    Terminal(client::Spawn),
+    Agent {
+        spawn: client::SpawnAgent,
+        cwd: String,
+    },
+}
+
+impl SpawnRequest {
+    /// The request its `SPAWNED` or `ERROR` answers.
+    pub(super) fn req(&self) -> RequestId {
+        match self {
+            Self::Terminal(spawn) => spawn.req,
+            Self::Agent { spawn, .. } => spawn.req,
+        }
+    }
+
+    /// How its program is connected, which decides the holder it may go
+    /// to ([`policy::placement`]).
+    pub(super) fn mode(&self) -> h1::SpawnMode {
+        match self {
+            Self::Terminal(_) => h1::SpawnMode::Pty,
+            Self::Agent { .. } => h1::SpawnMode::Pipes,
+        }
+    }
+}
+
+/// What a session runs, and the core's state for it (`types R1`).
+pub(super) enum Content {
+    /// A program on a PTY, with its emulator (boxed: it is large).
+    Terminal(Box<Screen>),
+    /// An ACP agent on plain pipes, with its transcript.
+    Agent(Agent),
+}
+
 /// Where a session's program is in its life (`types R1`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Life {
-    /// The client's `SPAWN`, until the holder reports the program. It is
+    /// The client's `SPAWN` (or `SPAWN_AGENT`), until the holder reports
+    /// the program. It is
     /// sent again if the holder goes away first (an empty holder exits, and
     /// may not have read it). With `hung_up`, its holder was told to hang
     /// it up (`KILL`, `STOP`, its `kill` client gone): it ends as soon as
     /// it starts, and its `SPAWNED` still answers the request.
-    Starting { spawn: client::Spawn, hung_up: bool },
+    Starting { spawn: SpawnRequest, hung_up: bool },
     /// Its program runs as `pid`.
     Running { pid: NonZeroU32 },
     /// Its holder was told to hang it up; its `EXITED` follows.
@@ -113,7 +157,7 @@ pub(super) enum Life {
 
 impl Life {
     /// Started from `spawn`, waiting for the holder to report the program.
-    fn starting(spawn: client::Spawn) -> Self {
+    fn starting(spawn: SpawnRequest) -> Self {
         Self::Starting {
             spawn,
             hung_up: false,
@@ -275,9 +319,10 @@ pub(super) struct Session {
     storing: Option<u64>,
     /// A replay for its client, waiting for the rebuild or for `storing`.
     /// Its output meanwhile isn't forwarded: the replay has it.
-    pending_replay: Option<PendingReplay>,
-    /// Its emulator, fed with all of its output.
-    pub(super) screen: Screen,
+    pub(super) pending_replay: Option<PendingReplay>,
+    /// A terminal's emulator, fed with all of its output, or an agent's
+    /// transcript, fed with all of its stdout.
+    pub(super) content: Content,
     /// It had output or input since the core last looked at its foreground
     /// program, or was just started or attached ([`super::process`]).
     pub(super) active: bool,
@@ -287,7 +332,15 @@ pub(super) struct Session {
     pub(super) foreground: Option<Foreground>,
 }
 
-struct PendingReplay {
+/// What a replay carries between its `REPLAY_START` and `REPLAY_END`.
+enum Replay {
+    /// A terminal's screen, as `DATA`.
+    Screen(Vec<u8>),
+    /// An agent's log, as `TRANSCRIPT` events.
+    Transcript(Vec<brindle_remote_protocol::serde_json::Value>),
+}
+
+pub(super) struct PendingReplay {
     req: Option<RequestId>,
     /// The size an `ATTACH` asked for.
     size: Option<(u16, u16)>,
@@ -318,8 +371,14 @@ impl Session {
     /// with no client says whether it may still come back for its owner
     /// (`owned`), for how long it has had none, and the layout its last
     /// client detached it with.
+    /// An agent session is listed at 0×0 with no title, and with its
+    /// activity and the name its agent gave ([`Agent::info`]).
     pub(super) fn info(&self, id: SessionId, now: Instant) -> SessionInfo {
         let detached = self.ownership.client().is_none();
+        let (title, agent) = match &self.content {
+            Content::Terminal(screen) => (screen.title(), None),
+            Content::Agent(agent) => (String::new(), Some(agent.info())),
+        };
         SessionInfo {
             session: id,
             pid: self.life.pid().map_or(0, NonZeroU32::get),
@@ -330,7 +389,7 @@ impl Session {
             cols: self.cols,
             rows: self.rows,
             key: self.meta.key.clone(),
-            title: self.screen.title(),
+            title,
             started: self.meta.started,
             profile: self.meta.profile.clone(),
             owned: detached && self.owner.is_some(),
@@ -339,6 +398,7 @@ impl Session {
                 .detached_since()
                 .map_or(0, |since| now.saturating_duration_since(since).as_secs()),
             layout: self.meta.layout.clone().filter(|_| detached),
+            agent,
         }
     }
 
@@ -348,6 +408,30 @@ impl Session {
             life: &self.life,
             ownership: &self.ownership,
             owner: self.owner.as_ref(),
+            kind: self.kind(),
+        }
+    }
+
+    pub(super) fn kind(&self) -> SessionKind {
+        match self.content {
+            Content::Terminal(_) => SessionKind::Terminal,
+            Content::Agent(_) => SessionKind::Agent,
+        }
+    }
+
+    /// A terminal's emulator; `None` for an agent session.
+    fn screen(&mut self) -> Option<&mut Screen> {
+        match &mut self.content {
+            Content::Terminal(screen) => Some(screen.as_mut()),
+            Content::Agent(_) => None,
+        }
+    }
+
+    /// An agent session's state; `None` for a terminal.
+    pub(super) fn agent(&mut self) -> Option<&mut Agent> {
+        match &mut self.content {
+            Content::Terminal(_) => None,
+            Content::Agent(agent) => Some(agent),
         }
     }
 
@@ -396,11 +480,19 @@ impl Session {
         let (mut meta, repaired) =
             adopt_meta(held.session, SessionMeta::from_value(&held.meta), session_key);
         let owner = ClientToken::from_wire(&std::mem::take(&mut meta.owner));
-        let (cols, rows) = emulator::clamped(held.cols, held.rows);
+        // An agent session has no grid: it is 0×0 whatever its holder says.
+        let (content, (cols, rows)) = match held.mode {
+            h1::SpawnMode::Pty => {
+                let (cols, rows) = emulator::clamped(held.cols, held.rows);
+                let screen = Screen::new(cols, rows, meta.scrollback);
+                (Content::Terminal(Box::new(screen)), (cols, rows))
+            }
+            h1::SpawnMode::Pipes => (Content::Agent(Agent::adopting()), (0, 0)),
+        };
         let session = Self {
             holder,
             life,
-            screen: Screen::new(cols, rows, meta.scrollback),
+            content,
             meta,
             owner,
             cols,
@@ -426,27 +518,51 @@ impl Session {
         holder: Token,
         client: Token,
         owner: Option<ClientToken>,
-        spawn: client::Spawn,
+        spawn: SpawnRequest,
         now: Instant,
     ) -> Self {
-        let meta = SessionMeta {
-            command: command_line(&spawn),
-            cwd: spawn.cwd.clone(),
-            key: session_key(),
-            layout: None,
-            owner: String::new(),
-            policy: spawn.policy,
-            profile: spawn.profile.clone(),
-            scrollback: spawn.scrollback,
-            started: unix_now(),
+        let (meta, content, cols, rows) = match &spawn {
+            SpawnRequest::Terminal(spawn) => (
+                SessionMeta {
+                    command: command_line(spawn.command.as_deref(), &spawn.args),
+                    cwd: spawn.cwd.clone(),
+                    key: session_key(),
+                    layout: None,
+                    owner: String::new(),
+                    policy: spawn.policy,
+                    profile: spawn.profile.clone(),
+                    scrollback: spawn.scrollback,
+                    started: unix_now(),
+                },
+                Content::Terminal(Box::new(Screen::new(spawn.cols, spawn.rows, spawn.scrollback))),
+                spawn.cols,
+                spawn.rows,
+            ),
+            // Its listed directory is the absolute one its agent works in.
+            SpawnRequest::Agent { spawn, cwd } => (
+                SessionMeta {
+                    command: command_line(Some(&spawn.command), &spawn.args),
+                    cwd: Some(cwd.clone()),
+                    key: session_key(),
+                    layout: None,
+                    owner: String::new(),
+                    policy: spawn.policy,
+                    profile: spawn.profile.clone(),
+                    scrollback: 0,
+                    started: unix_now(),
+                },
+                Content::Agent(Agent::new(cwd.clone())),
+                0,
+                0,
+            ),
         };
         Self {
             holder,
-            screen: Screen::new(spawn.cols, spawn.rows, spawn.scrollback),
+            content,
             meta,
             owner,
-            cols: spawn.cols,
-            rows: spawn.rows,
+            cols,
+            rows,
             ownership: Ownership::Attached(client),
             life: Life::starting(spawn),
             paused: false,
@@ -540,10 +656,10 @@ fn unix_now() -> u64 {
 }
 
 /// The command line `list` shows; empty for the login shell.
-fn command_line(spawn: &client::Spawn) -> String {
-    match &spawn.command {
-        Some(command) => std::iter::once(command.as_str())
-            .chain(spawn.args.iter().map(String::as_str))
+fn command_line(command: Option<&str>, args: &[String]) -> String {
+    match command {
+        Some(command) => std::iter::once(command)
+            .chain(args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" "),
         None => String::new(),
@@ -568,23 +684,24 @@ impl<L: EventLoop> Core<L> {
     /// every grid keeps ([`emulator::clamped`]), here, so the session's
     /// emulator, its program's terminal and its listing all have the same.
     pub(super) fn client_spawn(&mut self, client: Token, mut spawn: client::Spawn) {
-        if self.stopping.is_some() {
-            return self.send_client(
-                client,
-                error(Some(spawn.req), None, "the server is stopping"),
-            );
-        }
-        if self.stepping_down.is_some() {
-            return self.send_client(
-                client,
-                error(
-                    Some(spawn.req),
-                    None,
-                    "the core is stepping down for an upgrade; try again",
-                ),
-            );
-        }
         (spawn.cols, spawn.rows) = emulator::clamped(spawn.cols, spawn.rows);
+        self.queue_spawn(client, SpawnRequest::Terminal(spawn));
+    }
+
+    /// A spawn gets an id and waits for a holder of the core's build that
+    /// takes its kind ([`policy::placement`]); refused while the core is
+    /// stopping or stepping down.
+    pub(super) fn queue_spawn(&mut self, client: Token, spawn: SpawnRequest) {
+        let refusal = if self.stopping.is_some() {
+            Some("the server is stopping")
+        } else if self.stepping_down.is_some() {
+            Some("the core is stepping down for an upgrade; try again")
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return self.send_client(client, error(Some(spawn.req()), None, refusal));
+        }
         let id = self.allocate_id();
         self.waiting.push(WaitingSpawn { client, id, spawn });
         self.place_waiting();
@@ -602,18 +719,30 @@ impl<L: EventLoop> Core<L> {
         let WaitingSpawn { client, id, spawn } = waiting;
         let owner = self.client_token(client).cloned();
         let session = Session::spawning(holder, client, owner, spawn.clone(), Instant::now());
-        let message = ToHolder::Spawn(h1::Spawn {
-            session: id,
-            command: spawn.command,
-            args: spawn.args,
-            cwd: spawn.cwd,
-            env: spawn.env,
-            cols: spawn.cols,
-            rows: spawn.rows,
-            cell_w: spawn.cell_w,
-            cell_h: spawn.cell_h,
-            meta: session.stored_meta().to_value(),
-        });
+        let meta = session.stored_meta().to_value();
+        let message = match spawn {
+            SpawnRequest::Terminal(spawn) => ToHolder::Spawn(h1::Spawn {
+                session: id,
+                command: spawn.command,
+                args: spawn.args,
+                cwd: spawn.cwd,
+                env: spawn.env,
+                cols: spawn.cols,
+                rows: spawn.rows,
+                cell_w: spawn.cell_w,
+                cell_h: spawn.cell_h,
+                meta,
+            }),
+            // The agent starts in the directory its `session/new` names.
+            SpawnRequest::Agent { spawn, cwd } => ToHolder::SpawnPipes(h1::SpawnPipes {
+                session: id,
+                command: spawn.command,
+                args: spawn.args,
+                cwd: Some(cwd),
+                env: spawn.env,
+                meta,
+            }),
+        };
         // The session first: a `SPAWN` that can't be sent fails it, to its
         // client, as the holder's `SPAWN_FAILED` would.
         self.sessions.insert(id, session);
@@ -651,16 +780,19 @@ impl<L: EventLoop> Core<L> {
             Life::Starting {
                 spawn,
                 hung_up: false,
-            } => (Life::Running { pid: reported }, Some(spawn.req)),
+            } => (Life::Running { pid: reported }, Some(spawn.req())),
             Life::Starting {
                 spawn,
                 hung_up: true,
-            } => (Life::HungUp { pid: reported }, Some(spawn.req)),
+            } => (Life::HungUp { pid: reported }, Some(spawn.req())),
             Life::Running { .. } => (Life::Running { pid: reported }, None),
             Life::HungUp { .. } => (Life::HungUp { pid: reported }, None),
             exited @ Life::ExitedAwaitingOwner { .. } => (exited.clone(), None),
         };
         session.life = life;
+        // An agent that starts now (not one hung up before it started) is
+        // sent `initialize`, after its client has its `SPAWNED`.
+        let agent_started = req.is_some() && session.life.is_live() && session.agent().is_some();
         let client = session.ownership.client();
         let key = session.meta.key.clone();
         log!("session {id}: pid {pid} ({:?})", session.meta.command);
@@ -678,6 +810,9 @@ impl<L: EventLoop> Core<L> {
                 self.set_paused(id, true);
             }
         }
+        if agent_started {
+            self.agent_step(id, Input::Spawned);
+        }
     }
 
     pub(super) fn session_spawn_failed(&mut self, holder: Token, id: SessionId, message: String) {
@@ -690,7 +825,7 @@ impl<L: EventLoop> Core<L> {
         log!("session {id}: {message}");
         if let (Some(client), Life::Starting { spawn, .. }) = (session.ownership.client(), session.life)
         {
-            self.send_client(client, error(Some(spawn.req), None, message));
+            self.send_client(client, error(Some(spawn.req()), None, message));
         }
     }
 
@@ -720,6 +855,8 @@ impl<L: EventLoop> Core<L> {
         // `ATTACH`), and an `EXIT` kept for it ends the session there.
         if let Some(client) = session.ownership.client() {
             log!("session {id}: lost with its holder");
+            // An agent's log says it is gone, before the session's end.
+            self.agent_exited(id, None);
             self.send_waiting_replay(id);
             if self.sessions.remove(&id).is_none() {
                 return;
@@ -741,9 +878,15 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.holder_session(holder, id) else {
             return;
         };
+        // An agent's stdout goes to its reducer, whose events its client
+        // gets instead.
+        let Some(screen) = session.screen() else {
+            self.agent_step(id, Input::Stdout(&bytes));
+            return;
+        };
         // Attached or not, so a detached session's screen stays current.
         // Checkpoints wait for the end of the read (`checkpoint_due`).
-        session.screen.feed(id, &bytes);
+        screen.feed(id, &bytes);
         session.mark_active(now);
         // A client still waiting for its replay gets this output in it.
         if let Some(client) = session.ownership.client()
@@ -755,11 +898,19 @@ impl<L: EventLoop> Core<L> {
 
     /// An adopted session's checkpoint from its holder: the rebuild starts
     /// from it, unless the tail was truncated (and so doesn't follow it).
+    /// An agent's is kept for its adoption, which the tail completes
+    /// ([`Core::agent_adopted`]).
     pub(super) fn session_checkpoint(&mut self, holder: Token, id: SessionId, bytes: &[u8]) {
-        if let Some(session) = self.holder_session(holder, id)
-            && session.rebuild == (Rebuild::Pending { truncated: false })
-        {
-            session.screen.restore(id, bytes);
+        let Some(session) = self.holder_session(holder, id) else {
+            return;
+        };
+        let pending = matches!(session.rebuild, Rebuild::Pending { .. });
+        let clean = session.rebuild == (Rebuild::Pending { truncated: false });
+        match &mut session.content {
+            Content::Terminal(screen) if clean => screen.restore(id, bytes),
+            Content::Terminal(_) => {}
+            Content::Agent(agent) if pending => agent.checkpoint_read(bytes),
+            Content::Agent(_) => {}
         }
     }
 
@@ -773,15 +924,23 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         session.rebuild = Rebuild::Ready;
-        if truncated {
-            log!(
-                "session {id}: its tail was truncated; rebuilt from the last {} bytes only",
-                bytes.len()
-            );
-            session.screen.restore(id, b"\x1bc");
+        match session.screen() {
+            Some(screen) => {
+                if truncated {
+                    log!(
+                        "session {id}: its tail was truncated; rebuilt from the last {} bytes only",
+                        bytes.len()
+                    );
+                    screen.restore(id, b"\x1bc");
+                }
+                screen.restore(id, bytes);
+                screen.since_checkpoint = bytes.len() as u64;
+            }
+            None => self.agent_adopted(id, truncated, bytes),
         }
-        session.screen.restore(id, bytes);
-        session.screen.since_checkpoint = bytes.len() as u64;
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
         if let (Some(client), Some(pending)) =
             (session.ownership.client(), session.pending_replay.take())
         {
@@ -789,9 +948,10 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Sends the session's holder a checkpoint of its screen, covering the
-    /// output fed since the last one: only for a session whose program runs
-    /// and isn't being hung up, once its emulator is rebuilt.
+    /// Sends the session's holder a checkpoint of its screen (or an agent's
+    /// state, [`Core::agent_checkpoint`]), covering the output fed since
+    /// the last one: only for a session whose program runs and isn't being
+    /// hung up, once its emulator is rebuilt.
     pub(super) fn checkpoint(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
@@ -800,25 +960,31 @@ impl<L: EventLoop> Core<L> {
             (Rebuild::Ready, true) => {}
             (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => return,
         }
-        let bytes = session.screen.render(id);
-        let covers = std::mem::take(&mut session.screen.since_checkpoint);
+        let Some(screen) = session.screen() else {
+            return self.agent_checkpoint(id);
+        };
+        let bytes = screen.render(id);
+        let covers = std::mem::take(&mut screen.since_checkpoint);
         let holder = session.holder;
         for message in ToHolder::checkpoint(id, &bytes, covers) {
             self.send_holder(holder, message);
         }
     }
 
-    /// After a read of `holder`'s output: checkpoints its sessions that are
-    /// due (see [`is_due`]). With `may_defer`, they wait while more of the
-    /// holder's output is waiting.
+    /// After a read of `holder`'s output: checkpoints its terminal sessions
+    /// that are due (see [`is_due`]). With `may_defer`, they wait while more
+    /// of the holder's output is waiting. (Agent sessions are checked after
+    /// each step, [`policy::agent_checkpoint_due`].)
     pub(super) fn checkpoint_due(&mut self, holder: Token, may_defer: bool) {
         let mut due: Vec<(SessionId, u64)> = self
             .sessions
             .iter()
-            .filter(|(_, session)| {
-                session.holder == holder && is_due(session.screen.since_checkpoint, false)
+            .filter(|(_, session)| session.holder == holder)
+            .filter_map(|(&id, session)| match &session.content {
+                Content::Terminal(screen) => Some((id, screen.since_checkpoint)),
+                Content::Agent(_) => None,
             })
-            .map(|(&id, session)| (id, session.screen.since_checkpoint))
+            .filter(|&(_, since)| is_due(since, false))
             .collect();
         if due.is_empty() {
             return;
@@ -834,6 +1000,19 @@ impl<L: EventLoop> Core<L> {
     pub(super) fn checkpoint_all(&mut self) {
         let ids: Vec<SessionId> = self.sessions.keys().copied().collect();
         for id in ids {
+            self.checkpoint_at(id, AgentCheckpoint::StepDown);
+        }
+    }
+
+    /// The checkpoint a step-down or a detach takes: a terminal's always,
+    /// an agent's as [`policy::agent_checkpoint_due`] says.
+    fn checkpoint_at(&mut self, id: SessionId, at: AgentCheckpoint) {
+        let due = match self.sessions.get(&id).map(Session::kind) {
+            Some(SessionKind::Terminal) => true,
+            Some(SessionKind::Agent) => policy::agent_checkpoint_due(at, 0),
+            None => false,
+        };
+        if due {
             self.checkpoint(id);
         }
     }
@@ -843,14 +1022,23 @@ impl<L: EventLoop> Core<L> {
     /// lingering session whose owner may still come back keeps its exit for
     /// the owner.
     pub(super) fn session_exited(&mut self, holder: Token, id: SessionId, code: Option<i32>) {
-        let Some(session) = self.holder_session(holder, id) else {
+        if self.holder_session(holder, id).is_none() {
+            return;
+        }
+        log!("session {id}: exited ({code:?})");
+        // An agent's log gets its exit (and the stderr tail that came
+        // before it) first, so its client, or a replay, has it before the
+        // session's `EXIT`.
+        self.agent_exited(id, code);
+        let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        log!("session {id}: exited ({code:?})");
         // Whatever happens to the session, a replay of it now (one kept for
         // its owner, or one a client is still waiting for) shows no
         // contexts: the program that announced them is gone.
-        session.screen.process_exited(id);
+        if let Some(screen) = session.screen() {
+            screen.process_exited(id);
+        }
         match policy::exit_fate(&session.ownership, &session.life) {
             ExitFate::KeepForOwner => return session.life.exited(code),
             ExitFate::Report => {}
@@ -877,12 +1065,15 @@ impl<L: EventLoop> Core<L> {
         let Some(token) = self.client_token(client) else {
             return;
         };
+        let Some(protocol) = self.clients.get(&client).map(|entry| entry.protocol) else {
+            return;
+        };
         let sessions: Vec<(SessionId, SessionView<'_>)> = self
             .sessions
             .iter()
             .map(|(&id, session)| (id, session.view()))
             .collect();
-        let returning = policy::returning(&sessions, token);
+        let returning = policy::returning(&sessions, token, protocol);
         if !returning.is_empty() {
             log!(
                 "client {client} is back for {} session(s): {returning:?}",
@@ -958,11 +1149,11 @@ impl<L: EventLoop> Core<L> {
                         until: now + linger,
                         since: now,
                     };
-                    self.checkpoint(id);
+                    self.checkpoint_at(id, AgentCheckpoint::Detach);
                 }
                 Fate::Keep => {
                     log!("session {id}: detached");
-                    self.checkpoint(id);
+                    self.checkpoint_at(id, AgentCheckpoint::Detach);
                 }
             }
         }
@@ -1042,7 +1233,7 @@ impl<L: EventLoop> Core<L> {
         log!("stopping: hanging up {} session(s)", self.sessions.len());
         self.stopping = Some(super::Answer { client, req });
         for waiting in std::mem::take(&mut self.waiting) {
-            let req = waiting.spawn.req;
+            let req = waiting.spawn.req();
             self.send_client(
                 waiting.client,
                 error(Some(req), None, "the server is stopping"),
@@ -1128,6 +1319,16 @@ impl<L: EventLoop> Core<L> {
     /// The session, if it is attached to `client`; otherwise the `ERROR` is
     /// sent and `None` returned.
     fn client_session(&mut self, client: Token, id: SessionId) -> Option<&mut Session> {
+        self.attached_session(client, id, None)
+    }
+
+    /// The same, with the `ERROR` answering request `req`.
+    pub(super) fn attached_session(
+        &mut self,
+        client: Token,
+        id: SessionId,
+        req: Option<RequestId>,
+    ) -> Option<&mut Session> {
         if self
             .sessions
             .get(&id)
@@ -1140,16 +1341,32 @@ impl<L: EventLoop> Core<L> {
         } else {
             format!("no session {id}")
         };
-        self.send_client(client, error(None, Some(id), message));
+        self.send_client(client, error(req, Some(id), message));
         None
+    }
+
+    /// The session attached to `client` if it is a terminal; an agent
+    /// session's `ERROR` says it takes no `what`.
+    fn terminal_session(&mut self, client: Token, id: SessionId, what: &str) -> Option<&mut Session> {
+        let session = self.client_session(client, id)?;
+        match session.kind() {
+            SessionKind::Terminal => self.sessions.get_mut(&id),
+            SessionKind::Agent => {
+                let message = format!("session {id} is an agent session, which takes no {what}");
+                self.send_client(client, error(None, Some(id), message));
+                None
+            }
+        }
     }
 
     pub(super) fn client_input(&mut self, client: Token, data: Data) {
         let now = Instant::now();
-        let Some(session) = self.client_session(client, data.session) else {
+        let Some(session) = self.terminal_session(client, data.session, "input") else {
             return;
         };
-        session.screen.input_seen(data.session);
+        if let Some(screen) = session.screen() {
+            screen.input_seen(data.session);
+        }
         session.mark_active(now);
         let holder = session.holder;
         self.send_holder(
@@ -1161,8 +1378,10 @@ impl<L: EventLoop> Core<L> {
         );
     }
 
+    /// `RESIZE`; an agent session has no size, so its `RESIZE` is refused
+    /// here and never reaches its holder.
     pub(super) fn client_resize(&mut self, client: Token, resize: Resize) {
-        let Some(session) = self.client_session(client, resize.session) else {
+        let Some(session) = self.terminal_session(client, resize.session, "size") else {
             return;
         };
         // It came after the `ATTACH` whose replay still waits, so that
@@ -1184,7 +1403,8 @@ impl<L: EventLoop> Core<L> {
     /// reply; only a session that isn't this client's is refused.
     #[cfg(windows)]
     pub(super) fn client_reparent(&mut self, client: Token, reparent: client::Reparent) {
-        let Some(session) = self.client_session(client, reparent.session) else {
+        let Some(session) = self.terminal_session(client, reparent.session, "console window")
+        else {
             return;
         };
         let holder = session.holder;
@@ -1217,7 +1437,8 @@ impl<L: EventLoop> Core<L> {
     pub(super) fn client_attach(&mut self, client: Token, attach: client::Attach) {
         let id = attach.session;
         let session = self.sessions.get(&id).map(Session::view);
-        if let Some(refusal) = policy::attach_refusal(id, session, client) {
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+        if let Some(refusal) = policy::attach_refusal(id, session, client, protocol) {
             let message = refusal.to_string();
             return self.send_client(client, error(Some(attach.req), Some(id), message));
         }
@@ -1269,7 +1490,7 @@ impl<L: EventLoop> Core<L> {
         session.meta.layout = kept_layout(id, detach.layout);
         self.store_meta(id);
         self.detach_session(id, Instant::now());
-        self.checkpoint(id);
+        self.checkpoint_at(id, AgentCheckpoint::Detach);
     }
 
     /// `SET_LAYOUT` (protocol 3): the attached client's layout for the
@@ -1398,7 +1619,12 @@ impl<L: EventLoop> Core<L> {
         };
         // Rendered whole, in this turn of the loop: output read after it
         // is fed and forwarded after it, so nothing is lost or reordered.
-        let bytes = session.screen.render(id);
+        // An agent's replay is its whole log as transcript events
+        // (`Transcript::replay`), after which its live events follow.
+        let body = match &mut session.content {
+            Content::Terminal(screen) => Replay::Screen(screen.render(id)),
+            Content::Agent(agent) => Replay::Transcript(agent.replay()),
+        };
         self.send_client(
             client,
             ToClient::ReplayStart(client::ReplayStart {
@@ -1407,15 +1633,24 @@ impl<L: EventLoop> Core<L> {
                 pid,
             }),
         );
-        for chunk in bytes.chunks(REPLAY_CHUNK) {
-            self.send_client(
-                client,
-                ToClient::Data(Data {
-                    session: id,
-                    bytes: chunk.to_vec(),
-                }),
-            );
-        }
+        let resizes = match body {
+            Replay::Screen(bytes) => {
+                for chunk in bytes.chunks(REPLAY_CHUNK) {
+                    self.send_client(
+                        client,
+                        ToClient::Data(Data {
+                            session: id,
+                            bytes: chunk.to_vec(),
+                        }),
+                    );
+                }
+                true
+            }
+            Replay::Transcript(events) => {
+                self.send_transcript(client, id, events);
+                false
+            }
+        };
         self.send_client(
             client,
             ToClient::ReplayEnd(client::SessionRef { session: id }),
@@ -1424,7 +1659,9 @@ impl<L: EventLoop> Core<L> {
             self.sessions.remove(&id);
             return self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
         }
-        if let Some((cols, rows)) = size
+        // An agent session has no size: an `ATTACH`'s is ignored.
+        if resizes
+            && let Some((cols, rows)) = size
             && cols > 0
             && rows > 0
         {
@@ -1442,9 +1679,12 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         let (cols, rows) = emulator::clamped(cols, rows);
+        let Some(screen) = session.screen() else {
+            return;
+        };
+        screen.resize(id, cols, rows);
         session.cols = cols;
         session.rows = rows;
-        session.screen.resize(id, cols, rows);
         let holder = session.holder;
         self.send_holder(
             holder,
@@ -1487,7 +1727,7 @@ mod tests {
             ..SessionMeta::default()
         };
         let meta = meta.to_value();
-        HeldSession { session: 3, pid: 42, cols: 80, rows: 24, exit: None, meta, truncated }
+        HeldSession { session: 3, pid: 42, cols: 80, rows: 24, exit: None, meta, truncated, mode: h1::SpawnMode::Pty }
     }
 
     #[test]
@@ -1647,13 +1887,17 @@ mod tests {
         }
     }
 
+    fn terminal(policy: Policy) -> SpawnRequest {
+        SpawnRequest::Terminal(spawn(policy))
+    }
+
     #[test]
     fn each_life_answers_its_questions() {
         // (life, pid, starting, running, hung up, live)
         let cases = [
-            (Life::starting(spawn(Policy::Kill)), None, true, false, false, false),
+            (Life::starting(terminal(Policy::Kill)), None, true, false, false, false),
             (
-                Life::Starting { spawn: spawn(Policy::Kill), hung_up: true },
+                Life::Starting { spawn: terminal(Policy::Kill), hung_up: true },
                 None,
                 true,
                 false,
@@ -1685,7 +1929,7 @@ mod tests {
 
     #[test]
     fn a_hang_up_is_sent_once_and_never_for_an_exit() {
-        let mut starting = Life::starting(spawn(Policy::Kill));
+        let mut starting = Life::starting(terminal(Policy::Kill));
         assert!(starting.hang_up());
         assert!(!starting.hang_up());
         assert!(starting.is_starting() && starting.is_hung_up());
@@ -1701,7 +1945,7 @@ mod tests {
         // An exit keeps the pid its program had.
         running.exited(Some(1));
         assert_eq!(running, Life::ExitedAwaitingOwner { code: Some(1), pid: Some(pid(9)) });
-        let mut starting = Life::starting(spawn(Policy::Kill));
+        let mut starting = Life::starting(terminal(Policy::Kill));
         starting.exited(None);
         assert_eq!(starting, Life::ExitedAwaitingOwner { code: None, pid: None });
     }
@@ -1765,12 +2009,13 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 key: "k1".into(),
-                title: session.screen.title(),
+                title: session.screen().expect("a terminal").title(),
                 started: 1_700_000_000,
                 profile: Some("work".into()),
                 owned: true,
                 detached_secs: 5,
                 layout: Some(layout),
+                agent: None,
             }
         );
 
@@ -1799,19 +2044,11 @@ mod tests {
 
     #[test]
     fn the_listed_command_line_is_the_command_and_its_arguments() {
-        let login = spawn(Policy::Kill);
-        assert_eq!(command_line(&login), "");
+        assert_eq!(command_line(None, &[]), "");
         // Arguments with no command are the login shell's: not shown.
-        let args = client::Spawn { args: vec!["-l".into()], ..spawn(Policy::Kill) };
-        assert_eq!(command_line(&args), "");
-        let vim = client::Spawn {
-            command: Some("vim".into()),
-            args: vec!["a b".into(), "-R".into()],
-            ..spawn(Policy::Kill)
-        };
-        assert_eq!(command_line(&vim), "vim a b -R");
-        let bare = client::Spawn { command: Some("top".into()), ..spawn(Policy::Kill) };
-        assert_eq!(command_line(&bare), "top");
+        assert_eq!(command_line(None, &["-l".into()]), "");
+        assert_eq!(command_line(Some("vim"), &["a b".into(), "-R".into()]), "vim a b -R");
+        assert_eq!(command_line(Some("top"), &[]), "top");
     }
 
     #[test]

@@ -1,0 +1,3649 @@
+//! The ACP reducer (design decisions 4, 7, 8, 10, 13, 14 and 17 of the
+//! OpenSpec change `agents-sessions`): [`step`] takes one [`Input`] for an
+//! agent session (the agent's stdout, a client's command, a holder event)
+//! and returns what the core does about it as data ([`Output`]): the
+//! transcript events to send, the bytes to write to the agent's stdin, the
+//! reply to the client's request, whether to checkpoint and whether to hang
+//! the agent up. The core's handlers gather, call `step` and apply; they
+//! decide nothing (`fcis R1`, `R9`).
+//!
+//! - **The log changes only here.** [`AgentSession`] holds the
+//!   [`Transcript`], and `step` applies every event it returns before
+//!   returning it, so the core sends [`Output::events`] as they are. A
+//!   [`FoldError`] from its own events is a bug in this reducer: the step
+//!   stops and the session's ACP handling is marked failed (decision 13).
+//! - **Lines are split here.** The session holds the [`Lines`] the agent's
+//!   stdout goes through, so [`Input::Stdout`] takes the holder's bytes as
+//!   they come and [`AgentSession::lines`] gives the checkpoint its `covers`.
+//! - **Text from the agent is cleaned** ([`clean`]): control characters
+//!   other than `\n`, `\t` and the `\r` of a `\r\n` become U+FFFD, so no
+//!   client renders an escape sequence an agent wrote. Text fields are
+//!   bounded at [`TEXT_CHUNK`]; growing text is split into `Appended`s.
+//! - **Time is an argument.** A run of lines that aren't ACP messages is
+//!   one notice with its count, written when a message follows, at any
+//!   other input, or at an [`Input::Tick`] once [`BAD_RUN_QUIET`] has passed
+//!   with no more; [`Output::wake`] says when to tick.
+//!
+//! A whole pure module (`fcis` R2, R3; `PURE_MODULES`).
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::time::{Duration, Instant};
+
+use brindle_remote_protocol::serde_json::Value;
+use brindle_transcript::{
+    AgentState, Entry, EntryId, Event, NoticeLevel, PermissionOption, PermissionOutcome, Slot,
+    StopReason, TEXT_CHUNK, Transcript, TurnState, chunks,
+};
+use brindle_transcript::{HoldReason, ToolKind, ToolStatus};
+
+use super::lines::{Lines, Piece};
+use super::rpc::{self, PROTOCOL_VERSION, Purpose, Refusal, Rpc};
+use super::wire::{
+    self, AUTH_REQUIRED, Content, ContentKind, Id, Malformed, Message, NotificationKind,
+    OptionKind, RequestKind, RpcError, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
+};
+
+/// The most the log keeps, encoded (decision 14): past it the oldest
+/// entries are dropped whole, with a `Trimmed` event.
+pub const LOG_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The longest prompt taken, in bytes of UTF-8 (decision 10).
+pub const MAX_PROMPT: usize = 256 * 1024;
+
+/// How long a run of lines that aren't ACP messages may go without another
+/// before its notice is written.
+pub const BAD_RUN_QUIET: Duration = Duration::from_secs(1);
+
+/// Where the agent's ACP conversation is: what the transcript's
+/// [`AgentState`] can't say (which start request is out, the ACP session
+/// id, why the agent failed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Phase {
+    /// The holder hasn't said the agent started.
+    Spawning,
+    /// `initialize` is sent and not answered.
+    Initializing,
+    /// `session/new` is sent and not answered; the name and version the
+    /// agent gave in `initialize`.
+    Creating {
+        name: Option<String>,
+        version: Option<String>,
+    },
+    /// Takes prompts in the ACP session `session`.
+    Ready { session: String },
+    /// The agent answered `-32000` (decision 17): nothing more is sent.
+    LoginRequired,
+    /// The start failed (another ACP version, or an error or unreadable
+    /// answer to `initialize` or `session/new`; decision 4): the agent is
+    /// hung up, and its exit leaves the failed state, adding its stderr as
+    /// a notice.
+    Refused,
+    /// The core's handling of this agent failed (decision 13), or its
+    /// checkpoint couldn't be restored (decision 11): its lines are
+    /// ignored, and it runs until the session is closed.
+    Broken,
+    /// The agent's process ended.
+    Exited,
+}
+
+/// The kind of text entry a run of chunks grows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunKind {
+    User,
+    Agent,
+    Thought,
+}
+
+/// The chunk run in progress: chunks of `kind` append to `entry` (decision
+/// 7); a chunk of another kind, any other new entry or a turn's end ends it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Run {
+    pub kind: RunKind,
+    pub entry: EntryId,
+}
+
+/// A run of lines that weren't ACP messages, not yet written as a notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BadRun {
+    pub lines: u64,
+    /// When the last of them came.
+    pub last: Instant,
+}
+
+/// One agent session's ACP state: its log, its JSON-RPC bookkeeping, its
+/// stdout's line in progress and the rest of what `step` keeps. The
+/// checkpoint (`acp::checkpoint`) encodes it whole.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentSession {
+    pub(super) transcript: Transcript,
+    pub(super) rpc: Rpc,
+    pub(super) lines: Lines,
+    pub(super) phase: Phase,
+    /// The absolute directory `session/new` is given.
+    pub(super) cwd: String,
+    /// Brindle's version, for `initialize`'s `clientInfo`.
+    pub(super) version: String,
+    pub(super) run: Option<Run>,
+    /// The tool entries by the agent's call id; trimmed entries leave it.
+    pub(super) tools: BTreeMap<String, EntryId>,
+    pub(super) bad: Option<BadRun>,
+}
+
+impl AgentSession {
+    /// A session whose agent is being spawned in `cwd` (already absolute,
+    /// decision 4), by Brindle at `version`.
+    pub fn new(cwd: String, version: String) -> Self {
+        Self {
+            transcript: Transcript::new(),
+            rpc: Rpc::new(),
+            lines: Lines::new(),
+            phase: Phase::Spawning,
+            cwd,
+            version,
+            run: None,
+            tools: BTreeMap::new(),
+            bad: None,
+        }
+    }
+
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
+    }
+
+    /// The stdout line in progress and the bytes fed, for the checkpoint.
+    pub fn lines(&self) -> &Lines {
+        &self.lines
+    }
+
+    // What the tests look at; the core sees a session through its
+    // transcript and its lines.
+
+    #[cfg(test)]
+    pub fn rpc(&self) -> &Rpc {
+        &self.rpc
+    }
+
+    #[cfg(test)]
+    pub fn phase(&self) -> &Phase {
+        &self.phase
+    }
+
+    #[cfg(test)]
+    pub fn cwd(&self) -> &str {
+        &self.cwd
+    }
+}
+
+/// What happened to an agent session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Input<'a> {
+    /// The holder started the agent (`SPAWNED`): `initialize` goes out.
+    Spawned,
+    /// Bytes of the agent's stdout, as the holder sent them.
+    Stdout(&'a [u8]),
+    /// The holder's tail was truncated in an adoption (decision 11): the
+    /// bytes fed next follow a gap.
+    OutputLost,
+    /// The agent's process ended (`EXITED`), with the stderr tail the
+    /// holder sent before it (`STDERR_TAIL`, at most 16 KiB).
+    Exited { code: Option<i32>, stderr: &'a [u8] },
+    /// A command from the client that has the session attached.
+    Command(Command),
+    /// Handling this session failed in the core (a panic caught around
+    /// `step`, decision 13): its ACP handling stops, with this reason.
+    Fault { reason: String },
+    /// Time passed (at the [`Output::wake`] asked for).
+    Tick,
+}
+
+/// A client's command for an agent session (client protocol 4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Command {
+    /// `AGENT_PROMPT`.
+    Prompt { text: String },
+    /// `AGENT_UNQUEUE`: discard the slot's prompt, waiting or held.
+    Unqueue,
+    /// `AGENT_RESEND`: send the held prompt again.
+    Resend,
+    /// `AGENT_CANCEL`.
+    Cancel,
+    /// `AGENT_PERMISSION`: the chosen option's id, or `None` for cancelled.
+    Answer {
+        entry: EntryId,
+        option: Option<String>,
+    },
+}
+
+/// Why a client's command was refused; its text is the `ERROR`'s, which
+/// the core prefixes with the session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    NotReady,
+    LoginRequired,
+    /// The agent can't be used: its start failed or its handling did.
+    Failed {
+        message: String,
+    },
+    Exited,
+    AlreadyQueued,
+    TooLong {
+        len: usize,
+    },
+    NothingQueued,
+    NoneHeld,
+    NoSuchRequest {
+        entry: EntryId,
+    },
+    AlreadyAnswered {
+        entry: EntryId,
+    },
+    NoSuchOption {
+        entry: EntryId,
+        option: String,
+    },
+}
+
+impl fmt::Display for Refused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotReady => f.write_str("the agent isn't ready"),
+            Self::LoginRequired => {
+                f.write_str("the agent needs a login through its own command line")
+            }
+            Self::Failed { message } => write!(f, "the agent can't take prompts: {message}"),
+            Self::Exited => f.write_str("the agent has exited"),
+            Self::AlreadyQueued => f.write_str("a prompt is already queued"),
+            Self::TooLong { len } => write!(
+                f,
+                "the prompt is {len} bytes, over the limit of {} KiB",
+                MAX_PROMPT / 1024
+            ),
+            Self::NothingQueued => f.write_str("nothing is queued"),
+            Self::NoneHeld => f.write_str("no prompt is held"),
+            Self::NoSuchRequest { entry } => {
+                write!(f, "entry {entry} isn't a permission request")
+            }
+            Self::AlreadyAnswered { entry } => {
+                write!(f, "permission request {entry} was already answered")
+            }
+            Self::NoSuchOption { entry, option } => {
+                write!(
+                    f,
+                    "permission request {entry} doesn't offer option {option:?}"
+                )
+            }
+        }
+    }
+}
+
+/// Why the core checkpoints now (decision 11's moments that the reducer
+/// sees; `policy::agent_checkpoint_due` decides with the rest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Moment {
+    /// The agent became ready or needs a login: the session id is known.
+    Started,
+    /// A request is about to be written ([`Output::stdin`]): its id, and a
+    /// prompt's user entry, reach the holder ahead of its bytes.
+    BeforeRequest,
+    TurnEnded,
+    QueueChanged,
+    /// A permission request arrived, or was answered.
+    Permission,
+    /// The agent stopped being usable: it failed or exited.
+    Stopped,
+}
+
+/// What the core does after a step, in this order: send `events` to the
+/// attached client, checkpoint when `checkpoint` says so, then write
+/// `stdin` to the agent, then hang it up when `hang_up` says so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Output {
+    /// Already applied to the session's transcript.
+    pub events: Vec<Event>,
+    pub stdin: Vec<u8>,
+    /// The answer to a client's command; `None` for other inputs and for a
+    /// cancel, which is never refused here.
+    pub reply: Option<Result<(), Refused>>,
+    pub checkpoint: Option<Moment>,
+    /// Close the agent's stdin, then end it after the grace (decision 2).
+    pub hang_up: bool,
+    /// When to step [`Input::Tick`].
+    pub wake: Option<Instant>,
+}
+
+/// Steps `session` with one input.
+pub fn step(session: &mut AgentSession, input: Input<'_>, now: Instant) -> Output {
+    let mut step = Step {
+        s: session,
+        out: Output::default(),
+        fault: None,
+        now,
+    };
+    match input {
+        Input::Spawned => step.spawned(),
+        Input::Stdout(bytes) => step.stdout(bytes),
+        Input::OutputLost => {
+            step.flush_bad();
+            step.output_lost();
+        }
+        Input::Exited { code, stderr } => {
+            step.flush_bad();
+            step.exited(code, stderr);
+        }
+        Input::Command(command) => {
+            step.flush_bad();
+            step.command(command);
+        }
+        Input::Fault { reason } => {
+            step.flush_bad();
+            step.fail(&reason);
+        }
+        Input::Tick => step.tick(),
+    }
+    step.finish()
+}
+
+/// A turn's end.
+enum Ending {
+    Stop(StopReason),
+    Failed(String),
+}
+
+impl Ending {
+    fn state(&self) -> TurnState {
+        match self {
+            Self::Stop(stop) => TurnState::Ended { stop: stop.clone() },
+            Self::Failed(message) => TurnState::Failed {
+                message: message.clone(),
+            },
+        }
+    }
+}
+
+struct Step<'s> {
+    s: &'s mut AgentSession,
+    out: Output,
+    /// A fold error from this step's own events: the rest is skipped.
+    fault: Option<String>,
+    now: Instant,
+}
+
+impl Step<'_> {
+    fn finish(mut self) -> Output {
+        if let Some(reason) = self.fault.take() {
+            self.fail(&reason);
+        }
+        self.trim();
+        self.out.wake = self.s.bad.map(|bad| bad.last + BAD_RUN_QUIET);
+        self.out
+    }
+
+    // --- emitting -------------------------------------------------------
+
+    /// Applies `event` and keeps it for the client; after a fold error,
+    /// does nothing.
+    fn emit(&mut self, event: Event) {
+        if self.fault.is_some() {
+            return;
+        }
+        match self.s.transcript.apply(&event) {
+            Ok(()) => self.out.events.push(event),
+            Err(error) => self.fault = Some(error.to_string()),
+        }
+    }
+
+    fn mark(&mut self, moment: Moment) {
+        self.out.checkpoint = match self.out.checkpoint {
+            Some(Moment::BeforeRequest) => Some(Moment::BeforeRequest),
+            Some(
+                Moment::Started
+                | Moment::TurnEnded
+                | Moment::QueueChanged
+                | Moment::Permission
+                | Moment::Stopped,
+            )
+            | None => Some(moment),
+        };
+    }
+
+    /// Adds an entry that isn't text, ending the chunk run.
+    fn add(&mut self, entry: Entry) -> EntryId {
+        let id = self.s.transcript.next_id();
+        self.s.run = None;
+        self.emit(Event::Added { id, entry });
+        id
+    }
+
+    /// Adds a text entry of `kind`, its text split into `Appended`s, and
+    /// makes it the chunk run.
+    fn add_text(&mut self, kind: RunKind, text: &str) -> EntryId {
+        let id = self.s.transcript.next_id();
+        let mut pieces = chunks(text);
+        let first = pieces.next().unwrap_or_default().to_owned();
+        let entry = match kind {
+            RunKind::User => Entry::User { text: first },
+            RunKind::Agent => Entry::Agent { text: first },
+            RunKind::Thought => Entry::Thought { text: first },
+        };
+        self.emit(Event::Added { id, entry });
+        for piece in pieces {
+            self.emit(Event::Appended {
+                id,
+                text: piece.to_owned(),
+            });
+        }
+        self.s.run = Some(Run { kind, entry: id });
+        id
+    }
+
+    fn notice(&mut self, level: NoticeLevel, text: String) {
+        self.add(Entry::Notice {
+            level,
+            text: bound(text),
+        });
+    }
+
+    fn turn(&mut self, state: TurnState) {
+        self.emit(Event::Turn { state });
+    }
+
+    fn agent(&mut self, state: AgentState) {
+        self.emit(Event::Agent { state });
+    }
+
+    /// Holds a waiting prompt with `reason`; an empty or held slot stays.
+    fn hold_waiting(&mut self, reason: HoldReason) {
+        if let Slot::Waiting { text } = self.s.transcript.slot() {
+            let text = text.clone();
+            self.emit(Event::Queue {
+                slot: Slot::Held { text, reason },
+            });
+            self.mark(Moment::QueueChanged);
+        }
+    }
+
+    // --- reading the state ----------------------------------------------
+
+    fn running(&self) -> bool {
+        running(self.s.transcript.turn())
+    }
+
+    fn prompt_awaited(&self) -> bool {
+        self.s
+            .rpc
+            .outgoing()
+            .values()
+            .any(|purpose| *purpose == Purpose::Prompt)
+    }
+
+    /// The ACP session id when prompts can be sent, else why not.
+    fn readiness(&self) -> Result<String, Refused> {
+        match &self.s.phase {
+            Phase::Spawning | Phase::Initializing | Phase::Creating { .. } => {
+                Err(Refused::NotReady)
+            }
+            Phase::Ready { session } => Ok(session.clone()),
+            Phase::LoginRequired => Err(Refused::LoginRequired),
+            Phase::Refused | Phase::Broken => Err(Refused::Failed {
+                message: self.failure(),
+            }),
+            Phase::Exited => Err(Refused::Exited),
+        }
+    }
+
+    fn failure(&self) -> String {
+        match self.s.transcript.agent() {
+            AgentState::Failed { message } => message.clone(),
+            AgentState::Starting
+            | AgentState::Ready { .. }
+            | AgentState::LoginRequired { .. }
+            | AgentState::Exited { .. } => "ACP handling failed".to_owned(),
+        }
+    }
+
+    /// Whether the agent's lines are still read: not after a failed start,
+    /// a failed handling or an exit.
+    fn reading(&self) -> bool {
+        match self.s.phase {
+            Phase::Spawning
+            | Phase::Initializing
+            | Phase::Creating { .. }
+            | Phase::Ready { .. }
+            | Phase::LoginRequired => true,
+            Phase::Refused | Phase::Broken | Phase::Exited => false,
+        }
+    }
+
+    // --- holder events --------------------------------------------------
+
+    fn spawned(&mut self) {
+        if self.s.phase != Phase::Spawning {
+            return;
+        }
+        let line = self.s.rpc.initialize(&self.s.version);
+        self.s.phase = Phase::Initializing;
+        self.out.stdin.extend(line);
+        self.mark(Moment::BeforeRequest);
+    }
+
+    fn stdout(&mut self, bytes: &[u8]) {
+        for piece in self.s.lines.feed(bytes) {
+            if !self.reading() {
+                continue;
+            }
+            match piece {
+                Piece::Line(line) => self.line(&line),
+                Piece::TooLong { len } => {
+                    self.flush_bad();
+                    self.notice(
+                        NoticeLevel::Warning,
+                        format!(
+                            "a line of {len} bytes from the agent was over the {} MiB limit and was dropped",
+                            super::lines::MAX_LINE / (1024 * 1024)
+                        ),
+                    );
+                }
+                // `OutputLost` wrote the notice for the gap.
+                Piece::Lost { .. } => {}
+            }
+        }
+    }
+
+    fn output_lost(&mut self) {
+        self.s.lines.cut_front();
+        if self.s.phase == Phase::Exited {
+            return;
+        }
+        self.notice(
+            NoticeLevel::Warning,
+            "output from the agent was lost while the terminal server restarted".to_owned(),
+        );
+        let lost = "output was lost while the terminal server restarted";
+        if self.s.rpc.forget(Purpose::Prompt) {
+            self.hold_waiting(HoldReason::OutputLost);
+            self.s.run = None;
+            self.turn(TurnState::Failed {
+                message: lost.to_owned(),
+            });
+            self.mark(Moment::TurnEnded);
+        }
+        let starting = match self.s.phase {
+            Phase::Initializing => self.s.rpc.forget(Purpose::Initialize),
+            Phase::Creating { .. } => self.s.rpc.forget(Purpose::NewSession),
+            Phase::Spawning
+            | Phase::Ready { .. }
+            | Phase::LoginRequired
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited => false,
+        };
+        if starting {
+            self.refuse(format!("the agent couldn't start: {lost}"));
+        }
+    }
+
+    fn exited(&mut self, code: Option<i32>, stderr: &[u8]) {
+        if self.s.phase == Phase::Exited {
+            return;
+        }
+        let stderr = bound(clean(&String::from_utf8_lossy(stderr)));
+        let refused = self.s.phase == Phase::Refused;
+        self.s.phase = Phase::Exited;
+        for (entry, _) in self.s.rpc.cancel_permissions() {
+            self.emit(Event::Answered {
+                id: entry,
+                outcome: PermissionOutcome::Cancelled,
+            });
+        }
+        if refused {
+            // Decision 4: the version message stays the last agent state.
+            if !stderr.trim().is_empty() {
+                self.notice(
+                    NoticeLevel::Warning,
+                    format!("the agent's standard error:\n{stderr}"),
+                );
+            }
+        } else {
+            self.hold_waiting(HoldReason::AgentStopped);
+            if self.running() {
+                self.s.run = None;
+                self.turn(TurnState::Failed {
+                    message: "the agent exited".to_owned(),
+                });
+            }
+            self.agent(AgentState::Exited { code, stderr });
+        }
+        self.mark(Moment::Stopped);
+    }
+
+    /// The start failed (decision 4): the agent fails with `message`, is
+    /// sent nothing more and is hung up.
+    fn refuse(&mut self, message: String) {
+        self.s.phase = Phase::Refused;
+        self.hold_waiting(HoldReason::AgentStopped);
+        self.agent(AgentState::Failed {
+            message: bound(message),
+        });
+        self.out.hang_up = true;
+        self.mark(Moment::Stopped);
+    }
+
+    /// The core's handling failed (decision 13): the agent fails, a waiting
+    /// prompt is held, and the agent is left running.
+    fn fail(&mut self, reason: &str) {
+        self.fault = None;
+        if self.s.phase == Phase::Exited {
+            return;
+        }
+        self.s.phase = Phase::Broken;
+        self.s.run = None;
+        self.hold_waiting(HoldReason::AgentStopped);
+        if self.running() {
+            self.turn(TurnState::Failed {
+                message: "ACP handling failed".to_owned(),
+            });
+        }
+        self.agent(AgentState::Failed {
+            message: bound(format!("ACP handling failed: {}", clean(reason))),
+        });
+        self.mark(Moment::Stopped);
+    }
+
+    fn tick(&mut self) {
+        if let Some(bad) = self.s.bad
+            && self.now >= bad.last + BAD_RUN_QUIET
+        {
+            self.flush_bad();
+        }
+    }
+
+    // --- lines from the agent -------------------------------------------
+
+    fn bad_line(&mut self) {
+        let lines = self.s.bad.map_or(0, |bad| bad.lines);
+        self.s.bad = Some(BadRun {
+            lines: lines.saturating_add(1),
+            last: self.now,
+        });
+    }
+
+    /// Writes the run of bad lines as one notice.
+    fn flush_bad(&mut self) {
+        if let Some(bad) = self.s.bad.take() {
+            let text = if bad.lines == 1 {
+                "a line from the agent wasn't an ACP message".to_owned()
+            } else {
+                format!("{} lines from the agent weren't ACP messages", bad.lines)
+            };
+            self.notice(NoticeLevel::Warning, text);
+        }
+    }
+
+    fn line(&mut self, line: &[u8]) {
+        match wire::decode(line) {
+            Ok(message) => self.message(message),
+            // An empty line is no message and no fault.
+            Err(Malformed::Blank) => {}
+            Err(Malformed::InvalidRequest) => {
+                self.bad_line();
+                self.out
+                    .stdin
+                    .extend(rpc::error(None, Refusal::InvalidRequest));
+            }
+            // A batch is skipped and counted, never answered.
+            Err(
+                Malformed::NotJson
+                | Malformed::Batch
+                | Malformed::NotObject
+                | Malformed::NotJsonRpc
+                | Malformed::BadShape,
+            ) => self.bad_line(),
+        }
+    }
+
+    fn message(&mut self, message: Message) {
+        match message {
+            Message::Request { id, method, params } => {
+                self.flush_bad();
+                match wire::request_kind(&method) {
+                    RequestKind::Permission => self.permission(id, &params),
+                    RequestKind::Unoffered => self
+                        .out
+                        .stdin
+                        .extend(rpc::error(Some(&id), Refusal::MethodNotFound)),
+                }
+            }
+            Message::Notification { method, params } => match wire::notification_kind(&method) {
+                NotificationKind::SessionUpdate => match wire::session_update(&params) {
+                    Ok(update) => {
+                        self.flush_bad();
+                        self.update(update);
+                    }
+                    Err(_) => self.bad_line(),
+                },
+                NotificationKind::CancelRequest => match wire::cancel_request(&params) {
+                    Ok(id) => {
+                        self.flush_bad();
+                        self.withdraw(&id);
+                    }
+                    Err(_) => self.bad_line(),
+                },
+                NotificationKind::Other => self.flush_bad(),
+            },
+            Message::Response { id, result } => {
+                self.flush_bad();
+                if let Some(purpose) = self.s.rpc.answered(&id) {
+                    self.response(purpose, Ok(&result));
+                }
+            }
+            Message::Error { id, error } => {
+                self.flush_bad();
+                if let Some(id) = id
+                    && let Some(purpose) = self.s.rpc.answered(&id)
+                {
+                    self.response(purpose, Err(&error));
+                }
+            }
+        }
+    }
+
+    fn update(&mut self, update: wire::SessionUpdate) {
+        if let Phase::Ready { session } = &self.s.phase
+            && *session != update.session_id
+        {
+            return;
+        }
+        match update.update {
+            Update::UserChunk(content) => self.chunk(RunKind::User, content),
+            Update::AgentChunk(content) => self.chunk(RunKind::Agent, content),
+            Update::ThoughtChunk(content) => self.chunk(RunKind::Thought, content),
+            Update::ToolCall(call) => self.tool_call(call),
+            Update::ToolChanged(change) => self.tool_change(change),
+            Update::Ignored { .. } => {}
+        }
+    }
+
+    fn chunk(&mut self, kind: RunKind, content: Content) {
+        let text = match content {
+            Content::Text(text) => clean(&text),
+            Content::Other(kind) => placeholder(kind).to_owned(),
+        };
+        if text.is_empty() {
+            return;
+        }
+        if let Some(run) = self.s.run
+            && run.kind == kind
+            && self.s.transcript.entry(run.entry).is_some()
+        {
+            for piece in chunks(&text) {
+                self.emit(Event::Appended {
+                    id: run.entry,
+                    text: piece.to_owned(),
+                });
+            }
+        } else {
+            self.add_text(kind, &text);
+        }
+    }
+
+    /// The tool entry for the agent's call id, when the log still has it.
+    fn tool(&self, call: &str) -> Option<EntryId> {
+        let id = *self.s.tools.get(call)?;
+        self.s.transcript.entry(id).map(|_| id)
+    }
+
+    fn tool_call(&mut self, call: ToolCall) {
+        let id = bound(clean(&call.call));
+        let title = bound(clean(&call.title));
+        match self.tool(&id) {
+            // An agent may send `tool_call` again for a call it already
+            // named: its fields change the entry.
+            Some(entry) => {
+                self.change_tool(entry, Some(title), Some(call.kind), Some(call.status));
+            }
+            None => self.add_tool(id, title, call.kind, call.status),
+        }
+    }
+
+    fn tool_change(&mut self, change: ToolChange) {
+        let id = bound(clean(&change.call));
+        let title = change.title.map(|title| bound(clean(&title)));
+        match self.tool(&id) {
+            Some(entry) => self.change_tool(entry, title, change.kind, change.status),
+            // An update for a call the log doesn't have adds it with the
+            // fields it carries.
+            None => {
+                let title = title.unwrap_or_else(|| id.clone());
+                self.add_tool(
+                    id,
+                    title,
+                    change.kind.unwrap_or(ToolKind::Other),
+                    change.status.unwrap_or(ToolStatus::Pending),
+                );
+            }
+        }
+    }
+
+    fn add_tool(&mut self, call: String, title: String, kind: ToolKind, status: ToolStatus) {
+        let entry = self.add(Entry::Tool {
+            call: call.clone(),
+            title,
+            kind,
+            status,
+        });
+        self.s.tools.insert(call, entry);
+    }
+
+    /// Sends the fields that differ from the entry's, in whatever order
+    /// they come (statuses can go backwards); nothing when none differ.
+    fn change_tool(
+        &mut self,
+        entry: EntryId,
+        title: Option<String>,
+        kind: Option<ToolKind>,
+        status: Option<ToolStatus>,
+    ) {
+        let Some(Entry::Tool {
+            title: own_title,
+            kind: own_kind,
+            status: own_status,
+            ..
+        }) = self.s.transcript.entry(entry)
+        else {
+            return;
+        };
+        let title = title.filter(|title| title != own_title);
+        let kind = kind.filter(|kind| kind != own_kind);
+        let status = status.filter(|status| status != own_status);
+        if title.is_none() && kind.is_none() && status.is_none() {
+            return;
+        }
+        self.emit(Event::ToolChanged {
+            id: entry,
+            title,
+            kind,
+            status,
+        });
+    }
+
+    fn permission(&mut self, id: Id, params: &Value) {
+        let Ok(request) = wire::permission_request(params) else {
+            // Answered by its envelope id, never left waiting (decision 5).
+            self.out.stdin.extend(rpc::permission_answer(&id, None));
+            self.notice(
+                NoticeLevel::Warning,
+                "the agent asked for a permission Brindle couldn't read, which was answered cancelled"
+                    .to_owned(),
+            );
+            return;
+        };
+        let mut options = Vec::new();
+        let mut unknown = Vec::new();
+        for option in request.options {
+            match option.kind {
+                OptionKind::Known(kind) => options.push(PermissionOption {
+                    id: option.id,
+                    name: bound(clean(&option.name)),
+                    kind,
+                }),
+                OptionKind::Unknown { name } => unknown.push(clean(&name)),
+            }
+        }
+        let call = request.call.as_ref().map(|call| bound(clean(&call.call)));
+        let title = request
+            .call
+            .as_ref()
+            .and_then(|call| call.title.as_deref())
+            .map(|title| bound(clean(title)))
+            .or_else(|| {
+                let entry = self.tool(call.as_deref()?)?;
+                match self.s.transcript.entry(entry)? {
+                    Entry::Tool { title, .. } => Some(title.clone()),
+                    Entry::User { .. }
+                    | Entry::Agent { .. }
+                    | Entry::Thought { .. }
+                    | Entry::Permission { .. }
+                    | Entry::Notice { .. } => None,
+                }
+            })
+            .unwrap_or_else(|| "the agent asks for permission".to_owned());
+        let shown = !options.is_empty();
+        let entry = self.add(Entry::Permission {
+            call,
+            title,
+            options,
+            outcome: None,
+        });
+        if !unknown.is_empty() {
+            self.notice(
+                NoticeLevel::Info,
+                format!(
+                    "permission request {entry} also offered options of a kind Brindle doesn't know ({}), which aren't shown",
+                    unknown.join(", ")
+                ),
+            );
+        }
+        if !shown {
+            self.cancel_now(entry, &id);
+            self.notice(
+                NoticeLevel::Warning,
+                format!(
+                    "permission request {entry} offered no option Brindle can show, so it was answered cancelled"
+                ),
+            );
+        } else if *self.s.transcript.turn() == TurnState::Cancelling {
+            self.cancel_now(entry, &id);
+        } else if self.s.rpc.hold_permission(entry, id.clone()).is_err() {
+            self.cancel_now(entry, &id);
+            self.notice(
+                NoticeLevel::Warning,
+                format!(
+                    "more than {} permission requests were waiting, so request {entry} was answered cancelled",
+                    rpc::MAX_PENDING_PERMISSIONS
+                ),
+            );
+        } else if *self.s.transcript.turn() != TurnState::Blocked {
+            self.turn(TurnState::Blocked);
+        }
+        self.mark(Moment::Permission);
+    }
+
+    /// Answers a permission request `cancelled` at once and records it.
+    fn cancel_now(&mut self, entry: EntryId, id: &Id) {
+        self.out.stdin.extend(rpc::permission_answer(id, None));
+        self.emit(Event::Answered {
+            id: entry,
+            outcome: PermissionOutcome::Cancelled,
+        });
+    }
+
+    /// `$/cancel_request` for one of the agent's permission requests.
+    fn withdraw(&mut self, id: &Id) {
+        if let Some((entry, answer)) = self.s.rpc.withdraw(id) {
+            self.out.stdin.extend(answer);
+            self.emit(Event::Answered {
+                id: entry,
+                outcome: PermissionOutcome::Cancelled,
+            });
+            self.unblock();
+            self.mark(Moment::Permission);
+        }
+    }
+
+    /// With no permission request left waiting, a blocked turn works again
+    /// (or, with no prompt out, is idle).
+    fn unblock(&mut self) {
+        if self.s.rpc.permissions().is_empty() && *self.s.transcript.turn() == TurnState::Blocked {
+            let state = if self.prompt_awaited() {
+                TurnState::Working
+            } else {
+                TurnState::Idle
+            };
+            self.turn(state);
+        }
+    }
+
+    // --- answers to the core's requests ---------------------------------
+
+    fn response(&mut self, purpose: Purpose, result: Result<&Value, &RpcError>) {
+        match purpose {
+            Purpose::Initialize => self.initialized(result),
+            Purpose::NewSession => self.created(result),
+            Purpose::Prompt => self.prompted(result),
+        }
+    }
+
+    fn initialized(&mut self, result: Result<&Value, &RpcError>) {
+        if self.s.phase != Phase::Initializing {
+            return;
+        }
+        match result {
+            Ok(result) => match wire::initialize_result(result) {
+                Ok(initialized) if initialized.protocol_version == PROTOCOL_VERSION => {
+                    let (name, version) = initialized.agent.map_or((None, None), |agent| {
+                        (
+                            Some(bound(clean(&agent.name))),
+                            Some(bound(clean(&agent.version))),
+                        )
+                    });
+                    let line = self.s.rpc.new_session(&self.s.cwd);
+                    self.s.phase = Phase::Creating { name, version };
+                    self.out.stdin.extend(line);
+                    self.mark(Moment::BeforeRequest);
+                }
+                Ok(initialized) => self.refuse(format!(
+                    "the agent speaks ACP version {}; Brindle speaks {PROTOCOL_VERSION}",
+                    initialized.protocol_version
+                )),
+                Err(_) => self.refuse(
+                    "the agent's answer to initialize isn't one Brindle can read".to_owned(),
+                ),
+            },
+            Err(error) => {
+                let message = match wire::supported_versions(error) {
+                    Some(versions) => format!(
+                        "the agent supports ACP version{} {}; Brindle speaks {PROTOCOL_VERSION}",
+                        if versions.len() == 1 { "" } else { "s" },
+                        versions
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None if error.code == UNSUPPORTED_VERSION => format!(
+                        "the agent supports no ACP version Brindle speaks ({PROTOCOL_VERSION})"
+                    ),
+                    None => format!("the agent couldn't start: {}", clean(&error.message)),
+                };
+                self.refuse(message);
+            }
+        }
+    }
+
+    fn created(&mut self, result: Result<&Value, &RpcError>) {
+        let Phase::Creating { name, version } = &self.s.phase else {
+            return;
+        };
+        let (name, version) = (name.clone(), version.clone());
+        match result {
+            Ok(result) => match wire::new_session_result(result) {
+                Ok(created) => {
+                    self.s.phase = Phase::Ready {
+                        session: created.session_id,
+                    };
+                    self.agent(AgentState::Ready { name, version });
+                    self.mark(Moment::Started);
+                }
+                Err(_) => self.refuse(
+                    "the agent's answer to session/new isn't one Brindle can read".to_owned(),
+                ),
+            },
+            Err(error) if error.code == AUTH_REQUIRED => {
+                self.s.phase = Phase::LoginRequired;
+                self.agent(AgentState::LoginRequired {
+                    message: bound(clean(&error.message)),
+                });
+                self.mark(Moment::Started);
+            }
+            Err(error) => self.refuse(format!(
+                "the agent couldn't start a session: {}",
+                clean(&error.message)
+            )),
+        }
+    }
+
+    fn prompted(&mut self, result: Result<&Value, &RpcError>) {
+        match result {
+            Ok(result) => match wire::prompt_result(result) {
+                Ok(stop) => self.end_turn(Ending::Stop(stop)),
+                Err(_) => self.end_turn(Ending::Failed(
+                    "the agent's answer to the prompt isn't one Brindle can read".to_owned(),
+                )),
+            },
+            // Decision 17: the turn fails, a waiting prompt is held, then
+            // the agent needs a login (the queue's change first, as
+            // decision 10's table says).
+            Err(error) if error.code == AUTH_REQUIRED => {
+                let message = bound(clean(&error.message));
+                self.s.phase = Phase::LoginRequired;
+                self.s.run = None;
+                self.hold_waiting(HoldReason::LoginRequired);
+                self.turn(TurnState::Failed {
+                    message: message.clone(),
+                });
+                self.agent(AgentState::LoginRequired { message });
+                self.mark(Moment::TurnEnded);
+            }
+            Err(error) => self.end_turn(Ending::Failed(bound(clean(&error.message)))),
+        }
+    }
+
+    /// The prompt's answer ends the turn: a waiting prompt is sent after
+    /// `end_turn` with the agent ready, and held after any other ending
+    /// (decision 10).
+    fn end_turn(&mut self, ending: Ending) {
+        self.s.run = None;
+        let cancelling = *self.s.transcript.turn() == TurnState::Cancelling;
+        let ready = self.readiness().is_ok();
+        let waiting = match self.s.transcript.slot() {
+            Slot::Waiting { text } => Some(text.clone()),
+            Slot::Empty | Slot::Held { .. } => None,
+        };
+        let sends = ready && matches!(ending, Ending::Stop(StopReason::EndTurn));
+        if let Some(text) = waiting {
+            if sends {
+                self.turn(ending.state());
+                self.emit(Event::Queue { slot: Slot::Empty });
+                self.mark(Moment::QueueChanged);
+                self.send_prompt(text);
+                return;
+            }
+            self.hold_waiting(hold_reason(&ending, cancelling));
+        }
+        self.turn(ending.state());
+        self.mark(Moment::TurnEnded);
+    }
+
+    /// Sends `text` as a new turn: its user entry, the turn working, and
+    /// the `session/prompt` line, checkpointed before it is written.
+    fn send_prompt(&mut self, text: String) {
+        let Phase::Ready { session } = &self.s.phase else {
+            return;
+        };
+        let session = session.clone();
+        self.add_text(RunKind::User, &text);
+        // A prompt is no run the agent's chunks extend.
+        self.s.run = None;
+        self.turn(TurnState::Working);
+        let line = self.s.rpc.prompt(&session, &text);
+        self.out.stdin.extend(line);
+        self.mark(Moment::BeforeRequest);
+    }
+
+    // --- client commands ------------------------------------------------
+
+    fn command(&mut self, command: Command) {
+        let reply = match command {
+            Command::Prompt { text } => self.prompt(&text),
+            Command::Unqueue => self.unqueue(),
+            Command::Resend => self.resend(),
+            Command::Cancel => {
+                self.cancel();
+                return;
+            }
+            Command::Answer { entry, option } => self.answer(entry, option),
+        };
+        self.out.reply = Some(reply);
+    }
+
+    fn prompt(&mut self, text: &str) -> Result<(), Refused> {
+        self.readiness()?;
+        let text = clean(text);
+        if text.len() > MAX_PROMPT {
+            return Err(Refused::TooLong { len: text.len() });
+        }
+        if !self.running() {
+            // A held prompt stays held, untouched (decision 10).
+            self.send_prompt(text);
+            return Ok(());
+        }
+        match self.s.transcript.slot() {
+            Slot::Empty => {
+                self.emit(Event::Queue {
+                    slot: Slot::Waiting { text },
+                });
+                self.mark(Moment::QueueChanged);
+                Ok(())
+            }
+            Slot::Waiting { .. } | Slot::Held { .. } => Err(Refused::AlreadyQueued),
+        }
+    }
+
+    fn unqueue(&mut self) -> Result<(), Refused> {
+        match self.s.transcript.slot() {
+            Slot::Empty => Err(Refused::NothingQueued),
+            Slot::Waiting { .. } | Slot::Held { .. } => {
+                self.emit(Event::Queue { slot: Slot::Empty });
+                self.mark(Moment::QueueChanged);
+                Ok(())
+            }
+        }
+    }
+
+    fn resend(&mut self) -> Result<(), Refused> {
+        let Slot::Held { text, .. } = self.s.transcript.slot() else {
+            return Err(Refused::NoneHeld);
+        };
+        let text = text.clone();
+        self.readiness()?;
+        if self.running() {
+            self.emit(Event::Queue {
+                slot: Slot::Waiting { text },
+            });
+            self.mark(Moment::QueueChanged);
+        } else {
+            self.emit(Event::Queue { slot: Slot::Empty });
+            self.mark(Moment::QueueChanged);
+            self.send_prompt(text);
+        }
+        Ok(())
+    }
+
+    /// Decision 8: a waiting prompt is held first, then `session/cancel`,
+    /// then `cancelled` for each waiting permission request, and the turn
+    /// is cancelling until the prompt's answer ends it. With no prompt out
+    /// (decision 11's known gap) the turn ends here.
+    fn cancel(&mut self) {
+        let Phase::Ready { session } = &self.s.phase else {
+            return;
+        };
+        let session = session.clone();
+        match self.s.transcript.turn() {
+            TurnState::Working | TurnState::Blocked => {}
+            TurnState::Idle
+            | TurnState::Cancelling
+            | TurnState::Ended { .. }
+            | TurnState::Failed { .. } => return,
+        }
+        self.hold_waiting(HoldReason::Cancelled);
+        self.out.stdin.extend(rpc::cancel(&session));
+        for (entry, answer) in self.s.rpc.cancel_permissions() {
+            self.out.stdin.extend(answer);
+            self.emit(Event::Answered {
+                id: entry,
+                outcome: PermissionOutcome::Cancelled,
+            });
+        }
+        if self.prompt_awaited() {
+            self.turn(TurnState::Cancelling);
+            self.mark(Moment::Permission);
+        } else {
+            self.s.run = None;
+            self.turn(TurnState::Ended {
+                stop: StopReason::Cancelled,
+            });
+            self.mark(Moment::TurnEnded);
+        }
+    }
+
+    fn answer(&mut self, entry: EntryId, option: Option<String>) -> Result<(), Refused> {
+        match self.s.phase {
+            Phase::Refused | Phase::Broken | Phase::Exited => {
+                self.readiness()?;
+            }
+            Phase::Spawning
+            | Phase::Initializing
+            | Phase::Creating { .. }
+            | Phase::Ready { .. }
+            | Phase::LoginRequired => {}
+        }
+        let Some(Entry::Permission {
+            options, outcome, ..
+        }) = self.s.transcript.entry(entry)
+        else {
+            return Err(Refused::NoSuchRequest { entry });
+        };
+        if outcome.is_some() {
+            return Err(Refused::AlreadyAnswered { entry });
+        }
+        if let Some(chosen) = &option
+            && !options.iter().any(|offered| offered.id == *chosen)
+        {
+            return Err(Refused::NoSuchOption {
+                entry,
+                option: chosen.clone(),
+            });
+        }
+        let Some(answer) = self.s.rpc.answer_permission(entry, option.as_deref()) else {
+            return Err(Refused::AlreadyAnswered { entry });
+        };
+        self.out.stdin.extend(answer);
+        let outcome = match option {
+            Some(option) => PermissionOutcome::Selected { option },
+            None => PermissionOutcome::Cancelled,
+        };
+        self.emit(Event::Answered { id: entry, outcome });
+        self.unblock();
+        self.mark(Moment::Permission);
+        Ok(())
+    }
+
+    // --- the log's bound ------------------------------------------------
+
+    /// Drops the oldest entries past [`LOG_LIMIT`] (decision 14), and what
+    /// pointed at them: the tool ids, the chunk run, and a permission
+    /// request still waiting, which is answered `cancelled`.
+    fn trim(&mut self) {
+        if self.s.transcript.encoded_len() <= LOG_LIMIT {
+            return;
+        }
+        let Some(event) = self.s.transcript.trim_to(LOG_LIMIT) else {
+            return;
+        };
+        let through = match &event {
+            Event::Trimmed { through, .. } => *through,
+            Event::Added { .. }
+            | Event::Appended { .. }
+            | Event::ToolChanged { .. }
+            | Event::Answered { .. }
+            | Event::Queue { .. }
+            | Event::Turn { .. }
+            | Event::Agent { .. } => return,
+        };
+        self.out.events.push(event);
+        self.s.tools.retain(|_, entry| *entry > through);
+        if self.s.run.is_some_and(|run| run.entry <= through) {
+            self.s.run = None;
+        }
+        let dropped: Vec<EntryId> = self
+            .s
+            .rpc
+            .permissions()
+            .keys()
+            .copied()
+            .filter(|entry| *entry <= through)
+            .collect();
+        for entry in &dropped {
+            if let Some(answer) = self.s.rpc.answer_permission(*entry, None) {
+                self.out.stdin.extend(answer);
+            }
+        }
+        if !dropped.is_empty() {
+            self.notice(
+                NoticeLevel::Warning,
+                format!(
+                    "{} waiting permission request(s) left the log and were answered cancelled",
+                    dropped.len()
+                ),
+            );
+            self.unblock();
+            self.mark(Moment::Permission);
+        }
+    }
+}
+
+fn running(turn: &TurnState) -> bool {
+    match turn {
+        TurnState::Working | TurnState::Blocked | TurnState::Cancelling => true,
+        TurnState::Idle | TurnState::Ended { .. } | TurnState::Failed { .. } => false,
+    }
+}
+
+/// Why a waiting prompt is held when its turn ends as `ending` (decision
+/// 10). A `cancelled` stop the user didn't ask for (Codex ends a turn so
+/// after a rejected permission) is a stop reason, not the user's cancel.
+fn hold_reason(ending: &Ending, cancelling: bool) -> HoldReason {
+    match ending {
+        // Reached only when the agent isn't ready.
+        Ending::Stop(StopReason::EndTurn) => HoldReason::AgentStopped,
+        Ending::Stop(StopReason::Cancelled) if cancelling => HoldReason::Cancelled,
+        Ending::Stop(stop) => HoldReason::Stopped { stop: stop.clone() },
+        Ending::Failed(_) => HoldReason::Failed,
+    }
+}
+
+/// What a chunk that isn't text shows.
+fn placeholder(kind: ContentKind) -> &'static str {
+    match kind {
+        ContentKind::Image => "[image]",
+        ContentKind::Audio => "[audio]",
+        ContentKind::ResourceLink => "[link]",
+        ContentKind::Resource => "[resource]",
+        ContentKind::Unknown => "[content Brindle can't show]",
+    }
+}
+
+/// `text` with every control character but `\n`, `\t` and a `\r` before
+/// `\n` (or at the end, where a chunk may have cut a `\r\n`) replaced by
+/// U+FFFD (decision 8).
+pub fn clean(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let keep = match c {
+            '\n' | '\t' => true,
+            '\r' => chars.peek().is_none_or(|next| *next == '\n'),
+            other => !other.is_control(),
+        };
+        cleaned.push(if keep { c } else { '\u{FFFD}' });
+    }
+    cleaned
+}
+
+/// `text` cut to at most [`TEXT_CHUNK`] bytes at a character boundary, for
+/// a field that doesn't grow.
+fn bound(mut text: String) -> String {
+    if text.len() > TEXT_CHUNK {
+        let mut cut = TEXT_CHUNK;
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        text.truncate(cut);
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use brindle_remote_protocol::serde_json::{self, json};
+    use brindle_transcript::{Activity, PermissionKind};
+
+    /// An agent session under test, with a client's copy of its log folded
+    /// from every event `step` returned (checked equal to the session's
+    /// after each step) and every line written to the agent.
+    struct Agent {
+        s: AgentSession,
+        client: Transcript,
+        now: Instant,
+        events: Vec<Event>,
+        sent: Vec<Value>,
+    }
+
+    impl Agent {
+        fn new() -> Self {
+            Self::in_dir("/home/u/src")
+        }
+
+        fn in_dir(cwd: &str) -> Self {
+            Self {
+                s: AgentSession::new(cwd.into(), "0.3.0".into()),
+                client: Transcript::new(),
+                now: Instant::now(),
+                events: Vec::new(),
+                sent: Vec::new(),
+            }
+        }
+
+        /// Spawned, `initialize` and `session/new` answered: ready in ACP
+        /// session `s1`.
+        fn ready() -> Self {
+            Self::ready_in("s1")
+        }
+
+        fn ready_in(session: &str) -> Self {
+            let mut agent = Self::new();
+            agent.step(Input::Spawned);
+            agent.feed(&result(
+                1,
+                json!({"protocolVersion": 1, "agentInfo": {"name": "fake", "version": "1.0"}}),
+            ));
+            agent.feed(&result(2, json!({"sessionId": session})));
+            assert_eq!(
+                *agent.s.phase(),
+                Phase::Ready {
+                    session: session.into()
+                }
+            );
+            agent
+        }
+
+        fn step(&mut self, input: Input<'_>) -> Output {
+            let out = step(&mut self.s, input, self.now);
+            for event in &out.events {
+                assert_eq!(Event::from_value(&event.to_value()).as_ref(), Ok(event));
+                self.client
+                    .apply(event)
+                    .unwrap_or_else(|e| panic!("{event:?}: {e}"));
+            }
+            assert_eq!(self.client, self.s.transcript, "the client's fold differs");
+            for line in out.stdin.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                self.sent
+                    .push(serde_json::from_slice(line).expect("a JSON line"));
+            }
+            self.events.extend(out.events.iter().cloned());
+            out
+        }
+
+        fn feed(&mut self, line: &str) -> Output {
+            self.step(Input::Stdout(format!("{line}\n").as_bytes()))
+        }
+
+        fn cmd(&mut self, command: Command) -> Output {
+            self.step(Input::Command(command))
+        }
+
+        fn prompt(&mut self, text: &str) -> Output {
+            self.cmd(Command::Prompt { text: text.into() })
+        }
+
+        /// The id of the last `session/prompt` written.
+        fn prompt_id(&self) -> u64 {
+            self.last("session/prompt")["id"].as_u64().expect("an id")
+        }
+
+        fn last(&self, method: &str) -> &Value {
+            self.sent
+                .iter()
+                .rev()
+                .find(|line| line["method"] == method)
+                .unwrap_or_else(|| panic!("no {method} was sent"))
+        }
+
+        fn sent_methods(&self) -> Vec<&str> {
+            self.sent
+                .iter()
+                .filter_map(|line| line["method"].as_str())
+                .collect()
+        }
+
+        /// Starts a turn with `text` and returns its prompt's id.
+        fn turn(&mut self, text: &str) -> u64 {
+            assert_eq!(self.prompt(text).reply, Some(Ok(())));
+            self.prompt_id()
+        }
+
+        fn end(&mut self, id: u64, stop: &str) -> Output {
+            self.feed(&result(id, json!({"stopReason": stop})))
+        }
+
+        fn slot(&self) -> &Slot {
+            self.s.transcript().slot()
+        }
+
+        fn turn_state(&self) -> &TurnState {
+            self.s.transcript.turn()
+        }
+
+        fn agent_state(&self) -> &AgentState {
+            self.s.transcript.agent()
+        }
+
+        fn activity(&self) -> Activity {
+            self.s.transcript.activity()
+        }
+
+        fn entries(&self) -> Vec<Entry> {
+            self.s
+                .transcript
+                .entries()
+                .map(|(_, entry)| entry.clone())
+                .collect()
+        }
+
+        fn last_entry(&self) -> (EntryId, Entry) {
+            self.s
+                .transcript
+                .entries()
+                .last()
+                .map(|(id, entry)| (id, entry.clone()))
+                .expect("an entry")
+        }
+
+        fn notices(&self) -> Vec<String> {
+            self.entries()
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    Entry::Notice { text, .. } => Some(text),
+                    Entry::User { .. }
+                    | Entry::Agent { .. }
+                    | Entry::Thought { .. }
+                    | Entry::Tool { .. }
+                    | Entry::Permission { .. } => None,
+                })
+                .collect()
+        }
+
+        /// Asks permission with request id `id` and these `(id, kind)`
+        /// options; returns its entry.
+        fn ask(&mut self, id: Value, options: &[(&str, &str)]) -> EntryId {
+            self.feed(&permission(id, "call_1", options));
+            let (entry, _) = self.last_permission();
+            entry
+        }
+
+        fn last_permission(&self) -> (EntryId, Entry) {
+            self.s
+                .transcript
+                .entries()
+                .filter(|(_, entry)| matches!(entry, Entry::Permission { .. }))
+                .last()
+                .map(|(id, entry)| (id, entry.clone()))
+                .expect("a permission entry")
+        }
+    }
+
+    fn result(id: u64, result: Value) -> String {
+        json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
+    }
+
+    fn error(id: u64, code: i64, message: &str) -> String {
+        json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
+    }
+
+    fn update(update: Value) -> String {
+        json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": update}})
+            .to_string()
+    }
+
+    fn chunk(kind: &str, text: &str) -> String {
+        update(json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}}))
+    }
+
+    fn said(text: &str) -> String {
+        chunk("agent_message_chunk", text)
+    }
+
+    fn tool_call(call: &str, title: &str, status: &str) -> String {
+        update(
+            json!({"sessionUpdate": "tool_call", "toolCallId": call, "title": title, "kind": "edit", "status": status}),
+        )
+    }
+
+    fn tool_update(call: &str, status: &str) -> String {
+        update(json!({"sessionUpdate": "tool_call_update", "toolCallId": call, "status": status}))
+    }
+
+    fn permission(id: Value, call: &str, options: &[(&str, &str)]) -> String {
+        let options: Vec<Value> = options
+            .iter()
+            .map(|(id, kind)| json!({"optionId": id, "name": id.to_uppercase(), "kind": kind}))
+            .collect();
+        json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission",
+               "params": {"sessionId": "s1", "toolCall": {"toolCallId": call, "title": "Write a file"}, "options": options}})
+            .to_string()
+    }
+
+    const ALLOW_REJECT: [(&str, &str); 2] =
+        [("allow-once", "allow_once"), ("reject-once", "reject_once")];
+
+    fn waiting(text: &str) -> Slot {
+        Slot::Waiting { text: text.into() }
+    }
+
+    fn held(text: &str, reason: HoldReason) -> Slot {
+        Slot::Held {
+            text: text.into(),
+            reason,
+        }
+    }
+
+    fn ended(stop: StopReason) -> TurnState {
+        TurnState::Ended { stop }
+    }
+
+    /// The events of kinds that order a turn, as short names.
+    fn shape(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                Event::Added { entry, .. } => format!("added {}", entry_kind(entry)),
+                Event::Appended { .. } => "appended".into(),
+                Event::ToolChanged { .. } => "tool changed".into(),
+                Event::Answered { .. } => "answered".into(),
+                Event::Queue { slot } => match slot {
+                    Slot::Empty => "queue empty".into(),
+                    Slot::Waiting { .. } => "queue waiting".into(),
+                    Slot::Held { .. } => "queue held".into(),
+                },
+                Event::Turn { state } => format!("turn {}", turn_name(state)),
+                Event::Agent { state } => format!("agent {}", agent_name(state)),
+                Event::Trimmed { .. } => "trimmed".into(),
+            })
+            .collect()
+    }
+
+    fn entry_kind(entry: &Entry) -> &'static str {
+        match entry {
+            Entry::User { .. } => "user",
+            Entry::Agent { .. } => "agent",
+            Entry::Thought { .. } => "thought",
+            Entry::Tool { .. } => "tool",
+            Entry::Permission { .. } => "permission",
+            Entry::Notice { .. } => "notice",
+        }
+    }
+
+    fn turn_name(state: &TurnState) -> &'static str {
+        match state {
+            TurnState::Idle => "idle",
+            TurnState::Working => "working",
+            TurnState::Blocked => "blocked",
+            TurnState::Cancelling => "cancelling",
+            TurnState::Ended { .. } => "ended",
+            TurnState::Failed { .. } => "failed",
+        }
+    }
+
+    fn agent_name(state: &AgentState) -> &'static str {
+        match state {
+            AgentState::Starting => "starting",
+            AgentState::Ready { .. } => "ready",
+            AgentState::LoginRequired { .. } => "login required",
+            AgentState::Failed { .. } => "failed",
+            AgentState::Exited { .. } => "exited",
+        }
+    }
+
+    fn fixture_line(file: &str, n: usize) -> String {
+        let text = match file {
+            "initialize-32022" => include_str!("../../tests/fixtures/acp/initialize-32022.jsonl"),
+            "initialize-v2-reply" => {
+                include_str!("../../tests/fixtures/acp/initialize-v2-reply.jsonl")
+            }
+            "prompt-auth-required" => {
+                include_str!("../../tests/fixtures/acp/prompt-auth-required.jsonl")
+            }
+            other => panic!("no fixture {other}"),
+        };
+        text.lines().nth(n).expect("a line").to_owned()
+    }
+
+    // --- the start sequence (decision 4) --------------------------------
+
+    #[test]
+    fn spawning_sends_initialize_for_version_1_with_no_client_capabilities() {
+        let mut agent = Agent::new();
+        let out = agent.step(Input::Spawned);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"0.3.0\"}}}\n"
+        );
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+        assert_eq!(*agent.s.phase(), Phase::Initializing);
+        assert!(agent.step(Input::Spawned).stdin.is_empty(), "spawned twice");
+    }
+
+    #[test]
+    fn an_answered_initialize_sends_session_new_in_the_absolute_directory() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.feed(&result(1, json!({"protocolVersion": 1})));
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\"params\":{\"cwd\":\"/home/u/src\",\"mcpServers\":[]}}\n"
+        );
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+        assert_eq!(agent.s.cwd(), "/home/u/src");
+    }
+
+    #[test]
+    fn an_answered_session_new_makes_the_agent_ready_with_the_name_initialize_gave() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&result(1, json!({"protocolVersion": 1, "agentInfo": {"name": "fake", "title": "Fake", "version": "1.0"}})));
+        let out = agent.feed(&result(2, json!({"sessionId": "s1"})));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Ready {
+                name: Some("fake".into()),
+                version: Some("1.0".into())
+            }
+        );
+        assert_eq!(out.checkpoint, Some(Moment::Started));
+    }
+
+    #[test]
+    fn a_32022_with_its_supported_versions_fails_the_agent_naming_them() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.feed(&fixture_line("initialize-32022", 0));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent supports ACP version 2; Brindle speaks 1".into()
+            }
+        );
+        assert!(out.hang_up);
+        assert!(out.stdin.is_empty(), "no session/new");
+        assert_eq!(*agent.s.phase(), Phase::Refused);
+    }
+
+    #[test]
+    fn several_supported_versions_are_all_named() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&json!({"jsonrpc": "2.0", "id": 1, "error": {"code": -32022, "message": "no", "data": {"requested": 1, "supported": [2, 3]}}}).to_string());
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent supports ACP versions 2, 3; Brindle speaks 1".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_32022_without_well_formed_data_fails_naming_brindles_version() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.feed(&fixture_line("initialize-32022", 1));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent supports no ACP version Brindle speaks (1)".into()
+            }
+        );
+        assert!(out.hang_up);
+    }
+
+    #[test]
+    fn a_success_with_another_protocol_version_fails_the_agent_naming_it() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.feed(&fixture_line("initialize-v2-reply", 0));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent speaks ACP version 2; Brindle speaks 1".into()
+            }
+        );
+        assert!(out.hang_up);
+        assert!(!agent.sent_methods().contains(&"session/new"));
+    }
+
+    #[test]
+    fn another_initialize_error_fails_the_agent_with_its_message() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.feed(&error(1, -32603, "internal error"));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent couldn't start: internal error".into()
+            }
+        );
+        assert!(out.hang_up);
+    }
+
+    #[test]
+    fn an_unreadable_initialize_answer_fails_the_agent() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.feed(&result(1, json!({"nothing": true})));
+        assert!(matches!(agent.agent_state(), AgentState::Failed { .. }));
+        assert!(out.hang_up);
+    }
+
+    #[test]
+    fn a_refused_agent_is_sent_nothing_more() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&fixture_line("initialize-v2-reply", 0));
+        let out =
+            agent.feed(r#"{"jsonrpc":"2.0","id":9,"method":"fs/read_text_file","params":{}}"#);
+        assert!(out.stdin.is_empty());
+        assert!(agent.feed("not json").events.is_empty());
+    }
+
+    #[test]
+    fn a_refused_agents_exit_leaves_the_failed_state_and_adds_its_stderr_as_a_notice() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&fixture_line("initialize-32022", 0));
+        let out = agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"only v2 here\n",
+        });
+        assert_eq!(shape(&out.events), ["added notice"]);
+        assert_eq!(
+            agent.notices(),
+            ["the agent's standard error:\nonly v2 here\n"]
+        );
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent supports ACP version 2; Brindle speaks 1".into()
+            }
+        );
+        let last_agent = agent.events.iter().rev().find_map(|event| match event {
+            Event::Agent { state } => Some(state.clone()),
+            Event::Added { .. }
+            | Event::Appended { .. }
+            | Event::ToolChanged { .. }
+            | Event::Answered { .. }
+            | Event::Queue { .. }
+            | Event::Turn { .. }
+            | Event::Trimmed { .. } => None,
+        });
+        assert!(matches!(last_agent, Some(AgentState::Failed { .. })));
+    }
+
+    #[test]
+    fn a_refused_agents_exit_with_empty_stderr_adds_nothing() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&fixture_line("initialize-32022", 0));
+        let out = agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"",
+        });
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn auth_required_from_session_new_needs_a_login_and_keeps_the_agent_running() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&result(1, json!({"protocolVersion": 1})));
+        let out = agent.feed(&error(2, -32000, "run agent login"));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::LoginRequired {
+                message: "run agent login".into()
+            }
+        );
+        assert!(!out.hang_up);
+        assert_eq!(agent.activity(), Activity::Error);
+        assert_eq!(agent.prompt("hi").reply, Some(Err(Refused::LoginRequired)));
+        assert!(!agent.sent_methods().contains(&"authenticate"));
+    }
+
+    #[test]
+    fn another_session_new_error_fails_the_start() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&result(1, json!({"protocolVersion": 1})));
+        let out = agent.feed(&error(2, -32603, "no such directory"));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent couldn't start a session: no such directory".into()
+            }
+        );
+        assert!(out.hang_up);
+    }
+
+    #[test]
+    fn a_prompt_before_ready_is_refused_and_nothing_is_queued() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        let out = agent.prompt("hi");
+        assert_eq!(out.reply, Some(Err(Refused::NotReady)));
+        assert_eq!(
+            out.reply
+                .as_ref()
+                .map(|r| r.as_ref().map_err(ToString::to_string)),
+            Some(Err("the agent isn't ready".into()))
+        );
+        assert!(out.events.is_empty());
+        assert_eq!(*agent.slot(), Slot::Empty);
+    }
+
+    // --- prompts --------------------------------------------------------
+
+    #[test]
+    fn a_prompt_when_idle_is_sent_as_a_turn() {
+        let mut agent = Agent::ready();
+        let out = agent.prompt("hi");
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["added user", "turn working"]);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"session/prompt\",\"params\":{\"sessionId\":\"s1\",\"prompt\":[{\"type\":\"text\",\"text\":\"hi\"}]}}\n"
+        );
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+    }
+
+    #[test]
+    fn a_turn_gives_the_user_message_the_agent_message_and_the_end_in_order() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("hi");
+        agent.feed(&said("hello"));
+        let out = agent.end(id, "end_turn");
+        assert_eq!(out.checkpoint, Some(Moment::TurnEnded));
+        assert_eq!(
+            agent.entries(),
+            [
+                Entry::User { text: "hi".into() },
+                Entry::Agent {
+                    text: "hello".into()
+                }
+            ]
+        );
+        assert_eq!(*agent.turn_state(), ended(StopReason::EndTurn));
+    }
+
+    #[test]
+    fn chunks_of_one_kind_merge_into_one_entry() {
+        let mut agent = Agent::ready();
+        agent.turn("hi");
+        agent.feed(&said("Hel"));
+        agent.feed(&said("lo"));
+        let out = agent.feed(&said("!"));
+        assert_eq!(shape(&out.events), ["appended"]);
+        assert_eq!(
+            agent.last_entry().1,
+            Entry::Agent {
+                text: "Hello!".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_prompt_during_a_turn_waits_in_the_slot() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let out = agent.prompt("two");
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(*agent.slot(), waiting("two"));
+        assert_eq!(out.checkpoint, Some(Moment::QueueChanged));
+        assert!(out.stdin.is_empty());
+    }
+
+    #[test]
+    fn a_third_prompt_is_refused_as_already_queued() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.prompt("two");
+        let out = agent.prompt("three");
+        assert_eq!(out.reply, Some(Err(Refused::AlreadyQueued)));
+        assert!(out.events.is_empty() && out.stdin.is_empty());
+        assert_eq!(*agent.slot(), waiting("two"));
+    }
+
+    #[test]
+    fn a_prompt_over_256_kib_is_refused_naming_the_limit() {
+        let mut agent = Agent::ready();
+        let out = agent.prompt(&"x".repeat(300 * 1024));
+        assert_eq!(out.reply, Some(Err(Refused::TooLong { len: 300 * 1024 })));
+        assert!(
+            Refused::TooLong { len: 300 * 1024 }
+                .to_string()
+                .contains("256 KiB")
+        );
+        assert!(out.events.is_empty());
+        assert!(agent.prompt(&"x".repeat(MAX_PROMPT)).reply == Some(Ok(())));
+    }
+
+    #[test]
+    fn a_prompt_error_fails_the_turn_with_the_agents_message() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("hi");
+        agent.feed(&error(id, -32603, "rate limited"));
+        assert_eq!(
+            *agent.turn_state(),
+            TurnState::Failed {
+                message: "rate limited".into()
+            }
+        );
+        assert_eq!(
+            agent.prompt("again").reply,
+            Some(Ok(())),
+            "the agent is still ready"
+        );
+    }
+
+    #[test]
+    fn a_login_demanded_by_a_prompt_fails_the_turn_holds_the_waiting_prompt_then_needs_the_login() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        assert_eq!(id, 3, "the fixture answers id 3");
+        agent.prompt("two");
+        let out = agent.feed(&fixture_line("prompt-auth-required", 0));
+        assert_eq!(
+            shape(&out.events),
+            ["queue held", "turn failed", "agent login required"]
+        );
+        assert_eq!(*agent.slot(), held("two", HoldReason::LoginRequired));
+        assert_eq!(
+            *agent.turn_state(),
+            TurnState::Failed {
+                message: "Authentication required".into()
+            }
+        );
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::LoginRequired {
+                message: "Authentication required".into()
+            }
+        );
+        assert_eq!(
+            agent
+                .sent_methods()
+                .iter()
+                .filter(|m| **m == "session/prompt")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn once_a_login_is_needed_prompts_and_resends_are_refused_and_unqueue_still_discards() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.feed(&error(id, -32000, "session expired"));
+        assert_eq!(
+            agent.prompt("three").reply,
+            Some(Err(Refused::LoginRequired))
+        );
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::LoginRequired))
+        );
+        assert_eq!(agent.cmd(Command::Unqueue).reply, Some(Ok(())));
+        assert_eq!(*agent.slot(), Slot::Empty);
+    }
+
+    #[test]
+    fn a_session_whose_handling_failed_refuses_prompts() {
+        let mut agent = Agent::ready();
+        agent.step(Input::Fault {
+            reason: "boom".into(),
+        });
+        let refused = agent.prompt("hi").reply;
+        assert_eq!(
+            refused,
+            Some(Err(Refused::Failed {
+                message: "ACP handling failed: boom".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn a_prompt_after_the_agent_exited_is_refused() {
+        let mut agent = Agent::ready();
+        agent.step(Input::Exited {
+            code: Some(0),
+            stderr: b"",
+        });
+        assert_eq!(agent.prompt("hi").reply, Some(Err(Refused::Exited)));
+    }
+
+    // --- the slot (decision 10's table, row by row) ---------------------
+
+    #[test]
+    fn a_waiting_prompt_is_sent_after_end_turn_as_the_next_turn() {
+        let mut agent = Agent::ready();
+        let first = agent.turn("one");
+        agent.prompt("two");
+        let out = agent.end(first, "end_turn");
+        assert_eq!(
+            shape(&out.events),
+            ["turn ended", "queue empty", "added user", "turn working"]
+        );
+        assert_eq!(agent.prompt_id(), first + 1);
+        assert_eq!(
+            agent.last("session/prompt")["params"]["prompt"][0]["text"],
+            "two"
+        );
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+    }
+
+    #[test]
+    fn a_cancel_holds_a_waiting_prompt_before_session_cancel_is_sent() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.prompt("two");
+        let out = agent.cmd(Command::Cancel);
+        assert_eq!(shape(&out.events), ["queue held", "turn cancelling"]);
+        assert_eq!(*agent.slot(), held("two", HoldReason::Cancelled));
+        assert_eq!(agent.sent_methods().last(), Some(&"session/cancel"));
+    }
+
+    #[test]
+    fn a_failed_turn_holds_a_waiting_prompt() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        let out = agent.feed(&error(id, -32603, "rate limited"));
+        assert_eq!(shape(&out.events), ["queue held", "turn failed"]);
+        assert_eq!(*agent.slot(), held("two", HoldReason::Failed));
+        assert_eq!(
+            agent
+                .sent_methods()
+                .iter()
+                .filter(|m| **m == "session/prompt")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn every_other_stop_reason_holds_a_waiting_prompt_with_that_reason() {
+        for (name, stop) in [
+            ("max_tokens", StopReason::MaxTokens),
+            ("max_turn_requests", StopReason::MaxTurnRequests),
+            ("refusal", StopReason::Refusal),
+            (
+                "paused_for_review",
+                StopReason::Other {
+                    name: "paused_for_review".into(),
+                },
+            ),
+        ] {
+            let mut agent = Agent::ready();
+            let id = agent.turn("one");
+            agent.prompt("two");
+            let out = agent.end(id, name);
+            assert_eq!(shape(&out.events), ["queue held", "turn ended"], "{name}");
+            assert_eq!(
+                *agent.slot(),
+                held("two", HoldReason::Stopped { stop: stop.clone() })
+            );
+            assert_eq!(*agent.turn_state(), ended(stop));
+        }
+    }
+
+    #[test]
+    fn a_cancelled_stop_nobody_asked_for_holds_as_a_stop_reason_not_as_a_cancel() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.end(id, "cancelled");
+        assert_eq!(
+            *agent.slot(),
+            held(
+                "two",
+                HoldReason::Stopped {
+                    stop: StopReason::Cancelled
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn an_agent_exit_holds_a_waiting_prompt_before_the_exit() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.prompt("two");
+        let out = agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"",
+        });
+        assert_eq!(
+            shape(&out.events),
+            ["queue held", "turn failed", "agent exited"]
+        );
+        assert_eq!(*agent.slot(), held("two", HoldReason::AgentStopped));
+    }
+
+    #[test]
+    fn a_handling_fault_holds_a_waiting_prompt_before_the_failure() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.prompt("two");
+        let out = agent.step(Input::Fault {
+            reason: "boom".into(),
+        });
+        assert_eq!(
+            shape(&out.events),
+            ["queue held", "turn failed", "agent failed"]
+        );
+        assert_eq!(*agent.slot(), held("two", HoldReason::AgentStopped));
+    }
+
+    #[test]
+    fn lost_output_fails_the_turn_and_holds_a_waiting_prompt() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.prompt("two");
+        let out = agent.step(Input::OutputLost);
+        assert_eq!(
+            shape(&out.events),
+            ["added notice", "queue held", "turn failed"]
+        );
+        assert_eq!(*agent.slot(), held("two", HoldReason::OutputLost));
+        assert_eq!(
+            *agent.turn_state(),
+            TurnState::Failed {
+                message: "output was lost while the terminal server restarted".into()
+            }
+        );
+        assert!(
+            agent.s.rpc().outgoing().is_empty(),
+            "the prompt is forgotten"
+        );
+        let next = agent.feed(&said("tail of a lost line"));
+        assert!(
+            next.events.is_empty(),
+            "the rest of the cut line is dropped"
+        );
+        assert_eq!(
+            agent.turn("three"),
+            4,
+            "the next prompt works, its id never reused"
+        );
+    }
+
+    #[test]
+    fn unqueue_discards_a_waiting_prompt_which_is_then_never_sent() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        let out = agent.cmd(Command::Unqueue);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["queue empty"]);
+        agent.end(id, "end_turn");
+        assert_eq!(
+            agent
+                .sent_methods()
+                .iter()
+                .filter(|m| **m == "session/prompt")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn unqueue_discards_a_held_prompt() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.end(id, "max_tokens");
+        assert_eq!(agent.cmd(Command::Unqueue).reply, Some(Ok(())));
+        assert_eq!(*agent.slot(), Slot::Empty);
+    }
+
+    #[test]
+    fn resend_when_idle_sends_the_held_prompt_as_a_new_turn() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.end(id, "refusal");
+        let out = agent.cmd(Command::Resend);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(
+            shape(&out.events),
+            ["queue empty", "added user", "turn working"]
+        );
+        assert_eq!(
+            agent.last("session/prompt")["params"]["prompt"][0]["text"],
+            "two"
+        );
+    }
+
+    #[test]
+    fn resend_during_a_turn_queues_the_held_prompt_again() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.end(id, "refusal");
+        let third = agent.turn("three");
+        let out = agent.cmd(Command::Resend);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(*agent.slot(), waiting("two"));
+        agent.end(third, "end_turn");
+        assert_eq!(
+            agent.last("session/prompt")["params"]["prompt"][0]["text"],
+            "two"
+        );
+    }
+
+    #[test]
+    fn resend_while_the_agent_isnt_ready_is_refused_and_keeps_it_held() {
+        // A held prompt while starting comes only from a restored session.
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent
+            .s
+            .transcript
+            .apply(&Event::Queue {
+                slot: held("two", HoldReason::OutputLost),
+            })
+            .expect("a queue event");
+        agent.client = agent.s.transcript.clone();
+        let out = agent.cmd(Command::Resend);
+        assert_eq!(out.reply, Some(Err(Refused::NotReady)));
+        assert!(out.events.is_empty());
+        assert_eq!(*agent.slot(), held("two", HoldReason::OutputLost));
+
+        let mut broken = Agent::ready();
+        let id = broken.turn("one");
+        broken.prompt("two");
+        broken.end(id, "max_tokens");
+        broken.step(Input::Fault {
+            reason: "boom".into(),
+        });
+        assert!(matches!(
+            broken.cmd(Command::Resend).reply,
+            Some(Err(Refused::Failed { .. }))
+        ));
+        assert!(matches!(broken.slot(), Slot::Held { .. }));
+    }
+
+    #[test]
+    fn a_new_prompt_with_one_held_and_no_turn_is_sent_and_leaves_it_held() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        agent.end(id, "max_tokens");
+        let out = agent.prompt("three");
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["added user", "turn working"]);
+        assert_eq!(
+            *agent.slot(),
+            held(
+                "two",
+                HoldReason::Stopped {
+                    stop: StopReason::MaxTokens
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn a_new_prompt_with_one_waiting_or_held_during_a_turn_is_refused() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.prompt("two");
+        assert_eq!(agent.prompt("x").reply, Some(Err(Refused::AlreadyQueued)));
+        agent.end(id, "max_tokens");
+        agent.turn("three");
+        assert_eq!(agent.prompt("x").reply, Some(Err(Refused::AlreadyQueued)));
+        assert!(matches!(agent.slot(), Slot::Held { .. }));
+    }
+
+    #[test]
+    fn unqueue_or_resend_with_an_empty_slot_is_refused() {
+        let mut agent = Agent::ready();
+        assert_eq!(
+            agent.cmd(Command::Unqueue).reply,
+            Some(Err(Refused::NothingQueued))
+        );
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::NoneHeld))
+        );
+        assert_eq!(Refused::NothingQueued.to_string(), "nothing is queued");
+        assert_eq!(Refused::NoneHeld.to_string(), "no prompt is held");
+    }
+
+    #[test]
+    fn resend_of_a_waiting_prompt_is_refused() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.prompt("two");
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::NoneHeld))
+        );
+        assert_eq!(*agent.slot(), waiting("two"));
+    }
+
+    // --- cancel ---------------------------------------------------------
+
+    #[test]
+    fn cancel_sends_session_cancel_then_cancels_each_waiting_permission() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        let out = agent.cmd(Command::Cancel);
+        assert_eq!(out.reply, None);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/cancel\",\"params\":{\"sessionId\":\"s1\"}}\n{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
+        );
+        assert_eq!(shape(&out.events), ["answered", "turn cancelling"]);
+        assert!(matches!(
+            agent.s.transcript.entry(entry),
+            Some(Entry::Permission {
+                outcome: Some(PermissionOutcome::Cancelled),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_cancelled_turn_ends_when_the_agent_answers_the_prompt() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.cmd(Command::Cancel);
+        assert_eq!(*agent.turn_state(), TurnState::Cancelling);
+        agent.end(id, "cancelled");
+        assert_eq!(*agent.turn_state(), ended(StopReason::Cancelled));
+    }
+
+    #[test]
+    fn a_cancel_with_no_turn_running_produces_nothing() {
+        let mut agent = Agent::ready();
+        assert_eq!(agent.cmd(Command::Cancel), Output::default());
+        let id = agent.turn("one");
+        agent.end(id, "end_turn");
+        assert_eq!(agent.cmd(Command::Cancel), Output::default());
+    }
+
+    #[test]
+    fn a_cancel_with_no_prompt_out_ends_the_turn_here() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.s.rpc.forget(Purpose::Prompt);
+        let out = agent.cmd(Command::Cancel);
+        assert_eq!(*agent.turn_state(), ended(StopReason::Cancelled));
+        assert_eq!(out.checkpoint, Some(Moment::TurnEnded));
+    }
+
+    // --- permissions ----------------------------------------------------
+
+    #[test]
+    fn a_permission_request_is_logged_with_its_options_and_blocks_the_turn() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let out = agent.feed(&permission(json!(0), "call_1", &ALLOW_REJECT));
+        assert_eq!(shape(&out.events), ["added permission", "turn blocked"]);
+        assert_eq!(out.checkpoint, Some(Moment::Permission));
+        assert!(out.stdin.is_empty(), "never answered on its own");
+        assert_eq!(
+            agent.last_permission().1,
+            Entry::Permission {
+                call: Some("call_1".into()),
+                title: "Write a file".into(),
+                options: vec![
+                    PermissionOption {
+                        id: "allow-once".into(),
+                        name: "ALLOW-ONCE".into(),
+                        kind: PermissionKind::AllowOnce
+                    },
+                    PermissionOption {
+                        id: "reject-once".into(),
+                        name: "REJECT-ONCE".into(),
+                        kind: PermissionKind::RejectOnce
+                    },
+                ],
+                outcome: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_tool_calls_id_is_cleaned_and_still_matches_its_updates() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "c\u{1b}]0;x\u{7}"})));
+        assert!(matches!(
+            agent.last_entry().1,
+            Entry::Tool { call, title, .. } if call == "c\u{fffd}]0;x\u{fffd}" && title == "c\u{fffd}]0;x\u{fffd}"
+        ));
+        let entries = agent.entries().len();
+        agent.feed(&update(
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c\u{1b}]0;x\u{7}", "status": "completed"}),
+        ));
+        assert_eq!(agent.entries().len(), entries);
+    }
+
+    #[test]
+    fn a_permission_requests_title_falls_back_to_its_tool_calls() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Edit main.rs", "pending"));
+        agent.feed(&json!({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "toolCall": {"toolCallId": "call_1"}, "options": [{"optionId": "a", "name": "A", "kind": "allow_once"}]}}).to_string());
+        assert!(
+            matches!(agent.last_permission().1, Entry::Permission { title, .. } if title == "Edit main.rs")
+        );
+    }
+
+    #[test]
+    fn the_attached_clients_choice_answers_it_and_the_turn_works_again() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        let out = agent.cmd(Command::Answer {
+            entry,
+            option: Some("allow-once".into()),
+        });
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":{\"outcome\":\"selected\",\"optionId\":\"allow-once\"}}}\n"
+        );
+        assert_eq!(shape(&out.events), ["answered", "turn working"]);
+        assert_eq!(out.checkpoint, Some(Moment::Permission));
+    }
+
+    #[test]
+    fn an_answer_with_no_option_is_cancelled() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        let out = agent.cmd(Command::Answer {
+            entry,
+            option: None,
+        });
+        assert_eq!(out.reply, Some(Ok(())));
+        assert!(out.events.contains(&Event::Answered {
+            id: entry,
+            outcome: PermissionOutcome::Cancelled
+        }));
+    }
+
+    #[test]
+    fn a_second_answer_is_refused_naming_the_request() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        agent.cmd(Command::Answer {
+            entry,
+            option: Some("allow-once".into()),
+        });
+        let out = agent.cmd(Command::Answer {
+            entry,
+            option: Some("reject-once".into()),
+        });
+        assert_eq!(out.reply, Some(Err(Refused::AlreadyAnswered { entry })));
+        assert!(out.stdin.is_empty());
+    }
+
+    #[test]
+    fn an_answer_naming_an_option_not_offered_or_an_entry_not_a_request_is_refused() {
+        let mut agent = Agent::ready();
+        let user = EntryId(1);
+        agent.turn("one");
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        let out = agent.cmd(Command::Answer {
+            entry,
+            option: Some("deny".into()),
+        });
+        assert_eq!(
+            out.reply,
+            Some(Err(Refused::NoSuchOption {
+                entry,
+                option: "deny".into()
+            }))
+        );
+        let out = agent.cmd(Command::Answer {
+            entry: user,
+            option: None,
+        });
+        assert_eq!(out.reply, Some(Err(Refused::NoSuchRequest { entry: user })));
+        assert_eq!(*agent.turn_state(), TurnState::Blocked);
+    }
+
+    #[test]
+    fn a_withdrawn_request_is_answered_cancelled() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!("7"), &ALLOW_REJECT);
+        let out = agent
+            .feed(r#"{"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":"7"}}"#);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"7\",\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
+        );
+        assert_eq!(shape(&out.events), ["answered", "turn working"]);
+        assert_eq!(
+            agent
+                .cmd(Command::Answer {
+                    entry,
+                    option: None
+                })
+                .reply,
+            Some(Err(Refused::AlreadyAnswered { entry }))
+        );
+    }
+
+    #[test]
+    fn a_request_past_sixteen_waiting_is_answered_cancelled_with_a_notice() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        for id in 0..16 {
+            agent.ask(json!(id), &ALLOW_REJECT);
+        }
+        let out = agent.feed(&permission(json!(16), "call_1", &ALLOW_REJECT));
+        assert_eq!(
+            shape(&out.events),
+            ["added permission", "answered", "added notice"]
+        );
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":16,\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
+        );
+        assert_eq!(agent.s.rpc().permissions().len(), 16);
+    }
+
+    #[test]
+    fn an_option_of_an_unknown_kind_is_left_out_with_a_notice() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.ask(
+            json!(7),
+            &[
+                ("allow", "allow_once"),
+                ("session", "allow_for_session"),
+                ("reject", "reject_once"),
+            ],
+        );
+        let (_, entry) = agent.last_permission();
+        let Entry::Permission { options, .. } = entry else {
+            panic!("not a permission");
+        };
+        let ids: Vec<&str> = options.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(ids, ["allow", "reject"]);
+        assert_eq!(agent.notices().len(), 1);
+        assert!(agent.notices()[0].contains("allow_for_session"));
+        assert_eq!(*agent.turn_state(), TurnState::Blocked);
+    }
+
+    #[test]
+    fn a_request_with_no_option_brindle_knows_is_answered_cancelled() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let out = agent.feed(&permission(
+            json!(0),
+            "call_1",
+            &[("x", "allow_for_session")],
+        ));
+        assert_eq!(
+            shape(&out.events),
+            [
+                "added permission",
+                "added notice",
+                "answered",
+                "added notice"
+            ]
+        );
+        assert!(
+            out.stdin
+                .ends_with(b"\"outcome\":{\"outcome\":\"cancelled\"}}}\n")
+        );
+        assert_eq!(*agent.turn_state(), TurnState::Working);
+    }
+
+    #[test]
+    fn a_permission_request_that_cant_be_read_is_answered_cancelled_by_its_id() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let out = agent.feed(r#"{"jsonrpc":"2.0","id":"q","method":"session/request_permission","params":{"sessionId":"s1"}}"#);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":\"q\",\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
+        );
+        assert_eq!(shape(&out.events), ["added notice"]);
+    }
+
+    #[test]
+    fn a_permission_request_while_cancelling_is_answered_cancelled_at_once() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.cmd(Command::Cancel);
+        let out = agent.feed(&permission(json!(0), "call_1", &ALLOW_REJECT));
+        assert_eq!(shape(&out.events), ["added permission", "answered"]);
+        assert_eq!(*agent.turn_state(), TurnState::Cancelling);
+    }
+
+    // --- tool calls -----------------------------------------------------
+
+    #[test]
+    fn a_tool_call_is_one_entry_its_updates_change_by_id() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Write a file", "pending"));
+        let out = agent.feed(&tool_update("call_1", "completed"));
+        assert_eq!(
+            out.events,
+            [Event::ToolChanged {
+                id: EntryId(2),
+                title: None,
+                kind: None,
+                status: Some(ToolStatus::Completed)
+            }]
+        );
+        assert_eq!(
+            agent.last_entry().1,
+            Entry::Tool {
+                call: "call_1".into(),
+                title: "Write a file".into(),
+                kind: ToolKind::Edit,
+                status: ToolStatus::Completed
+            }
+        );
+    }
+
+    #[test]
+    fn tool_statuses_apply_in_the_order_they_come_even_backwards() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Write", "in_progress"));
+        for status in ["pending", "in_progress", "failed"] {
+            agent.feed(&tool_update("call_1", status));
+        }
+        assert!(matches!(
+            agent.last_entry().1,
+            Entry::Tool {
+                status: ToolStatus::Failed,
+                ..
+            }
+        ));
+        let statuses: Vec<ToolStatus> = agent
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolChanged { status, .. } => *status,
+                Event::Added { .. }
+                | Event::Appended { .. }
+                | Event::Answered { .. }
+                | Event::Queue { .. }
+                | Event::Turn { .. }
+                | Event::Agent { .. }
+                | Event::Trimmed { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [
+                ToolStatus::Pending,
+                ToolStatus::InProgress,
+                ToolStatus::Failed
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_call_sent_again_changes_its_entry() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Write", "pending"));
+        let out = agent.feed(&tool_call("call_1", "Write hello.txt", "pending"));
+        assert_eq!(shape(&out.events), ["tool changed"]);
+        assert_eq!(agent.entries().len(), 2);
+    }
+
+    #[test]
+    fn fields_that_didnt_change_send_nothing() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Write", "pending"));
+        assert!(
+            agent
+                .feed(&tool_call("call_1", "Write", "pending"))
+                .events
+                .is_empty()
+        );
+        assert!(
+            agent
+                .feed(&tool_update("call_1", "pending"))
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_update_for_a_call_the_log_doesnt_have_adds_it() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_update("call_9", "in_progress"));
+        assert_eq!(
+            agent.last_entry().1,
+            Entry::Tool {
+                call: "call_9".into(),
+                title: "call_9".into(),
+                kind: ToolKind::Other,
+                status: ToolStatus::InProgress
+            }
+        );
+    }
+
+    // --- chunk runs -----------------------------------------------------
+
+    #[test]
+    fn a_chunk_of_another_kind_ends_the_run() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&chunk("agent_thought_chunk", "hmm"));
+        agent.feed(&said("yes"));
+        agent.feed(&chunk("agent_thought_chunk", "more"));
+        let kinds: Vec<&str> = agent.entries().iter().map(entry_kind).collect();
+        assert_eq!(kinds, ["user", "thought", "agent", "thought"]);
+    }
+
+    #[test]
+    fn a_tool_call_ends_the_run() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&said("a"));
+        agent.feed(&tool_call("call_1", "Write", "pending"));
+        agent.feed(&said("b"));
+        let kinds: Vec<&str> = agent.entries().iter().map(entry_kind).collect();
+        assert_eq!(kinds, ["user", "agent", "tool", "agent"]);
+    }
+
+    #[test]
+    fn a_turns_end_ends_the_run() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.feed(&said("a"));
+        agent.end(id, "end_turn");
+        agent.feed(&said("b"));
+        let kinds: Vec<&str> = agent.entries().iter().map(entry_kind).collect();
+        assert_eq!(kinds, ["user", "agent", "agent"]);
+    }
+
+    #[test]
+    fn a_user_prompt_is_no_run_the_agents_user_chunks_extend() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&chunk("user_message_chunk", "echo"));
+        let kinds: Vec<&str> = agent.entries().iter().map(entry_kind).collect();
+        assert_eq!(kinds, ["user", "user"]);
+    }
+
+    #[test]
+    fn a_chunk_that_isnt_text_shows_a_placeholder_in_the_run() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&said("look: "));
+        agent.feed(&update(json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "image", "data": "AA==", "mimeType": "image/png"}})));
+        assert_eq!(
+            agent.last_entry().1,
+            Entry::Agent {
+                text: "look: [image]".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_chunk_over_64_kib_is_split_into_appends() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let out = agent.feed(&said(&"é".repeat(TEXT_CHUNK)));
+        assert_eq!(shape(&out.events), ["added agent", "appended"]);
+        for event in &out.events {
+            if let Event::Appended { text, .. }
+            | Event::Added {
+                entry: Entry::Agent { text },
+                ..
+            } = event
+            {
+                assert!(text.len() <= TEXT_CHUNK);
+            }
+        }
+    }
+
+    // --- messages the core doesn't take ---------------------------------
+
+    #[test]
+    fn a_request_for_a_method_not_offered_is_answered_method_not_found() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(r#"{"jsonrpc":"2.0","id":4,"method":"fs/read_text_file","params":{"path":"/etc/passwd"}}"#);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":4,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}\n"
+        );
+        assert!(out.events.is_empty());
+    }
+
+    #[test]
+    fn an_unknown_notification_is_ignored() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(r#"{"jsonrpc":"2.0","method":"_vendor/ping","params":{}}"#);
+        assert_eq!(out, Output::default());
+    }
+
+    #[test]
+    fn an_unknown_update_kind_changes_nothing_and_the_next_chunk_is_added() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let out = agent.feed(&update(
+            json!({"sessionUpdate": "brand_new_kind", "payload": {"x": 1}}),
+        ));
+        assert!(out.events.is_empty());
+        agent.feed(&said("hi"));
+        assert_eq!(agent.last_entry().1, Entry::Agent { text: "hi".into() });
+        assert!(agent.notices().is_empty());
+    }
+
+    #[test]
+    fn a_session_info_update_without_a_title_changes_nothing() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(&update(
+            json!({"sessionUpdate": "session_info_update", "_meta": {"codex": {}}}),
+        ));
+        assert_eq!(out, Output::default());
+    }
+
+    #[test]
+    fn an_update_for_another_acp_session_is_ignored() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "other", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x"}}}});
+        assert!(agent.feed(&line.to_string()).events.is_empty());
+    }
+
+    #[test]
+    fn an_answer_to_no_request_the_core_awaits_is_ignored() {
+        let mut agent = Agent::ready();
+        assert_eq!(agent.feed(&result(99, json!({}))), Output::default());
+        assert_eq!(agent.feed(&error(98, -1, "x")), Output::default());
+    }
+
+    // --- bad lines ------------------------------------------------------
+
+    #[test]
+    fn a_run_of_bad_lines_is_one_notice_with_its_count_when_a_message_follows() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        for line in ["hello world", "[1,2]", "42", r#"{"no":"jsonrpc"}"#] {
+            assert!(agent.feed(line).events.is_empty());
+        }
+        let out = agent.feed(&said("hi"));
+        assert_eq!(shape(&out.events), ["added notice", "added agent"]);
+        assert_eq!(
+            agent.notices(),
+            ["4 lines from the agent weren't ACP messages"]
+        );
+        assert_eq!(out.wake, None);
+    }
+
+    #[test]
+    fn one_bad_line_says_a_line_wasnt_an_acp_message() {
+        let mut agent = Agent::ready();
+        agent.feed("hello world");
+        agent.feed(&said("hi"));
+        assert_eq!(
+            agent.notices(),
+            ["a line from the agent wasn't an ACP message"]
+        );
+    }
+
+    #[test]
+    fn a_run_of_bad_lines_is_written_once_a_quiet_second_has_passed() {
+        let mut agent = Agent::ready();
+        let out = agent.feed("hello world");
+        assert_eq!(out.wake, Some(agent.now + BAD_RUN_QUIET));
+        agent.now += BAD_RUN_QUIET / 2;
+        assert!(agent.step(Input::Tick).events.is_empty());
+        agent.now += BAD_RUN_QUIET;
+        let out = agent.step(Input::Tick);
+        assert_eq!(shape(&out.events), ["added notice"]);
+        assert_eq!(out.wake, None);
+    }
+
+    #[test]
+    fn a_blank_line_is_no_message_and_isnt_counted() {
+        let mut agent = Agent::ready();
+        let out = agent.step(Input::Stdout(b"\n   \r\n"));
+        assert_eq!(out, Output::default());
+    }
+
+    #[test]
+    fn a_batch_is_counted_and_not_answered() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(r#"[{"jsonrpc":"2.0","id":1,"method":"fs/read_text_file"}]"#);
+        assert!(out.stdin.is_empty());
+        assert!(out.wake.is_some());
+    }
+
+    #[test]
+    fn a_request_with_an_unusable_id_is_answered_invalid_request_and_counted() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(r#"{"jsonrpc":"2.0","id":null,"method":"fs/read_text_file"}"#);
+        assert_eq!(
+            out.stdin,
+            b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}\n"
+        );
+        assert!(out.wake.is_some());
+    }
+
+    #[test]
+    fn params_of_the_wrong_shape_count_as_a_bad_line() {
+        let mut agent = Agent::ready();
+        agent.feed(r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1"}}"#);
+        agent.feed(&said("hi"));
+        assert_eq!(
+            agent.notices(),
+            ["a line from the agent wasn't an ACP message"]
+        );
+    }
+
+    #[test]
+    fn a_line_over_8_mib_is_dropped_with_a_notice() {
+        let mut agent = Agent::ready();
+        let mut line = vec![b'x'; super::super::lines::MAX_LINE + 1];
+        line.push(b'\n');
+        let out = agent.step(Input::Stdout(&line));
+        assert_eq!(shape(&out.events), ["added notice"]);
+        assert!(agent.notices()[0].contains("8 MiB"));
+    }
+
+    #[test]
+    fn control_characters_become_u_fffd_but_tab_newline_and_crlf_stay() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&said("a\u{1b}[2Jb\tc\r\nd\re\u{9b}f\u{7f}é"));
+        assert_eq!(
+            agent.last_entry().1,
+            Entry::Agent {
+                text: "a\u{fffd}[2Jb\tc\r\nd\u{fffd}e\u{fffd}f\u{fffd}é".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_crlf_cut_between_chunks_is_kept() {
+        assert_eq!(clean("a\r"), "a\r");
+        assert_eq!(clean("\nb"), "\nb");
+        assert_eq!(clean("a\rb"), "a\u{fffd}b");
+    }
+
+    #[test]
+    fn text_from_the_agent_passes_unchanged_through_the_pipes() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        // The bytes arrive cut inside a UTF-8 sequence.
+        let line = format!("{}\n", said("tab\there\r\nend ünïcödé 🦀"));
+        let (front, back) = line
+            .as_bytes()
+            .split_at(line.find('🦀').expect("a crab") + 2);
+        agent.step(Input::Stdout(front));
+        agent.step(Input::Stdout(back));
+        assert_eq!(
+            agent.last_entry().1,
+            Entry::Agent {
+                text: "tab\there\r\nend ünïcödé 🦀".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_users_prompt_is_cleaned_before_it_is_logged_and_sent() {
+        let mut agent = Agent::ready();
+        agent.prompt("a\u{1b}b");
+        assert_eq!(
+            agent.entries()[0],
+            Entry::User {
+                text: "a\u{fffd}b".into()
+            }
+        );
+        assert_eq!(
+            agent.last("session/prompt")["params"]["prompt"][0]["text"],
+            "a\u{fffd}b"
+        );
+    }
+
+    // --- exits and faults -----------------------------------------------
+
+    #[test]
+    fn an_exit_reports_its_status_and_the_end_of_its_stderr() {
+        let mut agent = Agent::ready();
+        let out = agent.step(Input::Exited {
+            code: Some(1),
+            stderr: b"loading\nfatal: no model\n",
+        });
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Exited {
+                code: Some(1),
+                stderr: "loading\nfatal: no model\n".into()
+            }
+        );
+        assert_eq!(out.checkpoint, Some(Moment::Stopped));
+        assert!(
+            agent
+                .step(Input::Exited {
+                    code: None,
+                    stderr: b""
+                })
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn an_exit_mid_turn_fails_the_turn_and_cancels_the_waiting_permissions() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        let out = agent.step(Input::Exited {
+            code: None,
+            stderr: b"\x1b[31mkilled\xff",
+        });
+        assert!(out.stdin.is_empty(), "nothing is written to a gone agent");
+        assert_eq!(
+            shape(&out.events),
+            ["answered", "turn failed", "agent exited"]
+        );
+        assert!(matches!(
+            agent.s.transcript.entry(entry),
+            Some(Entry::Permission {
+                outcome: Some(PermissionOutcome::Cancelled),
+                ..
+            })
+        ));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Exited {
+                code: None,
+                stderr: "\u{fffd}[31mkilled\u{fffd}".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_handling_fault_fails_the_agent_and_leaves_it_running_with_its_lines_ignored() {
+        let mut agent = Agent::ready();
+        let out = agent.step(Input::Fault {
+            reason: "panicked at reduce.rs".into(),
+        });
+        assert!(!out.hang_up);
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "ACP handling failed: panicked at reduce.rs".into()
+            }
+        );
+        assert!(agent.feed(&said("x")).events.is_empty());
+        assert!(
+            agent
+                .feed(r#"{"jsonrpc":"2.0","id":4,"method":"fs/x"}"#)
+                .stdin
+                .is_empty()
+        );
+        let before = agent.s.lines().covers();
+        agent.feed("more");
+        assert_eq!(
+            agent.s.lines().covers(),
+            before + 5,
+            "the bytes are still counted"
+        );
+    }
+
+    #[test]
+    fn an_exit_after_a_handling_fault_still_reports_the_exit() {
+        let mut agent = Agent::ready();
+        agent.step(Input::Fault {
+            reason: "boom".into(),
+        });
+        agent.step(Input::Exited {
+            code: Some(0),
+            stderr: b"",
+        });
+        assert!(matches!(agent.agent_state(), AgentState::Exited { .. }));
+    }
+
+    #[test]
+    fn a_fold_error_from_the_reducers_own_events_fails_the_handling() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Write", "pending"));
+        // A run pointing at the tool entry: the next chunk appends to it.
+        agent.s.run = Some(Run {
+            kind: RunKind::Agent,
+            entry: EntryId(2),
+        });
+        let out = agent.feed(&said("x"));
+        assert_eq!(shape(&out.events), ["turn failed", "agent failed"]);
+        assert!(
+            matches!(agent.agent_state(), AgentState::Failed { message } if message.contains("has no text to append to"))
+        );
+    }
+
+    // --- the log's bound (decision 14) ----------------------------------
+
+    /// Feeds alternating agent and thought chunks of 1 MiB, each its own
+    /// entry, until the log is past its bound.
+    fn fill(agent: &mut Agent) -> Vec<Output> {
+        let text = "x".repeat(1024 * 1024);
+        (0..18)
+            .map(|n| {
+                let kind = if n % 2 == 0 {
+                    "agent_message_chunk"
+                } else {
+                    "agent_thought_chunk"
+                };
+                agent.feed(&chunk(kind, &text))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_log_is_trimmed_past_16_mib_keeping_the_newest_entries() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let outs = fill(&mut agent);
+        let trimmed: Vec<&Event> = outs
+            .iter()
+            .flat_map(|out| &out.events)
+            .filter(|event| matches!(event, Event::Trimmed { .. }))
+            .collect();
+        assert!(!trimmed.is_empty());
+        assert!(agent.s.transcript.encoded_len() <= LOG_LIMIT);
+        assert!(agent.s.transcript.dropped() > 0);
+        let replay = agent.s.transcript.replay();
+        assert!(
+            matches!(replay[0], Event::Trimmed { .. }),
+            "a replay starts with it"
+        );
+        assert_eq!(
+            agent.s.transcript.next_id(),
+            EntryId(20),
+            "the newest entries stay"
+        );
+    }
+
+    #[test]
+    fn trimming_answers_a_waiting_permission_it_drops_and_forgets_its_tool_ids() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.feed(&tool_call("call_1", "Write", "pending"));
+        agent.ask(json!(0), &ALLOW_REJECT);
+        let outs = fill(&mut agent);
+        let answered: Vec<u8> = outs.iter().flat_map(|out| out.stdin.clone()).collect();
+        assert_eq!(
+            answered,
+            b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
+        );
+        assert!(agent.s.rpc().permissions().is_empty());
+        assert!(agent.s.tools.is_empty());
+        assert_eq!(*agent.turn_state(), TurnState::Working);
+    }
+
+    // --- activity (decision 15's table, row by row) ---------------------
+
+    #[test]
+    fn a_starting_agent_is_working() {
+        let mut agent = Agent::new();
+        assert_eq!(agent.activity(), Activity::Working);
+        agent.step(Input::Spawned);
+        assert_eq!(agent.activity(), Activity::Working);
+    }
+
+    #[test]
+    fn a_running_or_cancelling_turn_is_working() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        assert_eq!(agent.activity(), Activity::Working);
+        agent.cmd(Command::Cancel);
+        assert_eq!(agent.activity(), Activity::Working);
+    }
+
+    #[test]
+    fn a_waiting_permission_request_is_blocked() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        agent.ask(json!(0), &ALLOW_REJECT);
+        assert_eq!(agent.activity(), Activity::Blocked);
+    }
+
+    #[test]
+    fn a_turn_ended_with_end_turn_is_done() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        agent.end(id, "end_turn");
+        assert_eq!(agent.activity(), Activity::Done);
+    }
+
+    #[test]
+    fn a_new_session_or_a_cancelled_turn_is_idle() {
+        let mut agent = Agent::ready();
+        assert_eq!(agent.activity(), Activity::Idle);
+        let id = agent.turn("one");
+        agent.cmd(Command::Cancel);
+        agent.end(id, "cancelled");
+        assert_eq!(agent.activity(), Activity::Idle);
+    }
+
+    #[test]
+    fn another_stop_a_failed_turn_a_login_a_failure_or_an_exit_is_an_error() {
+        for stop in ["max_tokens", "max_turn_requests", "refusal", "paused"] {
+            let mut agent = Agent::ready();
+            let id = agent.turn("one");
+            agent.end(id, stop);
+            assert_eq!(agent.activity(), Activity::Error, "{stop}");
+        }
+        let mut failed = Agent::ready();
+        let id = failed.turn("one");
+        failed.feed(&error(id, -1, "no"));
+        assert_eq!(failed.activity(), Activity::Error);
+
+        let mut login = Agent::new();
+        login.step(Input::Spawned);
+        login.feed(&result(1, json!({"protocolVersion": 1})));
+        login.feed(&error(2, -32000, "log in"));
+        assert_eq!(login.activity(), Activity::Error);
+
+        let mut broken = Agent::ready();
+        broken.step(Input::Fault { reason: "x".into() });
+        assert_eq!(broken.activity(), Activity::Error);
+
+        let mut exited = Agent::ready();
+        exited.step(Input::Exited {
+            code: Some(0),
+            stderr: b"",
+        });
+        assert_eq!(exited.activity(), Activity::Error);
+    }
+
+    #[test]
+    fn the_slot_never_changes_the_activity() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("one");
+        let before = agent.activity();
+        agent.prompt("two");
+        assert_eq!(agent.activity(), before);
+        agent.end(id, "max_tokens");
+        let before = agent.activity();
+        agent.cmd(Command::Unqueue);
+        assert_eq!(agent.activity(), before);
+    }
+
+    // --- the captured sessions ------------------------------------------
+
+    const CAPTURES: [(&str, &[u8]); 8] = [
+        (
+            "antigravity-1.5.16-reject",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-reject.log"),
+        ),
+        (
+            "antigravity-1.5.16-trusted-workspace",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-trusted-workspace.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-auto",
+            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-auto.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-haiku-reject",
+            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-haiku-reject.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-reject",
+            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-reject.log"),
+        ),
+        (
+            "claude-code-acp-0.16.2-reject",
+            include_bytes!("../../tests/fixtures/acp/claude-code-acp-0.16.2-reject.log"),
+        ),
+        (
+            "codex-acp-2.12.0-reject",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-reject.log"),
+        ),
+        (
+            "copilot-1.0.115-reject",
+            include_bytes!("../../tests/fixtures/acp/copilot-1.0.115-reject.log"),
+        ),
+    ];
+
+    /// Hand-written lines with values no agent sent yet, for a session
+    /// already ready in `sess-1`.
+    const HANDWRITTEN: &[u8] =
+        include_bytes!("../../tests/fixtures/acp/handwritten-unknown-values.log");
+
+    const GEMINI: &[u8] =
+        include_bytes!("../../tests/fixtures/acp/gemini-0.71.1-login-on-stdout.log");
+
+    /// Plays a captured session through the reducer: the agent's lines are
+    /// fed (the answers to the core's requests renumbered to the ids the
+    /// core gave, and those to requests Brindle doesn't send skipped), the
+    /// capture's prompts are sent as commands (`after_prompt` runs after
+    /// each), and its permission answers are given by the option's kind,
+    /// checking the line written against the captured one.
+    fn replay(log: &[u8], after_prompt: impl FnMut(&mut Agent)) -> Agent {
+        let mut agent = Agent::in_dir("/home/user/scratch");
+        agent.step(Input::Spawned);
+        replay_into(agent, log, after_prompt)
+    }
+
+    fn replay_into(
+        mut agent: Agent,
+        log: &[u8],
+        mut after_prompt: impl FnMut(&mut Agent),
+    ) -> Agent {
+        let mut ours: Vec<(Value, u64)> = Vec::new();
+        let mut skipped: Vec<Value> = Vec::new();
+        for line in log.split(|b| *b == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if let Some(sent) = line.strip_prefix(b"c>a\t") {
+                let sent: Value = serde_json::from_slice(sent).expect("a client line");
+                let id = sent["id"].clone();
+                match sent["method"].as_str() {
+                    Some(method @ ("initialize" | "session/new")) => {
+                        let line = agent.last(method).clone();
+                        if line["id"] == id {
+                            assert_eq!(line, sent, "the core's {method}");
+                        }
+                        ours.push((id, line["id"].as_u64().expect("an id")));
+                    }
+                    Some("session/prompt") => {
+                        let text = sent["params"]["prompt"][0]["text"].as_str().expect("text");
+                        assert_eq!(agent.prompt(text).reply, Some(Ok(())));
+                        ours.push((id, agent.prompt_id()));
+                        after_prompt(&mut agent);
+                    }
+                    Some(_) => skipped.push(id),
+                    None => {
+                        let wire = Id::parse(&id).expect("an id");
+                        let entry = *agent
+                            .s
+                            .rpc()
+                            .permissions()
+                            .iter()
+                            .find(|(_, waiting)| **waiting == wire)
+                            .expect("a waiting request")
+                            .0;
+                        let Some(Entry::Permission { options, .. }) =
+                            agent.s.transcript.entry(entry)
+                        else {
+                            panic!("no permission entry");
+                        };
+                        let captured = sent["result"]["outcome"]["optionId"]
+                            .as_str()
+                            .expect("an option");
+                        let kind = options
+                            .iter()
+                            .find(|o| o.id == captured)
+                            .expect("offered")
+                            .kind;
+                        let chosen = options
+                            .iter()
+                            .find(|o| o.kind == kind)
+                            .expect("a kind")
+                            .id
+                            .clone();
+                        let out = agent.cmd(Command::Answer {
+                            entry,
+                            option: Some(chosen),
+                        });
+                        assert_eq!(out.reply, Some(Ok(())));
+                        assert_eq!(
+                            out.stdin,
+                            [&serde_json::to_vec(&sent).expect("json")[..], b"\n"].concat()
+                        );
+                    }
+                }
+            } else if let Some(from_agent) = line.strip_prefix(b"a>c\t") {
+                let mut bytes = from_agent.to_vec();
+                if let Ok(mut message) = serde_json::from_slice::<Value>(from_agent)
+                    && message.get("method").is_none()
+                    && let Some(id) = message.get("id").cloned()
+                {
+                    if skipped.contains(&id) {
+                        continue;
+                    }
+                    if let Some((_, own)) = ours.iter().find(|(captured, _)| *captured == id) {
+                        message["id"] = Value::from(*own);
+                    }
+                    bytes = message.to_string().into_bytes();
+                }
+                bytes.push(b'\n');
+                agent.step(Input::Stdout(&bytes));
+            }
+        }
+        agent
+    }
+
+    #[test]
+    fn every_captured_session_reduces_with_no_fault_and_the_clients_fold_agreeing() {
+        for (name, log) in CAPTURES {
+            let agent = replay(log, |_| {});
+            assert!(
+                matches!(agent.s.phase(), Phase::Ready { .. }),
+                "{name}: {:?}",
+                agent.s.phase()
+            );
+            assert!(
+                matches!(agent.turn_state(), TurnState::Ended { .. }),
+                "{name}: {:?}",
+                agent.turn_state()
+            );
+            assert!(agent.s.rpc().outgoing().is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn copilots_captured_turn_merges_its_thoughts_and_answers_the_rejection_by_kind() {
+        let agent = replay(CAPTURES[7].1, |_| {});
+        let kinds: Vec<&str> = agent.entries().iter().map(entry_kind).collect();
+        assert_eq!(kinds, ["user", "thought", "tool", "permission", "agent"]);
+        assert!(
+            matches!(&agent.entries()[3], Entry::Permission { outcome: Some(PermissionOutcome::Selected { option }), .. } if option == "reject_once")
+        );
+        assert!(matches!(
+            &agent.entries()[2],
+            Entry::Tool {
+                status: ToolStatus::Failed,
+                ..
+            }
+        ));
+        assert_eq!(*agent.turn_state(), ended(StopReason::EndTurn));
+        assert_eq!(agent.activity(), Activity::Done);
+    }
+
+    #[test]
+    fn codexs_cancelled_ending_after_a_rejection_holds_a_waiting_prompt_as_a_stop_not_a_cancel() {
+        let agent = replay(CAPTURES[6].1, |agent| {
+            assert_eq!(agent.prompt("and then?").reply, Some(Ok(())));
+        });
+        assert_eq!(*agent.turn_state(), ended(StopReason::Cancelled));
+        assert_eq!(agent.activity(), Activity::Idle);
+        assert_eq!(
+            *agent.slot(),
+            held(
+                "and then?",
+                HoldReason::Stopped {
+                    stop: StopReason::Cancelled
+                }
+            )
+        );
+        assert_eq!(
+            agent
+                .sent_methods()
+                .iter()
+                .filter(|m| **m == "session/cancel")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn antigravitys_string_request_id_is_answered_verbatim_and_its_tool_status_goes_back() {
+        // `replay` checks the answer's bytes against the captured `"id":"1"`.
+        let agent = replay(CAPTURES[0].1, |_| {});
+        assert!(matches!(
+            &agent.entries()[1],
+            Entry::Tool {
+                status: ToolStatus::Failed,
+                ..
+            }
+        ));
+        assert!(agent.events.iter().any(|event| matches!(
+            event,
+            Event::ToolChanged {
+                status: Some(ToolStatus::Pending),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn the_handwritten_unknown_values_are_confined_to_their_items() {
+        let agent = replay_into(Agent::ready_in("sess-1"), HANDWRITTEN, |_| {});
+        // The unknown option kind is left out with a notice, an unknown
+        // stop reason keeps its name.
+        assert!(
+            agent
+                .notices()
+                .iter()
+                .any(|n| n.contains("allow_for_session"))
+        );
+        assert!(agent.events.iter().any(|event| matches!(event, Event::Turn { state: TurnState::Ended { stop: StopReason::Other { name } } } if name == "paused_for_review")));
+    }
+
+    #[test]
+    fn geminis_login_prompt_on_stdout_is_one_notice_of_bad_lines_and_the_agent_stays_starting() {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        for line in GEMINI.split(|b| *b == b'\n') {
+            if let Some(from_agent) = line.strip_prefix(b"a>c\t") {
+                agent.step(Input::Stdout(&[from_agent, b"\n"].concat()));
+            }
+        }
+        agent.now += BAD_RUN_QUIET;
+        agent.step(Input::Tick);
+        assert_eq!(
+            agent.notices(),
+            ["6 lines from the agent weren't ACP messages"]
+        );
+        assert_eq!(*agent.agent_state(), AgentState::Starting);
+    }
+}

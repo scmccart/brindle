@@ -2,8 +2,10 @@
 //! (`fcis R1`): the handlers in `holder.rs` read their state, call these,
 //! and apply what comes back. `now` is always an argument.
 //!
-//! - **Spawns:** which `SPAWN`s are refused, and with what text
-//!   ([`spawn_refusal`]).
+//! - **Spawns:** which `SPAWN`s and `SPAWN_PIPES` are refused, and with
+//!   what text ([`spawn_refusal`], [`pipe_spawn_refusal`]).
+//! - **Pipe sessions and older cores:** whether a core is shown a session
+//!   ([`shown`]: not a pipe session, below H1 version 3).
 //! - **Exits:** when a reaped program's session is finished, its output
 //!   drained ([`drained`]).
 //! - **Supervision:** when a holder with sessions and no core starts one,
@@ -13,7 +15,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
-use brindle_remote_protocol::holder::Spawn;
+use brindle_remote_protocol::holder::{Spawn, SpawnMode, SpawnPipes};
 
 use super::{CORE_BACKOFF_MAX, CORE_BACKOFF_START, CORE_GRACE};
 use crate::pty::{OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT};
@@ -55,6 +57,42 @@ pub(super) fn spawn_refusal(draining: bool, exists: bool, spawn: &Spawn) -> Opti
         Some(SpawnRefusal::NoSize)
     } else {
         None
+    }
+}
+
+/// Why a `SPAWN_PIPES` is refused by a holder that is `draining` or
+/// (`exists`) already has a session with its id; the first reason in that
+/// order, as for a `SPAWN`. Its command is required, so an empty one is
+/// refused too (the core refuses it first, decision 2).
+pub(super) fn pipe_spawn_refusal(
+    draining: bool,
+    exists: bool,
+    spawn: &SpawnPipes,
+) -> Option<SpawnRefusal> {
+    if draining {
+        Some(SpawnRefusal::Draining)
+    } else if exists {
+        Some(SpawnRefusal::Exists(spawn.session))
+    } else if spawn.command.is_empty() {
+        Some(SpawnRefusal::EmptyCommand)
+    } else {
+        None
+    }
+}
+
+/// The H1 version from which a core is shown pipe sessions (the core's
+/// `policy::PIPES_PROTOCOL` is the same number, for placing them).
+pub(super) const PIPES_PROTOCOL: u32 = 3;
+
+/// Whether a core that negotiated H1 `protocol` is shown a session of
+/// `mode`: in `WELCOME`, by its output, checkpoints' tails and exit. One
+/// below [`PIPES_PROTOCOL`] isn't shown pipe sessions at all (an older core
+/// adopting a newer holder, decision 2): they keep running, their output
+/// only grows the tail, and they come back with a core that speaks it.
+pub(super) fn shown(protocol: u32, mode: SpawnMode) -> bool {
+    match mode {
+        SpawnMode::Pty => true,
+        SpawnMode::Pipes => protocol >= PIPES_PROTOCOL,
     }
 }
 
@@ -166,6 +204,40 @@ mod tests {
         for (draining, exists, spawn, refused) in cases {
             let refusal = spawn_refusal(draining, exists, &spawn).map(|refusal| refusal.to_string());
             assert_eq!(refusal.as_deref(), refused, "{draining} {exists} {spawn:?}");
+        }
+    }
+
+    #[test]
+    fn a_pipe_spawn_is_refused_draining_then_existing_then_with_no_command() {
+        let spawn = |command: &str| SpawnPipes {
+            session: 7,
+            command: command.into(),
+            args: Vec::new(),
+            cwd: None,
+            env: BTreeMap::new(),
+            meta: Value::Null,
+        };
+        let cases = [
+            (false, false, spawn("agent"), None),
+            (true, true, spawn(""), Some("the holder is draining and takes no new sessions")),
+            (false, true, spawn(""), Some("session 7 already exists")),
+            (false, false, spawn(""), Some("command must not be empty")),
+        ];
+        for (draining, exists, spawn, refused) in cases {
+            let refusal = pipe_spawn_refusal(draining, exists, &spawn).map(|refusal| refusal.to_string());
+            assert_eq!(refusal.as_deref(), refused, "{draining} {exists} {spawn:?}");
+        }
+    }
+
+    #[test]
+    fn a_core_below_h1_3_is_shown_only_pty_sessions() {
+        for protocol in 1..PIPES_PROTOCOL {
+            assert!(shown(protocol, SpawnMode::Pty));
+            assert!(!shown(protocol, SpawnMode::Pipes), "H1 {protocol}");
+        }
+        for protocol in [PIPES_PROTOCOL, PIPES_PROTOCOL + 1] {
+            assert!(shown(protocol, SpawnMode::Pty));
+            assert!(shown(protocol, SpawnMode::Pipes), "H1 {protocol}");
         }
     }
 

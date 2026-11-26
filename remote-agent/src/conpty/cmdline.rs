@@ -143,12 +143,21 @@ pub fn resolve_program(
             .map(|extension| format!("{name}{extension}"))
             .collect()
     };
-    path_dirs(path_var)
+    search_dirs(path_var)
         .iter()
-        .filter(|dir| is_rooted(dir))
         .flat_map(|dir| names.iter().map(move |name| in_dir(dir, name)))
         .find(|path| exists(path))
         .map_or(Resolved::NotFound, Resolved::Found)
+}
+
+/// The directories of `path_var` (`PATH`) a name without a directory is
+/// looked for in, in their order: those spelled from a drive or a share
+/// ([`resolve_program`]).
+pub fn search_dirs(path_var: &str) -> Vec<String> {
+    path_dirs(path_var)
+        .into_iter()
+        .filter(|dir| is_rooted(dir))
+        .collect()
 }
 
 /// Whether `name` ends with `suffix`, whatever the case of its ASCII
@@ -196,7 +205,7 @@ fn is_rooted(dir: &str) -> bool {
 }
 
 /// `name` in the directory `dir`.
-fn in_dir(dir: &str, name: &str) -> String {
+pub fn in_dir(dir: &str, name: &str) -> String {
     if dir.ends_with(['\\', '/']) {
         format!("{dir}{name}")
     } else {

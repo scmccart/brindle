@@ -1,0 +1,3 @@
+# Captured agent output is kept byte for byte: Gemini's login prompt ends a
+# line with CRLF, which the root's eol=lf would rewrite.
+*.log -text

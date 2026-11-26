@@ -73,6 +73,7 @@ use windows::core::PCWSTR;
 
 use super::event_loop::{ExitWatch, Source, Waker, os_error, win32};
 use super::pipe::Pipe;
+use super::piped::Job;
 use crate::conpty::cmdline::{self, Resolved, launch_line};
 use crate::conpty::hosts::{self, HostSeen, Listed};
 use crate::conpty::{Process, Pseudoconsole, choice};
@@ -146,13 +147,35 @@ impl Drop for Pty {
     }
 }
 
-/// A session's program: the process started on the pseudoconsole.
+/// A session's program: the process started on the pseudoconsole, or on
+/// plain pipes in a job of its own (`piped`).
 pub struct Program {
     /// Shared with its [`Group`]s, which outlive it.
     process: Arc<Process>,
-    console: Console,
+    ends: Ends,
     /// Wakes the loop when the process exits.
     watch: Option<ExitWatch>,
+}
+
+/// What ends a session's processes with it (`types R1`).
+#[derive(Clone)]
+enum Ends {
+    /// A PTY session's pseudoconsole: its host ends the processes on it.
+    Console(Console),
+    /// A pipe session's job, which holds every process the program starts
+    /// (and ends them once the last handle to it closes).
+    Job(Arc<Job>),
+}
+
+impl Program {
+    /// A pipe session's program, `process`, running in `job`.
+    pub(super) fn in_job(process: Process, job: Job) -> Self {
+        Self {
+            process: Arc::new(process),
+            ends: Ends::Job(Arc::new(job)),
+            watch: None,
+        }
+    }
 }
 
 /// How a program ended.
@@ -172,7 +195,7 @@ impl Program {
     pub fn group(&self) -> Group {
         Group {
             root: Arc::clone(&self.process),
-            console: Arc::clone(&self.console),
+            ends: self.ends.clone(),
         }
     }
 
@@ -191,7 +214,12 @@ impl Program {
             return Ok(None);
         };
         self.watch = None;
-        console(&self.console).take();
+        match &self.ends {
+            Ends::Console(shared) => drop(console(shared).take()),
+            // What it started may still run, and the hang-up's steps or the
+            // job's close end that.
+            Ends::Job(_) => {}
+        }
         Ok(Some(Exit {
             // Exit codes are unsigned here; an NTSTATUS reads as negative.
             code: Some(code as i32),
@@ -210,28 +238,35 @@ impl Program {
     }
 }
 
-/// The processes that end with a session's program: those attached to its
-/// console, and its root process. It outlives the program.
+/// The processes that end with a session's program: for a PTY session
+/// those attached to its console, and its root process; for a pipe session
+/// those in its job. It outlives the program.
 ///
 /// Windows has no process group to signal. The console's processes are the
 /// console host's to end, which it does when the pseudoconsole closes, and
 /// the group ends those the close missed. The group holds the root process
 /// open, so its pid stays its own, and the console host it was on can be
 /// asked for after it exits. Processes that left the console aren't in the
-/// group.
+/// group. A pipe session's job holds whatever its program starts.
 #[derive(Clone)]
 pub struct Group {
     root: Arc<Process>,
-    console: Console,
+    ends: Ends,
 }
 
 impl Group {
     /// Tells the processes their terminal is gone: closes the pseudoconsole
     /// if it is still open, on a thread of its own
     /// ([`crate::conpty::Pseudoconsole`]'s drop), so this never waits for
-    /// the console host. The host then ends the console's processes.
+    /// the console host. The host then ends the console's processes. A pipe
+    /// session has no terminal, and its job's processes are ended
+    /// (`TerminateJobObject`): its hang-up's `EndGroup` step, which follows
+    /// the close of its stdin.
     pub fn hang_up(&self) {
-        console(&self.console).take();
+        match &self.ends {
+            Ends::Console(shared) => drop(console(shared).take()),
+            Ends::Job(job) => job.terminate(),
+        }
     }
 
     /// Hangs the console's processes up, and ends them and the root process
@@ -249,10 +284,19 @@ impl Group {
     ///
     /// How many processes on the host it ended, the root aside; an error
     /// when they couldn't be listed (the root is ended all the same).
+    ///
+    /// A pipe session's job leaves nothing running once ended, so this ends
+    /// it again (in case a hang-up never came) and counts none.
     pub fn kill_remaining(&self) -> io::Result<usize> {
-        let ended = match self.host() {
-            Some(host) => host.end_its_programs(),
-            None => Ok(0),
+        let ended = match &self.ends {
+            Ends::Console(_) => match self.host() {
+                Some(host) => host.end_its_programs(),
+                None => Ok(0),
+            },
+            Ends::Job(job) => {
+                job.terminate();
+                Ok(0)
+            }
         };
         // Fails for a process that has exited, which is as wanted.
         // SAFETY: the handle is open and may terminate the process.
@@ -369,9 +413,14 @@ pub fn reparent(program: Option<&Program>, hwnd: u64) -> io::Result<Reparented> 
     let Some(program) = program else {
         return Ok(Reparented::Done);
     };
-    match console(&program.console).as_ref() {
-        Some(console) => console.reparent(hwnd).map_err(plain),
-        None => Ok(Reparented::Done),
+    match &program.ends {
+        Ends::Console(shared) => match console(shared).as_ref() {
+            Some(console) => console.reparent(hwnd).map_err(plain),
+            None => Ok(Reparented::Done),
+        },
+        // A pipe session has no console window (the holder refuses its
+        // `REPARENT` before it gets here).
+        Ends::Job(_) => Ok(Reparented::Done),
     }
 }
 
@@ -433,8 +482,9 @@ fn wants_inbox(request: &PtyCommand) -> bool {
 
 /// A one-way pipe of this process's own: the holder's overlapped end, with
 /// `access` (inbound to read from it, outbound to write to it), and the
-/// plain end for the console host, opened with `client_access`.
-fn pipe(
+/// plain end for the console host (or a pipe session's program, `piped`),
+/// opened with `client_access` and not inheritable.
+pub(super) fn pipe(
     access: FILE_FLAGS_AND_ATTRIBUTES,
     client_access: u32,
 ) -> io::Result<(OwnedHandle, OwnedHandle)> {
@@ -544,7 +594,7 @@ pub fn spawn(request: &PtyCommand) -> io::Result<(Pty, Program)> {
         },
         Program {
             process: Arc::new(process),
-            console,
+            ends: Ends::Console(console),
             watch: None,
         },
     ))
@@ -1219,7 +1269,10 @@ mod tests {
         let mut session = Session::start("cmd.exe", &["/D"], &[("PROMPT", "ready$G")]);
         session.until("ready>");
         let group = session.program.group();
-        let stale = Group { console: Arc::default(), ..group.clone() };
+        let stale = Group {
+            ends: Ends::Console(Arc::default()),
+            ..group.clone()
+        };
         stale.hang_up();
         assert!(session.program.try_wait().unwrap().is_none());
         stale.kill_remaining().unwrap();

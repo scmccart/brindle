@@ -2,6 +2,7 @@
 // code only; `docs/architecture/README.md` lists the exceptions.
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 
+mod acp;
 mod conpty;
 #[cfg(target_os = "linux")]
 mod liveness;

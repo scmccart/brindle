@@ -377,7 +377,7 @@ Brindle SHALL support a repeatable `--right-click <POS>` debug step that presses
 
 #### Scenario: Debug build of the helper
 - **WHEN** a debug build runs `brindle-remote --list-fault-switches`
-- **THEN** it prints `BRINDLE_TEST_HOLDER_PANIC` and `BRINDLE_TEST_FEED_PANIC`, each on its own line, and exits 0
+- **THEN** it prints `BRINDLE_TEST_HOLDER_PANIC`, `BRINDLE_TEST_FEED_PANIC` and `BRINDLE_TEST_ACP_PANIC`, each on its own line, and exits 0
 
 #### Scenario: Release build
 - **WHEN** a release build runs `brindle --list-fault-switches` or `brindle-remote --list-fault-switches`

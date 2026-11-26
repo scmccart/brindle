@@ -23,7 +23,8 @@
 //! |   12 | `PAUSE`            | core → holder | `session`                                                        |
 //! |   13 | `RESUME`           | core → holder | `session`                                                        |
 //! |   14 | `SET_META`         | core → holder | `session, meta` (version 2)                                      |
-//! |   32 | `WELCOME`          | holder → core | `protocol, build, pid, previous, sessions: [{session, pid, cols, rows, exit, meta, truncated}]` |
+//! |   15 | `SPAWN_PIPES`      | core → holder | `session, command, args, cwd, env, meta` (version 3)             |
+//! |   32 | `WELCOME`          | holder → core | `protocol, build, pid, previous, sessions: [{session, pid, cols, rows, exit, meta, truncated, mode?}]` |
 //! |   33 | `OUTPUT`           | holder → core | session, bytes                                                   |
 //! |   34 | `SPAWNED`          | holder → core | `session, pid`                                                   |
 //! |   35 | `SPAWN_FAILED`     | holder → core | `session, message`                                               |
@@ -32,6 +33,21 @@
 //! |   38 | `TAIL_BEGIN`       | holder → core | session, `len: u64 BE`                                           |
 //! |   39 | `TAIL_CHUNK`       | holder → core | session, bytes                                                   |
 //! |   40 | `TAIL_END`         | holder → core | session                                                          |
+//! |   41 | `STDERR_TAIL`      | holder → core | session, bytes (version 3; at most [`MAX_STDERR_TAIL`])          |
+//!
+//! **Version 3: sessions on plain pipes.** `SPAWN_PIPES` starts a program
+//! with its standard input, output and error on pipes and no terminal (an
+//! ACP agent, whose JSON lines a PTY would corrupt); `command` is required.
+//! It is answered with `SPAWNED` or `SPAWN_FAILED` as `SPAWN` is. `INPUT`
+//! goes to its stdin; its stdout is the session's output, sent as `OUTPUT`,
+//! kept as the tail, paused and covered by checkpoints exactly as a PTY's.
+//! Its stderr is kept as a ring of its newest [`MAX_STDERR_TAIL`] bytes,
+//! sent once as `STDERR_TAIL` just before `EXITED`, or after the session's
+//! `TAIL_END` when it exited with no core connected. `RESIZE` and
+//! `REPARENT` for one get an `ERROR`. `WELCOME` lists a pipe session with
+//! `mode: "pipes"` (a PTY session's `mode` is left out, so older transcripts
+//! encode as before), and only to a core that negotiated version 3: a core
+//! below it isn't shown pipe sessions at all.
 //!
 //! **Checkpoints and tails are chunked.** A checkpoint (the core's replay
 //! stream for a session) can pass the 1 MiB frame limit, and a full tail
@@ -83,7 +99,7 @@ use crate::wire::{self, SessionId};
 pub use crate::version::{NegotiationError, VersionRange, negotiate};
 
 /// The H1 versions this build speaks.
-pub const PROTOCOLS: VersionRange = VersionRange::new(1, 2);
+pub const PROTOCOLS: VersionRange = VersionRange::new(1, 3);
 
 pub const MSG_HELLO: u8 = 1;
 pub const MSG_SPAWN: u8 = 2;
@@ -100,6 +116,8 @@ pub const MSG_PAUSE: u8 = 12;
 pub const MSG_RESUME: u8 = 13;
 /// H1 version 2.
 pub const MSG_SET_META: u8 = 14;
+/// H1 version 3.
+pub const MSG_SPAWN_PIPES: u8 = 15;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_OUTPUT: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -109,6 +127,12 @@ pub const MSG_ERROR: u8 = 37;
 pub const MSG_TAIL_BEGIN: u8 = 38;
 pub const MSG_TAIL_CHUNK: u8 = 39;
 pub const MSG_TAIL_END: u8 = 40;
+/// H1 version 3.
+pub const MSG_STDERR_TAIL: u8 = 41;
+
+/// The most of a pipe session's standard error a holder keeps and sends in
+/// `STDERR_TAIL`: its newest bytes. A longer `STDERR_TAIL` is refused.
+pub const MAX_STDERR_TAIL: usize = 16 * 1024;
 
 /// How much of a blob [`split`] puts in each chunk by default. Smaller than
 /// the frame limit so one session's checkpoint doesn't hold up the others.
@@ -206,6 +230,39 @@ pub struct Spawn {
     pub meta: serde_json::Value,
 }
 
+/// `SPAWN_PIPES` (version 3): a program on plain pipes, with no terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnPipes {
+    pub session: SessionId,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// The program's complete environment.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub meta: serde_json::Value,
+}
+
+/// How a held session's program is connected.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnMode {
+    /// A PTY (`SPAWN`); left out of `WELCOME`.
+    #[default]
+    Pty,
+    /// Plain pipes (`SPAWN_PIPES`, version 3).
+    Pipes,
+}
+
+impl SpawnMode {
+    fn is_pty(&self) -> bool {
+        matches!(self, Self::Pty)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Resize {
     pub session: SessionId,
@@ -282,6 +339,9 @@ pub struct HeldSession {
     /// newest bytes are kept.
     #[serde(default)]
     pub truncated: bool,
+    /// How its program is connected; left out for a PTY (version 3).
+    #[serde(default, skip_serializing_if = "SpawnMode::is_pty")]
+    pub mode: SpawnMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -342,6 +402,8 @@ pub enum ToHolder {
     Resume(SessionRef),
     /// Replace the session's stored meta (H1 version 2).
     SetMeta(SetMeta),
+    /// Start a program on plain pipes (H1 version 3).
+    SpawnPipes(SpawnPipes),
 }
 
 impl ToHolder {
@@ -363,6 +425,7 @@ impl ToHolder {
             Self::Pause(m) => wire::json(MSG_PAUSE, m),
             Self::Resume(m) => wire::json(MSG_RESUME, m),
             Self::SetMeta(m) => wire::json(MSG_SET_META, m),
+            Self::SpawnPipes(m) => wire::json(MSG_SPAWN_PIPES, m),
         }
     }
 
@@ -388,6 +451,7 @@ impl ToHolder {
             MSG_PAUSE => Self::Pause(wire::from_json("PAUSE", frame)?),
             MSG_RESUME => Self::Resume(wire::from_json("RESUME", frame)?),
             MSG_SET_META => Self::SetMeta(wire::from_json("SET_META", frame)?),
+            MSG_SPAWN_PIPES => Self::SpawnPipes(wire::from_json("SPAWN_PIPES", frame)?),
             other => return Err(wire::unknown_type("core-to-holder", other)),
         })
     }
@@ -421,6 +485,9 @@ pub enum ToCore {
     TailBegin(BlobBegin),
     TailChunk(Data),
     TailEnd(BlobEnd),
+    /// The end of a pipe session's standard error, at most
+    /// [`MAX_STDERR_TAIL`] bytes (H1 version 3).
+    StderrTail(Data),
 }
 
 impl ToCore {
@@ -438,6 +505,15 @@ impl ToCore {
             Self::TailBegin(m) => encode_begin(MSG_TAIL_BEGIN, m),
             Self::TailChunk(m) => encode_data(MSG_TAIL_CHUNK, m),
             Self::TailEnd(m) => encode_end(MSG_TAIL_END, m),
+            Self::StderrTail(m) => {
+                if m.bytes.len() > MAX_STDERR_TAIL {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        stderr_tail_too_long(m),
+                    ));
+                }
+                encode_data(MSG_STDERR_TAIL, m)
+            }
         }
     }
 
@@ -455,6 +531,13 @@ impl ToCore {
             MSG_TAIL_BEGIN => Self::TailBegin(decode_begin("TAIL_BEGIN", frame)?),
             MSG_TAIL_CHUNK => Self::TailChunk(decode_data("TAIL_CHUNK", frame)?),
             MSG_TAIL_END => Self::TailEnd(decode_end("TAIL_END", frame)?),
+            MSG_STDERR_TAIL => {
+                let tail = decode_data("STDERR_TAIL", frame)?;
+                if tail.bytes.len() > MAX_STDERR_TAIL {
+                    return Err(wire::invalid(stderr_tail_too_long(&tail)));
+                }
+                Self::StderrTail(tail)
+            }
             other => return Err(wire::unknown_type("holder-to-core", other)),
         })
     }
@@ -476,6 +559,14 @@ impl ToCore {
             .chain(std::iter::once(Self::TailEnd(end)))
             .collect()
     }
+}
+
+fn stderr_tail_too_long(tail: &Data) -> String {
+    format!(
+        "session {}'s STDERR_TAIL is {} bytes; the limit is {MAX_STDERR_TAIL}",
+        tail.session,
+        tail.bytes.len()
+    )
 }
 
 fn encode_data(msg_type: u8, data: &Data) -> io::Result<Frame> {
@@ -826,6 +917,14 @@ pub(crate) mod samples {
                 session: 1,
                 meta: meta(),
             }),
+            ToHolder::SpawnPipes(SpawnPipes {
+                session: 2,
+                command: "npx".into(),
+                args: vec!["@agentclientprotocol/claude-agent-acp".into()],
+                cwd: Some("/home/u/src".into()),
+                env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                meta: meta(),
+            }),
         ]
     }
 
@@ -836,15 +935,28 @@ pub(crate) mod samples {
                 build: "abc123".into(),
                 pid: 4243,
                 previous: Previous::Crash,
-                sessions: vec![HeldSession {
-                    session: 1,
-                    pid: 5000,
-                    cols: 80,
-                    rows: 24,
-                    exit: Some(ExitStatus { code: Some(0) }),
-                    meta: meta(),
-                    truncated: true,
-                }],
+                sessions: vec![
+                    HeldSession {
+                        session: 1,
+                        pid: 5000,
+                        cols: 80,
+                        rows: 24,
+                        exit: Some(ExitStatus { code: Some(0) }),
+                        meta: meta(),
+                        truncated: true,
+                        mode: SpawnMode::Pty,
+                    },
+                    HeldSession {
+                        session: 2,
+                        pid: 5002,
+                        cols: 0,
+                        rows: 0,
+                        exit: None,
+                        meta: meta(),
+                        truncated: false,
+                        mode: SpawnMode::Pipes,
+                    },
+                ],
             }),
             ToCore::Output(Data {
                 session: 1,
@@ -881,6 +993,14 @@ pub(crate) mod samples {
                 bytes: b"x".to_vec(),
             }),
             ToCore::TailEnd(BlobEnd { session: 1 }),
+            ToCore::StderrTail(Data {
+                session: 2,
+                bytes: b"fatal: no model\n".to_vec(),
+            }),
+            ToCore::StderrTail(Data {
+                session: 2,
+                bytes: vec![b'e'; MAX_STDERR_TAIL],
+            }),
         ]
     }
 }
@@ -904,7 +1024,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToHolder::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_HELLO..=MSG_SET_META {
+        for expected in MSG_HELLO..=MSG_SPAWN_PIPES {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -918,7 +1038,7 @@ mod tests {
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
         for expected in
-            (MSG_CHECKPOINT_BEGIN..=MSG_CHECKPOINT_END).chain(MSG_WELCOME..=MSG_TAIL_END)
+            (MSG_CHECKPOINT_BEGIN..=MSG_CHECKPOINT_END).chain(MSG_WELCOME..=MSG_STDERR_TAIL)
         {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
@@ -1121,6 +1241,7 @@ mod tests {
                     exit: None,
                     meta: serde_json::Value::Null,
                     truncated: false,
+                    mode: SpawnMode::Pty,
                 }],
             })
         );
@@ -1163,12 +1284,22 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, MSG_WELCOME, MSG_OUTPUT, MSG_TAIL_BEGIN, 15, 255] {
+        for msg_type in [0, MSG_WELCOME, MSG_OUTPUT, MSG_TAIL_BEGIN, MSG_STDERR_TAIL, 16, 255] {
             let frame = Frame::new(msg_type, vec![0, 0, 0, 1]).unwrap();
             let error = ToHolder::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         }
-        for msg_type in [0, MSG_HELLO, MSG_INPUT, MSG_REPARENT, MSG_RESUME, MSG_SET_META, 41, 255] {
+        for msg_type in [
+            0,
+            MSG_HELLO,
+            MSG_INPUT,
+            MSG_REPARENT,
+            MSG_RESUME,
+            MSG_SET_META,
+            MSG_SPAWN_PIPES,
+            42,
+            255,
+        ] {
             let frame = Frame::new(msg_type, vec![0, 0, 0, 1]).unwrap();
             assert!(ToCore::decode(&frame).is_err());
         }
@@ -1376,14 +1507,85 @@ mod tests {
             core_build: String::new(),
             instance: 0,
         };
-        assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(2));
-        // A core that speaks only version 1 still gets it.
+        assert_eq!(answer_hello(&hello(1, 3), PROTOCOLS), Ok(3));
+        // A core of the previous release gets version 2, and one that
+        // speaks only version 1 still gets it.
+        assert_eq!(answer_hello(&hello(1, 2), PROTOCOLS), Ok(2));
         assert_eq!(answer_hello(&hello(1, 1), PROTOCOLS), Ok(1));
-        let error = answer_hello(&hello(3, 3), PROTOCOLS).unwrap_err();
+        let error = answer_hello(&hello(4, 4), PROTOCOLS).unwrap_err();
         assert!(
-            error.message.contains("offered 3, supported 1–2"),
+            error.message.contains("offered 4, supported 1–3"),
             "{}",
             error.message
         );
+    }
+
+    #[test]
+    fn a_pipe_session_is_listed_with_its_mode_and_a_pty_session_as_before() {
+        let held = |mode| HeldSession {
+            session: 1,
+            pid: 2,
+            cols: 0,
+            rows: 0,
+            exit: None,
+            meta: serde_json::Value::Null,
+            truncated: false,
+            mode,
+        };
+        assert_eq!(
+            serde_json::to_string(&held(SpawnMode::Pty)).unwrap(),
+            r#"{"session":1,"pid":2,"cols":0,"rows":0,"exit":null,"meta":null,"truncated":false}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&held(SpawnMode::Pipes)).unwrap(),
+            r#"{"session":1,"pid":2,"cols":0,"rows":0,"exit":null,"meta":null,"truncated":false,"mode":"pipes"}"#
+        );
+        let later: Result<HeldSession, _> = serde_json::from_str(
+            r#"{"session":1,"pid":2,"cols":0,"rows":0,"mode":"socket"}"#,
+        );
+        assert!(later.is_err(), "an unknown mode");
+    }
+
+    #[test]
+    fn a_stderr_tail_past_its_limit_is_refused_both_ways() {
+        let tail = |len| Data {
+            session: 3,
+            bytes: vec![b'x'; len],
+        };
+        let frame = ToCore::StderrTail(tail(MAX_STDERR_TAIL)).encode().unwrap();
+        assert_eq!(frame.payload.len(), 4 + MAX_STDERR_TAIL);
+        assert_eq!(
+            ToCore::decode(&frame).unwrap(),
+            ToCore::StderrTail(tail(MAX_STDERR_TAIL))
+        );
+        let error = ToCore::StderrTail(tail(MAX_STDERR_TAIL + 1))
+            .encode()
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let mut payload = 3u32.to_be_bytes().to_vec();
+        payload.extend(vec![b'x'; MAX_STDERR_TAIL + 1]);
+        let error = ToCore::decode(&Frame::new(MSG_STDERR_TAIL, payload).unwrap()).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("STDERR_TAIL"), "{error}");
+        assert!(ToCore::decode(&Frame::new(MSG_STDERR_TAIL, vec![0, 0]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn spawn_pipes_needs_a_command_and_no_grid() {
+        let frame = Frame::new(MSG_SPAWN_PIPES, br#"{"session":1,"command":"agent"}"#.to_vec())
+            .unwrap();
+        assert_eq!(
+            ToHolder::decode(&frame).unwrap(),
+            ToHolder::SpawnPipes(SpawnPipes {
+                session: 1,
+                command: "agent".into(),
+                args: Vec::new(),
+                cwd: None,
+                env: BTreeMap::new(),
+                meta: serde_json::Value::Null,
+            })
+        );
+        let frame = Frame::new(MSG_SPAWN_PIPES, br#"{"session":1}"#.to_vec()).unwrap();
+        assert!(ToHolder::decode(&frame).is_err());
     }
 }

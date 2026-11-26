@@ -222,7 +222,11 @@ brindle-remote stop              # hang every session up; the core and holders e
 brindle-remote check --holder-protocols 1,2   # whether this binary can take those holders over
 ```
 
-With no server running, `list` prints nothing and `status` says so.
+With no server running, `list` prints nothing and `status` says so. An
+agent session is listed with `agent: <activity>` (`idle`, `working`,
+`blocked`, `done` or `error`) in the title's place, and `--json` gives it an
+`agent` object; `kill` and `stop` end it as they end a terminal, without
+asking.
 
 ## Building
 

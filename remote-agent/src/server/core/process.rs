@@ -26,7 +26,7 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{Process, ToClient};
 
 use super::Core;
-use super::policy::{self, Look};
+use super::policy::{self, Look, SessionKind};
 use crate::server::event_loop::{EventLoop, Token};
 use crate::server::platform::pty;
 
@@ -41,6 +41,11 @@ impl<L: EventLoop> Core<L> {
         let mut due: Vec<(SessionId, Token, NonZeroU32)> = Vec::new();
         let clients = &self.clients;
         for (&id, session) in &mut self.sessions {
+            // An agent's program is the agent: no foreground to report.
+            if session.kind() == SessionKind::Agent {
+                session.active = false;
+                continue;
+            }
             let keep = match policy::look(session.active, session.active_at, now) {
                 Look::Skip => continue,
                 Look::Keep => true,

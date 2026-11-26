@@ -16,7 +16,7 @@ use brindle_remote_protocol::ready::ReadyRead;
 
 use super::clients::error;
 use super::policy::{self, Adoption, HolderView, Placement, Stage};
-use super::sessions::Session;
+use super::sessions::{Session, SpawnRequest};
 use super::{ADOPT_LIMIT, Core, Source, log};
 use crate::server::conn::Conn;
 use crate::server::daemon::{self, ReadyPipe};
@@ -111,6 +111,7 @@ impl Holder {
         HolderView {
             named: self.place.build.as_deref(),
             stage,
+            protocol: self.protocol(),
         }
     }
 }
@@ -122,11 +123,12 @@ pub(super) struct HolderStart {
     deadline: Instant,
 }
 
-/// A client's `SPAWN`, waiting for a holder of the core's build.
+/// A client's `SPAWN` or `SPAWN_AGENT`, waiting for a holder of the core's
+/// build.
 pub(super) struct WaitingSpawn {
     pub(super) client: Token,
     pub(super) id: SessionId,
-    pub(super) spawn: client::Spawn,
+    pub(super) spawn: SpawnRequest,
 }
 
 /// Whether what the directory shows of a holder belongs to a running one.
@@ -303,7 +305,10 @@ impl<L: EventLoop> Core<L> {
                     break;
                 }
             };
-            if let Ok(message @ (ToCore::Output(_) | ToCore::Exited(_))) = ToCore::decode(&frame) {
+            // An agent's stderr tail comes before its `EXITED`, for it.
+            if let Ok(message @ (ToCore::Output(_) | ToCore::StderrTail(_) | ToCore::Exited(_))) =
+                ToCore::decode(&frame)
+            {
                 self.handle_holder(token, message);
             }
         }
@@ -420,6 +425,8 @@ impl<L: EventLoop> Core<L> {
             ToCore::TailEnd(end) => self.blob(token, Blob::Tail, |assembler| {
                 assembler.end(end).map(|bytes| Some((end.session, bytes)))
             }),
+            // Only a pipe session has one: its agent's, kept for its exit.
+            ToCore::StderrTail(tail) => self.agent_stderr(token, tail.session, tail.bytes),
         }
     }
 
@@ -603,7 +610,18 @@ impl<L: EventLoop> Core<L> {
             return;
         }
         let (tokens, views) = self.holder_views();
-        let placement = policy::placement(&views, &self.build, self.holder_start.is_some());
+        // They go together, so one agent's among them needs a holder that
+        // runs pipe sessions (which runs PTY sessions too).
+        let mode = if self
+            .waiting
+            .iter()
+            .any(|waiting| waiting.spawn.mode() == h1::SpawnMode::Pipes)
+        {
+            h1::SpawnMode::Pipes
+        } else {
+            h1::SpawnMode::Pty
+        };
+        let placement = policy::placement(&views, &self.build, self.holder_start.is_some(), mode);
         match placement {
             Placement::Spawn(index) => {
                 let Some(&holder) = tokens.get(index) else {
@@ -620,7 +638,7 @@ impl<L: EventLoop> Core<L> {
 
     pub(super) fn fail_waiting(&mut self, message: &str) {
         for waiting in std::mem::take(&mut self.waiting) {
-            let req = waiting.spawn.req;
+            let req = waiting.spawn.req();
             self.send_client(waiting.client, error(Some(req), None, message));
         }
     }
@@ -741,6 +759,10 @@ pub(super) fn unsent(message: &ToHolder, error: &io::Error) -> Unsent {
     };
     match message {
         ToHolder::Spawn(spawn) => Unsent::Spawn {
+            session: spawn.session,
+            why: format!("the terminal server couldn't pass the request to its holder: {error}"),
+        },
+        ToHolder::SpawnPipes(spawn) => Unsent::Spawn {
             session: spawn.session,
             why: format!("the terminal server couldn't pass the request to its holder: {error}"),
         },

@@ -202,7 +202,8 @@ pub fn check_helper(helper: &Path, bin: &Path, default_bin: &Path) -> Result {
     match rule {
         Freshness::Sources => {
             let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-            let newer = ["remote-agent/src", "remote-protocol/src", "term-core/src"]
+            let sources = ["remote-agent/src", "remote-protocol/src", "term-core/src", "transcript/src"];
+            let newer = sources
                 .iter()
                 .flat_map(|dir| files(&root.join(dir)))
                 .find(|file| std::fs::metadata(file).and_then(|m| m.modified()).is_ok_and(|time| time > built));

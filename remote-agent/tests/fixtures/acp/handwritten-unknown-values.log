@@ -1,0 +1,11 @@
+c>a	{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"sess-1","prompt":[{"type":"text","text":"hello"}]}}
+a>c	{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"brand_new_kind","payload":{"x":1}}}}
+a>c	{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"hologram","frames":3}}}}
+a>c	{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"Teleport a file","kind":"teleport","status":"pending"}}}
+a>c	{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","kind":"teleport","status":"paused"}}}
+a>c	{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess-1","update":{"sessionUpdate":"tool_call","toolCallId":"call-2","kind":"edit"}}}
+a>c	{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"call-1","title":"Teleport a file","kind":"teleport"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"session","name":"Allow for this session","kind":"allow_for_session"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}
+a>c	{"jsonrpc":"2.0","id":8,"method":"session/request_permission","params":{"sessionId":"sess-1","toolCall":{"toolCallId":"call-1","title":"Teleport a file","kind":"teleport","status":"paused"},"options":[{"optionId":"allow","name":"Allow","kind":"allow_once"},{"optionId":"reject","name":"Reject","kind":"reject_once"}]}}
+a>c	{"jsonrpc":"2.0","id":3,"result":{"stopReason":"paused_for_review","extra":true}}
+c>a	{"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"sessionId":"sess-1","prompt":[{"type":"text","text":"again"}]}}
+a>c	{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn","brandNewField":{"a":1}}}

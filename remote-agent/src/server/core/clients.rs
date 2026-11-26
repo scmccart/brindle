@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
 use brindle_remote_protocol::{RequestId, SessionId};
 
+use super::agents::AgentCommand;
 use super::policy::{self, ClientOptions, Mark};
 use super::{Core, DEAD_CLIENT_READ_LIMIT, Source, log};
 use crate::server::conn::Conn;
@@ -258,7 +259,7 @@ impl<L: EventLoop> Core<L> {
                 self.send_client(
                     old,
                     error(
-                        Some(waiting.spawn.req),
+                        Some(waiting.spawn.req()),
                         None,
                         "this connection was replaced by a newer one with its token",
                     ),
@@ -325,6 +326,24 @@ impl<L: EventLoop> Core<L> {
             ToCore::Status(request) => self.client_status(client, request.req),
             ToCore::Stop(request) => self.client_stop(client, request.req),
             ToCore::StepDown(request) => self.client_step_down(client, request.req),
+            // Client protocol 4's agent sessions (`agents.rs`); each is
+            // refused below 4.
+            ToCore::SpawnAgent(spawn) => self.client_spawn_agent(client, spawn),
+            ToCore::AgentPrompt(prompt) => {
+                self.client_agent_command(client, AgentCommand::prompt(prompt))
+            }
+            ToCore::AgentCancel(target) => {
+                self.client_agent_command(client, AgentCommand::cancel(target))
+            }
+            ToCore::AgentPermission(answer) => {
+                self.client_agent_command(client, AgentCommand::answer(answer))
+            }
+            ToCore::AgentUnqueue(request) => {
+                self.client_agent_command(client, AgentCommand::unqueue(request))
+            }
+            ToCore::AgentResend(request) => {
+                self.client_agent_command(client, AgentCommand::resend(request))
+            }
         }
     }
 
@@ -469,6 +488,7 @@ pub(super) fn unsendable(message: &ToClient, failure: &io::Error) -> ToClient {
         ToClient::ServerStatus(m) => (Some(m.req), None),
         ToClient::Ok(m) => (Some(m.req), None),
         ToClient::Process(m) => (None, Some(m.session)),
+        ToClient::Transcript(m) => (None, Some(m.session)),
     };
     error(req, session, unsendable_text(message, failure))
 }
@@ -486,6 +506,7 @@ fn unsendable_text(message: &ToClient, failure: &io::Error) -> String {
         ToClient::ServerStatus(_) => "status",
         ToClient::Ok(_) => "answer",
         ToClient::Process(_) => "process info",
+        ToClient::Transcript(_) => "transcript",
     };
     format!("the terminal server couldn't send its {what}: {failure}")
 }

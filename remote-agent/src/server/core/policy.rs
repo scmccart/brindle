@@ -16,15 +16,23 @@
 //!   sessions a returning owner gets back ([`returning`]).
 //! - **Process info:** which sessions a look reads ([`look`]), and whether
 //!   a foreground program changed ([`foreground_changed`]).
+//! - **Agent sessions** (OpenSpec change `agents-sessions`): when one is
+//!   checkpointed ([`agent_checkpoint_due`]), that its spawns go only to a
+//!   holder that negotiated H1 3 ([`placement`] with
+//!   [`SpawnMode::Pipes`]), and what a client below protocol 4 is refused
+//!   ([`shown`], [`agent_request_refusal`], and [`attach_refusal`] and
+//!   [`returning`] by the session's [`SessionKind`]).
 
 use std::fmt;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{Hello, Policy};
+use brindle_remote_protocol::holder::SpawnMode;
 
 use super::clients::ClientToken;
-use super::sessions::{Life, Ownership};
+use super::sessions::{CHECKPOINT_AFTER, Life, Ownership};
+use crate::acp::reduce::Moment;
 use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, MAX_LINGER, RECONNECT_GRACE, UNUSED_LIMIT};
 use crate::pty::Foreground;
 use crate::server::event_loop::Token;
@@ -214,12 +222,17 @@ pub(super) fn queue_mark(over: bool, queued: usize) -> Option<Mark> {
     }
 }
 
+/// The first H1 version with sessions on plain pipes (`SPAWN_PIPES`).
+pub(super) const PIPES_PROTOCOL: u32 = 3;
+
 /// What [`placement`] reads of a holder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HolderView<'a> {
     /// The build its files name; `None` when their name says none.
     pub(super) named: Option<&'a str>,
     pub(super) stage: Stage<'a>,
+    /// The H1 version it negotiated, once it has welcomed the core.
+    pub(super) protocol: Option<u32>,
 }
 
 /// How far the core has got with a holder.
@@ -244,10 +257,19 @@ impl HolderView<'_> {
         }
     }
 
-    /// Whether spawns may go to it: it is adopted, and of `build`.
-    fn takes_spawns(&self, build: &str) -> bool {
+    /// Whether spawns of `mode` may go to it: it is adopted, of `build`,
+    /// and for pipe sessions it negotiated [`PIPES_PROTOCOL`] (a holder of
+    /// the core's build always does; the check keeps a pipe spawn from
+    /// ever reaching a holder that would drop it).
+    fn takes_spawns(&self, build: &str, mode: SpawnMode) -> bool {
+        let runs = match mode {
+            SpawnMode::Pty => true,
+            SpawnMode::Pipes => self
+                .protocol
+                .is_some_and(|protocol| protocol >= PIPES_PROTOCOL),
+        };
         match self.stage {
-            Stage::Adopted { build: own } => own == build,
+            Stage::Adopted { build: own } => own == build && runs,
             Stage::Connected | Stage::Adopting { .. } => false,
         }
     }
@@ -265,12 +287,21 @@ pub(super) enum Placement {
     Wait,
 }
 
-/// Where the core's waiting spawns go: to the first adopted holder of its
-/// `build` in `holders`' order, else they wait for one that is connected
-/// but hasn't welcomed the core yet, or for the one `starting`; with
-/// neither, the core starts one.
-pub(super) fn placement(holders: &[HolderView], build: &str, starting: bool) -> Placement {
-    if let Some(index) = holders.iter().position(|holder| holder.takes_spawns(build)) {
+/// Where the core's waiting spawns of `mode` go: to the first adopted
+/// holder of its `build` in `holders`' order (for [`SpawnMode::Pipes`],
+/// one that negotiated [`PIPES_PROTOCOL`]), else they wait for one of its
+/// build that is connected but hasn't welcomed the core yet, or for the
+/// one `starting`; with neither, the core starts one.
+pub(super) fn placement(
+    holders: &[HolderView],
+    build: &str,
+    starting: bool,
+    mode: SpawnMode,
+) -> Placement {
+    if let Some(index) = holders
+        .iter()
+        .position(|holder| holder.takes_spawns(build, mode))
+    {
         return Placement::Spawn(index);
     }
     let coming = holders
@@ -288,7 +319,8 @@ pub(super) fn placement(holders: &[HolderView], build: &str, starting: bool) -> 
 /// being adopted. If not, the waiting spawns fail.
 pub(super) fn holder_reached(holders: &[HolderView], build: &str) -> bool {
     holders.iter().any(|holder| {
-        holder.takes_spawns(build)
+        // A holder of the core's build runs both kinds of session.
+        holder.takes_spawns(build, SpawnMode::Pty)
             || (holder.of_build(build) && !matches!(holder.stage, Stage::Adopted { .. }))
     })
 }
@@ -377,18 +409,133 @@ pub(super) fn grace_fate(policy: Policy, life: &Life) -> GraceFate {
     }
 }
 
+/// The first client protocol with agent sessions.
+pub(super) const AGENT_PROTOCOL: u32 = 4;
+
+/// What a session runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SessionKind {
+    /// A program on a PTY, with an emulator in the core.
+    Terminal,
+    /// An ACP agent on plain pipes, with its transcript in the core.
+    Agent,
+}
+
+/// Whether a client on `protocol` is shown sessions of `kind`: listed,
+/// given back when it returns, attachable. Below [`AGENT_PROTOCOL`] it
+/// knows nothing of agent sessions (decision 9), so they don't exist for
+/// it; `KILL` and `STOP` still end them, as any session.
+pub(super) fn shown(kind: SessionKind, protocol: u32) -> bool {
+    match kind {
+        SessionKind::Terminal => true,
+        SessionKind::Agent => protocol >= AGENT_PROTOCOL,
+    }
+}
+
+/// When the core checkpoints an agent session (decision 11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentCheckpoint {
+    /// After `acp::reduce::step`, with the moment it asked to checkpoint
+    /// at: a start, a request about to be written (a prompt's entry and
+    /// id reach the holder before its bytes), a turn's end, a change of
+    /// the queue slot, a permission request arriving or answered, the agent
+    /// stopping.
+    Stepped(Option<Moment>),
+    /// The core is about to step down for an upgrade.
+    StepDown,
+    /// The session's client detached it.
+    Detach,
+}
+
+/// Whether an agent session with `since` bytes of stdout fed since its
+/// last checkpoint is checkpointed now: at every moment the reducer names,
+/// before a step-down and on a detach, and otherwise past
+/// [`CHECKPOINT_AFTER`] (512 KiB), as a terminal is.
+pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
+    match at {
+        AgentCheckpoint::Stepped(Some(
+            Moment::Started
+            | Moment::BeforeRequest
+            | Moment::TurnEnded
+            | Moment::QueueChanged
+            | Moment::Permission
+            | Moment::Stopped,
+        ))
+        | AgentCheckpoint::StepDown
+        | AgentCheckpoint::Detach => true,
+        AgentCheckpoint::Stepped(None) => since > CHECKPOINT_AFTER,
+    }
+}
+
+/// Why a `SPAWN_AGENT` of `command` is refused before anything starts: an
+/// agent session has no login-shell default, so it needs a command.
+pub(super) fn agent_spawn_refusal(command: &str) -> Option<&'static str> {
+    command
+        .trim()
+        .is_empty()
+        .then_some("an agent session needs a command")
+}
+
+/// A client protocol 4 message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AgentRequest {
+    Spawn,
+    Prompt,
+    Cancel,
+    Permission,
+    Unqueue,
+    Resend,
+}
+
+impl AgentRequest {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Spawn => "SPAWN_AGENT",
+            Self::Prompt => "AGENT_PROMPT",
+            Self::Cancel => "AGENT_CANCEL",
+            Self::Permission => "AGENT_PERMISSION",
+            Self::Unqueue => "AGENT_UNQUEUE",
+            Self::Resend => "AGENT_RESEND",
+        }
+    }
+}
+
+/// An agent message on a connection below [`AGENT_PROTOCOL`]; its text is
+/// the `ERROR`'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct NeedsAgentProtocol(AgentRequest);
+
+impl fmt::Display for NeedsAgentProtocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} needs client protocol {AGENT_PROTOCOL}", self.0.name())
+    }
+}
+
+/// Why a client on `protocol` can't send `request`: only a connection
+/// that negotiated [`AGENT_PROTOCOL`] may (`process R5`; a correct client
+/// below it never sends one).
+pub(super) fn agent_request_refusal(
+    protocol: u32,
+    request: AgentRequest,
+) -> Option<NeedsAgentProtocol> {
+    (protocol < AGENT_PROTOCOL).then_some(NeedsAgentProtocol(request))
+}
+
 /// What [`attach_refusal`] and [`returning`] read of a session.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SessionView<'a> {
     pub(super) life: &'a Life,
     pub(super) ownership: &'a Ownership,
     pub(super) owner: Option<&'a ClientToken>,
+    pub(super) kind: SessionKind,
 }
 
 /// Why an `ATTACH` is refused; its text is the `ERROR`'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Refusal {
     NoSession(SessionId),
+    /// An agent session, to a client below [`AGENT_PROTOCOL`].
+    NeedsAgentProtocol(SessionId),
     AttachedHere(SessionId),
     AttachedElsewhere(SessionId),
     Ending(SessionId),
@@ -398,6 +545,10 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoSession(id) => write!(f, "no session {id}"),
+            Self::NeedsAgentProtocol(id) => write!(
+                f,
+                "session {id} is an agent session, which needs client protocol {AGENT_PROTOCOL}"
+            ),
             Self::AttachedHere(id) => write!(f, "session {id} is already attached to this client"),
             Self::AttachedElsewhere(id) => write!(f, "session {id} is attached to another client"),
             Self::Ending(id) => write!(f, "session {id} is ending"),
@@ -405,17 +556,23 @@ impl fmt::Display for Refusal {
     }
 }
 
-/// Why `client` can't attach session `id` (`session`, if there is one):
-/// only a session with no client that isn't being hung up is given.
+/// Why `client`, on client `protocol`, can't attach session `id`
+/// (`session`, if there is one): only a session it is [`shown`] with no
+/// client that isn't being hung up is given. An agent session is refused
+/// to a client below protocol 4 before anything else is said of it.
 pub(super) fn attach_refusal(
     id: SessionId,
     session: Option<SessionView<'_>>,
     client: Token,
+    protocol: u32,
 ) -> Option<Refusal> {
     let session = match session {
         None => return Some(Refusal::NoSession(id)),
         Some(session) => session,
     };
+    if !shown(session.kind, protocol) {
+        return Some(Refusal::NeedsAgentProtocol(id));
+    }
     match session.ownership.client() {
         Some(attached) if attached == client => Some(Refusal::AttachedHere(id)),
         Some(_) => Some(Refusal::AttachedElsewhere(id)),
@@ -424,18 +581,21 @@ pub(super) fn attach_refusal(
     }
 }
 
-/// The sessions a client with `token` gets back when it connects: those it
-/// owns that have no client. One still starting isn't given back (its
-/// `SPAWN`'s answer went to a connection that is gone, so the client
-/// doesn't know it), nor one being hung up.
+/// The sessions a client with `token`, on client `protocol`, gets back
+/// when it connects: those it owns, is [`shown`], that have no client. One
+/// still starting isn't given back (its `SPAWN`'s answer went to a
+/// connection that is gone, so the client doesn't know it), nor one being
+/// hung up.
 pub(super) fn returning(
     sessions: &[(SessionId, SessionView<'_>)],
     token: &ClientToken,
+    protocol: u32,
 ) -> Vec<SessionId> {
     sessions
         .iter()
         .filter(|(_, session)| {
-            session.ownership.client().is_none()
+            shown(session.kind, protocol)
+                && session.ownership.client().is_none()
                 && !session.life.is_starting()
                 && !session.life.is_hung_up()
                 && session.owner == Some(token)
@@ -484,6 +644,7 @@ mod tests {
 
     use brindle_remote_protocol::client::Spawn;
 
+    use super::super::sessions::SpawnRequest;
     use super::*;
 
     fn secs(n: u64) -> Duration {
@@ -665,9 +826,16 @@ mod tests {
 
     // 3.2: holders.
 
+    /// A holder that negotiated H1 3 once it welcomed the core.
     fn holder<'a>(named: Option<&'a str>, stage: Stage<'a>) -> HolderView<'a> {
-        HolderView { named, stage }
+        let protocol = match stage {
+            Stage::Connected => None,
+            Stage::Adopting { .. } | Stage::Adopted { .. } => Some(3),
+        };
+        HolderView { named, stage, protocol }
     }
+
+    const MODES: [SpawnMode; 2] = [SpawnMode::Pty, SpawnMode::Pipes];
 
     #[test]
     fn spawns_go_to_the_first_adopted_holder_of_the_cores_build() {
@@ -676,9 +844,26 @@ mod tests {
         let own = holder(Some("b1"), Stage::Adopted { build: "b1" });
         // Its files may name another build than its WELCOME.
         let renamed = holder(Some("b0"), Stage::Adopted { build: "b1" });
-        assert_eq!(placement(&[other, own], "b1", false), Placement::Spawn(1));
-        assert_eq!(placement(&[renamed, own], "b1", true), Placement::Spawn(0));
-        assert_eq!(placement(&[adopting, own], "b1", false), Placement::Spawn(1));
+        for mode in MODES {
+            assert_eq!(placement(&[other, own], "b1", false, mode), Placement::Spawn(1));
+            assert_eq!(placement(&[renamed, own], "b1", true, mode), Placement::Spawn(0));
+            assert_eq!(placement(&[adopting, own], "b1", false, mode), Placement::Spawn(1));
+        }
+    }
+
+    #[test]
+    fn pipe_spawns_go_only_to_a_holder_that_negotiated_h1_3_else_one_starts() {
+        let old = HolderView {
+            named: Some("b1"),
+            stage: Stage::Adopted { build: "b1" },
+            protocol: Some(2),
+        };
+        let own = holder(Some("b1"), Stage::Adopted { build: "b1" });
+        assert_eq!(placement(&[old, own], "b1", false, SpawnMode::Pipes), Placement::Spawn(1));
+        assert_eq!(placement(&[old], "b1", false, SpawnMode::Pipes), Placement::Start);
+        assert_eq!(placement(&[old], "b1", true, SpawnMode::Pipes), Placement::Wait);
+        // A terminal's spawn goes to it as before.
+        assert_eq!(placement(&[old, own], "b1", false, SpawnMode::Pty), Placement::Spawn(0));
     }
 
     #[test]
@@ -701,7 +886,13 @@ mod tests {
             (&[adopting], true, Placement::Wait),
         ];
         for (holders, starting, expected) in cases {
-            assert_eq!(placement(holders, "b1", starting), expected, "{holders:?} {starting}");
+            for mode in MODES {
+                assert_eq!(
+                    placement(holders, "b1", starting, mode),
+                    expected,
+                    "{holders:?} {starting} {mode:?}"
+                );
+            }
         }
     }
 
@@ -735,8 +926,8 @@ mod tests {
         NonZeroU32::new(pid).unwrap()
     }
 
-    fn spawn() -> Spawn {
-        Spawn {
+    fn spawn() -> SpawnRequest {
+        SpawnRequest::Terminal(Spawn {
             req: 1,
             command: None,
             args: Vec::new(),
@@ -749,7 +940,7 @@ mod tests {
             scrollback: 100,
             policy: Policy::Kill,
             profile: None,
-        }
+        })
     }
 
     /// One of each kind of life.
@@ -820,7 +1011,12 @@ mod tests {
         let t0 = Instant::now();
         let running = Life::Running { pid: pid(9) };
         let hung_up = Life::HungUp { pid: pid(9) };
-        let view = |life, ownership| SessionView { life, ownership, owner: None };
+        let view = |life, ownership| SessionView {
+            life,
+            ownership,
+            owner: None,
+            kind: SessionKind::Terminal,
+        };
         let detached = Ownership::Detached { since: t0 };
         let mine = Ownership::Attached(3);
         let theirs = Ownership::Attached(4);
@@ -832,18 +1028,146 @@ mod tests {
             (Some(view(&hung_up, &detached)), Some("session 7 is ending")),
             (Some(view(&running, &detached)), None),
         ];
-        for (session, refused) in cases {
-            let refusal = attach_refusal(7, session, 3).map(|refusal| refusal.to_string());
-            assert_eq!(refusal.as_deref(), refused, "{session:?}");
+        // A terminal's attach is the same on every protocol.
+        for protocol in 1..=AGENT_PROTOCOL {
+            for (session, refused) in cases {
+                let refusal =
+                    attach_refusal(7, session, 3, protocol).map(|refusal| refusal.to_string());
+                assert_eq!(refusal.as_deref(), refused, "{session:?} on {protocol}");
+            }
         }
         // Whatever else they are, sessions with no client that aren't being
         // hung up are given: starting, exited, awaiting their owner.
         let awaiting = Ownership::AwaitingOwner { since: t0 };
         for life in lives() {
-            let session = SessionView { life: &life, ownership: &awaiting, owner: None };
-            let refusal = attach_refusal(7, Some(session), 3);
+            let session = SessionView {
+                life: &life,
+                ownership: &awaiting,
+                owner: None,
+                kind: SessionKind::Terminal,
+            };
+            let refusal = attach_refusal(7, Some(session), 3, 3);
             assert_eq!(refusal.is_some(), life.is_hung_up(), "{life:?}");
         }
+    }
+
+    #[test]
+    fn an_agent_session_is_refused_to_a_client_below_protocol_4_before_anything_else() {
+        let t0 = Instant::now();
+        let running = Life::Running { pid: pid(9) };
+        let hung_up = Life::HungUp { pid: pid(9) };
+        let agent = |life, ownership| SessionView {
+            life,
+            ownership,
+            owner: None,
+            kind: SessionKind::Agent,
+        };
+        let detached = Ownership::Detached { since: t0 };
+        let theirs = Ownership::Attached(4);
+        let text = "session 7 is an agent session, which needs client protocol 4";
+        for session in [
+            agent(&running, &detached),
+            agent(&running, &theirs),
+            agent(&hung_up, &detached),
+        ] {
+            for protocol in 1..AGENT_PROTOCOL {
+                let refusal = attach_refusal(7, Some(session), 3, protocol);
+                assert_eq!(refusal, Some(Refusal::NeedsAgentProtocol(7)));
+                assert_eq!(refusal.map(|r| r.to_string()).as_deref(), Some(text));
+            }
+        }
+        // On protocol 4 it is attached as a terminal is.
+        assert_eq!(attach_refusal(7, Some(agent(&running, &detached)), 3, 4), None);
+        assert_eq!(
+            attach_refusal(7, Some(agent(&running, &theirs)), 3, 4),
+            Some(Refusal::AttachedElsewhere(7))
+        );
+        // A session that doesn't exist is still "no session".
+        assert_eq!(attach_refusal(7, None, 3, 3), Some(Refusal::NoSession(7)));
+    }
+
+    #[test]
+    fn agent_sessions_are_shown_only_from_protocol_4_and_terminals_always() {
+        for protocol in 1..=5 {
+            assert!(shown(SessionKind::Terminal, protocol));
+            assert_eq!(shown(SessionKind::Agent, protocol), protocol >= 4, "{protocol}");
+        }
+    }
+
+    #[test]
+    fn a_returning_owner_below_protocol_4_gets_no_agent_session_back() {
+        let t0 = Instant::now();
+        let token = ClientToken::from_wire("tok").unwrap();
+        let running = Life::Running { pid: pid(9) };
+        let awaiting = Ownership::AwaitingOwner { since: t0 };
+        let view = |kind| SessionView {
+            life: &running,
+            ownership: &awaiting,
+            owner: Some(&token),
+            kind,
+        };
+        let sessions = [(1, view(SessionKind::Terminal)), (2, view(SessionKind::Agent))];
+        assert_eq!(returning(&sessions, &token, 3), [1]);
+        assert_eq!(returning(&sessions, &token, 4), [1, 2]);
+    }
+
+    #[test]
+    fn agent_messages_below_protocol_4_are_refused_naming_the_message() {
+        let cases = [
+            (AgentRequest::Spawn, "SPAWN_AGENT needs client protocol 4"),
+            (AgentRequest::Prompt, "AGENT_PROMPT needs client protocol 4"),
+            (AgentRequest::Cancel, "AGENT_CANCEL needs client protocol 4"),
+            (AgentRequest::Permission, "AGENT_PERMISSION needs client protocol 4"),
+            (AgentRequest::Unqueue, "AGENT_UNQUEUE needs client protocol 4"),
+            (AgentRequest::Resend, "AGENT_RESEND needs client protocol 4"),
+        ];
+        for (request, text) in cases {
+            for protocol in 1..AGENT_PROTOCOL {
+                let refusal = agent_request_refusal(protocol, request).map(|r| r.to_string());
+                assert_eq!(refusal.as_deref(), Some(text), "{protocol}");
+            }
+            assert_eq!(agent_request_refusal(4, request), None);
+        }
+    }
+
+    #[test]
+    fn an_agent_spawn_needs_a_command() {
+        for command in ["", "  ", "\t"] {
+            assert_eq!(agent_spawn_refusal(command), Some("an agent session needs a command"));
+        }
+        assert_eq!(agent_spawn_refusal("fake-agent"), None);
+    }
+
+    // agents-sessions 4.6: agent checkpoints.
+
+    #[test]
+    fn an_agent_session_is_checkpointed_at_every_moment_the_reducer_names() {
+        let moments = [
+            Moment::Started,
+            Moment::BeforeRequest,
+            Moment::TurnEnded,
+            Moment::QueueChanged,
+            Moment::Permission,
+            Moment::Stopped,
+        ];
+        for moment in moments {
+            assert!(agent_checkpoint_due(AgentCheckpoint::Stepped(Some(moment)), 0), "{moment:?}");
+        }
+    }
+
+    #[test]
+    fn an_agent_session_is_checkpointed_before_a_step_down_and_on_a_detach() {
+        assert!(agent_checkpoint_due(AgentCheckpoint::StepDown, 0));
+        assert!(agent_checkpoint_due(AgentCheckpoint::Detach, 0));
+    }
+
+    #[test]
+    fn otherwise_an_agent_session_is_checkpointed_past_512_kib_of_stdout() {
+        let quiet = AgentCheckpoint::Stepped(None);
+        assert_eq!(CHECKPOINT_AFTER, 512 * 1024);
+        assert!(!agent_checkpoint_due(quiet, 0));
+        assert!(!agent_checkpoint_due(quiet, CHECKPOINT_AFTER));
+        assert!(agent_checkpoint_due(quiet, CHECKPOINT_AFTER + 1));
     }
 
     #[test]
@@ -859,7 +1183,12 @@ mod tests {
         let lingering = Ownership::Lingering { until: t0, since: t0 };
         let detached = Ownership::Detached { since: t0 };
         let attached = Ownership::Attached(3);
-        let view = |life, ownership, owner| SessionView { life, ownership, owner };
+        let view = |life, ownership, owner| SessionView {
+            life,
+            ownership,
+            owner,
+            kind: SessionKind::Terminal,
+        };
         let sessions = [
             (1, view(&running, &awaiting, Some(&token))),
             (2, view(&running, &lingering, Some(&token))),
@@ -870,8 +1199,10 @@ mod tests {
             (7, view(&running, &detached, Some(&other))),
             (8, view(&running, &detached, None)),
         ];
-        assert_eq!(returning(&sessions, &token), [1, 2, 3]);
-        assert_eq!(returning(&sessions, &other), [7]);
+        for protocol in 1..=AGENT_PROTOCOL {
+            assert_eq!(returning(&sessions, &token, protocol), [1, 2, 3]);
+            assert_eq!(returning(&sessions, &other, protocol), [7]);
+        }
     }
 
     // 3.2: process info.

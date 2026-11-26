@@ -40,6 +40,13 @@
 //!   ([`CoreStart`]).
 //! - **Exit:** once it has no sessions (after having one, after `DRAIN`, or
 //!   when no core used it within [`UNUSED_LIMIT`] of starting).
+//! - **Pipe sessions** (H1 version 3's `SPAWN_PIPES`): a program on plain
+//!   pipes, no terminal. Its stdout is the session's output, as a PTY's is;
+//!   its stdin takes `INPUT`; its stderr is read always into a ring
+//!   ([`StderrRing`]) sent once as `STDERR_TAIL` before `EXITED` (after its
+//!   `TAIL_END` for one that ended with no core). A hang-up takes
+//!   `platform::piped::HangUp`'s steps. A core below version 3 isn't shown
+//!   them ([`policy::shown`]).
 //!
 //! Its decisions (spawn refusals, when an exited session is drained, when
 //! to start a core) are pure, in [`policy`].
@@ -59,7 +66,7 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::endpoint::{self, Endpoints};
 use brindle_remote_protocol::holder::{
     self as h1, Assembler, Data, ErrorMessage, ExitStatus, Exited, HeldSession, Hello, Previous,
-    Spawn, SpawnFailed, Spawned, ToCore, ToHolder, Welcome,
+    Spawn, SpawnFailed, SpawnMode, SpawnPipes, Spawned, ToCore, ToHolder, Welcome,
 };
 use brindle_remote_protocol::ready::ReadyRead;
 
@@ -69,7 +76,9 @@ use super::daemon::ReadyPipe;
 use super::event_loop::{Event, EventLoop, Interest, Loop, Token};
 use super::platform::listen::{self, Identity, Listener};
 use super::platform::lock::Lock;
+use super::platform::piped::{HangUp, HangUpStep};
 use super::platform::pty::{self, Group, Program, Pty};
+use super::platform::{self, PipeCommand, Piped};
 use super::{build_id, daemon, dir, fault};
 use crate::pty::{GRACEFUL_SHUTDOWN, OUTPUT_CHUNK_SIZE, PtyCommand, Reparented};
 
@@ -249,6 +258,29 @@ impl Tail {
     }
 }
 
+/// A pipe session's stderr: its newest [`h1::MAX_STDERR_TAIL`] bytes, read
+/// always and sent once, as `STDERR_TAIL`, when the session has ended.
+#[derive(Default)]
+struct StderrRing {
+    bytes: VecDeque<u8>,
+}
+
+impl StderrRing {
+    const LIMIT: usize = h1::MAX_STDERR_TAIL;
+
+    fn push(&mut self, data: &[u8]) {
+        let data = &data[data.len().saturating_sub(Self::LIMIT)..];
+        self.bytes.extend(data);
+        let excess = self.bytes.len().saturating_sub(Self::LIMIT);
+        self.bytes.drain(..excess);
+    }
+
+    fn to_vec(&self) -> Vec<u8> {
+        let (front, back) = self.bytes.as_slices();
+        [front, back].concat()
+    }
+}
+
 /// Where a session's program is in its life (`types R1`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Life {
@@ -264,22 +296,103 @@ enum Life {
 
 struct Session {
     /// The entry `WELCOME` reports; its `exit` is written only when the
-    /// session becomes [`Life::Finished`].
+    /// session becomes [`Life::Finished`]. Its `mode` says which [`Io`]
+    /// the session has.
     held: HeldSession,
     program: Program,
-    /// Closed on hang-up and once the session is finished.
-    pty: Option<Pty>,
+    /// Closed once the session is finished, and a PTY's on hang-up.
+    io: Option<Io>,
+    /// The PTY's token, or a pipe session's stdout's.
     token: Token,
     interest: Interest,
     checkpoint: Vec<u8>,
     tail: Tail,
     input: VecDeque<u8>,
     life: Life,
+    /// When output last came (a pipe session's stderr counts).
     last_output: Instant,
-    /// Closed once the PTY's output ended or the session was hung up.
+    /// Closed once the PTY's output (a pipe session's stdout) ended or a
+    /// PTY session was hung up.
     output: Output,
     /// The connected core sent `PAUSE`: its client isn't keeping up.
     paused: bool,
+    /// A pipe session's stderr; empty for a PTY session.
+    stderr: StderrRing,
+    /// A pipe session's hang-up has started ([`Holder::hang_ups`]).
+    hung_up: bool,
+}
+
+/// A session's streams (`types R1`): a PTY, or a pipe session's three
+/// pipes.
+enum Io {
+    Pty(Pty),
+    Pipes(Pipes),
+}
+
+/// A pipe session's pipes and their tokens. stdout's token is the
+/// session's own ([`Session::token`]).
+struct Pipes {
+    piped: Piped,
+    /// stdin's token and what it waits for, while stdin is open.
+    input: Option<(Token, Interest)>,
+    /// stderr's token, while stderr is open. It always waits to read.
+    error: Option<Token>,
+}
+
+impl Io {
+    /// Reads the program's output: the PTY's, or stdout.
+    fn read_output(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Pty(pty) => pty.read(buffer),
+            Self::Pipes(pipes) => pipes.piped.read_output(buffer),
+        }
+    }
+
+    /// Writes the program's input: to the PTY, or stdin.
+    fn write_input(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Pty(pty) => pty.write(bytes),
+            Self::Pipes(pipes) => pipes.piped.write_input(bytes),
+        }
+    }
+
+    /// Whether input written now can reach the program.
+    fn takes_input(&self) -> bool {
+        match self {
+            Self::Pty(_) => true,
+            Self::Pipes(pipes) => pipes.input.is_some(),
+        }
+    }
+
+    /// Every token it is registered with.
+    fn tokens(&self, output: Token) -> Vec<Token> {
+        match self {
+            Self::Pty(_) => vec![output],
+            Self::Pipes(pipes) => [Some(output), pipes.input.map(|(token, _)| token), pipes.error]
+                .into_iter()
+                .flatten()
+                .collect(),
+        }
+    }
+}
+
+/// Whether the session's output can still come: a PTY's, or a pipe
+/// session's stdout or stderr.
+fn streams(session: &Session) -> Output {
+    let stderr_open = match &session.io {
+        Some(Io::Pipes(pipes)) => Some(pipes.error.is_some()),
+        Some(Io::Pty(_)) | None => None,
+    };
+    streams_of(session.output, stderr_open)
+}
+
+/// [`streams`], given the PTY's or stdout's `output` and, for a pipe
+/// session, whether its stderr is open.
+fn streams_of(output: Output, stderr_open: Option<bool>) -> Output {
+    match (output, stderr_open) {
+        (Output::Closed, Some(true)) => Output::Open,
+        (output, Some(_) | None) => output,
+    }
 }
 
 /// Whether the connected core is staying, or said `GOODBYE` (`types R1`):
@@ -298,6 +411,9 @@ struct Core {
     token: Token,
     interest: Interest,
     instance: u64,
+    /// The H1 version it negotiated: below 3 it isn't shown pipe sessions
+    /// ([`policy::shown`]).
+    protocol: u32,
     /// Its queue went past [`CORE_QUEUE_HIGH`] and hasn't been under
     /// [`CORE_QUEUE_LOW`] since ([`core_backlog`]). A new core's connection
     /// starts empty, so under.
@@ -316,8 +432,19 @@ enum Source {
     Listener,
     Pending,
     Core,
+    /// A PTY, or a pipe session's stdout.
     Master(SessionId),
+    /// A pipe session's stdin.
+    Stdin(SessionId),
+    /// A pipe session's stderr.
+    Stderr(SessionId),
     CoreReady,
+}
+
+/// The connected core, if it is shown sessions of `mode` ([`policy::shown`]).
+fn core_for(core: &mut Option<Core>, mode: SpawnMode) -> Option<&mut Core> {
+    core.as_mut()
+        .filter(|core| policy::shown(core.protocol, mode))
 }
 
 const LISTENER: Token = 0;
@@ -344,6 +471,9 @@ struct Holder<L: EventLoop> {
     /// Process groups to kill when their hang-up grace ends, with the
     /// session whose program leads each one.
     kills: Vec<(SessionId, Group, Instant)>,
+    /// Pipe sessions' hang-ups in progress, with the group each ends
+    /// ([`HangUp`]'s steps).
+    hang_ups: Vec<(SessionId, Group, HangUp)>,
     /// The log said that `REPARENT` does nothing here, which it says once.
     reparent_unsupported: bool,
 }
@@ -377,6 +507,7 @@ impl<L: EventLoop> Holder<L> {
             core_starts: Vec::new(),
             core_ready: HashMap::new(),
             kills: Vec::new(),
+            hang_ups: Vec::new(),
             reparent_unsupported: false,
         })
     }
@@ -388,6 +519,7 @@ impl<L: EventLoop> Holder<L> {
             // Ticks come fast while kills wait or a reaped program's
             // output drains.
             let fast = !self.kills.is_empty()
+                || !self.hang_ups.is_empty()
                 || self.sessions.values().any(|session| match session.life {
                     Life::Reaped { .. } => true,
                     Life::Running | Life::Finished => false,
@@ -437,6 +569,17 @@ impl<L: EventLoop> Holder<L> {
                 }
                 if event.readable || event.closed {
                     self.read_output(session);
+                }
+            }
+            // A failed stdin shows as closed: the write reports it.
+            Some(Source::Stdin(session)) => {
+                if event.writable || event.closed {
+                    self.write_input(session);
+                }
+            }
+            Some(Source::Stderr(session)) => {
+                if event.readable || event.closed {
+                    self.read_errors(session);
                 }
             }
             Some(Source::CoreReady) => self.read_core_ready(event.token),
@@ -555,13 +698,16 @@ impl<L: EventLoop> Holder<L> {
             token,
             interest: Interest::READABLE,
             instance: hello.instance,
+            protocol,
             over: false,
             checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
             farewell: Farewell::Staying,
         };
+        let shown = |session: &Session| policy::shown(protocol, session.held.mode);
         let sessions = self
             .sessions
             .values()
+            .filter(|session| shown(session))
             .map(|session| HeldSession {
                 truncated: session.tail.truncated,
                 ..session.held.clone()
@@ -578,6 +724,9 @@ impl<L: EventLoop> Holder<L> {
             }),
         );
         for (&id, session) in &mut self.sessions {
+            if !shown(session) {
+                continue;
+            }
             for message in ToCore::checkpoint(id, &session.checkpoint) {
                 queue(&mut core.conn, message);
             }
@@ -585,11 +734,24 @@ impl<L: EventLoop> Holder<L> {
                 queue(&mut core.conn, message);
             }
             session.tail.sent();
+            // A pipe session that ended with no core: its stderr explains
+            // the exit `WELCOME` reported, after its tail.
+            match (session.held.mode, session.life) {
+                (SpawnMode::Pipes, Life::Finished) => queue(
+                    &mut core.conn,
+                    ToCore::StderrTail(Data {
+                        session: id,
+                        bytes: session.stderr.to_vec(),
+                    }),
+                ),
+                (SpawnMode::Pipes, Life::Running | Life::Reaped { .. }) | (SpawnMode::Pty, _) => {}
+            }
         }
         // The core now knows how these ended.
         let finished: Vec<SessionId> = self
             .sessions
             .iter()
+            .filter(|(_, session)| shown(session))
             .filter(|(_, session)| match session.life {
                 Life::Finished => true,
                 Life::Running | Life::Reaped { .. } => false,
@@ -759,8 +921,15 @@ impl<L: EventLoop> Holder<L> {
                 let Some(session) = self.sessions.get_mut(&resize.session) else {
                     return self.send_error(Some(resize.session), no_session(resize.session));
                 };
-                let Some(pty) = &session.pty else {
-                    return;
+                let pty = match &session.io {
+                    Some(Io::Pty(pty)) => pty,
+                    Some(Io::Pipes(_)) => {
+                        return self.send_error(
+                            Some(resize.session),
+                            format!("session {} is on pipes and has no size", resize.session),
+                        );
+                    }
+                    None => return,
                 };
                 let result = pty.resize(resize.cols, resize.rows, resize.cell_w, resize.cell_h);
                 session.held.cols = resize.cols;
@@ -815,8 +984,23 @@ impl<L: EventLoop> Holder<L> {
             }
             ToHolder::Reparent(reparent) => {
                 // Advisory: no reply, and a session that just ended is no
-                // error. What it came to is the log's.
+                // error. What it came to is the log's. A pipe session has
+                // no console window to give an owner, which is an error.
                 let session = self.sessions.get(&reparent.session);
+                if let Some(session) = session {
+                    match session.held.mode {
+                        SpawnMode::Pipes => {
+                            return self.send_error(
+                                Some(reparent.session),
+                                format!(
+                                    "session {} is on pipes and has no console window",
+                                    reparent.session
+                                ),
+                            );
+                        }
+                        SpawnMode::Pty => {}
+                    }
+                }
                 let program = session.map(|session| &session.program);
                 match pty::reparent(program, reparent.hwnd) {
                     Ok(Reparented::Done) => {}
@@ -844,6 +1028,7 @@ impl<L: EventLoop> Holder<L> {
                     session.held.meta = update.meta;
                 }
             }
+            ToHolder::SpawnPipes(spawn) => self.spawn_pipes(spawn),
         }
     }
 
@@ -921,9 +1106,10 @@ impl<L: EventLoop> Holder<L> {
                     exit: None,
                     meta: spawn.meta,
                     truncated: false,
+                    mode: SpawnMode::Pty,
                 },
                 program,
-                pty: Some(pty),
+                io: Some(Io::Pty(pty)),
                 token,
                 interest: Interest::READABLE,
                 checkpoint: Vec::new(),
@@ -933,6 +1119,110 @@ impl<L: EventLoop> Holder<L> {
                 last_output: Instant::now(),
                 output: Output::Open,
                 paused: false,
+                stderr: StderrRing::default(),
+                hung_up: false,
+            },
+        );
+        self.had_session = true;
+        self.send(ToCore::Spawned(Spawned { session: id, pid }));
+    }
+
+    /// `SPAWN_PIPES`: a program with its standard streams on pipes and no
+    /// terminal. Its stdout is the session's output, as a PTY's is; its
+    /// stderr is read always, into [`Session::stderr`].
+    fn spawn_pipes(&mut self, spawn: SpawnPipes) {
+        let id = spawn.session;
+        let exists = self.sessions.contains_key(&id);
+        if let Some(refusal) = policy::pipe_spawn_refusal(self.draining, exists, &spawn) {
+            return self.send(ToCore::SpawnFailed(SpawnFailed {
+                session: id,
+                message: refusal.to_string(),
+            }));
+        }
+        for arg in &spawn.args {
+            inject_fault(arg.as_bytes());
+        }
+        let request = PipeCommand {
+            command: &spawn.command,
+            args: &spawn.args,
+            cwd: spawn.cwd.as_deref(),
+            env: &spawn.env,
+        };
+        let (piped, mut program) = match platform::spawn_piped(&request) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let message = format!("cannot run {}: {error}", spawn.command);
+                log!("session {id}: {message}");
+                return self.send(ToCore::SpawnFailed(SpawnFailed {
+                    session: id,
+                    message,
+                }));
+            }
+        };
+        let tokens = [self.token(), self.token(), self.token()];
+        let [output, input, error] = tokens;
+        let sources = [
+            (piped.output_source(), output, Interest::READABLE),
+            (piped.error_source(), error, Interest::READABLE),
+        ]
+        .into_iter()
+        .chain(piped.input_source().map(|source| (source, input, Interest::NONE)));
+        let mut registered = Vec::new();
+        for (source, token, interest) in sources {
+            if let Err(failed) = self.ev.register(&source, token, interest) {
+                for token in registered {
+                    let _ = self.ev.deregister(token);
+                }
+                if let Err(kill) = program.group().kill() {
+                    log!("session {id}: can't end its program: {kill}");
+                }
+                let _ = program.wait();
+                return self.send(ToCore::SpawnFailed(SpawnFailed {
+                    session: id,
+                    message: format!("can't watch the program's pipes: {failed}"),
+                }));
+            }
+            registered.push(token);
+        }
+        self.sources.insert(output, Source::Master(id));
+        self.sources.insert(error, Source::Stderr(id));
+        self.sources.insert(input, Source::Stdin(id));
+        if let Err(failed) = program.watch(&self.ev.waker()) {
+            // The exit is then seen on a later turn of the loop.
+            log!("session {id}: can't watch its program for its exit: {failed}");
+        }
+        let pid = program.pid();
+        log!("session {id}: started {} on pipes as pid {pid}", spawn.command);
+        self.sessions.insert(
+            id,
+            Session {
+                held: HeldSession {
+                    session: id,
+                    pid,
+                    cols: 0,
+                    rows: 0,
+                    exit: None,
+                    meta: spawn.meta,
+                    truncated: false,
+                    mode: SpawnMode::Pipes,
+                },
+                program,
+                io: Some(Io::Pipes(Pipes {
+                    piped,
+                    input: Some((input, Interest::NONE)),
+                    error: Some(error),
+                })),
+                token: output,
+                interest: Interest::READABLE,
+                checkpoint: Vec::new(),
+                tail: Tail::default(),
+                input: VecDeque::new(),
+                life: Life::Running,
+                last_output: Instant::now(),
+                output: Output::Open,
+                paused: false,
+                stderr: StderrRing::default(),
+                hung_up: false,
             },
         );
         self.had_session = true;
@@ -944,8 +1234,9 @@ impl<L: EventLoop> Holder<L> {
         let Some(session) = self.sessions.get_mut(&data.session) else {
             return self.send_error(Some(data.session), no_session(data.session));
         };
-        if session.pty.is_none() {
-            // Hung up: the program is going, so its input is moot.
+        if !session.io.as_ref().is_some_and(Io::takes_input) {
+            // Hung up (or its stdin closed): the program is going, so its
+            // input is moot.
             return;
         }
         if session.input.len() + data.bytes.len() > INPUT_QUEUE_LIMIT {
@@ -964,10 +1255,29 @@ impl<L: EventLoop> Holder<L> {
     /// the terminal (EIO) before the kernel's own `SIGHUP` arrives, and a
     /// program blocked reading it, such as `cat`, now and then exits 1 from
     /// that failed read instead of dying of the signal.
+    ///
+    /// A pipe session is hung up in [`HangUp`]'s steps instead: its stdin
+    /// closes at once, while its stdout and stderr are still read, so the
+    /// core gets what the program says as it ends.
     fn hang_up(&mut self, id: SessionId) -> bool {
         let Some(session) = self.sessions.get_mut(&id) else {
             return false;
         };
+        match session.held.mode {
+            SpawnMode::Pty => {}
+            SpawnMode::Pipes => {
+                session.input.clear();
+                if !session.hung_up {
+                    session.hung_up = true;
+                    log!("session {id}: hung up");
+                    let group = session.program.group();
+                    self.hang_ups.push((id, group, HangUp::new(Instant::now())));
+                    // Its first step, closing stdin, is due at once.
+                    self.take_hang_up_steps(Instant::now());
+                }
+                return true;
+            }
+        }
         match session.life {
             Life::Running => {
                 let group = session.program.group();
@@ -978,20 +1288,54 @@ impl<L: EventLoop> Holder<L> {
             }
             Life::Reaped { .. } | Life::Finished => {}
         }
-        if session.pty.take().is_some() {
-            let _ = self.ev.deregister(session.token);
-            self.sources.remove(&session.token);
-        }
+        close_io(&mut self.ev, &mut self.sources, session);
         session.input.clear();
         session.output = Output::Closed;
         true
+    }
+
+    /// Takes the pipe sessions' hang-up steps due at `now`.
+    fn take_hang_up_steps(&mut self, now: Instant) {
+        let Self {
+            ev,
+            sources,
+            sessions,
+            hang_ups,
+            ..
+        } = self;
+        for (id, group, hang_up) in hang_ups.iter_mut() {
+            for step in hang_up.due(now) {
+                match step {
+                    HangUpStep::CloseInput => {
+                        if let Some(session) = sessions.get_mut(id) {
+                            close_stdin(ev, sources, session);
+                        }
+                    }
+                    HangUpStep::EndGroup => group.hang_up(),
+                    HangUpStep::KillRemaining => {
+                        if let Err(error) = group.kill_remaining() {
+                            log!("session {id}: can't end what its hang-up left running: {error}");
+                        }
+                    }
+                }
+            }
+        }
+        hang_ups.retain(|(_, _, hang_up)| hang_up.next_at().is_some());
+    }
+
+    /// Closes a pipe session's stdin ([`close_stdin`]).
+    fn close_input(&mut self, id: SessionId) {
+        if let Some(session) = self.sessions.get_mut(&id) {
+            close_stdin(&mut self.ev, &mut self.sources, session);
+        }
     }
 
     fn read_output(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        let Some(pty) = &mut session.pty else {
+        let mode = session.held.mode;
+        let Some(io) = &mut session.io else {
             return;
         };
         let mut buffer = [0u8; OUTPUT_CHUNK_SIZE];
@@ -1000,13 +1344,13 @@ impl<L: EventLoop> Holder<L> {
                 Output::Open => {}
                 Output::Closed => break,
             }
-            let dest = match self.core.as_mut() {
+            let dest = match core_for(&mut self.core, mode) {
                 Some(core) => {
                     core.over = core_backlog(core.over, core.conn.queued());
                     Dest::Core { over: core.over }
                 }
-                // Nothing is lost while the core is away: the program
-                // blocks once its tail is full.
+                // Nothing is lost while the core is away (or isn't shown
+                // the session): the program blocks once its tail is full.
                 None => Dest::Tail {
                     room: session.tail.room(),
                 },
@@ -1015,7 +1359,7 @@ impl<L: EventLoop> Holder<L> {
             if limit == 0 {
                 break;
             }
-            match pty.read(&mut buffer[..limit]) {
+            match io.read_output(&mut buffer[..limit]) {
                 // The program's side is closed.
                 Ok(0) => {
                     session.output = Output::Closed;
@@ -1025,7 +1369,7 @@ impl<L: EventLoop> Holder<L> {
                     let bytes = &buffer[..read];
                     session.tail.push(bytes);
                     session.last_output = Instant::now();
-                    if let Some(core) = self.core.as_mut() {
+                    if let Some(core) = core_for(&mut self.core, mode) {
                         queue(
                             &mut core.conn,
                             ToCore::Output(Data {
@@ -1050,12 +1394,13 @@ impl<L: EventLoop> Holder<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        let Some(pty) = &mut session.pty else {
+        let Some(io) = &mut session.io else {
             return;
         };
-        while !session.input.is_empty() {
+        let mut failed = false;
+        while !session.input.is_empty() && io.takes_input() {
             let (front, _) = session.input.as_slices();
-            match pty.write(front) {
+            match io.write_input(front) {
                 Ok(written) => {
                     session.input.drain(..written);
                 }
@@ -1064,9 +1409,54 @@ impl<L: EventLoop> Holder<L> {
                 Err(error) => {
                     log!("session {id}: writing input failed: {error}");
                     session.input.clear();
+                    failed = true;
                     break;
                 }
             }
+        }
+        // A pipe session's stdin that failed (its program closed its end)
+        // takes nothing more.
+        if failed {
+            match session.held.mode {
+                SpawnMode::Pipes => self.close_input(id),
+                SpawnMode::Pty => {}
+            }
+        }
+    }
+
+    /// Reads a pipe session's stderr into its ring, whatever its stdout
+    /// and the core are doing, so the program never blocks on it.
+    fn read_errors(&mut self, id: SessionId) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Some(Io::Pipes(pipes)) = &mut session.io else {
+            return;
+        };
+        let mut buffer = [0u8; OUTPUT_CHUNK_SIZE];
+        let mut ended = false;
+        for _ in 0..READS_PER_EVENT {
+            match pipes.piped.read_error(&mut buffer) {
+                Ok(0) => {
+                    ended = true;
+                    break;
+                }
+                Ok(read) => {
+                    session.stderr.push(&buffer[..read]);
+                    session.last_output = Instant::now();
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => {
+                    log!("session {id}: reading stderr failed: {error}");
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if ended && let Some(token) = pipes.error.take() {
+            let _ = self.ev.deregister(token);
+            self.sources.remove(&token);
         }
     }
 
@@ -1087,10 +1477,8 @@ impl<L: EventLoop> Holder<L> {
     }
 
     fn remove_session(&mut self, id: SessionId) {
-        if let Some(session) = self.sessions.remove(&id)
-            && session.pty.is_some()
-        {
-            self.drop_source(session.token);
+        if let Some(mut session) = self.sessions.remove(&id) {
+            close_io(&mut self.ev, &mut self.sources, &mut session);
         }
     }
 
@@ -1133,29 +1521,43 @@ impl<L: EventLoop> Holder<L> {
                 Life::Reaped { code, at } => (code, at),
                 Life::Running | Life::Finished => continue,
             };
-            // A hang-up, which closes the PTY, closes its output too.
-            if policy::drained(now, reaped_at, session.last_output, session.output) {
+            // A hang-up, which closes the PTY, closes its output too. A
+            // pipe session's output is its stdout and its stderr.
+            if policy::drained(now, reaped_at, session.last_output, streams(session)) {
                 session.life = Life::Finished;
                 session.held.exit = Some(ExitStatus { code });
-                if session.pty.take().is_some() {
-                    let _ = self.ev.deregister(session.token);
-                    self.sources.remove(&session.token);
-                }
-                finished.push((id, code));
+                close_io(&mut self.ev, &mut self.sources, session);
+                finished.push((id, code, session.held.mode));
             }
         }
-        for (id, code) in finished {
-            // Without a core, or with one that said GOODBYE (it may no
-            // longer read), the next one's WELCOME reports it.
-            let staying = self.core.as_ref().is_some_and(|core| match core.farewell {
+        for (id, code, mode) in finished {
+            // Without a core, with one that isn't shown the session, or
+            // with one that said GOODBYE (it may no longer read), the next
+            // one's WELCOME reports it.
+            let staying = core_for(&mut self.core, mode).is_some_and(|core| match core.farewell {
                 Farewell::Staying => true,
                 Farewell::Goodbye | Farewell::Handover => false,
             });
-            if staying {
-                self.send(ToCore::Exited(Exited { session: id, code }));
-                self.remove_session(id);
+            if !staying {
+                log!("session {id}: ended with no core to tell; kept for the next one");
+                continue;
             }
+            match mode {
+                // What the program said on stderr explains its exit.
+                SpawnMode::Pipes => {
+                    let bytes = self
+                        .sessions
+                        .get(&id)
+                        .map(|session| session.stderr.to_vec())
+                        .unwrap_or_default();
+                    self.send(ToCore::StderrTail(Data { session: id, bytes }));
+                }
+                SpawnMode::Pty => {}
+            }
+            self.send(ToCore::Exited(Exited { session: id, code }));
+            self.remove_session(id);
         }
+        self.take_hang_up_steps(now);
 
         self.kills.retain(|(id, group, at)| {
             if now < *at {
@@ -1220,17 +1622,37 @@ impl<L: EventLoop> Holder<L> {
         self.flush_core();
         let core_over = self.core.as_mut().map(|core| {
             core.over = core_backlog(core.over, core.conn.queued());
-            core.over
+            (core.over, core.protocol)
         });
         for session in self.sessions.values_mut() {
-            if session.pty.is_none() {
+            let Some(io) = &mut session.io else {
                 continue;
-            }
-            let dest = match core_over {
+            };
+            let shown_over = core_over
+                .filter(|&(_, protocol)| policy::shown(protocol, session.held.mode))
+                .map(|(over, _)| over);
+            let dest = match shown_over {
                 Some(over) => Dest::Core { over },
                 None => Dest::Tail {
                     room: session.tail.room(),
                 },
+            };
+            // A pipe session's stdin waits to be written to on its own.
+            let input_queued = !session.input.is_empty();
+            let pty_writable = match io {
+                Io::Pty(_) => input_queued,
+                Io::Pipes(pipes) => {
+                    if let Some((token, interest)) = &mut pipes.input {
+                        let want = Interest {
+                            readable: false,
+                            writable: input_queued,
+                        };
+                        if want != *interest && self.ev.modify(*token, want).is_ok() {
+                            *interest = want;
+                        }
+                    }
+                    false
+                }
             };
             let readable = match session.output {
                 Output::Open => read_limit(dest, session.paused, 1) > 0,
@@ -1238,7 +1660,7 @@ impl<L: EventLoop> Holder<L> {
             };
             let want = Interest {
                 readable,
-                writable: !session.input.is_empty(),
+                writable: pty_writable,
             };
             if want != session.interest && self.ev.modify(session.token, want).is_ok() {
                 session.interest = want;
@@ -1258,6 +1680,7 @@ impl<L: EventLoop> Holder<L> {
     fn should_exit(&self, now: Instant) -> bool {
         self.sessions.is_empty()
             && self.kills.is_empty()
+            && self.hang_ups.is_empty()
             && (self.had_session
                 || self.draining
                 || (self.core.is_none() && now >= self.started + UNUSED_LIMIT))
@@ -1294,6 +1717,29 @@ impl<L: EventLoop> Holder<L> {
             log!("exiting with {} session(s)", self.sessions.len());
         }
     }
+}
+
+/// Closes `session`'s streams, if they are open, and stops watching them.
+fn close_io<L: EventLoop>(ev: &mut L, sources: &mut HashMap<Token, Source>, session: &mut Session) {
+    if let Some(io) = session.io.take() {
+        for token in io.tokens(session.token) {
+            let _ = ev.deregister(token);
+            sources.remove(&token);
+        }
+    }
+}
+
+/// Closes a pipe session's stdin, and drops the input queued for it.
+fn close_stdin<L: EventLoop>(ev: &mut L, sources: &mut HashMap<Token, Source>, session: &mut Session) {
+    session.input.clear();
+    let Some(Io::Pipes(pipes)) = &mut session.io else {
+        return;
+    };
+    if let Some((token, _)) = pipes.input.take() {
+        let _ = ev.deregister(token);
+        sources.remove(&token);
+    }
+    pipes.piped.close_input();
 }
 
 fn no_session(id: SessionId) -> String {
@@ -1373,6 +1819,7 @@ fn unit_of(message: &ToHolder) -> Unit {
         }
         ToHolder::Reparent(reparent) => Unit::Session(reparent.session),
         ToHolder::SetMeta(update) => Unit::Session(update.session),
+        ToHolder::SpawnPipes(spawn) => Unit::Spawn(spawn.session),
         ToHolder::CheckpointBegin(begin) => Unit::Checkpoint(begin.session),
         ToHolder::CheckpointChunk(chunk) => Unit::Checkpoint(chunk.session),
         ToHolder::CheckpointEnd(end) => Unit::Checkpoint(end.session),
@@ -1397,6 +1844,7 @@ fn name_of(message: &ToHolder) -> &'static str {
         ToHolder::Pause(_) => "PAUSE",
         ToHolder::Resume(_) => "RESUME",
         ToHolder::SetMeta(_) => "SET_META",
+        ToHolder::SpawnPipes(_) => "SPAWN_PIPES",
     }
 }
 
@@ -1468,6 +1916,44 @@ mod tests {
         tail.cover(5);
         assert!(!tail.truncated);
         assert_eq!(tail.to_vec().len(), Tail::LIMIT - 5);
+    }
+
+    #[test]
+    fn the_stderr_ring_keeps_the_newest_bytes() {
+        let limit = StderrRing::LIMIT;
+        let mut ring = StderrRing::default();
+        ring.push(b"abc");
+        assert_eq!(ring.to_vec(), b"abc");
+        ring.push(&vec![b'x'; limit - 3]);
+        assert_eq!(ring.to_vec().len(), limit);
+        assert!(ring.to_vec().starts_with(b"abc"));
+        ring.push(b"yz");
+        let bytes = ring.to_vec();
+        assert_eq!(bytes.len(), limit);
+        assert!(bytes.starts_with(b"cx") && bytes.ends_with(b"xyz"));
+        // One read longer than the ring keeps its own end.
+        let long: Vec<u8> = (0..limit + 100).map(|i| i as u8).collect();
+        ring.push(&long);
+        assert_eq!(ring.to_vec(), &long[100..]);
+    }
+
+    #[test]
+    fn a_pipe_sessions_output_is_open_while_stdout_or_stderr_is() {
+        assert!(matches!(
+            streams_of(Output::Closed, Some(true)),
+            Output::Open
+        ));
+        assert!(matches!(
+            streams_of(Output::Open, Some(false)),
+            Output::Open
+        ));
+        assert!(matches!(
+            streams_of(Output::Closed, Some(false)),
+            Output::Closed
+        ));
+        // A PTY's (`None`) is its own.
+        assert!(matches!(streams_of(Output::Closed, None), Output::Closed));
+        assert!(matches!(streams_of(Output::Open, None), Output::Open));
     }
 
     #[test]
@@ -1588,6 +2074,18 @@ mod tests {
                 }),
                 Unit::Holder,
                 "HELLO",
+            ),
+            (
+                ToHolder::SpawnPipes(h1::SpawnPipes {
+                    session: 12,
+                    command: "agent".into(),
+                    args: Vec::new(),
+                    cwd: None,
+                    env: Default::default(),
+                    meta: Default::default(),
+                }),
+                Unit::Spawn(12),
+                "SPAWN_PIPES",
             ),
             (ToHolder::Drain(Drain {}), Unit::Holder, "DRAIN"),
             (

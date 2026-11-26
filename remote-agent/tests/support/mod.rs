@@ -16,6 +16,7 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+pub mod fake_agent;
 pub mod programs;
 #[cfg(unix)]
 pub mod relay;
@@ -36,7 +37,8 @@ use brindle_remote_protocol::client::{self, ToClient};
 use brindle_remote_protocol::relay::{MSG_RELAY_HEARTBEAT, is_relay_type};
 use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::holder::{
-    self as h1, Assembler, Data, Hello, SessionRef, Spawn, ToCore, ToHolder, Welcome,
+    self as h1, Assembler, Data, Hello, SessionRef, Spawn, SpawnMode, SpawnPipes, ToCore,
+    ToHolder, Welcome,
 };
 use brindle_remote_protocol::{Frame, RequestId, SessionId};
 use brindle_term_core::alacritty_terminal::grid::Dimensions;
@@ -44,8 +46,12 @@ use brindle_term_core::alacritty_terminal::index::{Column, Line};
 use brindle_term_core::alacritty_terminal::term::cell::Cell;
 pub use brindle_term_core::emulator::Emulator;
 use brindle_term_core::shell_integration::PathStyle;
+pub use brindle_transcript::{Event, Transcript};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_brindle-remote");
+/// The fake ACP agent (`src/fake_acp/main.rs`), which cargo builds with the
+/// helper for these tests; [`fake_agent::AgentScript`] writes what it plays.
+pub const FAKE_AGENT: &str = env!("CARGO_BIN_EXE_brindle-fake-acp-agent");
 /// Long enough for a loaded CI machine; tests poll, so passing ones are fast.
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -166,6 +172,9 @@ pub struct Adopted {
     pub welcome: Option<Welcome>,
     pub checkpoints: HashMap<SessionId, Vec<u8>>,
     pub tails: HashMap<SessionId, Vec<u8>>,
+    /// The `STDERR_TAIL` of each pipe session that ended with no core, each
+    /// right after that session's `TAIL_END`.
+    pub stderr_tails: HashMap<SessionId, Vec<u8>>,
 }
 
 impl Adopted {
@@ -289,9 +298,15 @@ impl TestCore {
 
     /// Sends `HELLO` and collects `WELCOME` with every checkpoint and tail.
     pub fn hello(&mut self, instance: u64) -> Adopted {
+        self.hello_up_to(instance, h1::PROTOCOLS.max)
+    }
+
+    /// [`TestCore::hello`] from a core that speaks H1 up to `max`: one
+    /// below 3 stands for an older core, which isn't shown pipe sessions.
+    pub fn hello_up_to(&mut self, instance: u64, max: u32) -> Adopted {
         self.send(ToHolder::Hello(Hello {
             min: h1::PROTOCOLS.min,
-            max: h1::PROTOCOLS.max,
+            max,
             core_build: "test-core".into(),
             instance,
         }));
@@ -301,7 +316,19 @@ impl TestCore {
         let mut adopted = Adopted::default();
         let mut checkpoints = Assembler::new(h1::MAX_CHECKPOINT_LEN);
         let mut tails = Assembler::new(h1::TAIL_LIMIT);
-        let mut left = welcome.sessions.len();
+        // A pipe session that ended has its stderr tail after its tail.
+        let ended_on_pipes = |id: SessionId| {
+            welcome.sessions.iter().any(|held| {
+                held.session == id && held.mode == SpawnMode::Pipes && held.exit.is_some()
+            })
+        };
+        let mut left = welcome.sessions.len()
+            + welcome
+                .sessions
+                .iter()
+                .filter(|held| ended_on_pipes(held.session))
+                .count();
+        let mut last_tail = None;
         while left > 0 {
             match self.recv() {
                 ToCore::CheckpointBegin(begin) => checkpoints.begin(begin).unwrap(),
@@ -314,7 +341,18 @@ impl TestCore {
                 ToCore::TailBegin(begin) => tails.begin(begin).unwrap(),
                 ToCore::TailChunk(chunk) => tails.chunk(&chunk).unwrap(),
                 ToCore::TailEnd(end) => {
+                    last_tail = Some(end.session);
                     adopted.tails.insert(end.session, tails.end(end).unwrap());
+                    left -= 1;
+                }
+                ToCore::StderrTail(Data { session, bytes }) => {
+                    assert_eq!(
+                        last_tail,
+                        Some(session),
+                        "session {session}'s STDERR_TAIL doesn't follow its TAIL_END"
+                    );
+                    assert!(ended_on_pipes(session), "STDERR_TAIL for {session}");
+                    adopted.stderr_tails.insert(session, bytes);
                     left -= 1;
                 }
                 other => panic!("unexpected {other:?} while adopting"),
@@ -334,6 +372,55 @@ impl TestCore {
             ToCore::Spawned(spawned) if spawned.session == session => spawned.pid,
             other => panic!("expected SPAWNED for {session}, got {other:?}"),
         }
+    }
+
+    /// Sends a `SPAWN_PIPES` and returns the program's pid, dropping output
+    /// as [`TestCore::spawn`] does.
+    pub fn spawn_pipes(&mut self, spawn: SpawnPipes) -> u32 {
+        let session = spawn.session;
+        self.send(ToHolder::SpawnPipes(spawn));
+        match self.recv_skipping_output() {
+            ToCore::Spawned(spawned) if spawned.session == session => spawned.pid,
+            other => panic!("expected SPAWNED for {session}, got {other:?}"),
+        }
+    }
+
+    /// A pipe session's output up to its end, its `STDERR_TAIL` (which
+    /// must come once, just before its `EXITED`) and its exit code. Other
+    /// sessions' messages are skipped.
+    pub fn pipes_end(&mut self, session: SessionId) -> (Vec<u8>, Vec<u8>, Option<i32>) {
+        let mut output = Vec::new();
+        let mut stderr = None;
+        loop {
+            match self.recv() {
+                ToCore::Output(Data { session: s, bytes }) if s == session => {
+                    assert!(stderr.is_none(), "output after STDERR_TAIL");
+                    output.extend(bytes);
+                }
+                ToCore::StderrTail(Data { session: s, bytes }) if s == session => {
+                    assert!(stderr.is_none(), "a second STDERR_TAIL");
+                    stderr = Some(bytes);
+                }
+                ToCore::Exited(exited) if exited.session == session => {
+                    let stderr = stderr.expect("no STDERR_TAIL before EXITED");
+                    return (output, stderr, exited.code);
+                }
+                ToCore::Output(_) | ToCore::StderrTail(_) | ToCore::Exited(_) | ToCore::Error(_) => {
+                    assert!(stderr.is_none(), "messages between STDERR_TAIL and EXITED");
+                }
+                other => panic!("expected EXITED for {session}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Every message the holder sends until it closes the connection.
+    pub fn until_closed(&mut self) -> Vec<ToCore> {
+        let mut messages = Vec::new();
+        let deadline = Instant::now() + TIMEOUT;
+        while let Some(message) = self.try_recv(deadline.saturating_duration_since(Instant::now())) {
+            messages.push(message);
+        }
+        messages
     }
 
     /// The next message that isn't `OUTPUT`.
@@ -476,6 +563,18 @@ pub fn spawn(session: SessionId, command: &str, args: &[&str]) -> Spawn {
         rows: 24,
         cell_w: 0,
         cell_h: 0,
+        meta: Default::default(),
+    }
+}
+
+/// A `SPAWN_PIPES` of `command args` with [`base_env`].
+pub fn pipe_spawn(session: SessionId, command: &str, args: &[&str]) -> SpawnPipes {
+    SpawnPipes {
+        session,
+        command: command.into(),
+        args: args.iter().map(|arg| arg.to_string()).collect(),
+        cwd: None,
+        env: base_env(),
         meta: Default::default(),
     }
 }
@@ -675,6 +774,13 @@ pub struct TestClient {
     /// How many `RELAY_HEARTBEAT`s arrived (from a relay; a core sends
     /// none), which [`TestClient::next`] skips.
     pub heartbeats: usize,
+    /// Each agent session's log as this client has it: every `TRANSCRIPT`
+    /// is folded in as it is read ([`TestClient::next`]), and a
+    /// `REPLAY_START` starts the session's log again.
+    transcripts: HashMap<SessionId, Transcript>,
+    /// The events folded into each session's log, in order, since its
+    /// last `REPLAY_START` (for checks of what came in which order).
+    events: HashMap<SessionId, Vec<Event>>,
 }
 
 impl TestClient {
@@ -695,6 +801,8 @@ impl TestClient {
             next_req: 1,
             welcome: None,
             heartbeats: 0,
+            transcripts: HashMap::new(),
+            events: HashMap::new(),
         }
     }
 
@@ -769,7 +877,9 @@ impl TestClient {
                     "a relay frame of type {:#x} amid the protocol",
                     frame.msg_type
                 );
-                return Recv::Message(ToClient::decode(&frame).unwrap());
+                let message = ToClient::decode(&frame).unwrap();
+                self.fold(&message);
+                return Recv::Message(message);
             }
             if self.closed {
                 return Recv::Closed;
@@ -793,6 +903,32 @@ impl TestClient {
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(_) => self.closed = true,
             }
+        }
+    }
+
+    /// Keeps the agent sessions' logs: a replay starts one again, and each
+    /// `TRANSCRIPT` event is decoded ([`Event::from_value`]) and folded.
+    fn fold(&mut self, message: &ToClient) {
+        match message {
+            ToClient::ReplayStart(start) => {
+                self.transcripts.remove(&start.session);
+                self.events.remove(&start.session);
+            }
+            ToClient::Transcript(transcript) => {
+                let log = self.transcripts.entry(transcript.session).or_default();
+                let events = self.events.entry(transcript.session).or_default();
+                for value in &transcript.events {
+                    let event = Event::from_value(value)
+                        .unwrap_or_else(|error| panic!("TRANSCRIPT event {value}: {error}"));
+                    // Protocol 4's forms only: nothing the decode dropped.
+                    assert_eq!(event.to_value(), *value, "TRANSCRIPT event {value} isn't one of protocol 4's forms");
+                    log.apply(&event).unwrap_or_else(|error| {
+                        panic!("session {}: {event:?} doesn't fold: {error}", transcript.session)
+                    });
+                    events.push(event);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1071,6 +1207,166 @@ impl TestClient {
         }
     }
 
+    // Agent sessions (client protocol 4).
+
+    /// Sends a `SPAWN_AGENT` and returns the reply (`SPAWNED` or `ERROR`).
+    /// Other messages are kept for later.
+    pub fn spawn_agent_reply(&mut self, mut spawn: client::SpawnAgent) -> ToClient {
+        spawn.req = self.take_req();
+        let req = spawn.req;
+        self.send(client::ToCore::SpawnAgent(spawn));
+        self.reply(req)
+    }
+
+    /// Starts an agent session and returns its id and the agent's pid.
+    pub fn spawn_agent(&mut self, spawn: client::SpawnAgent) -> (SessionId, u32) {
+        match self.spawn_agent_reply(spawn) {
+            ToClient::Spawned(spawned) => (spawned.session, spawned.pid),
+            other => panic!("expected SPAWNED, got {other:?}"),
+        }
+    }
+
+    /// The reply to agent request `req`: `Ok` for `OK`, the `ERROR`
+    /// otherwise.
+    fn agent_reply(&mut self, req: RequestId) -> Result<(), client::ErrorMessage> {
+        match self.reply(req) {
+            ToClient::Ok(_) => Ok(()),
+            ToClient::Error(error) => Err(error),
+            other => panic!("expected OK or ERROR, got {other:?}"),
+        }
+    }
+
+    /// `AGENT_PROMPT`: `text` for the agent, sent now or queued.
+    pub fn prompt(&mut self, session: SessionId, text: &str) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentPrompt(client::AgentPrompt {
+            req,
+            session,
+            text: text.into(),
+        }));
+        self.agent_reply(req)
+    }
+
+    /// `AGENT_UNQUEUE`: the prompt in the slot is discarded.
+    pub fn unqueue(&mut self, session: SessionId) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentUnqueue(client::AgentRequest { req, session }));
+        self.agent_reply(req)
+    }
+
+    /// `AGENT_RESEND`: a held prompt is sent again.
+    pub fn resend(&mut self, session: SessionId) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentResend(client::AgentRequest { req, session }));
+        self.agent_reply(req)
+    }
+
+    /// `AGENT_CANCEL`, which has no reply (an `ERROR` without a `req` if
+    /// it is refused).
+    pub fn cancel(&mut self, session: SessionId) {
+        self.send(client::ToCore::AgentCancel(client::SessionRef { session }));
+    }
+
+    /// `AGENT_PERMISSION`: permission request `entry` answered with
+    /// `option`, or dismissed with `None`.
+    pub fn answer(
+        &mut self,
+        session: SessionId,
+        entry: u64,
+        option: Option<&str>,
+    ) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentPermission(client::AgentPermission {
+            req,
+            session,
+            entry,
+            option: option.map(str::to_owned),
+        }));
+        self.agent_reply(req)
+    }
+
+    /// The agent session's log as this client has folded it so far.
+    pub fn transcript(&self, session: SessionId) -> Transcript {
+        self.transcripts.get(&session).cloned().unwrap_or_default()
+    }
+
+    /// The events this client folded into the session's log so far, in
+    /// the order they came, since its last replay started.
+    pub fn events(&self, session: SessionId) -> Vec<Event> {
+        self.events.get(&session).cloned().unwrap_or_default()
+    }
+
+    /// Reads until the session's log satisfies `done` (`what` names it for
+    /// the failure) and returns it. `TRANSCRIPT`s are folded and dropped;
+    /// other messages are kept for later.
+    pub fn transcript_until(
+        &mut self,
+        session: SessionId,
+        what: &str,
+        mut done: impl FnMut(&Transcript) -> bool,
+    ) -> Transcript {
+        let deadline = Instant::now() + limit(TIMEOUT);
+        let mut kept = Vec::new();
+        // What is already kept was folded when it was read.
+        for message in std::mem::take(&mut self.backlog) {
+            if !matches!(message, ToClient::Transcript(_)) {
+                kept.push(message);
+            }
+        }
+        while !self.transcripts.get(&session).is_some_and(&mut done) {
+            match self.next(deadline.saturating_duration_since(Instant::now())) {
+                Recv::Message(ToClient::Transcript(_)) => {}
+                Recv::Message(other) => kept.push(other),
+                other => panic!(
+                    "{other:?} before session {session}'s log {what}; it is {:#?}",
+                    self.transcript(session)
+                ),
+            }
+        }
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        self.transcript(session)
+    }
+
+    /// `ATTACH`es an agent session (its size, 0×0, is ignored) and reads
+    /// its replay, which starts the session's log again: the replay's
+    /// `REPLAY_START`, or the refusal. Messages for other sessions are kept
+    /// for later.
+    pub fn attach_agent(
+        &mut self,
+        session: SessionId,
+    ) -> Result<client::ReplayStart, client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::Attach(client::Attach {
+            req,
+            session,
+            cols: 0,
+            rows: 0,
+        }));
+        let mut kept = Vec::new();
+        let start = loop {
+            match self.recv() {
+                ToClient::ReplayStart(start) if start.req == Some(req) => break start,
+                ToClient::Error(error) if error.req == Some(req) => {
+                    kept.extend(self.backlog.drain(..));
+                    self.backlog = kept.into();
+                    return Err(error);
+                }
+                other => kept.push(other),
+            }
+        };
+        loop {
+            match self.recv() {
+                ToClient::Transcript(transcript) if transcript.session == session => {}
+                ToClient::ReplayEnd(end) if end.session == session => break,
+                other => kept.push(other),
+            }
+        }
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        Ok(start)
+    }
+
     /// Attaches to `session` (at 80×24) until the replay, fed to a fresh
     /// emulator, satisfies `done`; between tries it detaches again. For
     /// sessions whose output arrives while no client is attached.
@@ -1153,6 +1449,21 @@ pub fn client_spawn(command: &str, args: &[&str]) -> client::Spawn {
         cell_w: 0,
         cell_h: 0,
         scrollback: 1000,
+        policy: client::Policy::Kill,
+        profile: None,
+    }
+}
+
+/// A client `SPAWN_AGENT` of the fake ACP agent playing `script`
+/// ([`fake_agent::AgentScript::write`]), with a minimal environment of its
+/// own, in the server's default directory.
+pub fn client_agent(script: &Path) -> client::SpawnAgent {
+    client::SpawnAgent {
+        req: 0,
+        command: FAKE_AGENT.into(),
+        args: vec![script.display().to_string()],
+        cwd: None,
+        env: base_env(),
         policy: client::Policy::Kill,
         profile: None,
     }

@@ -157,6 +157,25 @@ jobs:
         run: |
           $zip = scripts/package-windows.ps1 -Exe target/release/brindle.exe -Helper target/release/brindle-remote.exe
           "path=$zip" >> $env:GITHUB_OUTPUT
+      # The zip holds exactly the files scripts/package-windows.ps1 names, so
+      # nothing else this build makes (the tests' fake ACP agent, say) slips
+      # in. A change to what it packs changes this list with it.
+      - name: Release zip contents
+        shell: pwsh
+        env:
+          ZIP: ${{ steps.zip.outputs.path }}
+        run: |
+          $expected = @('brindle.exe', 'brindle-remote.exe', 'brindle-remote-linux-x86_64', 'LICENSE-APACHE', 'LICENSE-MIT', 'THIRD-PARTY-NOTICES.txt')
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($env:ZIP)
+          try { $actual = @($archive.Entries | ForEach-Object { $_.FullName }) } finally { $archive.Dispose() }
+          $actual | Write-Host
+          $want = ($expected | Sort-Object -CaseSensitive) -join "`n"
+          $got = ($actual | Sort-Object -CaseSensitive) -join "`n"
+          if ($got -cne $want) {
+            Write-Host "expected:`n$want"
+            throw "the zip's files aren't the expected ones"
+          }
       # The one-command installer as a release publishes it (release.yml
       # stamps scripts/get.ps1 as install.ps1), run through iex in a new
       # PowerShell as a user would, against this zip in a local release

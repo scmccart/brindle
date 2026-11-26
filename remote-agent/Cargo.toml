@@ -9,16 +9,26 @@ publish = false
 name = "brindle-remote"
 path = "src/main.rs"
 
+# The fake ACP agent the tests play agents with (OpenSpec change
+# agents-sessions, design decision 16): built with the helper, never
+# packaged.
+[[bin]]
+name = "brindle-fake-acp-agent"
+path = "src/fake_acp/main.rs"
+
 [dependencies]
+agent-client-protocol-schema = { version = "=1.22.0", default-features = false }
 brindle-remote-protocol = { path = "../remote-protocol" }
 brindle-term-core = { path = "../term-core" }
+brindle-transcript = { path = "../transcript" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 # The holder's pseudoconsoles (`conpty`, which asks `ntdll` which console a
 # program is on), the list of processes a hang-up looks through for those
-# still on a session's console, and the server's event loop and pipes.
+# still on a session's console, the server's event loop and pipes, and the
+# jobs a pipe session's program runs in.
 # Brindle already builds this version, so only the features below are the
 # agent's own.
 [target.'cfg(windows)'.dependencies]
@@ -30,6 +40,7 @@ windows = { version = "0.61", features = [
   "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_IO",
+  "Win32_System_JobObjects",
   "Win32_System_LibraryLoader",
   "Win32_System_Pipes",
   "Win32_System_Threading",

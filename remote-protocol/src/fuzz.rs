@@ -276,6 +276,122 @@ fn the_protocol_2_fields_and_relay_frames_reject_bad_values_without_panicking() 
     assert!(client::ToCore::decode(&frame).is_ok());
 }
 
+/// Client protocol 4's and H1 version 3's messages and fields with every
+/// value of the wrong type, out of range or hostile: each is `Ok` or an
+/// `InvalidData` error. A `TRANSCRIPT` event that isn't an object and a
+/// `STDERR_TAIL` past its limit are errors, whatever else the frame holds.
+#[test]
+fn the_agent_messages_reject_bad_values_without_panicking() {
+    let bad = [
+        "null",
+        "true",
+        "-1",
+        "4294967296",
+        "18446744073709551616",
+        "1.5",
+        "\"7\"",
+        "[]",
+        "{}",
+        "[1,[2,[3]]]",
+        "\"\\ud800\"",
+    ];
+    let mut cases: Vec<(u8, String)> = Vec::new();
+    for value in bad {
+        cases.push((
+            client::MSG_SPAWN_AGENT,
+            format!(r#"{{"req":{value},"command":{value},"args":{value},"cwd":{value},"env":{value},"policy":{value},"profile":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_PROMPT,
+            format!(r#"{{"req":1,"session":{value},"text":{value}}}"#),
+        ));
+        cases.push((client::MSG_AGENT_CANCEL, format!(r#"{{"session":{value}}}"#)));
+        cases.push((
+            client::MSG_AGENT_PERMISSION,
+            format!(r#"{{"req":1,"session":1,"entry":{value},"option":{value}}}"#),
+        ));
+        cases.push((client::MSG_AGENT_UNQUEUE, format!(r#"{{"req":{value},"session":1}}"#)));
+        cases.push((client::MSG_AGENT_RESEND, format!(r#"{{"req":1,"session":{value}}}"#)));
+        cases.push((
+            client::MSG_TRANSCRIPT,
+            format!(r#"{{"session":{value},"events":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_SESSIONS,
+            format!(r#"{{"req":1,"sessions":[{{"session":1,"pid":2,"agent":{value}}}]}}"#),
+        ));
+        cases.push((
+            client::MSG_SESSIONS,
+            format!(r#"{{"req":1,"sessions":[{{"session":1,"pid":2,"agent":{{"activity":{value},"name":{value}}}}}]}}"#),
+        ));
+        cases.push((
+            holder::MSG_SPAWN_PIPES,
+            format!(r#"{{"session":1,"command":{value},"args":{value},"cwd":{value},"env":{value},"meta":{value}}}"#),
+        ));
+        cases.push((
+            holder::MSG_WELCOME,
+            format!(r#"{{"protocol":3,"pid":1,"sessions":[{{"session":1,"pid":2,"cols":0,"rows":0,"mode":{value}}}]}}"#),
+        ));
+        // An event of every wrong kind among objects.
+        cases.push((
+            client::MSG_TRANSCRIPT,
+            format!(r#"{{"session":1,"events":[{{"event":"turn"}},{value}]}}"#),
+        ));
+    }
+    let decoders = decoders();
+    for (msg_type, payload) in cases {
+        let frame = Frame {
+            msg_type,
+            payload: payload.into_bytes(),
+        };
+        for (_, decode) in &decoders {
+            if let Err(error) = decode(&frame) {
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            }
+        }
+    }
+
+    // An event that isn't an object is refused, wherever it is.
+    let mut rng = XorShift::new(0xa6e7_0000_0008);
+    for _ in 0..500 {
+        let mut events: Vec<serde_json::Value> = (0..rng.below(5))
+            .map(|_| serde_json::json!({"event": "turn", "n": rng.below(9)}))
+            .collect();
+        let odd = random_json(&mut rng, 2);
+        let at = rng.below(events.len() + 1);
+        events.insert(at, odd.clone());
+        let payload = serde_json::to_vec(&serde_json::json!({"session": 1, "events": events}))
+            .unwrap();
+        let frame = Frame {
+            msg_type: client::MSG_TRANSCRIPT,
+            payload,
+        };
+        let decoded = client::ToClient::decode(&frame);
+        assert_eq!(decoded.is_ok(), odd.is_object(), "{odd} at {at}: {decoded:?}");
+    }
+
+    // A STDERR_TAIL is refused past its limit, at any session id.
+    for _ in 0..200 {
+        let len = holder::MAX_STDERR_TAIL - 2 + rng.below(5);
+        let mut payload = (rng.next() as u32).to_be_bytes().to_vec();
+        payload.extend(rng.bytes(len));
+        let frame = Frame {
+            msg_type: holder::MSG_STDERR_TAIL,
+            payload,
+        };
+        match holder::ToCore::decode(&frame) {
+            Ok(holder::ToCore::StderrTail(tail)) => {
+                assert!(tail.bytes.len() <= holder::MAX_STDERR_TAIL)
+            }
+            Ok(other) => panic!("decoded {other:?}"),
+            Err(error) => {
+                assert!(len > holder::MAX_STDERR_TAIL, "{len} bytes refused: {error}");
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+        }
+    }
+}
+
 /// An in-memory stream that hands out short reads and is now and then
 /// interrupted, as a pipe from `ssh` can be.
 struct Choppy<'a> {

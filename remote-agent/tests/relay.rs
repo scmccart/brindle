@@ -17,7 +17,10 @@ use std::time::{Duration, Instant};
 use brindle_remote_protocol::Frame;
 use brindle_remote_protocol::client::{self, ToClient};
 use brindle_remote_protocol::relay::RelayMessage;
+use brindle_remote_protocol::serde_json::json;
+use brindle_transcript::{AgentState, Entry, HoldReason, Slot, StopReason, TurnState};
 
+use support::fake_agent::{ask, methods, prompts, responses, said, started, stop};
 use support::programs::{self, say};
 use support::relay::{self, HEARTBEAT, IDLE, Relay, SHORT_TIMINGS};
 use support::*;
@@ -292,6 +295,96 @@ fn heartbeats_never_reach_a_protocol_1_core() {
         TestClient::hello_with(&dir.path, "direct", |hello| (hello.min, hello.max) = (1, 1));
     direct.send_frame(&heartbeat());
     assert!(matches!(direct.recv(), ToClient::Error(_)));
+}
+
+/// An agent session through a relay (`agents-sessions` 8.2): every agent
+/// message a client sends, `SPAWN_AGENT` and `AGENT_PROMPT`, `_PERMISSION`,
+/// `_UNQUEUE`, `_CANCEL` and `_RESEND` (frames 15–20), reaches the core as
+/// sent, and its `TRANSCRIPT`s (frame 42) reach the client as the core sent
+/// them: what the agent was sent is what the client asked, and the log the
+/// client folded from them is the one a client on the core's own socket is
+/// replayed.
+#[test]
+fn an_agent_sessions_frames_pass_through_a_relay_unchanged() {
+    let mut dir = TempDir::new("relay-agent");
+    let mut relay = Relay::start(Path::new(BIN), &dir.path, &[]);
+    let host = relay.host();
+    dir.track(host.core_pid);
+    let mut client = relay.client("r");
+    assert_eq!(client.welcome.as_ref().unwrap().protocol, 4);
+
+    // The first turn asks permission and ends; the second waits for a
+    // cancel, and the third is the held prompt sent again.
+    let (mut script, record) = started(&dir.path, "relayed");
+    script
+        .step("expect session/prompt")
+        .step(ask("perm-1"))
+        .step(r#"expect-response "perm-1""#)
+        .step(said("first"))
+        .step(stop("end_turn"))
+        .step("expect session/prompt")
+        .step("expect session/cancel")
+        .step(stop("cancelled"))
+        .step("expect session/prompt")
+        .step(said("third"))
+        .step(stop("end_turn"));
+    let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+    dir.track(pid);
+    client.transcript_until(id, "is ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
+
+    // One turn, with a prompt waiting while it is blocked on a permission.
+    client.prompt(id, "one").unwrap();
+    let log = client.transcript_until(id, "waits on the permission", |log| *log.turn() == TurnState::Blocked);
+    let entry = log
+        .entries()
+        .find_map(|(entry, kind)| matches!(kind, Entry::Permission { .. }).then_some(entry.0))
+        .expect("the permission request is in the log");
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the prompt waiting", |log| *log.slot() == Slot::Waiting { text: "two".into() });
+    client.answer(id, entry, Some("allow-once")).unwrap();
+    let user_two = |log: &Transcript| {
+        log.entries().any(|(_, kind)| matches!(kind, Entry::User { text } if text == "two"))
+    };
+    client.transcript_until(id, "runs the waiting prompt's turn", |log| {
+        user_two(log) && *log.slot() == Slot::Empty && *log.turn() == TurnState::Working
+    });
+
+    // A prompt waits, is taken back, waits again, and is held by a cancel.
+    client.prompt(id, "three").unwrap();
+    client.unqueue(id).unwrap();
+    client.transcript_until(id, "has the slot empty", |log| *log.slot() == Slot::Empty);
+    client.prompt(id, "three").unwrap();
+    client.cancel(id);
+    let held = Slot::Held { text: "three".into(), reason: HoldReason::Cancelled };
+    client.transcript_until(id, "holds the prompt", |log| {
+        *log.slot() == held && *log.turn() == TurnState::Ended { stop: StopReason::Cancelled }
+    });
+    // Sent again, it is the next turn.
+    client.resend(id).unwrap();
+    let says_third = |log: &Transcript| {
+        log.entries().any(|(_, kind)| matches!(kind, Entry::Agent { text } if text == "third"))
+    };
+    let relayed = client.transcript_until(id, "has the resent prompt's turn", |log| {
+        says_third(log) && *log.turn() == TurnState::Ended { stop: StopReason::EndTurn }
+    });
+
+    // The agent was sent what the client asked, once each.
+    assert_eq!(prompts(&record), ["one", "two", "three"]);
+    let answers = responses(&record);
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0]["id"], json!("perm-1"));
+    assert_eq!(answers[0]["result"]["outcome"], json!({"outcome": "selected", "optionId": "allow-once"}));
+    assert_eq!(
+        methods(&record),
+        ["initialize", "session/new", "session/prompt", "session/prompt", "session/cancel", "session/prompt"]
+    );
+    // The relayed events folded into the log the core keeps.
+    client.detach(id);
+    // The DETACH is handled before the next request on this connection.
+    assert!(client.list().iter().any(|info| info.session == id && !info.attached));
+    let mut direct = TestClient::hello(&dir.path, "direct");
+    direct.attach_agent(id).unwrap();
+    assert_eq!(direct.transcript(id), relayed);
 }
 
 #[test]
