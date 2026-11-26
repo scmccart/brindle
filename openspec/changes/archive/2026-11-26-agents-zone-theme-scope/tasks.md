@@ -32,7 +32,7 @@ Before starting, check that `agents-profiles` and `agents-markdown` are archived
 
 ## 5. Integration
 
-- [ ] 5.1 Run the integration chore: `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, the gallery's `--check` and `BRINDLE_E2E=1 cargo test --test e2e -- agent cards zone` under `scripts/with-xvfb` (through `systemd-run --user --scope` when run from inside Brindle); verify all pass, including the `cards` and `zone` cases whose colours this change must not move, and report the new checks' lines.
+- [x] 5.1 Run the integration chore: `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, the gallery's `--check` and `BRINDLE_E2E=1 cargo test --test e2e -- agent cards zone` under `scripts/with-xvfb` (through `systemd-run --user --scope` when run from inside Brindle); verify all pass, including the `cards` and `zone` cases whose colours this change must not move, and report the new checks' lines.
 
 ## Workflow follow-up
 
