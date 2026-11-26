@@ -7,9 +7,14 @@
 //! Pure: values in, values out.
 
 pub use brindle_transcript::{
-    Activity, AgentState, Entry, EntryId, Event, HoldReason, NoticeLevel, PermissionKind,
+    Activity, AgentState, Conversation, Entry, EntryId, Event, HoldReason, NoticeLevel, PermissionKind,
     PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState,
 };
+
+/// What the zone's tests build conversations with; the zone itself reads
+/// only whether one is continuable.
+#[cfg(test)]
+pub use brindle_transcript::Continuation;
 
 use crate::remote::protocol::client::AgentActivity;
 use crate::terminal::status::State;

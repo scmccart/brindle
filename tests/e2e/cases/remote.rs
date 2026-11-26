@@ -291,8 +291,11 @@ const AGENT_PROFILE: &str = "Remote Agent";
 /// server in the container, which the first connection deploys, with the
 /// static fake ACP agent copied in to play the agent. `brindle agent
 /// "Remote Agent" -p hi` sends `hi` once the agent is ready and shows its
-/// answer; the agent recorded one prompt, and root's server lists the
-/// session. Skips like the other remote cases, and also when the static
+/// answer; the agent recorded one prompt. The agent then exits, and
+/// `agent_continue` starts the profile's command again in the container,
+/// on the same session, which resumes the conversation: a new prompt
+/// reaches the continued agent alone, and after the quit root's server
+/// lists the one session. Skips like the other remote cases, and also when the static
 /// fake agent isn't built (an error with `BRINDLE_REMOTE_E2E_REQUIRED=1`).
 pub fn agent_ssh(ctx: &Ctx) -> Result<Outcome> {
     let needs = match Needs::check(ctx)? {
@@ -307,52 +310,71 @@ pub fn agent_ssh(ctx: &Ctx) -> Result<Outcome> {
         )));
     };
     let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
-    let (agent, script, received) = ("/usr/local/bin/brindle-fake-acp-agent", "/root/agent.script", "/root/received.jsonl");
+    use super::agent::{EXITED, READY, RESTARTED, RESUME, Script};
+    let agent = "/usr/local/bin/brindle-fake-acp-agent";
+    let (script, next, gate) = ("/root/agent.script", "/root/next.script", "/root/exit");
+    let (first, second) = ("/root/first.jsonl", "/root/second.jsonl");
     ssh.container.copy_to(&fake, agent)?;
     ssh.container.exec(&["chmod", "755", agent])?;
-    let local_script = ctx.dir.join("agent.script");
-    let steps = [
-        format!("record {received}"),
-        "expect initialize".into(),
-        r#"respond {"protocolVersion":1,"agentInfo":{"name":"Fake Agent","version":"1.0"}}"#.into(),
-        "expect session/new".into(),
-        r#"respond {"sessionId":"s1"}"#.into(),
-        "expect session/prompt".into(),
-        r#"send {"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello from the container"}}}}"#.into(),
-        r#"respond {"stopReason":"end_turn"}"#.into(),
-    ];
-    fs::write(&local_script, steps.join("\n") + "\n").map_err(|e| format!("writing {}: {e}", local_script.display()))?;
-    ssh.container.copy_to(&local_script, script)?;
+    // The first agent answers, then exits once the case opens `gate`; the
+    // continue runs the profile's command again, so the case first puts
+    // the second agent's script in the first's place in the container.
+    let first_agent = super::agent::turn_then_exit(Path::new(first), RESUME, Path::new(gate)).write(ctx, "agent")?;
+    let second_agent = Script::initialized(Path::new(second), RESUME)
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(super::agent::says("Again from the container"))
+        .step(super::agent::stop("end_turn"))
+        .write(ctx, "next")?;
+    ssh.container.copy_to(&first_agent, script)?;
+    ssh.container.copy_to(&second_agent, next)?;
 
     let config = ssh.agent_profile(AGENT_PROFILE, agent, script);
+    let (docker, scale) = (ssh.container.docker.clone(), ctx.scale());
     let out = needs
         .run(ctx, "agent", &config)
         .agent(AGENT_PROFILE)
         .first_prompt("hi")
         .keep_detached()
-        .wait_for("agent \"Hello from the container\"")
-        .dump_at(12.0)
+        // Once the first agent has its prompt (it read its script when it
+        // started), the second's script takes its place and the gate opens.
+        .call_at(1.0, move |_| {
+            scale.eventually(60.0, "the first agent's prompt", || {
+                docker.exec(&["cat", first]).is_ok_and(|sent| sent.contains("\"session/prompt\""))
+            })?;
+            docker.exec(&["sh", "-c", &format!("cp {next} {script} && touch {gate}")])?;
+            Ok(())
+        })
+        .wait_for(&super::agent::answered())
+        .wait_for(EXITED)
+        .wait_for("continue=restart")
+        .action("agent_continue")
+        .wait_for(READY)
+        .send("again")
+        .key("enter")
+        .wait_for("agent \"Again from the container\"")
+        .dump_at(25.0)
         .run()?;
-    ensure!(
-        out.dump.wait_timeouts.is_empty() && out.dump.wait_pending.is_empty(),
-        "waits that gave up: {:?}, still waiting: {:?}; agent {:?}",
-        out.dump.wait_timeouts,
-        out.dump.wait_pending,
-        out.dump.agent
-    );
-    ensure!(
-        out.dump.agent_entries() == ["user \"hi\"", "agent \"Hello from the container\""],
-        "entries: {:?}",
-        out.dump.agent
-    );
+    super::agent::waited(&out)?;
+    let want = ["user \"hi\"", "agent \"Hello!\"", "user \"again\"", "agent \"Again from the container\""];
+    ensure!(super::agent::messages(&out) == want, "messages: {:?}", out.dump.agent);
+    ensure!(super::agent::has_notice(&out, RESTARTED), "no restart notice: {:?}", out.dump.agent);
     ensure!(out.dump.agent_field("turn") == Some("ended:end_turn"), "agent: {:?}", out.dump.agent);
-    let sent = ssh.container.exec(&["cat", received])?;
+    ensure!(out.dump.agent_field("session") == Some("open"), "agent: {:?}", out.dump.agent);
+    let prompts = |sent: &str| sent.lines().filter(|line| line.contains("\"session/prompt\"")).count();
+    let sent = ssh.container.exec(&["cat", first])?;
+    ensure!(prompts(&sent) == 1, "the first agent was sent one prompt: {sent}");
+    let sent = ssh.container.exec(&["cat", second])?;
+    ensure!(prompts(&sent) == 1 && sent.contains("\"text\":\"again\""), "the continued agent was sent `again` alone: {sent}");
     ensure!(
-        sent.lines().filter(|line| line.contains("\"session/prompt\"")).count() == 1,
-        "the agent was sent one prompt: {sent}"
+        sent.lines().any(|line| line.contains("\"session/resume\"") && line.contains("\"sessionId\":\"s1\"")),
+        "no session/resume of s1: {sent}"
     );
+    ensure!(!sent.contains("\"session/new\""), "a new conversation was started: {sent}");
     ssh.container.assert_cached_agent("/root/.cache/brindle")?;
-    // Quitting left the agent session detached in root's server.
+    // Quitting left the continued agent's session, the same one, detached
+    // in root's server.
     let listed = parse_list(&ssh.container.helper(&["list"])?);
     ensure!(listed.len() == 1 && !listed[0].attached, "root's server lists {listed:?}");
     Ok(Outcome::Pass)

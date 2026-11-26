@@ -1,9 +1,12 @@
 //! `PromptInput`: AI Elements' prompt input, a [`Textarea`] with a submit
-//! button, a queue row above it and a reason line beside the button.
+//! button, a queue row above it and a reason line beside the button, which
+//! may end with an owner's action button.
 //!
 //! An entity: it owns its [`TextArea`] (the draft) and the focus handles of
 //! its buttons, and the owner gives it a [`PromptStatus`], an optional
-//! [`Queued`] text and an optional reason, and hears back through
+//! [`Queued`] text, an optional reason and an optional action (a labelled
+//! button after the reason: what to do instead, while the input can't
+//! send), and hears back through
 //! [`PromptInputEvent`]s. It never changes its text on its own: a
 //! `Submit` leaves the draft for the owner to clear once the prompt is
 //! taken, and the queue row's buttons ask the owner and touch nothing.
@@ -22,7 +25,8 @@
 //! own escape otherwise.
 //!
 //! Focus stops, for the owner's [`FocusStops`](crate::FocusStops): the text
-//! area ([`Focusable`]), the queue row's enabled buttons
+//! area ([`Focusable`]), the reason line's action while it shows
+//! ([`PromptInput::action_stop`]), the queue row's enabled buttons
 //! ([`PromptInput::row_stops`]) and, while streaming, the stop button
 //! ([`PromptInput::stop_button`]). The submit button takes no focus while
 //! ready, since enter in the text area does what it does. A button the
@@ -72,6 +76,8 @@ pub enum PromptFocus {
     Discard,
     /// The stop button.
     Stop,
+    /// The reason line's action.
+    Action,
 }
 
 /// Whether a held text can be sent again.
@@ -118,6 +124,8 @@ pub enum PromptInputEvent {
     RemoveQueued,
     /// Send the held text again.
     ResendQueued,
+    /// Do what the reason line's action says.
+    Action,
 }
 
 /// What the submit button asks for.
@@ -171,8 +179,11 @@ pub struct PromptInput {
     status: PromptStatus,
     queued: Option<Queued>,
     reason: Option<SharedString>,
+    /// The reason line's action button's label.
+    action: Option<SharedString>,
     held_color: Option<Hsla>,
     stop_handle: FocusHandle,
+    action_handle: FocusHandle,
     remove_handle: FocusHandle,
     resend_handle: FocusHandle,
     discard_handle: FocusHandle,
@@ -198,8 +209,10 @@ impl PromptInput {
             status: PromptStatus::Ready,
             queued: None,
             reason: None,
+            action: None,
             held_color: None,
             stop_handle: cx.focus_handle(),
+            action_handle: cx.focus_handle(),
             remove_handle: cx.focus_handle(),
             resend_handle: cx.focus_handle(),
             discard_handle: cx.focus_handle(),
@@ -267,6 +280,25 @@ impl PromptInput {
         self.reason.as_ref()
     }
 
+    /// A button labelled `label` after the reason, which asks the owner
+    /// ([`PromptInputEvent::Action`]); `None` takes it away, and its focus
+    /// with it (the owner moves focus back to the text area).
+    pub fn set_action(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.action != label {
+            self.action = label;
+            cx.notify();
+        }
+    }
+
+    pub fn action(&self) -> Option<&SharedString> {
+        self.action.as_ref()
+    }
+
+    /// The reason line's action button's handle while it shows.
+    pub fn action_stop(&self) -> Option<FocusHandle> {
+        self.action.as_ref().map(|_| self.action_handle.clone())
+    }
+
     /// The colour of a held text's `not sent` label (the app's warning
     /// colour); the destructive colour by default.
     pub fn set_held_color(&mut self, color: Hsla, cx: &mut Context<Self>) {
@@ -301,6 +333,7 @@ impl PromptInput {
             (self.resend_handle.clone(), PromptFocus::SendAgain),
             (self.discard_handle.clone(), PromptFocus::Discard),
             (self.stop_handle.clone(), PromptFocus::Stop),
+            (self.action_handle.clone(), PromptFocus::Action),
         ];
         stops.into_iter().find(|(handle, _)| handle.is_focused(window)).map(|(_, stop)| stop)
     }
@@ -452,6 +485,16 @@ impl Render for PromptInput {
         let row = self.queued.clone().map(|queued| self.queue_row(&queued, cx));
         let button = self.submit_button(cx);
         let muted = cx.ui_theme().muted_foreground;
+        // An outline button after the reason, at the toolbar's height.
+        let action = self.action.clone().map(|label| {
+            div().debug_selector(|| "prompt-action".into()).flex_none().child(
+                Button::new("prompt-action", label)
+                    .variant(ButtonVariant::Outline)
+                    .size(ButtonSize::Sm)
+                    .focus(&self.action_handle)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PromptInputEvent::Action))),
+            )
+        });
         div()
             .flex()
             .flex_col()
@@ -479,9 +522,17 @@ impl Render for PromptInput {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(rems(0.75))
-                            .text_color(muted)
-                            .when_some(self.reason.clone(), |d, reason| d.child(reason)),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(rems(0.75))
+                                    .text_color(muted)
+                                    .when_some(self.reason.clone(), |d, reason| d.child(reason)),
+                            )
+                            .children(action),
                     )
                     .child(button),
             )
@@ -719,6 +770,36 @@ mod tests {
         click("prompt-queue-resend", cx);
         assert!(take(&events).is_empty());
         assert_eq!(input.read_with(cx, |input, _| input.row_stops()), [stops[1].clone()]);
+    }
+
+    /// An action after the reason asks the owner, by pointer and by key,
+    /// is a stop while it shows and is named by `focused`; taken away, it is
+    /// no stop. The draft is untouched.
+    #[test]
+    fn the_reason_lines_action_asks_the_owner() {
+        let (_, input, events, cx) = host();
+        cx.simulate_input("draft");
+        assert!(input.read_with(cx, |input, _| input.action_stop()).is_none());
+        update(&input, cx, |input, cx| {
+            input.set_status(PromptStatus::Disabled, cx);
+            input.set_reason(Some("the agent has exited".into()), cx);
+            input.set_action(Some("Continue conversation".into()), cx);
+        });
+        let reason = bounds("prompt-action", cx).expect("the action shows");
+        let area = bounds("prompt-area", cx).expect("drawn");
+        assert!(reason.top() >= area.bottom(), "{reason:?} under {area:?}");
+        click("prompt-action", cx);
+        assert_eq!(take(&events), [PromptInputEvent::Action]);
+        let stop = input.read_with(cx, |input, _| input.action_stop()).expect("a stop");
+        cx.update(|window, _| stop.focus(window));
+        cx.run_until_parked();
+        assert_eq!(cx.update(|window, cx| input.read(cx).focused(window, cx)), Some(PromptFocus::Action));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("space");
+        assert_eq!(take(&events), [PromptInputEvent::Action, PromptInputEvent::Action]);
+        assert_eq!(input.read_with(cx, |input, cx| input.text(cx).to_string()), "draft");
+        update(&input, cx, |input, cx| input.set_action(None, cx));
+        assert!(input.read_with(cx, |input, _| input.action_stop()).is_none());
     }
 
     /// Submitted draws the spinner, and a set text replaces the draft.

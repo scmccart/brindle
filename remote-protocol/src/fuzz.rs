@@ -313,6 +313,22 @@ fn the_agent_messages_reject_bad_values_without_panicking() {
         cases.push((client::MSG_AGENT_UNQUEUE, format!(r#"{{"req":{value},"session":1}}"#)));
         cases.push((client::MSG_AGENT_RESEND, format!(r#"{{"req":1,"session":{value}}}"#)));
         cases.push((
+            client::MSG_SPAWN_AGENT,
+            format!(r#"{{"req":1,"command":"a","conversation":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_SPAWN_AGENT,
+            format!(r#"{{"req":1,"command":"a","conversation":{{"id":{value},"cwd":{value}}}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_RESTART,
+            format!(r#"{{"req":{value},"session":{value},"command":{value},"args":{value},"env":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_RESTART,
+            format!(r#"{{"req":1,"session":1,"command":"a","args":[{value}],"env":{{"K":{value}}}}}"#),
+        ));
+        cases.push((
             client::MSG_TRANSCRIPT,
             format!(r#"{{"session":{value},"events":{value}}}"#),
         ));

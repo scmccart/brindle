@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 
 use crate::agent::sink::Sink as AgentSink;
-use crate::agent::spawn::AgentSpawnRequest;
+use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::config::RemoteTarget;
 
 /// What an agent zone's session starts from ([`agent_link`]).
@@ -82,6 +82,12 @@ impl AgentLink {
         self.0.answer(entry, option)
     }
 
+    /// Runs the session's ended agent again to continue its conversation
+    /// (`AGENT_RESTART`), as [`AgentLink::prompt`].
+    pub fn restart(&self, request: AgentRestartRequest) -> Option<protocol::RequestId> {
+        self.0.restart(request)
+    }
+
     /// Cancels the running turn; true when it was sent.
     pub fn cancel(&self) -> bool {
         self.0.cancel()
@@ -124,6 +130,10 @@ impl AgentLink {
     }
 
     pub fn answer(&self, _entry: u64, _option: Option<String>) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn restart(&self, _request: AgentRestartRequest) -> Option<protocol::RequestId> {
         match *self {}
     }
 

@@ -23,6 +23,18 @@
 //!   one notice with its count, written when a message follows, at any
 //!   other input, or at an [`Input::Tick`] once [`BAD_RUN_QUIET`] has passed
 //!   with no more; [`Output::wake`] says when to tick.
+//! - **A conversation can be continued** (OpenSpec change
+//!   `agents-session-recovery`). The transcript names it
+//!   ([`Event::Conversation`]) once `session/new`, `session/resume` or
+//!   `session/load` succeeds. An ended agent ([`Phase::Exited`], or
+//!   [`Phase::Lost`] with its holder) whose conversation can be continued
+//!   ([`AgentSession::continuable`]) is spawned again by [`Input::Restart`]
+//!   into the same log, and a session the server no longer had is started
+//!   by [`AgentSession::continuing`] into a fresh one. After `initialize`,
+//!   [`choose`] picks `session/resume` or `session/load` from what the new
+//!   agent offers; a kept log's load replay is muted (counted, not
+//!   applied), a fresh log's is shown. No continue falls back to
+//!   `session/new`.
 //!
 //! A whole pure module (`fcis` R2, R3; `PURE_MODULES`).
 
@@ -32,8 +44,8 @@ use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::{
-    AgentState, Entry, EntryId, Event, NoticeLevel, PermissionOption, PermissionOutcome, Slot,
-    StopReason, TEXT_CHUNK, Transcript, TurnState, chunks,
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, NoticeLevel, PermissionOption,
+    PermissionOutcome, Slot, StopReason, TEXT_CHUNK, Transcript, TurnState, chunks,
 };
 use brindle_transcript::{HoldReason, ToolKind, ToolStatus};
 
@@ -60,24 +72,37 @@ pub const BAD_RUN_QUIET: Duration = Duration::from_secs(1);
 /// id, why the agent failed).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
-    /// The holder hasn't said the agent started.
-    Spawning,
+    /// The holder hasn't said the agent started; what it starts.
+    Spawning { start: Start },
     /// `initialize` is sent and not answered.
-    Initializing,
-    /// `session/new` is sent and not answered; the name and version the
-    /// agent gave in `initialize`.
-    Creating {
-        name: Option<String>,
-        version: Option<String>,
+    Initializing { start: Start },
+    /// `session/new` is sent and not answered.
+    Creating { greeting: Greeting },
+    /// `session/resume` of conversation `conversation` is sent and not
+    /// answered (OpenSpec change `agents-session-recovery`, decision 2).
+    /// `log` says whether the log holds the conversation's earlier
+    /// messages: a fresh one gets a notice that it doesn't.
+    Resuming {
+        greeting: Greeting,
+        conversation: String,
+        log: Log,
+    },
+    /// `session/load` of conversation `conversation` is sent and not
+    /// answered: the agent replays it first, muted or shown.
+    Loading {
+        greeting: Greeting,
+        conversation: String,
+        replay: Replay,
     },
     /// Takes prompts in the ACP session `session`.
     Ready { session: String },
     /// The agent answered `-32000` (decision 17): nothing more is sent.
     LoginRequired,
     /// The start failed (another ACP version, or an error or unreadable
-    /// answer to `initialize` or `session/new`; decision 4): the agent is
-    /// hung up, and its exit leaves the failed state, adding its stderr as
-    /// a notice.
+    /// answer to `initialize`, `session/new`, `session/resume` or
+    /// `session/load`, or a continue the agent offers no way to make;
+    /// decision 4): the agent is hung up, and its exit leaves the failed
+    /// state, adding its stderr as a notice.
     Refused,
     /// The core's handling of this agent failed (decision 13), or its
     /// checkpoint couldn't be restored (decision 11): its lines are
@@ -85,6 +110,99 @@ pub enum Phase {
     Broken,
     /// The agent's process ended.
     Exited,
+    /// The agent's holder ended, and the agent with it.
+    Lost,
+}
+
+/// What a spawned agent starts: a new conversation, or one it continues
+/// (decisions 2 and 4 of `agents-session-recovery`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    /// `session/new` in the session's directory.
+    New,
+    /// `session/resume` or `session/load` of `conversation`, whichever the
+    /// new agent offers, into the log kept from its earlier agent or into a
+    /// fresh one.
+    Continue {
+        conversation: Conversation,
+        log: Log,
+    },
+}
+
+/// Whether a continued conversation's log is the session's own, kept from
+/// its earlier agent (`AGENT_RESTART`), or a fresh one in a new session
+/// whose server no longer had it (`SPAWN_AGENT` with a conversation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Log {
+    Kept,
+    Fresh,
+}
+
+/// What a `session/load`'s replay does to the log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    /// A kept log already holds it: each update is counted, not applied.
+    Muted { updates: u64 },
+    /// A fresh log takes it as ordinary updates.
+    Shown,
+}
+
+/// What `initialize` said that the agent's ready state and conversation
+/// carry: its name and version, and what it offers for continuing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Greeting {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub continuation: Continuation,
+}
+
+/// How a continue goes on once the new agent has answered `initialize`
+/// (decision 2's table), from what that agent offers, not the earlier one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Choice {
+    /// `session/resume`.
+    Resume,
+    /// `session/load`, its replay muted or shown.
+    Load { replay: Replay },
+    /// Neither is offered: the continue fails.
+    Neither,
+}
+
+/// Decision 2's table: a kept log resumes when it can and otherwise loads
+/// muted; a fresh log loads (shown) when it can and otherwise resumes.
+pub fn choose(log: Log, offered: Continuation) -> Choice {
+    match (log, offered) {
+        (Log::Kept, Continuation::ResumeAndLoad | Continuation::Resume)
+        | (Log::Fresh, Continuation::Resume) => Choice::Resume,
+        (Log::Kept, Continuation::Load) => Choice::Load {
+            replay: Replay::Muted { updates: 0 },
+        },
+        (Log::Fresh, Continuation::ResumeAndLoad | Continuation::Load) => Choice::Load {
+            replay: Replay::Shown,
+        },
+        (Log::Kept | Log::Fresh, Continuation::Neither) => Choice::Neither,
+    }
+}
+
+/// The notice an `AGENT_RESTART` adds before the agent starts again.
+pub const RESTARTED: &str = "the agent was started again to continue the conversation";
+
+/// The notice a fresh log's shown replay starts with.
+pub const REPLAY_SHOWN: &str =
+    "this continues an earlier conversation; what follows is the agent's replay of it";
+
+/// The notice a fresh log gets when the agent could only resume.
+pub const NOT_REPLAYED: &str =
+    "conversation continued; the agent doesn't replay its earlier messages, so they aren't shown";
+
+/// The failure when the continued agent offers neither way to continue.
+pub const CANT_CONTINUE: &str =
+    "the agent can't continue conversations: it offers neither session/load nor session/resume";
+
+/// The notice after a muted replay of `updates` updates.
+fn muted_notice(updates: u64) -> String {
+    let plural = if updates == 1 { "" } else { "s" };
+    format!("conversation continued; the agent's replay of {updates} update{plural} wasn't shown")
 }
 
 /// The kind of text entry a run of chunks grows.
@@ -134,11 +252,27 @@ impl AgentSession {
     /// A session whose agent is being spawned in `cwd` (already absolute,
     /// decision 4), by Brindle at `version`.
     pub fn new(cwd: String, version: String) -> Self {
+        Self::starting(Start::New, cwd, version)
+    }
+
+    /// A new session whose agent is spawned to continue `conversation`,
+    /// in the conversation's own directory, into a fresh log (a
+    /// `SPAWN_AGENT` naming a conversation the server no longer had).
+    pub fn continuing(conversation: Conversation, version: String) -> Self {
+        let cwd = conversation.cwd.clone();
+        let start = Start::Continue {
+            conversation,
+            log: Log::Fresh,
+        };
+        Self::starting(start, cwd, version)
+    }
+
+    fn starting(start: Start, cwd: String, version: String) -> Self {
         Self {
             transcript: Transcript::new(),
             rpc: Rpc::new(),
             lines: Lines::new(),
-            phase: Phase::Spawning,
+            phase: Phase::Spawning { start },
             cwd,
             version,
             run: None,
@@ -149,6 +283,38 @@ impl AgentSession {
 
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// Whether the agent has ended (exited, or lost with its holder) and
+    /// its conversation can be continued: the agent gave an ACP session,
+    /// offered `session/load` or `session/resume`, and didn't fail its
+    /// start (a failed start, a continue's included, stays `Failed`).
+    pub fn continuable(&self) -> bool {
+        let ended = match self.phase {
+            Phase::Exited | Phase::Lost => true,
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
+            | Phase::Ready { .. }
+            | Phase::LoginRequired
+            | Phase::Refused
+            | Phase::Broken => false,
+        };
+        let agent_ended = match self.transcript.agent() {
+            AgentState::Exited { .. } | AgentState::Lost { .. } => true,
+            AgentState::Starting
+            | AgentState::Ready { .. }
+            | AgentState::LoginRequired { .. }
+            | AgentState::Failed { .. } => false,
+        };
+        ended
+            && agent_ended
+            && self
+                .transcript
+                .conversation()
+                .is_some_and(|conversation| conversation.continuation.continuable())
     }
 
     /// The stdout line in progress and the bytes fed, for the checkpoint.
@@ -188,6 +354,13 @@ pub enum Input<'a> {
     /// The agent's process ended (`EXITED`), with the stderr tail the
     /// holder sent before it (`STDERR_TAIL`, at most 16 KiB).
     Exited { code: Option<i32>, stderr: &'a [u8] },
+    /// The agent's holder ended while the core ran, and the agent with it:
+    /// as [`Input::Exited`], but the agent is `Lost` with `message`.
+    Lost { message: &'a str },
+    /// `AGENT_RESTART`: the agent ended and is spawned again to continue
+    /// its conversation in this log. Refused unless
+    /// [`AgentSession::continuable`].
+    Restart,
     /// A command from the client that has the session attached.
     Command(Command),
     /// Handling this session failed in the core (a panic caught around
@@ -226,6 +399,13 @@ pub enum Refused {
         message: String,
     },
     Exited,
+    /// The agent was lost with its holder.
+    Lost,
+    /// An `AGENT_RESTART` for an agent that is still running or starting.
+    NotEnded,
+    /// An `AGENT_RESTART` for an agent whose conversation can't be
+    /// continued (none, neither offered, or a failed start).
+    CannotContinue,
     AlreadyQueued,
     TooLong {
         len: usize,
@@ -253,6 +433,9 @@ impl fmt::Display for Refused {
             }
             Self::Failed { message } => write!(f, "the agent can't take prompts: {message}"),
             Self::Exited => f.write_str("the agent has exited"),
+            Self::Lost => f.write_str("the agent was lost with its holder"),
+            Self::NotEnded => f.write_str("the agent hasn't ended"),
+            Self::CannotContinue => f.write_str("the agent can't continue this conversation"),
             Self::AlreadyQueued => f.write_str("a prompt is already queued"),
             Self::TooLong { len } => write!(
                 f,
@@ -302,8 +485,8 @@ pub struct Output {
     /// Already applied to the session's transcript.
     pub events: Vec<Event>,
     pub stdin: Vec<u8>,
-    /// The answer to a client's command; `None` for other inputs and for a
-    /// cancel, which is never refused here.
+    /// The answer to a client's command or an [`Input::Restart`]; `None`
+    /// for other inputs and for a cancel, which is never refused here.
     pub reply: Option<Result<(), Refused>>,
     pub checkpoint: Option<Moment>,
     /// Close the agent's stdin, then end it after the grace (decision 2).
@@ -330,6 +513,15 @@ pub fn step(session: &mut AgentSession, input: Input<'_>, now: Instant) -> Outpu
         Input::Exited { code, stderr } => {
             step.flush_bad();
             step.exited(code, stderr);
+        }
+        Input::Lost { message } => {
+            step.flush_bad();
+            step.lost(message);
+        }
+        Input::Restart => {
+            step.flush_bad();
+            let reply = step.restart();
+            step.out.reply = Some(reply);
         }
         Input::Command(command) => {
             step.flush_bad();
@@ -480,15 +672,18 @@ impl Step<'_> {
     /// The ACP session id when prompts can be sent, else why not.
     fn readiness(&self) -> Result<String, Refused> {
         match &self.s.phase {
-            Phase::Spawning | Phase::Initializing | Phase::Creating { .. } => {
-                Err(Refused::NotReady)
-            }
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. } => Err(Refused::NotReady),
             Phase::Ready { session } => Ok(session.clone()),
             Phase::LoginRequired => Err(Refused::LoginRequired),
             Phase::Refused | Phase::Broken => Err(Refused::Failed {
                 message: self.failure(),
             }),
             Phase::Exited => Err(Refused::Exited),
+            Phase::Lost => Err(Refused::Lost),
         }
     }
 
@@ -498,31 +693,41 @@ impl Step<'_> {
             AgentState::Starting
             | AgentState::Ready { .. }
             | AgentState::LoginRequired { .. }
-            | AgentState::Exited { .. } => "ACP handling failed".to_owned(),
+            | AgentState::Exited { .. }
+            | AgentState::Lost { .. } => "ACP handling failed".to_owned(),
         }
     }
 
     /// Whether the agent's lines are still read: not after a failed start,
-    /// a failed handling or an exit.
+    /// a failed handling, an exit or a lost holder.
     fn reading(&self) -> bool {
         match self.s.phase {
-            Phase::Spawning
-            | Phase::Initializing
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
             | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
             | Phase::Ready { .. }
             | Phase::LoginRequired => true,
-            Phase::Refused | Phase::Broken | Phase::Exited => false,
+            Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost => false,
         }
+    }
+
+    /// Whether the agent's process has ended, by an exit or with its
+    /// holder.
+    fn ended(&self) -> bool {
+        matches!(self.s.phase, Phase::Exited | Phase::Lost)
     }
 
     // --- holder events --------------------------------------------------
 
     fn spawned(&mut self) {
-        if self.s.phase != Phase::Spawning {
+        let Phase::Spawning { start } = &self.s.phase else {
             return;
-        }
+        };
+        let start = start.clone();
         let line = self.s.rpc.initialize(&self.s.version);
-        self.s.phase = Phase::Initializing;
+        self.s.phase = Phase::Initializing { start };
         self.out.stdin.extend(line);
         self.mark(Moment::BeforeRequest);
     }
@@ -552,7 +757,7 @@ impl Step<'_> {
 
     fn output_lost(&mut self) {
         self.s.lines.cut_front();
-        if self.s.phase == Phase::Exited {
+        if self.ended() {
             return;
         }
         self.notice(
@@ -569,27 +774,62 @@ impl Step<'_> {
             self.mark(Moment::TurnEnded);
         }
         let starting = match self.s.phase {
-            Phase::Initializing => self.s.rpc.forget(Purpose::Initialize),
+            Phase::Initializing { .. } => self.s.rpc.forget(Purpose::Initialize),
             Phase::Creating { .. } => self.s.rpc.forget(Purpose::NewSession),
-            Phase::Spawning
+            Phase::Resuming { .. } => self.s.rpc.forget(Purpose::Resume),
+            Phase::Loading { .. } => self.s.rpc.forget(Purpose::Load),
+            Phase::Spawning { .. }
             | Phase::Ready { .. }
             | Phase::LoginRequired
             | Phase::Refused
             | Phase::Broken
-            | Phase::Exited => false,
+            | Phase::Exited
+            | Phase::Lost => false,
         };
         if starting {
-            self.refuse(format!("the agent couldn't start: {lost}"));
+            let message = match self.s.phase {
+                Phase::Resuming { .. } | Phase::Loading { .. } => {
+                    format!("the agent couldn't continue the conversation: {lost}")
+                }
+                Phase::Spawning { .. }
+                | Phase::Initializing { .. }
+                | Phase::Creating { .. }
+                | Phase::Ready { .. }
+                | Phase::LoginRequired
+                | Phase::Refused
+                | Phase::Broken
+                | Phase::Exited
+                | Phase::Lost => format!("the agent couldn't start: {lost}"),
+            };
+            self.refuse(message);
         }
     }
 
     fn exited(&mut self, code: Option<i32>, stderr: &[u8]) {
-        if self.s.phase == Phase::Exited {
+        let stderr = bound(clean(&String::from_utf8_lossy(stderr)));
+        self.end(Phase::Exited, AgentState::Exited { code, stderr });
+    }
+
+    fn lost(&mut self, message: &str) {
+        self.end(
+            Phase::Lost,
+            AgentState::Lost {
+                message: bound(clean(message)),
+            },
+        );
+    }
+
+    /// The agent's process ended (`phase` says how): its waiting permission
+    /// requests are recorded cancelled, a waiting prompt is held, a running
+    /// turn fails, and the agent takes `state`. After a refused start the
+    /// failure stays the agent's state, and an exit's stderr is a notice.
+    /// Nothing more happens once it has ended.
+    fn end(&mut self, phase: Phase, state: AgentState) {
+        if self.ended() {
             return;
         }
-        let stderr = bound(clean(&String::from_utf8_lossy(stderr)));
         let refused = self.s.phase == Phase::Refused;
-        self.s.phase = Phase::Exited;
+        self.s.phase = phase;
         for (entry, _) in self.s.rpc.cancel_permissions() {
             self.emit(Event::Answered {
                 id: entry,
@@ -598,11 +838,17 @@ impl Step<'_> {
         }
         if refused {
             // Decision 4: the version message stays the last agent state.
-            if !stderr.trim().is_empty() {
-                self.notice(
-                    NoticeLevel::Warning,
-                    format!("the agent's standard error:\n{stderr}"),
-                );
+            match &state {
+                AgentState::Exited { stderr, .. } if !stderr.trim().is_empty() => {
+                    let text = format!("the agent's standard error:\n{stderr}");
+                    self.notice(NoticeLevel::Warning, text);
+                }
+                AgentState::Exited { .. }
+                | AgentState::Lost { .. }
+                | AgentState::Starting
+                | AgentState::Ready { .. }
+                | AgentState::LoginRequired { .. }
+                | AgentState::Failed { .. } => {}
             }
         } else {
             self.hold_waiting(HoldReason::AgentStopped);
@@ -612,9 +858,41 @@ impl Step<'_> {
                     message: "the agent exited".to_owned(),
                 });
             }
-            self.agent(AgentState::Exited { code, stderr });
+            self.agent(state);
         }
         self.mark(Moment::Stopped);
+    }
+
+    /// `AGENT_RESTART` (decision 4): an ended agent whose conversation can
+    /// be continued is spawned again into this log. The old agent's
+    /// requests are dead with it, its stdout's line is gone (the new
+    /// agent's holder session counts from 0), and the request ids go on.
+    /// No checkpoint: the session has no holder until the spawn is placed,
+    /// and [`Input::Spawned`] checkpoints before `initialize`.
+    fn restart(&mut self) -> Result<(), Refused> {
+        if !self.ended() {
+            return Err(Refused::NotEnded);
+        }
+        if !self.s.continuable() {
+            return Err(Refused::CannotContinue);
+        }
+        let Some(conversation) = self.s.transcript.conversation().cloned() else {
+            return Err(Refused::CannotContinue);
+        };
+        self.s.rpc.restart();
+        self.s.lines = Lines::new();
+        self.s.run = None;
+        self.s.tools.clear();
+        self.s.bad = None;
+        self.s.phase = Phase::Spawning {
+            start: Start::Continue {
+                conversation,
+                log: Log::Kept,
+            },
+        };
+        self.notice(NoticeLevel::Info, RESTARTED.to_owned());
+        self.agent(AgentState::Starting);
+        Ok(())
     }
 
     /// The start failed (decision 4): the agent fails with `message`, is
@@ -633,7 +911,7 @@ impl Step<'_> {
     /// prompt is held, and the agent is left running.
     fn fail(&mut self, reason: &str) {
         self.fault = None;
-        if self.s.phase == Phase::Exited {
+        if self.ended() {
             return;
         }
         self.s.phase = Phase::Broken;
@@ -720,6 +998,9 @@ impl Step<'_> {
                         self.flush_bad();
                         self.update(update);
                     }
+                    // A muted replay counts even an update Brindle can't
+                    // read: it would show nothing either way.
+                    Err(_) if self.mute() => {}
                     Err(_) => self.bad_line(),
                 },
                 NotificationKind::CancelRequest => match wire::cancel_request(&params) {
@@ -748,10 +1029,53 @@ impl Step<'_> {
         }
     }
 
+    /// Counts an update of a muted replay, saying whether it was one.
+    fn mute(&mut self) -> bool {
+        match &mut self.s.phase {
+            Phase::Loading {
+                replay: Replay::Muted { updates },
+                ..
+            } => {
+                *updates = updates.saturating_add(1);
+                true
+            }
+            Phase::Loading {
+                replay: Replay::Shown,
+                ..
+            }
+            | Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Ready { .. }
+            | Phase::LoginRequired
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => false,
+        }
+    }
+
     fn update(&mut self, update: wire::SessionUpdate) {
-        if let Phase::Ready { session } = &self.s.phase
-            && *session != update.session_id
-        {
+        // Only the conversation's own updates count once it is known.
+        let own = match &self.s.phase {
+            Phase::Ready { session: id }
+            | Phase::Resuming {
+                conversation: id, ..
+            }
+            | Phase::Loading {
+                conversation: id, ..
+            } => *id == update.session_id,
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::LoginRequired
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => true,
+        };
+        if !own || self.mute() {
             return;
         }
         match update.update {
@@ -991,13 +1315,15 @@ impl Step<'_> {
             Purpose::Initialize => self.initialized(result),
             Purpose::NewSession => self.created(result),
             Purpose::Prompt => self.prompted(result),
+            Purpose::Resume | Purpose::Load => self.continued(result),
         }
     }
 
     fn initialized(&mut self, result: Result<&Value, &RpcError>) {
-        if self.s.phase != Phase::Initializing {
+        let Phase::Initializing { start } = &self.s.phase else {
             return;
-        }
+        };
+        let start = start.clone();
         match result {
             Ok(result) => match wire::initialize_result(result) {
                 Ok(initialized) if initialized.protocol_version == PROTOCOL_VERSION => {
@@ -1007,10 +1333,12 @@ impl Step<'_> {
                             Some(bound(clean(&agent.version))),
                         )
                     });
-                    let line = self.s.rpc.new_session(&self.s.cwd);
-                    self.s.phase = Phase::Creating { name, version };
-                    self.out.stdin.extend(line);
-                    self.mark(Moment::BeforeRequest);
+                    let greeting = Greeting {
+                        name,
+                        version,
+                        continuation: initialized.continuation,
+                    };
+                    self.start(start, greeting);
                 }
                 Ok(initialized) => self.refuse(format!(
                     "the agent speaks ACP version {}; Brindle speaks {PROTOCOL_VERSION}",
@@ -1041,36 +1369,162 @@ impl Step<'_> {
         }
     }
 
+    /// After `initialize`: `session/new` for a new conversation, else
+    /// `session/resume` or `session/load` by decision 2's table (a shown
+    /// replay's notice first), or a refusal when neither is offered. No
+    /// continue falls back to `session/new`.
+    fn start(&mut self, start: Start, greeting: Greeting) {
+        let (conversation, log) = match start {
+            Start::New => {
+                let line = self.s.rpc.new_session(&self.s.cwd);
+                self.s.phase = Phase::Creating { greeting };
+                self.out.stdin.extend(line);
+                self.mark(Moment::BeforeRequest);
+                return;
+            }
+            Start::Continue { conversation, log } => (conversation, log),
+        };
+        let line = match choose(log, greeting.continuation) {
+            Choice::Resume => {
+                let line = self.s.rpc.resume(&conversation.id, &conversation.cwd);
+                self.s.phase = Phase::Resuming {
+                    greeting,
+                    conversation: conversation.id,
+                    log,
+                };
+                line
+            }
+            Choice::Load { replay } => {
+                if replay == Replay::Shown {
+                    self.notice(NoticeLevel::Info, REPLAY_SHOWN.to_owned());
+                }
+                let line = self.s.rpc.load(&conversation.id, &conversation.cwd);
+                self.s.phase = Phase::Loading {
+                    greeting,
+                    conversation: conversation.id,
+                    replay,
+                };
+                line
+            }
+            Choice::Neither => return self.refuse(CANT_CONTINUE.to_owned()),
+        };
+        self.out.stdin.extend(line);
+        self.mark(Moment::BeforeRequest);
+    }
+
     fn created(&mut self, result: Result<&Value, &RpcError>) {
-        let Phase::Creating { name, version } = &self.s.phase else {
+        let Phase::Creating { greeting } = &self.s.phase else {
             return;
         };
-        let (name, version) = (name.clone(), version.clone());
+        let greeting = greeting.clone();
         match result {
             Ok(result) => match wire::new_session_result(result) {
-                Ok(created) => {
-                    self.s.phase = Phase::Ready {
-                        session: created.session_id,
-                    };
-                    self.agent(AgentState::Ready { name, version });
-                    self.mark(Moment::Started);
-                }
+                Ok(created) => self.ready(created.session_id, greeting, None),
                 Err(_) => self.refuse(
                     "the agent's answer to session/new isn't one Brindle can read".to_owned(),
                 ),
             },
-            Err(error) if error.code == AUTH_REQUIRED => {
-                self.s.phase = Phase::LoginRequired;
-                self.agent(AgentState::LoginRequired {
-                    message: bound(clean(&error.message)),
-                });
-                self.mark(Moment::Started);
-            }
+            Err(error) if error.code == AUTH_REQUIRED => self.login_required(error),
             Err(error) => self.refuse(format!(
                 "the agent couldn't start a session: {}",
                 clean(&error.message)
             )),
         }
+    }
+
+    /// `session/resume`'s or `session/load`'s answer (decision 4 of
+    /// `agents-session-recovery`): the conversation continues in the same
+    /// ACP session, with the notice its way calls for; `-32000` needs a
+    /// login; any other error, or an answer Brindle can't read, fails it.
+    fn continued(&mut self, result: Result<&Value, &RpcError>) {
+        let (greeting, conversation, notice, method) = match &self.s.phase {
+            Phase::Resuming {
+                greeting,
+                conversation,
+                log,
+            } => {
+                let notice = match log {
+                    Log::Kept => None,
+                    Log::Fresh => Some((NoticeLevel::Warning, NOT_REPLAYED.to_owned())),
+                };
+                (greeting, conversation, notice, "session/resume")
+            }
+            Phase::Loading {
+                greeting,
+                conversation,
+                replay,
+            } => {
+                let notice = match replay {
+                    Replay::Muted { updates } => Some((NoticeLevel::Info, muted_notice(*updates))),
+                    Replay::Shown => None,
+                };
+                (greeting, conversation, notice, "session/load")
+            }
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Ready { .. }
+            | Phase::LoginRequired
+            | Phase::Refused
+            | Phase::Broken
+            | Phase::Exited
+            | Phase::Lost => return,
+        };
+        let (greeting, conversation) = (greeting.clone(), conversation.clone());
+        let readable = match result {
+            Ok(result) if method == "session/load" => wire::load_result(result).is_ok(),
+            Ok(result) => wire::resume_result(result).is_ok(),
+            Err(error) if error.code == AUTH_REQUIRED => return self.login_required(error),
+            Err(error) => {
+                return self.refuse(format!(
+                    "the agent couldn't continue the conversation: {}",
+                    clean(&error.message)
+                ));
+            }
+        };
+        if !readable {
+            return self.refuse(format!(
+                "the agent couldn't continue the conversation: its answer to {method} isn't one Brindle can read"
+            ));
+        }
+        // The replay's last chunk is no run a live chunk extends.
+        self.s.run = None;
+        self.ready(conversation, greeting, notice);
+    }
+
+    /// The agent takes prompts in ACP session `session`: the conversation,
+    /// then `notice` when there is one, then the ready state.
+    fn ready(
+        &mut self,
+        session: String,
+        greeting: Greeting,
+        notice: Option<(NoticeLevel, String)>,
+    ) {
+        self.emit(Event::Conversation {
+            conversation: Conversation {
+                id: session.clone(),
+                cwd: self.s.cwd.clone(),
+                continuation: greeting.continuation,
+            },
+        });
+        if let Some((level, text)) = notice {
+            self.notice(level, text);
+        }
+        self.s.phase = Phase::Ready { session };
+        self.agent(AgentState::Ready {
+            name: greeting.name,
+            version: greeting.version,
+        });
+        self.mark(Moment::Started);
+    }
+
+    /// `-32000` to a start request (decision 17): nothing more is sent.
+    fn login_required(&mut self, error: &RpcError) {
+        self.s.phase = Phase::LoginRequired;
+        self.agent(AgentState::LoginRequired {
+            message: bound(clean(&error.message)),
+        });
+        self.mark(Moment::Started);
     }
 
     fn prompted(&mut self, result: Result<&Value, &RpcError>) {
@@ -1249,12 +1703,14 @@ impl Step<'_> {
 
     fn answer(&mut self, entry: EntryId, option: Option<String>) -> Result<(), Refused> {
         match self.s.phase {
-            Phase::Refused | Phase::Broken | Phase::Exited => {
+            Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost => {
                 self.readiness()?;
             }
-            Phase::Spawning
-            | Phase::Initializing
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
             | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
             | Phase::Ready { .. }
             | Phase::LoginRequired => {}
         }
@@ -1309,7 +1765,8 @@ impl Step<'_> {
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
-            | Event::Agent { .. } => return,
+            | Event::Agent { .. }
+            | Event::Conversation { .. } => return,
         };
         self.out.events.push(event);
         self.s.tools.retain(|_, entry| *entry > through);
@@ -1659,6 +2116,7 @@ mod tests {
                 },
                 Event::Turn { state } => format!("turn {}", turn_name(state)),
                 Event::Agent { state } => format!("agent {}", agent_name(state)),
+                Event::Conversation { .. } => "conversation".into(),
                 Event::Trimmed { .. } => "trimmed".into(),
             })
             .collect()
@@ -1693,6 +2151,7 @@ mod tests {
             AgentState::LoginRequired { .. } => "login required",
             AgentState::Failed { .. } => "failed",
             AgentState::Exited { .. } => "exited",
+            AgentState::Lost { .. } => "lost",
         }
     }
 
@@ -1721,7 +2180,7 @@ mod tests {
             b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\"clientCapabilities\":{},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"0.3.0\"}}}\n"
         );
         assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
-        assert_eq!(*agent.s.phase(), Phase::Initializing);
+        assert_eq!(*agent.s.phase(), Phase::Initializing { start: Start::New });
         assert!(agent.step(Input::Spawned).stdin.is_empty(), "spawned twice");
     }
 
@@ -1874,6 +2333,7 @@ mod tests {
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
+            | Event::Conversation { .. }
             | Event::Trimmed { .. } => None,
         });
         assert!(matches!(last_agent, Some(AgentState::Failed { .. })));
@@ -2786,6 +3246,7 @@ mod tests {
                 | Event::Queue { .. }
                 | Event::Turn { .. }
                 | Event::Agent { .. }
+                | Event::Conversation { .. }
                 | Event::Trimmed { .. } => None,
             })
             .collect();
@@ -3645,5 +4106,697 @@ mod tests {
             ["6 lines from the agent weren't ACP messages"]
         );
         assert_eq!(*agent.agent_state(), AgentState::Starting);
+    }
+
+    // --- continuing a conversation (agents-session-recovery) -------------
+
+    /// `initialize`'s answer offering `capabilities`.
+    fn initialized(id: u64, capabilities: Value) -> String {
+        result(
+            id,
+            json!({"protocolVersion": 1, "agentCapabilities": capabilities,
+                   "agentInfo": {"name": "fake", "version": "2.0"}}),
+        )
+    }
+
+    fn both() -> Value {
+        json!({"loadSession": true, "sessionCapabilities": {"resume": {}}})
+    }
+
+    fn load_only() -> Value {
+        json!({"loadSession": true, "sessionCapabilities": {"list": {}}})
+    }
+
+    fn resume_only() -> Value {
+        json!({"sessionCapabilities": {"resume": {}}})
+    }
+
+    fn conversation_s1(continuation: Continuation) -> Conversation {
+        Conversation {
+            id: "s1".into(),
+            cwd: "/home/u/src".into(),
+            continuation,
+        }
+    }
+
+    impl Agent {
+        /// Ready in ACP session `s1`, its agent offering `capabilities`.
+        fn ready_offering(capabilities: Value) -> Self {
+            let mut agent = Self::new();
+            agent.step(Input::Spawned);
+            agent.feed(&initialized(1, capabilities));
+            agent.feed(&result(2, json!({"sessionId": "s1"})));
+            agent
+        }
+
+        /// Ready offering both, one turn done ("first" → "Done."), then the
+        /// agent exited with status 1.
+        fn ended() -> Self {
+            let mut agent = Self::ready_offering(both());
+            let id = agent.turn("first");
+            agent.feed(&said("Done."));
+            agent.end(id, "end_turn");
+            agent.exit();
+            agent
+        }
+
+        fn exit(&mut self) -> Output {
+            self.step(Input::Exited {
+                code: Some(1),
+                stderr: b"",
+            })
+        }
+
+        /// `AGENT_RESTART`, then the holder's `SPAWNED`: returns the
+        /// `initialize` id sent.
+        fn restart(&mut self) -> u64 {
+            assert_eq!(self.step(Input::Restart).reply, Some(Ok(())));
+            self.step(Input::Spawned);
+            self.last("initialize")["id"].as_u64().expect("an id")
+        }
+
+        /// The lines sent from the `n`th on.
+        fn sent_since(&self, n: usize) -> &[Value] {
+            &self.sent[n..]
+        }
+    }
+
+    #[test]
+    fn the_start_choice_follows_decision_2s_table() {
+        let muted = Choice::Load {
+            replay: Replay::Muted { updates: 0 },
+        };
+        let shown = Choice::Load {
+            replay: Replay::Shown,
+        };
+        for (log, offered, choice) in [
+            (Log::Kept, Continuation::ResumeAndLoad, Choice::Resume),
+            (Log::Kept, Continuation::Resume, Choice::Resume),
+            (Log::Kept, Continuation::Load, muted),
+            (Log::Kept, Continuation::Neither, Choice::Neither),
+            (Log::Fresh, Continuation::ResumeAndLoad, shown),
+            (Log::Fresh, Continuation::Load, shown),
+            (Log::Fresh, Continuation::Resume, Choice::Resume),
+            (Log::Fresh, Continuation::Neither, Choice::Neither),
+        ] {
+            assert_eq!(choose(log, offered), choice, "{log:?} {offered:?}");
+        }
+    }
+
+    // 2.1: the conversation is named.
+
+    #[test]
+    fn a_new_session_names_its_conversation_before_the_ready_state() {
+        let mut agent = Agent::in_dir("/home/u/src");
+        agent.step(Input::Spawned);
+        agent.feed(&initialized(1, both()));
+        let out = agent.feed(&result(2, json!({"sessionId": "s1"})));
+        assert_eq!(shape(&out.events), ["conversation", "agent ready"]);
+        assert_eq!(
+            out.events[0],
+            Event::Conversation {
+                conversation: conversation_s1(Continuation::ResumeAndLoad)
+            }
+        );
+        assert_eq!(out.checkpoint, Some(Moment::Started));
+        // What the agent offered is what the conversation says.
+        for (capabilities, continuation) in [
+            (load_only(), Continuation::Load),
+            (resume_only(), Continuation::Resume),
+            (json!({}), Continuation::Neither),
+        ] {
+            let agent = Agent::ready_offering(capabilities);
+            assert_eq!(
+                agent.s.transcript().conversation(),
+                Some(&conversation_s1(continuation))
+            );
+        }
+    }
+
+    #[test]
+    fn an_exit_leaves_the_conversation_in_the_log_and_its_replay() {
+        let agent = Agent::ended();
+        assert!(matches!(agent.agent_state(), AgentState::Exited { .. }));
+        let conversation = conversation_s1(Continuation::ResumeAndLoad);
+        assert_eq!(agent.s.transcript().conversation(), Some(&conversation));
+        assert!(agent.s.transcript().replay().contains(&Event::Conversation { conversation }));
+        assert!(agent.s.continuable());
+    }
+
+    #[test]
+    fn only_an_ended_agent_with_a_conversation_it_offered_to_continue_is_continuable() {
+        assert!(!Agent::new().s.continuable(), "no conversation yet");
+        assert!(!Agent::ready_offering(both()).s.continuable(), "still running");
+        let mut neither = Agent::ready_offering(json!({}));
+        neither.exit();
+        assert!(!neither.s.continuable(), "neither offered");
+        let mut never = Agent::new();
+        never.step(Input::Spawned);
+        never.feed(&initialized(1, both()));
+        never.exit();
+        assert!(!never.s.continuable(), "no ACP session was given");
+        let mut lost = Agent::ready_offering(load_only());
+        lost.step(Input::Lost {
+            message: "its holder ended",
+        });
+        assert!(lost.s.continuable());
+    }
+
+    // 2.2: the start choice after the new agent's `initialize`.
+
+    #[test]
+    fn a_kept_log_resumes_when_the_new_agent_offers_resume() {
+        let mut agent = Agent::ended();
+        let before = agent.sent.len();
+        let id = agent.restart();
+        let out = agent.feed(&initialized(id, both()));
+        assert_eq!(
+            agent.sent_since(before).last(),
+            Some(&json!({"jsonrpc": "2.0", "id": id + 1, "method": "session/resume",
+                "params": {"sessionId": "s1", "cwd": "/home/u/src", "mcpServers": []}}))
+        );
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+        assert!(matches!(agent.s.phase(), Phase::Resuming { log: Log::Kept, .. }));
+        let out = agent.feed(&result(id + 1, json!({})));
+        assert_eq!(shape(&out.events), ["conversation", "agent ready"]);
+        assert_eq!(out.checkpoint, Some(Moment::Started));
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Ready {
+                name: Some("fake".into()),
+                version: Some("2.0".into())
+            }
+        );
+        assert_eq!(*agent.s.phase(), Phase::Ready { session: "s1".into() });
+        let methods: Vec<&str> = agent
+            .sent_since(before)
+            .iter()
+            .filter_map(|line| line["method"].as_str())
+            .collect();
+        assert_eq!(methods, ["initialize", "session/resume"], "no session/new");
+    }
+
+    #[test]
+    fn a_kept_log_loads_muted_when_the_new_agent_offers_only_load() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        agent.feed(&initialized(id, load_only()));
+        assert_eq!(
+            *agent.last("session/load"),
+            json!({"jsonrpc": "2.0", "id": id + 1, "method": "session/load",
+                "params": {"sessionId": "s1", "cwd": "/home/u/src", "mcpServers": []}})
+        );
+        assert!(matches!(
+            agent.s.phase(),
+            Phase::Loading {
+                replay: Replay::Muted { updates: 0 },
+                ..
+            }
+        ));
+        assert!(!agent.sent_methods().contains(&"session/resume"));
+    }
+
+    #[test]
+    fn a_fresh_log_loads_and_shows_the_replay_after_its_notice() {
+        let mut agent = Agent::in_dir("/ignored");
+        agent.s = AgentSession::continuing(
+            conversation_s1(Continuation::Load),
+            "0.3.0".into(),
+        );
+        assert_eq!(agent.s.cwd(), "/home/u/src", "the conversation's directory");
+        agent.step(Input::Spawned);
+        let out = agent.feed(&initialized(1, both()));
+        assert_eq!(shape(&out.events), ["added notice"]);
+        assert_eq!(agent.notices(), [REPLAY_SHOWN]);
+        assert_eq!(agent.last("session/load")["params"]["sessionId"], "s1");
+        assert!(!agent.sent_methods().contains(&"session/new"));
+    }
+
+    #[test]
+    fn a_fresh_log_resumes_with_a_warning_when_the_agent_offers_only_resume() {
+        let mut agent = Agent::new();
+        agent.s = AgentSession::continuing(conversation_s1(Continuation::Resume), "0.3.0".into());
+        agent.step(Input::Spawned);
+        agent.feed(&initialized(1, resume_only()));
+        assert_eq!(agent.last("session/resume")["params"]["sessionId"], "s1");
+        let out = agent.feed(&result(2, json!({})));
+        assert_eq!(
+            shape(&out.events),
+            ["conversation", "added notice", "agent ready"]
+        );
+        assert!(matches!(
+            agent.last_entry().1,
+            Entry::Notice { level: NoticeLevel::Warning, text } if text == NOT_REPLAYED
+        ));
+        assert_eq!(
+            agent.s.transcript().conversation(),
+            Some(&conversation_s1(Continuation::Resume))
+        );
+    }
+
+    #[test]
+    fn a_new_agent_offering_neither_is_refused_and_sent_nothing_more() {
+        let mut agent = Agent::ended();
+        let before = agent.sent.len();
+        let id = agent.restart();
+        let out = agent.feed(&initialized(id, json!({})));
+        assert!(out.hang_up);
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: CANT_CONTINUE.into()
+            }
+        );
+        assert_eq!(agent.sent_since(before).len(), 1, "only initialize");
+        agent.exit();
+        assert!(matches!(agent.agent_state(), AgentState::Failed { .. }));
+        assert!(!agent.s.continuable(), "the session ends as after a mismatch");
+        assert_eq!(
+            agent.step(Input::Restart).reply,
+            Some(Err(Refused::CannotContinue))
+        );
+    }
+
+    // 2.3: the replay, muted or shown.
+
+    #[test]
+    fn a_muted_replay_of_7_updates_leaves_the_log_as_it_was_plus_one_notice() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        let kept = agent.entries();
+        let next = agent.s.transcript().next_id();
+        agent.feed(&initialized(id, load_only()));
+        for line in [
+            chunk("user_message_chunk", "first"),
+            said("Done."),
+            chunk("agent_thought_chunk", "hmm"),
+            tool_call("call_9", "Edit", "completed"),
+            tool_update("call_9", "completed"),
+            update(json!({"sessionUpdate": "available_commands_update", "availableCommands": []})),
+            // One Brindle can't read still counts.
+            update(json!({"sessionUpdate": "agent_message_chunk"})),
+        ] {
+            assert!(agent.feed(&line).events.is_empty(), "{line}");
+        }
+        // Another conversation's update isn't counted.
+        agent.feed(
+            &json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s2",
+                "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "x"}}}})
+            .to_string(),
+        );
+        assert_eq!(agent.entries(), kept);
+        let out = agent.feed(&result(id + 1, json!(null)));
+        assert_eq!(
+            shape(&out.events),
+            ["conversation", "added notice", "agent ready"]
+        );
+        let mut expected = kept;
+        expected.push(Entry::Notice {
+            level: NoticeLevel::Info,
+            text: "conversation continued; the agent's replay of 7 updates wasn't shown".into(),
+        });
+        assert_eq!(agent.entries(), expected);
+        assert_eq!(agent.last_entry().0, next);
+        assert_eq!(*agent.turn_state(), ended(StopReason::EndTurn), "no turn");
+        // A live chunk afterwards is a new entry, not the old run's.
+        agent.feed(&said("Back."));
+        assert!(matches!(agent.last_entry().1, Entry::Agent { text } if text == "Back."));
+    }
+
+    #[test]
+    fn a_muted_count_of_one_update_is_singular() {
+        assert_eq!(
+            muted_notice(1),
+            "conversation continued; the agent's replay of 1 update wasn't shown"
+        );
+    }
+
+    #[test]
+    fn a_shown_replay_of_a_user_and_an_agent_message_gives_two_entries() {
+        let mut agent = Agent::new();
+        agent.s = AgentSession::continuing(conversation_s1(Continuation::Load), "0.3.0".into());
+        agent.step(Input::Spawned);
+        agent.feed(&initialized(1, both()));
+        agent.feed(&chunk("user_message_chunk", "hi"));
+        agent.feed(&said("hel"));
+        agent.feed(&said("lo"));
+        let out = agent.feed(&result(2, json!({})));
+        assert_eq!(shape(&out.events), ["conversation", "agent ready"]);
+        assert_eq!(
+            agent.entries(),
+            [
+                Entry::Notice {
+                    level: NoticeLevel::Info,
+                    text: REPLAY_SHOWN.into()
+                },
+                Entry::User { text: "hi".into() },
+                Entry::Agent {
+                    text: "hello".into()
+                },
+            ]
+        );
+        assert_eq!(*agent.turn_state(), TurnState::Idle);
+        assert_eq!(agent.activity(), Activity::Idle);
+        agent.feed(&said("again"));
+        assert_eq!(agent.entries().len(), 4, "the replay's run ended");
+    }
+
+    #[test]
+    fn a_permission_request_during_a_muted_load_is_logged_and_answerable() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        agent.feed(&initialized(id, load_only()));
+        let entry = agent.ask(json!(0), &ALLOW_REJECT);
+        assert!(matches!(
+            agent.last_entry().1,
+            Entry::Permission { outcome: None, .. }
+        ));
+        agent.feed(&result(id + 1, json!({})));
+        assert_eq!(
+            agent
+                .cmd(Command::Answer {
+                    entry,
+                    option: Some("allow-once".into())
+                })
+                .reply,
+            Some(Ok(()))
+        );
+        assert_eq!(agent.sent.last().map(|line| &line["id"]), Some(&json!(0)));
+    }
+
+    // 2.4: the answers to session/resume and session/load.
+
+    #[test]
+    fn a_continue_answered_32000_needs_a_login_and_keeps_the_agent() {
+        for capabilities in [both(), load_only()] {
+            let mut agent = Agent::ended();
+            let id = agent.restart();
+            agent.feed(&initialized(id, capabilities));
+            let out = agent.feed(&error(id + 1, AUTH_REQUIRED, "log in first"));
+            assert!(!out.hang_up);
+            assert_eq!(
+                *agent.agent_state(),
+                AgentState::LoginRequired {
+                    message: "log in first".into()
+                }
+            );
+            assert_eq!(*agent.s.phase(), Phase::LoginRequired);
+        }
+    }
+
+    #[test]
+    fn a_continue_answered_with_another_error_fails_and_hangs_up() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        agent.feed(&initialized(id, both()));
+        let out = agent.feed(&error(id + 1, -32603, "no such session"));
+        assert!(out.hang_up);
+        let failed = AgentState::Failed {
+            message: "the agent couldn't continue the conversation: no such session".into(),
+        };
+        assert_eq!(*agent.agent_state(), failed);
+        assert_eq!(out.checkpoint, Some(Moment::Stopped));
+        agent.step(Input::Exited {
+            code: Some(0),
+            stderr: b"bye\n",
+        });
+        assert_eq!(*agent.agent_state(), failed, "its exit leaves the failure");
+        assert!(!agent.s.continuable());
+    }
+
+    #[test]
+    fn an_unreadable_continue_answer_fails_naming_the_request() {
+        for (capabilities, method) in [(both(), "session/resume"), (load_only(), "session/load")] {
+            let mut agent = Agent::ended();
+            let id = agent.restart();
+            agent.feed(&initialized(id, capabilities));
+            let out = agent.feed(&result(id + 1, json!("done")));
+            assert!(out.hang_up);
+            assert_eq!(
+                *agent.agent_state(),
+                AgentState::Failed {
+                    message: format!(
+                        "the agent couldn't continue the conversation: its answer to {method} isn't one Brindle can read"
+                    )
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn output_lost_mid_continue_fails_it() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        agent.feed(&initialized(id, both()));
+        let out = agent.step(Input::OutputLost);
+        assert!(out.hang_up);
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Failed {
+                message: "the agent couldn't continue the conversation: output was lost while the terminal server restarted".into()
+            }
+        );
+    }
+
+    // 2.5: restart and a lost holder.
+
+    #[test]
+    fn a_restart_adds_its_notice_starts_the_agent_and_asks_for_no_checkpoint() {
+        let mut agent = Agent::ended();
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["added notice", "agent starting"]);
+        assert_eq!(agent.notices().last().map(String::as_str), Some(RESTARTED));
+        assert_eq!(out.checkpoint, None);
+        assert!(out.stdin.is_empty() && !out.hang_up);
+        assert!(matches!(
+            agent.s.phase(),
+            Phase::Spawning {
+                start: Start::Continue { log: Log::Kept, .. }
+            }
+        ));
+        assert_eq!(agent.s.lines().covers(), 0, "the new holder session's");
+        let out = agent.step(Input::Spawned);
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
+    }
+
+    #[test]
+    fn ids_continue_after_a_restart() {
+        let mut agent = Agent::ended();
+        let next_request = agent.s.rpc().next_id();
+        let last_entry = agent.last_entry().0;
+        let id = agent.restart();
+        assert_eq!(id, next_request, "request ids go on");
+        agent.feed(&initialized(id, both()));
+        agent.feed(&result(id + 1, json!({})));
+        agent.turn("again");
+        let (user, entry) = agent
+            .s
+            .transcript()
+            .entries()
+            .find(|(_, entry)| matches!(entry, Entry::User { text } if text == "again"))
+            .map(|(id, entry)| (id, entry.clone()))
+            .expect("the prompt's entry");
+        assert!(matches!(entry, Entry::User { .. }));
+        // The restart's notice took the next id, the prompt the one after.
+        assert_eq!(user, EntryId(last_entry.0 + 2));
+        assert_eq!(agent.prompt_id(), id + 2);
+    }
+
+    #[test]
+    fn the_turn_in_flight_at_an_exit_fails_and_is_never_sent_to_the_new_agent() {
+        let mut agent = Agent::ready_offering(both());
+        agent.turn("fix it");
+        agent.exit();
+        assert_eq!(
+            *agent.turn_state(),
+            TurnState::Failed {
+                message: "the agent exited".into()
+            }
+        );
+        let before = agent.sent.len();
+        let id = agent.restart();
+        agent.feed(&initialized(id, both()));
+        let out = agent.feed(&result(id + 1, json!({})));
+        assert!(out.stdin.is_empty(), "nothing sent on its own");
+        let after = serde_json::to_string(agent.sent_since(before)).expect("JSON");
+        assert!(!after.contains("fix it"), "{after}");
+        assert!(matches!(agent.turn_state(), TurnState::Failed { .. }));
+    }
+
+    #[test]
+    fn a_held_prompt_can_be_sent_again_once_the_continued_agent_is_ready_and_not_before() {
+        let mut agent = Agent::ready_offering(both());
+        agent.turn("first");
+        agent.prompt("next");
+        agent.exit();
+        assert_eq!(*agent.slot(), held("next", HoldReason::AgentStopped));
+        let before = agent.sent.len();
+        let id = agent.restart();
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::NotReady))
+        );
+        agent.feed(&initialized(id, both()));
+        assert_eq!(
+            agent.cmd(Command::Resend).reply,
+            Some(Err(Refused::NotReady))
+        );
+        assert_eq!(*agent.slot(), held("next", HoldReason::AgentStopped));
+        let out = agent.feed(&result(id + 1, json!({})));
+        assert!(out.stdin.is_empty(), "not sent on its own");
+        let methods: Vec<&str> = agent
+            .sent_since(before)
+            .iter()
+            .filter_map(|line| line["method"].as_str())
+            .collect();
+        assert_eq!(methods, ["initialize", "session/resume"]);
+        assert_eq!(agent.cmd(Command::Resend).reply, Some(Ok(())));
+        assert_eq!(agent.last("session/prompt")["params"]["prompt"][0]["text"], "next");
+        assert_eq!(*agent.slot(), Slot::Empty);
+    }
+
+    #[test]
+    fn a_permission_cancelled_at_the_exit_stays_cancelled_and_is_never_answered_again() {
+        let mut agent = Agent::ready_offering(both());
+        agent.turn("first");
+        let entry = agent.ask(json!(5), &ALLOW_REJECT);
+        agent.exit();
+        let cancelled = |agent: &Agent| {
+            matches!(
+                agent.s.transcript().entry(entry),
+                Some(Entry::Permission {
+                    outcome: Some(PermissionOutcome::Cancelled),
+                    ..
+                })
+            )
+        };
+        assert!(cancelled(&agent));
+        let before = agent.sent.len();
+        let id = agent.restart();
+        agent.feed(&initialized(id, both()));
+        agent.feed(&result(id + 1, json!({})));
+        assert!(cancelled(&agent));
+        assert!(agent.s.rpc().permissions().is_empty());
+        assert!(
+            agent.sent_since(before).iter().all(|line| line.get("result").is_none()),
+            "no answer to the old request"
+        );
+        assert_eq!(
+            agent
+                .cmd(Command::Answer {
+                    entry,
+                    option: Some("allow-once".into())
+                })
+                .reply,
+            Some(Err(Refused::AlreadyAnswered { entry }))
+        );
+    }
+
+    #[test]
+    fn a_restart_is_refused_unless_the_agent_ended_with_a_conversation_to_continue() {
+        let mut running = Agent::ready_offering(both());
+        let out = running.step(Input::Restart);
+        assert_eq!(out.reply, Some(Err(Refused::NotEnded)));
+        assert!(out.events.is_empty() && out.stdin.is_empty());
+        let mut starting = Agent::ended();
+        starting.restart();
+        assert_eq!(
+            starting.step(Input::Restart).reply,
+            Some(Err(Refused::NotEnded))
+        );
+        let mut neither = Agent::ready_offering(json!({}));
+        neither.exit();
+        assert_eq!(
+            neither.step(Input::Restart).reply,
+            Some(Err(Refused::CannotContinue))
+        );
+        let mut refused = Agent::new();
+        refused.step(Input::Spawned);
+        refused.feed(&result(1, json!({"protocolVersion": 2})));
+        refused.exit();
+        assert_eq!(
+            refused.step(Input::Restart).reply,
+            Some(Err(Refused::CannotContinue))
+        );
+        for (refusal, text) in [
+            (Refused::NotEnded, "the agent hasn't ended"),
+            (
+                Refused::CannotContinue,
+                "the agent can't continue this conversation",
+            ),
+            (Refused::Lost, "the agent was lost with its holder"),
+        ] {
+            assert_eq!(refusal.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn a_restart_that_couldnt_be_placed_returns_to_ended_and_can_be_tried_again() {
+        let mut agent = Agent::ended();
+        assert_eq!(agent.step(Input::Restart).reply, Some(Ok(())));
+        agent.step(Input::Exited {
+            code: None,
+            stderr: b"no such file: fake-agent",
+        });
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Exited {
+                code: None,
+                stderr: "no such file: fake-agent".into()
+            }
+        );
+        assert!(agent.s.continuable());
+        agent.restart();
+    }
+
+    #[test]
+    fn a_lost_holder_ends_the_agent_as_an_exit_does_but_lost() {
+        let mut agent = Agent::ready_offering(load_only());
+        agent.turn("first");
+        let entry = agent.ask(json!(1), &ALLOW_REJECT);
+        agent.prompt("next");
+        let out = agent.step(Input::Lost {
+            message: "its holder ended",
+        });
+        assert_eq!(
+            shape(&out.events),
+            ["answered", "queue held", "turn failed", "agent lost"]
+        );
+        assert!(matches!(
+            agent.s.transcript().entry(entry),
+            Some(Entry::Permission {
+                outcome: Some(PermissionOutcome::Cancelled),
+                ..
+            })
+        ));
+        assert_eq!(*agent.slot(), held("next", HoldReason::AgentStopped));
+        assert_eq!(
+            *agent.turn_state(),
+            TurnState::Failed {
+                message: "the agent exited".into()
+            }
+        );
+        assert_eq!(
+            *agent.agent_state(),
+            AgentState::Lost {
+                message: "its holder ended".into()
+            }
+        );
+        assert_eq!(*agent.s.phase(), Phase::Lost);
+        assert_eq!(out.checkpoint, Some(Moment::Stopped));
+        assert_eq!(agent.activity(), Activity::Error);
+        assert_eq!(agent.prompt("x").reply, Some(Err(Refused::Lost)));
+        // Nothing more ends it.
+        assert!(agent.exit().events.is_empty());
+        assert!(agent
+            .step(Input::Lost {
+                message: "again"
+            })
+            .events
+            .is_empty());
+        let id = agent.restart();
+        agent.feed(&initialized(id, load_only()));
+        assert_eq!(agent.last("session/load")["params"]["sessionId"], "s1");
     }
 }

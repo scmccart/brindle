@@ -118,9 +118,9 @@ use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::budget::{Delivery, InputBudget, Offer};
 use crate::agent::model::agent_start;
-use crate::agent::spawn::AgentSpawnRequest;
+use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::remote::protocol::client::{
-    self, AgentPermission, AgentPrompt, AgentRequest, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request,
+    self, AgentPermission, AgentPrompt, AgentRequest, AgentRestart, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request,
     Resize, SessionInfo, Detach, SessionRef, SetLayout, SpawnAgent, ToClient, ToCore,
 };
 use crate::remote::hosts::LinkState;
@@ -1432,9 +1432,10 @@ impl Connection {
         abandon: Option<&Abandon>,
     ) -> Result<Running> {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let AgentSpawnRequest { command, args, cwd, env, profile } = request;
+        let AgentSpawnRequest { command, args, cwd, env, profile, conversation } = request;
         let started = self.ask("start the agent session", abandon, None, |req, reply| {
-            let spawn = SpawnAgent { req, command, args, cwd, env, policy: Policy::Detach, profile: Some(profile) };
+            let spawn =
+                SpawnAgent { req, command, args, cwd, env, policy: Policy::Detach, profile: Some(profile), conversation };
             (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;
         let Started { session, pid, key } = started;
@@ -2284,10 +2285,6 @@ impl Connection {
     /// whose write failed goes out on the next link. False once the
     /// connection ended.
     fn write(&self, message: &ToCore) -> bool {
-        #[allow(
-            clippy::wildcard_enum_match_arm,
-            reason = "railway R3 exception: the other messages carry no request id the link has to keep"
-        )]
         let request = match message {
             ToCore::Spawn(client::Spawn { req, .. })
             | ToCore::Attach(client::Attach { req, .. })
@@ -2297,8 +2294,21 @@ impl Connection {
             | ToCore::AgentPrompt(AgentPrompt { req, .. })
             | ToCore::AgentPermission(AgentPermission { req, .. })
             | ToCore::AgentUnqueue(AgentRequest { req, .. })
-            | ToCore::AgentResend(AgentRequest { req, .. }) => Some(*req),
-            _ => None,
+            | ToCore::AgentResend(AgentRequest { req, .. })
+            | ToCore::AgentRestart(AgentRestart { req, .. }) => Some(*req),
+            // No request id the link has to keep: no answer, or one the
+            // management requests wait for themselves.
+            ToCore::Hello(_)
+            | ToCore::Data(_)
+            | ToCore::Resize(_)
+            | ToCore::Close(_)
+            | ToCore::Detach(_)
+            | ToCore::Status(_)
+            | ToCore::Stop(_)
+            | ToCore::StepDown(_)
+            | ToCore::Reparent(_)
+            | ToCore::SetLayout(_)
+            | ToCore::AgentCancel(_) => None,
         };
         loop {
             let current = {
@@ -2606,6 +2616,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentPermission(_)
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
+        | ToCore::AgentRestart(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -2886,6 +2897,15 @@ impl Running {
     pub fn unqueue(&self) -> Option<RequestId> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentUnqueue(AgentRequest { req, session }))
+    }
+
+    /// Runs the session's ended agent again to continue its conversation
+    /// (`AGENT_RESTART`): `OK` once the core queued it, then the outcome
+    /// as transcript events.
+    pub fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+        let session = self.id;
+        let AgentRestartRequest { command, args, env } = request;
+        self.agent_request(|req| ToCore::AgentRestart(AgentRestart { req, session, command, args, env }))
     }
 
     /// Answers the permission request in entry `entry` with `option`, or

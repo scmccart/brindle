@@ -24,7 +24,9 @@ use brindle_remote_protocol::holder as h1;
 use brindle_remote_protocol::serde_json::json;
 use brindle_transcript::{AgentState, Entry, HoldReason, Slot, StopReason, TurnState};
 
-use support::fake_agent::{ask, prompts, responses, said, started, stop};
+use support::fake_agent::{
+    LOAD_ONLY, ask, initialized, methods, prompts, responses, said, started, stop, user_said,
+};
 use support::programs::{self, ENTER, say};
 #[cfg(unix)]
 use support::relay::Relay;
@@ -658,4 +660,50 @@ fn an_older_core_isnt_shown_an_agent_session_and_a_newer_one_gets_it_back() {
         matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
     });
     assert_eq!(says(&log), ["user: go", "agent: before and after"]);
+}
+
+/// A continuing `SPAWN_AGENT` (OpenSpec change `agents-session-recovery`,
+/// task 3.5) whose agent is still replaying its `session/load` when the
+/// core steps down: the next core finishes the load, with the replay
+/// folded once, and the conversation goes on.
+#[test]
+fn an_upgrade_mid_load_leaves_the_next_core_to_finish_it() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-load");
+    let (mut script, record) = initialized(&dir.path, "load", LOAD_ONLY);
+    script.step("expect session/load").step(user_said("one")).step(said("first"));
+    let gate = script.gate();
+    script
+        .step(said(" reply"))
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("next"))
+        .step(stop("end_turn"));
+    let cwd = dir.path.display().to_string();
+    let spawn = client::SpawnAgent {
+        conversation: Some(client::AgentConversation { id: "s1".into(), cwd }),
+        ..client_agent(&script.write())
+    };
+    let (id, pid) = client.spawn_agent(spawn);
+    dir.track(pid);
+    client.transcript_until(id, "has the replay's start", |log| says(log).contains(&"agent: first".to_owned()));
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    gate.open();
+    let log = client.transcript_until(id, "is ready", agent_ready);
+    assert_eq!(says(&log), ["user: one", "agent: first reply"]);
+    let notices: Vec<&str> = log
+        .entries()
+        .filter_map(|(_, entry)| match entry {
+            Entry::Notice { text, .. } => Some(text.as_str()),
+            Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } => None,
+        })
+        .collect();
+    assert_eq!(notices, ["this continues an earlier conversation; what follows is the agent's replay of it"]);
+
+    client.prompt(id, "two").unwrap();
+    let log = client.transcript_until(id, "has the turn's end", |log| {
+        matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
+    });
+    assert_eq!(says(&log), ["user: one", "agent: first reply", "user: two", "agent: next"]);
+    assert_eq!(methods(&record), ["initialize", "session/load", "session/prompt"]);
 }

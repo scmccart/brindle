@@ -31,6 +31,28 @@
 //!   then [`checkpoint::adopt`] rebuilds the session and the tail is fed
 //!   as stdout. A session that exited while no core ran gets its exit once
 //!   its stderr tail follows the tail.
+//! - **Ending** (change `agents-session-recovery`, decisions 5 and 6): an
+//!   agent that exits, or whose holder is lost, steps `Input::Exited` or
+//!   `Input::Lost`; when it can continue its conversation
+//!   ([`Agent::continuable`]) and a client has the session or may return,
+//!   [`policy::end_fate`] keeps it as `Life::AgentEnded`, in this core's
+//!   memory only (no program, no holder, no `EXIT`). A `DETACH`, `CLOSE`,
+//!   `KILL` or `STOP` ends it (`EXIT { code, lost: None }`), as does its
+//!   client's leaving unless it lingers ([`policy::ended_gone_fate`]).
+//! - **Continuing:** `AGENT_RESTART` from the attached client
+//!   ([`Core::client_agent_restart`]), refused as
+//!   [`policy::restart_refusal`] says or while the core stops, steps
+//!   `Input::Restart`, updates the listed command and queues a
+//!   `SpawnRequest::Restart`: a `SPAWN_PIPES` under the same session id
+//!   in the conversation's `cwd`, on any H1 3 holder of the core's build,
+//!   answered `OK` at once and never `SPAWNED`. A `SPAWN_FAILED` (or a
+//!   restart abandoned by a hang-up, `STOP` or a takeover) steps
+//!   `Exited { None, message }` and returns it to ended; a holder lost
+//!   before its `SPAWNED` places it again. A `SPAWN_AGENT` naming a
+//!   `conversation` starts as [`Agent::continuing`] in its `cwd`. Either
+//!   is checkpointed right after its `SPAWN_PIPES`, so a core killed
+//!   before `SPAWNED` still continues it. The reducer chooses resume or
+//!   load and mutes or shows the replay.
 //! - **Listing:** [`Agent::info`] maps the log's [`Activity`] onto the
 //!   wire's [`AgentActivity`] with an exhaustive `match` ([`activity`]).
 
@@ -42,9 +64,10 @@ use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
 use brindle_remote_protocol::serde_json::Value;
 use brindle_remote_protocol::{RequestId, SessionId};
-use brindle_transcript::{Activity, AgentState, EntryId, Event};
+use brindle_transcript::{Activity, AgentState, Continuation, Conversation, EntryId, Event};
 
 use super::clients::error;
+use super::holders::WaitingSpawn;
 use super::policy::{self, AgentCheckpoint, AgentRequest};
 use super::sessions::{Life, SpawnRequest};
 use super::{Core, log};
@@ -85,6 +108,38 @@ impl Agent {
     /// A new agent session working in `cwd` (absolute).
     pub(super) fn new(cwd: String) -> Self {
         Self::with(Acp::Running(Box::new(AgentSession::new(cwd, VERSION.to_owned()))))
+    }
+
+    /// A new agent session continuing `conversation` (a `SPAWN_AGENT` that
+    /// names one), into a fresh log, in the conversation's directory.
+    pub(super) fn continuing(conversation: &client::AgentConversation) -> Self {
+        let conversation = Conversation {
+            id: conversation.id.clone(),
+            cwd: conversation.cwd.clone(),
+            // What the new agent offers decides; the reducer reads that.
+            continuation: Continuation::Neither,
+        };
+        Self::with(Acp::Running(Box::new(AgentSession::continuing(
+            conversation,
+            VERSION.to_owned(),
+        ))))
+    }
+
+    /// Its agent is started again ([`Input::Restart`]): the new holder
+    /// session's stdout counts from 0, and no stderr tail is kept.
+    pub(super) fn restarted(&mut self) {
+        self.checkpointed = 0;
+        self.stderr = None;
+        self.wake = None;
+    }
+
+    /// Whether its agent ended and its conversation can be continued
+    /// ([`AgentSession::continuable`]).
+    pub(super) fn continuable(&self) -> bool {
+        match &self.acp {
+            Acp::Adopting { .. } => false,
+            Acp::Running(acp) => acp.continuable(),
+        }
     }
 
     /// An agent session adopted from a holder, waiting for its checkpoint
@@ -128,7 +183,8 @@ impl Agent {
                     AgentState::Starting
                     | AgentState::LoginRequired { .. }
                     | AgentState::Failed { .. }
-                    | AgentState::Exited { .. } => None,
+                    | AgentState::Exited { .. }
+                    | AgentState::Lost { .. } => None,
                 };
                 AgentInfo {
                     activity: activity(transcript.activity()),
@@ -197,6 +253,8 @@ fn inject_fault(input: &Input<'_>) {
         Input::Spawned
         | Input::OutputLost
         | Input::Exited { .. }
+        | Input::Lost { .. }
+        | Input::Restart
         | Input::Command(
             Command::Unqueue | Command::Resend | Command::Cancel | Command::Answer { .. },
         )
@@ -270,7 +328,8 @@ impl AgentCommand {
 impl<L: EventLoop> Core<L> {
     /// `SPAWN_AGENT`: refused below protocol 4 and with no command; else
     /// queued for a holder that runs pipe sessions, in the absolute
-    /// directory its agent will work in.
+    /// directory its agent will work in. One that continues a conversation
+    /// works in the conversation's directory, which ACP ties it to.
     pub(super) fn client_spawn_agent(&mut self, client: Token, spawn: client::SpawnAgent) {
         let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
         let refusal = policy::agent_request_refusal(protocol, AgentRequest::Spawn)
@@ -279,8 +338,76 @@ impl<L: EventLoop> Core<L> {
         if let Some(refusal) = refusal {
             return self.send_client(client, error(Some(spawn.req), None, refusal));
         }
-        let cwd = platform::agent_directory(spawn.cwd.as_deref(), &spawn.env);
+        let cwd = match &spawn.conversation {
+            Some(conversation) => conversation.cwd.clone(),
+            None => platform::agent_directory(spawn.cwd.as_deref(), &spawn.env),
+        };
         self.queue_spawn(client, SpawnRequest::Agent { spawn, cwd });
+    }
+
+    /// `AGENT_RESTART` (change `agents-session-recovery`, decision 5): an
+    /// ended agent session the client has attached is started again with
+    /// the command given, in its conversation's directory, under its own
+    /// id, key and meta (the command updated), on any holder of the
+    /// core's build. Refused below protocol 4, for a session the client
+    /// hasn't attached, while the core stops or steps down, and as
+    /// [`policy::restart_refusal`] says; the reducer's own refusal
+    /// ([`Input::Restart`]) comes last. `OK` once the spawn is queued; what
+    /// follows comes as transcript events.
+    pub(super) fn client_agent_restart(&mut self, client: Token, restart: client::AgentRestart) {
+        let (req, id) = (restart.req, restart.session);
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+        if let Some(refusal) = policy::agent_request_refusal(protocol, AgentRequest::Restart) {
+            return self.send_client(client, error(Some(req), Some(id), refusal.to_string()));
+        }
+        let stopping = self.stopping.is_some() || self.stepping_down.is_some();
+        let Some(session) = self.attached_session(client, id, Some(req)) else {
+            return;
+        };
+        let life = session.life.clone();
+        let Some(agent) = session.agent() else {
+            let message = format!("session {id} isn't an agent session");
+            return self.send_client(client, error(Some(req), Some(id), message));
+        };
+        let continuable = agent.continuable();
+        let cwd = match &agent.acp {
+            Acp::Running(acp) => acp.transcript().conversation().map(|c| c.cwd.clone()),
+            Acp::Adopting { .. } => None,
+        };
+        let refusal = if stopping {
+            Some("the server is stopping; try again".to_owned())
+        } else {
+            policy::restart_refusal(&life, continuable, &restart.command).map(|r| r.to_string())
+        };
+        if let Some(refusal) = refusal {
+            let message = format!("session {id}: {refusal}");
+            return self.send_client(client, error(Some(req), Some(id), message));
+        }
+        let Some(cwd) = cwd else {
+            let message = format!("session {id}: {}", Refused::CannotContinue);
+            return self.send_client(client, error(Some(req), Some(id), message));
+        };
+        match self.agent_step(id, Input::Restart) {
+            Some(Ok(())) => {}
+            Some(Err(refused)) => {
+                let message = format!("session {id}: {refused}");
+                return self.send_client(client, error(Some(req), Some(id), message));
+            }
+            None => {
+                let message = format!("session {id}: the terminal server's ACP handling failed");
+                return self.send_client(client, error(Some(req), Some(id), message));
+            }
+        }
+        log!(
+            "session {id}: its agent starts again to continue its conversation ({:?})",
+            restart.command
+        );
+        let command = (restart.command.clone(), restart.args.clone());
+        let spawn = SpawnRequest::Restart { restart, cwd };
+        self.start_again(id, &command.0, &command.1, spawn.clone());
+        self.send_client(client, ToClient::Ok(client::Request { req }));
+        self.waiting.push(WaitingSpawn { client, id, spawn });
+        self.place_waiting();
     }
 
     /// A protocol 4 client's command for an agent session it has attached:
@@ -461,7 +588,10 @@ impl<L: EventLoop> Core<L> {
         }
         let exited = match session.life {
             Life::ExitedAwaitingOwner { code, .. } => Some(code),
-            Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => None,
+            Life::Starting { .. }
+            | Life::Running { .. }
+            | Life::HungUp { .. }
+            | Life::AgentEnded { .. } => None,
         };
         let Some(agent) = session.agent() else {
             return log!("holder {holder}: a stderr tail for terminal session {id}; ignored");

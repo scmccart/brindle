@@ -1400,6 +1400,53 @@ mod tests {
         assert_eq!(all.cwd, Some("/d3".into()));
     }
 
+    /// `agents-session-recovery` 4.4: an agent zone whose agent exited or
+    /// was lost with its holder isn't recorded, though its session is still
+    /// open on the server (kept for a continue): the rule is the agent's
+    /// phase ([`ChatModel::keeps_session`]), as `ZoneContent::unrecorded`
+    /// applies it. A tab of that zone alone isn't recorded; beside a
+    /// running agent's zone, the running one is the tab.
+    #[test]
+    fn an_agent_zone_whose_agent_ended_isnt_recorded() {
+        use crate::agent::model::ChatModel;
+        use crate::agent::shared::AgentShared;
+        use crate::agent::transcript::{AgentState, Event};
+        let zone = |states: &[AgentState]| {
+            let mut shared = AgentShared::new();
+            let mut model = ChatModel::new("Fake", None);
+            for state in states {
+                shared.apply(&[Event::Agent { state: state.clone() }.to_value()]).unwrap();
+                let changes = shared.take_changes();
+                model.absorb(shared.transcript(), changes);
+            }
+            model
+        };
+        let ready = AgentState::Ready { name: None, version: None };
+        let ended = [
+            zone(&[ready.clone(), AgentState::Exited { code: Some(1), stderr: String::new() }]),
+            zone(&[ready.clone(), AgentState::Lost { message: "its holder ended".into() }]),
+        ];
+        let running = zone(&[ready]);
+        let session = |id: u32| Some(ServerSession { id, key: format!("k{id}") });
+        // What the tab's zones give `record_zones`: an entry for each zone
+        // that keeps its session.
+        let leaves = |zones: &[(u64, &ChatModel)]| -> HashMap<ZoneId, ZoneRecord> {
+            zones
+                .iter()
+                .filter(|(_, model)| model.keeps_session())
+                .map(|(n, _)| (ZoneId(*n), ZoneRecord { cwd: Some(PathBuf::from(format!("/d{n}"))), session: session(*n as u32) }))
+                .collect()
+        };
+        let (z1, z2) = (ZoneId(1), ZoneId(2));
+        for ended in &ended {
+            assert_eq!(record_zones(&ZoneTree::new(z1), z1, &leaves(&[(1, ended)])), None, "{:?}", ended.alert("", ""));
+            let mut two = ZoneTree::new(z1);
+            two.split(z1, SplitAxis::Horizontal, z2);
+            let recorded = record_zones(&two, z1, &leaves(&[(1, ended), (2, &running)])).unwrap();
+            assert_eq!(recorded, RecordedZones { cwd: Some("/d2".into()), zones: None, session: session(2) });
+        }
+    }
+
     #[test]
     fn remote_restore_drops_cwd_from_another_endpoint() {
         let config = Config::parse(

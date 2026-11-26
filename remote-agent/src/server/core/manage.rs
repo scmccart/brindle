@@ -30,9 +30,9 @@ use super::{Answer, Core, log};
 use crate::server::event_loop::{EventLoop, Token};
 
 impl<L: EventLoop> Core<L> {
-    /// `LIST`: the running sessions ([`super::sessions::Session::info`]).
-    /// Ones still starting, or whose program exited while their owner was
-    /// away, aren't listed.
+    /// `LIST`: the running sessions ([`super::sessions::Session::info`]),
+    /// and agent sessions kept for their conversation. Ones still starting,
+    /// or whose program exited while their owner was away, aren't listed.
     pub(super) fn client_list(&mut self, client: Token, req: RequestId) {
         let now = Instant::now();
         // A client below protocol 4 isn't shown agent sessions.
@@ -40,7 +40,7 @@ impl<L: EventLoop> Core<L> {
         let sessions = self
             .sessions
             .iter()
-            .filter(|(_, session)| session.life.is_running())
+            .filter(|(_, session)| session.life.is_listed())
             .filter(|(_, session)| policy::shown(session.kind(), protocol))
             .map(|(&id, session)| session.info(id, now))
             .collect();
@@ -56,7 +56,7 @@ impl<L: EventLoop> Core<L> {
                 let sessions = self
                     .sessions
                     .values()
-                    .filter(|session| session.holder == token)
+                    .filter(|session| session.holder == token && session.life.is_held())
                     .count();
                 holder.status(sessions as u32).map(|status| (token, status))
             })

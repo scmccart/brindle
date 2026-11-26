@@ -120,6 +120,13 @@ impl AgentShared {
         self.changes = Changes { reset: true, from_replay: true, ..Changes::default() };
     }
 
+    /// A fold for a new session that takes the zone's place (a continue in
+    /// a new session): its first change starts the zone over from it, as a
+    /// replay's does, but its events are live.
+    pub fn start_over(&mut self) {
+        self.changes.reset = true;
+    }
+
     /// `REPLAY_END`: events from here on are live.
     pub fn replay_end(&mut self) {
         self.replaying = false;
@@ -147,6 +154,7 @@ impl AgentShared {
             | Event::Queue { .. }
             | Event::Turn { .. }
             | Event::Agent { .. }
+            | Event::Conversation { .. }
             | Event::Trimmed { .. } => None,
         };
         self.transcript
@@ -159,7 +167,8 @@ impl AgentShared {
             Event::Appended { id, .. } => changes.appended(*id, before.unwrap_or(0)),
             Event::ToolChanged { id, .. } | Event::Answered { id, .. } => changes.replaced(*id),
             Event::Queue { .. } => changes.slot_changed = true,
-            Event::Turn { .. } | Event::Agent { .. } => changes.turn_or_agent = true,
+            // The conversation decides whether a continue is offered.
+            Event::Turn { .. } | Event::Agent { .. } | Event::Conversation { .. } => changes.turn_or_agent = true,
             Event::Trimmed { through, .. } => changes.trimmed(*through),
         }
         Ok(())

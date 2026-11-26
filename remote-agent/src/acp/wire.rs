@@ -29,7 +29,7 @@
 
 use agent_client_protocol_schema::v1 as acp;
 use brindle_remote_protocol::serde_json::{self, Map, Value};
-use brindle_transcript::{PermissionKind, StopReason, ToolKind, ToolStatus};
+use brindle_transcript::{Continuation, PermissionKind, StopReason, ToolKind, ToolStatus};
 
 /// The longest request id kept, as encoded JSON: a request with a longer id
 /// is answered `-32600` with a null id (decision 13).
@@ -252,6 +252,11 @@ pub struct Initialized {
     pub protocol_version: u16,
     /// `agentInfo`, when the agent gave a well-formed one.
     pub agent: Option<AgentInfo>,
+    /// Whether the agent offers `session/load`
+    /// (`agentCapabilities.loadSession`) and `session/resume`
+    /// (`agentCapabilities.sessionCapabilities.resume`). A malformed
+    /// capability reads as not offered.
+    pub continuation: Continuation,
 }
 
 /// The agent's `agentInfo`.
@@ -265,8 +270,13 @@ pub struct AgentInfo {
 pub fn initialize_result(result: &Value) -> Result<Initialized, BadParams> {
     let response: acp::InitializeResponse =
         serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+    let capabilities = &response.agent_capabilities;
     Ok(Initialized {
         protocol_version: response.protocol_version.as_u16(),
+        continuation: Continuation::from_offers(
+            capabilities.load_session,
+            capabilities.session_capabilities.resume.is_some(),
+        ),
         agent: response.agent_info.map(|info| AgentInfo {
             name: info.name,
             title: info.title,
@@ -303,6 +313,22 @@ pub fn new_session_result(result: &Value) -> Result<NewSession, BadParams> {
     Ok(NewSession {
         session_id: response.session_id.0.to_string(),
     })
+}
+
+/// That `session/resume` succeeded: its result has nothing the reducer
+/// reads, but must be an object the schema crate accepts.
+pub fn resume_result(result: &Value) -> Result<(), BadParams> {
+    let _: acp::ResumeSessionResponse =
+        serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+    Ok(())
+}
+
+/// That `session/load` succeeded, as [`resume_result`] for `session/resume`.
+/// The replay came before it, as `session/update` notifications.
+pub fn load_result(result: &Value) -> Result<(), BadParams> {
+    let _: acp::LoadSessionResponse =
+        serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+    Ok(())
 }
 
 /// Why the turn a `session/prompt` result ends, read from `stopReason`
@@ -1156,6 +1182,80 @@ mod tests {
         assert_eq!(lines, 310);
     }
 
+    /// What each captured agent's `initialize` offers for continuing a
+    /// conversation: Copilot only `session/load`, the others both.
+    #[test]
+    fn the_captured_agents_offer_load_and_resume_but_copilot_only_load() {
+        let mut offers = Vec::new();
+        for (name, bytes) in CAPTURES {
+            for line in decode_capture(bytes).1.into_iter().flatten() {
+                if let Decoded::Initialized(init) = line {
+                    offers.push((name, init.continuation));
+                }
+            }
+        }
+        assert_eq!(
+            offers,
+            [
+                ("antigravity-1.5.16-reject", Continuation::ResumeAndLoad),
+                ("antigravity-1.5.16-trusted-workspace", Continuation::ResumeAndLoad),
+                ("claude-agent-acp-0.112.0-auto", Continuation::ResumeAndLoad),
+                ("claude-agent-acp-0.112.0-haiku-reject", Continuation::ResumeAndLoad),
+                ("claude-agent-acp-0.112.0-reject", Continuation::ResumeAndLoad),
+                ("claude-code-acp-0.16.2-reject", Continuation::ResumeAndLoad),
+                ("codex-acp-2.12.0-reject", Continuation::ResumeAndLoad),
+                ("copilot-1.0.115-reject", Continuation::Load),
+            ]
+        );
+    }
+
+    /// Hand-written capabilities no captured agent sent: resume alone,
+    /// neither, and malformed ones, which read as not offered.
+    #[test]
+    fn initialize_reads_load_and_resume_and_a_malformed_one_as_not_offered() {
+        let offer = |capabilities: Value| {
+            initialize_result(&json!({"protocolVersion": 1, "agentCapabilities": capabilities}))
+                .map(|init| init.continuation)
+        };
+        assert_eq!(
+            offer(json!({"sessionCapabilities": {"resume": {}}})),
+            Ok(Continuation::Resume)
+        );
+        assert_eq!(
+            offer(json!({"loadSession": false, "sessionCapabilities": {"list": {}}})),
+            Ok(Continuation::Neither)
+        );
+        assert_eq!(offer(json!({})), Ok(Continuation::Neither));
+        assert_eq!(
+            offer(json!({"loadSession": true, "sessionCapabilities": {"resume": null}})),
+            Ok(Continuation::Load)
+        );
+        assert_eq!(
+            offer(json!({"loadSession": "yes", "sessionCapabilities": {"resume": 7}})),
+            Ok(Continuation::Neither)
+        );
+        assert_eq!(
+            offer(json!({"loadSession": true, "sessionCapabilities": "all"})),
+            Ok(Continuation::Load)
+        );
+        assert_eq!(
+            initialize_result(&json!({"protocolVersion": 1})).map(|init| init.continuation),
+            Ok(Continuation::Neither)
+        );
+    }
+
+    #[test]
+    fn resume_and_load_results_are_objects_or_null() {
+        for result in [json!({}), json!({"modes": null}), json!({"configOptions": [1]}), Value::Null] {
+            assert_eq!(resume_result(&result), Ok(()), "{result}");
+            assert_eq!(load_result(&result), Ok(()), "{result}");
+        }
+        for result in [json!("ok"), json!(7), json!(true)] {
+            assert!(resume_result(&result).is_err(), "{result}");
+            assert!(load_result(&result).is_err(), "{result}");
+        }
+    }
+
     #[test]
     fn the_captured_agents_send_every_kind_the_reducer_reads() {
         let mut seen = Vec::new();
@@ -1404,6 +1504,8 @@ mod tests {
                 let _ = permission_request(&value);
                 let _ = initialize_result(&value);
                 let _ = new_session_result(&value);
+                let _ = resume_result(&value);
+                let _ = load_result(&value);
                 let _ = prompt_result(&value);
                 let _ = cancel_request(&value);
             }

@@ -82,6 +82,7 @@ pub fn all() -> Vec<Case> {
         display("windows-agent-batch-hint", agent_batch_hint),
         display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
         display("windows-agent-markdown", agent_markdown).needs_fake_agent(),
+        display("windows-agent-continue", agent_continue).needs_fake_agent(),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -1292,6 +1293,77 @@ fn agent_markdown(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.agent_blocks(2) == parts, "parts {:#?}", out.dump.agent_blocks(2));
     let links = [link(2, "file:///C:/x", "c", "confirm"), link(2, "file:///etc/hosts", "h", "refuse:no-drive")];
     ensure!(out.dump.agent_links(2) == links, "links {:#?}", out.dump.agent_links(2));
+    Ok(Outcome::Pass)
+}
+
+/// An agent that offered `session/resume` exits after a turn: the zone
+/// offers Continue conversation one Tab from the prompt, and enter on it
+/// starts the agent again on the same session, in a holder's pipe session
+/// (the continued agent is the holder's child, in the session's job), by
+/// `session/resume` of the same conversation; the earlier turn stays shown
+/// once, and a new prompt reaches the new agent and only it. The case puts
+/// the continue's script in the profile's place itself, once the first
+/// agent has its prompt (it read its script when it started), rather than
+/// from a Shell tab as the Linux cases do, then opens the gate that lets
+/// the first agent exit.
+fn agent_continue(ctx: &Ctx) -> Result<Outcome> {
+    use super::agent::{EXITED, READY, RESTARTED, RESUME, Script, recorded};
+    let go = super::agent::gate(ctx, "exit");
+    std::fs::remove_file(&go).ok();
+    let (first, second) = super::agent::records(ctx);
+    let next = Script::initialized(&second, RESUME)
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(super::agent::says("Again"))
+        .step(super::agent::stop("end_turn"))
+        .write(ctx, "next")?;
+    let profile = super::agent::turn_then_exit(&first, RESUME, &go).profile(ctx, "agent")?;
+    let current = ctx.dir.join("agent.script");
+    let (helper, server_dir, scale) = (ctx.helper.clone(), ctx.server_dir.clone(), ctx.scale());
+    let (first_record, second_record) = (first.clone(), second.clone());
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .call_at(1.0, move |_| {
+            scale.eventually(60.0, "the first agent's prompt", || recorded(&first_record, "session/prompt"))?;
+            std::fs::copy(&next, &current)
+                .map_err(|e| format!("copying {} over {}: {e}", next.display(), current.display()))?;
+            std::fs::write(&go, "").map_err(|e| format!("writing {}: {e}", go.display()))?;
+            scale.eventually(60.0, "the continued agent's prompt", || recorded(&second_record, "session/prompt"))?;
+            let agent = super::agent::agent_pid(&helper, &server_dir)?.ok_or("no running agent session listed")?;
+            let parent = local_server::parent(agent)?;
+            ensure!(
+                parent.is_some_and(local_server::is_holder),
+                "the continued agent {agent}'s parent {parent:?} isn't a holder"
+            );
+            Ok(())
+        })
+        .wait_for(&super::agent::answered())
+        .wait_for(EXITED)
+        .wait_for("continue=restart")
+        .key("tab")
+        .key("enter")
+        .wait_for(READY)
+        .send("again")
+        .key("enter")
+        .wait_for("agent \"Again\"")
+        .dump_at(20.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    let want = ["user \"hi\"", "agent \"Hello!\"", "user \"again\"", "agent \"Again\""];
+    ensure!(super::agent::messages(&out) == want, "messages: {:?}", out.dump.agent);
+    ensure!(super::agent::has_notice(&out, RESTARTED), "no restart notice: {:?}", out.dump.agent);
+    ensure!(out.dump.agent_field("session") == Some("open"), "agent: {:?}", out.dump.agent);
+    let sent = (super::agent::prompts_sent(&first)?, super::agent::prompts_sent(&second)?);
+    ensure!(sent.0 == ["hi"] && sent.1 == ["again"], "sent: {:?} then {:?}", sent.0, sent.1);
+    let resumed = std::fs::read_to_string(&second).unwrap_or_default();
+    ensure!(
+        resumed.lines().any(|l| l.contains("\"session/resume\"") && l.contains("\"sessionId\":\"s1\"")),
+        "no session/resume of s1: {resumed}"
+    );
+    ensure!(!recorded(&second, "session/new"), "a new conversation was started: {resumed}");
     Ok(Outcome::Pass)
 }
 

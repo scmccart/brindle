@@ -548,7 +548,9 @@ impl ZoneContent {
 
     /// Whether session restore leaves the zone out: a terminal that only
     /// shows a message (a failed attach), or an agent zone whose session
-    /// isn't open any more (ended, never started, lost or broken).
+    /// isn't open any more (ended, never started, lost or broken) or whose
+    /// agent exited or was lost with its holder, though the server keeps
+    /// that session for a continue ([`crate::agent::model::ChatModel::keeps_session`]).
     pub fn unrecorded(&self, cx: &App) -> bool {
         match self {
             Self::Terminal(view) => view.read(cx).terminal.read(cx).shows_only_message(),
@@ -662,7 +664,8 @@ impl ZoneContent {
             Self::Agent(view) => {
                 let view = view.read(cx);
                 let at_end = view.scroller().read(cx).follow() == brindle_ui::Follow::AtEnd;
-                Some(view.agent().read(cx).model().describe(zone.0, at_end, &crate::terminal::links::plan_here))
+                let agent = view.agent().read(cx);
+                Some(agent.model().describe(zone.0, at_end, &agent.offer(cx), &crate::terminal::links::plan_here))
             }
         }
     }
@@ -672,7 +675,10 @@ impl ZoneContent {
     pub fn wait_text(&self, cx: &App) -> String {
         match self {
             Self::Terminal(view) => view.read(cx).terminal.read(cx).screen_text(),
-            Self::Agent(view) => view.read(cx).agent().read(cx).model().wait_text(&crate::terminal::links::plan_here),
+            Self::Agent(view) => {
+                let agent = view.read(cx).agent().read(cx);
+                agent.model().wait_text(&agent.offer(cx), &crate::terminal::links::plan_here)
+            }
         }
     }
 

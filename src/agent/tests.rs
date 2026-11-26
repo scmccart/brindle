@@ -1,9 +1,9 @@
 //! The `Agent` entity over a real sink and fake requests (task 5.1).
 
-use super::test_support::{Call, Zone, added, agent, app, ready, settle, user};
+use super::test_support::{Call, FAKE_PROFILE, Start, Zone, added, agent, app, ready, set_config, settle, user};
 use super::*;
-use crate::agent::model::{AgentPhase, UNSENT};
-use crate::agent::transcript::{AgentState, Event, Slot, TurnState};
+use crate::agent::model::{AgentPhase, NoOffer, UNSENT};
+use crate::agent::transcript::{AgentState, Continuation, Entry, Event, NoticeLevel, Slot, TurnState};
 
 fn drained<T>(rx: &mut futures::channel::mpsc::UnboundedReceiver<T>) -> Vec<T> {
     std::iter::from_fn(|| rx.try_next().ok().flatten()).collect()
@@ -173,4 +173,177 @@ fn life_events_and_leaving_the_session() {
     ended.agent.read_with(&cx, |agent, _| assert_eq!(agent.server_session(), None, "an ended session isn't kept"));
     ended.agent.update(&mut cx, |agent, _| agent.close());
     assert_eq!(ended.take_calls(), [Call::Close]);
+}
+
+// `agents-session-recovery` 4.3: continuing a conversation.
+
+fn conversation(continuation: Continuation) -> Event {
+    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation };
+    Event::Conversation { conversation }
+}
+
+fn exited() -> Event {
+    Event::Agent { state: AgentState::Exited { code: Some(1), stderr: "boom".into() } }
+}
+
+fn notice(text: &str) -> Entry {
+    Entry::Notice { level: NoticeLevel::Info, text: text.into() }
+}
+
+/// A zone of the `Fake` agent profile whose agent ran one turn, with a
+/// conversation `continuation` offers, then exited.
+fn ended_zone(continuation: Continuation, cx: &mut gpui::TestAppContext) -> Zone {
+    set_config(FAKE_PROFILE, cx);
+    let mut zone = Zone::new(None, cx);
+    zone.feed(&[conversation(continuation), ready(), added(1, user("hi")), added(2, agent("Hello!")), exited()]);
+    settle(cx);
+    zone
+}
+
+/// `Restart`: `AGENT_RESTART` with the profile's command, arguments and
+/// environment (as a new zone's: no terminal variables); the zone says the
+/// agent is starting, then the continue's events show the agent ready on
+/// the same session, the earlier turn kept.
+#[test]
+fn a_restart_sends_agent_restart_and_the_agent_comes_back_on_the_same_session() {
+    let mut cx = app();
+    let mut zone = ended_zone(Continuation::Resume, &mut cx);
+    zone.agent.read_with(&cx, |agent, cx| assert_eq!(agent.offer(cx), Offer::Restart));
+    zone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    let calls = zone.take_calls();
+    let [Call::Restart(request)] = calls.as_slice() else { panic!("one restart: {calls:?}") };
+    assert_eq!((request.command.as_str(), request.args.as_slice()), ("fake-acp", &["--acp".to_string()][..]));
+    for name in crate::agent::spawn::TERMINAL_ONLY {
+        assert!(!request.env.contains_key(name), "{name}");
+    }
+    assert!(zone.take_starts().is_empty(), "the same session");
+    zone.agent.read_with(&cx, |agent, _| {
+        assert_eq!(agent.model().phase(), &AgentPhase::Live(AgentState::Starting));
+    });
+
+    zone.sink.reply(1, Ok(()));
+    zone.feed(&[
+        added(3, notice("the agent was started again to continue the conversation")),
+        Event::Agent { state: AgentState::Starting },
+        conversation(Continuation::Resume),
+        ready(),
+    ]);
+    settle(&cx);
+    zone.agent.read_with(&cx, |agent, _| {
+        assert!(matches!(agent.model().phase(), AgentPhase::Live(AgentState::Ready { .. })));
+        assert_eq!(agent.model().blocks().len(), 3, "the earlier turn and the notice");
+        assert_eq!(agent.server_session(), Some((7, None)));
+    });
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("again", false, cx));
+    assert_eq!(zone.take_calls(), [Call::Prompt("again".into())]);
+}
+
+/// A refused restart shows the refusal and the ended agent again.
+#[test]
+fn a_refused_restart_shows_why() {
+    let mut cx = app();
+    let mut zone = ended_zone(Continuation::Resume, &mut cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    assert!(matches!(zone.take_calls().as_slice(), [Call::Restart(_)]));
+    zone.sink.reply(1, Err("session 7: the agent can't continue this conversation".into()));
+    settle(&cx);
+    zone.agent.read_with(&cx, |agent, cx| {
+        assert!(matches!(agent.model().phase(), AgentPhase::Live(AgentState::Exited { .. })));
+        assert_eq!(agent.model().refusal(), Some("session 7: the agent can't continue this conversation"));
+        assert_eq!(agent.offer(cx), Offer::Restart, "offered again");
+    });
+    // One that couldn't go says so.
+    zone.down.set(true);
+    zone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), Some(UNSENT)));
+}
+
+/// `Respawn`: the server lost the session, so a new one continues the
+/// conversation (`SPAWN_AGENT` naming it, in its directory); the zone
+/// keeps its place and shows the old conversation until the new session's
+/// events replace it, then sends through the new session.
+#[test]
+fn a_respawn_starts_a_new_session_continuing_the_conversation() {
+    let mut cx = app();
+    let mut zone = ended_zone(Continuation::Load, &mut cx);
+    zone.sink.lost("the terminal server no longer has session 7");
+    settle(&cx);
+    zone.agent.read_with(&cx, |agent, cx| {
+        assert!(matches!(agent.offer(cx), Offer::Respawn { .. }));
+        assert_eq!(agent.server_session(), None);
+    });
+    zone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    let starts = zone.take_starts();
+    let [Start::Spawn(request)] = starts.as_slice() else { panic!("one spawn: {starts:?}") };
+    assert_eq!(
+        request.conversation,
+        Some(crate::remote::protocol::client::AgentConversation { id: "sess-1".into(), cwd: "/home/u/src".into() })
+    );
+    assert_eq!((request.cwd.as_deref(), request.command.as_str()), (Some("/home/u/src"), "fake-acp"));
+    zone.agent.read_with(&cx, |agent, _| {
+        assert_eq!(agent.model().phase(), &AgentPhase::Connecting);
+        assert_eq!(agent.model().blocks().len(), 2, "the old conversation, until the new one comes");
+        assert_eq!(agent.directory().map(|dir| dir.to_string_lossy().into_owned()).as_deref(), Some("/home/u/src"));
+    });
+
+    zone.feed_new(&[
+        added(1, notice("this continues an earlier conversation; what follows is the agent's replay of it")),
+        added(2, user("hi")),
+        added(3, agent("Hello!")),
+        conversation(Continuation::Load),
+        ready(),
+    ]);
+    settle(&cx);
+    zone.agent.read_with(&cx, |agent, _| {
+        assert!(matches!(agent.model().phase(), AgentPhase::Live(AgentState::Ready { .. })));
+        assert_eq!(agent.model().blocks().len(), 3, "the new session's log");
+        assert_eq!(agent.server_session(), Some((8, None)), "the new session");
+    });
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("next", false, cx));
+    assert_eq!(zone.take_calls(), [Call::Prompt("next".into())]);
+}
+
+/// No offer, nothing sent: an agent that can't continue, a profile that
+/// is gone, a session started with another profile than the zone's.
+#[test]
+fn nothing_is_continued_without_an_offer() {
+    let mut cx = app();
+    let zone = ended_zone(Continuation::Neither, &mut cx);
+    zone.agent.read_with(&cx, |agent, cx| assert_eq!(agent.offer(cx), Offer::None(NoOffer::NotOffered)));
+    zone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    assert!(zone.take_calls().is_empty());
+
+    let gone = ended_zone(Continuation::Resume, &mut cx);
+    set_config("[[profiles]]\nname = \"Shell\"\n", &mut cx);
+    gone.agent.read_with(&cx, |agent, cx| {
+        assert_eq!(agent.offer(cx), Offer::None(NoOffer::ProfileGone { name: "Fake".into() }));
+    });
+    gone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    assert!(gone.take_calls().is_empty() && gone.take_starts().is_empty());
+
+    let substitute = ended_zone(Continuation::Resume, &mut cx);
+    substitute.agent.update(&mut cx, |agent, _| agent.set_started_with("Old"));
+    substitute.agent.read_with(&cx, |agent, cx| {
+        assert_eq!(agent.offer(cx), Offer::None(NoOffer::ProfileGone { name: "Old".into() }));
+    });
+    substitute.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
+    assert!(substitute.take_calls().is_empty());
+
+    // A renamed profile is still the zone's.
+    let renamed = ended_zone(Continuation::Resume, &mut cx);
+    set_config(&FAKE_PROFILE.replace("\"Fake\"", "\"Renamed\""), &mut cx);
+    renamed.agent.update(&mut cx, |agent, cx| agent.set_profile_name("Renamed", cx));
+    renamed.agent.read_with(&cx, |agent, cx| assert_eq!(agent.offer(cx), Offer::Restart));
+}
+
+/// A closed zone continues nothing.
+#[test]
+fn a_closed_zone_continues_nothing() {
+    let mut cx = app();
+    let zone = ended_zone(Continuation::Resume, &mut cx);
+    zone.agent.update(&mut cx, |agent, cx| {
+        agent.close();
+        agent.continue_conversation(cx);
+    });
+    assert_eq!(zone.take_calls(), [Call::Close]);
 }

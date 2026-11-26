@@ -14,10 +14,11 @@ use crate::FirstPrompt;
 use crate::agent::model::ChatModel;
 use crate::agent::shared::AgentShared;
 use crate::agent::sink::Sink;
+use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::agent::transcript::{AgentState, Entry, EntryId, Event};
-use crate::agent::{Agent, Requests};
+use crate::agent::{Agent, Connect, Requests};
 use crate::config::{Config, ConfigReport};
-use crate::remote::Host;
+use crate::remote::{AgentStart, Host};
 use crate::remote::SessionKey;
 use crate::remote::protocol::{RequestId, SessionId};
 use crate::settings::Settings;
@@ -35,6 +36,15 @@ pub fn app() -> TestAppContext {
     cx
 }
 
+/// Makes the app's config `text`.
+pub fn set_config(text: &str, cx: &mut TestAppContext) {
+    let config = Config::parse(text).unwrap().config;
+    cx.update(|cx| cx.set_global(Settings::new(config, ConfigReport::default(), Vec::new())));
+}
+
+/// A config whose agent profile `Fake` runs `fake-acp --acp`.
+pub const FAKE_PROFILE: &str = "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake-acp\"\nargs = [\"--acp\"]\n";
+
 /// What the zone sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
@@ -46,6 +56,7 @@ pub enum Call {
     Close,
     Detach(Option<serde_json::Value>),
     Layout(Option<serde_json::Value>),
+    Restart(AgentRestartRequest),
 }
 
 pub type Calls = Rc<RefCell<Vec<Call>>>;
@@ -56,6 +67,8 @@ pub struct FakeRequests {
     calls: Calls,
     next: Cell<RequestId>,
     pub down: Rc<Cell<bool>>,
+    /// The session's id.
+    session: SessionId,
 }
 
 impl FakeRequests {
@@ -104,9 +117,39 @@ impl Requests for FakeRequests {
     }
 
     fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)> {
-        Some((7, None))
+        Some((self.session, None))
+    }
+
+    fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+        self.record(Call::Restart(request))
     }
 }
+
+/// A [`Connect`] that records each start and gives fake requests for a
+/// new session ([`FakeRequests`], session 8, sharing the zone's calls), or
+/// `refuse`s it.
+fn fake_connect(calls: Calls, down: Rc<Cell<bool>>, starts: Starts, sinks: Sinks) -> Connect {
+    Box::new(move |_host, start, sink| {
+        let start = match start {
+            AgentStart::Spawn(request) => Start::Spawn(request()),
+            AgentStart::Attach { session, .. } => Start::Attach(session),
+        };
+        starts.borrow_mut().push(start);
+        sinks.borrow_mut().push(sink);
+        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(101), down: down.clone(), session: 8 };
+        Ok(Box::new(requests) as Box<dyn Requests>)
+    })
+}
+
+/// What the fake connect was asked to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Start {
+    Spawn(AgentSpawnRequest),
+    Attach(SessionId),
+}
+
+pub type Starts = Rc<RefCell<Vec<Start>>>;
+pub type Sinks = Rc<RefCell<Vec<Sink>>>;
 
 /// An agent zone's entity over a real sink, with fake requests.
 pub struct Zone {
@@ -115,6 +158,10 @@ pub struct Zone {
     pub calls: Calls,
     pub down: Rc<Cell<bool>>,
     pub shared: Arc<Mutex<AgentShared>>,
+    /// What the zone's connect started (a continue in a new session), and
+    /// the new sessions' sinks.
+    pub starts: Starts,
+    pub sinks: Sinks,
 }
 
 impl Zone {
@@ -123,19 +170,32 @@ impl Zone {
         let shared = feed.shared.clone();
         let calls = Calls::default();
         let down = Rc::new(Cell::new(false));
-        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(1), down: down.clone() };
+        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(1), down: down.clone(), session: 7 };
+        let (starts, sinks) = (Starts::default(), Sinks::default());
+        let connect = fake_connect(calls.clone(), down.clone(), starts.clone(), sinks.clone());
         let first = first.map(|text| FirstPrompt::new(text.to_string()).unwrap());
         let agent = cx.new(|cx| {
             let model = ChatModel::new("Fake", first);
-            Agent::from_parts(model, feed, Some(Box::new(requests)), "fake-acp".into(), Host::Local, None, cx)
+            let requests = Some(Box::new(requests) as Box<dyn Requests>);
+            Agent::from_parts(model, feed, requests, "fake-acp".into(), Host::Local, None, connect, cx)
         });
-        Self { sink, agent, calls, down, shared }
+        Self { sink, agent, calls, down, shared, starts, sinks }
     }
 
     /// Folds `events` on this thread, as the reader thread does.
     pub fn feed(&mut self, events: &[Event]) {
         let values = events.iter().map(Event::to_value).collect();
         self.sink.transcript(values).unwrap();
+    }
+
+    /// Folds `events` into the newest session the zone's connect started.
+    pub fn feed_new(&mut self, events: &[Event]) {
+        let values = events.iter().map(Event::to_value).collect();
+        self.sinks.borrow_mut().last_mut().expect("a new session").transcript(values).unwrap();
+    }
+
+    pub fn take_starts(&self) -> Vec<Start> {
+        std::mem::take(&mut *self.starts.borrow_mut())
     }
 
     pub fn take_calls(&self) -> Vec<Call> {

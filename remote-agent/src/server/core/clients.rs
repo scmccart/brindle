@@ -251,15 +251,17 @@ impl<L: EventLoop> Core<L> {
                 "client {new} has the token of client {old}, which it replaces; {} session(s) go to the new one",
                 self.sessions_of(old).len()
             );
+            // A restart's session is hung up with the others still
+            // starting, which ends it ([`Core::hang_up`]).
             let (failed, kept) = std::mem::take(&mut self.waiting)
                 .into_iter()
-                .partition(|waiting| waiting.client == old);
+                .partition(|waiting| waiting.client == old && !waiting.spawn.is_restart());
             self.waiting = kept;
             for waiting in failed {
                 self.send_client(
                     old,
                     error(
-                        Some(waiting.spawn.req()),
+                        waiting.spawn.answers(),
                         None,
                         "this connection was replaced by a newer one with its token",
                     ),
@@ -344,6 +346,7 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentResend(request) => {
                 self.client_agent_command(client, AgentCommand::resend(request))
             }
+            ToCore::AgentRestart(restart) => self.client_agent_restart(client, restart),
         }
     }
 

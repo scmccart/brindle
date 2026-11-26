@@ -6,8 +6,10 @@ use std::time::Duration;
 use gpui::{EntityInputHandler as _, FocusHandle, VisualTestContext};
 
 use super::*;
-use crate::agent::test_support::{Call, Zone, added, app, ready, settle, user};
-use crate::agent::transcript::{AgentState, Entry, Event, HoldReason, PermissionOption, Slot, StopReason, TurnState};
+use crate::agent::test_support::{Call, FAKE_PROFILE, Zone, added, app, ready, set_config, settle, user};
+use crate::agent::transcript::{
+    AgentState, Continuation, Conversation, Entry, Event, HoldReason, PermissionOption, Slot, StopReason, TurnState,
+};
 
 struct Fixture {
     zone: Zone,
@@ -17,7 +19,15 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_config(None)
+    }
+
+    /// A fixture whose app's config is `config` (`None`: the default).
+    fn with_config(config: Option<&str>) -> Self {
         let mut app = app();
+        if let Some(config) = config {
+            set_config(config, &mut app);
+        }
         let zone = Zone::new(None, &mut app);
         let agent = zone.agent.clone();
         let (view, cx) = app.add_window_view(|window, cx| AgentView::new(agent, Theme::default(), None, window, cx));
@@ -408,9 +418,9 @@ fn set_profile_changes_the_text_size() {
 fn the_prompt_state_follows_the_model() {
     use crate::agent::model::DisabledWhy;
     let model = ChatModel::new("Fake", None);
-    let (status, queued, reason) = prompt_state(&model);
-    assert_eq!((status, queued), (UiStatus::Disabled, None));
-    assert_eq!(reason.as_ref().map(SharedString::as_ref), Some(DisabledWhy::Connecting.text()));
+    let state = prompt_state(&model, &Offer::None(NoOffer::NotEnded));
+    assert_eq!((state.status, state.queued, state.action), (UiStatus::Disabled, None, None));
+    assert_eq!(state.reason.as_ref().map(SharedString::as_ref), Some(DisabledWhy::Connecting.text()));
     assert_eq!(bubble_part(0, true), BubblePart::Whole);
     assert_eq!(bubble_part(0, false), BubblePart::First);
     assert_eq!(bubble_part(1, false), BubblePart::Middle);
@@ -418,6 +428,120 @@ fn the_prompt_state_follows_the_model() {
     assert_eq!(queued_of(&QueueRow::Waiting { text: "a".into() }), Some(Queued::Waiting { text: "a".into() }));
     assert_eq!(tool_status(ToolStatus::InProgress), UiToolStatus::Running);
     assert_eq!(tool_icon(ToolKind::Execute), Icon::Terminal);
+}
+
+// `agents-session-recovery` 5.1: the Continue conversation button.
+
+fn conversation(continuation: Continuation) -> Event {
+    let conversation = Conversation { id: "sess-1".into(), cwd: "/home/u/src".into(), continuation };
+    Event::Conversation { conversation }
+}
+
+fn exited() -> Event {
+    Event::Agent { state: AgentState::Exited { code: Some(1), stderr: "boom".into() } }
+}
+
+/// A view of the `Fake` agent profile's zone (in a config that has it, or
+/// not) whose agent ran one turn with a conversation `continuation`
+/// offers, then exited.
+fn ended_view(continuation: Continuation, config: Option<&str>) -> Fixture {
+    let mut f = Fixture::with_config(config);
+    f.feed(&[conversation(continuation), ready(), added(1, user("hi")), exited()]);
+    f
+}
+
+fn action(f: &mut Fixture) -> Option<String> {
+    f.view.read_with(f.cx, |view, cx| view.prompt.read(cx).action().map(|label| label.to_string()))
+}
+
+fn reason_text(f: &mut Fixture) -> Option<String> {
+    f.reason().map(|reason| reason.to_string())
+}
+
+fn action_stop(f: &mut Fixture) -> Option<FocusHandle> {
+    f.view.read_with(f.cx, |view, cx| view.prompt.read(cx).action_stop())
+}
+
+/// What the reason line shows for each offer: the button after the
+/// exit's reason (or after a refused continue's words); no button and why
+/// not for an ended agent that can't continue; a running or never-started
+/// agent's own reason.
+#[test]
+fn the_reason_line_follows_the_offer() {
+    use crate::agent::model::{DisabledWhy, StartFailure};
+    let mut f = ended_view(Continuation::Resume, Some(FAKE_PROFILE));
+    let text = |state: &PromptState| state.reason.as_ref().map(|r| r.to_string());
+    let shown = |f: &mut Fixture, offer: Offer| f.zone.agent.read_with(f.cx, |agent, _| prompt_state(agent.model(), &offer));
+    let state = shown(&mut f, Offer::Restart);
+    assert_eq!(state.status, UiStatus::Disabled);
+    assert_eq!((text(&state).as_deref(), state.action), (Some(DisabledWhy::Exited.text()), Some(CONTINUE.into())));
+    for (why, says) in [
+        (NoOffer::NotOffered, "the agent can't continue conversations"),
+        (NoOffer::NoConversation, "the agent never started a conversation"),
+        (NoOffer::ProfileGone { name: "Fake".into() }, "the profile Fake is gone"),
+    ] {
+        let state = shown(&mut f, Offer::None(why));
+        assert_eq!((text(&state).as_deref(), state.action), (Some(says), None));
+    }
+    let mut g = Fixture::new();
+    g.feed(&[ready()]);
+    let state = shown(&mut g, Offer::None(NoOffer::NotEnded));
+    assert_eq!((state.reason, state.action), (None, None));
+    let mut h = Fixture::new();
+    h.zone.sink.failed(&anyhow::Error::new(StartFailure::NoServer("no helper".into())));
+    h.settle();
+    let state = shown(&mut h, Offer::None(NoOffer::NoConversation));
+    assert_eq!(text(&state).as_deref(), Some(DisabledWhy::NotStarted.text()), "a never-started agent keeps its reason");
+}
+
+/// An exited agent that can continue shows the button, one Tab from the
+/// prompt (`continue` on the focus line); enter on it sends the restart,
+/// the button goes with its focus, and a refusal brings it back after the
+/// refusal's words. `agent_continue` does the same.
+#[test]
+fn the_continue_button_and_agent_continue_restart_the_agent() {
+    let mut f = ended_view(Continuation::Resume, Some(FAKE_PROFILE));
+    assert_eq!(action(&mut f).as_deref(), Some(CONTINUE));
+    let stop = action_stop(&mut f).expect("a stop");
+    assert_eq!(f.tabs(1), [stop]);
+    let view = f.view.clone();
+    assert_eq!(f.cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).as_deref(), Some("continue"));
+    f.cx.simulate_keystrokes("enter");
+    f.settle();
+    assert!(matches!(f.calls().as_slice(), [Call::Restart(_)]));
+    assert_eq!(action(&mut f), None, "starting, nothing to continue");
+    assert_eq!(f.focused(), Some(f.prompt_handle()), "the button went, and its focus with it");
+
+    f.zone.sink.reply(1, Err("session 7: the server is stopping; try again".into()));
+    f.settle();
+    assert_eq!(action(&mut f).as_deref(), Some(CONTINUE), "offered again");
+    assert_eq!(reason_text(&mut f).as_deref(), Some("session 7: the server is stopping; try again"));
+    f.cx.dispatch_action(AgentContinue);
+    f.settle();
+    assert!(matches!(f.calls().as_slice(), [Call::Restart(_)]));
+}
+
+/// No button where nothing can be continued: an agent that offered
+/// neither load nor resume, and a profile gone from the config, which a
+/// config change takes away from a zone already showing the button.
+#[test]
+fn no_continue_button_when_it_isnt_offered() {
+    let mut f = ended_view(Continuation::Neither, Some(FAKE_PROFILE));
+    assert_eq!(action(&mut f), None);
+    assert_eq!(reason_text(&mut f).as_deref(), Some("the agent can't continue conversations"));
+    assert_eq!(f.tabs(1), [f.prompt_handle()], "Tab finds no other stop");
+    f.cx.dispatch_action(AgentContinue);
+    assert!(f.calls().is_empty());
+
+    let mut g = ended_view(Continuation::Resume, Some(FAKE_PROFILE));
+    let stop = action_stop(&mut g).expect("offered");
+    g.focus(&stop);
+    let mut app = g.cx.clone();
+    set_config("[[profiles]]\nname = \"Shell\"\n", &mut app);
+    g.settle();
+    assert_eq!(action(&mut g), None);
+    assert_eq!(reason_text(&mut g).as_deref(), Some("the profile Fake is gone"));
+    assert_eq!(g.focused(), Some(g.prompt_handle()), "the button's focus went back to the prompt");
 }
 
 /// The plan of a Linux host called `here`, as the dump's tests use.

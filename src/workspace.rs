@@ -792,6 +792,9 @@ impl Workspace {
             match session::resolve_tab(entry, &config, &home, style, &|dir: &Path| dir.is_dir()) {
                 None => {}
                 Some(RestoredTab::Local { profile, host, cwd, title, zones, session, missing_profile }) => {
+                    // The profile the tab's sessions were started with, when
+                    // the tab now uses another.
+                    let gone = missing_profile.clone();
                     let missing_note = missing_profile.map(|name| {
                         log::warn!("session restore: no profile named {name:?}, using the default profile");
                         missing_profile_text(&name, &config.profiles[profile].name)
@@ -801,7 +804,7 @@ impl Workspace {
                     }
                     match (zones, session) {
                         (Some(zones), _) => {
-                            if !self.restore_zones(profile, host, zones, window, cx) {
+                            if !self.restore_zones(profile, host, zones, gone.as_deref(), window, cx) {
                                 continue;
                             }
                         }
@@ -809,7 +812,8 @@ impl Workspace {
                             let profile = config.profiles[profile].clone();
                             // A tab whose one session is of the other kind
                             // isn't restored: the session opens on its own.
-                            let Some(start) = self.restored_zone(&profile, &host, cwd, Some(&recorded), &config, cx)
+                            let Some(start) =
+                                self.restored_zone(&profile, &host, cwd, Some(&recorded), gone.as_deref(), &config, cx)
                             else {
                                 continue;
                             };
@@ -842,12 +846,14 @@ impl Workspace {
     /// sessions on, else its profile's (`session::resolve_tab`). A zone
     /// whose listed session is of the other kind is left out of the split
     /// ([`Workspace::restored_zone`]); `false` when none is left, and no
-    /// tab opened.
+    /// tab opened. `gone` names the profile the tab recorded when the
+    /// config no longer has it.
     fn restore_zones(
         &mut self,
         profile_ix: usize,
         host: Host,
         zones: RestoredZoneNode,
+        gone: Option<&str>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -856,7 +862,7 @@ impl Workspace {
         let (mut tree, leaves, mut active_id) = zones.into_tree();
         let mut terminals = Vec::new();
         for (id, cwd, session) in leaves {
-            match self.restored_zone(&profile, &host, cwd, session.as_ref(), &config, cx) {
+            match self.restored_zone(&profile, &host, cwd, session.as_ref(), gone, &config, cx) {
                 Some(start) => terminals.push((id, start)),
                 None => {
                     tree.remove(id);
@@ -1169,8 +1175,9 @@ impl Workspace {
             TabKind::Agent => {
                 let listed = crate::remote::ListedSession::of(info);
                 let directory = info.cwd.as_ref().map(PathBuf::from);
+                let started_with = info.profile.clone();
                 ZoneStart::Agent(cx.new(|cx| {
-                    Agent::attach(profile, host, listed.session, listed.key, false, directory, cx)
+                    Agent::attach(profile, host, listed.session, listed.key, false, directory, started_with, cx)
                 }))
             }
         }
@@ -1205,13 +1212,17 @@ impl Workspace {
     /// endpoint once its listing there confirms it, which the zone waits
     /// for, saying it is connecting. A listed session of the other kind
     /// isn't restored into the tab (`None`): it opens as a tab of its own.
-    /// Otherwise `profile` is started anew in `cwd`.
+    /// Otherwise `profile` is started anew in `cwd`. `gone` names the
+    /// profile the tab recorded when `profile` stands in for it: an agent
+    /// zone attached under it continues only with that one.
+    #[allow(clippy::too_many_arguments, reason = "the recorded zone's parts, each a value the caller holds")]
     fn restored_zone(
         &mut self,
         profile: &Profile,
         host: &Host,
         cwd: PathBuf,
         recorded: Option<&session::ServerSession>,
+        gone: Option<&str>,
         config: &Config,
         cx: &mut Context<Self>,
     ) -> Option<ZoneStart> {
@@ -1232,7 +1243,8 @@ impl Workspace {
                         ZoneStart::Terminal(cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx)))
                     }
                     TabKind::Agent => ZoneStart::Agent(cx.new(|cx| {
-                        Agent::attach(profile, host, recorded.id, key, true, Some(cwd), cx)
+                        let started_with = gone.map(str::to_string);
+                        Agent::attach(profile, host, recorded.id, key, true, Some(cwd), started_with, cx)
                     })),
                 });
             }
@@ -1246,7 +1258,7 @@ impl Workspace {
             None => {}
         }
         #[cfg(not(any(target_os = "linux", windows)))]
-        let _ = recorded;
+        let _ = (recorded, gone);
         Some(match kind {
             TabKind::Terminal => ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))),
             TabKind::Agent => {

@@ -53,7 +53,7 @@ macro_rules! forms {
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
     Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
-    AgentResend);
+    AgentResend, AgentRestart);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
     Process, Transcript);
@@ -1561,6 +1561,18 @@ fn ready() -> serde_json::Value {
     json!({"event": "agent", "state": {"agent": "ready", "name": "fake-acp-agent", "version": "1.0.0"}})
 }
 
+/// The agent's ACP session id in the agent fixtures.
+const CONVERSATION: &str = "sess-4f1c";
+const KEY_2: &str = "0d7e3a91c4b25f68e1a9d0c3b7f24e85";
+
+fn conversation(continuation: &str) -> serde_json::Value {
+    json!({"event": "conversation", "conversation": {"id": CONVERSATION, "cwd": "/home/u/src", "continuation": continuation}})
+}
+
+fn notice(text: &str) -> serde_json::Value {
+    json!({"type": "notice", "level": "info", "text": text})
+}
+
 const AGENT: &str = "fake-acp-agent --script /home/u/turn.script";
 
 fn agent_info(session: u32, activity: client::AgentActivity) -> client::SessionInfo {
@@ -1589,7 +1601,7 @@ fn agent_transcripts() -> Vec<Transcript> {
         Transcript {
             name: "client-agent-session",
             protocol: Protocol::Client4,
-            about: "Protocol 4: an agent session's spawn, a turn with a waiting prompt discarded and queued again, a permission answered (and answered again, refused), a cancel holding the waiting prompt, its resend, a permission answered cancelled, and the close.",
+            about: "Protocol 4: an agent session's spawn and its conversation, a turn with a waiting prompt discarded and queued again, a permission answered (and answered again, refused), a cancel holding the waiting prompt, its resend, a permission answered cancelled, the agent's exit and its restart continuing the conversation, a continuing spawn into a new session, and the closes.",
             steps: vec![
                 hello_4(TOKEN),
                 welcome_4(),
@@ -1604,6 +1616,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     ]),
                     policy: Policy::Detach,
                     profile: Some("Agent".into()),
+                    conversation: None,
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 1,
@@ -1611,7 +1624,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     pid: 5000,
                     key: KEY.into(),
                 })),
-                transcript(1, vec![ready()]),
+                transcript(1, vec![conversation("resume_and_load"), ready()]),
                 prompt(2, 1, "Write notes.md"),
                 ok(2),
                 transcript(
@@ -1701,12 +1714,74 @@ fn agent_transcripts() -> Vec<Transcript> {
                 ),
                 c(client::ToCore::AgentUnqueue(client::AgentRequest { req: 11, session: 1 })),
                 error(Some(11), Some(1), "nothing is queued"),
+                // The agent exits; its conversation can be continued, so the
+                // session stays, and the client restarts it.
+                transcript(
+                    1,
+                    vec![json!({"event": "agent", "state": {"agent": "exited", "code": 1, "stderr": "fatal: out of memory\n"}})],
+                ),
+                c(client::ToCore::AgentRestart(client::AgentRestart {
+                    req: 12,
+                    session: 1,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/again.script".into()],
+                    env: BTreeMap::from([
+                        ("HOME".into(), "/home/u".into()),
+                        ("PATH".into(), "/usr/local/bin:/usr/bin".into()),
+                    ]),
+                })),
+                ok(12),
+                transcript(
+                    1,
+                    vec![
+                        added(8, notice("the agent was started again to continue the conversation")),
+                        json!({"event": "agent", "state": {"agent": "starting"}}),
+                    ],
+                ),
+                transcript(1, vec![conversation("resume_and_load"), ready()]),
+                // A client whose session the server lost continues the
+                // conversation in a new one.
+                c(client::ToCore::SpawnAgent(client::SpawnAgent {
+                    req: 13,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/load.script".into()],
+                    cwd: None,
+                    env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                    policy: Policy::Detach,
+                    profile: Some("Agent".into()),
+                    conversation: Some(client::AgentConversation {
+                        id: CONVERSATION.into(),
+                        cwd: "/home/u/src".into(),
+                    }),
+                })),
+                s(client::ToClient::Spawned(client::Spawned {
+                    req: 13,
+                    session: 2,
+                    pid: 5001,
+                    key: KEY_2.into(),
+                })),
+                transcript(
+                    2,
+                    vec![
+                        added(1, notice("this continues an earlier conversation; what follows is the agent's replay of it")),
+                        added(2, text_entry("user", "Write notes.md")),
+                        added(3, text_entry("agent", "I'll write it.\n")),
+                        conversation("resume_and_load"),
+                        ready(),
+                    ],
+                ),
                 c(client::ToCore::Close(client::SessionRef { session: 1 })),
                 transcript(
                     1,
                     vec![json!({"event": "agent", "state": {"agent": "exited", "stderr": ""}})],
                 ),
                 exit(1, None),
+                c(client::ToCore::Close(client::SessionRef { session: 2 })),
+                transcript(
+                    2,
+                    vec![json!({"event": "agent", "state": {"agent": "exited", "stderr": ""}})],
+                ),
+                exit(2, None),
             ],
         },
         Transcript {
