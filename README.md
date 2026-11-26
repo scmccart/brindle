@@ -797,10 +797,6 @@ a launch beside a running Brindle is handed to it. From `brindle --help`:
 ```
     brindle agent [PROFILE] [-d DIR] [-p PROMPT] [OPTIONS]
                                  Open an agent tab
-    -c, --continue               Continue the latest conversation in the
-                                 directory, else choose one or start anew
-    -r, --resume                 List the directory's conversations to choose
-                                 one
 ```
 
 An agent zone shows the conversation, newest at the bottom, with the prompt

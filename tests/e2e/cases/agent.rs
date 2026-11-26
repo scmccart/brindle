@@ -2628,7 +2628,7 @@ pub fn continue_held(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// Continue Agent Conversation from the command palette continues the
+/// Continue This Conversation from the command palette continues the
 /// conversation as the button does.
 pub fn continue_palette(ctx: &Ctx) -> Result<Outcome> {
     let go = gate(ctx, "exit");
@@ -2639,7 +2639,8 @@ pub fn continue_palette(ctx: &Ctx) -> Result<Outcome> {
     let out = from_shell(run, &swap, true)
         .wait_for(EXITED)
         .action("open_command_palette")
-        .send("Continue Agent Conversation")
+        // `agent_continue`'s name since `agents-session-list`.
+        .send("Continue This Conversation")
         .action("picker_confirm")
         .wait_for(READY)
         .dump_at(13.0)
@@ -2755,8 +2756,10 @@ pub fn continue_lost(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// An agent that offered neither `session/load` nor `session/resume`
-/// exits: no Continue conversation button (Tab from the prompt finds no
-/// other stop), the dump says why, and `agent_continue` starts nothing.
+/// exits: no Continue conversation button (Tab from the prompt reaches
+/// Conversations…, the first of the other buttons since
+/// `agents-session-list`), the dump says why, and `agent_continue` starts
+/// nothing.
 pub fn continue_none(ctx: &Ctx) -> Result<Outcome> {
     let (first, _) = records(ctx);
     let profile = Script::offering(&first, NEITHER)
@@ -2776,7 +2779,9 @@ pub fn continue_none(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(7.0)
         .run()?;
     waited(&out)?;
-    ensure!(out.dump.focus_stop.as_deref() == Some("prompt"), "no button to Tab to: {:?}", out.dump.focus_stop);
+    ensure!(out.dump.focus_stop.as_deref() == Some("conversations"), "no Continue button to Tab to: {:?}", out.dump.focus_stop);
+    let prompt = out.dump.agent.iter().find_map(|line| line.strip_prefix("prompt ")).unwrap_or("");
+    ensure!(prompt.ends_with("actions=conversations,new"), "the other buttons: {:?}", out.dump.agent);
     ensure!(out.dump.agent_field("state") == Some("exited:1"), "agent: {:?}", out.dump.agent);
     ensure!(recorded_count(&first, "initialize") == 1, "the agent was started again");
     Ok(Outcome::Pass)
