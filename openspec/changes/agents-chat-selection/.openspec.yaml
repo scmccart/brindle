@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-25
+# Proposal stage only: lets the proposal validate on its own. The design
+# stage removes this line and writes the change's delta specs.
+skip_specs: true
