@@ -34,7 +34,8 @@ brindle-remote-agent ────┼──▶ brindle-remote-protocol (remote-pr
 | `remote-protocol/**` | process, types, railway |
 | `transcript/**` | fcis, types, railway, process |
 | `remote-agent/**` | process, ports, railway |
-| `remote-agent/src/acp/**` | fcis, railway |
+| `remote-agent/src/acp/**` | fcis, railway, ports (R14: one module per ACP version) |
+| an ACP method or field name, or a new ACP version | ports (R14) |
 | `src/remote/**`, `src/terminal/**`, `src/instance.rs`, `src/session.rs`, `src/config.rs` | process, railway, fcis |
 | the rest of `src/**` (views, overlays, settings) | fcis, types, ports |
 | `tests/**`, `remote-agent/tests/**`, any new kind of test, any flake | testing |

@@ -1,12 +1,12 @@
-//! What the agent writes on stdout, decoded in two steps (design decision 5):
-//! first the JSON-RPC envelope, by hand ([`decode`] into [`Message`], with
-//! `params` and `result` kept as [`Value`]), then the params or result of
-//! each method the reducer reads, into Brindle's own closed types, through
-//! the schema crate's types where the spike found them lenient enough.
+//! What an ACP v1 agent writes, read into the forms (`acp::forms`): the
+//! params or result of each method the reducer reads, decoded into
+//! Brindle's own closed types through the schema crate's types where the
+//! spike found them lenient enough (design decision 5 of `agents-sessions`).
+//! With [`super::encode`], the only code naming `agent_client_protocol_schema::v1`,
+//! a v1 method name or a v1 field name (`ports R14`).
 //!
-//! The two steps confine every failure to one message: an unknown method,
-//! an unknown update kind or a malformed message is one skipped item
-//! ([`Malformed`], [`BadParams`]), never a lost connection.
+//! Each failure is confined to one message: an unknown method, an unknown
+//! update kind or a malformed message is one skipped item ([`BadParams`]).
 //!
 //! - **`session/update`** is dispatched here on its `sessionUpdate` kind,
 //!   never through the crate's `SessionUpdate` enum, which costs the helper
@@ -24,9 +24,6 @@
 //!   at a time ([`auth_methods`], OpenSpec change `agents-login`), and left
 //!   out of what the schema crate decodes, so a bad method is one left out,
 //!   never a lost `initialize`.
-//! - **Request ids** ([`Id`]) are kept as the JSON number or string the agent
-//!   sent (Antigravity sends `"1"`; others start at `0`), and echoed back
-//!   verbatim.
 //!
 //! The crate's enums are `#[non_exhaustive]`, so they are mapped onto
 //! `brindle_transcript`'s closed ones here, and the reducer never matches
@@ -35,197 +32,19 @@
 use std::collections::BTreeMap;
 
 use agent_client_protocol_schema::v1 as acp;
-use brindle_remote_protocol::serde_json::{self, Map, Value};
+use brindle_remote_protocol::serde_json::{self, Value};
 use brindle_transcript::{
-    Continuation, LoginKind, LoginMethod, PermissionKind, StopReason, ToolKind, ToolStatus,
+    LoginKind, LoginMethod, PermissionKind, StopReason, ToolKind, ToolStatus,
 };
 
-/// The longest request id kept, as encoded JSON: a request with a longer id
-/// is answered `-32600` with a null id (decision 13).
-pub const MAX_ID_LEN: usize = 1024;
-
-/// ACP's error codes the core reads: authentication required (decision
-/// 17), and an `initialize` refused for its version (decision 4). The codes
-/// the core sends are `rpc`'s.
-pub const AUTH_REQUIRED: i64 = -32000;
-pub const UNSUPPORTED_VERSION: i64 = -32022;
-
-/// A JSON-RPC request id: a number or a string, at most [`MAX_ID_LEN`]
-/// bytes encoded, kept as sent so an answer echoes it verbatim.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Id(Value);
-
-impl Id {
-    /// The id of a request the core sends (the core's own come from
-    /// `Rpc`; the tests build them).
-    #[cfg(test)]
-    pub fn number(id: u64) -> Self {
-        Self(Value::from(id))
-    }
-
-    /// The id `value` is, when it is a number or a string within
-    /// [`MAX_ID_LEN`] encoded.
-    pub fn parse(value: &Value) -> Option<Self> {
-        let scalar = matches!(value, Value::Number(_) | Value::String(_));
-        (scalar && value.to_string().len() <= MAX_ID_LEN).then(|| Self(value.clone()))
-    }
-
-    /// The id as a non-negative integer, as the core's own requests have.
-    pub fn as_u64(&self) -> Option<u64> {
-        self.0.as_u64()
-    }
-
-    /// The id as JSON text, as it goes back on the wire.
-    pub fn encode(&self) -> String {
-        self.0.to_string()
-    }
-
-    /// The id as a JSON value.
-    pub fn to_value(&self) -> Value {
-        self.0.clone()
-    }
-}
-
-/// A JSON-RPC error object.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RpcError {
-    pub code: i64,
-    pub message: String,
-    pub data: Option<Value>,
-}
-
-/// One line from the agent, as JSON-RPC 2.0.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Message {
-    /// A request, which the core must answer.
-    Request {
-        id: Id,
-        method: String,
-        params: Value,
-    },
-    /// A notification, which nobody answers.
-    Notification { method: String, params: Value },
-    /// A success answering one of the core's requests.
-    Response { id: Id, result: Value },
-    /// An error answering one of the core's requests; `id` is `None` when
-    /// the agent couldn't read which (JSON-RPC's `null`).
-    Error { id: Option<Id>, error: RpcError },
-}
-
-/// Why a line isn't a message. Every kind is skipped and counted (decision
-/// 13); only [`Malformed::InvalidRequest`] is also answered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Malformed {
-    /// Empty, or only whitespace.
-    Blank,
-    /// Not JSON.
-    NotJson,
-    /// A JSON-RPC batch, which ACP doesn't use.
-    Batch,
-    /// JSON, but not an object.
-    NotObject,
-    /// An object without `"jsonrpc": "2.0"`.
-    NotJsonRpc,
-    /// A request (it has a method and an id) whose method isn't a string or
-    /// whose id isn't a number or string within [`MAX_ID_LEN`]: answered
-    /// `-32600` with a null id.
-    InvalidRequest,
-    /// Anything else that isn't a message: a notification whose method isn't
-    /// a string, a response without a usable id, with both or neither of
-    /// `result` and `error`, or with an error that isn't `{ code, message }`.
-    BadShape,
-}
-
-/// Decodes one line (without its newline). Invalid UTF-8 is replaced
-/// first, so a line that is otherwise JSON-RPC still decodes.
-pub fn decode(line: &[u8]) -> Result<Message, Malformed> {
-    let text = String::from_utf8_lossy(line);
-    if text.trim().is_empty() {
-        return Err(Malformed::Blank);
-    }
-    let value: Value = serde_json::from_str(&text).map_err(|_| Malformed::NotJson)?;
-    let mut object = match value {
-        Value::Object(object) => object,
-        Value::Array(_) => return Err(Malformed::Batch),
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
-            return Err(Malformed::NotObject);
-        }
-    };
-    if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-        return Err(Malformed::NotJsonRpc);
-    }
-    let id = object.remove("id");
-    match (object.remove("method"), id) {
-        (Some(Value::String(method)), None) => Ok(Message::Notification {
-            method,
-            params: object.remove("params").unwrap_or(Value::Null),
-        }),
-        (Some(Value::String(method)), Some(id)) => {
-            let id = Id::parse(&id).ok_or(Malformed::InvalidRequest)?;
-            Ok(Message::Request {
-                id,
-                method,
-                params: object.remove("params").unwrap_or(Value::Null),
-            })
-        }
-        (Some(_), Some(_)) => Err(Malformed::InvalidRequest),
-        (Some(_), None) => Err(Malformed::BadShape),
-        (None, id) => answer(object, id),
-    }
-}
-
-/// A message with no method: a response or an error.
-fn answer(mut object: Map<String, Value>, id: Option<Value>) -> Result<Message, Malformed> {
-    match (object.remove("result"), object.remove("error")) {
-        (Some(result), None) => {
-            let id = id.as_ref().and_then(Id::parse).ok_or(Malformed::BadShape)?;
-            Ok(Message::Response { id, result })
-        }
-        (None, Some(error)) => {
-            let id = match id {
-                None | Some(Value::Null) => None,
-                Some(id) => Some(Id::parse(&id).ok_or(Malformed::BadShape)?),
-            };
-            let error = rpc_error(&error).ok_or(Malformed::BadShape)?;
-            Ok(Message::Error { id, error })
-        }
-        (Some(_), Some(_)) | (None, None) => Err(Malformed::BadShape),
-    }
-}
-
-fn rpc_error(value: &Value) -> Option<RpcError> {
-    Some(RpcError {
-        code: value.get("code")?.as_i64()?,
-        message: value.get("message")?.as_str()?.to_owned(),
-        data: value.get("data").cloned(),
-    })
-}
-
-/// Why a known method's params or result didn't decode: the message is
-/// skipped (a request is still answered by its envelope id). The text is
-/// for tests and debugging, never shown with agent data in it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BadParams(pub String);
-
-impl BadParams {
-    fn missing(what: &str) -> Self {
-        Self(format!("no {what}"))
-    }
-
-    fn from_serde(error: &serde_json::Error) -> Self {
-        Self(error.to_string())
-    }
-}
-
-/// A request from the agent, by its method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestKind {
-    /// `session/request_permission`.
-    Permission,
-    /// Anything the core didn't offer (`fs/*`, `terminal/*`, elicitation,
-    /// extensions): answered `-32601`.
-    Unoffered,
-}
+use crate::acp::envelope::{BadParams, Id, RpcError};
+use crate::acp::forms::{
+    AgentInfo, Content, ContentKind, Continued, Initialized, MAX_LOGIN_ARG, MAX_LOGIN_ARGS,
+    MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
+    NewSession, NotificationKind, OptionKind, Patch, PermissionRequest, RequestKind,
+    RequestedOption, SessionUpdate, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
+};
+use brindle_transcript::Continuation;
 
 pub fn request_kind(method: &str) -> RequestKind {
     match method {
@@ -234,46 +53,12 @@ pub fn request_kind(method: &str) -> RequestKind {
     }
 }
 
-/// A notification from the agent, by its method.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NotificationKind {
-    /// `session/update`.
-    SessionUpdate,
-    /// `$/cancel_request`: the agent withdraws one of its requests.
-    CancelRequest,
-    /// Anything else (`_auth/status_update` and the like): ignored, and
-    /// never logged, since some carry the account's email.
-    Other,
-}
-
 pub fn notification_kind(method: &str) -> NotificationKind {
     match method {
         "session/update" => NotificationKind::SessionUpdate,
         "$/cancel_request" => NotificationKind::CancelRequest,
         _ => NotificationKind::Other,
     }
-}
-
-/// What `initialize` answered.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Initialized {
-    /// The version the agent speaks; Brindle speaks 1.
-    pub protocol_version: u16,
-    /// `agentInfo`, when the agent gave a well-formed one.
-    pub agent: Option<AgentInfo>,
-    /// Whether the agent offers `session/load`
-    /// (`agentCapabilities.loadSession`) and `session/resume`
-    /// (`agentCapabilities.sessionCapabilities.resume`). A malformed
-    /// capability reads as not offered.
-    pub continuation: Continuation,
-}
-
-/// The agent's `agentInfo`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentInfo {
-    pub name: String,
-    pub title: Option<String>,
-    pub version: String,
 }
 
 /// `initialize`'s answer, read through the schema crate. `authMethods` is
@@ -299,38 +84,6 @@ pub fn initialize_result(result: &Value) -> Result<Initialized, BadParams> {
             version: info.version,
         }),
     })
-}
-
-/// The most login methods kept from `initialize` (OpenSpec change
-/// `agents-login`, design decision 3); the rest are left out.
-pub const MAX_LOGIN_METHODS: usize = 16;
-/// The longest method id and name kept, in bytes: a method with a longer
-/// one is left out (an id can't be cut, since a login names it).
-pub const MAX_LOGIN_ID: usize = 1024;
-/// The longest method description kept, in bytes: a longer one is cut.
-pub const MAX_LOGIN_DESCRIPTION: usize = 4 * 1024;
-/// The most `args` and `env` entries a terminal method may have, and the
-/// longest each argument, key and value may be, in bytes: past either, the
-/// method is left out, since a cut argument would run something else.
-pub const MAX_LOGIN_ARGS: usize = 32;
-pub const MAX_LOGIN_ARG: usize = 4 * 1024;
-/// The most the kept methods may take, encoded as the transcript sends
-/// them: the methods past it are left out, so a `LoginRequired` event,
-/// which carries them all, fits a frame (`pack_transcript`).
-pub const MAX_LOGIN_METHODS_LEN: usize = 256 * 1024;
-
-/// The login methods `initialize` advertised, as [`auth_methods`] read them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Methods {
-    /// The methods kept, in the agent's order. Their name and description
-    /// are as sent (bounded, not yet cleaned).
-    pub methods: Vec<LoginMethod>,
-    /// How many methods were left out: of a type Brindle doesn't run, a
-    /// terminal one Brindle didn't advertise, malformed, past a bound, or
-    /// past [`MAX_LOGIN_METHODS`] or [`MAX_LOGIN_METHODS_LEN`].
-    pub dropped: usize,
-    /// How many kept descriptions were cut to [`MAX_LOGIN_DESCRIPTION`].
-    pub cut: usize,
 }
 
 /// Reads `initialize`'s `authMethods` by hand, one method at a time
@@ -436,7 +189,11 @@ fn login_args(args: Option<&Value>) -> Option<Vec<String>> {
         return None;
     }
     args.iter()
-        .map(|arg| arg.as_str().filter(|arg| login_word(arg)).map(str::to_owned))
+        .map(|arg| {
+            arg.as_str()
+                .filter(|arg| login_word(arg))
+                .map(str::to_owned)
+        })
         .collect()
 }
 
@@ -481,13 +238,6 @@ pub fn supported_versions(error: &RpcError) -> Option<Vec<u16>> {
     (!versions.is_empty()).then_some(versions)
 }
 
-/// What `session/new` answered.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewSession {
-    /// The ACP session id every later request names.
-    pub session_id: String,
-}
-
 pub fn new_session_result(result: &Value) -> Result<NewSession, BadParams> {
     let response: acp::NewSessionResponse =
         serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
@@ -498,7 +248,7 @@ pub fn new_session_result(result: &Value) -> Result<NewSession, BadParams> {
 
 /// That `session/resume` succeeded: its result has nothing the reducer
 /// reads, but must be an object the schema crate accepts.
-pub fn resume_result(result: &Value) -> Result<(), BadParams> {
+fn resume_result(result: &Value) -> Result<(), BadParams> {
     let _: acp::ResumeSessionResponse =
         serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
     Ok(())
@@ -506,7 +256,7 @@ pub fn resume_result(result: &Value) -> Result<(), BadParams> {
 
 /// That `session/load` succeeded, as [`resume_result`] for `session/resume`.
 /// The replay came before it, as `session/update` notifications.
-pub fn load_result(result: &Value) -> Result<(), BadParams> {
+fn load_result(result: &Value) -> Result<(), BadParams> {
     let _: acp::LoadSessionResponse =
         serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
     Ok(())
@@ -529,82 +279,6 @@ pub fn prompt_result(result: &Value) -> Result<StopReason, BadParams> {
             name: other.to_owned(),
         },
     })
-}
-
-/// A `session/update` notification.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionUpdate {
-    pub session_id: String,
-    pub update: Update,
-}
-
-/// What a `session/update` says, by its `sessionUpdate` kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Update {
-    /// `user_message_chunk`.
-    UserChunk(Content),
-    /// `agent_message_chunk`.
-    AgentChunk(Content),
-    /// `agent_thought_chunk`.
-    ThoughtChunk(Content),
-    /// `tool_call`: a new tool call.
-    ToolCall(ToolCall),
-    /// `tool_call_update`: the fields that arrived, in no assumed order.
-    ToolChanged(ToolChange),
-    /// `session_info_update`: what it says of the conversation's title
-    /// (OpenSpec change `agents-session-title`, decision 2). Its
-    /// `updatedAt` and `_meta` aren't read.
-    SessionInfo { title: Patch<String> },
-    /// Any other kind, known (`plan`, `usage_update`,
-    /// `available_commands_update`, …) or not.
-    Ignored { kind: String },
-}
-
-/// What an update says of one optional field, ACP's "undefined, null or a
-/// value" (`MaybeUndefined`): left out keeps it, `null` clears it, a value
-/// sets it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Patch<T> {
-    Keep,
-    Clear,
-    Set(T),
-}
-
-/// A chunk's content block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Content {
-    Text(String),
-    /// A block that isn't text, by its kind; the reducer shows a placeholder.
-    Other(ContentKind),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContentKind {
-    Image,
-    Audio,
-    ResourceLink,
-    Resource,
-    /// A kind the schema crate added after 1.22.0 (it can't decode one yet).
-    Unknown,
-}
-
-/// A new tool call. Its content isn't kept (tool rows are one line).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolCall {
-    /// The agent's id for it.
-    pub call: String,
-    pub title: String,
-    pub kind: ToolKind,
-    pub status: ToolStatus,
-}
-
-/// A tool call's changed fields; `None` leaves a field as it was.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ToolChange {
-    pub call: String,
-    pub title: Option<String>,
-    pub kind: Option<ToolKind>,
-    pub status: Option<ToolStatus>,
 }
 
 pub fn session_update(params: &Value) -> Result<SessionUpdate, BadParams> {
@@ -645,9 +319,7 @@ fn session_title(update: &Value) -> Patch<String> {
         None => Patch::Keep,
         Some(Value::Null) => Patch::Clear,
         Some(Value::String(title)) => Patch::Set(title.clone()),
-        Some(Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_)) => {
-            Patch::Keep
-        }
+        Some(Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_)) => Patch::Keep,
     }
 }
 
@@ -686,11 +358,12 @@ fn tool_call(update: &Value) -> Result<ToolCall, BadParams> {
 fn tool_change(update: &Value) -> Result<ToolChange, BadParams> {
     let update: acp::ToolCallUpdate =
         serde_json::from_value(update.clone()).map_err(|e| BadParams::from_serde(&e))?;
+    // v1 can't clear a tool call's field: `null` reads as left out.
     Ok(ToolChange {
         call: update.tool_call_id.0.to_string(),
-        title: update.fields.title,
-        kind: update.fields.kind.map(tool_kind),
-        status: update.fields.status.and_then(tool_status),
+        title: Patch::kept_or_set(update.fields.title),
+        kind: Patch::kept_or_set(update.fields.kind.map(tool_kind)),
+        status: Patch::kept_or_set(update.fields.status.and_then(tool_status)),
     })
 }
 
@@ -727,37 +400,6 @@ fn tool_status(status: acp::ToolCallStatus) -> Option<ToolStatus> {
         acp::ToolCallStatus::Failed => Some(ToolStatus::Failed),
         _ => None,
     }
-}
-
-/// A `session/request_permission` request's params.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PermissionRequest {
-    pub session_id: String,
-    /// The tool call it asks about, when `toolCall` decodes; its title may
-    /// differ from the `tool_call`'s (Copilot's does).
-    pub call: Option<ToolChange>,
-    /// The options that are well-formed, in the agent's order.
-    pub options: Vec<RequestedOption>,
-}
-
-/// One option a permission request offers.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequestedOption {
-    /// The agent's id for it, which the answer names. Ids vary between
-    /// agents (`reject_once`, `deny`, `cancel`), so choose by `kind`.
-    pub id: String,
-    pub name: String,
-    pub kind: OptionKind,
-}
-
-/// What choosing an option does.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OptionKind {
-    Known(PermissionKind),
-    /// A kind ACP v1 doesn't name, kept as sent.
-    Unknown {
-        name: String,
-    },
 }
 
 /// Decodes a permission request by hand, so an option kind Brindle doesn't
@@ -811,237 +453,30 @@ pub fn cancel_request(params: &Value) -> Result<Id, BadParams> {
         .ok_or_else(|| BadParams::missing("requestId"))
 }
 
+/// That `session/resume` or `session/load` succeeded, as `how` says: its
+/// result has nothing the reducer reads, but must be an object the schema
+/// crate accepts. A load's replay came before it, as `session/update`
+/// notifications.
+pub fn continued_result(how: Continued, result: &Value) -> Result<(), BadParams> {
+    match how {
+        Continued::Resume => resume_result(result),
+        Continued::Load => load_result(result),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use brindle_remote_protocol::serde_json::json;
+    use crate::acp::envelope::{Malformed, Message, decode};
+    use crate::acp::forms::AUTH_REQUIRED;
+    use brindle_remote_protocol::serde_json::Map;
 
     fn ok(line: &str) -> Message {
         decode(line.as_bytes()).unwrap_or_else(|e| panic!("{line}: {e:?}"))
     }
-
-    #[test]
-    fn a_request_has_its_id_method_and_params() {
-        let message =
-            ok(r#"{"jsonrpc":"2.0","id":5,"method":"fs/read_text_file","params":{"path":"/x"}}"#);
-        assert_eq!(
-            message,
-            Message::Request {
-                id: Id::number(5),
-                method: "fs/read_text_file".into(),
-                params: json!({"path": "/x"}),
-            }
-        );
-    }
-
-    #[test]
-    fn a_notification_is_a_method_with_no_id() {
-        let message = ok(r#"{"jsonrpc":"2.0","method":"session/update","params":{"a":1}}"#);
-        assert_eq!(
-            message,
-            Message::Notification {
-                method: "session/update".into(),
-                params: json!({"a": 1}),
-            }
-        );
-    }
-
-    #[test]
-    fn missing_params_are_null() {
-        assert_eq!(
-            ok(r#"{"jsonrpc":"2.0","method":"x"}"#),
-            Message::Notification {
-                method: "x".into(),
-                params: Value::Null
-            }
-        );
-    }
-
-    #[test]
-    fn a_response_has_its_id_and_result() {
-        assert_eq!(
-            ok(r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s"}}"#),
-            Message::Response {
-                id: Id::number(2),
-                result: json!({"sessionId": "s"}),
-            }
-        );
-    }
-
-    #[test]
-    fn an_error_has_its_code_message_and_data() {
-        assert_eq!(
-            ok(
-                r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"no","data":{"supported":[2]}}}"#
-            ),
-            Message::Error {
-                id: Some(Id::number(1)),
-                error: RpcError {
-                    code: -32022,
-                    message: "no".into(),
-                    data: Some(json!({"supported": [2]})),
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn an_error_with_a_null_id_has_none() {
-        let Message::Error { id, error } =
-            ok(r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#)
-        else {
-            panic!("not an error");
-        };
-        assert_eq!((id, error.code, error.data), (None, -32700, None));
-    }
-
-    #[test]
-    fn an_error_without_a_code_or_message_is_bad_shape() {
-        for line in [
-            r#"{"jsonrpc":"2.0","id":1,"error":{"message":"no"}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"error":{"code":1}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"error":"no"}"#,
-        ] {
-            assert_eq!(decode(line.as_bytes()), Err(Malformed::BadShape), "{line}");
-        }
-    }
-
-    #[test]
-    fn a_response_with_both_or_neither_result_and_error_is_bad_shape() {
-        for line in [
-            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":1,"message":"m"}}"#,
-            r#"{"jsonrpc":"2.0","id":1}"#,
-            r#"{"jsonrpc":"2.0","result":{}}"#,
-        ] {
-            assert_eq!(decode(line.as_bytes()), Err(Malformed::BadShape), "{line}");
-        }
-    }
-
-    #[test]
-    fn a_request_id_can_be_a_string_and_is_echoed_verbatim() {
-        let Message::Request { id, .. } =
-            ok(r#"{"jsonrpc":"2.0","method":"session/request_permission","params":{},"id":"1"}"#)
-        else {
-            panic!("not a request");
-        };
-        assert_eq!(id.encode(), r#""1""#);
-        assert_eq!(id.as_u64(), None);
-    }
-
-    #[test]
-    fn an_id_round_trips_through_its_json_value() {
-        for id in [Id::number(0), Id::number(u64::MAX)] {
-            assert_eq!(Id::parse(&id.to_value()), Some(id));
-        }
-        let text = Id::parse(&json!("1")).unwrap_or_else(|| panic!("not an id"));
-        assert_eq!(Id::parse(&text.to_value()), Some(text));
-    }
-
-    #[test]
-    fn a_request_id_can_be_a_number_including_zero() {
-        let Message::Request { id, .. } = ok(r#"{"jsonrpc":"2.0","id":0,"method":"m"}"#) else {
-            panic!("not a request");
-        };
-        assert_eq!((id.encode().as_str(), id.as_u64()), ("0", Some(0)));
-    }
-
-    #[test]
-    fn a_line_without_jsonrpc_2_is_not_json_rpc() {
-        for line in [
-            r#"{"id":1,"method":"m"}"#,
-            r#"{"jsonrpc":"1.0","id":1,"method":"m"}"#,
-            r#"{"jsonrpc":2,"id":1,"method":"m"}"#,
-        ] {
-            assert_eq!(
-                decode(line.as_bytes()),
-                Err(Malformed::NotJsonRpc),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_request_id_over_1_kib_is_an_invalid_request() {
-        let at_limit = "a".repeat(MAX_ID_LEN - 2);
-        let line = format!(r#"{{"jsonrpc":"2.0","id":"{at_limit}","method":"m"}}"#);
-        assert!(matches!(
-            decode(line.as_bytes()),
-            Ok(Message::Request { .. })
-        ));
-        let over = "a".repeat(MAX_ID_LEN - 1);
-        let line = format!(r#"{{"jsonrpc":"2.0","id":"{over}","method":"m"}}"#);
-        assert_eq!(decode(line.as_bytes()), Err(Malformed::InvalidRequest));
-    }
-
-    #[test]
-    fn a_response_id_over_1_kib_is_bad_shape() {
-        let over = "a".repeat(MAX_ID_LEN);
-        let line = format!(r#"{{"jsonrpc":"2.0","id":"{over}","result":{{}}}}"#);
-        assert_eq!(decode(line.as_bytes()), Err(Malformed::BadShape));
-    }
-
-    #[test]
-    fn a_request_whose_id_is_not_a_number_or_string_is_an_invalid_request() {
-        for id in ["null", "true", "{}", "[1]"] {
-            let line = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"m"}}"#);
-            assert_eq!(
-                decode(line.as_bytes()),
-                Err(Malformed::InvalidRequest),
-                "{line}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_request_whose_method_is_not_a_string_is_an_invalid_request() {
-        assert_eq!(
-            decode(br#"{"jsonrpc":"2.0","id":1,"method":7}"#),
-            Err(Malformed::InvalidRequest)
-        );
-        assert_eq!(
-            decode(br#"{"jsonrpc":"2.0","method":7}"#),
-            Err(Malformed::BadShape)
-        );
-    }
-
-    #[test]
-    fn a_batch_array_is_rejected() {
-        assert_eq!(
-            decode(br#"[{"jsonrpc":"2.0","id":1,"method":"m"}]"#),
-            Err(Malformed::Batch)
-        );
-        assert_eq!(decode(b"[]"), Err(Malformed::Batch));
-    }
-
-    #[test]
-    fn json_that_is_not_an_object_is_not_an_object() {
-        for line in ["1", "\"x\"", "null", "true"] {
-            assert_eq!(decode(line.as_bytes()), Err(Malformed::NotObject), "{line}");
-        }
-    }
-
-    #[test]
-    fn a_blank_line_is_blank_and_text_is_not_json() {
-        assert_eq!(decode(b""), Err(Malformed::Blank));
-        assert_eq!(decode(b" \t\r"), Err(Malformed::Blank));
-        assert_eq!(
-            decode(b"Please visit the following URL"),
-            Err(Malformed::NotJson)
-        );
-    }
-
-    #[test]
-    fn invalid_utf8_is_replaced_and_the_line_still_decodes() {
-        let mut line = br#"{"jsonrpc":"2.0","method":"m","params":{"t":""#.to_vec();
-        line.extend_from_slice(&[0xff, 0xfe]);
-        line.extend_from_slice(br#""}}"#);
-        let Ok(Message::Notification { params, .. }) = decode(&line) else {
-            panic!("did not decode");
-        };
-        assert_eq!(params["t"], json!("\u{fffd}\u{fffd}"));
-    }
+    use brindle_remote_protocol::serde_json::json;
 
     #[test]
     fn methods_map_to_their_kinds() {
@@ -1175,9 +610,9 @@ mod tests {
         else {
             panic!("did not decode");
         };
-        assert_eq!(change.kind, Some(ToolKind::Other));
-        assert_eq!(change.status, None);
-        assert_eq!(change.title, None);
+        assert_eq!(change.kind, Patch::Set(ToolKind::Other));
+        assert_eq!(change.status, Patch::Keep);
+        assert_eq!(change.title, Patch::Keep);
     }
 
     #[test]
@@ -1224,7 +659,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(request.call.map(|c| c.title), Some(Some("T".into())));
+        assert_eq!(request.call.map(|c| c.title), Some(Patch::Set("T".into())));
     }
 
     #[test]
@@ -1252,70 +687,70 @@ mod tests {
     const CAPTURES: [(&str, &[u8]); 16] = [
         (
             "antigravity-1.5.16-reject",
-            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-reject.log"),
+            include_bytes!("../../../tests/fixtures/acp/antigravity-1.5.16-reject.log"),
         ),
         (
             "antigravity-1.5.16-trusted-workspace",
-            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-trusted-workspace.log"),
+            include_bytes!("../../../tests/fixtures/acp/antigravity-1.5.16-trusted-workspace.log"),
         ),
         (
             "claude-agent-acp-0.112.0-auto",
-            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-auto.log"),
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.112.0-auto.log"),
         ),
         (
             "claude-agent-acp-0.112.0-haiku-reject",
-            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-haiku-reject.log"),
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.112.0-haiku-reject.log"),
         ),
         (
             "claude-agent-acp-0.112.0-reject",
-            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-reject.log"),
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.112.0-reject.log"),
         ),
         (
             "claude-code-acp-0.16.2-reject",
-            include_bytes!("../../tests/fixtures/acp/claude-code-acp-0.16.2-reject.log"),
+            include_bytes!("../../../tests/fixtures/acp/claude-code-acp-0.16.2-reject.log"),
         ),
         (
             "codex-acp-2.12.0-reject",
-            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-reject.log"),
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.0-reject.log"),
         ),
         (
             "copilot-1.0.115-reject",
-            include_bytes!("../../tests/fixtures/acp/copilot-1.0.115-reject.log"),
+            include_bytes!("../../../tests/fixtures/acp/copilot-1.0.115-reject.log"),
         ),
         (
             "gemini-0.71.1-login-on-stdout",
-            include_bytes!("../../tests/fixtures/acp/gemini-0.71.1-login-on-stdout.log"),
+            include_bytes!("../../../tests/fixtures/acp/gemini-0.71.1-login-on-stdout.log"),
         ),
         (
             "handwritten-unknown-values",
-            include_bytes!("../../tests/fixtures/acp/handwritten-unknown-values.log"),
+            include_bytes!("../../../tests/fixtures/acp/handwritten-unknown-values.log"),
         ),
         // `agents-tool-content` task 1.1.
         (
             "antigravity-1.5.16-edit-run",
-            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run.log"),
+            include_bytes!("../../../tests/fixtures/acp/antigravity-1.5.16-edit-run.log"),
         ),
         (
             "antigravity-1.5.16-edit-run-terminal",
-            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run-terminal.log"),
+            include_bytes!("../../../tests/fixtures/acp/antigravity-1.5.16-edit-run-terminal.log"),
         ),
         (
             "claude-agent-acp-0.112.0-edit-run",
-            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run.log"),
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run.log"),
         ),
         (
             "claude-agent-acp-0.112.0-edit-run-terminal",
             include_bytes!(
-                "../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run-terminal.log"
+                "../../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run-terminal.log"
             ),
         ),
         (
             "codex-acp-2.12.0-edit-run",
-            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run.log"),
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.0-edit-run.log"),
         ),
         (
             "codex-acp-2.12.0-edit-run-terminal",
-            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run-terminal.log"),
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.0-edit-run-terminal.log"),
         ),
     ];
 
@@ -1473,19 +908,40 @@ mod tests {
             offers,
             [
                 ("antigravity-1.5.16-reject", Continuation::ResumeAndLoad),
-                ("antigravity-1.5.16-trusted-workspace", Continuation::ResumeAndLoad),
+                (
+                    "antigravity-1.5.16-trusted-workspace",
+                    Continuation::ResumeAndLoad
+                ),
                 ("claude-agent-acp-0.112.0-auto", Continuation::ResumeAndLoad),
-                ("claude-agent-acp-0.112.0-haiku-reject", Continuation::ResumeAndLoad),
-                ("claude-agent-acp-0.112.0-reject", Continuation::ResumeAndLoad),
+                (
+                    "claude-agent-acp-0.112.0-haiku-reject",
+                    Continuation::ResumeAndLoad
+                ),
+                (
+                    "claude-agent-acp-0.112.0-reject",
+                    Continuation::ResumeAndLoad
+                ),
                 ("claude-code-acp-0.16.2-reject", Continuation::ResumeAndLoad),
                 ("codex-acp-2.12.0-reject", Continuation::ResumeAndLoad),
                 ("copilot-1.0.115-reject", Continuation::Load),
                 ("antigravity-1.5.16-edit-run", Continuation::ResumeAndLoad),
-                ("antigravity-1.5.16-edit-run-terminal", Continuation::ResumeAndLoad),
-                ("claude-agent-acp-0.112.0-edit-run", Continuation::ResumeAndLoad),
-                ("claude-agent-acp-0.112.0-edit-run-terminal", Continuation::ResumeAndLoad),
+                (
+                    "antigravity-1.5.16-edit-run-terminal",
+                    Continuation::ResumeAndLoad
+                ),
+                (
+                    "claude-agent-acp-0.112.0-edit-run",
+                    Continuation::ResumeAndLoad
+                ),
+                (
+                    "claude-agent-acp-0.112.0-edit-run-terminal",
+                    Continuation::ResumeAndLoad
+                ),
                 ("codex-acp-2.12.0-edit-run", Continuation::ResumeAndLoad),
-                ("codex-acp-2.12.0-edit-run-terminal", Continuation::ResumeAndLoad),
+                (
+                    "codex-acp-2.12.0-edit-run-terminal",
+                    Continuation::ResumeAndLoad
+                ),
             ]
         );
     }
@@ -1532,19 +988,19 @@ mod tests {
     const AUTH_CAPTURES: [(&str, &[u8]); 4] = [
         (
             "antigravity-1.5.16-auth-terminal",
-            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-auth-terminal.log"),
+            include_bytes!("../../../tests/fixtures/acp/antigravity-1.5.16-auth-terminal.log"),
         ),
         (
             "claude-code-acp-0.16.2-auth-terminal",
-            include_bytes!("../../tests/fixtures/acp/claude-code-acp-0.16.2-auth-terminal.log"),
+            include_bytes!("../../../tests/fixtures/acp/claude-code-acp-0.16.2-auth-terminal.log"),
         ),
         (
             "codex-acp-2.12.0-auth-terminal",
-            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-auth-terminal.log"),
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.0-auth-terminal.log"),
         ),
         (
             "copilot-1.0.115-auth-terminal",
-            include_bytes!("../../tests/fixtures/acp/copilot-1.0.115-auth-terminal.log"),
+            include_bytes!("../../../tests/fixtures/acp/copilot-1.0.115-auth-terminal.log"),
         ),
     ];
 
@@ -1583,7 +1039,12 @@ mod tests {
 
     #[test]
     fn every_captured_initialize_answer_gives_its_agents_methods() {
-        let antigravity = ["oauth-personal", "oauth-business", "gemini-api-key", "agent-platform"];
+        let antigravity = [
+            "oauth-personal",
+            "oauth-business",
+            "gemini-api-key",
+            "agent-platform",
+        ];
         let mut seen = Vec::new();
         for (name, bytes) in CAPTURES.iter().chain(AUTH_CAPTURES.iter()) {
             for answer in initialize_answers(bytes) {
@@ -1598,12 +1059,19 @@ mod tests {
                             && (n.ends_with("-auth-terminal") || n.contains("-edit-run"))
                             && advertised =>
                         {
-                            antigravity.iter().copied().chain(["terminal-login"]).collect()
+                            antigravity
+                                .iter()
+                                .copied()
+                                .chain(["terminal-login"])
+                                .collect()
                         }
                         n if n.starts_with("antigravity") => antigravity.to_vec(),
                         // 0.112's two terminal logins, offered to the later
                         // `initialize` only.
-                        n if n.starts_with("claude-agent-acp") && n.contains("-edit-run") && advertised => {
+                        n if n.starts_with("claude-agent-acp")
+                            && n.contains("-edit-run")
+                            && advertised =>
+                        {
                             vec!["claude-ai-login", "console-login"]
                         }
                         n if n.starts_with("claude-agent-acp") => Vec::new(),
@@ -1623,7 +1091,11 @@ mod tests {
                         n if n.starts_with("claude-agent-acp") && n.contains("-edit-run") => 2,
                         _ => 0,
                     };
-                    assert_eq!((read.dropped, read.cut), (dropped, 0), "{name} ({advertised})");
+                    assert_eq!(
+                        (read.dropped, read.cut),
+                        (dropped, 0),
+                        "{name} ({advertised})"
+                    );
                     // `initialize` itself still reads.
                     assert!(initialize_result(&answer).is_ok(), "{name}");
                 }
@@ -1693,17 +1165,27 @@ mod tests {
         );
         assert_eq!(
             read.methods,
-            [agent_method("plain", "Plain", None), agent_method("agent", "Agent", None)]
+            [
+                agent_method("plain", "Plain", None),
+                agent_method("agent", "Agent", None)
+            ]
         );
         assert_eq!((read.dropped, read.cut), (9, 0));
         // None, or null, is no methods; anything else not a list, one
         // left out.
         assert_eq!(auth_methods(&json!({}), true), Methods::default());
-        assert_eq!(auth_methods(&json!({"authMethods": null}), true), Methods::default());
-        assert_eq!(auth_methods(&json!({"authMethods": {"id": "x"}}), true).dropped, 1);
+        assert_eq!(
+            auth_methods(&json!({"authMethods": null}), true),
+            Methods::default()
+        );
+        assert_eq!(
+            auth_methods(&json!({"authMethods": {"id": "x"}}), true).dropped,
+            1
+        );
         // `initialize` reads whatever the methods are.
         assert!(
-            initialize_result(&json!({"protocolVersion": 1, "authMethods": [{"type": 1}, 3]})).is_ok()
+            initialize_result(&json!({"protocolVersion": 1, "authMethods": [{"type": 1}, 3]}))
+                .is_ok()
         );
     }
 
@@ -1776,13 +1258,21 @@ mod tests {
             description: None,
             kind: LoginKind::Terminal {
                 args: args.iter().map(|a| (*a).into()).collect(),
-                env: env.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .collect(),
             },
         };
         assert_eq!(
             read.methods,
             [
-                terminal("cli-login", "CLI", &["login"], &[("B", ""), ("LOGIN_MODE", "device")]),
+                terminal(
+                    "cli-login",
+                    "CLI",
+                    &["login"],
+                    &[("B", ""), ("LOGIN_MODE", "device")]
+                ),
                 terminal("bare", "Bare", &[], &[]),
                 terminal("nulls", "Nulls", &[], &[]),
             ]
@@ -1823,7 +1313,9 @@ mod tests {
             assert_eq!((read.methods.len(), read.dropped), (0, 1), "{fields}");
         }
         // At the bounds, kept.
-        let at: Vec<String> = (0..MAX_LOGIN_ARGS).map(|_| "a".repeat(MAX_LOGIN_ARG)).collect();
+        let at: Vec<String> = (0..MAX_LOGIN_ARGS)
+            .map(|_| "a".repeat(MAX_LOGIN_ARG))
+            .collect();
         let read = auth_methods(
             &json!({"authMethods": [{"id": "t", "name": "T", "type": "terminal", "args": at}]}),
             true,
@@ -1833,7 +1325,12 @@ mod tests {
 
     #[test]
     fn resume_and_load_results_are_objects_or_null() {
-        for result in [json!({}), json!({"modes": null}), json!({"configOptions": [1]}), Value::Null] {
+        for result in [
+            json!({}),
+            json!({"modes": null}),
+            json!({"configOptions": [1]}),
+            Value::Null,
+        ] {
             assert_eq!(resume_result(&result), Ok(()), "{result}");
             assert_eq!(load_result(&result), Ok(()), "{result}");
         }
@@ -1914,10 +1411,7 @@ mod tests {
             matches!(&copilot[..], [Patch::Set(title)] if title.starts_with("Please create a file named hello.txt")),
             "{copilot:?}"
         );
-        assert_eq!(
-            titles("codex-acp-2.12.0-reject"),
-            vec![Patch::Keep; 4]
-        );
+        assert_eq!(titles("codex-acp-2.12.0-reject"), vec![Patch::Keep; 4]);
     }
 
     #[test]
@@ -1964,8 +1458,8 @@ mod tests {
             .collect();
         let teleport = |status| ToolChange {
             call: "call-1".into(),
-            title: Some("Teleport a file".into()),
-            kind: Some(ToolKind::Other),
+            title: Patch::Set("Teleport a file".into()),
+            kind: Patch::Set(ToolKind::Other),
             status,
         };
         let option = |id: &str, name: &str, kind| RequestedOption {
@@ -1989,13 +1483,13 @@ mod tests {
                     status: ToolStatus::Pending,
                 })),
                 Decoded::Update(Update::ToolChanged(ToolChange {
-                    title: None,
-                    ..teleport(None)
+                    title: Patch::Keep,
+                    ..teleport(Patch::Keep)
                 })),
                 Decoded::Bad(String::new()),
                 Decoded::Permission(PermissionRequest {
                     session_id: "sess-1".into(),
-                    call: Some(teleport(None)),
+                    call: Some(teleport(Patch::Keep)),
                     options: vec![
                         option(
                             "allow",
@@ -2018,7 +1512,7 @@ mod tests {
                 }),
                 Decoded::Permission(PermissionRequest {
                     session_id: "sess-1".into(),
-                    call: Some(teleport(None)),
+                    call: Some(teleport(Patch::Keep)),
                     options: vec![
                         option(
                             "allow",
@@ -2052,7 +1546,7 @@ mod tests {
     #[test]
     fn an_initialize_32022_names_the_versions_or_none_without_data() {
         let messages = jsonl(include_bytes!(
-            "../../tests/fixtures/acp/initialize-32022.jsonl"
+            "../../../tests/fixtures/acp/initialize-32022.jsonl"
         ));
         let versions: Vec<Option<Vec<u16>>> = messages
             .iter()
@@ -2070,7 +1564,7 @@ mod tests {
     #[test]
     fn an_initialize_success_with_version_2_decodes_with_its_version() {
         let messages = jsonl(include_bytes!(
-            "../../tests/fixtures/acp/initialize-v2-reply.jsonl"
+            "../../../tests/fixtures/acp/initialize-v2-reply.jsonl"
         ));
         let [Message::Response { id, result }] = messages.as_slice() else {
             panic!("{messages:?}");
@@ -2085,7 +1579,7 @@ mod tests {
     #[test]
     fn a_prompt_answered_32000_is_an_auth_required_error() {
         let messages = jsonl(include_bytes!(
-            "../../tests/fixtures/acp/prompt-auth-required.jsonl"
+            "../../../tests/fixtures/acp/prompt-auth-required.jsonl"
         ));
         let [Message::Error { id, error }] = messages.as_slice() else {
             panic!("{messages:?}");

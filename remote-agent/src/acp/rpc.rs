@@ -3,30 +3,20 @@
 //! requests still awaiting a response and what each was for, and the
 //! agent's permission requests still waiting for a person, by the
 //! transcript entry that shows each, with the JSON-RPC id to answer it by.
-//! Its encoders write every line the core sends, each one line ending in
-//! `\n`.
-//!
-//! The lines are written here, not through the schema crate's types: the
-//! crate encodes `clientCapabilities` with explicit `false` fields, and
-//! decision 4 offers nothing but what Brindle does, which since the
-//! OpenSpec change `agents-login` is `{"auth":{"terminal":true}}` (a client
-//! runs an agent's terminal login methods). Every string goes through
-//! JSON's own escaping, so no line holds a raw newline, and a request id
-//! from the agent is echoed as it was sent.
+//! It also keeps the session's [`Dialect`], which writes each line
+//! (`ports R14`): no ACP version is named here.
 
 use std::collections::BTreeMap;
 
-use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::EntryId;
 
-use super::wire::Id;
+use super::dialect::Dialect;
+use super::envelope::Id;
+use super::forms::{Continued, Request};
 
 /// The most permission requests an agent may have waiting at once; one
 /// past it is answered `cancelled` at once, with a notice (decision 4).
 pub const MAX_PENDING_PERMISSIONS: usize = 16;
-
-/// The ACP version Brindle asks for and speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
 
 /// What one of the core's requests was for, which says how its response
 /// is read.
@@ -44,34 +34,8 @@ pub enum Purpose {
     Authenticate,
 }
 
-/// The JSON-RPC errors the core answers an agent's request with.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal {
-    /// `-32601`: a method the core didn't offer (`fs/*`, `terminal/*`, …).
-    MethodNotFound,
-    /// `-32600`: a request the core can't read, such as one with an id
-    /// over 1 KiB, answered with a null id.
-    InvalidRequest,
-}
-
-impl Refusal {
-    pub fn code(self) -> i64 {
-        match self {
-            Self::MethodNotFound => -32601,
-            Self::InvalidRequest => -32600,
-        }
-    }
-
-    fn message(self) -> &'static str {
-        match self {
-            Self::MethodNotFound => "Method not found",
-            Self::InvalidRequest => "Invalid Request",
-        }
-    }
-}
-
 /// The cap of [`MAX_PENDING_PERMISSIONS`] is reached: answer this request
-/// `cancelled` ([`permission_answer`] with no option).
+/// `cancelled` ([`Request::PermissionAnswer`] with no option).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Full;
 
@@ -91,6 +55,7 @@ pub struct Rpc {
     next_id: u64,
     outgoing: BTreeMap<u64, Purpose>,
     permissions: BTreeMap<EntryId, Id>,
+    dialect: Dialect,
 }
 
 impl Default for Rpc {
@@ -100,16 +65,19 @@ impl Default for Rpc {
 }
 
 impl Rpc {
-    /// Before the first request: ids start at 1.
+    /// Before the first request: ids start at 1, and the session speaks
+    /// the newest version until `initialize`'s answer says otherwise.
     pub fn new() -> Self {
         Self {
             next_id: 1,
             outgoing: BTreeMap::new(),
             permissions: BTreeMap::new(),
+            dialect: Dialect::newest(),
         }
     }
 
-    /// As a checkpoint left it.
+    /// As a checkpoint left it, speaking the newest version until
+    /// [`speak`](Self::speak) is told the checkpoint's.
     pub fn from_parts(
         next_id: u64,
         outgoing: BTreeMap<u64, Purpose>,
@@ -125,6 +93,7 @@ impl Rpc {
             next_id,
             outgoing,
             permissions,
+            dialect: Dialect::newest(),
         })
     }
 
@@ -143,61 +112,77 @@ impl Rpc {
         &self.permissions
     }
 
-    fn request(&mut self, purpose: Purpose, method: &str, params: &str) -> Vec<u8> {
+    /// The ACP version the session speaks, which writes every line.
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
+    /// The session now speaks `dialect`: `initialize`'s answer chose it, or
+    /// a checkpoint recorded it.
+    pub fn speak(&mut self, dialect: Dialect) {
+        self.dialect = dialect;
+    }
+
+    /// Takes the next id for a request for `purpose`, awaiting its answer.
+    fn request(&mut self, purpose: Purpose) -> u64 {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
         self.outgoing.insert(id, purpose);
-        line(format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":{},"params":{params}}}"#,
-            quote(method)
-        ))
+        id
     }
 
-    /// `initialize`, asking for [`PROTOCOL_VERSION`] as Brindle at
-    /// `version`, with one client capability: `auth.terminal`, since a
-    /// client runs an agent's terminal login methods (`agents-login`).
-    /// No `fs` and no `terminal`.
+    /// `initialize`, asking for the newest version Brindle speaks as
+    /// Brindle at `version` ([`Request::Initialize`]).
     pub fn initialize(&mut self, version: &str) -> Vec<u8> {
-        let params = format!(
-            r#"{{"protocolVersion":{PROTOCOL_VERSION},"clientCapabilities":{{"auth":{{"terminal":true}}}},"clientInfo":{{"name":"brindle","version":{}}}}}"#,
-            quote(version)
-        );
-        self.request(Purpose::Initialize, "initialize", &params)
+        let id = self.request(Purpose::Initialize);
+        Dialect::newest().encode(Request::Initialize { id, version })
     }
 
     /// `authenticate` with the login method `method` (`agents-login`); the
-    /// request's id is the one [`cancel_request`] names.
+    /// request's id is the one [`Request::Withdraw`] names.
     pub fn authenticate(&mut self, method: &str) -> Vec<u8> {
-        let params = format!(r#"{{"methodId":{}}}"#, quote(method));
-        self.request(Purpose::Authenticate, "authenticate", &params)
+        let id = self.request(Purpose::Authenticate);
+        self.dialect.encode(Request::Authenticate { id, method })
     }
 
-    /// `session/new` in `cwd` (already absolute), with no MCP servers.
+    /// A new conversation in `cwd` (already absolute), with no MCP servers.
     pub fn new_session(&mut self, cwd: &str) -> Vec<u8> {
-        let params = format!(r#"{{"cwd":{},"mcpServers":[]}}"#, quote(cwd));
-        self.request(Purpose::NewSession, "session/new", &params)
+        let id = self.request(Purpose::NewSession);
+        self.dialect.encode(Request::NewSession { id, cwd })
     }
 
-    /// `session/resume` of conversation `session` in `cwd` (its own
-    /// directory), with no MCP servers.
+    /// Continues conversation `session` in `cwd` (its own directory) with
+    /// no replay, with no MCP servers.
     pub fn resume(&mut self, session: &str, cwd: &str) -> Vec<u8> {
-        self.request(Purpose::Resume, "session/resume", &continuing(session, cwd))
+        self.continuing(Purpose::Resume, Continued::Resume, session, cwd)
     }
 
-    /// `session/load` of conversation `session` in `cwd`, as
+    /// Continues conversation `session` in `cwd`, replayed first, as
     /// [`resume`](Self::resume).
     pub fn load(&mut self, session: &str, cwd: &str) -> Vec<u8> {
-        self.request(Purpose::Load, "session/load", &continuing(session, cwd))
+        self.continuing(Purpose::Load, Continued::Load, session, cwd)
     }
 
-    /// `session/prompt` with one text block.
+    fn continuing(
+        &mut self,
+        purpose: Purpose,
+        how: Continued,
+        session: &str,
+        cwd: &str,
+    ) -> Vec<u8> {
+        let id = self.request(purpose);
+        self.dialect.encode(Request::Continue {
+            id,
+            how,
+            session,
+            cwd,
+        })
+    }
+
+    /// A prompt of one text block.
     pub fn prompt(&mut self, session: &str, text: &str) -> Vec<u8> {
-        let params = format!(
-            r#"{{"sessionId":{},"prompt":[{{"type":"text","text":{}}}]}}"#,
-            quote(session),
-            quote(text)
-        );
-        self.request(Purpose::Prompt, "session/prompt", &params)
+        let id = self.request(Purpose::Prompt);
+        self.dialect.encode(Request::Prompt { id, session, text })
     }
 
     /// The request a response or error answers, which is then no longer
@@ -253,15 +238,25 @@ impl Rpc {
     /// withdrawn, or never one).
     pub fn answer_permission(&mut self, entry: EntryId, option: Option<&str>) -> Option<Vec<u8>> {
         let id = self.permissions.remove(&entry)?;
-        Some(permission_answer(&id, option))
+        Some(
+            self.dialect
+                .encode(Request::PermissionAnswer { id: &id, option }),
+        )
     }
 
     /// Answers every waiting permission request `cancelled` (after a
     /// `session/cancel`), in entry order.
     pub fn cancel_permissions(&mut self) -> Vec<(EntryId, Vec<u8>)> {
+        let dialect = self.dialect;
         std::mem::take(&mut self.permissions)
             .into_iter()
-            .map(|(entry, id)| (entry, permission_answer(&id, None)))
+            .map(|(entry, id)| {
+                let answer = dialect.encode(Request::PermissionAnswer {
+                    id: &id,
+                    option: None,
+                });
+                (entry, answer)
+            })
             .collect()
     }
 
@@ -278,72 +273,29 @@ impl Rpc {
     }
 }
 
-/// `session/cancel` for `session`, a notification.
-pub fn cancel(session: &str) -> Vec<u8> {
-    line(format!(
-        r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":{}}}}}"#,
-        quote(session)
-    ))
-}
-
-/// `$/cancel_request` for the core's own request `id` (a login the user
-/// cancelled), a notification. The agent may ignore it, but must still
-/// answer the request.
-pub fn cancel_request(id: u64) -> Vec<u8> {
-    line(format!(
-        r#"{{"jsonrpc":"2.0","method":"$/cancel_request","params":{{"requestId":{id}}}}}"#
-    ))
-}
-
-/// The answer to permission request `id`: the option chosen, or
-/// `cancelled` with none.
-pub fn permission_answer(id: &Id, option: Option<&str>) -> Vec<u8> {
-    let outcome = match option {
-        Some(option) => format!(r#"{{"outcome":"selected","optionId":{}}}"#, quote(option)),
-        None => r#"{"outcome":"cancelled"}"#.to_owned(),
-    };
-    line(format!(
-        r#"{{"jsonrpc":"2.0","id":{},"result":{{"outcome":{outcome}}}}}"#,
-        id.encode()
-    ))
-}
-
-/// An error answering request `id`, or a null id when the request's id
-/// couldn't be read.
-pub fn error(id: Option<&Id>, refusal: Refusal) -> Vec<u8> {
-    let id = id.map_or_else(|| "null".to_owned(), Id::encode);
-    line(format!(
-        r#"{{"jsonrpc":"2.0","id":{id},"error":{{"code":{},"message":{}}}}}"#,
-        refusal.code(),
-        quote(refusal.message())
-    ))
-}
-
-/// The params of `session/resume` and `session/load`.
-fn continuing(session: &str, cwd: &str) -> String {
-    format!(
-        r#"{{"sessionId":{},"cwd":{},"mcpServers":[]}}"#,
-        quote(session),
-        quote(cwd)
-    )
-}
-
-/// `text` as a JSON string.
-fn quote(text: &str) -> String {
-    Value::from(text).to_string()
-}
-
-fn line(text: String) -> Vec<u8> {
-    let mut bytes = text.into_bytes();
-    bytes.push(b'\n');
-    bytes
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::wire::{Message, decode};
-    use brindle_remote_protocol::serde_json::{self, json};
+    use crate::acp::envelope::{Message, decode};
+    use crate::acp::forms::Refusal;
+    use brindle_remote_protocol::serde_json::{self, Value, json};
+
+    // The lines the core writes outside `Rpc`, in the dialect it speaks.
+    fn cancel(session: &str) -> Vec<u8> {
+        Dialect::newest().encode(Request::Cancel { session })
+    }
+
+    fn cancel_request(id: u64) -> Vec<u8> {
+        Dialect::newest().encode(Request::Withdraw { id })
+    }
+
+    fn permission_answer(id: &Id, option: Option<&str>) -> Vec<u8> {
+        Dialect::newest().encode(Request::PermissionAnswer { id, option })
+    }
+
+    fn error(id: Option<&Id>, refusal: Refusal) -> Vec<u8> {
+        Dialect::newest().encode(Request::Error { id, refusal })
+    }
 
     fn text(bytes: &[u8]) -> &str {
         std::str::from_utf8(bytes).unwrap_or_else(|e| panic!("{e}"))

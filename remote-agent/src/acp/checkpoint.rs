@@ -69,13 +69,14 @@ use brindle_transcript::{
     TEXT_CHUNK, Transcript,
 };
 
+use super::dialect::{Dialect, Unsupported};
+use super::envelope::Id;
 use super::lines::{Lines, Partial};
 use super::reduce::{
     self, AfterLogin, AgentSession, BAD_RUN_QUIET, BadRun, Greeting, Input, Log, Login, Output,
     Phase, Replay, Run, RunKind, Start,
 };
-use super::rpc::{BadParts, PROTOCOL_VERSION, Purpose, Rpc};
-use super::wire::Id;
+use super::rpc::{BadParts, Purpose, Rpc};
 
 /// The four bytes a checkpoint starts with.
 pub const MAGIC: [u8; 4] = *b"BACP";
@@ -174,7 +175,8 @@ impl fmt::Display for Unreadable {
             Self::Field { name } => write!(f, "its checkpoint's {name} is missing or malformed"),
             Self::Acp { version } => write!(
                 f,
-                "its conversation speaks ACP version {version}, and this terminal server speaks {PROTOCOL_VERSION}"
+                "its conversation speaks ACP version {version}, and this terminal server speaks {}",
+                Dialect::newest().version()
             ),
             Self::Log { error } => write!(f, "its checkpoint's log doesn't hold together: {error}"),
             Self::Rpc { parts } => {
@@ -287,7 +289,7 @@ fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
         object.insert("covers".into(), session.lines.covers().into());
     }
     let mut state = Map::new();
-    state.insert("acp".into(), PROTOCOL_VERSION.into());
+    state.insert("acp".into(), session.rpc.dialect().version().into());
     state.insert("cwd".into(), session.cwd.clone().into());
     state.insert("version".into(), session.version.clone().into());
     state.insert("phase".into(), phase_value(&session.phase));
@@ -687,9 +689,8 @@ fn restore(
     now: Instant,
 ) -> Result<AgentSession, Unreadable> {
     let acp = number(state, "acp")?;
-    if acp != u64::from(PROTOCOL_VERSION) {
-        return Err(Unreadable::Acp { version: acp });
-    }
+    let dialect = Dialect::from_version(acp)
+        .map_err(|Unsupported { version }| Unreadable::Acp { version })?;
     let cwd = text(state, "cwd")?.to_owned();
     let version = text(state, "version")?.to_owned();
     let phase = restore_phase(object(field(state, "phase")?, "phase")?)?;
@@ -697,7 +698,8 @@ fn restore(
         Some(transcript) => transcript,
         None => restore_log(array(state, "log")?)?,
     };
-    let rpc = restore_rpc(object(field(state, "rpc")?, "rpc")?)?;
+    let mut rpc = restore_rpc(object(field(state, "rpc")?, "rpc")?)?;
+    rpc.speak(dialect);
     let run = field(state, "run")?;
     let run = if run.is_null() {
         None
@@ -2570,6 +2572,29 @@ mod tests {
         assert_eq!(adopted.restored, Ok(()));
         assert_eq!(adopted.session, agent.s);
         assert!(matches!(adopted.session.phase, Phase::LoginRequired(_)));
+    }
+
+    /// `agents-tool-content` decision 2: the `acp` field a checkpoint from
+    /// before `Dialect` recorded restores the session's dialect, in either
+    /// format, and the pinned bytes below still decode.
+    #[test]
+    fn a_format_1_or_2_checkpoint_restores_its_dialect() {
+        let agent = Agent::ready();
+        let format_2 = encode(&agent.s).expect("it fits");
+        let (state, partial) = state_of(&format_2);
+        assert_eq!(state["acp"], 1);
+        let format_1 = rebuild(&state, &partial);
+        for bytes in [format_1, format_2] {
+            let session = decode(&bytes, agent.now).expect("it decodes");
+            assert_eq!(session.rpc.dialect(), Dialect::newest());
+            assert_eq!(session.rpc.dialect().version(), 1);
+        }
+        let pinned: Vec<u8> = (0..PINNED.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&PINNED[at..at + 2], 16).expect("hex"))
+            .collect();
+        let session = decode(&pinned, Instant::now()).expect("it decodes");
+        assert_eq!(session.rpc.dialect().version(), 1);
     }
 
     #[test]

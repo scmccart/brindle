@@ -57,12 +57,14 @@ use brindle_transcript::{
 };
 use brindle_transcript::{HoldReason, ToolKind, ToolStatus};
 
-use super::lines::{Lines, Piece};
-use super::rpc::{self, PROTOCOL_VERSION, Purpose, Refusal, Rpc};
-use super::wire::{
-    self, AUTH_REQUIRED, Content, ContentKind, Id, Malformed, Message, NotificationKind,
-    OptionKind, Patch, RequestKind, RpcError, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
+use super::dialect::{self, Dialect, Unsupported};
+use super::envelope::{self, Id, Malformed, Message, RpcError};
+use super::forms::{
+    self, AUTH_REQUIRED, Content, ContentKind, Continued, NotificationKind, OptionKind, Patch,
+    Refusal, Request, RequestKind, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
 };
+use super::lines::{Lines, Piece};
+use super::rpc::{self, Purpose, Rpc};
 
 /// The most the log keeps, encoded (decision 14): past it the oldest
 /// entries are dropped whole, with a `Trimmed` event, down to
@@ -1151,7 +1153,7 @@ impl Step<'_> {
     }
 
     fn line(&mut self, line: &[u8]) {
-        match wire::decode(line) {
+        match envelope::decode(line) {
             Ok(message) => self.message(message),
             // An empty line is no message and no fault.
             Err(Malformed::Blank) => {}
@@ -1159,7 +1161,10 @@ impl Step<'_> {
                 self.bad_line();
                 self.out
                     .stdin
-                    .extend(rpc::error(None, Refusal::InvalidRequest));
+                    .extend(self.s.rpc.dialect().encode(Request::Error {
+                        id: None,
+                        refusal: Refusal::InvalidRequest,
+                    }));
             }
             // A batch is skipped and counted, never answered.
             Err(
@@ -1176,34 +1181,44 @@ impl Step<'_> {
         match message {
             Message::Request { id, method, params } => {
                 self.flush_bad();
-                match wire::request_kind(&method) {
+                match self.s.rpc.dialect().request_kind(&method) {
                     RequestKind::Permission => self.permission(id, &params),
-                    RequestKind::Unoffered => self
-                        .out
-                        .stdin
-                        .extend(rpc::error(Some(&id), Refusal::MethodNotFound)),
+                    RequestKind::Unoffered => {
+                        self.out
+                            .stdin
+                            .extend(self.s.rpc.dialect().encode(Request::Error {
+                                id: Some(&id),
+                                refusal: Refusal::MethodNotFound,
+                            }))
+                    }
                 }
             }
-            Message::Notification { method, params } => match wire::notification_kind(&method) {
-                NotificationKind::SessionUpdate => match wire::session_update(&params) {
-                    Ok(update) => {
-                        self.flush_bad();
-                        self.update(update);
+            Message::Notification { method, params } => {
+                match self.s.rpc.dialect().notification_kind(&method) {
+                    NotificationKind::SessionUpdate => {
+                        match self.s.rpc.dialect().session_update(&params) {
+                            Ok(update) => {
+                                self.flush_bad();
+                                self.update(update);
+                            }
+                            // A muted replay counts even an update Brindle can't
+                            // read: it would show nothing either way.
+                            Err(_) if self.mute() => {}
+                            Err(_) => self.bad_line(),
+                        }
                     }
-                    // A muted replay counts even an update Brindle can't
-                    // read: it would show nothing either way.
-                    Err(_) if self.mute() => {}
-                    Err(_) => self.bad_line(),
-                },
-                NotificationKind::CancelRequest => match wire::cancel_request(&params) {
-                    Ok(id) => {
-                        self.flush_bad();
-                        self.withdraw(&id);
+                    NotificationKind::CancelRequest => {
+                        match self.s.rpc.dialect().cancel_request(&params) {
+                            Ok(id) => {
+                                self.flush_bad();
+                                self.withdraw(&id);
+                            }
+                            Err(_) => self.bad_line(),
+                        }
                     }
-                    Err(_) => self.bad_line(),
-                },
-                NotificationKind::Other => self.flush_bad(),
-            },
+                    NotificationKind::Other => self.flush_bad(),
+                }
+            }
             Message::Response { id, result } => {
                 self.flush_bad();
                 if let Some(purpose) = self.s.rpc.answered(&id) {
@@ -1250,7 +1265,7 @@ impl Step<'_> {
         }
     }
 
-    fn update(&mut self, update: wire::SessionUpdate) {
+    fn update(&mut self, update: forms::SessionUpdate) {
         // Only the conversation's own updates count once it is known.
         let own = match &self.s.phase {
             Phase::Ready { session: id }
@@ -1361,9 +1376,16 @@ impl Step<'_> {
 
     fn tool_change(&mut self, change: ToolChange) {
         let id = bound(clean(&change.call));
-        let title = change.title.map(|title| bound(clean(&title)));
+        // A cleared field goes back to what a call with none has: its id
+        // for a title, `other`, `pending`.
+        let title = change
+            .title
+            .map(|title| bound(clean(&title)))
+            .or_reset(|| id.clone());
+        let kind = change.kind.or_reset(|| ToolKind::Other);
+        let status = change.status.or_reset(|| ToolStatus::Pending);
         match self.tool(&id) {
-            Some(entry) => self.change_tool(entry, title, change.kind, change.status),
+            Some(entry) => self.change_tool(entry, title, kind, status),
             // An update for a call the log doesn't have adds it with the
             // fields it carries.
             None => {
@@ -1371,8 +1393,8 @@ impl Step<'_> {
                 self.add_tool(
                     id,
                     title,
-                    change.kind.unwrap_or(ToolKind::Other),
-                    change.status.unwrap_or(ToolStatus::Pending),
+                    kind.unwrap_or(ToolKind::Other),
+                    status.unwrap_or(ToolStatus::Pending),
                 );
             }
         }
@@ -1420,9 +1442,14 @@ impl Step<'_> {
     }
 
     fn permission(&mut self, id: Id, params: &Value) {
-        let Ok(request) = wire::permission_request(params) else {
+        let Ok(request) = self.s.rpc.dialect().permission_request(params) else {
             // Answered by its envelope id, never left waiting (decision 5).
-            self.out.stdin.extend(rpc::permission_answer(&id, None));
+            self.out
+                .stdin
+                .extend(self.s.rpc.dialect().encode(Request::PermissionAnswer {
+                    id: &id,
+                    option: None,
+                }));
             self.notice(
                 NoticeLevel::Warning,
                 "the agent asked for a permission Brindle couldn't read, which was answered cancelled"
@@ -1446,7 +1473,7 @@ impl Step<'_> {
         let title = request
             .call
             .as_ref()
-            .and_then(|call| call.title.as_deref())
+            .and_then(|call| call.title.value())
             .map(|title| bound(clean(title)))
             .or_else(|| {
                 let entry = self.tool(call.as_deref()?)?;
@@ -1503,7 +1530,12 @@ impl Step<'_> {
 
     /// Answers a permission request `cancelled` at once and records it.
     fn cancel_now(&mut self, entry: EntryId, id: &Id) {
-        self.out.stdin.extend(rpc::permission_answer(id, None));
+        self.out.stdin.extend(
+            self.s
+                .rpc
+                .dialect()
+                .encode(Request::PermissionAnswer { id, option: None }),
+        );
         self.emit(Event::Answered {
             id: entry,
             outcome: PermissionOutcome::Cancelled,
@@ -1553,35 +1585,23 @@ impl Step<'_> {
             return;
         };
         let start = start.clone();
+        // `initialize` asked for the newest version; the answer names the
+        // one the session speaks.
+        let newest = Dialect::newest().version();
         match result {
-            Ok(result) => match wire::initialize_result(result) {
-                Ok(initialized) if initialized.protocol_version == PROTOCOL_VERSION => {
-                    let (name, version) = initialized.agent.map_or((None, None), |agent| {
-                        (
-                            Some(agent_name(&agent)),
-                            Some(bound(clean(&agent.version))),
-                        )
-                    });
-                    let greeting = Greeting {
-                        name,
-                        version,
-                        continuation: initialized.continuation,
-                    };
-                    self.keep_methods(wire::auth_methods(result, true));
-                    self.start(start, greeting);
-                }
-                Ok(initialized) => self.refuse(format!(
-                    "the agent speaks ACP version {}; Brindle speaks {PROTOCOL_VERSION}",
-                    initialized.protocol_version
-                )),
-                Err(_) => self.refuse(
+            Ok(result) => match dialect::spoken(result).map(Dialect::from_version) {
+                None => self.refuse(
                     "the agent's answer to initialize isn't one Brindle can read".to_owned(),
                 ),
+                Some(Err(Unsupported { version })) => self.refuse(format!(
+                    "the agent speaks ACP version {version}; Brindle speaks {newest}"
+                )),
+                Some(Ok(dialect)) => self.speaking(dialect, start, result),
             },
             Err(error) => {
-                let message = match wire::supported_versions(error) {
+                let message = match Dialect::newest().supported_versions(error) {
                     Some(versions) => format!(
-                        "the agent supports ACP version{} {}; Brindle speaks {PROTOCOL_VERSION}",
+                        "the agent supports ACP version{} {}; Brindle speaks {newest}",
                         if versions.len() == 1 { "" } else { "s" },
                         versions
                             .iter()
@@ -1589,9 +1609,9 @@ impl Step<'_> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
-                    None if error.code == UNSUPPORTED_VERSION => format!(
-                        "the agent supports no ACP version Brindle speaks ({PROTOCOL_VERSION})"
-                    ),
+                    None if error.code == UNSUPPORTED_VERSION => {
+                        format!("the agent supports no ACP version Brindle speaks ({newest})")
+                    }
                     None => format!("the agent couldn't start: {}", clean(&error.message)),
                 };
                 self.refuse(message);
@@ -1599,11 +1619,32 @@ impl Step<'_> {
         }
     }
 
+    /// `initialize`'s answer, read in the version it names.
+    fn speaking(&mut self, dialect: Dialect, start: Start, result: &Value) {
+        self.s.rpc.speak(dialect);
+        match dialect.initialize_result(result) {
+            Ok(initialized) => {
+                let (name, version) = initialized.agent.map_or((None, None), |agent| {
+                    (Some(agent_name(&agent)), Some(bound(clean(&agent.version))))
+                });
+                let greeting = Greeting {
+                    name,
+                    version,
+                    continuation: initialized.continuation,
+                };
+                self.keep_methods(dialect.auth_methods(result, true));
+                self.start(start, greeting);
+            }
+            Err(_) => self
+                .refuse("the agent's answer to initialize isn't one Brindle can read".to_owned()),
+        }
+    }
+
     /// Keeps the login methods `initialize` advertised, their text cleaned,
     /// with one warning notice when any were left out or cut
     /// (`agents-login` decision 3). Brindle always advertises
     /// `auth.terminal`.
-    fn keep_methods(&mut self, read: wire::Methods) {
+    fn keep_methods(&mut self, read: forms::Methods) {
         self.s.methods = read
             .methods
             .into_iter()
@@ -1667,7 +1708,7 @@ impl Step<'_> {
         };
         let greeting = greeting.clone();
         match result {
-            Ok(result) => match wire::new_session_result(result) {
+            Ok(result) => match self.s.rpc.dialect().new_session_result(result) {
                 Ok(created) => self.ready(created.session_id, greeting, None),
                 Err(_) => self.refuse(
                     "the agent's answer to session/new isn't one Brindle can read".to_owned(),
@@ -1688,7 +1729,7 @@ impl Step<'_> {
     /// ACP session, with the notice its way calls for; `-32000` needs a
     /// login; any other error, or an answer Brindle can't read, fails it.
     fn continued(&mut self, result: Result<&Value, &RpcError>) {
-        let (greeting, conversation, log, notice, method) = match &self.s.phase {
+        let (greeting, conversation, log, notice, how) = match &self.s.phase {
             Phase::Resuming {
                 greeting,
                 conversation,
@@ -1698,7 +1739,7 @@ impl Step<'_> {
                     Log::Kept => None,
                     Log::Fresh => Some((NoticeLevel::Warning, NOT_REPLAYED.to_owned())),
                 };
-                (greeting, conversation, *log, notice, "session/resume")
+                (greeting, conversation, *log, notice, Continued::Resume)
             }
             Phase::Loading {
                 greeting,
@@ -1711,7 +1752,7 @@ impl Step<'_> {
                     }
                     Replay::Shown => (None, Log::Fresh),
                 };
-                (greeting, conversation, log, notice, "session/load")
+                (greeting, conversation, log, notice, Continued::Load)
             }
             Phase::Spawning { .. }
             | Phase::Initializing { .. }
@@ -1727,8 +1768,7 @@ impl Step<'_> {
         };
         let (greeting, conversation) = (greeting.clone(), conversation.clone());
         let readable = match result {
-            Ok(result) if method == "session/load" => wire::load_result(result).is_ok(),
-            Ok(result) => wire::resume_result(result).is_ok(),
+            Ok(result) => self.s.rpc.dialect().continued_result(how, result).is_ok(),
             // After a login the same continue is sent again (the session's
             // directory is the conversation's).
             Err(error) if error.code == AUTH_REQUIRED => {
@@ -1752,6 +1792,7 @@ impl Step<'_> {
             }
         };
         if !readable {
+            let method = self.s.rpc.dialect().continue_method(how);
             return self.refuse(format!(
                 "the agent couldn't continue the conversation: its answer to {method} isn't one Brindle can read"
             ));
@@ -1879,7 +1920,7 @@ impl Step<'_> {
 
     fn prompted(&mut self, result: Result<&Value, &RpcError>) {
         match result {
-            Ok(result) => match wire::prompt_result(result) {
+            Ok(result) => match self.s.rpc.dialect().prompt_result(result) {
                 Ok(stop) => self.end_turn(Ending::Stop(stop)),
                 Err(_) => self.end_turn(Ending::Failed(
                     "the agent's answer to the prompt isn't one Brindle can read".to_owned(),
@@ -2019,7 +2060,9 @@ impl Step<'_> {
     fn cancel_login(&mut self, login: Login) {
         if let Some(id) = self.s.rpc.awaited(Purpose::Authenticate) {
             self.s.rpc.forget_id(id);
-            self.out.stdin.extend(rpc::cancel_request(id));
+            self.out
+                .stdin
+                .extend(self.s.rpc.dialect().encode(Request::Withdraw { id }));
         }
         self.needs_login(login);
         self.mark(Moment::Login);
@@ -2100,7 +2143,12 @@ impl Step<'_> {
             | TurnState::Failed { .. } => return,
         }
         self.hold_waiting(HoldReason::Cancelled);
-        self.out.stdin.extend(rpc::cancel(&session));
+        self.out.stdin.extend(
+            self.s
+                .rpc
+                .dialect()
+                .encode(Request::Cancel { session: &session }),
+        );
         for (entry, answer) in self.s.rpc.cancel_permissions() {
             self.out.stdin.extend(answer);
             self.emit(Event::Answered {
@@ -2300,7 +2348,7 @@ pub fn clean(text: &str) -> String {
 /// `agentInfo.title` when it is given and not blank, else `agentInfo.name`
 /// (which the npm adapters fill with their package's name), cleaned and
 /// bounded.
-fn agent_name(agent: &wire::AgentInfo) -> String {
+fn agent_name(agent: &forms::AgentInfo) -> String {
     agent
         .title
         .as_deref()
@@ -2671,6 +2719,87 @@ mod tests {
             other => panic!("no fixture {other}"),
         };
         text.lines().nth(n).expect("a line").to_owned()
+    }
+
+    /// `agents-tool-content` decision 2: a version that can clear a tool
+    /// call's field (v1 can't) puts it back to what a call with none has.
+    #[test]
+    fn a_cleared_tool_field_goes_back_to_what_a_call_with_none_has() {
+        let mut agent = Agent::ready();
+        agent.feed(&tool_call("c1", "Edit notes.txt", "in_progress"));
+        let (entry, _) = agent.last_entry();
+        let change = |title, kind, status| ToolChange {
+            call: "c1".into(),
+            title,
+            kind,
+            status,
+        };
+        let unknown = ToolChange {
+            call: "c2".into(),
+            ..change(Patch::Clear, Patch::Set(ToolKind::Read), Patch::Clear)
+        };
+        let mut step = Step {
+            s: &mut agent.s,
+            out: Output::default(),
+            fault: None,
+            now: agent.now,
+        };
+        step.tool_change(change(Patch::Keep, Patch::Keep, Patch::Keep));
+        step.tool_change(change(Patch::Clear, Patch::Clear, Patch::Clear));
+        // Cleared again, nothing differs.
+        step.tool_change(change(Patch::Clear, Patch::Clear, Patch::Clear));
+        // A call the log doesn't have, cleared, is added as one with none.
+        step.tool_change(unknown);
+        let events = step.out.events;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events[0],
+            Event::ToolChanged {
+                id: entry,
+                title: Some("c1".into()),
+                kind: Some(ToolKind::Other),
+                status: Some(ToolStatus::Pending),
+                locations: None,
+                input: None,
+                result: None,
+                more: None,
+            }
+        );
+        assert!(
+            matches!(&events[1], Event::Added { entry: Entry::Tool { call, title, kind: ToolKind::Read, status: ToolStatus::Pending, .. }, .. } if call == "c2" && title == "c2"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn v1_never_clears_a_tool_field() {
+        let update = |fields: Value| {
+            let mut update = json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1"});
+            if let (Some(update), Some(fields)) = (update.as_object_mut(), fields.as_object()) {
+                update.extend(fields.clone());
+            }
+            Dialect::newest().session_update(&json!({"sessionId": "s1", "update": update}))
+        };
+        for fields in [
+            json!({}),
+            json!({"title": null, "kind": null, "status": null}),
+            json!({"title": "T", "kind": "read", "status": "completed"}),
+        ] {
+            let Ok(forms::SessionUpdate {
+                update: Update::ToolChanged(change),
+                ..
+            }) = update(fields.clone())
+            else {
+                panic!("{fields}: didn't decode");
+            };
+            for cleared in [
+                change.title == Patch::Clear,
+                change.kind == Patch::Clear,
+                change.status == Patch::Clear,
+            ] {
+                assert!(!cleared, "{fields}: {change:?}");
+            }
+        }
     }
 
     // --- the start sequence (decision 4) --------------------------------
@@ -5868,7 +5997,7 @@ mod tests {
     fn methods_left_out_or_cut_add_one_warning() {
         let mut agent = Agent::new();
         agent.step(Input::Spawned);
-        let long = "d".repeat(wire::MAX_LOGIN_DESCRIPTION + 1);
+        let long = "d".repeat(forms::MAX_LOGIN_DESCRIPTION + 1);
         let out = agent.feed(&result(
             1,
             json!({"protocolVersion": 1, "authMethods": [

@@ -66,7 +66,7 @@ Before starting, check these:
 
 ## 2. One module per ACP version (no behaviour change)
 
-- [ ] 2.1 **Split `remote-agent/src/acp/wire.rs` and `rpc.rs`**:
+- [x] 2.1 **Split `remote-agent/src/acp/wire.rs` and `rpc.rs`**:
   - into `envelope.rs`: `Id`, `Message`, `Malformed`, `decode`, `RpcError`, `BadParams`;
   - into `forms.rs`: every type the reducer reads (`Initialized`, `AgentInfo`, `Methods`, `NewSession`, `SessionUpdate`, `Update`, `Patch`, `Content`, `ContentKind`, `ToolCall`, `ToolChange`, `PermissionRequest`, `RequestedOption`, `OptionKind`, `RequestKind`, `NotificationKind`), and `Request`, the lines the reducer asks to be written;
   - into `v1/decode.rs` and `v1/encode.rs`: everything that names `agent_client_protocol_schema::v1`, an ACP method name or an ACP field name. That covers `initialize_result`, `auth_methods`, `supported_versions`, `new_session_result`, `resume_result`, `load_result`, `prompt_result`, `session_update`, `permission_request`, `cancel_request`, `request_kind`, `notification_kind`, and the encoders behind `Rpc::{initialize, authenticate, new_session, resume, load, prompt}`, `cancel`, `cancel_request`, `permission_answer` and `error`.
@@ -74,7 +74,7 @@ Before starting, check these:
   - `rpc.rs` keeps `Rpc`'s ids, outgoing purposes and held permissions, and takes its lines from the dialect.
   - Update `acp/mod.rs`'s module docs.
   - Verify: every existing unit test, the capture replay test and `cargo test -p brindle-remote-agent` pass with changes to paths only.
-- [ ] 2.2 **Add `acp/dialect.rs`.**
+- [x] 2.2 **Add `acp/dialect.rs`.**
   - `Dialect { V1 }`, `newest()`, and `from_version(n) -> Result<Dialect, Unsupported>`.
   - One method per decoder, for `continued_result` (which takes `continued`'s `method == "session/load"` check out of `reduce.rs`, flag 15) and for `encode(Request)`. Each is a single exhaustive `match self`.
   - The reducer holds the session's `Dialect`: set from `initialize`'s answer (in place of `initialized`'s `protocol_version == PROTOCOL_VERSION`), and restored by `checkpoint::decode` from `acp`.
@@ -82,19 +82,19 @@ Before starting, check these:
     - `from_version` for 1, 0, 2 and 65535;
     - the "the agent speaks ACP version N" and `supported_versions` failure texts read as before;
     - a format 1 and a format 2 checkpoint from before the change restore their dialect.
-- [ ] 2.3 **Use `Patch<T>` (moved to `forms.rs`) for `ToolChange`'s fields**, with the reducer applying all three cases.
+- [x] 2.3 **Use `Patch<T>` (moved to `forms.rs`) for `ToolChange`'s fields**, with the reducer applying all three cases.
   - Verify with unit tests:
     - `Clear` resets a title to the call id, a kind to `other` and a status to `pending`;
     - v1's decoder never produces `Clear` for a tool field;
     - `session_info_update`'s title still keeps, clears and sets as before.
-- [ ] 2.4 **Add the rule** (`ports R14`).
+- [x] 2.4 **Add the rule** (`ports R14`).
   - In `docs/architecture/ports-and-adapters.md`: one module per ACP protocol version; `Dialect` matched only in `acp/dialect.rs`; and, in `ports R6`'s text, a protocol version an outside program chooses is a seam like a platform. Add its "Enforced by" line.
   - Add its row to `docs/architecture/README.md`.
   - Add `acp_versions_stay_in_their_modules` to `tests/architecture.rs`.
   - Add `acp/{envelope,forms,dialect}.rs` and `acp/v1/{decode,encode}.rs` to `PURE_MODULES` and `fcis`'s table, in place of `acp/wire.rs`.
   - Update `.claude/rules/remote-agent.md`.
   - Verify: `cargo test -p brindle --test architecture` passes, and fails when a `v1::` path is added to `reduce.rs` (try it, then revert).
-- [ ] 2.5 **Commit 2.1–2.4 on their own**, before any tool content, as `refactor(remote): …`, so the move can be reviewed as a move.
+- [x] 2.5 **Commit 2.1–2.4 on their own**, before any tool content, as `refactor(remote): …`, so the move can be reviewed as a move.
   - Verify: `cargo test --workspace` and the clippy command pass at that commit.
 
 ## 3. Pure code in the server

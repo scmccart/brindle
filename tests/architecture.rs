@@ -716,6 +716,54 @@ fn only_the_acp_modules_name_the_schema_crate() {
     );
 }
 
+/// One module per ACP version (ports R14): each version's schema module is
+/// named only under its own `acp/vN/`, `Dialect`'s variants are matched only
+/// in `acp/dialect.rs`, and the reducer, the request bookkeeping and the
+/// checkpoint name no version module.
+#[test]
+fn acp_versions_stay_in_their_modules() {
+    let acp = Path::new("remote-agent/src/acp");
+    let mut files = sources("remote-agent/src");
+    files.extend(sources("remote-agent/tests"));
+    assert!(files.iter().any(|file| file.starts_with(acp.join("v1"))));
+    for version in ["v1", "v2"] {
+        let home = acp.join(version);
+        let outside: Vec<PathBuf> = files
+            .iter()
+            .filter(|file| !file.starts_with(&home))
+            .cloned()
+            .collect();
+        assert_none(
+            offenders(
+                &outside,
+                Scope::All,
+                &[&format!("agent_client_protocol_schema::{version}")],
+            ),
+            &format!(
+                "only remote-agent/src/acp/{version}/ names ACP {version}'s schema module \
+                 (docs/architecture/ports-and-adapters.md R14)"
+            ),
+        );
+    }
+    let dialect = acp.join("dialect.rs");
+    assert!(files.contains(&dialect), "{} is missing", dialect.display());
+    let others: Vec<PathBuf> = files.iter().filter(|file| **file != dialect).cloned().collect();
+    assert_none(
+        offenders(&others, Scope::All, &["Dialect::V"]),
+        "Dialect's variants are matched only in remote-agent/src/acp/dialect.rs; \
+         call its methods (docs/architecture/ports-and-adapters.md R14)",
+    );
+    let versionless: Vec<PathBuf> = ["reduce.rs", "rpc.rs", "checkpoint.rs"]
+        .iter()
+        .map(|file| acp.join(file))
+        .collect();
+    assert_none(
+        offenders(&versionless, Scope::All, &["v1::", "v2::"]),
+        "the reducer, rpc and the checkpoint read acp/forms.rs, never a version's \
+         module (docs/architecture/ports-and-adapters.md R14)",
+    );
+}
+
 /// The transcript crate's one door in the app: no file in `src/` but
 /// `src/agent/transcript.rs` names `brindle_transcript`, so the app reaches
 /// the transcript's types through `crate::agent::transcript` (ports R3).
@@ -1047,7 +1095,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 59] = [
+const PURE_MODULES: [&str; 63] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1101,7 +1149,11 @@ const PURE_MODULES: [&str; 59] = [
     "remote-agent/src/server/core/policy.rs",
     "remote-agent/src/server/holder/policy.rs",
     "remote-agent/src/server/login_env.rs",
-    "remote-agent/src/acp/wire.rs",
+    "remote-agent/src/acp/envelope.rs",
+    "remote-agent/src/acp/forms.rs",
+    "remote-agent/src/acp/dialect.rs",
+    "remote-agent/src/acp/v1/decode.rs",
+    "remote-agent/src/acp/v1/encode.rs",
     "remote-agent/src/acp/lines.rs",
     "remote-agent/src/acp/rpc.rs",
     "remote-agent/src/acp/reduce.rs",
