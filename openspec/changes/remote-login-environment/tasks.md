@@ -4,8 +4,8 @@ No client protocol or H1 version changes (design.md decision 8). The relay link 
 
 ## 1. Shared contract: the relay link
 
-- [ ] 1.1 `brindle-remote-protocol` `relay.rs`: add `LoginEnv::{Captured(BTreeMap<String, String>), Failed(String)}` (snake_case, externally tagged) and `RelayHost.login: Option<LoginEnv>`, with `serde(default, skip_serializing_if = "Option::is_none")`. Correct `RelayHost.env`'s doc: it is the relay's own environment with the passwd basics, not "a fresh login's". Update the module doc's table row and add a unit round trip for both forms and for none. Verify with `cargo test -p brindle-remote-protocol relay`.
-- [ ] 1.2 Add the transcript fixture `remote-protocol/tests/fixtures/relay-host-login.hex` (a `RELAY_HOST` with a captured login, then one with a failed login), written only when missing, and add both forms to `fuzz.rs`'s relay seeds. Verify with `cargo test -p brindle-remote-protocol --test transcripts`, the fuzz tests, and `relay-link.hex` passing unchanged.
+- [x] 1.1 `brindle-remote-protocol` `relay.rs`: add `LoginEnv::{Captured(BTreeMap<String, String>), Failed(String)}` (snake_case, externally tagged) and `RelayHost.login: Option<LoginEnv>`, with `serde(default, skip_serializing_if = "Option::is_none")`. Correct `RelayHost.env`'s doc: it is the relay's own environment with the passwd basics, not "a fresh login's". Update the module doc's table row and add a unit round trip for both forms and for none. Verify with `cargo test -p brindle-remote-protocol relay`.
+- [x] 1.2 Add the transcript fixture `remote-protocol/tests/fixtures/relay-host-login.hex` (a `RELAY_HOST` with a captured login, then one with a failed login), written only when missing, and add both forms to `fuzz.rs`'s relay seeds. Verify with `cargo test -p brindle-remote-protocol --test transcripts`, the fuzz tests, and `relay-link.hex` passing unchanged.
 
 ## 2. Pure code in the helper
 

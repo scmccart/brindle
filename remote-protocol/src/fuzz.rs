@@ -253,6 +253,18 @@ fn the_protocol_2_fields_and_relay_frames_reject_bad_values_without_panicking() 
             relay::MSG_RELAY_HOST,
             format!(r#"{{"version":{value},"env":{value},"shell":{value},"core_pid":{value}}}"#),
         ));
+        cases.push((
+            relay::MSG_RELAY_HOST,
+            format!(r#"{{"login":{value}}}"#),
+        ));
+        cases.push((
+            relay::MSG_RELAY_HOST,
+            format!(r#"{{"login":{{"captured":{value}}}}}"#),
+        ));
+        cases.push((
+            relay::MSG_RELAY_HOST,
+            format!(r#"{{"login":{{"failed":{value}}}}}"#),
+        ));
         cases.push((relay::MSG_RELAY_ERROR, format!(r#"{{"message":{value}}}"#)));
     }
     cases.push((relay::MSG_RELAY_HEARTBEAT, "{}".into()));
