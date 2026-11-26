@@ -1243,6 +1243,11 @@ impl<L: EventLoop> Core<L> {
             return;
         }
         log!("session {id}: exited ({code:?})");
+        // An agent hung up to start again after its login starts again
+        // (`agents-login` decision 8): no exit in its log, no `EXIT`.
+        if let Some((client, restart)) = self.login_restart_due(id) {
+            return self.restart_after_login(id, code, client, restart);
+        }
         // An agent's log gets its exit (and the stderr tail that came
         // before it) first, so its client, or a replay, has it before the
         // session's `EXIT`.
@@ -1261,7 +1266,7 @@ impl<L: EventLoop> Core<L> {
     /// The session's program ended with `code`, its agent's log already
     /// told: what becomes of the session ([`policy::exit_fate`], or for an
     /// agent [`policy::end_fate`]).
-    fn ended(&mut self, id: SessionId, code: Option<i32>) {
+    pub(super) fn ended(&mut self, id: SessionId, code: Option<i32>) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
@@ -1534,6 +1539,12 @@ impl<L: EventLoop> Core<L> {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
+        // A hang-up asked for now (`CLOSE`, `KILL`, `STOP`, a client gone)
+        // drops a restart its agent's exit would start; the restart's own
+        // hang-up comes before the restart is kept.
+        if let Some(agent) = session.agent() {
+            agent.login_restart = None;
+        }
         if let Life::AgentEnded { code } = session.life {
             return self.end_ended(id, code);
         }

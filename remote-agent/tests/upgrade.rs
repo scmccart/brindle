@@ -25,7 +25,8 @@ use brindle_remote_protocol::serde_json::json;
 use brindle_transcript::{AgentState, Entry, HoldReason, Slot, StopReason, TurnState};
 
 use support::fake_agent::{
-    LOAD_ONLY, ask, initialized, methods, prompts, responses, said, started, stop, user_said,
+    LOAD_ONLY, NEITHER, TWO_LOGINS, ask, initialized, methods, offering_logins, prompts, recorded,
+    responses, said, started, stop, user_said,
 };
 use support::programs::{self, ENTER, say};
 #[cfg(unix)]
@@ -660,6 +661,44 @@ fn an_older_core_isnt_shown_an_agent_session_and_a_newer_one_gets_it_back() {
         matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
     });
     assert_eq!(says(&log), ["user: go", "agent: before and after"]);
+}
+
+/// OpenSpec change `agents-login`, task 5.2: the core steps down while the
+/// agent logs in, and the agent answers `authenticate` only once the next
+/// core has adopted it; that core carries the login on to `session/new`.
+#[test]
+fn a_login_running_at_an_upgrade_is_carried_on_by_the_next_core() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-logging-in");
+    let (mut script, record) = offering_logins(&dir.path, "logging-in", NEITHER, TWO_LOGINS);
+    script
+        .step("expect session/new")
+        .step(r#"respond-error -32000 "log in first""#)
+        .step("expect authenticate");
+    let gate = script.gate();
+    script.step("respond {}").step("expect session/new").step(r#"respond {"sessionId":"s1"}"#);
+    let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+    dir.track(pid);
+    client.transcript_until(id, "needs a login", |log| matches!(log.agent(), AgentState::LoginRequired { .. }));
+    client.login(id, "api-key").unwrap();
+    let logging_in = AgentState::LoggingIn { method: "api-key".into(), name: "API Key".into() };
+    client.transcript_until(id, "is logging in", |log| *log.agent() == logging_in);
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    assert_eq!(*client.transcript(id).agent(), logging_in);
+    gate.open();
+    client.transcript_until(id, "is ready", agent_ready);
+    let states: Vec<AgentState> = client
+        .events(id)
+        .into_iter()
+        .filter_map(|event| if let brindle_transcript::Event::Agent { state } = event { Some(state) } else { None })
+        .collect();
+    assert_eq!(
+        states,
+        [logging_in, AgentState::Starting, AgentState::Ready { name: Some("fake".into()), version: Some("1.0".into()) }]
+    );
+    assert_eq!(methods(&record), ["initialize", "session/new", "authenticate", "session/new"]);
+    let authenticate = recorded(&record).into_iter().find(|value| value["method"] == "authenticate").expect("authenticate");
+    assert_eq!(authenticate["params"], json!({"methodId": "api-key"}));
 }
 
 /// A continuing `SPAWN_AGENT` (OpenSpec change `agents-session-recovery`,

@@ -347,6 +347,9 @@ impl<L: EventLoop> Core<L> {
                 self.client_agent_command(client, AgentCommand::resend(request))
             }
             ToCore::AgentRestart(restart) => self.client_agent_restart(client, restart),
+            ToCore::AgentLogin(login) => {
+                self.client_agent_command(client, AgentCommand::login(login))
+            }
         }
     }
 

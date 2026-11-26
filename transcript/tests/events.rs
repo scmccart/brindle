@@ -20,14 +20,14 @@
 //! writes only fixtures that don't exist yet; it never rewrites one. To
 //! rework a fixture that never shipped, delete it and regenerate.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Once;
 
 use brindle_transcript::{
-    AgentState, Continuation, Conversation, Entry, EntryId, Event, HoldReason, NoticeLevel,
-    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus,
-    TurnState,
+    AgentState, Continuation, Conversation, Entry, EntryId, Event, HoldReason, LoginKind,
+    LoginMethod, NoticeLevel, PermissionKind, PermissionOption, PermissionOutcome, Slot,
+    StopReason, ToolKind, ToolStatus, TurnState,
 };
 use serde_json::Value;
 
@@ -66,9 +66,10 @@ forms!(turn_form, TURN_FORMS, TurnState, "TurnState::":
 forms!(stop_form, STOP_FORMS, StopReason, "StopReason::":
     EndTurn, MaxTokens, MaxTurnRequests, Refusal, Cancelled, Other);
 forms!(agent_form, AGENT_FORMS, AgentState, "AgentState::":
-    Starting, Ready, LoginRequired, Failed, Exited, Lost);
+    Starting, Ready, LoginRequired, LoggingIn, Failed, Exited, Lost);
 forms!(continuation_form, CONTINUATION_FORMS, Continuation, "Continuation::":
     ResumeAndLoad, Resume, Load, Neither);
+forms!(login_kind_form, LOGIN_KIND_FORMS, LoginKind, "LoginKind::": Agent, Terminal);
 
 fn expected_forms() -> Vec<&'static str> {
     [
@@ -85,6 +86,7 @@ fn expected_forms() -> Vec<&'static str> {
         STOP_FORMS,
         AGENT_FORMS,
         CONTINUATION_FORMS,
+        LOGIN_KIND_FORMS,
     ]
     .concat()
 }
@@ -140,7 +142,12 @@ fn forms(event: &Event) -> Vec<&'static str> {
                 stop_forms(stop, &mut forms);
             }
         }
-        Event::Agent { state } => forms.push(agent_form(state)),
+        Event::Agent { state } => {
+            forms.push(agent_form(state));
+            if let AgentState::LoginRequired { methods, .. } = state {
+                forms.extend(methods.iter().map(|method| login_kind_form(&method.kind)));
+            }
+        }
         Event::Conversation { conversation } => {
             forms.push(continuation_form(&conversation.continuation));
         }
@@ -436,6 +443,7 @@ fn fixtures() -> Vec<(&'static str, Event)> {
             "agent-login-required",
             agent(AgentState::LoginRequired {
                 message: "run agent login".into(),
+                methods: Vec::new(),
             }),
         ),
         (
@@ -488,6 +496,53 @@ fn fixtures() -> Vec<(&'static str, Event)> {
         (
             "conversation-neither",
             conversation("sess-4", Continuation::Neither),
+        ),
+        // Added by `agents-login`, within protocol 4 before it shipped (its
+        // design decision 2).
+        (
+            "agent-login-required-methods",
+            agent(AgentState::LoginRequired {
+                message: "Authentication required".into(),
+                methods: vec![
+                    LoginMethod {
+                        id: "oauth-personal".into(),
+                        name: "Log in with Google".into(),
+                        description: None,
+                        kind: LoginKind::Agent,
+                    },
+                    LoginMethod {
+                        id: "api-key".into(),
+                        name: "API Key".into(),
+                        description: Some("Use an API key".into()),
+                        kind: LoginKind::Agent,
+                    },
+                ],
+            }),
+        ),
+        (
+            "agent-login-required-terminal",
+            agent(AgentState::LoginRequired {
+                message: "Authentication required".into(),
+                methods: vec![LoginMethod {
+                    id: "cli-login".into(),
+                    name: "Log in from the terminal".into(),
+                    description: Some("Paste a code from your browser".into()),
+                    kind: LoginKind::Terminal {
+                        args: vec!["login".into()],
+                        env: BTreeMap::from([
+                            ("LOGIN_MODE".into(), "device".into()),
+                            ("NO_BROWSER".into(), "1".into()),
+                        ]),
+                    },
+                }],
+            }),
+        ),
+        (
+            "agent-logging-in",
+            agent(AgentState::LoggingIn {
+                method: "oauth-personal".into(),
+                name: "Log in with Google".into(),
+            }),
         ),
     ]
 }
@@ -625,13 +680,25 @@ fn every_form_appears_in_a_fixture() {
     assert!(missing.is_empty(), "no fixture has {}", missing.join(", "));
 }
 
-/// `value` with a field it doesn't know added to every object in it.
+/// The fields whose objects are maps, every key data rather than a field
+/// name: a key added there is an entry, not an unknown field.
+const MAP_FIELDS: [&str; 1] = ["env"];
+
+/// `value` with a field it doesn't know added to every object in it but
+/// the maps ([`MAP_FIELDS`]).
 fn with_unknown_fields(value: &Value) -> Value {
     match value {
         Value::Object(object) => {
             let mut object: serde_json::Map<String, Value> = object
                 .iter()
-                .map(|(key, inner)| (key.clone(), with_unknown_fields(inner)))
+                .map(|(key, inner)| {
+                    let inner = if MAP_FIELDS.contains(&key.as_str()) {
+                        inner.clone()
+                    } else {
+                        with_unknown_fields(inner)
+                    };
+                    (key.clone(), inner)
+                })
                 .collect();
             object.insert(
                 "zz_later".into(),

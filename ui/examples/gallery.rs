@@ -554,7 +554,7 @@ impl Gallery {
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
                 "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger", "tabs-default",
-                "tabs-plain", "tabs-strip", "confirm-allow", "confirm-reject",
+                "tabs-plain", "tabs-strip", "confirm-allow", "confirm-reject", "login-google", "login-key",
             ]
             .map(String::from),
         );
@@ -1573,6 +1573,32 @@ impl Gallery {
                     })
                     .ok();
             });
+        // A choice with descriptions (stacked) and a disabled action, as an
+        // agent zone's login row: a press is logged as `login:KEY`.
+        let logged = cx.weak_entity();
+        let login = Confirmation::new("demo-login", "Log in to continue", ConfirmationState::Requested)
+            .action(ConfirmationAction::new("Log in with Google").key("google").focus(&self.handle("login-google")))
+            .action(
+                ConfirmationAction::new("API Key")
+                    .key("key")
+                    .description("Use an API key")
+                    .focus(&self.handle("login-key")),
+            )
+            .action(
+                ConfirmationAction::new("Log in from the terminal")
+                    .key("terminal")
+                    .description("the login can't be run through `cmd /c`")
+                    .disabled(true),
+            )
+            .on_action(move |key, _, cx| {
+                let key = key.as_str().to_string();
+                logged
+                    .update(cx, |gallery, cx| {
+                        gallery.permission_log.push(format!("login:{key}"));
+                        cx.notify();
+                    })
+                    .ok();
+            });
         let thought = Reasoning::new("demo-thought", self.thought_open)
             .label(if self.thought_open { "Thought for 4s" } else { "Thinking…" })
             .on_toggle(move |open, _, cx| {
@@ -1624,6 +1650,7 @@ impl Gallery {
                             .child(Tool::new(Icon::Globe, "Fetch the Windows SDK release notes", ToolStatus::Running))
                             .child(Tool::new(Icon::Pencil, "Edit .github/workflows/build-windows.yml", ToolStatus::Failed))
                             .child(permission)
+                            .child(login)
                             .child(Alert::new("Heads up").description("The agent edits files in this directory."))
                             .child(
                                 Alert::new("Brindle could not start the agent")
@@ -1807,12 +1834,14 @@ impl FocusStops for Gallery {
         stops.extend(named(&["checkbox", "switch", "toggle", "tabs-default", "tabs-plain", "tabs-strip"]));
         // The AI elements, as an agent's zone orders them: the prompt, the
         // reason line's action while it shows, its queue row's buttons, the
+        // login choice's enabled actions (its disabled one is no stop), the
         // permission's while requested, and the stop button while
         // streaming.
         let prompt = self.prompt.read(cx);
         stops.push(prompt.focus_handle(cx));
         stops.extend(prompt.action_stop());
         stops.extend(prompt.row_stops());
+        stops.extend(named(&["login-google", "login-key"]));
         if self.permission == ConfirmationState::Requested {
             stops.extend(named(&["confirm-allow", "confirm-reject"]));
         }
@@ -3024,6 +3053,8 @@ mod check {
         c.run_check("prompt-input-reason-action-is-a-stop-asking-the-owner", check).await;
         let check = confirmation_space_on_reject(&mut c).await;
         c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
+        let check = confirmation_described_actions(&mut c).await;
+        c.run_check("confirmation-described-actions-stack-and-a-disabled-one-is-no-stop", check).await;
         let check = scroller_keeps_the_view_while_away(&mut c).await;
         c.run_check("message-scroller-item-added-while-away-keeps-the-view", check).await;
         let check = response_paints(&mut c).await;
@@ -5600,6 +5631,26 @@ mod check {
             gallery.stops(cx).contains(&reject)
         })?;
         ensure!(!listed, "an answered permission's button is still a stop");
+        Ok(())
+    }
+
+    /// The spec's "Action descriptions": the login choice's actions stack
+    /// with their descriptions; tab goes from Log in with Google to API
+    /// Key, enter asks for it, and the disabled action is no stop.
+    async fn confirmation_described_actions(c: &mut Checker) -> Check {
+        c.focus("login-google").await?;
+        c.key("tab").await?;
+        let key = c.handle("login-key")?;
+        let focused = c.with(move |_, window, _| key.is_focused(window))?;
+        ensure!(focused, "tab from Log in with Google didn't reach API Key");
+        c.key("enter").await?;
+        let log = c.with(|gallery, _, _| gallery.permission_log.clone())?;
+        ensure!(log == ["login:key"], "enter on API Key asked {log:?}");
+        c.key("tab").await?;
+        let key = c.handle("login-key")?;
+        let google = c.handle("login-google")?;
+        let past = c.with(move |_, window, _| !key.is_focused(window) && !google.is_focused(window))?;
+        ensure!(past, "tab from API Key stayed in the login choice: the disabled action took focus");
         Ok(())
     }
 

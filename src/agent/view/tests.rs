@@ -658,3 +658,101 @@ fn link_presses_ask_or_fail_through_events() {
     press(&mut f, "javascript:void", Modifiers::control());
     assert_eq!(*failed.borrow(), ["couldn't open javascript:void: its scheme (javascript) isn't one Brindle opens"]);
 }
+
+// OpenSpec change `agents-login`, task 7.2.
+
+fn login_methods() -> Vec<crate::agent::transcript::LoginMethod> {
+    use crate::agent::transcript::{LoginKind, LoginMethod};
+    vec![
+        LoginMethod { id: "google".into(), name: "Log in with Google".into(), description: None, kind: LoginKind::Agent },
+        LoginMethod {
+            id: "api-key".into(),
+            name: "API Key".into(),
+            description: Some("Use an API key".into()),
+            kind: LoginKind::Agent,
+        },
+    ]
+}
+
+fn focused_name(f: &mut Fixture) -> String {
+    let view = f.view.clone();
+    f.cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).unwrap_or_default()
+}
+
+/// The login row arrives with nothing focused; tab walks its methods in
+/// the agent's order after the prompt, each named `login:ID`; enter on one
+/// sends `AGENT_LOGIN` for it; while it runs, Cancel login is the one
+/// stop (`login:cancel`) and sends `AGENT_CANCEL`; once the agent is
+/// ready the row goes and focus returns to the prompt.
+#[test]
+fn the_login_row_walks_its_methods_and_cancel_login() {
+    let mut f = Fixture::new();
+    f.feed(&[Event::Agent { state: AgentState::LoginRequired { message: "log in".into(), methods: login_methods() } }]);
+    let prompt = f.prompt_handle();
+    assert_eq!(f.focused(), Some(prompt.clone()), "nothing is chosen for the user");
+    let (google, key) = f.view.read_with(f.cx, |view, _| {
+        (view.login_handle("google").cloned().expect("a stop"), view.login_handle("api-key").cloned().expect("a stop"))
+    });
+    assert_eq!(f.tabs(3), [google.clone(), key, prompt.clone()]);
+    let mut names = Vec::new();
+    for _ in 0..3 {
+        f.cx.simulate_keystrokes("tab");
+        names.push(focused_name(&mut f));
+    }
+    assert_eq!(names, ["login:google", "login:api-key", "prompt"]);
+
+    f.focus(&google);
+    f.cx.simulate_keystrokes("enter");
+    f.settle();
+    assert_eq!(f.calls(), [Call::Login("google".into())]);
+    f.zone.sink.reply(1, Ok(()));
+    f.feed(&[Event::Agent { state: AgentState::LoggingIn { method: "google".into(), name: "Log in with Google".into() } }]);
+    assert_eq!(f.focused(), Some(prompt.clone()), "the method that had focus went");
+    let cancel = f.view.read_with(f.cx, |view, _| view.cancel_login_handle().clone());
+    assert_eq!(f.tabs(2), [cancel.clone(), prompt.clone()]);
+    f.focus(&cancel);
+    assert_eq!(focused_name(&mut f), "login:cancel");
+    f.cx.simulate_keystrokes("enter");
+    f.settle();
+    assert_eq!(f.calls(), [Call::Cancel]);
+
+    f.feed(&[Event::Agent { state: AgentState::Starting }, ready()]);
+    assert_eq!(f.focused(), Some(prompt), "Cancel login went with the row");
+    f.view.read_with(f.cx, |view, _| assert_eq!(view.login, crate::agent::model::LoginRow::None));
+}
+
+/// The row's words: its title while choosing and while one runs, and each
+/// method's description with what a terminal login runs, or why it is
+/// withheld.
+#[test]
+fn the_login_rows_words() {
+    use crate::agent::login::{MethodOffer, TerminalLogin, Withheld};
+    use crate::agent::model::{LoginRow, MethodChoice};
+    let words = |text: Option<SharedString>| text.map(|text| text.to_string());
+    assert_eq!(login_title(&LoginRow::None), None);
+    let choose = LoginRow::Choose { message: "x".into(), methods: Vec::new() };
+    assert_eq!(words(login_title(&choose)).as_deref(), Some("Log in to continue"));
+    let running = LoginRow::Running { method: "g".into(), name: "Google".into(), terminal: false };
+    assert_eq!(words(login_title(&running)).as_deref(), Some("Logging in with Google…"));
+    let choice = |description: Option<&str>, offer| MethodChoice {
+        id: "m".into(),
+        name: "M".into(),
+        description: description.map(|text| SharedString::from(text.to_string())),
+        offer,
+    };
+    assert_eq!(method_description(&choice(None, MethodOffer::Agent)), None);
+    assert_eq!(words(method_description(&choice(Some("Use `gh`"), MethodOffer::Agent))).as_deref(), Some("Use `gh`"));
+    let plan = TerminalLogin {
+        command: "agent".into(),
+        args: vec!["--login".into()],
+        appended: vec!["--login".into()],
+        env: [("LOGIN_MODE".to_string(), "device".to_string())].into(),
+        dropped: vec!["PATH".into()],
+    };
+    assert_eq!(
+        words(method_description(&choice(Some("In a terminal"), MethodOffer::Terminal(plan)))).as_deref(),
+        Some("In a terminal · Runs with --login; sets LOGIN_MODE=device; not applied: PATH")
+    );
+    let withheld = MethodOffer::Withheld(Withheld { why: "the login can't be run through `ssh`".into() });
+    assert_eq!(words(method_description(&choice(None, withheld))).as_deref(), Some("the login can't be run through `ssh`"));
+}

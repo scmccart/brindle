@@ -12,12 +12,17 @@
 //!
 //! The owner keys each action ([`ItemKey`]), so a press names the action
 //! the person saw even when the list is rebuilt.
+//!
+//! An action may carry a description (what it does, in plain text) and be
+//! disabled (drawn muted, no stop, asking nothing). When any action has a
+//! description, the actions stack, each with its description under it,
+//! instead of sitting in one row.
 
 use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ElementId, FocusHandle, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
-    Styled, Window, div, rems,
+    Styled, Window, div, prelude::FluentBuilder as _, rems,
 };
 
 use crate::components::{Button, ItemKey};
@@ -57,13 +62,34 @@ pub struct ConfirmationAction {
     pub label: SharedString,
     pub variant: ButtonVariant,
     pub focus: Option<FocusHandle>,
+    pub description: Option<SharedString>,
+    pub disabled: bool,
 }
 
 impl ConfirmationAction {
     /// An outline button keyed by its label.
     pub fn new(label: impl Into<SharedString>) -> Self {
         let label = label.into();
-        Self { key: ItemKey::new(label.clone()), label, variant: ButtonVariant::Outline, focus: None }
+        Self {
+            key: ItemKey::new(label.clone()),
+            label,
+            variant: ButtonVariant::Outline,
+            focus: None,
+            description: None,
+            disabled: false,
+        }
+    }
+
+    /// Plain text shown under the button, saying what it does.
+    pub fn description(mut self, description: impl Into<SharedString>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// A disabled action is drawn muted, is no stop and asks nothing.
+    pub fn disabled(mut self, disabled: bool) -> Self {
+        self.disabled = disabled;
+        self
     }
 
     pub fn key(mut self, key: impl Into<ItemKey>) -> Self {
@@ -85,6 +111,12 @@ impl ConfirmationAction {
 }
 
 type OnAction = Rc<dyn Fn(&ItemKey, &mut Window, &mut App) + 'static>;
+
+/// Whether the actions stack, each with its description under it: when
+/// any has one. Otherwise they sit in one row at the end.
+pub fn actions_stack(actions: &[ConfirmationAction]) -> bool {
+    actions.iter().any(|action| action.description.is_some())
+}
 
 #[derive(IntoElement)]
 pub struct Confirmation {
@@ -124,26 +156,45 @@ impl ParentElement for Confirmation {
 impl RenderOnce for Confirmation {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = cx.ui_theme();
+        let stacked = actions_stack(&self.actions);
+        let muted = t.muted_foreground;
         let footer: AnyElement = match self.state.outcome() {
             None => div()
                 .debug_selector(|| "confirmation-actions".into())
                 .flex()
-                .flex_wrap()
-                .justify_end()
                 .gap_2()
+                .when(stacked, |d| d.flex_col().items_start())
+                .when(!stacked, |d| d.flex_wrap().justify_end())
                 .children(self.actions.into_iter().enumerate().map(|(ix, action)| {
                     let id = ElementId::NamedInteger("confirmation-action".into(), ix as u64);
                     let mut button = Button::new(id, action.label)
                         .variant(action.variant)
-                        .size(ButtonSize::Sm);
-                    if let Some(handle) = &action.focus {
+                        .size(ButtonSize::Sm)
+                        .disabled(action.disabled);
+                    if let Some(handle) = action.focus.as_ref().filter(|_| !action.disabled) {
                         button = button.focus(handle);
                     }
-                    if let Some(on_action) = self.on_action.clone() {
+                    if let Some(on_action) = self.on_action.clone().filter(|_| !action.disabled) {
                         let key = action.key;
                         button = button.on_click(move |_, window, cx| on_action(&key, window, cx));
                     }
-                    div().debug_selector(move || format!("confirmation-action-{ix}")).child(button)
+                    div()
+                        .debug_selector(move || format!("confirmation-action-{ix}"))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .min_w_0()
+                        .child(button)
+                        .when_some(action.description, |d, description| {
+                            d.child(
+                                div()
+                                    .debug_selector(move || format!("confirmation-description-{ix}"))
+                                    .text_size(rems(0.75))
+                                    .text_color(muted)
+                                    .whitespace_normal()
+                                    .child(description),
+                            )
+                        })
                 }))
                 .into_any_element(),
             Some((icon, label)) => div()
@@ -197,6 +248,58 @@ mod tests {
         );
         assert_eq!(ConfirmationState::Rejected { label: "Reject".into() }.outcome(), Some((Icon::X, "Reject".into())));
         assert_eq!(ConfirmationState::Cancelled.outcome(), Some((Icon::X, "Cancelled".into())));
+    }
+
+    #[test]
+    fn a_description_stacks_the_actions() {
+        assert!(!actions_stack(&[ConfirmationAction::new("Allow"), ConfirmationAction::new("Reject")]));
+        assert!(actions_stack(&[ConfirmationAction::new("A"), ConfirmationAction::new("B").description("Use a key")]));
+    }
+
+    struct Described {
+        first: FocusHandle,
+        asked: Rc<RefCell<Vec<ItemKey>>>,
+    }
+
+    impl Focusable for Described {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.first.clone()
+        }
+    }
+
+    impl Render for Described {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let asked = self.asked.clone();
+            div().w(px(400.)).child(
+                Confirmation::new("login", "Log in to continue", ConfirmationState::Requested)
+                    .action(ConfirmationAction::new("Log in with Google").key("google").focus(&self.first))
+                    .action(ConfirmationAction::new("API Key").key("key").description("Use an API key"))
+                    .action(ConfirmationAction::new("Terminal").key("terminal").description("unavailable").disabled(true))
+                    .on_action(move |key, _, _| asked.borrow_mut().push(key.clone())),
+            )
+        }
+    }
+
+    /// The spec's "Action descriptions": each description sits under its
+    /// button, the actions stack in the owner's order, and a disabled one
+    /// asks nothing when clicked.
+    #[test]
+    fn described_actions_stack_and_a_disabled_one_asks_nothing() {
+        let mut app = test_support::app();
+        let asked = Rc::new(RefCell::new(Vec::new()));
+        let asked2 = asked.clone();
+        let (_, cx) = app.add_window_view(move |_, cx| Described { first: cx.focus_handle(), asked: asked2 });
+        cx.run_until_parked();
+        let first = cx.debug_bounds("confirmation-action-0").expect("the first action");
+        let second = cx.debug_bounds("confirmation-action-1").expect("the second action");
+        let third = cx.debug_bounds("confirmation-action-2").expect("the third action");
+        let description = cx.debug_bounds("confirmation-description-1").expect("its description");
+        assert!(first.bottom() <= second.top() && second.bottom() <= third.top(), "stacked in order");
+        assert!(description.top() >= second.top() && description.bottom() <= second.bottom(), "under its button");
+        cx.simulate_click(second.origin + gpui::point(px(4.), px(4.)), gpui::Modifiers::none());
+        assert_eq!(*asked.borrow(), [ItemKey::from("key")]);
+        cx.simulate_click(third.origin + gpui::point(px(4.), px(4.)), gpui::Modifiers::none());
+        assert_eq!(*asked.borrow(), [ItemKey::from("key")], "a disabled action asks nothing");
     }
 
     struct Host {

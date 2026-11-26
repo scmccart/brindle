@@ -1285,6 +1285,14 @@ impl TestClient {
         self.agent_reply(req)
     }
 
+    /// `AGENT_LOGIN` (change `agents-login`): the agent logs in with its
+    /// login method `method`.
+    pub fn login(&mut self, session: SessionId, method: &str) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentLogin(client::AgentLogin { req, session, method: method.into() }));
+        self.agent_reply(req)
+    }
+
     /// `AGENT_CANCEL`, which has no reply (an `ERROR` without a `req` if
     /// it is refused).
     pub fn cancel(&mut self, session: SessionId) {

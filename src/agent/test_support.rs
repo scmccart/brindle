@@ -57,6 +57,7 @@ pub enum Call {
     Detach(Option<serde_json::Value>),
     Layout(Option<serde_json::Value>),
     Restart(AgentRestartRequest),
+    Login(String),
 }
 
 pub type Calls = Rc<RefCell<Vec<Call>>>;
@@ -122,6 +123,10 @@ impl Requests for FakeRequests {
 
     fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
         self.record(Call::Restart(request))
+    }
+
+    fn login(&self, method: &str) -> Option<RequestId> {
+        self.record(Call::Login(method.to_string()))
     }
 }
 

@@ -88,7 +88,14 @@ impl AgentLink {
         self.0.restart(request)
     }
 
-    /// Cancels the running turn; true when it was sent.
+    /// Logs the agent in with its login method `method` (`AGENT_LOGIN`), as
+    /// [`AgentLink::prompt`].
+    pub fn login(&self, method: &str) -> Option<protocol::RequestId> {
+        self.0.login(method)
+    }
+
+    /// Cancels the running turn, or the agent's login; true when it was
+    /// sent.
     pub fn cancel(&self) -> bool {
         self.0.cancel()
     }
@@ -134,6 +141,10 @@ impl AgentLink {
     }
 
     pub fn restart(&self, _request: AgentRestartRequest) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn login(&self, _method: &str) -> Option<protocol::RequestId> {
         match *self {}
     }
 

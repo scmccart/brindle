@@ -19,6 +19,10 @@
 //!   Brindle doesn't know as text ([`OptionKind::Unknown`]), and its id is in
 //!   the envelope, so even a request whose params fail to decode can be
 //!   answered.
+//! - **Login methods** (`initialize`'s `authMethods`) are read by hand, one
+//!   at a time ([`auth_methods`], OpenSpec change `agents-login`), and left
+//!   out of what the schema crate decodes, so a bad method is one left out,
+//!   never a lost `initialize`.
 //! - **Request ids** ([`Id`]) are kept as the JSON number or string the agent
 //!   sent (Antigravity sends `"1"`; others start at `0`), and echoed back
 //!   verbatim.
@@ -27,9 +31,13 @@
 //! `brindle_transcript`'s closed ones here, and the reducer never matches
 //! one of them.
 
+use std::collections::BTreeMap;
+
 use agent_client_protocol_schema::v1 as acp;
 use brindle_remote_protocol::serde_json::{self, Map, Value};
-use brindle_transcript::{Continuation, PermissionKind, StopReason, ToolKind, ToolStatus};
+use brindle_transcript::{
+    Continuation, LoginKind, LoginMethod, PermissionKind, StopReason, ToolKind, ToolStatus,
+};
 
 /// The longest request id kept, as encoded JSON: a request with a longer id
 /// is answered `-32600` with a null id (decision 13).
@@ -267,9 +275,16 @@ pub struct AgentInfo {
     pub version: String,
 }
 
+/// `initialize`'s answer, read through the schema crate. `authMethods` is
+/// left to [`auth_methods`], which reads it one method at a time, so a bad
+/// method never costs the answer.
 pub fn initialize_result(result: &Value) -> Result<Initialized, BadParams> {
+    let mut result = result.clone();
+    if let Some(object) = result.as_object_mut() {
+        object.remove("authMethods");
+    }
     let response: acp::InitializeResponse =
-        serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(result).map_err(|e| BadParams::from_serde(&e))?;
     let capabilities = &response.agent_capabilities;
     Ok(Initialized {
         protocol_version: response.protocol_version.as_u16(),
@@ -283,6 +298,171 @@ pub fn initialize_result(result: &Value) -> Result<Initialized, BadParams> {
             version: info.version,
         }),
     })
+}
+
+/// The most login methods kept from `initialize` (OpenSpec change
+/// `agents-login`, design decision 3); the rest are left out.
+pub const MAX_LOGIN_METHODS: usize = 16;
+/// The longest method id and name kept, in bytes: a method with a longer
+/// one is left out (an id can't be cut, since a login names it).
+pub const MAX_LOGIN_ID: usize = 1024;
+/// The longest method description kept, in bytes: a longer one is cut.
+pub const MAX_LOGIN_DESCRIPTION: usize = 4 * 1024;
+/// The most `args` and `env` entries a terminal method may have, and the
+/// longest each argument, key and value may be, in bytes: past either, the
+/// method is left out, since a cut argument would run something else.
+pub const MAX_LOGIN_ARGS: usize = 32;
+pub const MAX_LOGIN_ARG: usize = 4 * 1024;
+/// The most the kept methods may take, encoded as the transcript sends
+/// them: the methods past it are left out, so a `LoginRequired` event,
+/// which carries them all, fits a frame (`pack_transcript`).
+pub const MAX_LOGIN_METHODS_LEN: usize = 256 * 1024;
+
+/// The login methods `initialize` advertised, as [`auth_methods`] read them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Methods {
+    /// The methods kept, in the agent's order. Their name and description
+    /// are as sent (bounded, not yet cleaned).
+    pub methods: Vec<LoginMethod>,
+    /// How many methods were left out: of a type Brindle doesn't run, a
+    /// terminal one Brindle didn't advertise, malformed, past a bound, or
+    /// past [`MAX_LOGIN_METHODS`] or [`MAX_LOGIN_METHODS_LEN`].
+    pub dropped: usize,
+    /// How many kept descriptions were cut to [`MAX_LOGIN_DESCRIPTION`].
+    pub cut: usize,
+}
+
+/// Reads `initialize`'s `authMethods` by hand, one method at a time
+/// (`agents-login` design decision 3), so one bad method never loses the
+/// others:
+///
+/// - no `type`, or `"agent"`: [`LoginKind::Agent`];
+/// - `"terminal"`: [`LoginKind::Terminal`] with its `args` and `env`, kept
+///   only when Brindle advertised `auth.terminal` (`terminal_advertised`);
+///   an agent that sends one anyway breaks ACP's MUST;
+/// - any other `type`, a missing, empty or non-string `id` or `name`, an
+///   `id` with a control character, malformed `args` or `env` (not a list of
+///   strings, or not a map of strings; a control character, an empty key or
+///   one with `=`), or one past a bound: left out and counted.
+///
+/// `_meta` is never read, so Zed's `terminal-auth` (Copilot's) is ignored.
+/// No `authMethods`, or `null`, is no methods; one that isn't a list counts
+/// as one left out.
+pub fn auth_methods(result: &Value, terminal_advertised: bool) -> Methods {
+    let mut read = Methods::default();
+    let list = match result.get("authMethods") {
+        None | Some(Value::Null) => return read,
+        Some(Value::Array(list)) => list,
+        Some(_) => {
+            read.dropped = 1;
+            return read;
+        }
+    };
+    let mut len = 0usize;
+    for method in list {
+        let Some((method, cut)) = auth_method(method, terminal_advertised) else {
+            read.dropped += 1;
+            continue;
+        };
+        let encoded = serde_json::to_vec(&method).map_or(usize::MAX, |bytes| bytes.len());
+        if read.methods.len() == MAX_LOGIN_METHODS
+            || len.saturating_add(encoded) > MAX_LOGIN_METHODS_LEN
+        {
+            read.dropped += 1;
+            continue;
+        }
+        len += encoded;
+        read.cut += usize::from(cut);
+        read.methods.push(method);
+    }
+    read
+}
+
+/// One method, and whether its description was cut; `None` when it is left
+/// out.
+fn auth_method(method: &Value, terminal_advertised: bool) -> Option<(LoginMethod, bool)> {
+    let text = |key: &str| method.get(key).and_then(Value::as_str);
+    let id = text("id").filter(|id| {
+        !id.is_empty() && id.len() <= MAX_LOGIN_ID && !id.chars().any(char::is_control)
+    })?;
+    let name = text("name").filter(|name| !name.is_empty() && name.len() <= MAX_LOGIN_ID)?;
+    let description = match method.get("description") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(description)) => Some(description.as_str()),
+        Some(_) => return None,
+    };
+    let kind = match method.get("type") {
+        None | Some(Value::Null) => LoginKind::Agent,
+        Some(Value::String(kind)) => match kind.as_str() {
+            "agent" => LoginKind::Agent,
+            "terminal" if terminal_advertised => LoginKind::Terminal {
+                args: login_args(method.get("args"))?,
+                env: login_env(method.get("env"))?,
+            },
+            _ => return None,
+        },
+        Some(_) => return None,
+    };
+    let (description, cut) = match description {
+        Some(description) if description.len() > MAX_LOGIN_DESCRIPTION => {
+            (Some(cut_to(description, MAX_LOGIN_DESCRIPTION)), true)
+        }
+        Some(description) => (Some(description.to_owned()), false),
+        None => (None, false),
+    };
+    Some((
+        LoginMethod {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            description,
+            kind,
+        },
+        cut,
+    ))
+}
+
+/// A word a terminal login passes on: bounded, with no control character.
+fn login_word(word: &str) -> bool {
+    word.len() <= MAX_LOGIN_ARG && !word.chars().any(char::is_control)
+}
+
+fn login_args(args: Option<&Value>) -> Option<Vec<String>> {
+    let args = match args {
+        None | Some(Value::Null) => return Some(Vec::new()),
+        Some(args) => args.as_array()?,
+    };
+    if args.len() > MAX_LOGIN_ARGS {
+        return None;
+    }
+    args.iter()
+        .map(|arg| arg.as_str().filter(|arg| login_word(arg)).map(str::to_owned))
+        .collect()
+}
+
+fn login_env(env: Option<&Value>) -> Option<BTreeMap<String, String>> {
+    let env = match env {
+        None | Some(Value::Null) => return Some(BTreeMap::new()),
+        Some(env) => env.as_object()?,
+    };
+    if env.len() > MAX_LOGIN_ARGS {
+        return None;
+    }
+    env.iter()
+        .map(|(key, value)| {
+            let value = value.as_str()?;
+            let key_ok = !key.is_empty() && !key.contains('=') && login_word(key);
+            (key_ok && login_word(value)).then(|| (key.clone(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// `text` cut to at most `limit` bytes at a character boundary.
+fn cut_to(text: &str, limit: usize) -> String {
+    let mut cut = limit.min(text.len());
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text[..cut].to_owned()
 }
 
 /// The versions an `initialize` error `-32022` says the agent supports:
@@ -1242,6 +1422,293 @@ mod tests {
             initialize_result(&json!({"protocolVersion": 1})).map(|init| init.continuation),
             Ok(Continuation::Neither)
         );
+    }
+
+    // agents-login 3.1: the login methods.
+
+    /// The captures made with `clientCapabilities.auth.terminal: true`
+    /// (`agents-login` task 1.1).
+    const AUTH_CAPTURES: [(&str, &[u8]); 4] = [
+        (
+            "antigravity-1.5.16-auth-terminal",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-auth-terminal.log"),
+        ),
+        (
+            "claude-code-acp-0.16.2-auth-terminal",
+            include_bytes!("../../tests/fixtures/acp/claude-code-acp-0.16.2-auth-terminal.log"),
+        ),
+        (
+            "codex-acp-2.12.0-auth-terminal",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-auth-terminal.log"),
+        ),
+        (
+            "copilot-1.0.115-auth-terminal",
+            include_bytes!("../../tests/fixtures/acp/copilot-1.0.115-auth-terminal.log"),
+        ),
+    ];
+
+    /// The result of each answered `initialize` in a capture.
+    fn initialize_answers(bytes: &[u8]) -> Vec<Value> {
+        let mut asked = Vec::new();
+        let mut answers = Vec::new();
+        for (direction, line) in capture_lines(bytes) {
+            match decode(line) {
+                Ok(Message::Request { id, method, .. })
+                    if direction == "c>a" && method == "initialize" =>
+                {
+                    asked.push(id.encode());
+                }
+                Ok(Message::Response { id, result }) if asked.contains(&id.encode()) => {
+                    answers.push(result);
+                }
+                Ok(_) | Err(_) => {}
+            }
+        }
+        answers
+    }
+
+    fn agent_method(id: &str, name: &str, description: Option<&str>) -> LoginMethod {
+        LoginMethod {
+            id: id.into(),
+            name: name.into(),
+            description: description.map(Into::into),
+            kind: LoginKind::Agent,
+        }
+    }
+
+    fn ids(methods: &Methods) -> Vec<&str> {
+        methods.methods.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn every_captured_initialize_answer_gives_its_agents_methods() {
+        let antigravity = ["oauth-personal", "oauth-business", "gemini-api-key", "agent-platform"];
+        let mut seen = Vec::new();
+        for (name, bytes) in CAPTURES.iter().chain(AUTH_CAPTURES.iter()) {
+            for answer in initialize_answers(bytes) {
+                // Every capture but the terminal one: the same with or
+                // without auth.terminal, and nothing left out.
+                for advertised in [true, false] {
+                    let read = auth_methods(&answer, advertised);
+                    let expected: Vec<&str> = match *name {
+                        "antigravity-1.5.16-auth-terminal" if advertised => {
+                            antigravity.iter().copied().chain(["terminal-login"]).collect()
+                        }
+                        n if n.starts_with("antigravity") => antigravity.to_vec(),
+                        n if n.starts_with("claude-agent-acp") => Vec::new(),
+                        n if n.starts_with("claude-code-acp") => vec!["claude-login"],
+                        n if n.starts_with("codex") => vec!["api-key", "chat-gpt"],
+                        n if n.starts_with("copilot") => vec!["copilot-login"],
+                        n => panic!("{n}: an initialize answer this test doesn't expect"),
+                    };
+                    assert_eq!(ids(&read), expected, "{name} ({advertised})");
+                    let dropped = usize::from(*name == "antigravity-1.5.16-auth-terminal" && !advertised);
+                    assert_eq!((read.dropped, read.cut), (dropped, 0), "{name} ({advertised})");
+                    // `initialize` itself still reads.
+                    assert!(initialize_result(&answer).is_ok(), "{name}");
+                }
+                seen.push(*name);
+            }
+        }
+        assert_eq!(seen.len(), 12, "{seen:?}");
+    }
+
+    #[test]
+    fn the_captured_methods_are_agent_methods_but_antigravitys_terminal_login() {
+        let answer = |bytes| initialize_answers(bytes).remove(0);
+        let read = auth_methods(&answer(AUTH_CAPTURES[0].1), true);
+        assert_eq!(
+            read.methods.last(),
+            Some(&LoginMethod {
+                id: "terminal-login".into(),
+                name: "Log in from the terminal".into(),
+                description: Some(
+                    "Log in with your Google account by pasting a code in a terminal; works over SSH"
+                        .into()
+                ),
+                kind: LoginKind::Terminal {
+                    args: vec!["--login".into()],
+                    env: BTreeMap::new(),
+                },
+            })
+        );
+        // Copilot's `_meta.terminal-auth` is never read: an agent method.
+        let read = auth_methods(&answer(AUTH_CAPTURES[3].1), true);
+        assert_eq!(
+            read.methods,
+            [agent_method(
+                "copilot-login",
+                "Log in with Copilot CLI",
+                Some("Run `copilot login` in the terminal")
+            )]
+        );
+        // Codex's `_meta.api-key` likewise.
+        let read = auth_methods(&answer(AUTH_CAPTURES[2].1), true);
+        assert_eq!(
+            read.methods,
+            [
+                agent_method("api-key", "API Key", Some("Use an API key to authenticate")),
+                agent_method("chat-gpt", "ChatGPT", Some("Use ChatGPT to authenticate")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_method_of_another_type_or_malformed_is_left_out_and_counted() {
+        let read = auth_methods(
+            &json!({"authMethods": [
+                {"id": "env", "name": "Env", "type": "env_var", "vars": [{"name": "KEY"}]},
+                {"id": "plain", "name": "Plain"},
+                {"name": "No id"},
+                {"id": 7, "name": "Number id"},
+                {"id": "", "name": "Empty id"},
+                {"id": "a\u{1b}b", "name": "Escape in its id"},
+                {"id": "no-name"},
+                {"id": "typed", "name": "Typed", "type": 1},
+                {"id": "described", "name": "Described", "description": ["x"]},
+                {"id": "agent", "name": "Agent", "type": "agent", "description": null},
+                "a string",
+            ]}),
+            true,
+        );
+        assert_eq!(
+            read.methods,
+            [agent_method("plain", "Plain", None), agent_method("agent", "Agent", None)]
+        );
+        assert_eq!((read.dropped, read.cut), (9, 0));
+        // None, or null, is no methods; anything else not a list, one
+        // left out.
+        assert_eq!(auth_methods(&json!({}), true), Methods::default());
+        assert_eq!(auth_methods(&json!({"authMethods": null}), true), Methods::default());
+        assert_eq!(auth_methods(&json!({"authMethods": {"id": "x"}}), true).dropped, 1);
+        // `initialize` reads whatever the methods are.
+        assert!(
+            initialize_result(&json!({"protocolVersion": 1, "authMethods": [{"type": 1}, 3]})).is_ok()
+        );
+    }
+
+    #[test]
+    fn past_16_methods_the_rest_are_left_out() {
+        let methods: Vec<Value> = (0..17)
+            .map(|n| json!({"id": format!("m{n}"), "name": format!("Method {n}")}))
+            .collect();
+        let read = auth_methods(&json!({ "authMethods": methods }), true);
+        assert_eq!(read.methods.len(), MAX_LOGIN_METHODS);
+        assert_eq!(read.methods.last().map(|m| m.id.as_str()), Some("m15"));
+        assert_eq!(read.dropped, 1);
+    }
+
+    #[test]
+    fn an_over_long_description_is_cut_at_a_character_and_an_over_long_id_or_name_left_out() {
+        let long = "é".repeat(MAX_LOGIN_DESCRIPTION);
+        let read = auth_methods(
+            &json!({"authMethods": [
+                {"id": "a", "name": "A", "description": long},
+                {"id": "x".repeat(MAX_LOGIN_ID + 1), "name": "Long id"},
+                {"id": "b", "name": "n".repeat(MAX_LOGIN_ID + 1)},
+                {"id": "x".repeat(MAX_LOGIN_ID), "name": "n".repeat(MAX_LOGIN_ID)},
+            ]}),
+            true,
+        );
+        assert_eq!(read.methods.len(), 2);
+        let description = read.methods[0].description.as_deref().unwrap_or_default();
+        assert_eq!(description.len(), MAX_LOGIN_DESCRIPTION);
+        assert!(description.chars().all(|c| c == 'é'));
+        assert_eq!((read.dropped, read.cut), (2, 1));
+    }
+
+    #[test]
+    fn methods_past_their_total_length_are_left_out_so_their_event_fits_a_frame() {
+        // About 96 KiB each: two fit, the third doesn't.
+        let big = |n: usize| {
+            json!({"id": format!("t{n}"), "name": "T", "type": "terminal",
+                   "args": vec!["a".repeat(MAX_LOGIN_ARG); 24]})
+        };
+        let mut methods: Vec<Value> = (0..MAX_LOGIN_METHODS - 1).map(big).collect();
+        methods.push(json!({"id": "small", "name": "Small"}));
+        let read = auth_methods(&json!({ "authMethods": methods }), true);
+        assert_eq!(ids(&read), ["t0", "t1", "small"]);
+        assert_eq!(read.dropped, MAX_LOGIN_METHODS - 3);
+        let len = serde_json::to_vec(&read.methods).map_or(usize::MAX, |bytes| bytes.len());
+        assert!(len <= MAX_LOGIN_METHODS_LEN + 16, "{len}");
+        // At the most a terminal method can be on its own, it is left out
+        // too: past the total by itself.
+        let env: Map<String, Value> = (0..MAX_LOGIN_ARGS)
+            .map(|k| (format!("K{k}"), json!("v".repeat(MAX_LOGIN_ARG))))
+            .collect();
+        let largest = json!({"id": "x", "name": "X", "type": "terminal",
+                             "args": vec!["a".repeat(MAX_LOGIN_ARG); MAX_LOGIN_ARGS], "env": env});
+        let read = auth_methods(&json!({ "authMethods": [largest] }), true);
+        assert_eq!((read.methods.len(), read.dropped), (0, 1));
+    }
+
+    #[test]
+    fn a_terminal_method_is_kept_only_when_brindle_advertised_auth_terminal() {
+        let answer = json!({"authMethods": [
+            {"id": "cli-login", "name": "CLI", "type": "terminal", "args": ["login"], "env": {"LOGIN_MODE": "device", "B": ""}},
+            {"id": "bare", "name": "Bare", "type": "terminal"},
+            {"id": "nulls", "name": "Nulls", "type": "terminal", "args": null, "env": null},
+        ]});
+        let read = auth_methods(&answer, true);
+        let terminal = |id: &str, name: &str, args: &[&str], env: &[(&str, &str)]| LoginMethod {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            kind: LoginKind::Terminal {
+                args: args.iter().map(|a| (*a).into()).collect(),
+                env: env.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect(),
+            },
+        };
+        assert_eq!(
+            read.methods,
+            [
+                terminal("cli-login", "CLI", &["login"], &[("B", ""), ("LOGIN_MODE", "device")]),
+                terminal("bare", "Bare", &[], &[]),
+                terminal("nulls", "Nulls", &[], &[]),
+            ]
+        );
+        assert_eq!(read.dropped, 0);
+        let read = auth_methods(&answer, false);
+        assert!(read.methods.is_empty());
+        assert_eq!(read.dropped, 3);
+    }
+
+    #[test]
+    fn a_terminal_method_with_malformed_or_over_long_args_or_env_is_left_out() {
+        let many: Vec<String> = (0..=MAX_LOGIN_ARGS).map(|n| n.to_string()).collect();
+        let many_env: Map<String, Value> = (0..=MAX_LOGIN_ARGS)
+            .map(|n| (format!("K{n}"), json!("v")))
+            .collect();
+        let long = "a".repeat(MAX_LOGIN_ARG + 1);
+        let bad = [
+            json!({"args": ["auth", "--port", 8123]}),
+            json!({"args": "login"}),
+            json!({"args": ["log\nin"]}),
+            json!({"args": [long]}),
+            json!({"args": many}),
+            json!({"env": {"DEBUG": 1}}),
+            json!({"env": ["A=1"]}),
+            json!({"env": {"": "x"}}),
+            json!({"env": {"A=B": "x"}}),
+            json!({"env": {"A": "x\u{0}"}}),
+            json!({"env": {"A": long}}),
+            json!({"env": many_env}),
+        ];
+        for fields in bad {
+            let mut method = json!({"id": "t", "name": "T", "type": "terminal"});
+            for (key, value) in fields.as_object().into_iter().flatten() {
+                method[key] = value.clone();
+            }
+            let read = auth_methods(&json!({ "authMethods": [method] }), true);
+            assert_eq!((read.methods.len(), read.dropped), (0, 1), "{fields}");
+        }
+        // At the bounds, kept.
+        let at: Vec<String> = (0..MAX_LOGIN_ARGS).map(|_| "a".repeat(MAX_LOGIN_ARG)).collect();
+        let read = auth_methods(
+            &json!({"authMethods": [{"id": "t", "name": "T", "type": "terminal", "args": at}]}),
+            true,
+        );
+        assert_eq!(read.methods.len(), 1);
     }
 
     #[test]

@@ -53,6 +53,17 @@
 //!   is checkpointed right after its `SPAWN_PIPES`, so a core killed
 //!   before `SPAWNED` still continues it. The reducer chooses resume or
 //!   load and mutes or shows the replay.
+//! - **Logging in** (change `agents-login`): `AGENT_LOGIN` steps
+//!   `Command::Login`, and `AGENT_CANCEL` cancels a running login as the
+//!   reducer says. An `AGENT_RESTART` is also taken while the running
+//!   agent needs a login (after a terminal login, decision 8): the reducer
+//!   hangs it up (`Phase::Restarting`), the restart is kept on the
+//!   [`Agent`] until the holder's `EXITED`, and that exit steps
+//!   `Input::Restart` again and queues the restart as an ended agent's,
+//!   with no `Exited` in the log and no `EXIT`
+//!   ([`Core::restart_after_login`]). Any other hang-up (`CLOSE`, `KILL`,
+//!   `STOP`, a gone `kill` client) drops the kept restart, as does an exit
+//!   with no client attached, and the exit then ends the agent as any.
 //! - **Listing:** [`Agent::info`] maps the log's [`Activity`] onto the
 //!   wire's [`AgentActivity`] with an exhaustive `match` ([`activity`]).
 
@@ -102,6 +113,18 @@ pub(super) struct Agent {
     /// Its checkpoint came out too large to store, so its handling failed
     /// and it isn't checkpointed again (the bounds make this unreachable).
     unstorable: bool,
+    /// An `AGENT_RESTART` taken while its agent needed a login
+    /// (`agents-login` decision 8): the agent is hung up, and its exit
+    /// starts this restart. Any other hang-up drops it, and so does an exit
+    /// with no client to start it for.
+    pub(super) login_restart: Option<LoginRestart>,
+}
+
+/// An `AGENT_RESTART` waiting for its agent's exit, and the directory the
+/// new agent works in.
+pub(super) struct LoginRestart {
+    pub(super) restart: client::AgentRestart,
+    pub(super) cwd: String,
 }
 
 impl Agent {
@@ -131,6 +154,7 @@ impl Agent {
         self.checkpointed = 0;
         self.stderr = None;
         self.wake = None;
+        self.login_restart = None;
     }
 
     /// Whether its agent ended and its conversation can be continued
@@ -139,6 +163,15 @@ impl Agent {
         match &self.acp {
             Acp::Adopting { .. } => false,
             Acp::Running(acp) => acp.continuable(),
+        }
+    }
+
+    /// Whether its agent runs and waits for a login
+    /// ([`AgentSession::needs_login`]).
+    pub(super) fn needs_login(&self) -> bool {
+        match &self.acp {
+            Acp::Adopting { .. } => false,
+            Acp::Running(acp) => acp.needs_login(),
         }
     }
 
@@ -157,6 +190,7 @@ impl Agent {
             stderr: None,
             wake: None,
             unstorable: false,
+            login_restart: None,
         }
     }
 
@@ -182,6 +216,7 @@ impl Agent {
                     AgentState::Ready { name, .. } => name.clone(),
                     AgentState::Starting
                     | AgentState::LoginRequired { .. }
+                    | AgentState::LoggingIn { .. }
                     | AgentState::Failed { .. }
                     | AgentState::Exited { .. }
                     | AgentState::Lost { .. } => None,
@@ -256,7 +291,11 @@ fn inject_fault(input: &Input<'_>) {
         | Input::Lost { .. }
         | Input::Restart
         | Input::Command(
-            Command::Unqueue | Command::Resend | Command::Cancel | Command::Answer { .. },
+            Command::Unqueue
+            | Command::Resend
+            | Command::Cancel
+            | Command::Answer { .. }
+            | Command::Login { .. },
         )
         | Input::Fault { .. }
         | Input::Tick => return,
@@ -323,6 +362,18 @@ impl AgentCommand {
             command: Command::Resend,
         }
     }
+
+    /// `AGENT_LOGIN` (OpenSpec change `agents-login`).
+    pub(super) fn login(login: client::AgentLogin) -> Self {
+        Self {
+            request: AgentRequest::Login,
+            req: Some(login.req),
+            session: login.session,
+            command: Command::Login {
+                method: login.method,
+            },
+        }
+    }
 }
 
 impl<L: EventLoop> Core<L> {
@@ -354,6 +405,12 @@ impl<L: EventLoop> Core<L> {
     /// [`policy::restart_refusal`] says; the reducer's own refusal
     /// ([`Input::Restart`]) comes last. `OK` once the spawn is queued; what
     /// follows comes as transcript events.
+    ///
+    /// An agent that runs and needs a login (`agents-login` decision 8) is
+    /// hung up instead, the restart kept ([`Agent::login_restart`]) until
+    /// its exit starts it ([`Core::restart_after_login`]); `OK` at once. It
+    /// works in its conversation's directory, or its session's when it has
+    /// none yet.
     pub(super) fn client_agent_restart(&mut self, client: Token, restart: client::AgentRestart) {
         let (req, id) = (restart.req, restart.session);
         let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
@@ -365,19 +422,23 @@ impl<L: EventLoop> Core<L> {
             return;
         };
         let life = session.life.clone();
+        let session_cwd = session.meta.cwd.clone();
         let Some(agent) = session.agent() else {
             let message = format!("session {id} isn't an agent session");
             return self.send_client(client, error(Some(req), Some(id), message));
         };
         let continuable = agent.continuable();
+        let needs_login = agent.needs_login();
         let cwd = match &agent.acp {
             Acp::Running(acp) => acp.transcript().conversation().map(|c| c.cwd.clone()),
             Acp::Adopting { .. } => None,
         };
+        let cwd = if needs_login { cwd.or(session_cwd) } else { cwd };
         let refusal = if stopping {
             Some("the server is stopping; try again".to_owned())
         } else {
-            policy::restart_refusal(&life, continuable, &restart.command).map(|r| r.to_string())
+            policy::restart_refusal(&life, continuable, needs_login, &restart.command)
+                .map(|r| r.to_string())
         };
         if let Some(refusal) = refusal {
             let message = format!("session {id}: {refusal}");
@@ -398,6 +459,17 @@ impl<L: EventLoop> Core<L> {
                 return self.send_client(client, error(Some(req), Some(id), message));
             }
         }
+        if needs_login {
+            // Hung up by the step: its exit starts the restart.
+            log!(
+                "session {id}: its agent is hung up to start again after its login ({:?})",
+                restart.command
+            );
+            if let Some(agent) = self.sessions.get_mut(&id).and_then(|session| session.agent()) {
+                agent.login_restart = Some(LoginRestart { restart, cwd });
+            }
+            return self.send_client(client, ToClient::Ok(client::Request { req }));
+        }
         log!(
             "session {id}: its agent starts again to continue its conversation ({:?})",
             restart.command
@@ -406,6 +478,61 @@ impl<L: EventLoop> Core<L> {
         let spawn = SpawnRequest::Restart { restart, cwd };
         self.start_again(id, &command.0, &command.1, spawn.clone());
         self.send_client(client, ToClient::Ok(client::Request { req }));
+        self.waiting.push(WaitingSpawn { client, id, spawn });
+        self.place_waiting();
+    }
+
+    /// The restart agent session `id`'s exit starts, if any: one taken
+    /// while its agent needed a login, with a client attached to start it
+    /// for, while the core isn't stopping or stepping down. The restart is
+    /// dropped either way.
+    pub(super) fn login_restart_due(&mut self, id: SessionId) -> Option<(Token, LoginRestart)> {
+        let stopping = self.stopping.is_some() || self.stepping_down.is_some();
+        let session = self.sessions.get_mut(&id)?;
+        let client = session.ownership.client();
+        let restart = session.agent()?.login_restart.take()?;
+        match client {
+            Some(client) if !stopping => Some((client, restart)),
+            Some(_) | None => {
+                log!("session {id}: its restart after a login is dropped: no client to start it for");
+                None
+            }
+        }
+    }
+
+    /// Agent session `id`'s agent, hung up for a restart after a login,
+    /// exited: the reducer spawns it anew ([`Input::Restart`] in
+    /// `Phase::Restarting`), and the restart is queued as an ended agent's
+    /// is, under the same id. Should the reducer refuse (it can't: only
+    /// `Restarting` keeps a restart), the exit is stepped instead.
+    pub(super) fn restart_after_login(
+        &mut self,
+        id: SessionId,
+        code: Option<i32>,
+        client: Token,
+        pending: LoginRestart,
+    ) {
+        match self.agent_step(id, Input::Restart) {
+            Some(Ok(())) => {}
+            Some(Err(refused)) => {
+                log!("session {id}: its restart after a login was refused ({refused})");
+                self.agent_exited(id, code);
+                return self.ended(id, code);
+            }
+            // The step panicked: its handling failed, and the exit ends it.
+            None => {
+                self.agent_exited(id, code);
+                return self.ended(id, code);
+            }
+        }
+        let LoginRestart { restart, cwd } = pending;
+        log!(
+            "session {id}: its agent starts again after its login ({:?})",
+            restart.command
+        );
+        let command = (restart.command.clone(), restart.args.clone());
+        let spawn = SpawnRequest::Restart { restart, cwd };
+        self.start_again(id, &command.0, &command.1, spawn.clone());
         self.waiting.push(WaitingSpawn { client, id, spawn });
         self.place_waiting();
     }

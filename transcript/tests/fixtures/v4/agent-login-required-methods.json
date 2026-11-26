@@ -1,0 +1,1 @@
+{"event":"agent","state":{"agent":"login_required","message":"Authentication required","methods":[{"id":"oauth-personal","kind":"agent","name":"Log in with Google"},{"description":"Use an API key","id":"api-key","kind":"agent","name":"API Key"}]}}

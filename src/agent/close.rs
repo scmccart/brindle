@@ -52,7 +52,8 @@ pub enum Closing {
     /// A terminal zone: never asks.
     Terminal(ZoneId),
     /// An agent zone, with its title (the agent's name, else its
-    /// profile's) and whether it is busy ([`AgentBusy::of`]).
+    /// profile's) and whether it is busy (its model's `close_busy`:
+    /// [`AgentBusy::of`] its status, none while it logs in).
     Agent { zone: ZoneId, name: String, busy: Option<AgentBusy> },
 }
 

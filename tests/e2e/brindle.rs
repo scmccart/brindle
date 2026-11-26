@@ -825,7 +825,8 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 8] = ["agent ", "note ", "entry ", "block ", "link ", "queued ", "conversation ", "prompt "];
+const AGENT_LINES: [&str; 9] =
+    ["agent ", "login ", "note ", "entry ", "block ", "link ", "queued ", "conversation ", "prompt "];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -1042,6 +1043,12 @@ impl Dump {
     pub fn agent_field(&self, key: &str) -> Option<&str> {
         let line = self.agent.iter().find_map(|line| line.strip_prefix("agent "))?;
         line.split(' ').find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// The agent zone's login row (`--- login choice …` or `--- login
+    /// running …`), each line without `login `.
+    pub fn agent_logins(&self) -> Vec<&str> {
+        self.agent.iter().filter_map(|line| line.strip_prefix("login ")).collect()
     }
 
     /// The agent zone's entries (`--- entry N KIND …`), each as `KIND …`
@@ -1318,6 +1325,25 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.link.is_none(), "an agent's link isn't the terminal's hovered one: {:?}", dump.link);
     ensure!(dump.agent_field("state") == Some("ready") && dump.agent_field("session") == Some("open"), "{:?}", dump.agent);
     ensure!(dump.agent_field("zone") == Some("1") && dump.agent_field("missing").is_none(), "{:?}", dump.agent);
+    // The login row, after the agent line.
+    let login = Dump::parse(
+        "--- tab 1 \"Fake Agent\" (active)\n\
+         --- agent zone=1 state=login-required turn=idle activity=error status=error link=up session=open\n\
+         --- login choice method=\"google\" kind=agent \"Log in with Google\"\n\
+         --- login choice method=\"cli\" kind=terminal \"CLI\" args=\"login\" env=\"\" dropped=\"PATH\"\n\
+         --- conversation entries=0 at=end\n--- prompt status=disabled first=\"hi\"\n--- focus other modality=keyboard\n",
+    );
+    ensure!(
+        login.agent_logins()
+            == [
+                "choice method=\"google\" kind=agent \"Log in with Google\"",
+                "choice method=\"cli\" kind=terminal \"CLI\" args=\"login\" env=\"\" dropped=\"PATH\""
+            ],
+        "logins {:?}",
+        login.agent
+    );
+    ensure!(login.agent.len() == 5, "agent lines with a login row {:?}", login.agent);
+    ensure!(dump.agent_logins().is_empty(), "no login row {:?}", dump.agent);
     ensure!(dump.agent_field("continue") == Some("none:not-ended"), "{:?}", dump.agent);
     ensure!(dump.agent_entries() == ["user \"hi there\"", "agent \"Hello!\""], "entries {:?}", dump.agent_entries());
     ensure!(dump.size.is_none() && dump.screen.is_empty(), "no screen {:?}", dump.screen);

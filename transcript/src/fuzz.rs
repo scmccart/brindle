@@ -158,16 +158,39 @@ fn turn(rng: &mut XorShift) -> TurnState {
     }
 }
 
+fn login_method(rng: &mut XorShift) -> LoginMethod {
+    LoginMethod {
+        id: text(rng),
+        name: text(rng),
+        description: rng.chance(2).then(|| text(rng)),
+        kind: if rng.chance(2) {
+            LoginKind::Agent
+        } else {
+            LoginKind::Terminal {
+                args: (0..rng.below(3)).map(|_| text(rng)).collect(),
+                env: (0..rng.below(3)).map(|_| (text(rng), text(rng))).collect(),
+            }
+        },
+    }
+}
+
 fn agent(rng: &mut XorShift) -> AgentState {
-    match rng.below(6) {
+    match rng.below(7) {
         0 => AgentState::Starting,
         1 => AgentState::Ready {
             name: rng.chance(2).then(|| text(rng)),
             version: rng.chance(2).then(|| text(rng)),
         },
-        2 => AgentState::LoginRequired { message: text(rng) },
+        2 => AgentState::LoginRequired {
+            message: text(rng),
+            methods: (0..rng.below(4)).map(|_| login_method(rng)).collect(),
+        },
         3 => AgentState::Failed { message: text(rng) },
         4 => AgentState::Lost { message: text(rng) },
+        5 => AgentState::LoggingIn {
+            method: text(rng),
+            name: text(rng),
+        },
         _ => AgentState::Exited {
             code: rng.chance(2).then(|| rng.next() as i32),
             stderr: text(rng),
@@ -368,6 +391,15 @@ const WORDS: &[&str] = &[
     "pending",
     "info",
     "allow_once",
+    "login_required",
+    "logging_in",
+    "methods",
+    "method",
+    "kind",
+    "terminal",
+    "args",
+    "env",
+    "description",
 ];
 
 fn random_json(rng: &mut XorShift, depth: usize) -> Value {

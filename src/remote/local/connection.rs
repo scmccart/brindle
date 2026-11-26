@@ -2295,7 +2295,8 @@ impl Connection {
             | ToCore::AgentPermission(AgentPermission { req, .. })
             | ToCore::AgentUnqueue(AgentRequest { req, .. })
             | ToCore::AgentResend(AgentRequest { req, .. })
-            | ToCore::AgentRestart(AgentRestart { req, .. }) => Some(*req),
+            | ToCore::AgentRestart(AgentRestart { req, .. })
+            | ToCore::AgentLogin(client::AgentLogin { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2617,6 +2618,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
         | ToCore::AgentRestart(_)
+        | ToCore::AgentLogin(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -2906,6 +2908,14 @@ impl Running {
         let session = self.id;
         let AgentRestartRequest { command, args, env } = request;
         self.agent_request(|req| ToCore::AgentRestart(AgentRestart { req, session, command, args, env }))
+    }
+
+    /// Logs the agent in with its login method `method` (`AGENT_LOGIN`):
+    /// `OK` once the agent was asked, then the login's states as
+    /// transcript events. `AGENT_CANCEL` cancels it ([`Running::cancel`]).
+    pub fn login(&self, method: &str) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentLogin(client::AgentLogin { req, session, method: method.to_string() }))
     }
 
     /// Answers the permission request in entry `entry` with `option`, or

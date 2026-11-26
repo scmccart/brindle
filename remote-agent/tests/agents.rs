@@ -19,13 +19,14 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
 use brindle_remote_protocol::serde_json::{self, Value, json};
 use brindle_transcript::{
-    AgentState, Entry, EntryId, HoldReason, PermissionOutcome, Slot, StopReason, ToolKind,
-    ToolStatus, TurnState,
+    AgentState, Entry, EntryId, HoldReason, LoginKind, LoginMethod, PermissionOutcome, Slot,
+    StopReason, ToolKind, ToolStatus, TurnState,
 };
 
 use support::fake_agent::{
-    AgentScript, Gate, LOAD_ONLY, NEITHER, RESUME_AND_LOAD, RESUME_ONLY, ask, continuable,
-    initialized, methods, prompts, recorded, responses, said, started, stop, update, user_said,
+    AgentScript, Gate, LOAD_ONLY, NEITHER, RESUME_AND_LOAD, RESUME_ONLY, TERMINAL_LOGIN, TWO_LOGINS,
+    ask, continuable, initialized, methods, offering_logins, prompts, recorded, responses, said,
+    started, stop, update, user_said,
 };
 use support::*;
 
@@ -54,8 +55,16 @@ fn lines(reader: impl Read + Send + 'static) -> Receiver<String> {
 
 impl Agent {
     fn start(script: &Path) -> Self {
+        Self::start_with(script, &[], &[])
+    }
+
+    /// Started with `args` after the script and `env` added to its
+    /// environment.
+    fn start_with(script: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(FAKE_AGENT)
             .arg(script)
+            .args(args)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -219,6 +228,54 @@ fn fake_agent_refuses_a_bad_script_naming_its_line() {
     assert_eq!(
         agent.err(),
         format!("brindle-fake-acp-agent: {}: line 2: \"sleep\" isn't a step", path.display())
+    );
+}
+
+/// OpenSpec change `agents-login`, tasks 4.1 and 4.2: the arguments after
+/// the script choose its `args` section, `record-env` writes the agent's
+/// environment, and `respond-to` answers a request by its id.
+#[test]
+fn fake_agent_plays_the_section_its_arguments_name() {
+    let dir = TempDir::new("fake-agent-args");
+    let env_file = dir.path.join("env.txt");
+    let mut script = AgentScript::new(&dir.path, "args");
+    script
+        .step("exit 5")
+        .step("args login --device")
+        .step(format!("record-env {}", env_file.display()))
+        .step(r#"respond-to 3 {"loggedIn":true}"#)
+        .step(r#"respond-error-to "a" -32000 "not yet""#)
+        .step("exit 0");
+    let path = script.write();
+
+    let mut login = Agent::start_with(&path, &["login", "--device"], &[("LOGIN_MODE", "device")]);
+    assert_eq!(parsed(&login.out()), json!({"jsonrpc": "2.0", "id": 3, "result": {"loggedIn": true}}));
+    assert_eq!(
+        parsed(&login.out()),
+        json!({"jsonrpc": "2.0", "id": "a", "error": {"code": -32000, "message": "not yet"}})
+    );
+    assert_eq!(login.status(), Some(0));
+    let text = std::fs::read_to_string(&env_file).expect("the recorded environment");
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines.contains(&"LOGIN_MODE=device"), "{text}");
+    // Sorted by name, not by whole line: `=` sorts after `(`, so
+    // `ProgramFiles=…` comes before `ProgramFiles(x86)=…` on Windows.
+    let names: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split_once('=').map_or(*line, |(name, _)| name))
+        .collect();
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_eq!(names, sorted);
+
+    // With no arguments, the steps before the first section.
+    assert_eq!(Agent::start(&path).status(), Some(5));
+    // Arguments no section is for are a usage error.
+    let mut other = Agent::start_with(&path, &["logout"], &[]);
+    assert_eq!(other.status(), Some(2));
+    assert_eq!(
+        other.err(),
+        format!("brindle-fake-acp-agent: {} has no args section for \"logout\"", path.display())
     );
 }
 
@@ -1489,21 +1546,72 @@ fn an_agent_exit_is_reported_with_its_status_and_stderr() {
     }
 }
 
+// OpenSpec change `agents-login`, task 5.1: logging the agent in through
+// the core.
+
+/// [`TWO_LOGINS`] as the transcript carries them.
+fn two_logins() -> Vec<LoginMethod> {
+    vec![
+        LoginMethod { id: "oauth-personal".into(), name: "Log in with Google".into(), description: None, kind: LoginKind::Agent },
+        LoginMethod {
+            id: "api-key".into(),
+            name: "API Key".into(),
+            description: Some("Use an API key".into()),
+            kind: LoginKind::Agent,
+        },
+    ]
+}
+
+/// The agent needs a login with `message`, offering [`TWO_LOGINS`].
+fn needs_login(message: &str) -> AgentState {
+    AgentState::LoginRequired { message: message.into(), methods: two_logins() }
+}
+
+fn logging_in(method: &str, name: &str) -> AgentState {
+    AgentState::LoggingIn { method: method.into(), name: name.into() }
+}
+
+/// The agent states from the first that needs a login on.
+fn from_login(events: &[Event]) -> Vec<AgentState> {
+    agent_states(events)
+        .into_iter()
+        .skip_while(|state| !matches!(state, AgentState::LoginRequired { .. }))
+        .collect()
+}
+
+/// The `idx`th recorded message with `method`.
+fn sent(record: &Path, method: &str, idx: usize) -> Value {
+    recorded(record)
+        .into_iter()
+        .filter(|value| value["method"] == method)
+        .nth(idx)
+        .unwrap_or_else(|| panic!("no {method} #{idx} in {:?}", methods(record)))
+}
+
+/// A script whose agent offers [`TWO_LOGINS`] and answers `session/new`
+/// with `-32000` "log in first"; the test adds the rest.
+fn login_at_start(dir: &TempDir, name: &str) -> (AgentScript, PathBuf) {
+    let (mut script, record) = offering_logins(&dir.path, name, NEITHER, TWO_LOGINS);
+    script.step("expect session/new").step(r#"respond-error -32000 "log in first""#);
+    (script, record)
+}
+
+/// Starts `script` and waits until its agent needs a login with `message`.
+fn needing_login(client: &mut TestClient, dir: &mut TempDir, script: &Path, message: &str) -> (SessionId, u32) {
+    let (id, pid) = spawned(client, dir, client_agent(script));
+    let wanted = needs_login(message);
+    client.transcript_until(id, "needs a login", |log| *log.agent() == wanted);
+    (id, pid)
+}
+
 #[test]
 fn login_required_by_session_new_refuses_prompts() {
     let (mut dir, mut client) = agent_core("agent-login-new", &[]);
-    let mut script = AgentScript::new(&dir.path, "login-new");
-    script
-        .step("expect initialize")
-        .step(r#"respond {"protocolVersion":1,"agentInfo":{"name":"fake","version":"1.0"}}"#)
-        .step("expect session/new")
-        .step(r#"respond-error -32000 "run agent login""#);
-    let (id, pid) = spawned(&mut client, &mut dir, client_agent(&script.write()));
-    let needs_login = AgentState::LoginRequired { message: "run agent login".into() };
-    client.transcript_until(id, "needs a login", |log| *log.agent() == needs_login);
+    let (script, _) = login_at_start(&dir, "login-new");
+    let (id, pid) = needing_login(&mut client, &mut dir, &script.write(), "log in first");
 
     let refusal = client.prompt(id, "hi").unwrap_err();
-    assert_eq!(refusal.message, format!("session {id}: the agent needs a login through its own command line"));
+    assert_eq!(refusal.message, format!("session {id}: the agent needs a login"));
     assert_eq!(activity_of(&mut client, id), Some(AgentActivity::Error));
     assert!(alive(pid), "the session stays running");
 }
@@ -1511,24 +1619,224 @@ fn login_required_by_session_new_refuses_prompts() {
 #[test]
 fn login_demanded_by_a_prompt_holds_the_waiting_one() {
     let (mut dir, mut client) = agent_core("agent-login-prompt", &[]);
-    let ending = [r#"respond-error -32000 "session expired""#.to_owned()];
-    let (script, record, gate) = gated_turn(&dir, "login-prompt", &ending, 0);
-    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    let (mut script, record) = offering_logins(&dir.path, "login-prompt", NEITHER, TWO_LOGINS);
+    script.step("expect session/new").step(r#"respond {"sessionId":"s1"}"#).step("expect session/prompt");
+    let gate = script.gate();
+    script.step(r#"respond-error -32000 "session expired""#);
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
     client.transcript_until(id, "is ready", ready);
     client.prompt(id, "one").unwrap();
     client.prompt(id, "two").unwrap();
     gate.open();
 
-    let needs_login = AgentState::LoginRequired { message: "session expired".into() };
-    let log = client.transcript_until(id, "needs a login", |log| *log.agent() == needs_login);
+    let wanted = needs_login("session expired");
+    let log = client.transcript_until(id, "needs a login", |log| *log.agent() == wanted);
     assert!(matches!(log.turn(), TurnState::Failed { .. }), "{:?}", log.turn());
     assert_eq!(*log.slot(), held("two", HoldReason::LoginRequired));
     assert_in_order(&client.events(id), &["queue held two LoginRequired", "turn Failed", "state LoginRequired"]);
     let refusal = client.resend(id).unwrap_err();
-    assert_eq!(refusal.message, format!("session {id}: the agent needs a login through its own command line"));
+    assert_eq!(refusal.message, format!("session {id}: the agent needs a login"));
     assert_eq!(activity_of(&mut client, id), Some(AgentActivity::Error));
     client.unqueue(id).unwrap();
     assert_eq!(prompts(&record), ["one"]);
+}
+
+#[test]
+fn a_login_at_the_start_sends_authenticate_then_session_new_and_takes_prompts() {
+    let (mut dir, mut client) = agent_core("agent-login-start", &[]);
+    let (mut script, record) = login_at_start(&dir, "login-start");
+    script.step("expect authenticate");
+    let gate = script.gate();
+    script
+        .step("respond {}")
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(said("logged in"))
+        .step(stop("end_turn"));
+    let (id, _) = needing_login(&mut client, &mut dir, &script.write(), "log in first");
+
+    client.login(id, "oauth-personal").unwrap();
+    let wanted = logging_in("oauth-personal", "Log in with Google");
+    client.transcript_until(id, "is logging in", |log| *log.agent() == wanted);
+    assert_eq!(activity_of(&mut client, id), Some(AgentActivity::Working));
+    let refusal = client.prompt(id, "too soon").unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent is logging in"));
+    let refusal = client.login(id, "api-key").unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: a login is already running"));
+    gate.open();
+
+    client.transcript_until(id, "is ready", ready);
+    assert_eq!(
+        from_login(&client.events(id)),
+        [
+            needs_login("log in first"),
+            logging_in("oauth-personal", "Log in with Google"),
+            AgentState::Starting,
+            AgentState::Ready { name: Some("fake".into()), version: Some("1.0".into()) },
+        ]
+    );
+    assert_in_order(&client.events(id), &["state LoggingIn", "state Starting", "conversation s1", "state Ready"]);
+    assert_eq!(methods(&record), ["initialize", "session/new", "authenticate", "session/new"]);
+    let authenticate = sent(&record, "authenticate", 0);
+    assert_eq!((authenticate["id"].clone(), authenticate["params"].clone()), (json!(3), json!({"methodId": "oauth-personal"})));
+    assert_eq!(sent(&record, "session/new", 1)["id"], json!(4));
+
+    client.prompt(id, "hi").unwrap();
+    let log = client.transcript_until(id, "has the turn's end", ended(1));
+    assert_eq!(says(&log), ["user: hi", "agent: logged in"]);
+}
+
+#[test]
+fn a_failed_login_offers_the_methods_again() {
+    let (mut dir, mut client) = agent_core("agent-login-failed", &[]);
+    let (mut script, record) = login_at_start(&dir, "login-failed");
+    script
+        .step("expect authenticate")
+        .step(r#"respond-error -32603 "browser login timed out""#)
+        .step("expect authenticate")
+        .step("respond {}")
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#);
+    let (id, _) = needing_login(&mut client, &mut dir, &script.write(), "log in first");
+
+    client.login(id, "api-key").unwrap();
+    let wanted = needs_login("browser login timed out");
+    client.transcript_until(id, "needs a login again", |log| *log.agent() == wanted);
+    assert_eq!(activity_of(&mut client, id), Some(AgentActivity::Error));
+
+    client.login(id, "oauth-personal").unwrap();
+    client.transcript_until(id, "is ready", ready);
+    assert_eq!(
+        from_login(&client.events(id)),
+        [
+            needs_login("log in first"),
+            logging_in("api-key", "API Key"),
+            needs_login("browser login timed out"),
+            logging_in("oauth-personal", "Log in with Google"),
+            AgentState::Starting,
+            AgentState::Ready { name: Some("fake".into()), version: Some("1.0".into()) },
+        ]
+    );
+    let chosen: Vec<Value> = (0..2).map(|n| sent(&record, "authenticate", n)["params"]["methodId"].clone()).collect();
+    assert_eq!(chosen, [json!("api-key"), json!("oauth-personal")]);
+}
+
+#[test]
+fn a_cancelled_login_sends_cancel_request_and_ignores_the_late_answer() {
+    let (mut dir, mut client) = agent_core("agent-login-cancel", &[]);
+    let (mut script, record) = login_at_start(&dir, "login-cancel");
+    // The late answer to the cancelled `authenticate` (id 3), then a
+    // request of the agent's own: its answer, recorded, says the core has
+    // read the late one.
+    let ping = json!({"jsonrpc": "2.0", "id": "ping", "method": "_vendor/ping", "params": {}});
+    script
+        .step("expect authenticate")
+        .step("expect $/cancel_request")
+        .step("respond-to 3 {}")
+        .step(format!("send {ping}"))
+        .step(r#"expect-response "ping""#)
+        .step("expect authenticate")
+        .step("respond {}")
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#);
+    let (id, _) = needing_login(&mut client, &mut dir, &script.write(), "log in first");
+
+    client.login(id, "oauth-personal").unwrap();
+    let wanted = logging_in("oauth-personal", "Log in with Google");
+    client.transcript_until(id, "is logging in", |log| *log.agent() == wanted);
+    client.cancel(id);
+    let wanted = needs_login("log in first");
+    client.transcript_until(id, "needs a login again", |log| *log.agent() == wanted);
+
+    // The agent was told which request was cancelled, and its late `{}`
+    // started nothing.
+    answered(&record, 1);
+    assert_eq!(methods(&record), ["initialize", "session/new", "authenticate", "$/cancel_request"]);
+    let authenticate = sent(&record, "authenticate", 0)["id"].clone();
+    assert_eq!(sent(&record, "$/cancel_request", 0)["params"], json!({"requestId": authenticate}));
+    assert!(sent(&record, "$/cancel_request", 0).get("id").is_none(), "a notification");
+    assert_eq!(*client.transcript(id).agent(), needs_login("log in first"));
+
+    // Choosing again is taken.
+    client.login(id, "api-key").unwrap();
+    client.transcript_until(id, "is ready", ready);
+    assert_eq!(
+        from_login(&client.events(id)),
+        [
+            needs_login("log in first"),
+            logging_in("oauth-personal", "Log in with Google"),
+            needs_login("log in first"),
+            logging_in("api-key", "API Key"),
+            AgentState::Starting,
+            AgentState::Ready { name: Some("fake".into()), version: Some("1.0".into()) },
+        ]
+    );
+    assert_eq!(
+        methods(&record),
+        ["initialize", "session/new", "authenticate", "$/cancel_request", "authenticate", "session/new"]
+    );
+}
+
+#[test]
+fn a_login_after_a_prompts_demand_carries_on_and_the_held_prompt_goes_by_a_resend() {
+    let (mut dir, mut client) = agent_core("agent-login-resend", &[]);
+    let (mut script, record) = offering_logins(&dir.path, "login-resend", NEITHER, TWO_LOGINS);
+    script.step("expect session/new").step(r#"respond {"sessionId":"s1"}"#).step("expect session/prompt");
+    let gate = script.gate();
+    script
+        .step(r#"respond-error -32000 "session expired""#)
+        .step("expect authenticate")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("sent again"))
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.prompt(id, "two").unwrap();
+    gate.open();
+    let wanted = needs_login("session expired");
+    client.transcript_until(id, "needs a login", |log| *log.agent() == wanted);
+
+    client.login(id, "oauth-personal").unwrap();
+    let log = client.transcript_until(id, "is ready again", ready);
+    assert_in_order(&client.events(id), &["state LoginRequired", "state LoggingIn", "state Starting", "state Ready"]);
+    // Neither prompt went again on its own, and no new session was made.
+    assert_eq!(*log.slot(), held("two", HoldReason::LoginRequired));
+    assert!(matches!(log.turn(), TurnState::Failed { .. }), "{:?}", log.turn());
+    assert_eq!(methods(&record), ["initialize", "session/new", "session/prompt", "authenticate"]);
+
+    client.resend(id).unwrap();
+    let log = client.transcript_until(id, "has the resent prompt's turn", |log| {
+        says(log).contains(&"agent: sent again".to_owned()) && *log.turn() == end(StopReason::EndTurn)
+    });
+    assert_eq!(*log.slot(), Slot::Empty);
+    prompted(&record, &["one", "two"]);
+    assert_eq!(sent(&record, "session/prompt", 1)["params"]["sessionId"], json!("s1"));
+}
+
+#[test]
+fn a_login_for_an_unknown_method_or_while_ready_is_refused() {
+    let (mut dir, mut client) = agent_core("agent-login-refused", &[]);
+    let (mut script, record) = login_at_start(&dir, "login-refused");
+    script.step("expect authenticate").step("respond {}").step("expect session/new").step(r#"respond {"sessionId":"s1"}"#);
+    let (id, _) = needing_login(&mut client, &mut dir, &script.write(), "log in first");
+
+    let refusal = client.login(id, "no-such-method").unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent offers no login method \"no-such-method\""));
+    assert_eq!(*client.transcript(id).agent(), needs_login("log in first"));
+
+    // The one login that went out is the next one's.
+    client.login(id, "api-key").unwrap();
+    client.transcript_until(id, "is ready", ready);
+    assert_eq!(methods(&record), ["initialize", "session/new", "authenticate", "session/new"]);
+    assert_eq!(sent(&record, "authenticate", 0)["params"]["methodId"], json!("api-key"));
+
+    let refusal = client.login(id, "api-key").unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent isn't waiting for a login"));
+    let terminal = client.list().into_iter().find(|info| info.session == id).expect("listed");
+    assert_eq!(terminal.agent.map(|agent| agent.activity), Some(AgentActivity::Idle));
 }
 
 #[test]
@@ -1848,6 +2156,43 @@ fn a_truncated_tail_fails_the_turn_and_holds_the_waiting_prompt() {
     });
     assert_eq!(*log.slot(), held("two", HoldReason::OutputLost));
     assert_eq!(prompts(&record), ["one", "three"]);
+}
+
+/// OpenSpec change `agents-login`, task 5.2: the core is killed while the
+/// agent logs in, and the agent answers `authenticate` only once the next
+/// core has adopted it; that core carries the login on.
+#[test]
+fn a_login_running_when_the_core_is_killed_is_carried_on_by_the_next_core() {
+    let token = "token-agent-killed-logging-in";
+    let (mut dir, mut client) = agent_core("agent-killed-logging-in", &[]);
+    let (mut script, record) = login_at_start(&dir, "killed-logging-in");
+    script.step("expect authenticate");
+    let gate = script.gate();
+    script.step("respond {}").step("expect session/new").step(r#"respond {"sessionId":"s1"}"#);
+    let (id, pid) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "needs a login", |log| *log.agent() == needs_login("log in first"));
+    client.login(id, "oauth-personal").unwrap();
+    // The agent has the request, so the holder has the checkpoint the core
+    // queued before it.
+    until("the agent gets authenticate", TIMEOUT, || methods(&record).contains(&"authenticate".to_owned()).then_some(()));
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (id, pid));
+    assert_eq!(*client.transcript(id).agent(), logging_in("oauth-personal", "Log in with Google"));
+    gate.open();
+    client.transcript_until(id, "is ready", ready);
+    // The replay's state, then the login's answer carried on.
+    assert_eq!(
+        agent_states(&client.events(id)),
+        [
+            logging_in("oauth-personal", "Log in with Google"),
+            AgentState::Starting,
+            AgentState::Ready { name: Some("fake".into()), version: Some("1.0".into()) },
+        ]
+    );
+    assert_eq!(methods(&record), ["initialize", "session/new", "authenticate", "session/new"]);
+    assert_eq!(sent(&record, "session/new", 1)["id"], json!(4), "the request ids go on");
 }
 
 // OpenSpec change `agents-session-recovery`, task 3.4: an agent that ended
@@ -2187,4 +2532,175 @@ fn an_unrunnable_restart_returns_the_session_to_ended_for_another_try() {
     client.restart(id, &again.write()).unwrap();
     ready_again(&mut client, &mut dir, id);
     assert_eq!(methods(&record), ["initialize", "session/resume"]);
+}
+
+// OpenSpec change `agents-login`, task 5.3: terminal login methods, and a
+// restart while the agent needs a login (decision 8).
+
+/// The notice a restart while a login is needed adds.
+const RESTARTED_AFTER_LOGIN: &str = "the agent is started again after its login";
+
+fn needs_any_login(log: &Transcript) -> bool {
+    matches!(log.agent(), AgentState::LoginRequired { .. })
+}
+
+/// The `EXIT`s already sent for session `id`.
+fn exits_of(client: &mut TestClient, id: SessionId) -> Vec<ToClient> {
+    already_sent(client)
+        .into_iter()
+        .filter(|message| matches!(message, ToClient::Exit(exit) if exit.session == id))
+        .collect()
+}
+
+#[test]
+fn initialize_advertises_terminal_logins_and_a_terminal_method_is_the_clients_to_run() {
+    let (mut dir, mut client) = agent_core("agent-login-terminal", &[]);
+    let (mut script, record) = offering_logins(&dir.path, "login-terminal", NEITHER, TERMINAL_LOGIN);
+    script.step("expect session/new").step(r#"respond-error -32000 "log in first""#);
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    let log = client.transcript_until(id, "needs a login", needs_any_login);
+
+    // `auth.terminal`, and no `fs` or `terminal` capability.
+    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], json!({"auth": {"terminal": true}}));
+    let terminal = LoginMethod {
+        id: "cli-login".into(),
+        name: "Log in from the terminal".into(),
+        description: None,
+        kind: LoginKind::Terminal {
+            args: vec!["login".into()],
+            env: [("LOGIN_MODE".to_owned(), "device".to_owned())].into(),
+        },
+    };
+    let AgentState::LoginRequired { methods: offered, .. } = log.agent() else {
+        panic!("{:?}", log.agent());
+    };
+    assert_eq!(offered.iter().map(|method| method.id.as_str()).collect::<Vec<_>>(), ["oauth-personal", "cli-login"]);
+    assert_eq!(offered[1], terminal);
+
+    let refusal = client.login(id, "cli-login").unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: login method \"cli-login\" runs in a terminal, which Brindle opens"));
+    assert!(needs_any_login(&client.transcript(id)));
+    assert_eq!(methods(&record), ["initialize", "session/new"]);
+}
+
+#[test]
+fn a_restart_while_a_login_is_needed_at_the_start_runs_a_new_agent_with_session_new() {
+    let (mut dir, mut client) = agent_core("agent-login-restart-new", &[]);
+    let (mut script, first) = offering_logins(&dir.path, "restart-new", NEITHER, TERMINAL_LOGIN);
+    script.step("expect session/new").step(r#"respond-error -32000 "log in first""#);
+    let (id, old) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "needs a login", needs_any_login);
+
+    let (mut again, record) = offering_logins(&dir.path, "restart-new-again", NEITHER, TERMINAL_LOGIN);
+    again
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(said("logged in"))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    let info = listed(&mut client, id).expect("listed");
+    assert_ne!(info.pid, old, "a new agent process");
+    assert!(info.command.contains("restart-new-again.script"), "{}", info.command);
+    assert!(gone(old), "the old agent was hung up");
+
+    // No exit in the log, and no `EXIT`: the session went on.
+    let events = client.events(id);
+    assert_in_order(&events, &[
+        "state LoginRequired",
+        &format!("notice {RESTARTED_AFTER_LOGIN}"),
+        "state Starting",
+        "conversation s1",
+        "state Ready",
+    ]);
+    let states = agent_states(&events);
+    assert!(!states.iter().any(|state| matches!(state, AgentState::Exited { .. })), "{states:?}");
+    assert!(exits_of(&mut client, id).is_empty());
+    // The new agent was sent `initialize` with `auth.terminal`, then
+    // `session/new`; the old one nothing more.
+    assert_eq!(methods(&first), ["initialize", "session/new"]);
+    assert_eq!(methods(&record), ["initialize", "session/new"]);
+    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], json!({"auth": {"terminal": true}}));
+
+    client.prompt(id, "hi").unwrap();
+    let log = client.transcript_until(id, "has the turn's end", ended(1));
+    assert_eq!(says(&log), ["user: hi", "agent: logged in"]);
+}
+
+#[test]
+fn a_restart_after_a_prompts_login_demand_takes_up_the_same_session_keeping_the_log() {
+    let (mut dir, mut client) = agent_core("agent-login-restart-resume", &[]);
+    let (mut script, first) = offering_logins(&dir.path, "restart-resume", RESUME_AND_LOAD, TERMINAL_LOGIN);
+    script
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(said("first"))
+        .step(stop("end_turn"))
+        .step("expect session/prompt");
+    let gate = script.gate();
+    script.step(r#"respond-error -32000 "session expired""#);
+    let (id, old) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", ended(1));
+    client.prompt(id, "two").unwrap();
+    client.prompt(id, "three").unwrap();
+    gate.open();
+    let before = client.transcript_until(id, "needs a login", needs_any_login);
+    assert_eq!(*before.slot(), held("three", HoldReason::LoginRequired));
+
+    let (mut again, record) = initialized(&dir.path, "restart-resume-again", RESUME_ONLY);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("third"))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    assert!(gone(old), "the old agent was hung up");
+    assert!(exits_of(&mut client, id).is_empty());
+
+    // The same ACP session is taken up, and the log and the held prompt
+    // are kept.
+    assert_eq!(methods(&record), ["initialize", "session/resume"]);
+    assert_eq!(sent(&record, "session/resume", 0)["params"]["sessionId"], json!("s1"));
+    assert_eq!(says(&log), says(&before));
+    assert_eq!(*log.slot(), held("three", HoldReason::LoginRequired));
+    assert_in_order(&client.events(id), &[
+        "state LoginRequired",
+        &format!("notice {RESTARTED_AFTER_LOGIN}"),
+        "state Starting",
+        "conversation s1",
+        "state Ready",
+    ]);
+
+    client.resend(id).unwrap();
+    client.transcript_until(id, "has the resent prompt's turn", |log| says(log).contains(&"agent: third".to_owned()));
+    prompted(&record, &["three"]);
+    assert_eq!(prompts(&first), ["one", "two"]);
+}
+
+#[test]
+fn a_close_before_the_old_agent_exits_drops_the_restart() {
+    let (mut dir, mut client) = agent_core("agent-login-restart-closed", &[]);
+    let (mut script, _) = offering_logins(&dir.path, "restart-closed", NEITHER, TERMINAL_LOGIN);
+    script.step("expect session/new").step(r#"respond-error -32000 "log in first""#);
+    // Past the demand it waits here, reading nothing: the hang-up doesn't
+    // end it until the gate opens.
+    let gate = script.gate();
+    let (id, old) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "needs a login", needs_any_login);
+
+    let (again, record) = offering_logins(&dir.path, "restart-closed-again", NEITHER, TERMINAL_LOGIN);
+    client.restart(id, &again.write()).unwrap();
+    client.send(client::ToCore::Close(client::SessionRef { session: id }));
+    gate.open();
+    exit_of(&mut client, id);
+    assert!(gone(old));
+    assert!(listed(&mut client, id).is_none());
+    assert!(!record.exists(), "no new agent was started");
+    assert!(matches!(agent_states(&client.events(id)).last(), Some(AgentState::Exited { .. })));
 }

@@ -14,8 +14,10 @@
 //!   from [`Transcript::replay`] equals the log it came from.
 //! - **Forms are frozen per client protocol version** (`process R5`): the
 //!   event kinds and the values of every closed enum inside an event are
-//!   protocol 4's, pinned by `tests/fixtures/v4/`. Within protocol 4 an
-//!   event may only gain optional fields, defaulted and omitted when unset;
+//!   protocol 4's, pinned by `tests/fixtures/v4/`. Protocol 4's forms
+//!   freeze with the release that first ships it; until then the `agents-*`
+//!   changes amend them in place. Once shipped, an event may only gain
+//!   optional fields, defaulted and omitted when unset;
 //!   [`Event::from_value`] ignores fields it doesn't know, and an unknown
 //!   kind or value is a [`DecodeError`].
 //!
@@ -30,7 +32,7 @@
 #![cfg_attr(not(test), warn(clippy::wildcard_enum_match_arm))]
 #![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -258,8 +260,18 @@ pub enum AgentState {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
     },
-    /// The agent needs a login through its own command line.
-    LoginRequired { message: String },
+    /// The agent needs a login: its message, and the login methods it
+    /// advertised in `initialize`, in its order (none encodes as before
+    /// methods existed).
+    LoginRequired {
+        message: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        methods: Vec<LoginMethod>,
+    },
+    /// A login the server runs for a client (ACP's `authenticate`) is out:
+    /// the method's id and name, so a client attaching mid-login can say
+    /// what runs.
+    LoggingIn { method: String, name: String },
     /// The agent can't be used: it speaks another ACP version, or handling
     /// its messages failed.
     Failed { message: String },
@@ -274,6 +286,39 @@ pub enum AgentState {
     /// The agent was lost with the holder that ran it, so neither its exit
     /// status nor its standard error is known; `message` says so.
     Lost { message: String },
+}
+
+/// A login method an agent advertised (OpenSpec change `agents-login`,
+/// design decision 2). On the wire it is `{id, name, description?, kind,
+/// args?, env?}`; only a [`LoginKind::Terminal`] method has `args` and `env`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoginMethod {
+    /// The agent's id for it, which a login names.
+    pub id: String,
+    /// What the user is shown.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(flatten)]
+    pub kind: LoginKind,
+}
+
+/// How a login method runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LoginKind {
+    /// The agent logs in itself when asked (ACP's `authenticate`), which
+    /// the server sends on a client's request.
+    Agent,
+    /// The client runs the agent's own program with `args` appended and
+    /// `env` laid over its environment, and restarts the agent once it
+    /// exits with status 0.
+    Terminal {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        env: BTreeMap<String, String>,
+    },
 }
 
 /// The agent's ACP session (its conversation), once the agent gave one:
@@ -770,7 +815,7 @@ impl Transcript {
     /// slot doesn't change it.
     pub fn activity(&self) -> Activity {
         match &self.agent {
-            AgentState::Starting => Activity::Working,
+            AgentState::Starting | AgentState::LoggingIn { .. } => Activity::Working,
             AgentState::LoginRequired { .. }
             | AgentState::Failed { .. }
             | AgentState::Exited { .. }
@@ -1465,9 +1510,34 @@ mod tests {
             (
                 AgentState::LoginRequired {
                     message: "log in".into(),
+                    methods: Vec::new(),
                 },
                 failed(),
                 Activity::Error,
+            ),
+            (
+                AgentState::LoginRequired {
+                    message: "log in".into(),
+                    methods: vec![agent_method("chat-gpt", "ChatGPT")],
+                },
+                TurnState::Idle,
+                Activity::Error,
+            ),
+            (
+                AgentState::LoggingIn {
+                    method: "chat-gpt".into(),
+                    name: "ChatGPT".into(),
+                },
+                TurnState::Idle,
+                Activity::Working,
+            ),
+            (
+                AgentState::LoggingIn {
+                    method: "chat-gpt".into(),
+                    name: "ChatGPT".into(),
+                },
+                failed(),
+                Activity::Working,
             ),
             (
                 AgentState::Failed {
@@ -1628,6 +1698,126 @@ mod tests {
             .to_value(),
             serde_json::json!({"event": "tool_changed", "id": 1})
         );
+    }
+
+    fn agent_method(id: &str, name: &str) -> LoginMethod {
+        LoginMethod {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            kind: LoginKind::Agent,
+        }
+    }
+
+    fn terminal_method() -> LoginMethod {
+        LoginMethod {
+            id: "cli-login".into(),
+            name: "Log in from the terminal".into(),
+            description: Some("Paste a code".into()),
+            kind: LoginKind::Terminal {
+                args: vec!["login".into()],
+                env: BTreeMap::from([("LOGIN_MODE".into(), "device".into())]),
+            },
+        }
+    }
+
+    #[test]
+    fn a_login_demand_without_methods_encodes_as_before_methods_existed() {
+        let state = AgentState::LoginRequired {
+            message: "run agent login".into(),
+            methods: Vec::new(),
+        };
+        assert_eq!(
+            Event::Agent { state }.to_value(),
+            serde_json::json!({"event": "agent", "state": {"agent": "login_required", "message": "run agent login"}})
+        );
+    }
+
+    #[test]
+    fn login_methods_encode_flat_with_their_kind_and_only_a_terminals_args_and_env() {
+        let state = AgentState::LoginRequired {
+            message: "m".into(),
+            methods: vec![agent_method("chat-gpt", "ChatGPT"), terminal_method()],
+        };
+        let value = Event::Agent { state }.to_value();
+        assert_eq!(
+            value["state"]["methods"],
+            serde_json::json!([
+                {"id": "chat-gpt", "name": "ChatGPT", "kind": "agent"},
+                {"id": "cli-login", "name": "Log in from the terminal", "description": "Paste a code",
+                 "kind": "terminal", "args": ["login"], "env": {"LOGIN_MODE": "device"}},
+            ])
+        );
+        // A terminal method with no args and no env leaves both out.
+        let bare = LoginMethod {
+            kind: LoginKind::Terminal {
+                args: Vec::new(),
+                env: BTreeMap::new(),
+            },
+            ..agent_method("t", "T")
+        };
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            serde_json::json!({"id": "t", "name": "T", "kind": "terminal"})
+        );
+        // An agent method's stray args and env are not its own: they're
+        // ignored, as any unknown field is.
+        let stray = serde_json::json!({"event": "agent", "state": {"agent": "login_required", "message": "m",
+            "methods": [{"id": "a", "name": "A", "kind": "agent", "args": ["x"], "env": {"K": "v"}}]}});
+        assert_eq!(
+            Event::from_value(&stray),
+            Ok(Event::Agent {
+                state: AgentState::LoginRequired {
+                    message: "m".into(),
+                    methods: vec![agent_method("a", "A")],
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_login_method_without_its_id_name_or_kind_or_of_an_unknown_kind_is_a_decode_error() {
+        for method in [
+            serde_json::json!({"name": "A", "kind": "agent"}),
+            serde_json::json!({"id": "a", "kind": "agent"}),
+            serde_json::json!({"id": "a", "name": "A"}),
+            serde_json::json!({"id": "a", "name": "A", "kind": "env_var"}),
+            serde_json::json!({"id": "a", "name": "A", "kind": "terminal", "args": "login"}),
+            serde_json::json!({"id": "a", "name": "A", "kind": "terminal", "env": {"K": 1}}),
+        ] {
+            let value = serde_json::json!({"event": "agent", "state": {"agent": "login_required", "message": "m", "methods": [method]}});
+            assert!(Event::from_value(&value).is_err(), "{value}");
+        }
+        for state in [
+            serde_json::json!({"agent": "logging_in", "method": "a"}),
+            serde_json::json!({"agent": "logging_in", "name": "A"}),
+        ] {
+            let value = serde_json::json!({"event": "agent", "state": state});
+            assert!(Event::from_value(&value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn the_login_states_fold_and_replay_as_the_agents_state() {
+        let required = AgentState::LoginRequired {
+            message: "log in".into(),
+            methods: vec![agent_method("chat-gpt", "ChatGPT"), terminal_method()],
+        };
+        let logging_in = AgentState::LoggingIn {
+            method: "chat-gpt".into(),
+            name: "ChatGPT".into(),
+        };
+        let mut transcript = with(required.clone(), TurnState::Idle);
+        assert_eq!(transcript.agent(), &required);
+        assert_eq!(fold(&transcript.replay()), Ok(transcript.clone()));
+        transcript
+            .apply(&Event::Agent {
+                state: logging_in.clone(),
+            })
+            .unwrap();
+        assert_eq!(transcript.agent(), &logging_in);
+        assert_eq!(transcript.replay().last(), Some(&Event::Agent { state: logging_in }));
+        assert_eq!(fold(&transcript.replay()), Ok(transcript));
     }
 
     #[test]

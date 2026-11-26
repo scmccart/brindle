@@ -7,8 +7,8 @@
 //! Pure: values in, values out.
 
 pub use brindle_transcript::{
-    Activity, AgentState, Conversation, Entry, EntryId, Event, HoldReason, NoticeLevel, PermissionKind,
-    PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState,
+    Activity, AgentState, Conversation, Entry, EntryId, Event, HoldReason, LoginKind, LoginMethod, NoticeLevel,
+    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState,
 };
 
 /// What the zone's tests build conversations with; the zone itself reads
