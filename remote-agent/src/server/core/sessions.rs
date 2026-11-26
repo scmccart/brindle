@@ -155,8 +155,9 @@ impl SpawnRequest {
 pub(super) enum Content {
     /// A program on a PTY, with its emulator (boxed: it is large).
     Terminal(Box<Screen>),
-    /// An ACP agent on plain pipes, with its transcript.
-    Agent(Agent),
+    /// An ACP agent on plain pipes, with its transcript (boxed: it is
+    /// larger than a boxed screen).
+    Agent(Box<Agent>),
 }
 
 /// Where a session's program is in its life (`types R1`).
@@ -398,6 +399,20 @@ pub(super) struct PendingReplay {
     req: Option<RequestId>,
     /// The size an `ATTACH` asked for.
     size: Option<(u16, u16)>,
+    /// The page an `ATTACH` asked for, for an agent session
+    /// ([`policy::page_budget`]).
+    page: Option<u32>,
+}
+
+impl PendingReplay {
+    /// A reconnect's replay: no request, no size, the default page.
+    fn reconnect() -> Self {
+        Self {
+            req: None,
+            size: None,
+            page: None,
+        }
+    }
 }
 
 impl Session {
@@ -485,7 +500,7 @@ impl Session {
     pub(super) fn agent(&mut self) -> Option<&mut Agent> {
         match &mut self.content {
             Content::Terminal(_) => None,
-            Content::Agent(agent) => Some(agent),
+            Content::Agent(agent) => Some(&mut **agent),
         }
     }
 
@@ -541,7 +556,7 @@ impl Session {
                 let screen = Screen::new(cols, rows, meta.scrollback);
                 (Content::Terminal(Box::new(screen)), (cols, rows))
             }
-            h1::SpawnMode::Pipes => (Content::Agent(Agent::adopting()), (0, 0)),
+            h1::SpawnMode::Pipes => (Content::Agent(Box::new(Agent::adopting())), (0, 0)),
         };
         let session = Self {
             holder,
@@ -606,10 +621,10 @@ impl Session {
                     scrollback: 0,
                     started: unix_now(),
                 },
-                Content::Agent(match &spawn.conversation {
+                Content::Agent(Box::new(match &spawn.conversation {
                     None => Agent::new(cwd.clone()),
                     Some(conversation) => Agent::continuing(conversation),
-                }),
+                })),
                 0,
                 0,
             ),
@@ -834,7 +849,7 @@ impl<L: EventLoop> Core<L> {
         // client, as the holder's `SPAWN_FAILED` would.
         self.sessions.insert(id, session);
         if self.send_holder(holder, message) && continues {
-            self.agent_checkpoint(id);
+            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: nothing stored yet
         }
     }
 
@@ -866,7 +881,7 @@ impl<L: EventLoop> Core<L> {
             meta,
         });
         if self.send_holder(holder, message) {
-            self.agent_checkpoint(id);
+            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: restarted
         }
     }
 
@@ -1160,7 +1175,7 @@ impl<L: EventLoop> Core<L> {
         if let (Some(client), Some(pending)) =
             (session.ownership.client(), session.pending_replay.take())
         {
-            self.replay(client, id, pending.req, pending.size);
+            self.replay(client, id, pending);
         }
     }
 
@@ -1168,7 +1183,9 @@ impl<L: EventLoop> Core<L> {
     /// state, [`Core::agent_checkpoint`]), covering the output fed since
     /// the last one: only for a session whose program runs and isn't being
     /// hung up, once its emulator is rebuilt.
-    pub(super) fn checkpoint(&mut self, id: SessionId) {
+    /// An agent's is written whole or appended as `at` and what its holder
+    /// stores say ([`policy::agent_checkpoint_form`]).
+    pub(super) fn checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
@@ -1177,7 +1194,7 @@ impl<L: EventLoop> Core<L> {
             (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => return,
         }
         let Some(screen) = session.screen() else {
-            return self.agent_checkpoint(id);
+            return self.agent_checkpoint(id, at);
         };
         let bytes = screen.render(id);
         let covers = std::mem::take(&mut screen.since_checkpoint);
@@ -1208,7 +1225,8 @@ impl<L: EventLoop> Core<L> {
         let behind = may_defer && self.holder_behind(holder);
         due.retain(|&(_, since)| is_due(since, behind));
         for (id, _) in due {
-            self.checkpoint(id);
+            // A terminal's checkpoint is always whole.
+            self.checkpoint(id, AgentCheckpoint::Stepped(None));
         }
     }
 
@@ -1229,7 +1247,7 @@ impl<L: EventLoop> Core<L> {
             None => false,
         };
         if due {
-            self.checkpoint(id);
+            self.checkpoint(id, at);
         }
     }
 
@@ -1343,7 +1361,7 @@ impl<L: EventLoop> Core<L> {
                 | Life::Running { .. }
                 | Life::HungUp { .. }
                 | Life::AgentEnded { .. } => {
-                    self.replay(client, id, None, None);
+                    self.replay(client, id, PendingReplay::reconnect());
                 }
             }
         }
@@ -1765,8 +1783,11 @@ impl<L: EventLoop> Core<L> {
         self.replay(
             client,
             id,
-            Some(attach.req),
-            Some((attach.cols, attach.rows)),
+            PendingReplay {
+                req: Some(attach.req),
+                size: Some((attach.cols, attach.rows)),
+                page: attach.page,
+            },
         );
     }
 
@@ -1873,7 +1894,7 @@ impl<L: EventLoop> Core<L> {
                 && let (Some(client), Some(pending)) =
                     (session.ownership.client(), session.pending_replay.take())
             {
-                self.replay(client, id, pending.req, pending.size);
+                self.replay(client, id, pending);
             }
         }
     }
@@ -1889,7 +1910,7 @@ impl<L: EventLoop> Core<L> {
         if let (Some(client), Some(pending)) =
             (session.ownership.client(), session.pending_replay.take())
         {
-            self.replay(client, id, pending.req, pending.size);
+            self.replay(client, id, pending);
         }
     }
 
@@ -1899,14 +1920,10 @@ impl<L: EventLoop> Core<L> {
     /// `EXIT` after the replay. One still being rebuilt from its holder
     /// gets its replay once the rebuild is done (no output comes before),
     /// and one whose meta isn't in its holder's socket yet once it is
-    /// (output read meanwhile is in the replay, not sent before it).
-    pub(super) fn replay(
-        &mut self,
-        client: Token,
-        id: SessionId,
-        req: Option<RequestId>,
-        size: Option<(u16, u16)>,
-    ) {
+    /// (output read meanwhile is in the replay, not sent before it). An
+    /// agent session's replay is the newest page of its log within the
+    /// budget `pending.page` asks for (`agents-log-paging` decision 5).
+    pub(super) fn replay(&mut self, client: Token, id: SessionId, pending: PendingReplay) {
         let now = Instant::now();
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
@@ -1914,9 +1931,10 @@ impl<L: EventLoop> Core<L> {
         session.ownership = Ownership::Attached(client);
         session.tell_foreground(now);
         if session.rebuild != Rebuild::Ready || session.storing.is_some() {
-            session.pending_replay = Some(PendingReplay { req, size });
+            session.pending_replay = Some(pending);
             return;
         }
+        let PendingReplay { req, size, page } = pending;
         let pid = session.life.pid().map_or(0, NonZeroU32::get);
         // An ended agent session stays: its replay ends with the exit.
         let exited = match session.life {
@@ -1928,11 +1946,14 @@ impl<L: EventLoop> Core<L> {
         };
         // Rendered whole, in this turn of the loop: output read after it
         // is fed and forwarded after it, so nothing is lost or reordered.
-        // An agent's replay is its whole log as transcript events
-        // (`Transcript::replay`), after which its live events follow.
+        // An agent's replay is the newest page of its log as transcript
+        // events (`Transcript::page`), after which its live events follow;
+        // the client fetches the rest as it needs it.
         let body = match &mut session.content {
             Content::Terminal(screen) => Replay::Screen(screen.render(id)),
-            Content::Agent(agent) => Replay::Transcript(agent.replay()),
+            Content::Agent(agent) => {
+                Replay::Transcript(agent.replay(policy::page_budget(page)))
+            }
         };
         self.send_client(
             client,

@@ -6,6 +6,9 @@
 //!   what text ([`spawn_refusal`], [`pipe_spawn_refusal`]).
 //! - **Pipe sessions and older cores:** whether a core is shown a session
 //!   ([`shown`]: not a pipe session, below H1 version 3).
+//! - **Appended checkpoints:** which `CHECKPOINT_APPEND`s are refused
+//!   ([`append_open_refusal`] on the message, [`append_refusal`] at its
+//!   `CHECKPOINT_END`), by length and version alone (`process R1`).
 //! - **Exits:** when a reaped program's session is finished, its output
 //!   drained ([`drained`]).
 //! - **Supervision:** when a holder with sessions and no core starts one,
@@ -15,7 +18,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::SessionId;
-use brindle_remote_protocol::holder::{Spawn, SpawnMode, SpawnPipes};
+use brindle_remote_protocol::holder::{MAX_CHECKPOINT_LEN, Spawn, SpawnMode, SpawnPipes};
 
 use super::{CORE_BACKOFF_MAX, CORE_BACKOFF_START, CORE_GRACE};
 use crate::pty::{OUTPUT_DRAIN_IDLE, OUTPUT_DRAIN_LIMIT};
@@ -96,6 +99,59 @@ pub(super) fn shown(protocol: u32, mode: SpawnMode) -> bool {
     }
 }
 
+/// Why a `CHECKPOINT_APPEND` is refused; its text is the `ERROR`'s. The
+/// stored checkpoint and the tail stay as they were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AppendRefusal {
+    /// The core negotiated an H1 version below [`APPEND_PROTOCOL`].
+    NeedsVersion,
+    /// The session's stored checkpoint is empty: there is no header to
+    /// append to.
+    NothingToAppendTo,
+    /// The stored checkpoint and the append would pass the limit.
+    PastLimit { len: u64 },
+}
+
+impl fmt::Display for AppendRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NeedsVersion => {
+                write!(f, "CHECKPOINT_APPEND needs H1 version {APPEND_PROTOCOL}")
+            }
+            Self::NothingToAppendTo => {
+                f.write_str("the checkpoint append was refused: nothing to append to")
+            }
+            Self::PastLimit { len } => write!(
+                f,
+                "the checkpoint append was refused: the checkpoint would be {len} bytes, past the holder's {}",
+                MAX_CHECKPOINT_LEN
+            ),
+        }
+    }
+}
+
+/// The H1 version that has `CHECKPOINT_APPEND`.
+pub(super) const APPEND_PROTOCOL: u32 = 3;
+
+/// Why a core that negotiated H1 `protocol` may not open an append.
+pub(super) fn append_open_refusal(protocol: u32) -> Option<AppendRefusal> {
+    (protocol < APPEND_PROTOCOL).then_some(AppendRefusal::NeedsVersion)
+}
+
+/// Why `adding` bytes can't be appended to a stored checkpoint of
+/// `stored` bytes: it is empty, or the two would pass
+/// [`MAX_CHECKPOINT_LEN`].
+pub(super) fn append_refusal(stored: u64, adding: u64) -> Option<AppendRefusal> {
+    let len = stored.saturating_add(adding);
+    if stored == 0 {
+        Some(AppendRefusal::NothingToAppendTo)
+    } else if len > MAX_CHECKPOINT_LEN {
+        Some(AppendRefusal::PastLimit { len })
+    } else {
+        None
+    }
+}
+
 /// Whether more of a session's output may come from its PTY.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Output {
@@ -173,6 +229,36 @@ mod tests {
     use brindle_remote_protocol::serde_json::Value;
 
     use super::*;
+
+    #[test]
+    fn an_append_is_refused_onto_nothing_past_the_limit_and_below_version_3() {
+        assert_eq!(append_open_refusal(2), Some(AppendRefusal::NeedsVersion));
+        assert_eq!(append_open_refusal(1), Some(AppendRefusal::NeedsVersion));
+        assert_eq!(append_open_refusal(3), None);
+        assert_eq!(append_refusal(0, 10), Some(AppendRefusal::NothingToAppendTo));
+        assert_eq!(append_refusal(0, 0), Some(AppendRefusal::NothingToAppendTo));
+        assert_eq!(append_refusal(10, 0), None);
+        assert_eq!(append_refusal(10, MAX_CHECKPOINT_LEN - 10), None);
+        assert_eq!(
+            append_refusal(10, MAX_CHECKPOINT_LEN - 9),
+            Some(AppendRefusal::PastLimit {
+                len: MAX_CHECKPOINT_LEN + 1
+            })
+        );
+        assert_eq!(
+            AppendRefusal::NeedsVersion.to_string(),
+            "CHECKPOINT_APPEND needs H1 version 3"
+        );
+        assert_eq!(
+            AppendRefusal::NothingToAppendTo.to_string(),
+            "the checkpoint append was refused: nothing to append to"
+        );
+        assert!(
+            AppendRefusal::PastLimit { len: 5 }
+                .to_string()
+                .ends_with("would be 5 bytes, past the holder's 67108864")
+        );
+    }
 
     fn spawn(command: Option<&str>, cols: u16, rows: u16) -> Spawn {
         Spawn {

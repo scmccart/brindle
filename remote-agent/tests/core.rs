@@ -1637,6 +1637,7 @@ fn an_attach_holds_when_the_core_is_killed_as_its_replay_starts() {
         session,
         cols: 80,
         rows: 24,
+        page: None,
     }));
     loop {
         match b.recv() {

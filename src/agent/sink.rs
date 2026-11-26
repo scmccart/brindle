@@ -16,6 +16,7 @@
 //! can't decode or fold, or a panic, breaks the session (it is detached,
 //! still running), as an emulator failure breaks a terminal's.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
@@ -119,6 +120,12 @@ pub struct Sink {
     /// The debug-only fault switch's marker (`BRINDLE_TEST_SINK_PANIC`,
     /// `process R20`): an event whose JSON holds it panics the fold.
     fault: Option<Vec<u8>>,
+    /// A fetch's `AGENT_PAGE` frames by request, until its last frame
+    /// (OpenSpec change `agents-log-paging`).
+    pages: BTreeMap<RequestId, Vec<Value>>,
+    /// Fetches whose frames a replay's start cut off: their remaining
+    /// frames are dropped, since the fold they were for is gone.
+    dropping: BTreeSet<RequestId>,
 }
 
 impl Sink {
@@ -135,7 +142,14 @@ impl Sink {
         let shared = Arc::new(Mutex::new(AgentShared::new()));
         let gate = Arc::new(Mutex::new(EventGate::default()));
         let (tx, events) = unbounded();
-        let sink = Self { shared: shared.clone(), gate: gate.clone(), tx, fault };
+        let sink = Self {
+            shared: shared.clone(),
+            gate: gate.clone(),
+            tx,
+            fault,
+            pages: BTreeMap::new(),
+            dropping: BTreeSet::new(),
+        };
         (sink, Feed { shared, events, gate })
     }
 
@@ -176,8 +190,35 @@ impl Sink {
         }
     }
 
+    /// One `AGENT_PAGE` frame of fetch `request`: kept until its last
+    /// (`last` is `Some(more)`), then the whole page is folded in front
+    /// ([`AgentShared::prepend`]) and the zone told. `Err` says why it
+    /// couldn't be folded. Frames of a fetch a replay cut off are dropped.
+    pub fn page(&mut self, request: RequestId, events: Vec<Value>, last: Option<bool>) -> Result<(), String> {
+        if self.dropping.contains(&request) {
+            if last.is_some() {
+                self.dropping.remove(&request);
+            }
+            return Ok(());
+        }
+        self.pages.entry(request).or_default().extend(events);
+        let Some(more) = last else { return Ok(()) };
+        let page = self.pages.remove(&request).unwrap_or_default();
+        let folded = {
+            let mut shared = self.shared.lock();
+            self.inject_fault(&page);
+            shared.prepend(&page, more)
+        };
+        self.send(AgentEvent::Changed);
+        folded.map_err(|broken| broken.to_string())
+    }
+
     /// A replay starts (the fold starts over) or ends.
     pub fn replay(&mut self, active: bool) {
+        if active {
+            let cut = std::mem::take(&mut self.pages);
+            self.dropping.extend(cut.into_keys());
+        }
         {
             let mut shared = self.shared.lock();
             if active {
@@ -192,8 +233,11 @@ impl Sink {
         }
     }
 
-    /// The core's answer to request `request`.
+    /// The core's answer to request `request`. A fetch that failed (with
+    /// the link) leaves no frames behind.
     pub fn reply(&mut self, request: RequestId, outcome: Result<(), String>) {
+        self.pages.remove(&request);
+        self.dropping.remove(&request);
         self.send(AgentEvent::Reply { request, outcome });
     }
 
@@ -369,5 +413,86 @@ mod tests {
             sink.transcript(vec![added(2, "says BRINDLE-FAULT here")])
         }));
         assert!(panicked.is_err());
+    }
+
+    // agents-log-paging 4.2: a fetch's pages.
+
+    fn window(from: u64, earlier: u64) -> Value {
+        Event::Window { from: EntryId(from), earlier }.to_value()
+    }
+
+    /// A sink whose fold holds entries 3 and 4 behind a window over 2.
+    fn paged() -> (Sink, Feed) {
+        let (mut sink, mut feed) = Sink::with_fault(None);
+        sink.replay(true);
+        sink.transcript(vec![window(3, 2), added(3, "three"), added(4, "four")]).unwrap();
+        sink.replay(false);
+        taken(&mut feed);
+        feed.shared.lock().take_changes();
+        (sink, feed)
+    }
+
+    fn texts(feed: &Feed) -> Vec<String> {
+        feed.shared
+            .lock()
+            .transcript()
+            .entries()
+            .map(|(id, entry)| match entry {
+                Entry::Agent { text } => format!("{}:{text}", id.0),
+                other => format!("{}:{other:?}", id.0),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_two_frame_page_is_folded_once_at_its_last_frame() {
+        let (mut sink, mut feed) = paged();
+        sink.page(9, vec![added(1, "one")], None).unwrap();
+        assert_eq!(taken(&mut feed), [], "nothing is folded before the last frame");
+        assert_eq!(texts(&feed), ["3:three", "4:four"]);
+        sink.page(9, vec![added(2, "two")], Some(false)).unwrap();
+        assert_eq!(taken(&mut feed), [AgentEvent::Changed]);
+        assert_eq!(texts(&feed), ["1:one", "2:two", "3:three", "4:four"]);
+        let changes = feed.shared.lock().take_changes();
+        assert_eq!((changes.prepended, changes.from_replay), (Some(2), true));
+        assert!(feed.shared.lock().transcript().window().is_none());
+    }
+
+    #[test]
+    fn a_page_with_a_gap_breaks_the_session_and_changes_nothing() {
+        let (mut sink, feed) = paged();
+        let refused = sink.page(9, vec![added(1, "one")], Some(false)).unwrap_err();
+        assert!(refused.contains("a page from the terminal server couldn't be applied"), "{refused}");
+        assert_eq!(texts(&feed), ["3:three", "4:four"]);
+    }
+
+    #[test]
+    fn an_empty_page_after_a_trim_took_the_window_folds_as_nothing() {
+        let (mut sink, mut feed) = paged();
+        // A trim through entry 2 takes the whole window.
+        let trimmed = Event::Trimmed { through: EntryId(2), dropped: 2 }.to_value();
+        sink.transcript(vec![trimmed]).unwrap();
+        assert!(feed.shared.lock().transcript().window().is_none());
+        taken(&mut feed);
+        feed.shared.lock().take_changes();
+        sink.page(9, Vec::new(), Some(false)).unwrap();
+        assert_eq!(texts(&feed), ["3:three", "4:four"]);
+        assert_eq!(feed.shared.lock().take_changes().prepended, Some(0));
+    }
+
+    #[test]
+    fn a_page_cut_off_by_a_replay_is_dropped() {
+        let (mut sink, mut feed) = paged();
+        sink.page(9, vec![added(1, "one")], None).unwrap();
+        // A reconnect replays the newest page again.
+        sink.replay(true);
+        sink.transcript(vec![window(3, 2), added(3, "three"), added(4, "four")]).unwrap();
+        sink.replay(false);
+        taken(&mut feed);
+        sink.page(9, vec![added(2, "two")], Some(false)).unwrap();
+        assert_eq!(texts(&feed), ["3:three", "4:four"], "the cut page is dropped");
+        // A later fetch folds as usual.
+        sink.page(10, vec![added(1, "one"), added(2, "two")], Some(false)).unwrap();
+        assert_eq!(texts(&feed), ["1:one", "2:two", "3:three", "4:four"]);
     }
 }

@@ -163,7 +163,7 @@ The server's per-session emulator SHALL NOT write anything to the PTY. Device at
 - **THEN** it receives exactly one reply, from the client
 
 ### Requirement: Protocol versions
-A client and the core SHALL agree on a protocol version when they connect, and so SHALL the core and each holder. A core SHALL speak every client protocol version and every holder protocol version from the first terminal-server release's up to its own. Client protocol 2 adds process info. Client protocol 3 adds layout updates for attached sessions. Client protocol 4 adds agent sessions. Holder protocol 3 adds sessions on plain pipes and their standard error. A client SHALL refuse a core that speaks none of its versions, with an error naming both versions. A holder speaking an older holder protocol that can't store a session's changed owner or policy SHALL keep working; only those changes are lost if the core restarts before the holder drains.
+A client and the core SHALL agree on a protocol version when they connect, and so SHALL the core and each holder. A core SHALL speak every client protocol version and every holder protocol version from the first terminal-server release's up to its own. Client protocol 2 adds process info. Client protocol 3 adds layout updates for attached sessions. Client protocol 4 adds agent sessions, whose conversations are sent a page at a time with older entries fetched on demand. Holder protocol 3 adds sessions on plain pipes, their standard error, and checkpoints appended to. A client SHALL refuse a core that speaks none of its versions, with an error naming both versions. A holder speaking an older holder protocol that can't store a session's changed owner or policy SHALL keep working; only those changes are lost if the core restarts before the holder drains.
 
 #### Scenario: Older client, newer core
 - **WHEN** a Brindle from an older release connects to a core from a newer release
@@ -188,6 +188,10 @@ A client and the core SHALL agree on a protocol version when they connect, and s
 #### Scenario: Pipe sessions need holder protocol 3
 - **WHEN** a core that speaks holder protocols 1 to 3 starts an agent session
 - **THEN** it starts it on a holder that negotiated holder protocol 3, starting a holder of its own build if it has none
+
+#### Scenario: Appended checkpoints go only to a holder of the core's build
+- **WHEN** a core checkpoints an agent session that a draining holder of another build holds
+- **THEN** it writes the whole checkpoint, never a segment to append
 
 ### Requirement: Upgrades keep every session
 When a client whose server binary is newer than the running core connects, the core SHALL save each session's screen to its holder and exit, and the newer core SHALL take over. Every session SHALL keep running under its holder with the same program and pid. The new core SHALL rebuild each session's screen, scrollback, status and marks from what the holder kept.

@@ -313,3 +313,137 @@ pub fn self_test() -> Result {
     ensure!(!wait_gave_up("[INFO brindle] ready\n"), "a quiet log reads as a wait that gave up");
     Ok(())
 }
+
+// `agent-attach-long` (OpenSpec change `agents-log-paging`, design.md
+// decision 14): how long a launch takes to show a long agent conversation
+// it attaches again, which a paged attach bounds by its newest 256 KiB.
+
+/// The conversation's thoughts, each followed by a short agent message.
+pub const ATTACH_THOUGHTS: usize = 1_900;
+/// Each thought's length, exactly.
+pub const THOUGHT_BYTES: usize = 8 * 1024;
+/// The conversation's last entry, an agent message, and what the attach's
+/// `--wait-for` waits for.
+pub const LAST_ENTRY: &str = "End of the long conversation.";
+/// What the server keeps of an agent's log before trimming it
+/// (`remote-agent/src/acp/reduce.rs`'s `LOG_LIMIT`): the conversation stays
+/// under it, encoding included, so the attach has all of it to page.
+const LOG_LIMIT: usize = 16 * 1024 * 1024;
+/// How long the live run may take to show the whole conversation.
+const LIVE_LIMIT: Duration = Duration::from_secs(300);
+
+/// Thought `n`, [`THOUGHT_BYTES`] long.
+fn thought(n: usize) -> String {
+    let head = format!("Thought {n}: ");
+    let mut text = head + &"lorem ipsum ".repeat(THOUGHT_BYTES / 12);
+    text.truncate(THOUGHT_BYTES - 1);
+    text.push('.');
+    text
+}
+
+/// The conversation's replies to the first prompt, in order: thought 0,
+/// `Message 0`, …, the last message [`LAST_ENTRY`]; each a new entry.
+pub fn long_replies() -> Vec<(&'static str, String)> {
+    let mut replies = Vec::with_capacity(2 * ATTACH_THOUGHTS);
+    for n in 0..ATTACH_THOUGHTS {
+        replies.push(("agent_thought_chunk", thought(n)));
+        let message = if n + 1 == ATTACH_THOUGHTS { LAST_ENTRY.to_string() } else { format!("Message {n}") };
+        replies.push(("agent_message_chunk", message));
+    }
+    replies
+}
+
+/// The fake agent's script for the long conversation: ready at once,
+/// recording what it is sent in `record`; on the prompt it sends
+/// [`long_replies`] and ends the turn.
+pub fn long_script(record: &Path) -> String {
+    let mut lines = vec![
+        format!("record {}", record.display()),
+        "expect initialize".to_string(),
+        r#"respond {"protocolVersion":1,"agentInfo":{"name":"Fake Agent","version":"1.0"}}"#.to_string(),
+        "expect session/new".to_string(),
+        r#"respond {"sessionId":"s1"}"#.to_string(),
+        "expect session/prompt".to_string(),
+    ];
+    lines.extend(long_replies().into_iter().map(|(kind, text)| {
+        format!(
+            r#"send {{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{{"sessionUpdate":"{kind}","content":{{"type":"text","text":"{}"}}}}}}}}"#,
+            json_escape(&text)
+        )
+    }));
+    lines.push(r#"respond {"stopReason":"end_turn"}"#.to_string());
+    lines.join("\n") + "\n"
+}
+
+/// Waits for Brindle to exit within `limit`, ending it past that; then
+/// checks its log for a `--wait-for` that gave up.
+fn exited(ctx: &Ctx, mut child: Child, label: &str, limit: Duration) -> Result {
+    let started = Instant::now();
+    while child.try_wait().map_err(|e| e.to_string())?.is_none() {
+        if started.elapsed() > limit {
+            end(child);
+            return Err(format!("{label}: Brindle didn't exit within {}s; see {label}.log", limit.as_secs()));
+        }
+        std::thread::sleep(POLL);
+    }
+    let log = std::fs::read_to_string(ctx.dir.join(format!("{label}.log"))).unwrap_or_default();
+    ensure!(!wait_gave_up(&log), "{label}: the last entry never showed; see {label}.log");
+    Ok(())
+}
+
+/// The live run shows the whole conversation and quits, leaving its
+/// session detached and its tab recorded; the timed run restores the tab,
+/// which attaches the session, and quits once it shows the last entry.
+pub fn attach_long(ctx: &Ctx) -> Result<Measured> {
+    let agent = fake_agent::find(&ctx.default_bin);
+    if let Err(why) = fake_agent::check(&agent, &ctx.default_bin) {
+        return Ok(Measured::Skip(why));
+    }
+    let (record, script_path) = (ctx.dir.join("long.jsonl"), ctx.dir.join("long.script"));
+    std::fs::write(&script_path, long_script(&record)).map_err(|e| format!("writing the script: {e}"))?;
+    let config = config(&agent.path, &script_path);
+    let interval = STEP_INTERVAL.as_secs_f64().to_string();
+    let live = ["agent", "Fake", "--no-restore", "-p", "go", "--step-interval", &interval, "--wait-for", LAST_ENTRY];
+    let child = spawn_with(ctx, "live", &config, &[&live[..], &["--action", "quit"]].concat())?;
+    exited(ctx, child, "live", LIVE_LIMIT)?;
+
+    let launched = Instant::now();
+    let child = spawn_with(ctx, "attach", &config, &["--step-interval", &interval, "--wait-for", LAST_ENTRY, "--action", "quit"])?;
+    exited(ctx, child, "attach", EXIT_LIMIT)?;
+    let took = launched.elapsed();
+    let replies = long_replies();
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    Ok(Measured::Attach(crate::report::AttachResult {
+        bytes: replies.iter().map(|(_, text)| text.len() as u64).sum::<u64>() + 2,
+        entries: 1 + replies.len() as u64,
+        attach_ms: ms(took),
+        step_interval_ms: ms(STEP_INTERVAL),
+    }))
+}
+
+/// The long conversation and its script (`--self-test`).
+pub fn self_test_attach() -> Result {
+    let replies = long_replies();
+    ensure!(replies.len() == 2 * ATTACH_THOUGHTS, "{} replies", replies.len());
+    for (n, pair) in replies.chunks(2).enumerate() {
+        ensure!(pair[0].0 == "agent_thought_chunk" && pair[0].1.len() == THOUGHT_BYTES, "thought {n}");
+        ensure!(pair[0].1.starts_with(&format!("Thought {n}: ")), "thought {n}'s text");
+        ensure!(pair[1].0 == "agent_message_chunk", "message {n}");
+    }
+    ensure!(replies.last().is_some_and(|(_, text)| text == LAST_ENTRY), "the last entry");
+    ensure!(replies.iter().filter(|(_, text)| text.contains(LAST_ENTRY)).count() == 1, "the last entry shows twice");
+    let bytes: usize = replies.iter().map(|(_, text)| text.len()).sum();
+    ensure!(bytes > 14 * 1024 * 1024, "only {bytes} bytes");
+    // Each entry encodes with some 200 bytes of JSON around its text.
+    ensure!(bytes + replies.len() * 200 < LOG_LIMIT, "{bytes} bytes would be trimmed");
+
+    let lines: Vec<String> = long_script(Path::new("/case/r.jsonl")).lines().map(String::from).collect();
+    ensure!(lines[0] == "record /case/r.jsonl", "{:?}", &lines[..1]);
+    let at = lines.iter().position(|l| l == "expect session/prompt").ok_or("no prompt step")?;
+    let sends = &lines[at + 1..lines.len() - 1];
+    ensure!(sends.len() == replies.len(), "{} sends", sends.len());
+    let value: serde_json::Value = serde_json::from_str(&sends[0][5..]).map_err(|e| e.to_string())?;
+    ensure!(value["params"]["update"]["content"]["text"] == replies[0].1, "the first send's text");
+    ensure!(lines.last().is_some_and(|l| l == r#"respond {"stopReason":"end_turn"}"#), "no end of turn");
+    Ok(())
+}

@@ -58,7 +58,8 @@ pub fn start_of(message: &ToCore) -> Option<Start> {
         | ToCore::AgentPermission(_)
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
-        | ToCore::AgentLogin(_) => None,
+        | ToCore::AgentLogin(_)
+        | ToCore::AgentFetch(_) => None,
     }
 }
 
@@ -177,7 +178,8 @@ pub fn over_endpoint(message: &ToCore, endpoint: &EndpointEnv) -> Option<(ToCore
         | ToCore::AgentPermission(_)
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
-        | ToCore::AgentLogin(_) => return None,
+        | ToCore::AgentLogin(_)
+        | ToCore::AgentFetch(_) => return None,
     };
     Some((message, fallback))
 }
@@ -189,7 +191,7 @@ mod tests {
     use crate::config::{Config, Profile};
     use crate::remote::Host;
     use crate::remote::protocol::client::{
-        AgentLogin, AgentPermission, AgentPrompt, AgentRequest, Attach, Data, Detach, Hello, Kill, KillTarget, Policy,
+        AgentFetch, AgentLogin, AgentPermission, AgentPrompt, AgentRequest, Attach, Data, Detach, Hello, Kill, KillTarget, Policy,
         Reparent, Request, Resize, SessionRef, SetLayout,
     };
 
@@ -259,7 +261,7 @@ mod tests {
             (ToCore::Data(Data { session: 1, bytes: b"x".to_vec() }), None),
             (ToCore::Resize(Resize { session: 1, cols: 80, rows: 24, cell_w: 8, cell_h: 16 }), None),
             (ToCore::Close(session()), None),
-            (ToCore::Attach(Attach { req: 1, session: 1, cols: 80, rows: 24 }), None),
+            (ToCore::Attach(Attach { req: 1, session: 1, cols: 80, rows: 24, page: None }), None),
             (ToCore::Detach(Detach { session: 1, layout: None }), None),
             (ToCore::List(request()), None),
             (ToCore::Kill(Kill { req: 1, target: KillTarget::All }), None),
@@ -276,6 +278,7 @@ mod tests {
             (ToCore::AgentResend(AgentRequest { req: 1, session: 1 }), None),
             (ToCore::AgentRestart(restart(BTreeMap::new())), Some(Start::Program)),
             (ToCore::AgentLogin(AgentLogin { req: 1, session: 1, method: "m".into() }), None),
+            (ToCore::AgentFetch(AgentFetch { req: 1, session: 1, before: 9, max_bytes: 1024 }), None),
         ]
     }
 

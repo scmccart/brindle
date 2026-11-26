@@ -227,6 +227,21 @@ pub trait SessionSink: Send {
     /// with its text), or the request failed with the link or connection.
     /// Only an agent session's sink sends requests that come back here.
     fn reply(&mut self, _request: RequestId, _outcome: std::result::Result<(), String>) {}
+    /// One `AGENT_PAGE` frame answering the agent request `request` (an
+    /// `AGENT_FETCH`, OpenSpec change `agents-log-paging`): its events, and
+    /// on the last frame whether more are earlier. The sink folds the
+    /// request's frames in front at the last; `Err` says why they couldn't
+    /// be, and the session is let go as broken. Its [`SessionSink::reply`]
+    /// follows the last frame. A terminal's sink never gets one.
+    fn page(
+        &mut self,
+        _request: RequestId,
+        events: Vec<serde_json::Value>,
+        _last: Option<bool>,
+    ) -> std::result::Result<(), String> {
+        log::debug!("terminal server: a page of {} events for a terminal dropped", events.len());
+        Ok(())
+    }
     /// The link to the core went down; the session stays shown, and a
     /// reconnect's replay of it (or its loss) follows.
     fn link_down(&mut self) {}
@@ -340,7 +355,7 @@ impl AttachRequest {
             // own, unless a listing gives one first.
             Attaching::Recorded => (0, 0, Awaits::Listing),
         };
-        let attach = client::Attach { req, session: self.session, cols, rows };
+        let attach = client::Attach { req, session: self.session, cols, rows, page: None };
         let message = match awaits {
             Awaits::Replay => Some(ToCore::Attach(attach.clone())),
             Awaits::Listing => None,
@@ -420,6 +435,9 @@ impl Waiting {
         };
     }
 }
+
+/// What a fetch sent while the link is down is answered with.
+const LINK_DOWN: &str = "the connection to the terminal server is down";
 
 /// Tells `session`'s sink how its agent request `req` went, confining a
 /// panic to the call: it is only the request's bookkeeping, and the
@@ -1928,6 +1946,44 @@ impl Connection {
                     self.break_session(session, &sink, &reason);
                 }
             }
+            // An `AGENT_FETCH`'s answer: its frames go to the session's
+            // sink while the fetch still waits, and the last ends the wait
+            // with its `OK`, after the sink folded the page.
+            ToClient::AgentPage(client::AgentPage { req, session, events, last }) => {
+                let waiting = {
+                    let state = self.state.lock();
+                    match state.requests.get(&req).map(|pending| &pending.waiting) {
+                        Some(Waiting::Agent { session: asked, sink, .. }) if *asked == session => Some(sink.clone()),
+                        Some(
+                            Waiting::Agent { .. }
+                            | Waiting::Spawn { .. }
+                            | Waiting::Attach { .. }
+                            | Waiting::List(_)
+                            | Waiting::Done(_),
+                        )
+                        | None => None,
+                    }
+                };
+                let Some(sink) = waiting else {
+                    log::debug!("terminal server: a page for session {session} answering no fetch, dropped");
+                    return;
+                };
+                let more = last.map(|last| last.more);
+                let mut refused = None;
+                let delivered = self.deliver(session, &sink, |sink| refused = sink.page(req, events, more).err());
+                if more.is_none() {
+                    return;
+                }
+                self.state.lock().requests.remove(&req);
+                match (delivered, refused) {
+                    (Delivered::Done, Some(reason)) => self.break_session(session, &sink, &reason),
+                    (Delivered::Done, None) => {
+                        self.deliver(session, &sink, |sink| sink.reply(req, Ok(())));
+                    }
+                    // The sink was told it is broken, and its session let go.
+                    (Delivered::Panicked(_), _) => {}
+                }
+            }
         }
     }
 
@@ -2335,7 +2391,8 @@ impl Connection {
             | ToCore::AgentUnqueue(AgentRequest { req, .. })
             | ToCore::AgentResend(AgentRequest { req, .. })
             | ToCore::AgentRestart(AgentRestart { req, .. })
-            | ToCore::AgentLogin(client::AgentLogin { req, .. }) => Some(*req),
+            | ToCore::AgentLogin(client::AgentLogin { req, .. })
+            | ToCore::AgentFetch(client::AgentFetch { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2676,6 +2733,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentResend(_)
         | ToCore::AgentRestart(_)
         | ToCore::AgentLogin(_)
+        | ToCore::AgentFetch(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -2973,6 +3031,29 @@ impl Running {
     pub fn login(&self, method: &str) -> Option<RequestId> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentLogin(client::AgentLogin { req, session, method: method.to_string() }))
+    }
+
+    /// Fetches the whole entries before `before` within `max_bytes`
+    /// (`AGENT_FETCH`): `AGENT_PAGE` frames go to the session's sink
+    /// ([`SessionSink::page`]), then its reply. While the link is down it
+    /// is answered at once with the link's failure, rather than held for
+    /// the next link (whose replay starts the zone over anyway).
+    pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+        let session = self.id;
+        let down = {
+            let mut state = self.conn.state.lock();
+            let sink = state.shown(self.id, self.key.as_ref())?.sink.clone();
+            let req = self.conn.req();
+            if state.link.is_up() {
+                state.requests.insert(req, Pending::queued(Waiting::Agent { req, session, sink }));
+                self.conn.send(ToCore::AgentFetch(client::AgentFetch { req, session, before, max_bytes }));
+                return Some(req);
+            }
+            (req, sink)
+        };
+        let (req, sink) = down;
+        reply_to(session, &sink, req, Err(LINK_DOWN.to_string()));
+        Some(req)
     }
 
     /// Answers the permission request in entry `entry` with `option`, or
@@ -3323,6 +3404,18 @@ pub(super) mod fake {
         }
         fn broken(&mut self, reason: &str) {
             self.0.send(format!("broken {reason}")).ok();
+        }
+        fn page(
+            &mut self,
+            request: RequestId,
+            events: Vec<serde_json::Value>,
+            last: Option<bool>,
+        ) -> std::result::Result<(), String> {
+            self.0.send(format!("page {request} {} {last:?}", serde_json::Value::Array(events))).ok();
+            Ok(())
+        }
+        fn reply(&mut self, request: RequestId, outcome: std::result::Result<(), String>) {
+            self.0.send(format!("reply {request} {outcome:?}")).ok();
         }
     }
 
@@ -3856,6 +3949,45 @@ mod tests {
     }
 
     /// 5.5: a lost relay link says so once in each terminal, input typed
+    /// `agents-log-paging` 4.1: a fetch's `AGENT_PAGE` frames reach the
+    /// session's sink in order, and its reply follows the last one; a page
+    /// for no fetch is dropped.
+    #[test]
+    fn a_multi_frame_page_reaches_the_sink_in_order_before_its_reply() {
+        let (connection, plan) = relay("A8");
+        let (link, far) = fake::link(&[], |message, out| match message {
+            ToCore::AgentFetch(fetch) => {
+                let frame = |n: u64, last| {
+                    let events = vec![serde_json::json!({ "n": n })];
+                    ToClient::AgentPage(client::AgentPage { req: fetch.req, session: fetch.session, events, last })
+                };
+                // One for no fetch first, which nobody is told of.
+                out.send(ToClient::AgentPage(client::AgentPage {
+                    req: 999,
+                    session: fetch.session,
+                    events: Vec::new(),
+                    last: None,
+                }));
+                out.send(frame(1, None));
+                out.send(frame(2, None));
+                out.send(frame(3, Some(client::PageEnd { more: true })));
+            }
+            _ => fake::spawning(message, out),
+        });
+        plan.link(link);
+        let (sink, tab) = fake::sink();
+        let running = connection.spawn(spawn_request(&[]), sink, None).unwrap();
+        far.next();
+        let req = running.fetch(5, 4096).expect("shown");
+        let ToCore::AgentFetch(fetch) = far.next() else { panic!("not AGENT_FETCH") };
+        assert_eq!((fetch.req, fetch.session, fetch.before, fetch.max_bytes), (req, running.id(), 5, 4096));
+        assert_eq!(seen(&tab), format!("page {req} [{{\"n\":1}}] None"));
+        assert_eq!(seen(&tab), format!("page {req} [{{\"n\":2}}] None"));
+        assert_eq!(seen(&tab), format!("page {req} [{{\"n\":3}}] Some(true)"));
+        assert_eq!(seen(&tab), format!("reply {req} Ok(())"));
+        assert!(connection.state.lock().requests.is_empty(), "the fetch no longer waits");
+    }
+
     /// meanwhile goes out after the reconnect, and only the session the
     /// reconnected core's `LIST` lacks is lost.
     #[test]
@@ -5512,12 +5644,12 @@ mod tests {
         assert!(gone.is_empty(), "{gone:?}");
         again.sort_by_key(|(attach, _)| attach.req);
         let [(at_listed, told), (as_requested, untold)] = <[_; 2]>::try_from(again).ok().expect("two attaches");
-        assert_eq!(at_listed, client::Attach { req: 1, session: 5, cols: 132, rows: 43 });
+        assert_eq!(at_listed, client::Attach { req: 1, session: 5, cols: 132, rows: 43, page: None });
         let (sink, size) = told.expect("its sink is told the size");
         assert!(Arc::ptr_eq(&sink, &carried.sinks[&1]));
         assert_eq!(size, (132, 43));
         // The request's size: none, which the core takes as the session's.
-        assert_eq!(as_requested, client::Attach { req: 2, session: 6, cols: 0, rows: 0 });
+        assert_eq!(as_requested, client::Attach { req: 2, session: 6, cols: 0, rows: 0, page: None });
         assert!(untold.is_none());
         for req in [1, 2] {
             assert_eq!(carried.awaits(req), Some(Awaits::Replay));
@@ -5583,7 +5715,7 @@ mod tests {
         let (again, gone) = carried.decide(&[listed_at(7, "k7", Some((132, 43)))]);
         assert!(gone.is_empty(), "{gone:?}");
         let [(attach, told)] = <[_; 1]>::try_from(again).ok().expect("one attach");
-        assert_eq!(attach, client::Attach { req: 1, session: 7, cols: 100, rows: 30 });
+        assert_eq!(attach, client::Attach { req: 1, session: 7, cols: 100, rows: 30, page: None });
         assert!(told.is_none());
         assert_eq!(carried.awaits(1), Some(Awaits::Replay));
         assert_eq!(carried.requests[&1].sent, Sent::Queued);

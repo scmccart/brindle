@@ -544,6 +544,33 @@ pub fn assert_hung_up(session: SessionId, code: Option<i32>) {
     assert!(code.is_some(), "session {session} ended with no code");
 }
 
+/// The records of an agent checkpoint of format 2 (`BACP`, `u16` 2, then
+/// each record's kind, sequence number, JSON state and partial line; see
+/// `acp/checkpoint.rs`), as `(kind, seq)`: what a holder stores of a base
+/// and the segments appended to it, read without decoding the states.
+#[track_caller]
+pub fn checkpoint_records(blob: &[u8]) -> Vec<(char, u32)> {
+    let (header, mut rest) = blob.split_at(6);
+    assert_eq!(header, b"BACP\x00\x02", "not a format 2 checkpoint");
+    let take = |len: usize, rest: &mut &[u8]| -> Vec<u8> {
+        assert!(rest.len() >= len, "a record runs past the end");
+        let (taken, left) = rest.split_at(len);
+        *rest = left;
+        taken.to_vec()
+    };
+    let mut records = Vec::new();
+    while !rest.is_empty() {
+        let kind = take(1, &mut rest)[0] as char;
+        let seq = u32::from_be_bytes(take(4, &mut rest).try_into().unwrap());
+        for _ in 0..2 {
+            let len = u32::from_be_bytes(take(4, &mut rest).try_into().unwrap());
+            take(len as usize, &mut rest);
+        }
+        records.push((kind, seq));
+    }
+    records
+}
+
 pub fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.is_empty()
         || haystack
@@ -1080,6 +1107,7 @@ impl TestClient {
             session,
             cols,
             rows,
+            page: None,
         }));
         let mut kept = Vec::new();
         let start = loop {
@@ -1328,6 +1356,112 @@ impl TestClient {
         self.agent_reply(req)
     }
 
+    /// `AGENT_FETCH` (OpenSpec change `agents-log-paging`): the entries
+    /// before `before` within `max_bytes`, as the `AGENT_PAGE` frames
+    /// answering it carry them, and whether more are earlier; or the
+    /// refusal. Other messages are kept for later.
+    pub fn fetch(
+        &mut self,
+        session: SessionId,
+        before: u64,
+        max_bytes: u32,
+    ) -> Result<(Vec<Event>, bool), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentFetch(client::AgentFetch {
+            req,
+            session,
+            before,
+            max_bytes,
+        }));
+        let mut kept = Vec::new();
+        let mut events = Vec::new();
+        let result = loop {
+            match self.recv() {
+                ToClient::AgentPage(page) if page.req == req => {
+                    assert_eq!(page.session, session);
+                    for value in &page.events {
+                        let event = Event::from_value(value)
+                            .unwrap_or_else(|error| panic!("AGENT_PAGE event {value}: {error}"));
+                        assert_eq!(event.to_value(), *value, "AGENT_PAGE event {value} isn't one of protocol 4's forms");
+                        events.push(event);
+                    }
+                    if let Some(last) = page.last {
+                        break Ok((std::mem::take(&mut events), last.more));
+                    }
+                }
+                ToClient::Error(error) if error.req == Some(req) => break Err(error),
+                other => kept.push(other),
+            }
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        result
+    }
+
+    /// `ATTACH` (which gives the session this client's token as its owner,
+    /// so its replay waits for the new meta to reach the holder's socket)
+    /// and an `AGENT_FETCH` written in one write, so the core reads both
+    /// before its next flush: gives the fetch's answer, read before the
+    /// replay, and the replay's start once it has ended.
+    pub fn attach_agent_and_fetch(
+        &mut self,
+        session: SessionId,
+        before: u64,
+        max_bytes: u32,
+    ) -> (Result<(), client::ErrorMessage>, client::ReplayStart) {
+        let attach = self.take_req();
+        let fetch = self.take_req();
+        let mut bytes = Vec::new();
+        for message in [
+            client::ToCore::Attach(client::Attach { req: attach, session, cols: 0, rows: 0, page: None }),
+            client::ToCore::AgentFetch(client::AgentFetch { req: fetch, session, before, max_bytes }),
+        ] {
+            message.encode().unwrap().write_to(&mut bytes).unwrap();
+        }
+        io::Write::write_all(&mut self.stream, &bytes).unwrap();
+        let mut kept = Vec::new();
+        let mut answer = None;
+        let mut start = None;
+        loop {
+            match self.recv() {
+                ToClient::Error(error) if error.req == Some(fetch) => answer = Some(Err(error)),
+                ToClient::AgentPage(page) if page.req == fetch => {
+                    if page.last.is_some() {
+                        answer = Some(Ok(()));
+                    }
+                }
+                ToClient::ReplayStart(replay) if replay.req == Some(attach) => {
+                    assert!(answer.is_some(), "the replay started before the fetch was answered");
+                    start = Some(replay);
+                }
+                ToClient::Transcript(transcript) if transcript.session == session => {}
+                ToClient::ReplayEnd(end) if end.session == session => break,
+                other => kept.push(other),
+            }
+        }
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        (answer.expect("the fetch's answer"), start.expect("the replay's start"))
+    }
+
+    /// Fetches the pages before the session's log's window, a whole page
+    /// at a time, folding each in front ([`Transcript::prepend`]) until the
+    /// core says none are earlier; gives the log, now held from its start
+    /// (or its trim). Live events read meanwhile are folded as they come.
+    pub fn fetch_to_start(&mut self, session: SessionId) -> Transcript {
+        while let Some(window) = self.transcript(session).window() {
+            let (events, more) = self
+                .fetch(session, window.from.0, brindle_transcript::PAGE_BYTES as u32)
+                .unwrap_or_else(|error| panic!("the fetch was refused: {}", error.message));
+            self.transcripts
+                .entry(session)
+                .or_default()
+                .prepend(&events, more)
+                .unwrap_or_else(|error| panic!("a fetched page doesn't fold: {error}"));
+        }
+        self.transcript(session)
+    }
+
     /// The agent session's log as this client has folded it so far.
     pub fn transcript(&self, session: SessionId) -> Transcript {
         self.transcripts.get(&session).cloned().unwrap_or_default()
@@ -1379,12 +1513,23 @@ impl TestClient {
         &mut self,
         session: SessionId,
     ) -> Result<client::ReplayStart, client::ErrorMessage> {
+        self.attach_agent_paged(session, None)
+    }
+
+    /// [`TestClient::attach_agent`] asking for a replay page of `page`
+    /// bytes (`ATTACH.page`, OpenSpec change `agents-log-paging`).
+    pub fn attach_agent_paged(
+        &mut self,
+        session: SessionId,
+        page: Option<u32>,
+    ) -> Result<client::ReplayStart, client::ErrorMessage> {
         let req = self.take_req();
         self.send(client::ToCore::Attach(client::Attach {
             req,
             session,
             cols: 0,
             rows: 0,
+            page,
         }));
         let mut kept = Vec::new();
         let start = loop {

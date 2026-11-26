@@ -22,8 +22,8 @@ use crate::agent::login::{self, AgentCommand, MethodOffer, TerminalLogin};
 use crate::agent::markdown::{self, Part};
 use crate::agent::shared::{Changes, Dirty};
 use crate::agent::transcript::{
-    Activity, AgentState, Conversation, Entry, EntryId, HoldReason, NoticeLevel, PermissionKind, PermissionOption,
-    PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState, status_of,
+    Activity, AgentState, Conversation, Entry, EntryId, HoldReason, NoticeLevel, PAGE_BYTES, PermissionKind,
+    PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState, Window, status_of,
 };
 use crate::terminal::links::Plan;
 use crate::terminal::status::State;
@@ -774,6 +774,28 @@ pub enum Sent {
     Restart { was: AgentState },
     /// `AGENT_LOGIN`: a refusal is shown beside the login row.
     Login,
+    /// `AGENT_FETCH` (OpenSpec change `agents-log-paging`): its page comes
+    /// as a change before the reply; a refusal shows on the Earlier row.
+    Fetch,
+}
+
+/// The entries before the ones the zone holds (OpenSpec change
+/// `agents-log-paging` decision 11), from the transcript's window: none,
+/// or `count` of them, which the zone can fetch, is fetching, or failed
+/// to fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Earlier {
+    None,
+    Available { count: u64 },
+    Loading { count: u64, request: RequestId },
+    Failed { count: u64, why: SharedString },
+}
+
+/// A page to ask for: the entries before `before`, within `max_bytes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fetch {
+    pub before: EntryId,
+    pub max_bytes: usize,
 }
 
 /// What a reply does to the prompt input.
@@ -961,6 +983,10 @@ pub struct ChatModel {
     /// The first prompt is shown in the read-only input, waiting for a
     /// login ([`First::Show`]).
     first_shown: bool,
+    /// The transcript's window: the zone holds the entries from its
+    /// `from` on.
+    window: Option<Window>,
+    earlier: Earlier,
 }
 
 fn running(turn: &TurnState) -> bool {
@@ -1001,6 +1027,8 @@ impl ChatModel {
             login_note: None,
             terminal_login: None,
             first_shown: false,
+            window: None,
+            earlier: Earlier::None,
         }
     }
 
@@ -1174,11 +1202,140 @@ impl ChatModel {
         None
     }
 
+    /// The entries before the ones the zone holds.
+    pub fn earlier(&self) -> &Earlier {
+        &self.earlier
+    }
+
+    /// The page to ask for now (decision 11), given whether the Earlier
+    /// row is in view and was in the frame before: while entries are
+    /// available, whenever the row is in view; after a failure, only when
+    /// the row comes into view again (or on [`Self::retry`]); nothing while
+    /// a fetch waits, the link is down, the session can't be followed, or
+    /// with nothing earlier.
+    pub fn fetch_due(&self, row_in_view: bool, was_in_view: bool) -> Option<Fetch> {
+        let ask = match &self.earlier {
+            Earlier::Available { .. } => row_in_view,
+            Earlier::Failed { .. } => row_in_view && !was_in_view,
+            Earlier::None | Earlier::Loading { .. } => false,
+        };
+        if ask { self.fetch() } else { None }
+    }
+
+    /// The Earlier row was pressed: after a failure, ask again.
+    pub fn retry(&self) -> Option<Fetch> {
+        match &self.earlier {
+            Earlier::Failed { .. } => self.fetch(),
+            Earlier::None | Earlier::Available { .. } | Earlier::Loading { .. } => None,
+        }
+    }
+
+    /// The page before the window, when one can be asked for now.
+    fn fetch(&self) -> Option<Fetch> {
+        let live = match &self.phase {
+            AgentPhase::Live(_) => true,
+            AgentPhase::Connecting | AgentPhase::NotStarted(_) | AgentPhase::Lost { .. } | AgentPhase::Broken { .. } => false,
+        };
+        let up = match self.link {
+            Link::Up => true,
+            Link::Reconnecting => false,
+        };
+        let window = self.window.filter(|_| live && up)?;
+        Some(Fetch { before: window.from, max_bytes: PAGE_BYTES })
+    }
+
+    /// The fetch [`Self::fetch_due`] or [`Self::retry`] asked for went out
+    /// as `request`.
+    pub fn fetching(&mut self, request: RequestId) {
+        let count = match &self.earlier {
+            Earlier::Available { count } | Earlier::Failed { count, .. } => *count,
+            Earlier::None | Earlier::Loading { .. } => return,
+        };
+        self.earlier = Earlier::Loading { count, request };
+        self.pending.insert(request, Sent::Fetch);
+    }
+
+    /// The fetch [`Self::fetch_due`] or [`Self::retry`] asked for couldn't
+    /// go (the session isn't connected): failed, with [`UNSENT`].
+    pub fn fetch_unsent(&mut self) {
+        let count = match &self.earlier {
+            Earlier::Available { count } | Earlier::Failed { count, .. } => *count,
+            Earlier::None | Earlier::Loading { .. } => return,
+        };
+        self.earlier = Earlier::Failed { count, why: UNSENT.into() };
+    }
+
+    /// The reply to fetch `request`: its page has already been folded, so
+    /// an `Ok` finds the window moved; a refusal shows on the row. A reply
+    /// the zone no longer waits for (a replay started since) changes
+    /// nothing.
+    fn fetched(&mut self, request: RequestId, outcome: Result<(), String>) {
+        let Earlier::Loading { count, request: waiting } = &self.earlier else { return };
+        if *waiting != request {
+            return;
+        }
+        let count = *count;
+        self.earlier = match outcome {
+            Ok(()) => Earlier::Available { count },
+            Err(why) => Earlier::Failed { count, why: why.into() },
+        };
+        if self.window.is_none() {
+            self.earlier = Earlier::None;
+        }
+    }
+
+    /// Follows the transcript's window: none when it has none; else its
+    /// count, available again once a page came (or the zone starts over),
+    /// a fetch or a failure kept otherwise.
+    fn follow_window(&mut self, window: Option<Window>, reset: bool, paged: bool) {
+        self.window = window;
+        let Some(Window { earlier: count, .. }) = window else {
+            self.earlier = Earlier::None;
+            return;
+        };
+        let was = std::mem::replace(&mut self.earlier, Earlier::None);
+        self.earlier = if reset || paged {
+            Earlier::Available { count }
+        } else {
+            match was {
+                Earlier::None | Earlier::Available { .. } => Earlier::Available { count },
+                Earlier::Loading { request, .. } => Earlier::Loading { count, request },
+                Earlier::Failed { why, .. } => Earlier::Failed { count, why },
+            }
+        };
+    }
+
+    /// Copies the entries a fetched page put in front of the held ones,
+    /// renders their Markdown once and draws them, with each thought open
+    /// as the user left it; gives the splice at the list's start.
+    fn prepend_entries(&mut self, transcript: &Transcript, added_from: Option<EntryId>) -> Option<Splice> {
+        let held = self.entries.first().map(|(id, _)| *id).or(added_from);
+        let fresh: Vec<(EntryId, Entry)> = transcript
+            .entries()
+            .take_while(|(id, _)| held.is_none_or(|held| *id < held))
+            .map(|(id, entry)| (id, entry.clone()))
+            .collect();
+        if fresh.is_empty() {
+            return None;
+        }
+        for (id, entry) in &fresh {
+            self.keep_render(*id, render_entry(entry));
+        }
+        let blocks: Vec<Block> =
+            fresh.iter().flat_map(|(id, entry)| self.draw(*id, entry, self.thought_open(*id))).collect();
+        let count = blocks.len();
+        self.blocks.splice(0..0, blocks);
+        self.entries.splice(0..0, fresh);
+        Some(Splice { range: 0..0, count })
+    }
+
     /// Folds what changed in the shared transcript into the zone's copy.
     pub fn absorb(&mut self, transcript: &Transcript, changes: Changes) -> Absorbed {
         let before = self.before();
         let mut splices = Vec::new();
         if changes.reset {
+            // A fetch in flight belongs to the copy that is gone.
+            self.pending.retain(|_, sent| *sent != Sent::Fetch);
             self.entries = transcript.entries().map(|(id, entry)| (id, entry.clone())).collect();
             self.auto_open = None;
             self.rendered.clear();
@@ -1190,6 +1347,9 @@ impl ChatModel {
             self.blocks = self.entries.iter().flat_map(|(id, entry)| self.draw(*id, entry, false)).collect();
             splices.push(Splice { range: 0..old, count: self.blocks.len() });
         } else {
+            if changes.prepended.is_some_and(|added| added > 0) {
+                splices.extend(self.prepend_entries(transcript, changes.added_from));
+            }
             if let Some(through) = changes.trimmed_through {
                 self.entries.retain(|(id, _)| *id > through);
                 self.rendered.retain(|id, _| *id > through);
@@ -1240,6 +1400,7 @@ impl ChatModel {
             self.slot = transcript.slot().clone();
         }
         splices.extend(self.update_thoughts(changes.reset));
+        self.follow_window(transcript.window(), changes.reset, changes.prepended.is_some());
         self.finish(before, splices, changes.from_replay)
     }
 
@@ -1785,6 +1946,10 @@ impl ChatModel {
     /// the draft.
     pub fn replied(&mut self, request: RequestId, outcome: Result<(), String>) -> Replied {
         let Some(sent) = self.pending.remove(&request) else { return Replied::Nothing };
+        if sent == Sent::Fetch {
+            self.fetched(request, outcome);
+            return Replied::Nothing;
+        }
         self.answered(sent, outcome)
     }
 
@@ -1836,6 +2001,8 @@ impl ChatModel {
                 Sent::FirstPrompt(_) | Sent::Resend | Sent::Unqueue | Sent::Answer(_) | Sent::Restart { .. } | Sent::Login,
                 Ok(()),
             ) => Replied::Nothing,
+            // Answered through `fetched`, which knows the request.
+            (Sent::Fetch, Ok(()) | Err(_)) => Replied::Nothing,
             (Sent::Login, Err(why)) => {
                 self.login_note = Some(why);
                 Replied::Nothing
@@ -2171,6 +2338,12 @@ impl ChatModel {
         out.push_str(&format!("--- conversation entries={}", self.entries.len()));
         if let Some(at_end) = at_end {
             out.push_str(if at_end { " at=end" } else { " at=away" });
+        }
+        match &self.earlier {
+            Earlier::None => out.push_str(" earlier=none"),
+            Earlier::Available { count } => out.push_str(&format!(" earlier={count}")),
+            Earlier::Loading { .. } => out.push_str(" earlier=loading"),
+            Earlier::Failed { count, why } => out.push_str(&format!(" earlier={count} fetch-error={:?}", why.as_ref())),
         }
         out.push_str(&format!("\n--- prompt status={}", self.prompt_status().word()));
         if let Some(first) = self.first_shown() {
@@ -3257,13 +3430,13 @@ mod tests {
 --- entry 6 notice level=warn \"1 line was not an ACP message\"
 --- working \"Working…\"
 --- queued waiting \"next\"
---- conversation entries=6 at=end
+--- conversation entries=6 at=end earlier=none
 --- prompt status=streaming
 ";
         assert_eq!(zone.model.describe(1, true, &found(&zone.model), &linux), expected);
         let wait = zone.model.wait_text(&found(&zone.model), &linux);
         assert!(wait.starts_with("--- agent state=ready name=\"Fake Agent\" turn=working"), "{wait}");
-        assert!(wait.contains("--- conversation entries=6\n"), "{wait}");
+        assert!(wait.contains("--- conversation entries=6 earlier=none\n"), "{wait}");
 
         let mut zone = Zone::new(None);
         zone.model.set_note("the profile \"Old\" is gone; this tab uses \"Fake\"");
@@ -3276,7 +3449,7 @@ mod tests {
              it will update once its terminals have ended\" turn=idle activity=none status=none link=up session=open \
              continue=none:no-conversation\n\
              --- note \"the profile \\\"Old\\\" is gone; this tab uses \\\"Fake\\\"\"\n\
-             --- conversation entries=0 at=away\n\
+             --- conversation entries=0 at=away earlier=none\n\
              --- prompt status=disabled\n"
         );
         assert_eq!(zone.model.note(), Some("the profile \"Old\" is gone; this tab uses \"Fake\""));
@@ -3633,7 +3806,7 @@ mod tests {
 --- entry 3 thought open=false \"- [ ] check `x`\\n- see https://t.example\"
 --- block entry=3 part=0 kind=list \"- [ ] check x\\n- see https://t.example\"
 --- link entry=3 part=0 target=\"https://t.example\" text=\"https://t.example\" action=open
---- conversation entries=3 at=end
+--- conversation entries=3 at=end earlier=none
 ";
         assert!(dump.contains(expected), "{dump}");
         assert!(!dump.contains("--- block entry=1"), "{dump}");
@@ -4165,5 +4338,207 @@ mod tests {
         // No login: sent as ever.
         let mut zone = Zone::new(Some("hi"));
         assert_eq!(zone.feed(&[ready()]).first, Some(First::Send("hi".into())));
+    }
+
+    // OpenSpec change `agents-log-paging`, tasks 5.3 and 5.4: the window,
+    // the Earlier row's fetches and the page fold.
+
+    /// A server's log: the agent ready, the conversation titled, a user's
+    /// message, then `count` agent messages of 20 KiB, a thought among
+    /// them, the turn ended.
+    fn long_log(count: u64) -> Transcript {
+        let mut log = Transcript::new();
+        let mut events = vec![
+            ready(),
+            Event::Conversation { conversation: Conversation { title: Some("Long talk".into()), ..conversation(crate::agent::transcript::Continuation::Resume) } },
+            added(1, user("go")),
+            turn(TurnState::Working),
+        ];
+        for n in 0..count {
+            let entry = if n == 3 { thought("# Thinking\n\nabout it") } else { agent(&format!("**{n}** {}", "x".repeat(20 * 1024))) };
+            events.push(added(n + 2, entry));
+        }
+        events.push(turn(TurnState::Ended { stop: StopReason::EndTurn }));
+        for event in &events {
+            log.apply(event).unwrap();
+        }
+        log
+    }
+
+    /// A zone attached to `server`'s log with its newest page.
+    fn paged(server: &Transcript) -> Zone {
+        let mut zone = Zone::new(None);
+        zone.replay(&server.page(PAGE_BYTES));
+        zone
+    }
+
+    /// The server's answer to the zone's fetch, folded as the sink folds it
+    /// (the page first), then the reply.
+    fn answer_fetch(zone: &mut Zone, server: &Transcript, fetch: Fetch, request: RequestId) -> Absorbed {
+        let fetched = server.fetch(fetch.before, fetch.max_bytes);
+        let values: Vec<_> = fetched.events.iter().map(Event::to_value).collect();
+        zone.shared.prepend(&values, fetched.more).unwrap();
+        let absorbed = zone.absorb();
+        assert_eq!(zone.model.replied(request, Ok(())), Replied::Nothing);
+        absorbed
+    }
+
+    fn conversation_line(model: &ChatModel) -> String {
+        let dump = model.describe(1, false, &found(model), &linux);
+        dump.lines().find(|line| line.starts_with("--- conversation")).unwrap().to_string()
+    }
+
+    #[test]
+    fn a_paged_zone_fetches_while_the_row_shows_and_folds_each_page_in_front() {
+        let server = long_log(40);
+        let mut zone = paged(&server);
+        let window = zone.shared.transcript().window().expect("800 KiB is paged");
+        let count = window.earlier;
+        assert_eq!(*zone.model.earlier(), Earlier::Available { count });
+        assert_eq!(zone.model.title(), "Long talk", "the page carries the title");
+        assert_eq!(zone.model.blocks().first().map(|block| block.entry), Some(window.from));
+
+        // Asked for only while the row is in view.
+        assert_eq!(zone.model.fetch_due(false, false), None);
+        let fetch = zone.model.fetch_due(true, false).expect("a fetch while the row shows");
+        assert_eq!(fetch, Fetch { before: window.from, max_bytes: PAGE_BYTES });
+        zone.model.fetching(7);
+        assert!(matches!(zone.model.earlier(), Earlier::Loading { count: c, request: 7 } if *c == count));
+        assert_eq!(zone.model.fetch_due(true, true), None, "nothing more while it loads");
+        assert!(conversation_line(&zone.model).ends_with(" earlier=loading"));
+
+        // The page goes in front: its entries' blocks are one splice at 0,
+        // their Markdown rendered once, the row's count lower, nothing
+        // raised, and a `done` the user saw stays seen.
+        assert_eq!(zone.model.seen(), Some(None));
+        let shown = zone.model.blocks().len();
+        let absorbed = answer_fetch(&mut zone, &server, fetch, 7);
+        let added = zone.model.blocks().len() - shown;
+        assert_eq!(absorbed.splices, [Splice { range: 0..0, count: added }]);
+        assert!(added > 0);
+        assert_eq!((absorbed.notice, absorbed.status, absorbed.title_changed), (None, None, false));
+        assert!(zone.model.seen && zone.model.shown_status().is_none(), "the prepend unsaw the done");
+        let left = zone.shared.transcript().window().map_or(0, |window| window.earlier);
+        assert!(left < count);
+        assert_eq!(*zone.model.earlier(), if left == 0 { Earlier::None } else { Earlier::Available { count: left } });
+        let first = zone.model.blocks()[0].entry;
+        assert!(zone.model.rendered.contains_key(&first) || matches!(zone.shared.transcript().entry(first), Some(Entry::User { .. })));
+        let ids: Vec<EntryId> = zone.model.entries.iter().map(|(id, _)| *id).collect();
+        let held: Vec<EntryId> = zone.shared.transcript().entries().map(|(id, _)| id).collect();
+        assert_eq!(ids, held, "the zone holds the transcript's entries, in order");
+
+        // Fetched back to the start, the last page drops the window.
+        let mut request = 8;
+        while let Some(fetch) = zone.model.fetch_due(true, true) {
+            zone.model.fetching(request);
+            answer_fetch(&mut zone, &server, fetch, request);
+            request += 1;
+        }
+        assert_eq!(*zone.model.earlier(), Earlier::None);
+        assert_eq!(zone.model.entries.len() as u64, 41);
+        assert_eq!(zone.model.entries[0].0, EntryId(1));
+        assert!(conversation_line(&zone.model).ends_with(" earlier=none"));
+        // The thought (entry 5) has its part, drawn closed.
+        assert!(!parts_of(&zone.model, 5).is_empty());
+        in_step(&zone.model);
+    }
+
+    /// Decision 12: `earlier=N` after `at=`, which `wait_text` drops, so a
+    /// wait reads `entries=N earlier=N`; a failure's reason escaped as the
+    /// other quoted fields are.
+    #[test]
+    fn the_conversation_line_counts_the_earlier_entries() {
+        let server = long_log(40);
+        let mut zone = paged(&server);
+        let count = zone.shared.transcript().window().unwrap().earlier;
+        let held = zone.model.entries.len();
+        assert_eq!(conversation_line(&zone.model), format!("--- conversation entries={held} at=away earlier={count}"));
+        let wait = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(wait.contains(&format!("--- conversation entries={held} earlier={count}\n")), "{wait}");
+        zone.model.fetching(3);
+        zone.model.replied(3, Err("refused: \"no\"\nat all".into()));
+        assert!(
+            conversation_line(&zone.model).ends_with(&format!(" earlier={count} fetch-error=\"refused: \\\"no\\\"\\nat all\"")),
+            "{}",
+            conversation_line(&zone.model)
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_asks_again_only_when_the_row_comes_back_or_is_pressed() {
+        let server = long_log(40);
+        let mut zone = paged(&server);
+        let count = zone.shared.transcript().window().unwrap().earlier;
+        assert_eq!(zone.model.retry(), None, "nothing to retry");
+        zone.model.fetching(3);
+        zone.model.replied(3, Err("the connection to the terminal server is down".into()));
+        assert_eq!(
+            *zone.model.earlier(),
+            Earlier::Failed { count, why: "the connection to the terminal server is down".into() }
+        );
+        assert_eq!(
+            conversation_line(&zone.model),
+            format!("--- conversation entries={} at=away earlier={count} fetch-error=\"the connection to the terminal server is down\"", zone.model.entries.len())
+        );
+        assert_eq!(zone.model.fetch_due(true, true), None, "still in view: not again");
+        assert!(zone.model.fetch_due(true, false).is_some(), "back in view: again");
+        assert!(zone.model.retry().is_some(), "a press: again");
+        // Nothing while reconnecting, not even on a press.
+        zone.model.set_link(Link::Reconnecting);
+        assert_eq!((zone.model.fetch_due(true, false), zone.model.retry()), (None, None));
+        zone.model.set_link(Link::Up);
+        // A fetch that then succeeds is available again.
+        zone.model.fetching(4);
+        let fetch = Fetch { before: zone.shared.transcript().window().unwrap().from, max_bytes: PAGE_BYTES };
+        answer_fetch(&mut zone, &server, fetch, 4);
+        assert!(matches!(zone.model.earlier(), Earlier::Available { .. } | Earlier::None));
+    }
+
+    #[test]
+    fn a_reset_drops_a_fetch_in_flight_and_its_late_reply() {
+        let server = long_log(40);
+        let mut zone = paged(&server);
+        let count = zone.shared.transcript().window().unwrap().earlier;
+        zone.model.fetching(5);
+        // A reconnect replays the newest page again.
+        zone.replay(&server.page(PAGE_BYTES));
+        assert_eq!(*zone.model.earlier(), Earlier::Available { count });
+        assert_eq!(zone.model.replied(5, Err("late".into())), Replied::Nothing);
+        assert_eq!(*zone.model.earlier(), Earlier::Available { count }, "the late reply changed nothing");
+        assert_eq!(zone.model.refusal(), None);
+        // A short log has no window, and nothing to fetch.
+        let mut short = Zone::ready();
+        short.feed(&[added(1, user("hi"))]);
+        assert_eq!(*short.model.earlier(), Earlier::None);
+        assert_eq!(short.model.fetch_due(true, false), None);
+    }
+
+    #[test]
+    fn a_tool_call_in_progress_above_the_page_shows_working_until_fetched() {
+        let mut server = Transcript::new();
+        let mut events = vec![
+            ready(),
+            added(1, user("go")),
+            turn(TurnState::Working),
+            added(2, Entry::Tool { call: "c1".into(), title: "cargo build".into(), kind: ToolKind::Execute, status: ToolStatus::InProgress }),
+        ];
+        for n in 0..20 {
+            events.push(added(n + 3, agent(&"y".repeat(20 * 1024))));
+        }
+        for event in &events {
+            server.apply(event).unwrap();
+        }
+        let mut zone = paged(&server);
+        assert_eq!(zone.model.working_row(), Some(WorkingRow::Working));
+        let mut request = 1;
+        let mut working = None;
+        while let Some(fetch) = zone.model.fetch_due(true, true) {
+            zone.model.fetching(request);
+            let absorbed = answer_fetch(&mut zone, &server, fetch, request);
+            working = absorbed.working.or(working);
+            request += 1;
+        }
+        assert_eq!(working, Some(Some(WorkingRow::Tool { title: "cargo build".into() })));
+        assert_eq!(zone.model.working_row(), Some(WorkingRow::Tool { title: "cargo build".into() }));
     }
 }

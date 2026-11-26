@@ -1,7 +1,7 @@
 //! Opt-in performance suite: keystroke latency (`--latency-bench`) and
-//! vtebench throughput, in a local shell tab, and a Markdown reply streamed
-//! into an agent zone by the fake ACP agent. It reports numbers and never
-//! fails on them.
+//! vtebench throughput, in a local shell tab, a Markdown reply streamed
+//! into an agent zone by the fake ACP agent, and a long agent conversation
+//! attached again. It reports numbers and never fails on them.
 //!
 //! ```sh
 //! cargo build --release
@@ -29,8 +29,8 @@
 //! Each run is kept in `target/tmp/perf/<UTC time>/` (`latest` links to the
 //! newest), with `summary.toml` and every case's logs and raw data. Each
 //! case runs in a terminal server of its own (`tests/common/server.rs`),
-//! which needs `brindle-remote` beside the release binary. The agent case
-//! needs the fake ACP agent (`tests/common/fake_agent.rs`: beside the
+//! which needs `brindle-remote` beside the release binary. The agent cases
+//! need the fake ACP agent (`tests/common/fake_agent.rs`: beside the
 //! release build, or `BRINDLE_FAKE_ACP_AGENT`) and skips without it.
 
 #[path = "../common/mod.rs"]
@@ -48,12 +48,13 @@ use std::time::Instant;
 use common::Selection;
 use common::server::{Suite, private_dir};
 pub use common::Result;
-use report::{LatencyResult, StreamResult, Summary, ThroughputResult};
+use report::{AttachResult, LatencyResult, StreamResult, Summary, ThroughputResult};
 
 pub enum Measured {
     Latency(LatencyResult),
     Throughput(ThroughputResult),
     Stream(StreamResult),
+    Attach(AttachResult),
     Skip(String),
 }
 
@@ -99,6 +100,7 @@ fn cases() -> Vec<Case> {
         Case { name: "latency-shell", run: cases::latency_shell },
         Case { name: "throughput-brindle", run: cases::throughput_brindle },
         Case { name: "agent-markdown-stream", run: agent::markdown_stream },
+        Case { name: "agent-attach-long", run: agent::attach_long },
     ]
 }
 
@@ -248,6 +250,10 @@ fn main() {
                 println!("measured {} ({took:.0}s)", case.name);
                 summary.stream.insert(case.name.into(), result);
             }
+            Ok(Measured::Attach(result)) => {
+                println!("measured {} ({took:.0}s)", case.name);
+                summary.attach.insert(case.name.into(), result);
+            }
             Ok(Measured::Skip(why)) => println!("skipped  {}: {why}", case.name),
             Err(why) => {
                 println!("FAILED   {} ({took:.0}s): {why}", case.name);
@@ -316,6 +322,7 @@ fn self_test() -> i32 {
         ("server helpers", common::server::self_test),
         ("summary write", self_test_summary),
         ("agent stream", agent::self_test),
+        ("agent attach", agent::self_test_attach),
         ("fake agent lookup", common::fake_agent::self_test),
     ];
     let mut failed = 0;

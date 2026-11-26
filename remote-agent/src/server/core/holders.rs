@@ -91,6 +91,15 @@ impl Holder {
         status(self.welcome.as_ref(), sessions)
     }
 
+    /// Whether it is of the core's build ([`policy::adoption`]); one that
+    /// hasn't welcomed the core yet counts as another build's, so an agent
+    /// checkpoint for it is written whole.
+    pub(super) fn adoption(&self) -> Adoption {
+        self.welcome
+            .as_ref()
+            .map_or(Adoption::Drain, |welcome| welcome.adoption)
+    }
+
     fn draining(&self) -> bool {
         self.welcome
             .as_ref()
@@ -390,6 +399,16 @@ impl<L: EventLoop> Core<L> {
             }
             ToCore::Exited(exited) => self.session_exited(token, exited.session, exited.code),
             ToCore::Error(holder_error) => {
+                // What it stores of the session's checkpoint is no longer
+                // known: the next is whole (agents-log-paging decision 9).
+                if let Some(agent) = holder_error
+                    .session
+                    .and_then(|id| self.sessions.get_mut(&id))
+                    .filter(|session| session.holder == token)
+                    .and_then(|session| session.agent())
+                {
+                    agent.forget_stored();
+                }
                 let client = holder_error
                     .session
                     .and_then(|id| self.sessions.get(&id))
@@ -777,7 +796,9 @@ pub(super) fn unsent(message: &ToHolder, error: &io::Error) -> Unsent {
         ToHolder::Input(data) => session(data.session, "input"),
         ToHolder::Resize(resize) => session(resize.session, "a resize"),
         ToHolder::Hangup(target) => session(target.session, "a hang-up"),
-        ToHolder::CheckpointBegin(begin) => session(begin.session, "a checkpoint"),
+        ToHolder::CheckpointBegin(begin) | ToHolder::CheckpointAppend(begin) => {
+            session(begin.session, "a checkpoint")
+        }
         ToHolder::CheckpointChunk(chunk) => session(chunk.session, "a checkpoint"),
         ToHolder::CheckpointEnd(end) => session(end.session, "a checkpoint"),
         ToHolder::Reparent(reparent) => session(reparent.session, "the window that owns its console"),

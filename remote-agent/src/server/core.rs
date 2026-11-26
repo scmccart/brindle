@@ -898,6 +898,7 @@ mod tests {
                         session: SESSION,
                         cols: 100,
                         rows: 30,
+                        page: None,
                     })
                     .encode(),
                 );

@@ -94,6 +94,14 @@ impl AgentLink {
         self.0.login(method)
     }
 
+    /// Fetches the whole entries before entry `before` within `max_bytes`
+    /// (`AGENT_FETCH`, OpenSpec change `agents-log-paging`), as
+    /// [`AgentLink::prompt`]: the sink folds the page in front before the
+    /// reply comes; while the link is down the reply is its failure.
+    pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<protocol::RequestId> {
+        self.0.fetch(before, max_bytes)
+    }
+
     /// Cancels the running turn, or the agent's login; true when it was
     /// sent.
     pub fn cancel(&self) -> bool {
@@ -145,6 +153,10 @@ impl AgentLink {
     }
 
     pub fn login(&self, _method: &str) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn fetch(&self, _before: u64, _max_bytes: u32) -> Option<protocol::RequestId> {
         match *self {}
     }
 

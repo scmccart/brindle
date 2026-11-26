@@ -24,6 +24,7 @@
 //! |   13 | `RESUME`           | core → holder | `session`                                                        |
 //! |   14 | `SET_META`         | core → holder | `session, meta` (version 2)                                      |
 //! |   15 | `SPAWN_PIPES`      | core → holder | `session, command, args, cwd, env, meta` (version 3)             |
+//! |   16 | `CHECKPOINT_APPEND`| core → holder | session, `len: u64 BE` (version 3)                               |
 //! |   32 | `WELCOME`          | holder → core | `protocol, build, pid, previous, sessions: [{session, pid, cols, rows, exit, meta, truncated, mode?}]` |
 //! |   33 | `OUTPUT`           | holder → core | session, bytes                                                   |
 //! |   34 | `SPAWNED`          | holder → core | `session, pid`                                                   |
@@ -48,6 +49,19 @@
 //! `mode: "pipes"` (a PTY session's `mode` is left out, so older transcripts
 //! encode as before), and only to a core that negotiated version 3: a core
 //! below it isn't shown pipe sessions at all.
+//!
+//! **Version 3: appended checkpoints** (OpenSpec change
+//! `agents-log-paging`, amending version 3 before it shipped).
+//! `CHECKPOINT_APPEND` opens a checkpoint blob as `CHECKPOINT_BEGIN` does,
+//! of the same kind (one open per session, [`MAX_OPEN_BLOBS`] in all),
+//! followed by `CHECKPOINT_CHUNK`s and `CHECKPOINT_END { covers }`. On
+//! `END` the holder appends the bytes to the stored checkpoint instead of
+//! replacing it, and covers the tail as for a whole one. It refuses, with
+//! an `ERROR` for the session and the stored checkpoint and tail kept, an
+//! append onto an empty checkpoint and one that would take the stored
+//! checkpoint past its limit. Both are length checks: the holder still
+//! reads none of it. Adopting sends the stored checkpoint, whole and
+//! appended parts as one blob. A connection below version 3 is refused it.
 //!
 //! **Checkpoints and tails are chunked.** A checkpoint (the core's replay
 //! stream for a session) can pass the 1 MiB frame limit, and a full tail
@@ -118,6 +132,8 @@ pub const MSG_RESUME: u8 = 13;
 pub const MSG_SET_META: u8 = 14;
 /// H1 version 3.
 pub const MSG_SPAWN_PIPES: u8 = 15;
+/// H1 version 3.
+pub const MSG_CHECKPOINT_APPEND: u8 = 16;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_OUTPUT: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -404,6 +420,9 @@ pub enum ToHolder {
     SetMeta(SetMeta),
     /// Start a program on plain pipes (H1 version 3).
     SpawnPipes(SpawnPipes),
+    /// Open a checkpoint blob that `CHECKPOINT_END` appends to the stored
+    /// one (H1 version 3).
+    CheckpointAppend(BlobBegin),
 }
 
 impl ToHolder {
@@ -426,6 +445,7 @@ impl ToHolder {
             Self::Resume(m) => wire::json(MSG_RESUME, m),
             Self::SetMeta(m) => wire::json(MSG_SET_META, m),
             Self::SpawnPipes(m) => wire::json(MSG_SPAWN_PIPES, m),
+            Self::CheckpointAppend(m) => encode_begin(MSG_CHECKPOINT_APPEND, m),
         }
     }
 
@@ -452,6 +472,9 @@ impl ToHolder {
             MSG_RESUME => Self::Resume(wire::from_json("RESUME", frame)?),
             MSG_SET_META => Self::SetMeta(wire::from_json("SET_META", frame)?),
             MSG_SPAWN_PIPES => Self::SpawnPipes(wire::from_json("SPAWN_PIPES", frame)?),
+            MSG_CHECKPOINT_APPEND => {
+                Self::CheckpointAppend(decode_begin("CHECKPOINT_APPEND", frame)?)
+            }
             other => return Err(wire::unknown_type("core-to-holder", other)),
         })
     }
@@ -467,6 +490,17 @@ impl ToHolder {
                 covers,
             })))
             .collect()
+    }
+
+    /// Bytes to append to the stored checkpoint, covering `covers` bytes
+    /// of the tail: `CHECKPOINT_APPEND`, chunks of [`CHUNK_LEN`] and
+    /// `CHECKPOINT_END` (H1 version 3).
+    pub fn checkpoint_append(session: SessionId, bytes: &[u8], covers: u64) -> Vec<Self> {
+        let mut messages = Self::checkpoint(session, bytes, covers);
+        if let Some(Self::CheckpointBegin(begin)) = messages.first().cloned() {
+            messages[0] = Self::CheckpointAppend(begin);
+        }
+        messages
     }
 }
 
@@ -925,6 +959,7 @@ pub(crate) mod samples {
                 env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
                 meta: meta(),
             }),
+            ToHolder::CheckpointAppend(BlobBegin { session: 2, len: 5 }),
         ]
     }
 
@@ -1024,7 +1059,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToHolder::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_HELLO..=MSG_SPAWN_PIPES {
+        for expected in MSG_HELLO..=MSG_CHECKPOINT_APPEND {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -1042,6 +1077,27 @@ mod tests {
         {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
+    }
+
+    #[test]
+    fn an_append_is_a_checkpoint_whose_begin_is_checkpoint_append() {
+        let bytes = vec![7u8; CHUNK_LEN + 3];
+        let whole = ToHolder::checkpoint(4, &bytes, 9);
+        let append = ToHolder::checkpoint_append(4, &bytes, 9);
+        assert_eq!(append.len(), whole.len());
+        assert_eq!(
+            append[0],
+            ToHolder::CheckpointAppend(BlobBegin {
+                session: 4,
+                len: bytes.len() as u64
+            })
+        );
+        assert_eq!(append[1..], whole[1..]);
+        let frame = append[0].encode().unwrap();
+        assert_eq!(frame.msg_type, 16);
+        assert_eq!(frame.payload[..4], [0, 0, 0, 4]);
+        // An empty append is a begin of 0 and an end.
+        assert_eq!(ToHolder::checkpoint_append(4, b"", 0).len(), 2);
     }
 
     #[test]

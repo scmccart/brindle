@@ -372,6 +372,10 @@ and one in an agent zone:
   answering until Brindle sees the reply's last line and quits, streamed in 32-byte chunks and again in one, and the
   difference. It needs the test agent `brindle-fake-acp-agent`, which
   `cargo build --release` builds beside Brindle.
+- **Long conversation attach** (`agent-attach-long`): the time from a launch
+  to its restored agent tab showing the end of a conversation of about
+  15 MiB, which it attaches again and pages, until Brindle quits on it. It
+  needs the same test agent.
 
 The suite reports numbers and never fails on them. Run it on an idle machine and
 compare runs made on the same machine. Each run is kept in
@@ -760,6 +764,13 @@ blocks that Toggle Agent Thoughts opens. The zone's status dot follows the agent
 or error dot goes once you type in the prompt input. An agent's tab title is
 the name it gives, else the profile's.
 
+A long conversation opens at its newest messages: an attach (a relaunch, Attach
+Session…) shows the newest 256 KiB of it, and an "Earlier messages" row above
+the first loads the rest a page at a time as you scroll up to it (with the
+wheel or shift-pageup), keeping what you are reading where it is. While a page
+loads the row turns a spinner; one that couldn't be loaded says why, and loads
+again when you scroll back to it or press it.
+
 The agent's messages and thoughts are drawn as Markdown (CommonMark, with
 GitHub's strikethrough, task lists, tables and autolinks): headings,
 emphasis, inline code, code blocks in the terminal's font with a label and a
@@ -815,7 +826,7 @@ agent's own command line, then open a new tab. An agent that exits, or speaks
 another ACP version, leaves its conversation readable.
 
 Not yet: syntax highlighting, logging in from the zone (`agents-login`), going on after an agent exits (`agents-session-recovery`),
-paging long conversations (`agents-log-paging`) and ACP version 2
+and ACP version 2
 (`agents-acp-v2`), each a change of its own; nor the agent's file and
 terminal access, modes, slash commands, mixing agent and terminal zones in a
 tab, finding or selecting text in a conversation, or editing agent profiles

@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
 
-use brindle_remote_protocol::Frame;
+use brindle_remote_protocol::{Frame, SessionId};
 use brindle_remote_protocol::endpoint::Endpoints;
 use brindle_remote_protocol::holder::{self as h1, Drain, Goodbye, Previous, ToCore, ToHolder};
 
@@ -2220,4 +2220,121 @@ fn a_bare_name_that_is_a_batch_file_fails_with_how_to_run_it() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+// agents-log-paging 3.1: appended checkpoints (H1 3's `CHECKPOINT_APPEND`).
+
+/// Sends `bytes` as a whole checkpoint (`append` false) or appended to
+/// what is stored, covering `covers` bytes of the tail.
+fn store(core: &mut TestCore, session: SessionId, bytes: &[u8], covers: u64, append: bool) {
+    let messages = if append {
+        ToHolder::checkpoint_append(session, bytes, covers)
+    } else {
+        ToHolder::checkpoint(session, bytes, covers)
+    };
+    for message in messages {
+        core.send(message);
+    }
+}
+
+/// The `ERROR` the holder sends next, skipping output.
+fn next_error(core: &mut TestCore) -> (Option<SessionId>, String) {
+    match core.recv_skipping_output() {
+        ToCore::Error(error) => (error.session, error.message),
+        other => panic!("expected ERROR, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_whole_checkpoint_and_two_appends_are_adopted_as_their_concatenation() {
+    let (dir, mut core, _) = holder("append");
+    core.spawn_pipes(pipe_programs::copies(1));
+    core.input(1, b"a\n");
+    let seen = core.output_until(1, b"a\n");
+    store(&mut core, 1, b"BASE", seen.len() as u64, false);
+    core.input(1, b"b\n");
+    let seen = core.output_until(1, b"b\n");
+    store(&mut core, 1, b"+S1", seen.len() as u64, true);
+    core.input(1, b"c\n");
+    let seen = core.output_until(1, b"c\n");
+    store(&mut core, 1, b"+S2", seen.len() as u64, true);
+    core.input(1, b"d\n");
+    core.output_until(1, b"d\n");
+    drop(core);
+
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(2);
+    assert_eq!(adopted.checkpoints[&1], b"BASE+S1+S2");
+    assert_eq!(adopted.tails[&1], b"d\n", "each append covered its tail");
+    // A whole one replaces the base and its segments.
+    store(&mut core, 1, b"NEW", 2, false);
+    drop(core);
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(3);
+    assert_eq!(adopted.checkpoints[&1], b"NEW");
+    assert_eq!(adopted.tails[&1], b"");
+    core.hang_up(1);
+    core.pipes_end(1);
+}
+
+#[test]
+fn an_append_onto_nothing_or_past_64_mib_is_refused_and_changes_nothing() {
+    let (dir, mut core, _) = holder("append-refused");
+    // Onto a session with no checkpoint stored.
+    core.spawn_pipes(pipe_programs::copies(1));
+    core.input(1, b"x\n");
+    let seen = core.output_until(1, b"x\n");
+    store(&mut core, 1, b"+S1", seen.len() as u64, true);
+    assert_eq!(
+        next_error(&mut core),
+        (Some(1), "the checkpoint append was refused: nothing to append to".into())
+    );
+    // Past the 64 MiB a checkpoint may be.
+    core.spawn_pipes(pipe_programs::copies(2));
+    core.input(2, b"y\n");
+    let seen = core.output_until(2, b"y\n");
+    let base = vec![b'B'; h1::MAX_CHECKPOINT_LEN as usize - 4];
+    store(&mut core, 2, &base, seen.len() as u64, false);
+    core.input(2, b"z\n");
+    let seen = core.output_until(2, b"z\n");
+    store(&mut core, 2, b"+TOO+", seen.len() as u64, true);
+    let (session, message) = next_error(&mut core);
+    assert_eq!(session, Some(2));
+    assert!(
+        message.starts_with("the checkpoint append was refused: the checkpoint would be 67108865 bytes"),
+        "{message}"
+    );
+    drop(core);
+
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(2);
+    assert_eq!(adopted.checkpoints[&1], b"", "nothing was stored");
+    assert_eq!(adopted.tails[&1], b"x\n", "and the tail wasn't covered");
+    assert!(adopted.checkpoints[&2] == base, "the base is as it was");
+    assert_eq!(adopted.tails[&2], b"z\n");
+    for session in [1, 2] {
+        core.hang_up(session);
+        core.pipes_end(session);
+    }
+}
+
+#[test]
+fn an_append_on_an_h1_2_connection_is_refused() {
+    let (dir, mut first, _) = holder("append-h1-2");
+    first.spawn(programs::exits_after_a_line(1, 0));
+    store(&mut first, 1, b"CP", 0, false);
+    drop(first);
+    let mut older = TestCore::connect_to(&dir);
+    let adopted = older.hello_up_to(2, 2);
+    assert_eq!(adopted.welcome().protocol, 2);
+    store(&mut older, 1, b"+S1", 0, true);
+    assert_eq!(
+        next_error(&mut older),
+        (Some(1), "CHECKPOINT_APPEND needs H1 version 3".into())
+    );
+    drop(older);
+    let mut core = TestCore::connect_to(&dir);
+    let adopted = core.hello(3);
+    assert_eq!(adopted.checkpoints[&1], b"CP");
+    core.hang_up(1);
 }

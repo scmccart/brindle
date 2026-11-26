@@ -746,3 +746,95 @@ fn an_upgrade_mid_load_leaves_the_next_core_to_finish_it() {
     assert_eq!(says(&log), ["user: one", "agent: first reply", "user: two", "agent: next"]);
     assert_eq!(methods(&record), ["initialize", "session/load", "session/prompt"]);
 }
+
+// OpenSpec change `agents-log-paging`, task 3.4: which form an agent
+// checkpoint takes, read from what the holder stores.
+
+/// The records of the checkpoint the session's holder stores (the only
+/// holder in `dir`), read by a test core that adopts it while no core runs.
+fn stored_records(dir: &TempDir, id: SessionId) -> Vec<(char, u32)> {
+    let mut core = TestCore::connect_to(dir);
+    let adopted = core.hello(77);
+    let blob = adopted.checkpoints.get(&id).expect("the session's checkpoint");
+    checkpoint_records(blob)
+}
+
+/// A script with a short first turn, and a second that says `before`,
+/// waits at the gate it gives, then says ` and after`.
+fn two_turns(dir: &Path, name: &str) -> (PathBuf, support::fake_agent::Gate) {
+    let (mut script, _) = started(dir, name);
+    script
+        .step("expect session/prompt")
+        .step(said("first"))
+        .step(stop("end_turn"))
+        .step("expect session/prompt")
+        .step(said("before"));
+    let gate = script.gate();
+    script.step(said(" and after")).step(stop("end_turn"));
+    (script.write(), gate)
+}
+
+/// Runs [`two_turns`]'s first turn and the second up to its gate.
+fn to_the_gate(client: &mut TestClient, id: SessionId) {
+    client.transcript_until(id, "is ready", agent_ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", |log| {
+        says(log).contains(&"agent: first".to_owned()) && matches!(log.turn(), TurnState::Ended { .. })
+    });
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the second turn's start", |log| says(log).contains(&"agent: before".to_owned()));
+}
+
+#[test]
+fn a_step_down_writes_the_agent_checkpoint_whole_and_the_next_core_carries_the_turn_on() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-whole");
+    let (script, gate) = two_turns(&dir.path, "whole");
+    let (id, pid) = client.spawn_agent(client_agent(&script));
+    dir.track(pid);
+    to_the_gate(&mut client, id);
+
+    // The turns' checkpoints are small beside the spawn's base, so they
+    // were appended to it; the step-down's replaces them with one base.
+    step_down(&mut client);
+    assert_eq!(stored_records(&dir, id), [('B', 0)]);
+
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "a");
+    dir.track(client.core_pid());
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (id, pid));
+    gate.open();
+    let log = client.transcript_until(id, "has the second turn's end", |log| {
+        says(log).len() == 4 && matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
+    });
+    assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: before and after"]);
+}
+
+#[test]
+fn a_draining_holder_of_another_build_is_sent_only_whole_agent_checkpoints() {
+    let mut dir = TempDir::new("agent-drain");
+    let (old_bin, new_build) = other_build_copy(&dir);
+    start(&old_bin, "serve", &dir.path, &[("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "a");
+    dir.track(client.core_pid());
+    let (script, gate) = two_turns(&dir.path, "drain");
+    let (id, pid) = client.spawn_agent(client_agent(&script));
+    dir.track(pid);
+    dir.track(parent(pid).unwrap());
+    client.transcript_until(id, "is ready", agent_ready);
+
+    step_down(&mut client);
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, "a");
+    dir.track(client.core_pid());
+    assert_eq!(client.welcome.as_ref().unwrap().core_build, new_build);
+    client.reconnect_replay();
+    // Each of the turns' checkpoints (the prompts, the first turn's end)
+    // is small beside the base, so a holder of the core's own build would
+    // have segments appended; this one is draining.
+    to_the_gate(&mut client, id);
+    kill(client.core_pid());
+    assert!(client.closes());
+    assert_eq!(stored_records(&dir, id), [('B', 0)]);
+    drop(gate);
+}

@@ -16,7 +16,7 @@
 //! |    3 | `SPAWN`         | client → core | `req, command, args, cwd, env, cols, rows, cell_w, cell_h, scrollback, policy, profile?` |
 //! |    4 | `RESIZE`        | client → core | `session, cols, rows, cell_w, cell_h`                          |
 //! |    5 | `CLOSE`         | client → core | `session`                                                      |
-//! |    6 | `ATTACH`        | client → core | `req, session, cols, rows`                                     |
+//! |    6 | `ATTACH`        | client → core | `req, session, cols, rows, page?`                              |
 //! |    7 | `DETACH`        | client → core | `session, layout?`                                             |
 //! |    8 | `LIST`          | client → core | `req`                                                          |
 //! |    9 | `KILL`          | client → core | `req, target: {"session": id} \| "all"`                        |
@@ -33,6 +33,7 @@
 //! |   20 | `AGENT_RESEND`  | client → core | `req, session` (protocol 4)                                    |
 //! |   21 | `AGENT_RESTART` | client → core | `req, session, command, args, env` (protocol 4)                |
 //! |   22 | `AGENT_LOGIN`   | client → core | `req, session, method` (protocol 4)                            |
+//! |   23 | `AGENT_FETCH`   | client → core | `req, session, before, max_bytes` (protocol 4)                 |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
 //! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
@@ -44,6 +45,7 @@
 //! |   40 | `OK`            | core → client | `req`                                                          |
 //! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
 //! |   42 | `TRANSCRIPT`    | core → client | `session, events: [object]` (protocol 4)                       |
+//! |   43 | `AGENT_PAGE`    | core → client | `req, session, events: [object], last?: {more}` (protocol 4)   |
 //!
 //! Exchanges:
 //! - `HELLO` → `WELCOME`, or `ERROR` naming both ranges ([`negotiate`]).
@@ -126,6 +128,18 @@
 //!   frame holds whole events ([`pack_transcript`]). `ATTACH` of an agent
 //!   session is answered with `REPLAY_START`, `TRANSCRIPT`…, `REPLAY_END`,
 //!   then live `TRANSCRIPT`s; its `cols` and `rows` are ignored.
+//! - Paging (OpenSpec change `agents-log-paging`, amending protocol 4
+//!   before it shipped): an agent session's replay is a page of its newest
+//!   whole entries (`brindle-transcript`'s `Transcript::page`), about 256
+//!   KiB, behind a `window` event when older entries were left out.
+//!   `ATTACH`'s `page` asks for a smaller page, in bytes (the core clamps
+//!   it to its own; left out, the core's). `AGENT_FETCH` → `AGENT_PAGE`…
+//!   or `ERROR` asks for the entries before entry `before`, up to
+//!   `max_bytes` (clamped the same way): one or more `AGENT_PAGE` frames of
+//!   whole events with the request's `req` ([`pack_page`]), the last with
+//!   `last: {more}`, saying whether older entries remain; an empty page is
+//!   one frame. Only the client that has the session attached, and whose
+//!   replay of it has ended, may fetch.
 //! - `SessionInfo.agent` (`activity`, `name?`) is set for agent sessions,
 //!   which only protocol 4 lists, with size 0×0; it is left out otherwise.
 //!   [`AgentActivity`] is this crate's own closed enum, in program status's
@@ -179,6 +193,8 @@ pub const MSG_AGENT_RESEND: u8 = 20;
 pub const MSG_AGENT_RESTART: u8 = 21;
 /// Protocol 4.
 pub const MSG_AGENT_LOGIN: u8 = 22;
+/// Protocol 4.
+pub const MSG_AGENT_FETCH: u8 = 23;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_ERROR: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -192,6 +208,8 @@ pub const MSG_OK: u8 = 40;
 pub const MSG_PROCESS: u8 = 41;
 /// Protocol 4.
 pub const MSG_TRANSCRIPT: u8 = 42;
+/// Protocol 4.
+pub const MSG_AGENT_PAGE: u8 = 43;
 
 /// Bytes for one session: input from the client, output from the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +364,11 @@ pub struct Attach {
     pub session: SessionId,
     pub cols: u16,
     pub rows: u16,
+    /// Protocol 4: the most an agent session's replay page holds, in
+    /// bytes; the core clamps it to its own. Left out when unset, so an
+    /// `ATTACH` without it encodes as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -517,6 +540,47 @@ pub struct AgentLogin {
     pub method: String,
 }
 
+/// `AGENT_FETCH` (protocol 4): the entries before entry `before`, up to
+/// `max_bytes` of them (the core clamps it), answered by `AGENT_PAGE`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentFetch {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub before: u64,
+    pub max_bytes: u32,
+}
+
+/// `AGENT_PAGE` (protocol 4): one frame of an `AGENT_FETCH`'s answer, whole
+/// transcript events in order; the last frame carries `last`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentPage {
+    pub req: RequestId,
+    pub session: SessionId,
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<PageEnd>,
+}
+
+/// How a fetch's answer ends: whether older entries remain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageEnd {
+    pub more: bool,
+}
+
+impl AgentPage {
+    /// Refuses events that aren't JSON objects.
+    fn check(&self) -> io::Result<()> {
+        match self.events.iter().position(|event| !event.is_object()) {
+            None => Ok(()),
+            Some(index) => Err(wire::invalid(format!(
+                "AGENT_PAGE event {index} of session {} isn't a JSON object",
+                self.session
+            ))),
+        }
+    }
+}
+
 /// `AGENT_PROMPT` (protocol 4): plain text for the agent, sent now or
 /// queued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -578,9 +642,58 @@ pub fn pack_transcript(
     // `{"session":4294967295,"events":[]}`, the longest session id's; each
     // event after the first adds a comma.
     const ENVELOPE: usize = 34;
-    let mut messages = Vec::new();
+    Ok(pack_events(session, events, ENVELOPE)?
+        .into_iter()
+        .map(|events| Transcript { session, events })
+        .collect())
+}
+
+/// The `AGENT_PAGE` messages that answer fetch `req` with `events` for
+/// `session` in order: whole events per frame, `last` on the final one,
+/// and one frame with no events for an empty page. Refused as
+/// [`pack_transcript`] refuses.
+pub fn pack_page(
+    req: RequestId,
+    session: SessionId,
+    events: Vec<serde_json::Value>,
+    more: bool,
+) -> io::Result<Vec<AgentPage>> {
+    // `{"req":18446744073709551615,"session":4294967295,"events":[],
+    // "last":{"more":false}}`, the longest ids'.
+    const ENVELOPE: usize = 83;
+    let mut pages: Vec<AgentPage> = pack_events(session, events, ENVELOPE)?
+        .into_iter()
+        .map(|events| AgentPage {
+            req,
+            session,
+            events,
+            last: None,
+        })
+        .collect();
+    if pages.is_empty() {
+        pages.push(AgentPage {
+            req,
+            session,
+            events: Vec::new(),
+            last: None,
+        });
+    }
+    if let Some(page) = pages.last_mut() {
+        page.last = Some(PageEnd { more });
+    }
+    Ok(pages)
+}
+
+/// `events` cut into groups of whole events that each fit a frame with an
+/// `envelope` of that many bytes around them.
+fn pack_events(
+    session: SessionId,
+    events: Vec<serde_json::Value>,
+    envelope: usize,
+) -> io::Result<Vec<Vec<serde_json::Value>>> {
+    let mut groups = Vec::new();
     let mut current = Vec::new();
-    let mut size = ENVELOPE;
+    let mut size = envelope;
     for (index, event) in events.into_iter().enumerate() {
         if !event.is_object() {
             return Err(io::Error::new(
@@ -589,7 +702,7 @@ pub fn pack_transcript(
             ));
         }
         let len = serde_json::to_vec(&event).map_or(usize::MAX, |bytes| bytes.len());
-        if ENVELOPE.saturating_add(len) > crate::MAX_FRAME_PAYLOAD_SIZE {
+        if envelope.saturating_add(len) > crate::MAX_FRAME_PAYLOAD_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
@@ -599,22 +712,16 @@ pub fn pack_transcript(
             ));
         }
         if !current.is_empty() && size + 1 + len > crate::MAX_FRAME_PAYLOAD_SIZE {
-            messages.push(Transcript {
-                session,
-                events: std::mem::take(&mut current),
-            });
-            size = ENVELOPE;
+            groups.push(std::mem::take(&mut current));
+            size = envelope;
         }
         size += len + usize::from(!current.is_empty());
         current.push(event);
     }
     if !current.is_empty() {
-        messages.push(Transcript {
-            session,
-            events: current,
-        });
+        groups.push(current);
     }
-    Ok(messages)
+    Ok(groups)
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -716,6 +823,8 @@ pub enum ToCore {
     AgentRestart(AgentRestart),
     /// Protocol 4: log in an agent that needs a login.
     AgentLogin(AgentLogin),
+    /// Protocol 4: fetch entries older than the client holds.
+    AgentFetch(AgentFetch),
 }
 
 impl ToCore {
@@ -743,6 +852,7 @@ impl ToCore {
             Self::AgentResend(m) => wire::json(MSG_AGENT_RESEND, m),
             Self::AgentRestart(m) => wire::json(MSG_AGENT_RESTART, m),
             Self::AgentLogin(m) => wire::json(MSG_AGENT_LOGIN, m),
+            Self::AgentFetch(m) => wire::json(MSG_AGENT_FETCH, m),
         }
     }
 
@@ -772,6 +882,7 @@ impl ToCore {
             MSG_AGENT_RESEND => Self::AgentResend(wire::from_json("AGENT_RESEND", frame)?),
             MSG_AGENT_RESTART => Self::AgentRestart(wire::from_json("AGENT_RESTART", frame)?),
             MSG_AGENT_LOGIN => Self::AgentLogin(wire::from_json("AGENT_LOGIN", frame)?),
+            MSG_AGENT_FETCH => Self::AgentFetch(wire::from_json("AGENT_FETCH", frame)?),
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -796,6 +907,8 @@ pub enum ToClient {
     /// Protocol 4: an agent session's transcript events, live or within a
     /// replay.
     Transcript(Transcript),
+    /// Protocol 4: a frame of an `AGENT_FETCH`'s answer.
+    AgentPage(AgentPage),
 }
 
 impl ToClient {
@@ -817,6 +930,11 @@ impl ToClient {
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 wire::json(MSG_TRANSCRIPT, m)
             }
+            Self::AgentPage(m) => {
+                m.check()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+                wire::json(MSG_AGENT_PAGE, m)
+            }
         }
     }
 
@@ -837,6 +955,11 @@ impl ToClient {
                 let transcript: Transcript = wire::from_json("TRANSCRIPT", frame)?;
                 transcript.check()?;
                 Self::Transcript(transcript)
+            }
+            MSG_AGENT_PAGE => {
+                let page: AgentPage = wire::from_json("AGENT_PAGE", frame)?;
+                page.check()?;
+                Self::AgentPage(page)
             }
             other => return Err(wire::unknown_type("core-to-client", other)),
         })
@@ -917,6 +1040,14 @@ pub(crate) mod samples {
                 session: 3,
                 cols: 100,
                 rows: 30,
+                page: None,
+            }),
+            ToCore::Attach(Attach {
+                req: 3,
+                session: 9,
+                cols: 0,
+                rows: 0,
+                page: Some(16_384),
             }),
             ToCore::Detach(Detach {
                 session: 3,
@@ -1010,6 +1141,12 @@ pub(crate) mod samples {
                 req: 17,
                 session: 9,
                 method: "oauth-personal".into(),
+            }),
+            ToCore::AgentFetch(AgentFetch {
+                req: 18,
+                session: 9,
+                before: 120,
+                max_bytes: 262_144,
             }),
         ]
     }
@@ -1110,6 +1247,20 @@ pub(crate) mod samples {
             ToClient::Transcript(Transcript {
                 session: 9,
                 events: Vec::new(),
+            }),
+            ToClient::AgentPage(AgentPage {
+                req: 18,
+                session: 9,
+                events: vec![
+                    serde_json::json!({"event": "added", "id": 118, "entry": {"type": "user", "text": "hi"}}),
+                ],
+                last: None,
+            }),
+            ToClient::AgentPage(AgentPage {
+                req: 18,
+                session: 9,
+                events: Vec::new(),
+                last: Some(PageEnd { more: true }),
             }),
             ToClient::ServerStatus(ServerStatus {
                 req: 6,
@@ -1545,6 +1696,113 @@ mod tests {
             panic!("not TRANSCRIPT");
         };
         assert_eq!(transcript.events, [serde_json::json!({"later": {"x": [1]}})]);
+    }
+
+    #[test]
+    fn paging_messages_use_the_documented_field_names() {
+        let attach = |page| {
+            ToCore::Attach(Attach {
+                req: 2,
+                session: 3,
+                cols: 0,
+                rows: 0,
+                page,
+            })
+            .encode()
+            .unwrap()
+            .payload
+        };
+        assert_eq!(attach(None), br#"{"req":2,"session":3,"cols":0,"rows":0}"#, "as before");
+        assert_eq!(
+            attach(Some(4096)),
+            br#"{"req":2,"session":3,"cols":0,"rows":0,"page":4096}"#
+        );
+        let frame = ToCore::AgentFetch(AgentFetch {
+            req: 5,
+            session: 3,
+            before: 40,
+            max_bytes: 1024,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.msg_type, 23);
+        assert_eq!(
+            frame.payload,
+            br#"{"req":5,"session":3,"before":40,"max_bytes":1024}"#
+        );
+        let page = |last| {
+            ToClient::AgentPage(AgentPage {
+                req: 5,
+                session: 3,
+                events: Vec::new(),
+                last,
+            })
+            .encode()
+            .unwrap()
+        };
+        assert_eq!(page(None).msg_type, 43);
+        assert_eq!(page(None).payload, br#"{"req":5,"session":3,"events":[]}"#);
+        assert_eq!(
+            page(Some(PageEnd { more: false })).payload,
+            br#"{"req":5,"session":3,"events":[],"last":{"more":false}}"#
+        );
+        // A page's events must be objects, both ways.
+        let bad = AgentPage {
+            req: 5,
+            session: 3,
+            events: vec![serde_json::json!(1)],
+            last: None,
+        };
+        assert_eq!(
+            ToClient::AgentPage(bad).encode().unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let frame = Frame::new(MSG_AGENT_PAGE, br#"{"req":5,"session":3,"events":[1]}"#.to_vec()).unwrap();
+        assert_eq!(
+            ToClient::decode(&frame).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn a_page_is_packed_into_frames_of_whole_events_with_last_on_the_final_one() {
+        // A 3 MiB page: 48 events of 64 KiB.
+        let event = |n: usize| serde_json::json!({"event": "appended", "id": n, "text": "x".repeat(64 * 1024)});
+        let events: Vec<serde_json::Value> = (0..48).map(event).collect();
+        let packed = pack_page(u64::MAX, u32::MAX, events.clone(), true).unwrap();
+        assert!(packed.len() >= 3, "3 MiB needs at least three frames");
+        let mut unpacked = Vec::new();
+        for (index, page) in packed.iter().enumerate() {
+            assert_eq!((page.req, page.session), (u64::MAX, u32::MAX));
+            assert!(!page.events.is_empty());
+            let last = index + 1 == packed.len();
+            assert_eq!(page.last, last.then_some(PageEnd { more: true }));
+            let frame = ToClient::AgentPage(page.clone()).encode().unwrap();
+            assert!(frame.payload.len() <= crate::MAX_FRAME_PAYLOAD_SIZE);
+            unpacked.extend(page.events.clone());
+        }
+        assert_eq!(unpacked, events);
+        // An empty page is one frame.
+        assert_eq!(
+            pack_page(1, 2, Vec::new(), false).unwrap(),
+            [AgentPage {
+                req: 1,
+                session: 2,
+                events: Vec::new(),
+                last: Some(PageEnd { more: false }),
+            }]
+        );
+        // The largest event that fits a frame on its own does, with the
+        // longest ids and `last`.
+        let fill = crate::MAX_FRAME_PAYLOAD_SIZE
+            - br#"{"req":18446744073709551615,"session":4294967295,"events":[{"t":""}],"last":{"more":false}}"#.len();
+        let largest = serde_json::json!({"t": "x".repeat(fill)});
+        let packed = pack_page(u64::MAX, u32::MAX, vec![largest], false).unwrap();
+        assert!(ToClient::AgentPage(packed[0].clone()).encode().is_ok());
+        assert_eq!(
+            pack_page(1, 2, vec![serde_json::json!("turn")], false).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

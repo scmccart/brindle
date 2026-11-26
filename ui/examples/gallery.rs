@@ -623,6 +623,24 @@ fn render_demo_item(item: &DemoItem, ix: usize) -> gpui::AnyElement {
     div().px_4().child(item).into_any_element()
 }
 
+/// The demo conversation's top row: an agent zone's "Earlier messages"
+/// while it loads, its loader still.
+fn render_demo_top_row(cx: &App) -> gpui::AnyElement {
+    let t = cx.ui_theme();
+    div()
+        .px_4()
+        .py_2()
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .text_size(px(12.))
+        .text_color(t.muted_foreground)
+        .child(Loader::new().color(t.muted_foreground))
+        .child("Earlier messages")
+        .into_any_element()
+}
+
 /// A piece of a demo text: its text, its style and, when it is a link, its
 /// target and whether it shows the target as a tooltip.
 type Piece<'a> = (&'a str, RunStyle, Option<(&'a str, bool)>);
@@ -783,7 +801,13 @@ impl Gallery {
         let conversation = {
             let count = conversation_items.borrow().len();
             let items = conversation_items.clone();
-            cx.new(|cx| MessageScroller::new(count, move |ix, _, _| render_demo_item(&items.borrow()[ix], ix), cx))
+            cx.new(|cx| {
+                let mut scroller =
+                    MessageScroller::new(count, move |ix, _, _| render_demo_item(&items.borrow()[ix], ix), cx)
+                        .with_top_row(|_, cx| render_demo_top_row(cx));
+                scroller.show_top_row(true, cx);
+                scroller
+            })
         };
         let prompt = cx.new(|cx| {
             let mut prompt = PromptInput::new(cx);
@@ -3408,6 +3432,8 @@ mod check {
         c.run_check("confirmation-destructive-answered-draws-in-the-default-tone", check).await;
         let check = scroller_keeps_the_view_while_away(&mut c).await;
         c.run_check("message-scroller-item-added-while-away-keeps-the-view", check).await;
+        let check = scroller_pages_up_to_the_top_row(&mut c).await;
+        c.run_check("message-scroller-page-up-reaches-the-top-row", check).await;
         let check = response_paints(&mut c).await;
         c.run_check("response-and-code-block-paint-every-block-kind", check).await;
         let check = code_block_copy_press(&mut c).await;
@@ -6126,6 +6152,26 @@ mod check {
         c.tick().await;
         let end = top(c)?;
         ensure!(end.0 == Follow::AtEnd, "scrolling to the end didn't follow it ({end:?})");
+        Ok(())
+    }
+
+    /// Paging up from the end reaches the top row ("Earlier messages"),
+    /// which says so; scrolling to the end takes it out of view again.
+    async fn scroller_pages_up_to_the_top_row(c: &mut Checker) -> Check {
+        let in_view = |c: &mut Checker| c.with(|gallery, _, cx| gallery.conversation.read(cx).top_row_in_view());
+        ensure!(!in_view(c)?, "the top row is in view at the conversation's end");
+        for _ in 0..20 {
+            if in_view(c)? {
+                break;
+            }
+            c.with(|gallery, _, cx| gallery.conversation.update(cx, |s, cx| s.scroll_page(PageDirection::Up, cx)))?;
+            c.tick().await;
+        }
+        ensure!(in_view(c)?, "paging up never brought the top row into view");
+        c.with(|gallery, _, cx| gallery.conversation.update(cx, |s, cx| s.scroll_to_end(cx)))?;
+        c.tick().await;
+        c.tick().await;
+        ensure!(!in_view(c)?, "the top row stayed in view at the end");
         Ok(())
     }
 

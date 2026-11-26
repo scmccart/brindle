@@ -12,6 +12,14 @@
 //! - **The fold** ([`Transcript::apply`]) is the one way a log changes. An
 //!   event it can't apply is a [`FoldError`], never a panic. A log rebuilt
 //!   from [`Transcript::replay`] equals the log it came from.
+//! - **Pages** (OpenSpec change `agents-log-paging`): an attach sends
+//!   [`Transcript::page`], the newest whole entries within a byte budget
+//!   behind an [`Event::Window`], and a client fetches older ones with
+//!   [`Transcript::fetch`] and folds them in front with
+//!   [`Transcript::prepend`]. The laws, pinned by property tests: a page
+//!   folds to the log's suffix from its window, live events keep the copy
+//!   equal to the server's suffix, and fetched pages folded in front until
+//!   nothing more remains give the whole log.
 //! - **Forms are frozen per client protocol version** (`process R5`): the
 //!   event kinds and the values of every closed enum inside an event are
 //!   protocol 4's, pinned by `tests/fixtures/v4/`. Protocol 4's forms
@@ -440,6 +448,15 @@ pub enum Event {
         through: EntryId,
         dropped: u64,
     },
+    /// Only in a page ([`Transcript::page`]), after any `Trimmed` and
+    /// before the first `Added`, never live: the entries from `from` on
+    /// follow, and `earlier` kept entries before `from` exist on the server
+    /// and can be fetched (OpenSpec change `agents-log-paging`, design
+    /// decision 3). `Trimmed` still means gone.
+    Window {
+        from: EntryId,
+        earlier: u64,
+    },
 }
 
 impl Event {
@@ -505,6 +522,25 @@ pub enum FoldError {
     TrimPastEnd { through: EntryId, next: EntryId },
     /// A `Trimmed` that doesn't go past the last one.
     TrimBehind { through: EntryId, trimmed: EntryId },
+    /// A `Window` on a transcript that already holds entries.
+    WindowAfterEntries,
+    /// A `Window` that starts before the next entry's id.
+    WindowBehind { from: EntryId, next: EntryId },
+    /// A `Window` with no earlier entries: a page that holds every entry
+    /// has no window.
+    WindowEmpty { from: EntryId },
+    /// A fetched page that doesn't end right before the held entries.
+    PageGap { last: EntryId, from: EntryId },
+    /// A fetched page whose entries and `more` don't fit the window: `more`
+    /// with no entries, no `more` while earlier entries would remain, or
+    /// more entries than the window has.
+    WindowMismatch {
+        earlier: u64,
+        fetched: u64,
+        more: bool,
+    },
+    /// A fetched page with entries for a transcript that holds every entry.
+    NoWindow,
 }
 
 impl fmt::Display for FoldError {
@@ -530,6 +566,38 @@ impl fmt::Display for FoldError {
                 f,
                 "trimmed through entry {through}, but entries through {trimmed} were already"
             ),
+            Self::WindowAfterEntries => {
+                f.write_str("a page's window came after entries were already held")
+            }
+            Self::WindowBehind { from, next } => write!(
+                f,
+                "a page's window starts at entry {from}, but the next entry is {next}"
+            ),
+            Self::WindowEmpty { from } => {
+                write!(f, "a page's window at entry {from} has no earlier entries")
+            }
+            Self::PageGap { last, from } => write!(
+                f,
+                "a fetched page ends at entry {last}, but the held entries start at {from}"
+            ),
+            Self::WindowMismatch {
+                earlier,
+                fetched,
+                more,
+            } => {
+                let more = if *more {
+                    "more to fetch"
+                } else {
+                    "nothing more to fetch"
+                };
+                write!(
+                    f,
+                    "a fetched page of {fetched} entries with {more} doesn't fit the {earlier} earlier entries"
+                )
+            }
+            Self::NoWindow => {
+                f.write_str("a fetched page came for a transcript that holds every entry")
+            }
         }
     }
 }
@@ -562,9 +630,37 @@ struct Trim {
     dropped: u64,
 }
 
+/// The most a page or a fetched page holds, in entries' encoded length
+/// (OpenSpec change `agents-log-paging`, design decision 3).
+pub const PAGE_BYTES: usize = 256 * 1024;
+
+/// What a paged transcript doesn't hold: the entries before `from`, of
+/// which `earlier` (never 0) are kept on the server and can be fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Window {
+    pub from: EntryId,
+    pub earlier: u64,
+}
+
+/// A fetch's answer ([`Transcript::fetch`]): the entries' events, in id
+/// order, and whether kept entries remain before the first of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fetched {
+    pub events: Vec<Event>,
+    pub more: bool,
+}
+
 /// An agent session's log: its entries in id order, the queue slot, the
-/// turn and the agent's state. It changes only through [`Transcript::apply`],
-/// so the core's log and a client's copy fold the same events the same way.
+/// turn and the agent's state. It changes only through [`Transcript::apply`]
+/// and, on a client's copy, [`Transcript::prepend`], so the core's log and
+/// a client's copy fold the same events the same way.
+///
+/// A client's copy may hold only a suffix of the log (OpenSpec change
+/// `agents-log-paging`, design decision 4): a page's [`Event::Window`]
+/// sets a [`Window`], events for entries below it are ignored (a later
+/// fetch brings them current), a `Trimmed` below it lowers its count, and
+/// fetched pages folded in front with [`Transcript::prepend`] lower it
+/// until it goes. The server's log never has a window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Transcript {
     entries: VecDeque<Kept>,
@@ -577,6 +673,8 @@ pub struct Transcript {
     trimmed: Option<Trim>,
     /// The kept entries' encoded length.
     size: usize,
+    /// Set by [`Event::Window`]; `None` when every kept entry is held.
+    window: Option<Window>,
 }
 
 impl Default for Transcript {
@@ -590,6 +688,7 @@ impl Default for Transcript {
             conversation: None,
             trimmed: None,
             size: 0,
+            window: None,
         }
     }
 }
@@ -603,6 +702,12 @@ impl Transcript {
 
     /// Applies one event, or says why it can't and leaves the log as it was.
     pub fn apply(&mut self, event: &Event) -> Result<(), FoldError> {
+        if let Some(id) = entry_change(event)
+            && self.window.is_some_and(|window| id < window.from)
+        {
+            // Not held: a later fetch brings the entry as it is then.
+            return Ok(());
+        }
         match event {
             Event::Added { id, entry } => {
                 if *id != self.next {
@@ -679,11 +784,52 @@ impl Transcript {
                 self.conversation = Some(conversation.clone());
             }
             Event::Trimmed { through, dropped } => self.trim(*through, *dropped)?,
+            Event::Window { from, earlier } => {
+                if !self.entries.is_empty() {
+                    return Err(FoldError::WindowAfterEntries);
+                }
+                if *from < self.next {
+                    return Err(FoldError::WindowBehind {
+                        from: *from,
+                        next: self.next,
+                    });
+                }
+                if *earlier == 0 {
+                    return Err(FoldError::WindowEmpty { from: *from });
+                }
+                self.next = *from;
+                self.window = Some(Window {
+                    from: *from,
+                    earlier: *earlier,
+                });
+            }
         }
         Ok(())
     }
 
     fn trim(&mut self, through: EntryId, dropped: u64) -> Result<(), FoldError> {
+        self.trim_entries(through, dropped)?;
+        if let Some(window) = self.window {
+            // Below the window, the trim takes entries the server kept and
+            // this copy never held: fewer remain to fetch. At or past it,
+            // the held entries were dropped through it, so nothing earlier
+            // is left.
+            let earlier = if through < window.from {
+                window
+                    .earlier
+                    .min(window.from.0.saturating_sub(through.0).saturating_sub(1))
+            } else {
+                0
+            };
+            self.window = (earlier > 0).then_some(Window {
+                from: window.from,
+                earlier,
+            });
+        }
+        Ok(())
+    }
+
+    fn trim_entries(&mut self, through: EntryId, dropped: u64) -> Result<(), FoldError> {
         if let Some(trim) = self.trimmed
             && through <= trim.through
         {
@@ -783,20 +929,174 @@ impl Transcript {
         self.size
     }
 
+    /// What this copy doesn't hold, when it was paged; the server's log
+    /// never has a window.
+    pub fn window(&self) -> Option<Window> {
+        self.window
+    }
+
     /// The events that rebuild this log in a fresh one: `Trimmed` when
-    /// entries were dropped, each entry's `Added` with its text split into
-    /// `Appended`s of at most [`TEXT_CHUNK`] bytes and a permission's
-    /// outcome as its `Answered`, the slot's `Queue` when it isn't empty,
-    /// the `Conversation` when there is one, then `Turn` and `Agent`.
+    /// entries were dropped, `Window` when this copy holds only a suffix,
+    /// each entry's `Added` with its text split into `Appended`s of at most
+    /// [`TEXT_CHUNK`] bytes and a permission's outcome as its `Answered`,
+    /// the slot's `Queue` when it isn't empty, the `Conversation` when there
+    /// is one, then `Turn` and `Agent`.
     pub fn replay(&self) -> Vec<Event> {
-        let mut events = Vec::with_capacity(self.entries.len() + 5);
+        self.replay_from(0)
+    }
+
+    /// [`Transcript::replay`] cut at a start entry (design decision 3): the
+    /// newest whole entries whose encoded lengths add up to at most
+    /// `budget`, always the newest one, reaching back to the oldest pending
+    /// permission; then a `Window` naming how many kept entries precede
+    /// them. Everything that isn't an entry (the slot, the conversation,
+    /// the turn, the agent's state) is in every page. A log that fits the
+    /// budget pages as its `replay()`.
+    pub fn page(&self, budget: usize) -> Vec<Event> {
+        let mut start = self.entries.len() - self.newest_within(self.entries.len(), budget);
+        if let Some(pending) = self.entries.iter().position(|kept| {
+            matches!(kept.entry, Entry::Permission { outcome: None, .. })
+        }) {
+            start = start.min(pending);
+        }
+        self.replay_from(start)
+    }
+
+    /// The newest whole kept entries with ids below `before` whose encoded
+    /// lengths add up to at most `budget` (at least one when any exists),
+    /// each as it stands now, in id order; `more` says whether kept
+    /// entries remain before the first of them. A fetch carries entries
+    /// only: the state after them is already the client's.
+    pub fn fetch(&self, before: EntryId, budget: usize) -> Fetched {
+        let end = self.entries.partition_point(|kept| kept.id < before);
+        let start = end - self.newest_within(end, budget);
+        let mut events = Vec::new();
+        for kept in self.entries.range(start..end) {
+            replay_entry(kept.id, &kept.entry, &mut events);
+        }
+        Fetched {
+            events,
+            more: start > 0 || self.window.is_some(),
+        }
+    }
+
+    /// How many of the kept entries before index `end`, newest first, fit
+    /// in `budget`; at least one when there is one.
+    fn newest_within(&self, end: usize, budget: usize) -> usize {
+        let mut total = 0usize;
+        let mut taken = 0usize;
+        for kept in self.entries.range(..end).rev() {
+            total = total.saturating_add(kept.size);
+            if taken > 0 && total > budget {
+                break;
+            }
+            taken += 1;
+        }
+        taken
+    }
+
+    /// Folds a fetched page in front of the held entries (design decision
+    /// 4): its entries must end right before the window's `from`; they go
+    /// in front, the window's count drops by theirs, and the window goes
+    /// when `more` is false. An empty page with `more` false on a copy
+    /// with no window is the answer to a fetch a trim overtook, and changes
+    /// nothing. A refused page changes nothing.
+    pub fn prepend(&mut self, events: &[Event], more: bool) -> Result<(), FoldError> {
+        let Some(first) = events.iter().find_map(|event| match event {
+            Event::Added { id, .. } => Some(*id),
+            Event::Appended { .. }
+            | Event::ToolChanged { .. }
+            | Event::Answered { .. }
+            | Event::Queue { .. }
+            | Event::Turn { .. }
+            | Event::Agent { .. }
+            | Event::Conversation { .. }
+            | Event::Trimmed { .. }
+            | Event::Window { .. } => None,
+        }) else {
+            return match self.window {
+                None if !more => Ok(()),
+                window => Err(FoldError::WindowMismatch {
+                    earlier: window.map_or(0, |window| window.earlier),
+                    fetched: 0,
+                    more,
+                }),
+            };
+        };
+        let Some(window) = self.window else {
+            return Err(FoldError::NoWindow);
+        };
+        let mut page = Self {
+            next: first,
+            ..Self::default()
+        };
+        for event in events {
+            page.apply(event)?;
+        }
+        let last = page.entries.back().map_or(first, |kept| kept.id);
+        if page.window.is_some() || last.next() != window.from {
+            return Err(FoldError::PageGap {
+                last,
+                from: window.from,
+            });
+        }
+        let fetched = page.entries.len() as u64;
+        let earlier = window.earlier.checked_sub(fetched);
+        let earlier = match (earlier, more) {
+            (Some(earlier), true) if earlier > 0 => Some(earlier),
+            (Some(0), false) => None,
+            (Some(_) | None, true | false) => {
+                return Err(FoldError::WindowMismatch {
+                    earlier: window.earlier,
+                    fetched,
+                    more,
+                });
+            }
+        };
+        let from = page.entries.front().map_or(window.from, |kept| kept.id);
+        self.size += page.size;
+        while let Some(kept) = page.entries.pop_back() {
+            self.entries.push_front(kept);
+        }
+        self.window = earlier.map(|earlier| Window { from, earlier });
+        Ok(())
+    }
+
+    /// This log with the entries before `from` taken out into a window:
+    /// what a page from `from` folds to (design decision 4's first law).
+    #[cfg(test)]
+    pub(crate) fn suffix(&self, from: EntryId) -> Self {
+        let mut suffix = self.clone();
+        let mut taken = 0u64;
+        while let Some(front) = suffix.entries.front()
+            && front.id < from
+        {
+            suffix.size -= front.size;
+            suffix.entries.pop_front();
+            taken += 1;
+        }
+        let earlier = taken + self.window.map_or(0, |window| window.earlier);
+        if earlier > 0 {
+            let from = suffix.entries.front().map_or(suffix.next, |kept| kept.id);
+            suffix.window = Some(Window { from, earlier });
+        }
+        suffix
+    }
+
+    fn replay_from(&self, start: usize) -> Vec<Event> {
+        let mut events = Vec::with_capacity(self.entries.len() - start + 6);
         if let Some(trim) = self.trimmed {
             events.push(Event::Trimmed {
                 through: trim.through,
                 dropped: trim.dropped,
             });
         }
-        for kept in &self.entries {
+        let earlier = start as u64 + self.window.map_or(0, |window| window.earlier);
+        if earlier > 0 {
+            let from = self.entries.get(start).map_or(self.next, |kept| kept.id);
+            events.push(Event::Window { from, earlier });
+        }
+        for kept in self.entries.range(start..) {
             replay_entry(kept.id, &kept.entry, &mut events);
         }
         match &self.slot {
@@ -869,6 +1169,23 @@ impl Transcript {
             dropped: count,
         };
         self.apply(&event).ok().map(|()| event)
+    }
+}
+
+/// The entry a change to an existing entry names: the events a paged copy
+/// ignores below its window.
+fn entry_change(event: &Event) -> Option<EntryId> {
+    match event {
+        Event::Appended { id, .. } | Event::ToolChanged { id, .. } | Event::Answered { id, .. } => {
+            Some(*id)
+        }
+        Event::Added { .. }
+        | Event::Queue { .. }
+        | Event::Turn { .. }
+        | Event::Agent { .. }
+        | Event::Conversation { .. }
+        | Event::Trimmed { .. }
+        | Event::Window { .. } => None,
     }
 }
 
@@ -1896,5 +2213,486 @@ mod tests {
                 }
             })
         );
+    }
+
+    // Paging (OpenSpec change `agents-log-paging`, design decisions 3, 4).
+
+    /// A log of `count` agent entries of about `size` bytes each, then a
+    /// ready agent.
+    fn long(count: u64, size: usize) -> Transcript {
+        let mut events: Vec<Event> = (1..=count)
+            .map(|id| added(id, agent(&"x".repeat(size))))
+            .collect();
+        events.push(Event::Agent { state: ready() });
+        fold(&events).unwrap()
+    }
+
+    fn window(from: u64, earlier: u64) -> Event {
+        Event::Window {
+            from: EntryId(from),
+            earlier,
+        }
+    }
+
+    fn appended(id: u64, text: &str) -> Event {
+        Event::Appended {
+            id: EntryId(id),
+            text: text.into(),
+        }
+    }
+
+    /// A copy paged from entry 5 of `long(8, 10)`.
+    fn paged() -> Transcript {
+        let server = long(8, 10);
+        let copy = fold(&server.replay_from(4)).unwrap();
+        assert_eq!(
+            copy.window(),
+            Some(Window {
+                from: EntryId(5),
+                earlier: 4
+            })
+        );
+        copy
+    }
+
+    #[test]
+    fn a_window_goes_only_on_an_empty_transcript_at_or_past_the_next_id() {
+        let mut copy = fold(&[window(5, 4)]).unwrap();
+        assert_eq!(copy.next_id(), EntryId(5));
+        assert_eq!(
+            copy.window(),
+            Some(Window {
+                from: EntryId(5),
+                earlier: 4
+            })
+        );
+        copy.apply(&added(5, agent("hi"))).unwrap();
+        let before = copy.clone();
+        assert_eq!(
+            copy.apply(&window(9, 1)),
+            Err(FoldError::WindowAfterEntries)
+        );
+        assert_eq!(copy, before, "a refused event changes nothing");
+
+        let mut trimmed = fold(&[Event::Trimmed {
+            through: EntryId(6),
+            dropped: 6,
+        }])
+        .unwrap();
+        let before = trimmed.clone();
+        assert_eq!(
+            trimmed.apply(&window(5, 1)),
+            Err(FoldError::WindowBehind {
+                from: EntryId(5),
+                next: EntryId(7)
+            })
+        );
+        assert_eq!(trimmed, before, "a refused event changes nothing");
+        trimmed.apply(&window(7, 3)).unwrap();
+        // A window with nothing earlier is refused.
+        let mut empty = Transcript::new();
+        assert_eq!(
+            empty.apply(&window(3, 0)),
+            Err(FoldError::WindowEmpty { from: EntryId(3) })
+        );
+        assert_eq!(empty, Transcript::new());
+    }
+
+    #[test]
+    fn changes_below_the_window_are_ignored_and_the_rest_fold_as_before() {
+        let mut copy = paged();
+        let before = copy.clone();
+        for event in [
+            appended(2, "more"),
+            Event::ToolChanged {
+                id: EntryId(1),
+                title: None,
+                kind: None,
+                status: Some(ToolStatus::Completed),
+            },
+            Event::Answered {
+                id: EntryId(4),
+                outcome: PermissionOutcome::Cancelled,
+            },
+        ] {
+            assert_eq!(copy.apply(&event), Ok(()), "{event:?}");
+            assert_eq!(copy, before, "{event:?} changed nothing");
+        }
+        // An entry from the window on is held.
+        copy.apply(&appended(5, "!")).unwrap();
+        assert_eq!(copy.entry(EntryId(5)), Some(&agent(&format!("{}!", "x".repeat(10)))));
+        // An `Added` must still be the next id.
+        assert_eq!(
+            copy.apply(&added(10, agent("late"))),
+            Err(FoldError::OutOfOrder {
+                id: EntryId(10),
+                expected: EntryId(9)
+            })
+        );
+        // State events aren't entries: unchanged.
+        copy.apply(&Event::Queue {
+            slot: Slot::Waiting { text: "next".into() },
+        })
+        .unwrap();
+        copy.apply(&Event::Turn { state: TurnState::Working }).unwrap();
+        copy.apply(&Event::Conversation {
+            conversation: conversation("s1", Continuation::Resume),
+        })
+        .unwrap();
+        assert_eq!(copy.turn(), &TurnState::Working);
+        assert!(copy.window().is_some());
+    }
+
+    #[test]
+    fn a_trim_below_the_window_lowers_its_count_and_one_at_or_past_it_drops_it() {
+        let mut copy = paged();
+        copy.apply(&Event::Trimmed {
+            through: EntryId(2),
+            dropped: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            copy.window(),
+            Some(Window {
+                from: EntryId(5),
+                earlier: 2
+            })
+        );
+        assert_eq!(copy.entries().count(), 4, "no held entry was dropped");
+        copy.apply(&Event::Trimmed {
+            through: EntryId(4),
+            dropped: 2,
+        })
+        .unwrap();
+        assert_eq!(copy.window(), None, "nothing earlier is left");
+        assert_eq!(copy.dropped(), 4);
+
+        let mut copy = paged();
+        copy.apply(&Event::Trimmed {
+            through: EntryId(6),
+            dropped: 6,
+        })
+        .unwrap();
+        assert_eq!(copy.window(), None);
+        assert_eq!(
+            copy.entries().map(|(id, _)| id).collect::<Vec<_>>(),
+            [EntryId(7), EntryId(8)]
+        );
+    }
+
+    #[test]
+    fn a_log_that_fits_pages_as_its_replay() {
+        let server = long(8, 10);
+        assert_eq!(server.page(PAGE_BYTES), server.replay());
+        assert_eq!(server.page(server.encoded_len()), server.replay());
+    }
+
+    #[test]
+    fn a_long_log_pages_its_newest_whole_entries_within_the_budget_then_its_state() {
+        let mut server = long(10, 100);
+        let held = Slot::Held {
+            text: "again".into(),
+            reason: HoldReason::Failed,
+        };
+        let titled = Conversation {
+            title: Some("Hello.txt file creation".into()),
+            ..conversation("s1", Continuation::Resume)
+        };
+        for event in [
+            Event::Trimmed {
+                through: EntryId(2),
+                dropped: 2,
+            },
+            Event::Queue { slot: held.clone() },
+            Event::Conversation {
+                conversation: titled.clone(),
+            },
+            Event::Turn {
+                state: TurnState::Working,
+            },
+        ] {
+            server.apply(&event).unwrap();
+        }
+        let size = server.entries.back().unwrap().size;
+        let page = server.page(size * 3);
+        assert_eq!(
+            page,
+            [
+                Event::Trimmed {
+                    through: EntryId(2),
+                    dropped: 2
+                },
+                window(8, 5),
+                added(8, agent(&"x".repeat(100))),
+                added(9, agent(&"x".repeat(100))),
+                added(10, agent(&"x".repeat(100))),
+                Event::Queue { slot: held },
+                Event::Conversation {
+                    conversation: titled
+                },
+                Event::Turn {
+                    state: TurnState::Working
+                },
+                Event::Agent { state: ready() },
+            ]
+        );
+        assert_eq!(fold(&page), Ok(server.suffix(EntryId(8))));
+        // A budget one byte short takes one entry fewer.
+        assert_eq!(fold(&server.page(size * 3 - 1)).unwrap().entries().count(), 2);
+    }
+
+    #[test]
+    fn a_budget_of_nothing_gives_the_newest_entry_and_a_huge_one_goes_alone() {
+        let server = long(4, 10);
+        let page = fold(&server.page(0)).unwrap();
+        assert_eq!(
+            page.entries().map(|(id, _)| id).collect::<Vec<_>>(),
+            [EntryId(4)]
+        );
+        let mut server = long(4, 10);
+        server.apply(&added(5, agent(&"€".repeat(350_000)))).unwrap();
+        let page = server.page(PAGE_BYTES);
+        let copy = fold(&page).unwrap();
+        assert_eq!(
+            copy.entries().map(|(id, _)| id).collect::<Vec<_>>(),
+            [EntryId(5)]
+        );
+        assert_eq!(copy.window().map(|window| window.earlier), Some(4));
+        assert!(page.iter().filter(|event| matches!(event, Event::Appended { .. })).count() > 10);
+    }
+
+    #[test]
+    fn a_pending_permission_far_back_pulls_the_page_down_to_it() {
+        let mut server = long(2, 10);
+        server.apply(&added(3, permission())).unwrap();
+        for id in 4..40 {
+            server.apply(&added(id, agent(&"y".repeat(64 * 1024)))).unwrap();
+        }
+        let copy = fold(&server.page(PAGE_BYTES)).unwrap();
+        assert_eq!(
+            copy.window(),
+            Some(Window {
+                from: EntryId(3),
+                earlier: 2
+            })
+        );
+        assert_eq!(copy, server.suffix(EntryId(3)));
+    }
+
+    #[test]
+    fn a_page_carries_a_login_demand_with_its_methods() {
+        let mut server = long(20, 100);
+        let demand = AgentState::LoginRequired {
+            message: "log in first".into(),
+            methods: vec![agent_method("oauth", "Log in"), terminal_method()],
+        };
+        server
+            .apply(&Event::Agent {
+                state: demand.clone(),
+            })
+            .unwrap();
+        let page = server.page(300);
+        assert_eq!(page.last(), Some(&Event::Agent { state: demand }));
+        assert!(matches!(page[0], Event::Window { .. }));
+    }
+
+    #[test]
+    fn a_fetch_takes_whole_entries_below_before_as_they_stand_now() {
+        let mut server = long(3, 10);
+        server.apply(&added(4, tool("call_1"))).unwrap();
+        server.apply(&added(5, permission())).unwrap();
+        for id in 6..=8 {
+            server.apply(&added(id, agent("z"))).unwrap();
+        }
+        server
+            .apply(&Event::ToolChanged {
+                id: EntryId(4),
+                title: None,
+                kind: None,
+                status: Some(ToolStatus::Completed),
+            })
+            .unwrap();
+        server
+            .apply(&Event::Answered {
+                id: EntryId(5),
+                outcome: PermissionOutcome::Cancelled,
+            })
+            .unwrap();
+        let fetched = server.fetch(EntryId(6), PAGE_BYTES);
+        assert!(!fetched.more);
+        let mut expected = Vec::new();
+        for (id, entry) in server.entries().take(5) {
+            replay_entry(id, entry, &mut expected);
+        }
+        assert_eq!(fetched.events, expected);
+        assert!(
+            fetched.events.iter().all(|event| entry_change(event).is_some()
+                || matches!(event, Event::Added { .. })),
+            "entries only"
+        );
+        // A budget that takes two: more remain.
+        let size = server.entries.get(4).unwrap().size + server.entries.get(3).unwrap().size;
+        let fetched = server.fetch(EntryId(6), size);
+        assert!(fetched.more);
+        assert_eq!(fold_page(&fetched.events).first(), Some(&EntryId(4)));
+        // At or below the first kept entry: nothing.
+        assert_eq!(
+            server.fetch(EntryId(1), PAGE_BYTES),
+            Fetched {
+                events: Vec::new(),
+                more: false
+            }
+        );
+        assert_eq!(server.fetch(EntryId(2), 0).events, [added(1, agent(&"x".repeat(10)))]);
+    }
+
+    /// The ids of a fetched page's `Added`s.
+    fn fold_page(events: &[Event]) -> Vec<EntryId> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Added { id, .. } => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_page_folded_in_front_lowers_the_count_and_the_last_drops_the_window() {
+        let server = long(8, 10);
+        let mut copy = paged();
+        let first = server.fetch(EntryId(5), server.entries[0].size * 2);
+        assert!(first.more);
+        copy.prepend(&first.events, first.more).unwrap();
+        assert_eq!(
+            copy.window(),
+            Some(Window {
+                from: EntryId(3),
+                earlier: 2
+            })
+        );
+        assert_eq!(copy, server.suffix(EntryId(3)));
+        let rest = server.fetch(EntryId(3), PAGE_BYTES);
+        assert!(!rest.more);
+        copy.prepend(&rest.events, rest.more).unwrap();
+        assert_eq!(copy, server);
+    }
+
+    #[test]
+    fn an_empty_page_without_more_on_a_copy_with_no_window_changes_nothing() {
+        let mut copy = long(3, 10);
+        let before = copy.clone();
+        assert_eq!(copy.prepend(&[], false), Ok(()));
+        assert_eq!(copy, before);
+    }
+
+    #[test]
+    fn a_page_that_doesnt_fit_the_window_is_refused_and_changes_nothing() {
+        let server = long(8, 10);
+        let gap = server.fetch(EntryId(4), PAGE_BYTES);
+        let whole = server.fetch(EntryId(5), PAGE_BYTES);
+        let part = server.fetch(EntryId(5), 0);
+        let cases: [(Transcript, &[Event], bool, FoldError); 5] = [
+            (
+                paged(),
+                &gap.events,
+                false,
+                FoldError::PageGap {
+                    last: EntryId(3),
+                    from: EntryId(5),
+                },
+            ),
+            (long(3, 10), &whole.events, false, FoldError::NoWindow),
+            (
+                paged(),
+                &part.events,
+                false,
+                FoldError::WindowMismatch {
+                    earlier: 4,
+                    fetched: 1,
+                    more: false,
+                },
+            ),
+            (
+                paged(),
+                &[],
+                true,
+                FoldError::WindowMismatch {
+                    earlier: 4,
+                    fetched: 0,
+                    more: true,
+                },
+            ),
+            (
+                paged(),
+                &whole.events,
+                true,
+                FoldError::WindowMismatch {
+                    earlier: 4,
+                    fetched: 4,
+                    more: true,
+                },
+            ),
+        ];
+        for (mut copy, events, more, error) in cases {
+            let before = copy.clone();
+            assert_eq!(copy.prepend(events, more), Err(error.clone()));
+            assert_eq!(copy, before, "{error}");
+            assert!(!error.to_string().is_empty());
+        }
+        // An empty page without more while earlier entries remain.
+        let mut copy = paged();
+        assert!(matches!(
+            copy.prepend(&[], false),
+            Err(FoldError::WindowMismatch { fetched: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_paged_copy_replays_with_its_window() {
+        let copy = paged();
+        assert_eq!(fold(&copy.replay()), Ok(copy));
+    }
+
+    #[test]
+    fn the_new_fold_errors_read_as_what_went_wrong() {
+        for (error, text) in [
+            (
+                FoldError::WindowAfterEntries,
+                "a page's window came after entries were already held",
+            ),
+            (
+                FoldError::WindowBehind {
+                    from: EntryId(3),
+                    next: EntryId(5),
+                },
+                "a page's window starts at entry 3, but the next entry is 5",
+            ),
+            (
+                FoldError::PageGap {
+                    last: EntryId(3),
+                    from: EntryId(5),
+                },
+                "a fetched page ends at entry 3, but the held entries start at 5",
+            ),
+            (
+                FoldError::WindowMismatch {
+                    earlier: 4,
+                    fetched: 1,
+                    more: false,
+                },
+                "a fetched page of 1 entries with nothing more to fetch doesn't fit the 4 earlier entries",
+            ),
+            (
+                FoldError::WindowEmpty { from: EntryId(3) },
+                "a page's window at entry 3 has no earlier entries",
+            ),
+            (
+                FoldError::NoWindow,
+                "a fetched page came for a transcript that holds every entry",
+            ),
+        ] {
+            assert_eq!(error.to_string(), text);
+        }
     }
 }
