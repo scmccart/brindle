@@ -7,8 +7,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use brindle_ui::{
-    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardHeader, ContextMenuTarget as _, EdgeBar, Icon,
-    Modality, Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
+    ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, ContextMenuTarget as _, EdgeBar,
+    Icon, Modality, ThemeScope, Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -355,6 +355,10 @@ pub struct ZoneMenuRequest {
     pub at: Point<Pixels>,
     /// The secondary press that asked, whose release ends the gesture.
     pub press: Option<MouseDownEvent>,
+    /// The token set the menu is drawn in: the zone's for an agent zone,
+    /// which is drawn in a theme scope, `None` (the window's) for a
+    /// terminal zone ([`ZoneTreeView::scope_of`]).
+    pub tokens: Option<Tokens>,
 }
 
 /// A zone's close asks first (design.md decision 12): its agent is busy.
@@ -744,6 +748,10 @@ pub struct ZoneTreeView {
     /// headers, borders and the gaps between them). The focus ring and the
     /// status dots stay on the window's tokens and global theme.
     pub theme: Theme,
+    /// `theme`'s zone token set (`Theme::zone_tokens`), which the tab's
+    /// agent zones are drawn in. Kept beside `theme` so `render` derives
+    /// nothing: `new`, `from_restored` and `set_profile` refresh it.
+    zone_tokens: Tokens,
     pub font_size_override: Option<f32>,
     tree: ZoneTree,
     zones: HashMap<ZoneId, Zone>,
@@ -791,6 +799,7 @@ impl ZoneTreeView {
             profile,
             host,
             kind: start.kind(),
+            zone_tokens: theme.zone_tokens(),
             theme,
             font_size_override,
             tree: ZoneTree::new(id),
@@ -831,6 +840,7 @@ impl ZoneTreeView {
             profile,
             host,
             kind,
+            zone_tokens: theme.zone_tokens(),
             theme,
             font_size_override,
             tree,
@@ -1172,6 +1182,7 @@ impl ZoneTreeView {
     /// dialog previews it), with its theme and font size. The host stays.
     pub fn set_profile(&mut self, profile: Profile, theme: Theme, font_size: Option<f32>, cx: &mut Context<Self>) {
         self.profile = profile;
+        self.zone_tokens = theme.zone_tokens();
         self.theme = theme.clone();
         self.font_size_override = font_size;
         for zone in self.zones.values() {
@@ -1324,7 +1335,32 @@ impl ZoneTreeView {
             self.can_split(id, SplitAxis::Horizontal, window, cx),
             self.can_split(id, SplitAxis::Vertical, window, cx),
         );
-        cx.emit(ZoneMenuRequest { rows, at, press });
+        cx.emit(ZoneMenuRequest { rows, at, press, tokens: self.scope_of(id) });
+    }
+
+    /// The theme scope zone `id` is drawn in, which its tooltips and header
+    /// menu take too: an agent zone's is the tab theme's zone token set
+    /// (`agents-zone-theme-scope` decision 3), a terminal zone has none
+    /// and keeps the window's set, as does a zone that isn't there.
+    fn scope_of(&self, id: ZoneId) -> Option<Tokens> {
+        match &self.zones.get(&id)?.content {
+            ZoneContent::Agent(_) => Some(self.zone_tokens),
+            ZoneContent::Terminal(_) => None,
+        }
+    }
+
+    /// Zone `id`'s card colours, and the scope it is drawn in: the tab
+    /// theme's card colours on the window's background (`window`, the set
+    /// round the cards), and for a zone drawn in a scope, the window's
+    /// focus ring, which would otherwise take the scope's.
+    fn leaf_look(&self, id: ZoneId, window: &Tokens) -> (CardColors, Option<Tokens>) {
+        let scope = self.scope_of(id);
+        let mut colors = self.theme.card_colors();
+        colors.surround = Some(window.background);
+        if scope.is_some() {
+            colors.ring = Some(brindle_ui::focus_ring(window));
+        }
+        (colors, scope)
     }
 
     /// Where `OpenZoneMenu` puts the active zone's menu: below the start of
@@ -1588,12 +1624,18 @@ impl ZoneTreeView {
                 .into_any_element(),
         };
         // The gap round the cards is the strip's colour (the chrome
-        // background), so the corner cutouts match it.
-        let mut colors = self.theme.card_colors();
-        colors.surround = Some(tokens.background);
-        let card =Card::new(("zone", id.0 as usize)).colors(colors).size_full().min_w_0().min_h_0();
+        // background), so the corner cutouts match it. An agent zone is
+        // drawn, header and all, in its theme's zone tokens, keeping the
+        // window's ring; what else keeps the window's colours (the status
+        // dot, the progress bar) is computed from `tokens` below.
+        let (colors, scope) = self.leaf_look(id, tokens);
+        let scoped = move |card: AnyElement| match scope {
+            Some(set) => ThemeScope::new(set, card).into_any_element(),
+            None => card,
+        };
+        let card = Card::new(("zone", id.0 as usize)).colors(colors).size_full().min_w_0().min_h_0();
         if self.zones.len() <= 1 {
-            return card.child(view).into_any_element();
+            return scoped(card.child(view).into_any_element());
         }
 
         let active = id == self.active;
@@ -1689,13 +1731,15 @@ impl ZoneTreeView {
             .action(inert("zone-close-press", close));
 
         let laid_out = self.laid_out.clone();
-        card.header(header)
-            .ring(ring)
-            .on_header_bounds(move |bounds, _, _| {
-                laid_out.borrow_mut().headers.insert(id, bounds);
-            })
-            .child(view)
-            .into_any_element()
+        scoped(
+            card.header(header)
+                .ring(ring)
+                .on_header_bounds(move |bounds, _, _| {
+                    laid_out.borrow_mut().headers.insert(id, bounds);
+                })
+                .child(view)
+                .into_any_element(),
+        )
     }
 }
 
@@ -1704,7 +1748,9 @@ impl Render for ZoneTreeView {
         let tree = self.tree.clone();
         // Headers are recorded again as this frame lays them out.
         self.laid_out.borrow_mut().headers.clear();
-        let tokens = cx.ui_theme();
+        // The window's set, for what round and on the cards keeps the
+        // window's colours whatever scope a zone is drawn in.
+        let tokens = cx.window_theme();
         let content = self.render_tree(&tree, &tokens, window, cx);
         let laid_out = self.laid_out.clone();
         div()
@@ -2032,24 +2078,38 @@ mod tests {
         view: Entity<ZoneTreeView>,
         cx: &'static mut gpui::VisualTestContext,
         menus: Rc<RefCell<Vec<Vec<bool>>>>,
+        /// The token set each menu request carried.
+        menu_sets: Rc<RefCell<Vec<Option<Tokens>>>>,
         exited: Rc<Cell<bool>>,
         _subscriptions: Vec<Subscription>,
     }
 
     impl Tab {
         fn new(app: &mut gpui::TestAppContext, profile: Profile, start: impl FnOnce(&mut App) -> ZoneStart) -> Self {
+            Self::themed(app, profile, Theme::default(), start)
+        }
+
+        /// A tab whose theme (its profile's) is `theme`.
+        fn themed(
+            app: &mut gpui::TestAppContext,
+            profile: Profile,
+            theme: Theme,
+            start: impl FnOnce(&mut App) -> ZoneStart,
+        ) -> Self {
             let start = app.update(start);
-            let (view, cx) = app.add_window_view(|window, cx| {
-                ZoneTreeView::new(profile, Host::Local, Theme::default(), None, start, window, cx)
-            });
+            let (view, cx) =
+                app.add_window_view(|window, cx| ZoneTreeView::new(profile, Host::Local, theme, None, start, window, cx));
             let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
             let (menus, exited) = (Rc::<RefCell<Vec<Vec<bool>>>>::default(), Rc::new(Cell::new(false)));
+            let menu_sets = Rc::<RefCell<Vec<Option<Tokens>>>>::default();
             let subscriptions = cx.update(|_, cx| {
                 let menus = menus.clone();
+                let menu_sets = menu_sets.clone();
                 let exited = exited.clone();
                 vec![
                     cx.subscribe(&view, move |_, request: &ZoneMenuRequest, _| {
-                        menus.borrow_mut().push(split_items(&request.rows))
+                        menus.borrow_mut().push(split_items(&request.rows));
+                        menu_sets.borrow_mut().push(request.tokens);
                     }),
                     cx.subscribe(&view, move |_, event: &TerminalEvent, _| {
                         if matches!(event, TerminalEvent::Exited) {
@@ -2058,7 +2118,20 @@ mod tests {
                     }),
                 ]
             });
-            Self { view, cx, menus, exited, _subscriptions: subscriptions }
+            Self { view, cx, menus, menu_sets, exited, _subscriptions: subscriptions }
+        }
+
+        /// The only zone's scope and card look, and the set the menu it
+        /// asks for carries, with `window` as the window's set.
+        fn look(&mut self, window: &Tokens) -> (Option<Tokens>, CardColors, Option<Tokens>) {
+            let window = *window;
+            let (scope, colors) = self.view.read_with(self.cx, |view, _| {
+                let (colors, scope) = view.leaf_look(view.active, &window);
+                (scope, colors)
+            });
+            self.view.update_in(self.cx, |view, window, cx| view.open_menu(view.active, Point::default(), None, window, cx));
+            let menu = self.menu_sets.borrow_mut().pop().expect("the zone asked for its menu");
+            (scope, colors, menu)
         }
 
         /// Whether the only zone can split right and down, as
@@ -2123,6 +2196,42 @@ mod tests {
         let agent = zone.agent.clone();
         let mut same = Tab::new(&mut app, fake, |_| ZoneStart::Agent(agent));
         assert_eq!(same.splits(), (true, true, vec![true, true]));
+    }
+
+    /// The spec's "A profile theme unlike the window's" and "The ring and
+    /// the status dot", at the view: an agent zone in a tab whose profile
+    /// sets brindle-light is drawn in that theme's zone tokens, keeps the
+    /// window's ring and asks for its menu in its set; a terminal zone gets
+    /// no scope, no ring of its own and a menu in the window's set. A
+    /// profile change brings the new theme's set.
+    #[test]
+    fn an_agent_zone_is_drawn_in_its_themes_zone_tokens_and_a_terminal_zone_in_none() {
+        use crate::agent::test_support::{Zone, app};
+        let mut app = app();
+        let light = crate::theme::builtin_theme("brindle-light").unwrap();
+        let window = app.update(|cx| cx.window_theme());
+        assert_ne!(window, light.zone_tokens(), "the case needs a profile theme unlike the window's");
+
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let mut tab = Tab::themed(&mut app, Profile::default_shell(), light.clone(), |_| ZoneStart::Agent(agent));
+        let (scope, colors, menu) = tab.look(&window);
+        assert_eq!(scope, Some(light.zone_tokens()));
+        assert_eq!(colors.ring, Some(brindle_ui::focus_ring(&window)), "the ring is the window's");
+        assert_eq!(colors.surround, Some(window.background));
+        assert_eq!(colors.surface, light.card_colors().surface);
+        assert_eq!(menu, Some(light.zone_tokens()));
+
+        let dark = crate::theme::builtin_theme("tokyo-night").unwrap();
+        tab.view.update(tab.cx, |view, cx| view.set_profile(Profile::default_shell(), dark.clone(), None, cx));
+        assert_eq!(tab.look(&window).0, Some(dark.zone_tokens()), "set_profile refreshes the set");
+
+        let mut terminal = Tab::themed(&mut app, Profile::default_shell(), light.clone(), |cx| {
+            let config = Settings::get(cx).config.clone();
+            ZoneStart::Terminal(cx.new(|cx| Terminal::message("shell", Theme::default(), &config, cx)))
+        });
+        let (scope, colors, menu) = terminal.look(&window);
+        assert_eq!((scope, colors.ring, menu), (None, None, None));
     }
 
     /// An agent tab a launch opened (`brindle agent -p hi`, task 6.3) sends
