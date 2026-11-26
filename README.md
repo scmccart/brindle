@@ -92,7 +92,10 @@ says so in the tab. It does not create or start containers.
 
 Official Windows archives include the static x86-64 Linux helper beside
 `brindle.exe`, and so does `scripts/install.ps1` (see "On Windows" below).
-To build that helper by hand for a Windows source build, build it in Docker
+For a Windows source build, `scripts/run-throwaway.ps1` builds that helper in
+Docker (through `scripts/linux-helper.ps1`, which `install.ps1` shares) when
+it is missing, older than its sources or not the binary's release, and points
+Brindle at it for the run. To build it by hand instead, build it in Docker
 and point Brindle at it:
 
 ```powershell

@@ -111,7 +111,13 @@ BRINDLE_E2E=1 cargo test --test e2e -- --shard 2/3   # every 3rd selected case, 
 
 ### Manual checks
 
-The suite never sends real keys, so these stay manual. Hand them to the user, with `scripts/run-throwaway.sh` (on Windows `scripts/run-throwaway.ps1`, which also sets a private `BRINDLE_SERVER_DIR` and `BRINDLE_SERVER_HELPER` (the `brindle-remote.exe` beside the binary), runs `brindle-remote stop` on exit, `-Keep` included, and takes `-Config FILE`, `-Keep` and `-BrindleArgs 'terminal','-d','C:/Temp'`) to try them on a build without touching their config, saved session or terminal server (the shell script runs Brindle against a private config, state and server directory under `/tmp`, stops that server on exit, and takes `--config FILE`, `--keep` and `-- <brindle args>`; it opens a window, so it is theirs to run, not ours):
+The suite never sends real keys, so these stay manual. Hand them to the user, with `scripts/run-throwaway.sh` (on Windows `scripts/run-throwaway.ps1`) to try them on a build without touching their saved session or terminal server. It opens a window, so it is theirs to run, not ours. The two scripts take the same options: `--config FILE`/`-Config FILE`, `--keep`/`-Keep`, and Brindle's arguments after `--`/`-BrindleArgs 'terminal','-d','C:/Temp'`. They differ as written here:
+- **Private:** the state and terminal server directories (under `/tmp`, or `%TEMP%` with `BRINDLE_SERVER_HELPER` set to the `brindle-remote.exe` beside the binary). Each script runs `brindle-remote stop` on exit, `--keep` included, and removes the directory unless kept.
+- **Config:** without the option, a fresh private `config.toml`. `--config FILE` points `BRINDLE_CONFIG` at that file itself (its absolute path): edits apply live, the settings dialog writes it, and the cleanup leaves it, so pass a copy to keep an original.
+- **Helper, Linux:** for a binary in this checkout's `target/`, the shell script stops ("run cargo build") when the `brindle-remote` beside it is older than its sources (`check_helper`'s four directories, `remote-agent/Cargo.toml` or `Cargo.lock`). It builds nothing.
+- **Helper, Windows:** for a binary in `target\`, with `BRINDLE_REMOTE_AGENT` unset and no `brindle-remote-linux-x86_64` beside it, the PowerShell script sets `BRINDLE_REMOTE_AGENT` to the static Linux helper, built in Docker by `scripts/linux-helper.ps1` (shared with `install.ps1`, into `target\linux-helper`) when it is missing, older than those inputs, or not the binary's release. Without Docker it warns that remote profiles won't work and runs anyway. `-NoLinuxHelper` skips this, and `scripts/linux-helper.ps1 -Root . -Bin target\release\brindle.exe -Check` prints the decision with no build or window.
+
+The checks:
 - IME composition: with IBus, ctrl-shift-u `e9` space gives `é`, in a terminal and in a palette;
 - wheel scrolling in local tabs;
 - dragging tabs to reorder them;

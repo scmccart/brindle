@@ -7,7 +7,8 @@
 #   scripts/install.ps1 -RemoteAgent PATH        # use this Linux helper instead of building it
 #
 # The Linux helper is built in Docker (Linux containers) from this checkout,
-# with the Rust version in rust-toolchain.toml. Re-run it to update; a Brindle
+# with the Rust version in rust-toolchain.toml, by scripts/linux-helper.ps1,
+# which run-throwaway.ps1 shares. Re-run it to update; a Brindle
 # that is running keeps its old build until it restarts. The install directory
 # is added to your user PATH. scripts/uninstall.ps1 removes it all again.
 
@@ -21,18 +22,20 @@ $root = Split-Path -Parent $PSScriptRoot
 Push-Location $root
 try {
     $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-    $rust = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "(.+)"').Matches[0].Groups[1].Value
+    # The Docker build and the checks are shared with run-throwaway.ps1.
+    $linuxHelper = Join-Path $PSScriptRoot 'linux-helper.ps1'
 
     # Fail before the long builds if the Linux helper can't be had.
     if ($RemoteAgent) {
         $RemoteAgent = (Resolve-Path $RemoteAgent).Path
     } else {
-        if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-            throw "install: docker not found; install Docker Desktop, or pass -RemoteAgent with a Linux brindle-remote $version"
+        $docker = & $linuxHelper -ProbeDocker
+        switch ($docker.State) {
+            'Ready' {}
+            'Unchecked' {}
+            'Unavailable' { throw "install: $($docker.Message), or pass -RemoteAgent with a Linux brindle-remote $version" }
+            'Failed' { throw "install: $($docker.Message)" }
         }
-        $os = docker info --format '{{.OSType}}' 2>$null
-        if ($LASTEXITCODE -ne 0) { throw 'install: the Docker daemon is not running; start Docker Desktop' }
-        if ($os -ne 'linux') { throw "install: Docker runs $os containers; switch Docker Desktop to Linux containers" }
     }
 
     & "$PSScriptRoot\fetch-conpty.ps1"
@@ -40,35 +43,23 @@ try {
     cargo build --release --locked -p brindle -p brindle-remote-agent
     if ($LASTEXITCODE) { throw 'install: cargo build failed' }
 
-    if (-not $RemoteAgent) {
-        # A target directory of its own keeps the container's host artifacts
-        # apart from the Windows build's; the registry volume keeps downloads.
-        $target = 'target/linux-helper'
-        $mounts = @('-v', "${root}:/src", '-v', 'brindle-cargo-registry:/usr/local/cargo/registry', '-w', '/src')
-        $build = "apt-get update -qq && apt-get install -y -qq musl-tools >/dev/null && " +
-            "rustup target add x86_64-unknown-linux-musl && " +
-            "CARGO_TARGET_DIR=$target cargo build --locked --release -p brindle-remote-agent --target x86_64-unknown-linux-musl"
-        docker run --rm @mounts "rust:$rust" sh -c $build
-        if ($LASTEXITCODE) { throw 'install: building the Linux helper in Docker failed' }
-        $RemoteAgent = Join-Path $root "$target\x86_64-unknown-linux-musl\release\brindle-remote"
-    }
-
-    # The helper must be a Linux binary of this version, or remote profiles
-    # upload it and then refuse it on the host.
-    $bytes = [System.IO.File]::ReadAllBytes($RemoteAgent)
-    if ($bytes.Length -lt 4 -or $bytes[0] -ne 0x7f -or $bytes[1] -ne 0x45 -or $bytes[2] -ne 0x4c -or $bytes[3] -ne 0x46) {
-        throw "install: $RemoteAgent is not a Linux ELF binary"
-    }
-    if (Get-Command docker -ErrorAction SilentlyContinue) {
-        $dir = Split-Path -Parent $RemoteAgent
-        $leaf = Split-Path -Leaf $RemoteAgent
-        $said = docker run --rm -v "${dir}:/helper:ro" "rust:$rust" "/helper/$leaf" --version 2>&1
-        if ($LASTEXITCODE -or "$said".Trim() -ne $version) {
-            throw "install: $RemoteAgent prints '$said' for --version, not $version"
-        }
+    # The helper must be a Linux binary of this build's release, or remote
+    # profiles upload it and then refuse it on the host. A given one is
+    # checked (rules 1 and 3 in linux-helper.ps1); otherwise it is built
+    # every time, then checked.
+    $bin = Join-Path $root 'target\release\brindle.exe'
+    $linux = if ($RemoteAgent) {
+        & $linuxHelper -Root $root -Bin $bin -Helper $RemoteAgent
     } else {
-        Write-Warning "install: can't run $RemoteAgent to check its version; it must be $version"
+        & $linuxHelper -Root $root -Bin $bin -Build Always
     }
+    switch ($linux.State) {
+        'Ready' {}
+        'Unchecked' { Write-Warning "install: $($linux.Message)" }
+        'Unavailable' { throw "install: $($linux.Message)" }
+        'Failed' { throw "install: $($linux.Message)" }
+    }
+    $RemoteAgent = $linux.Path
 
     New-Item -ItemType Directory -Force $Prefix | Out-Null
     # Windows locks a running exe, but lets it be renamed: move the old one
