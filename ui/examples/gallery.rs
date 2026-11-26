@@ -39,6 +39,7 @@ use brindle_ui::{
     LOADER_STEPS, Loader, Message, MessageFrom, MessageScroller, PromptInput, PromptInputEvent, PromptStatus, Reasoning,
     Shimmer, Tool, ToolStatus,
 };
+use brindle_ui::{Diff, DiffRowData, DiffSign};
 use brindle_ui::{
     Code, CodeBlock, ColumnAlign, HeadingLevel, Inline, InlineLink, ListItem, ListKind, Response, RichBlock, RunStyle,
     Table, Task,
@@ -559,6 +560,8 @@ pub struct Gallery {
     /// `remove`, `resend`.
     prompt_log: Vec<String>,
     thought_open: bool,
+    /// The edit tool row's content shows.
+    tool_open: bool,
     permission: ConfirmationState,
     /// The permission's actions pressed, by label, in order.
     permission_log: Vec<String>,
@@ -934,6 +937,7 @@ impl Gallery {
             narrow_prompts,
             prompt_log: Vec::new(),
             thought_open: false,
+            tool_open: true,
             permission: ConfirmationState::Requested,
             permission_log: Vec::new(),
             motion_step: 0,
@@ -1879,6 +1883,33 @@ impl Gallery {
                     .ok();
             })
             .child("The workflow names fxc.exe; the SDK path moved with 10.0.26100.0.");
+        // A tool row that opens, and its diff below it while open.
+        let flipped = cx.weak_entity();
+        let edit = Tool::new(Icon::Pencil, "Edit build-windows.yml", ToolStatus::Done)
+            .id("demo-tool-edit")
+            .summary("+1 \u{2212}1")
+            .open(Some(self.tool_open))
+            .on_toggle(move |open, _, cx| {
+                flipped
+                    .update(cx, |gallery, cx| {
+                        gallery.tool_open = open;
+                        cx.notify();
+                    })
+                    .ok();
+            });
+        let row = |sign, old, new, text: &str, hunk_start| DiffRowData { sign, old, new, text: text.to_string().into(), hunk_start };
+        let diff = Diff::new(
+            "demo-diff",
+            [
+                row(DiffSign::Context, Some(12), Some(12), "      - name: Build", false),
+                row(DiffSign::Removed, Some(13), None, "        run: cargo build", false),
+                row(DiffSign::Added, None, Some(13), "        run: cargo build --release --locked", false),
+                row(DiffSign::Added, None, Some(40), "        GPUI_FXC_PATH: ${{ steps.sdk.outputs.fxc }}", true),
+            ],
+        )
+        .header("Modified", ".github/workflows/build-windows.yml", None);
+        let tool_open = self.tool_open;
+        let edit = div().flex().flex_col().gap_1().child(edit).when(tool_open, |d| d.child(diff));
         // An answered destructive request draws as a plain one.
         let answered = Confirmation::new(
             "demo-permission-answered",
@@ -1939,6 +1970,7 @@ impl Gallery {
                             .child(Tool::new(Icon::Search, "Search for fxc.exe", ToolStatus::Pending))
                             .child(Tool::new(Icon::Globe, "Fetch the Windows SDK release notes", ToolStatus::Running))
                             .child(Tool::new(Icon::Pencil, "Edit .github/workflows/build-windows.yml", ToolStatus::Failed))
+                            .child(edit)
                             .child(motion)
                             .child(permission)
                             .child(recorded(answered, "permission-answered", &self.records))

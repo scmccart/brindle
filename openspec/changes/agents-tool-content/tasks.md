@@ -251,7 +251,7 @@ Before starting, check these:
 
 ## 6. brindle-ui and tokens
 
-- [ ] 6.1 **Add the diff tokens.**
+- [x] 6.1 **Add the diff tokens.**
   - Add `diff_added` and `diff_removed` to `brindle-ui`'s `Tokens`, with fixed tints in `Tokens::neutral_light` and `neutral_dark`.
   - Generalise `destructive_tint` into `legible_tint(base, text, colour, max)`, keeping `destructive_tint`'s results byte for byte.
   - Derive the two tokens in `tokens_over` from `muted` and the theme's green (`ansi[2]`) and red (`ansi[1]`), up to `DIFF_TINT_MAX`.
@@ -260,13 +260,13 @@ Before starting, check these:
     - a test that both differ from `muted` for every built-in;
     - `the_destructive_tint_stops_where_it_stays_legible` and `ui_tokens_keep_their_values` unchanged;
     - `ui_tokens_css_covers_every_builtin_with_shadcn_names` unchanged, since the export doesn't list them.
-- [ ] 6.2 **Extend `Tool`** (`ui/src/components/tool.rs`) with `.summary`, `.open(Option<bool>)` and `.on_toggle`, and update its module docs. Add it to the gallery.
+- [x] 6.2 **Extend `Tool`** (`ui/src/components/tool.rs`) with `.summary`, `.open(Option<bool>)` and `.on_toggle`, and update its module docs. Add it to the gallery.
   - Verify with component tests:
     - the chevron;
     - the press asking the owner;
     - no press handler without an open state;
     - the summary and badge staying whole beside a long title.
-- [ ] 6.3 **Add `Diff`** (`ui/src/components/diff.rs`, exported from `components/mod.rs`).
+- [x] 6.3 **Add `Diff`** (`ui/src/components/diff.rs`, exported from `components/mod.rs`).
   - The header with the operation, path, earlier path and copy button.
   - Lines on `muted`, `diff_added` and `diff_removed`, with sign column, both line numbers and text in the given code family.
   - A border line between hunks, and no focus.

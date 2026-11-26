@@ -46,6 +46,7 @@ pub mod command;
 pub mod confirmation;
 pub mod context_menu;
 pub mod dialog;
+pub mod diff;
 pub mod dropdown_menu;
 pub mod edge_bar;
 pub mod input;
@@ -101,6 +102,7 @@ pub use combobox::{
 pub use command::{Command, CommandEvent, CommandGroup, CommandItem, CommandRow, CommandRows, Scroll, item_keyed};
 pub use context_menu::{ContextMenu, ContextMenuTarget};
 pub use dialog::{Dialog, dialog_width};
+pub use diff::{COPY_DIFF, Diff, DiffRowData, DiffSign, diff_line_background};
 pub use dropdown_menu::{DropdownMenu, trigger_key_opens};
 pub use edge_bar::{EDGE_BAR_HEIGHT, EdgeBar};
 pub use input::Input;
