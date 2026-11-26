@@ -812,6 +812,182 @@ pub fn scroll(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The steps of a long conversation's turn (OpenSpec change
+/// `agents-log-paging` task 6.1): after the prompt, the conversation
+/// titled `title` when there is one, then `entries` chunks alternating a
+/// thought of `size` bytes and a short agent message, each a new entry, and
+/// the turn's end. The thoughts carry the bytes, so a page holds many
+/// entries but draws few lines (a closed thought is one row), and
+/// shift-pageup reaches each page's top in a few presses.
+fn long_turn(entries: usize, size: usize, title: Option<&str>) -> Vec<String> {
+    let mut steps = vec!["expect session/prompt".to_string()];
+    steps.extend(title.map(|title| titles(Some(title))));
+    for n in 0..entries {
+        steps.push(if n % 2 == 0 {
+            let head = format!("thought {n} ");
+            let text = head.clone() + &"lorem ipsum ".repeat(size.saturating_sub(head.len()) / 12);
+            update(&format!(r#"{{"sessionUpdate":"agent_thought_chunk","content":{{"type":"text","text":"{text}"}}}}"#))
+        } else {
+            says(&format!("message {n}"))
+        });
+    }
+    steps.push(stop("end_turn"));
+    steps
+}
+
+/// The `Fake` profile whose agent answers the first prompt with
+/// [`long_turn`], written as `NAME.script`.
+fn long_conversation(ctx: &Ctx, name: &str, entries: usize, size: usize, title: Option<&str>) -> Result<String> {
+    long_turn(entries, size, title)
+        .into_iter()
+        .fold(Script::ready(&ctx.dir.join(format!("{name}.jsonl"))), Script::step)
+        .profile(ctx, name)
+}
+
+/// The long conversation of the `agent-earlier-*` cases: about 1 MiB in
+/// 400 entries after the prompt, so an attach's 256 KiB page leaves most of
+/// it to fetch.
+const LONG_ENTRIES: u64 = 400;
+const LONG_SIZE: usize = 5 * 1024;
+const LONG_TITLE: &str = "A long conversation";
+
+/// The shift-pageup presses that take the `agent-earlier-*` conversation
+/// from its end to its start, fetching each page as its row shows: a page
+/// draws about 100 one-row entries.
+const PAGE_UPS: usize = 60;
+
+/// [`long_turn`]'s steps: the chunks alternate, each kind's text where it
+/// should be, the title first, and the turn ends.
+pub fn self_test_long_turn() -> Result {
+    let steps = long_turn(6, 200, Some("T"));
+    ensure!(steps.len() == 1 + 1 + 6 + 1, "{} steps", steps.len());
+    ensure!(steps[0] == "expect session/prompt" && steps[1].contains("session_info_update"), "{:?}", &steps[..2]);
+    let chunks = &steps[2..8];
+    for (n, step) in chunks.iter().enumerate() {
+        let kind = if n % 2 == 0 { "agent_thought_chunk" } else { "agent_message_chunk" };
+        ensure!(step.starts_with("send ") && step.contains(kind), "chunk {n}: {step}");
+        let value: serde_json::Value = serde_json::from_str(&step[5..]).map_err(|e| format!("chunk {n}: {e}"))?;
+        let text = value["params"]["update"]["content"]["text"].as_str().unwrap_or_default();
+        ensure!(text.starts_with(&format!("{} {n}", if n % 2 == 0 { "thought" } else { "message" })), "chunk {n}: {text}");
+        ensure!(n % 2 == 1 || (190..=200).contains(&text.len()), "thought {n} is {} bytes", text.len());
+    }
+    ensure!(steps[8] == stop("end_turn"), "{}", steps[8]);
+    ensure!(long_turn(3, 10, None).len() == 1 + 3 + 1, "untitled");
+    Ok(())
+}
+
+/// `n` shift-pageup presses.
+fn page_ups(mut run: Run<'_>, n: usize) -> Run<'_> {
+    for _ in 0..n {
+        run = run.key("shift-pageup");
+    }
+    run
+}
+
+/// The ids of the dump's `--- entry` lines, in order.
+fn entry_ids(out: &crate::brindle::Output) -> Vec<u64> {
+    out.dump.agent.iter().filter_map(|line| line.strip_prefix("entry ")?.split(' ').next()?.parse().ok()).collect()
+}
+
+/// The `--- conversation` line's `earlier=` value.
+fn earlier(out: &crate::brindle::Output) -> Option<&str> {
+    let line = out.dump.agent.iter().find_map(|line| line.strip_prefix("conversation "))?;
+    line.split(' ').find_map(|f| f.strip_prefix("earlier="))
+}
+
+/// The ids from `first` to the conversation's last entry, each once and
+/// in order: the zone holds one stretch of it.
+fn held_through_the_end(out: &crate::brindle::Output, first: u64) -> Result {
+    let ids = entry_ids(out);
+    let want: Vec<u64> = (first..=LONG_ENTRIES + 1).collect();
+    ensure!(ids == want, "entry ids {:?}…{:?} ({} of them), not {first}..={}", ids.first(), ids.last(), ids.len(), LONG_ENTRIES + 1);
+    Ok(())
+}
+
+/// Runs the long conversation's turn live and leaves it detached, its
+/// tab recorded for the next run to restore.
+fn long_turn_detached(ctx: &Ctx, profile: &str) -> Result {
+    let out = Run::new(ctx, "live")
+        .config(profile)
+        .agent("Fake")
+        .first_prompt("go")
+        .keep_detached()
+        .wait_for(ENDED)
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(earlier(&out) == Some("none"), "a live zone holds the whole conversation: {:?}", out.dump.agent.last());
+    held_through_the_end(&out, 1)
+}
+
+/// An attach of a long conversation (OpenSpec change `agents-log-paging`,
+/// task 6.2): the restored zone holds the newest page, from an entry past
+/// the first through the last, the conversation line counting the entries
+/// before it, and the tab is titled with the conversation's title, which
+/// every page carries.
+pub fn earlier_page(ctx: &Ctx) -> Result<Outcome> {
+    let profile = long_conversation(ctx, "long", LONG_ENTRIES as usize, LONG_SIZE, Some(LONG_TITLE))?;
+    long_turn_detached(ctx, &profile)?;
+    let out = Run::new(ctx, "attached").config(&profile).restore().wait_for(ENDED).dump_at(6.0).run()?;
+    waited(&out)?;
+    let first = entry_ids(&out).first().copied().ok_or("no entries")?;
+    ensure!(first > 1, "the whole conversation was sent: the first entry is {first}");
+    held_through_the_end(&out, first)?;
+    ensure!(earlier(&out) == Some((first - 1).to_string().as_str()), "earlier={:?} with entry {first} first", earlier(&out));
+    ensure!(out.dump.tabs.first().map(|(title, _)| title.as_str()) == Some(LONG_TITLE), "tabs: {:?}", out.dump.tabs);
+    Ok(Outcome::Pass)
+}
+
+/// Scrolling an attached long conversation to its start (task 6.3):
+/// shift-pageup reaches the Earlier row, each page goes in front, and the
+/// zone ends up holding every entry with its parts, away from the end,
+/// the motion clock stopped once nothing loads and nothing notified.
+pub fn earlier_scroll(ctx: &Ctx) -> Result<Outcome> {
+    let profile = long_conversation(ctx, "long", LONG_ENTRIES as usize, LONG_SIZE, Some(LONG_TITLE))?;
+    long_turn_detached(ctx, &profile)?;
+    let log = ctx.dir.join("scroll.notify");
+    let run = Run::new(ctx, "scroll")
+        .config(&profile)
+        .config("\n[notifications]\nwhen = \"always\"\n")
+        .env("BRINDLE_NOTIFY_LOG", log.to_str().ok_or("the log's path isn't UTF-8")?)
+        .restore()
+        .step_interval(0.2)
+        .wait_for(ENDED);
+    let out = page_ups(run, PAGE_UPS).wait_for("earlier=none").dump_at(30.0).run()?;
+    waited(&out)?;
+    held_through_the_end(&out, 1)?;
+    for entry in 2..=LONG_ENTRIES + 1 {
+        ensure!(!out.dump.agent_blocks(entry).is_empty(), "entry {entry} has no parts");
+    }
+    agent_has(&out, "conversation entries=401 at=away earlier=none")?;
+    ensure!(out.dump.motion.as_deref() == Some("stopped"), "motion {:?}", out.dump.motion);
+    ensure!(notices(&log).is_empty(), "fetched pages notified: {:?}", notices(&log));
+    Ok(Outcome::Pass)
+}
+
+/// A long conversation attached again after it was fetched to its start
+/// (task 6.4): each attach starts from the newest page, with as many
+/// entries before it as the first, and scrolling up fetches them again.
+pub fn earlier_reattach(ctx: &Ctx) -> Result<Outcome> {
+    let profile = long_conversation(ctx, "long", LONG_ENTRIES as usize, LONG_SIZE, Some(LONG_TITLE))?;
+    long_turn_detached(ctx, &profile)?;
+    let out = Run::new(ctx, "first").config(&profile).restore().keep_detached().wait_for(ENDED).dump_at(6.0).run()?;
+    waited(&out)?;
+    let count = earlier(&out).ok_or("no conversation line")?.to_string();
+    ensure!(count.parse::<u64>().is_ok_and(|n| n > 0), "the first attach's earlier={count}");
+    let scrolled = |label| {
+        let run = Run::new(ctx, label).config(&profile).restore().keep_detached().step_interval(0.2);
+        let run = run.wait_for(ENDED).wait_for(&format!("earlier={count}"));
+        page_ups(run, PAGE_UPS).wait_for("earlier=none").dump_at(30.0).run()
+    };
+    for label in ["fetched", "again"] {
+        let out = scrolled(label)?;
+        waited(&out)?;
+        held_through_the_end(&out, 1)?;
+    }
+    Ok(Outcome::Pass)
+}
+
 /// Copy Last Agent Message puts the agent's last message on the
 /// clipboard, which a paste into the prompt input shows.
 pub fn copy(ctx: &Ctx) -> Result<Outcome> {

@@ -401,6 +401,7 @@ fn self_test() -> i32 {
         ("remote parsing", cases::self_test_remote),
         ("clipboard helpers", cases::self_test_clipboard),
         ("agent capture measures", cases::self_test_agent_layout),
+        ("agent long conversation", cases::self_test_agent_long_turn),
         ("server helpers", common::server::self_test),
         ("fake agent lookup", fake_agent::self_test),
         ("fake agent selection", self_test_wants_fake_agent),

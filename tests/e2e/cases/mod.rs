@@ -272,6 +272,9 @@ fn unix() -> Vec<Case> {
         display("agent-working", agent::working).needs_fake_agent(),
         display("agent-thoughts", agent::thoughts).needs_fake_agent(),
         display("agent-scroll", agent::scroll).needs_fake_agent(),
+        display("agent-earlier-page", agent::earlier_page).needs_fake_agent(),
+        display("agent-earlier-scroll", agent::earlier_scroll).needs_fake_agent(),
+        display("agent-earlier-reattach", agent::earlier_reattach).needs_fake_agent(),
         display("agent-copy", agent::copy).needs_fake_agent(),
         display("agent-markdown-render", agent::markdown_render).needs_fake_agent(),
         display("agent-markdown-stream", agent::markdown_stream).needs_fake_agent(),
@@ -326,6 +329,11 @@ pub fn self_test_clipboard() -> Result {
 pub fn self_test_agent_layout() -> Result {
     agent::self_test_layout()?;
     agent::self_test_zone_theme()
+}
+
+/// The `agent-earlier-*` cases' long conversation script (`--self-test`).
+pub fn self_test_agent_long_turn() -> Result {
+    agent::self_test_long_turn()
 }
 
 /// The remote cases' parsers (`--self-test`).

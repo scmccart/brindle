@@ -722,6 +722,15 @@ impl<'a> Run<'a> {
             // when `pipe` drops.
             std::io::Write::write_all(&mut pipe, bytes).map_err(|e| format!("writing Brindle's stdin: {e}"))?;
         }
+        // Read while it runs: a dump longer than the pipe's buffer (a long
+        // conversation's) would otherwise hold Brindle in its write.
+        let reader = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                out.read_to_string(&mut text).ok();
+                text
+            })
+        });
         let started = Instant::now();
         // Captures count from the window's first appearance, as Brindle's
         // steps and dump do; the rest of the timeline counts from the spawn.
@@ -783,8 +792,10 @@ impl<'a> Run<'a> {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let mut stdout = String::new();
-        child.stdout.take().unwrap().read_to_string(&mut stdout).ok();
+        let stdout = match reader {
+            Some(reader) => reader.join().map_err(|payload| format!("the stdout reader panicked: {}", panic_message(&*payload)))?,
+            None => String::new(),
+        };
         ctx.save(&format!("{}.dump", self.label), &stdout);
         let errors = events.join().map_err(|payload| format!("the timeline thread panicked: {}", panic_message(&*payload)))?;
         ensure!(errors.is_empty(), "timeline: {}", errors.join("; "));
