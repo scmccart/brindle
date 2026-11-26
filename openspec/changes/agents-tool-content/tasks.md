@@ -291,9 +291,9 @@ Before starting, check these:
   - Verify in the e2e cases of 8.1, 8.5 and 8.9.
 - [x] 7.2 **Add `toggle_agent_tool_details` to `ACTIONS`** ("Toggle Tool Details", no default key). Only `AgentView` handles it (`src/agent/mod.rs`).
   - Verify with a unit test beside `an_agent_zone_lists_no_terminal_commands` that the palette lists it in an agent zone and not in a terminal zone.
-- [ ] 7.3 **Keep the end in view while an open row's output grows**, through the scroller's existing follow rule, with the working row still the last item.
+- [x] 7.3 **Keep the end in view while an open row's output grows**, through the scroller's existing follow rule, with the working row still the last item.
   - Verify in the e2e case of 8.2.
-- [ ] 7.4 **Hand the model its `ToolPolicy`** from the settings when the zone is built and on every config reload, applying the returned `Splice`s.
+- [x] 7.4 **Hand the model its `ToolPolicy`** from the settings when the zone is built and on every config reload, applying the returned `Splice`s.
   - Verify in the e2e case of 8.8.
 
 ## 8. End-to-end and perf cases (fake ACP agent)
@@ -304,16 +304,16 @@ Before starting, check these:
   - the row open while the call is in progress (behind a `Gate`) and closed once it completes;
   - `toggle_agent_tool_details` opening it again, and it staying open;
   - a pixel check of the added and removed colours against the `e2e` theme.
-- [ ] 8.2 **`agent-tool-output`**: output streamed in Codex's `_meta` pieces behind a `Gate`; its text and exit; the conversation staying at its end (`at=end`).
-- [ ] 8.3 **`agent-tool-raw`**: a call with only a raw input shows it; a call with content doesn't.
+- [x] 8.2 **`agent-tool-output`**: output streamed in Codex's `_meta` pieces behind a `Gate`; its text and exit; the conversation staying at its end (`at=end`).
+- [x] 8.3 **`agent-tool-raw`**: a call with only a raw input shows it; a call with content doesn't.
 - [ ] 8.4 **`agent-tool-bounds`**: 200 KiB of output and a 40-item call show their counts.
-- [ ] 8.5 **`agent-permission-detail`**:
+- [x] 8.5 **`agent-permission-detail`**:
   - a pending request shows its call's diff while the call's own line reads `open=permission`, also with `tool_details = "closed"`;
   - after `Allow once`, the detail is gone from the permission and back in the running call's row;
   - content sent only in the request shows too.
 - [ ] 8.6 **`agent-tool-restore`**: quit mid-turn with a diff and a pending permission, relaunch, and the restored zone shows both.
 - [ ] 8.7 **`agent-tool-page`**: a session waits on a permission for a tool call with more than a page of entries after it; the restored zone's first entry is that tool call, and the permission shows its diff (`earlier=` present).
-- [ ] 8.8 **`agent-tool-settings`**:
+- [x] 8.8 **`agent-tool-settings`**:
   - `tool_details = "closed"` keeps a running call's row closed;
   - `tool_details_when_done = "open"` keeps a finished one open;
   - rewriting the config while Brindle runs opens the finished rows without a restart;
@@ -326,12 +326,12 @@ Before starting, check these:
 
 ## 9. Docs
 
-- [ ] 9.1 **Update the docs** for tool content:
+- [x] 9.1 **Update the docs** for tool content:
   - `docs/code-map.md`: `remote/` and the terminal server's ACP section (the modules, `Dialect`, the open outputs), `brindle-transcript` (the forms, the page's reach), the `agent/` entry (the detail, the policy) and `brindle-ui` (`Tool`, `Diff`);
   - `README.md`'s Agent tabs section and its config table;
   - `CLAUDE.md`'s dump description (the tool line's `open=` and `items=`, `detail=`, the `--- item`, `--- hunk`, `--- location` and `--- raw` lines) and the manual checks list (task 10.4's checks);
   - `.claude/rules/transcript.md`.
-- [ ] 9.2 **Tell `agents-acp-v2` what it inherits.** Add to its proposal that its v2 module goes behind `Dialect` and maps v2's tool content as design decision 9 says, open outputs included.
+- [x] 9.2 **Tell `agents-acp-v2` what it inherits.** Add to its proposal that its v2 module goes behind `Dialect` and maps v2's tool content as design decision 9 says, open outputs included.
 
 ## 10. Integration and landing
 

@@ -865,8 +865,22 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 10] =
-    ["agent ", "login ", "note ", "entry ", "block ", "link ", "working ", "queued ", "conversation ", "prompt "];
+const AGENT_LINES: [&str; 14] = [
+    "agent ",
+    "login ",
+    "note ",
+    "entry ",
+    "block ",
+    "link ",
+    "item ",
+    "hunk ",
+    "location ",
+    "raw ",
+    "working ",
+    "queued ",
+    "conversation ",
+    "prompt ",
+];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -1127,6 +1141,30 @@ impl Dump {
     /// action=A`.
     pub fn agent_links(&self, entry: u64) -> Vec<&str> {
         self.entry_lines("link ", entry)
+    }
+
+    /// Tool call entry `entry`'s content items (`--- item entry=N index=I
+    /// kind=K …`), each as `index=I kind=K …`.
+    pub fn agent_items(&self, entry: u64) -> Vec<&str> {
+        self.entry_lines("item ", entry)
+    }
+
+    /// Its diffs' hunks (`--- hunk entry=N index=I old=O new=W "LINES"`),
+    /// each as `index=I old=O new=W "LINES"`.
+    pub fn agent_hunks(&self, entry: u64) -> Vec<&str> {
+        self.entry_lines("hunk ", entry)
+    }
+
+    /// Its raw values (`--- raw entry=N which=W "TEXT"`), each as `which=W
+    /// "TEXT"`.
+    pub fn agent_raws(&self, entry: u64) -> Vec<&str> {
+        self.entry_lines("raw ", entry)
+    }
+
+    /// Entry `entry`'s line (`--- entry N KIND …`), without `entry N `.
+    pub fn agent_entry(&self, entry: u64) -> Option<&str> {
+        let prefix = format!("entry {entry} ");
+        self.agent.iter().find_map(|line| line.strip_prefix(prefix.as_str()))
     }
 
     fn entry_lines(&self, word: &str, entry: u64) -> Vec<&str> {
@@ -1390,6 +1428,20 @@ pub fn self_test_dump() -> Result {
         dump.agent_links(2)
     );
     ensure!(dump.link.is_none(), "an agent's link isn't the terminal's hovered one: {:?}", dump.link);
+    // A tool call's content lines (agents-tool-content decision 12).
+    let tool = Dump::parse(
+        "--- agent zone=1 state=ready turn=working activity=working status=working link=up session=open \
+         continue=none:not-ended\n\
+         --- entry 3 tool call=\"c1\" kind=edit status=completed open=no items=1 \"Edit a\"\n\
+         --- item entry=3 index=0 kind=diff op=modify path=\"/p/a\" added=1 removed=0 omitted=0\n\
+         --- hunk entry=3 index=0 old=1 new=1 \"+x\"\n--- location entry=3 path=\"/p/a\"\n\
+         --- raw entry=4 which=input \"{}\"\n--- prompt status=ready\n",
+    );
+    ensure!(tool.agent.len() == 7, "agent lines {:?}", tool.agent);
+    ensure!(tool.agent_entry(3).is_some_and(|l| l.contains("open=no items=1")), "{:?}", tool.agent);
+    ensure!(tool.agent_items(3) == ["index=0 kind=diff op=modify path=\"/p/a\" added=1 removed=0 omitted=0"], "{:?}", tool.agent);
+    ensure!(tool.agent_hunks(3) == ["index=0 old=1 new=1 \"+x\""], "{:?}", tool.agent);
+    ensure!(tool.agent_raws(4) == ["which=input \"{}\""] && tool.agent_raws(3).is_empty(), "{:?}", tool.agent);
     ensure!(dump.agent_field("state") == Some("ready") && dump.agent_field("session") == Some("open"), "{:?}", dump.agent);
     ensure!(dump.agent_field("zone") == Some("1") && dump.agent_field("missing").is_none(), "{:?}", dump.agent);
     // The login row, after the agent line.

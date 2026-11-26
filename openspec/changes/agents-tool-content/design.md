@@ -636,6 +636,8 @@ Flags added while implementing (2026-11-26, sections 1–4):
 28. **Every entry-change event below the window records nothing** in `shared.rs` (`Appended`, `ToolChanged`, `ToolItems`, `ToolOutput`, `Answered` for an entry the fold doesn't hold), not only the new ones: before, such a change marked an entry the zone didn't have. Recommend: accept.
 29. **`legible_tint` takes the colour's own minimum** (`colour_min`): `destructive_tint` passes 3.0, so its results stay byte for byte, and the diff tints pass 1.0 (no check), since their sign column, not their tint, carries the meaning. Recommend: accept.
 30. **A long diff's or output's runs read as one frame**: `Diff` and `CodeBlock` gain `.joined(above, below)`, a run joined above drawing no header, and the view asks `tool::continues_into` whether the next block goes on with the same item. An output's label (`cargo test · exit 1`, `output` with no command) is built with its part (`OutputHead::label`). Recommend: accept.
+31. **The dump doesn't show a row's summary** (`+1 −1 · exit 1`): decision 12's tool line has no field for it, so task 8.1's "the row's summary" is checked by `model.rs`'s unit tests, not the e2e case, and 8.1 stays open. Recommend: add ` summary="…"` to the tool line, when it has one, before `items=` (additive; the cases' prefixes still match), or accept the unit tests.
+32. **A permission request naming a call the agent never sent adds that tool entry first** (task 4's rule), so the request is the entry after it: `agent-permission-keys`' expectations move from entry 2 to entry 3 (`permission:3:reject-once`), and `agent-quit-restore` expects the tool entry between the prompt and the request. Recommend: accept; it is the rule the request-only content needs.
 
 ## The user's decisions
 

@@ -447,6 +447,28 @@ fn the_zones_actions_act_on_the_agent() {
     assert!(!open(&mut f));
     f.cx.dispatch_action(ToggleAgentThoughts);
     assert!(open(&mut f));
+    // A finished call's row, closed, opens on Toggle Tool Details.
+    let mut tool = crate::agent::transcript::Entry::tool(
+        "c1".into(),
+        "Run".into(),
+        crate::agent::transcript::ToolKind::Execute,
+        crate::agent::transcript::ToolStatus::Completed,
+    );
+    if let crate::agent::transcript::Entry::Tool { input, .. } = &mut tool {
+        *input = Some("ls".into());
+    }
+    f.feed(&[added(4, tool)]);
+    let row = |f: &mut Fixture| {
+        f.zone.agent.read_with(f.cx, |agent, _| {
+            agent.model().blocks().iter().find_map(|b| match &b.body {
+                BlockBody::Tool { state, .. } => Some(*state),
+                _ => None,
+            })
+        })
+    };
+    assert_eq!(row(&mut f), Some(crate::agent::tool::RowState::Closed));
+    f.cx.dispatch_action(crate::actions::ToggleAgentToolDetails);
+    assert_eq!(row(&mut f), Some(crate::agent::tool::RowState::Open));
     f.cx.dispatch_action(AgentScrollToBottom);
     assert_eq!(f.view.read_with(f.cx, |view, cx| view.scroller.read(cx).follow()), brindle_ui::Follow::AtEnd);
 }
