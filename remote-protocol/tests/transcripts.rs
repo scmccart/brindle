@@ -53,13 +53,13 @@ macro_rules! forms {
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
     Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
-    AgentResend, AgentRestart, AgentLogin);
+    AgentResend, AgentRestart, AgentLogin, AgentFetch);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
-    Process, Transcript);
+    Process, Transcript, AgentPage);
 forms!(to_holder_form, TO_HOLDER_FORMS, holder::ToHolder, "holder::ToHolder::":
     Hello, Spawn, Input, Resize, Hangup, CheckpointBegin, CheckpointChunk, CheckpointEnd, Drain,
-    Goodbye, Reparent, Pause, Resume, SetMeta, SpawnPipes);
+    Goodbye, Reparent, Pause, Resume, SetMeta, SpawnPipes, CheckpointAppend);
 forms!(holder_to_core_form, HOLDER_TO_CORE_FORMS, holder::ToCore, "holder::ToCore::":
     Welcome, Output, Spawned, SpawnFailed, Exited, Error, CheckpointBegin, CheckpointChunk,
     CheckpointEnd, TailBegin, TailChunk, TailEnd, StderrTail);
@@ -119,6 +119,20 @@ const LOGIN_FORMS: &[&str] = &[
     "relay::RelayHost.login=Failed",
 ];
 
+/// Whether an `AGENT_PAGE` frame is a fetch's last, and what it says.
+fn page_end_form(page: &client::AgentPage) -> &'static str {
+    match page.last {
+        None => "client::AgentPage.last=None",
+        Some(client::PageEnd { more: true }) => "client::AgentPage.last=more",
+        Some(client::PageEnd { more: false }) => "client::AgentPage.last=no-more",
+    }
+}
+const PAGE_END_FORMS: &[&str] = &[
+    "client::AgentPage.last=None",
+    "client::AgentPage.last=more",
+    "client::AgentPage.last=no-more",
+];
+
 /// Every form some transcript must have.
 fn expected_forms() -> Vec<&'static str> {
     [
@@ -136,6 +150,7 @@ fn expected_forms() -> Vec<&'static str> {
         ACTIVITY_FORMS,
         SPAWN_MODE_FORMS,
         PERMISSION_OPTION_FORMS,
+        PAGE_END_FORMS,
     ]
     .concat()
 }
@@ -207,6 +222,9 @@ impl Step {
                 let mut forms = vec![to_client_form(message)];
                 if let client::ToClient::Exit(exit) = message {
                     forms.push(lost_form(exit));
+                }
+                if let client::ToClient::AgentPage(page) = message {
+                    forms.push(page_end_form(page));
                 }
                 if let client::ToClient::Sessions(sessions) = message {
                     forms.extend(
@@ -775,6 +793,7 @@ fn transcripts() -> Vec<Transcript> {
                         session: 3,
                         cols: 100,
                         rows: 30,
+                        page: None,
                     })),
                 ],
                 replay(
@@ -798,6 +817,7 @@ fn transcripts() -> Vec<Transcript> {
                         session: 4,
                         cols: 100,
                         rows: 30,
+                        page: None,
                     })),
                     error(Some(2), Some(4), "session 4 is attached"),
                 ],
@@ -849,7 +869,7 @@ fn transcripts() -> Vec<Transcript> {
                             listed(2, "3c0b7e2f5a9d4186b2e7c0f19d3a5b48", Some(layout)),
                         ],
                     })),
-                    c(client::ToCore::Attach(client::Attach { req: 2, session: 1, cols: 80, rows: 24 })),
+                    c(client::ToCore::Attach(client::Attach { req: 2, session: 1, cols: 80, rows: 24, page: None })),
                     s(client::ToClient::ReplayStart(client::ReplayStart { req: Some(2), session: 1, pid: 5001 })),
                     s(client::ToClient::ReplayEnd(client::SessionRef { session: 1 })),
                     c(client::ToCore::List(client::Request { req: 3 })),
@@ -1360,6 +1380,7 @@ fn transcripts() -> Vec<Transcript> {
                     session: 7,
                     cols: 100,
                     rows: 30,
+                    page: None,
                 })),
             ]
             .into_iter()
@@ -1511,6 +1532,7 @@ fn transcripts() -> Vec<Transcript> {
     ]
     .into_iter()
     .chain(agent_transcripts())
+    .chain(paging_transcripts())
     .collect()
 }
 
@@ -1675,6 +1697,326 @@ fn agent_info(session: u32, activity: client::AgentActivity) -> client::SessionI
         }),
         ..Default::default()
     }
+}
+
+/// An `AGENT_FETCH`.
+fn fetch(req: u64, session: u32, before: u64, max_bytes: u32) -> Step {
+    c(client::ToCore::AgentFetch(client::AgentFetch {
+        req,
+        session,
+        before,
+        max_bytes,
+    }))
+}
+
+/// One `AGENT_PAGE` frame of `events`, the last when `last` is given.
+fn page(req: u64, session: u32, events: Vec<serde_json::Value>, last: Option<bool>) -> Step {
+    s(client::ToClient::AgentPage(client::AgentPage {
+        req,
+        session,
+        events: events.into_iter().map(sorted).collect(),
+        last: last.map(|more| client::PageEnd { more }),
+    }))
+}
+
+fn window(from: u64, earlier: u64) -> serde_json::Value {
+    json!({"event": "window", "from": from, "earlier": earlier})
+}
+
+fn trimmed(through: u64, dropped: u64) -> serde_json::Value {
+    json!({"event": "trimmed", "through": through, "dropped": dropped})
+}
+
+/// Transcripts added by `agents-log-paging`, within protocol 4 and H1 3
+/// before they shipped (its design decision 2).
+fn paging_transcripts() -> Vec<Transcript> {
+    let attach = |req: u64, session: u32, page: Option<u32>| {
+        c(client::ToCore::Attach(client::Attach {
+            req,
+            session,
+            cols: 0,
+            rows: 0,
+            page,
+        }))
+    };
+    let replay_start = |req: u64, session: u32| {
+        s(client::ToClient::ReplayStart(client::ReplayStart {
+            req: Some(req),
+            session,
+            pid: 5000 + session,
+        }))
+    };
+    let replay_end = |session: u32| s(client::ToClient::ReplayEnd(client::SessionRef { session }));
+    vec![
+        Transcript {
+            name: "client-agent-attach-paged",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with paging: attaching a long agent session with a smaller page asked for, its replay a page of the newest entries behind a trim and a window, then live events, one below the window (ignored by the client) and one above it.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                attach(2, 2, Some(16_384)),
+                replay_start(2, 2),
+                transcript(
+                    2,
+                    vec![
+                        trimmed(40, 40),
+                        window(118, 77),
+                        added(118, text_entry("user", "and then the tests")),
+                        added(
+                            119,
+                            json!({"type": "tool", "call": "call_9", "title": "Run cargo test", "kind": "execute", "status": "in_progress"}),
+                        ),
+                        added(120, text_entry("agent", "The tests are running.")),
+                        json!({"event": "conversation", "conversation": {"id": CONVERSATION, "cwd": "/home/u/src", "continuation": "resume", "title": "Notes and tests"}}),
+                        turn(json!({"turn": "working"})),
+                        ready(),
+                    ],
+                ),
+                replay_end(2),
+                transcript(
+                    2,
+                    vec![
+                        json!({"event": "tool_changed", "id": 60, "status": "completed"}),
+                        json!({"event": "tool_changed", "id": 119, "status": "completed"}),
+                        json!({"event": "appended", "id": 120, "text": " They pass."}),
+                        turn(json!({"turn": "ended", "stop": {"reason": "end_turn"}})),
+                    ],
+                ),
+            ],
+        },
+        Transcript {
+            name: "client-agent-fetch",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with paging: an attach's page behind a window, a fetch answered in two frames with more to come, a trim that takes the window while a second fetch is out, and that fetch's empty page.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                attach(2, 3, None),
+                replay_start(2, 3),
+                transcript(
+                    3,
+                    vec![
+                        window(5, 4),
+                        added(5, text_entry("agent", "The fifth entry.")),
+                        turn(json!({"turn": "ended", "stop": {"reason": "end_turn"}})),
+                        ready(),
+                    ],
+                ),
+                replay_end(3),
+                fetch(3, 3, 5, 262_144),
+                page(
+                    3,
+                    3,
+                    vec![
+                        added(3, text_entry("user", "Write notes.md")),
+                        added(4, permission_entry(Some("call_1"), "Write notes.md")),
+                        json!({"event": "answered", "id": 4, "outcome": {"outcome": "selected", "option": "allow-once"}}),
+                    ],
+                    None,
+                ),
+                page(3, 3, vec![], Some(true)),
+                fetch(4, 3, 3, 262_144),
+                transcript(3, vec![trimmed(2, 2)]),
+                page(4, 3, vec![], Some(false)),
+                prompt(5, 3, "and then the tests"),
+                ok(5),
+                transcript(
+                    3,
+                    vec![
+                        added(6, text_entry("user", "and then the tests")),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+            ],
+        },
+        Transcript {
+            name: "client-agent-fetch-refused",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with paging: fetches refused for a session the core doesn't have, a terminal session, an agent session attached to no one here, and one whose replay hasn't ended; and one from a protocol 3 client.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                fetch(2, 9, 5, 262_144),
+                error(Some(2), Some(9), "no session 9"),
+                fetch(3, 1, 5, 262_144),
+                error(Some(3), Some(1), "session 1 isn't an agent session"),
+                fetch(4, 2, 5, 262_144),
+                error(Some(4), Some(2), "session 2 isn't attached to this client"),
+                attach(5, 2, None),
+                fetch(6, 2, 5, 262_144),
+                error(Some(6), Some(2), "session 2's replay hasn't ended"),
+                replay_start(5, 2),
+                transcript(2, vec![window(5, 4), added(5, text_entry("agent", "hi")), ready()]),
+                replay_end(2),
+            ],
+        },
+        Transcript {
+            name: "client-agent-fetch-old-client",
+            protocol: Protocol::Client3,
+            about: "A protocol 3 client sending AGENT_FETCH is refused.",
+            steps: vec![
+                c(client::ToCore::Hello(client::Hello {
+                    min: 1,
+                    max: 3,
+                    client_version: "0.5.0".into(),
+                    client_token: TOKEN.into(),
+                    ..Default::default()
+                })),
+                s(client::ToClient::Welcome(client::Welcome {
+                    protocol: 3,
+                    core_version: "0.6.0".into(),
+                    core_build: "e4a3".into(),
+                    pid: 4242,
+                    holder_protocols: vec![3],
+                })),
+                fetch(2, 2, 5, 262_144),
+                error(Some(2), Some(2), "AGENT_FETCH needs client protocol 4"),
+            ],
+        },
+        Transcript {
+            name: "holder-checkpoint-append",
+            protocol: Protocol::Holder,
+            about: "H1 version 3 with appended checkpoints: an agent session's whole checkpoint, two appends to it, the core leaving, and on the next core's connection the adoption, the stored checkpoint coming back as the three parts in one blob.",
+            steps: [
+                vec![
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 3,
+                        core_build: "e4a3".into(),
+                        instance: 1,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 3,
+                        build: "e4a3".into(),
+                        pid: 4243,
+                        previous: Previous::None,
+                        sessions: Vec::new(),
+                    })),
+                    ch(holder::ToHolder::SpawnPipes(holder::SpawnPipes {
+                        session: 2,
+                        command: "fake-acp-agent".into(),
+                        args: vec!["--script".into(), "/home/u/turn.script".into()],
+                        cwd: Some("/home/u/src".into()),
+                        env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                        meta: meta("detach", AGENT),
+                    })),
+                    h(holder::ToCore::Spawned(holder::Spawned { session: 2, pid: 5002 })),
+                ],
+                checkpoint_to_holder(2, APPEND_BASE, 16, 120),
+                append_to_holder(2, APPEND_FIRST, 16, 64),
+                append_to_holder(2, APPEND_SECOND, 16, 30),
+                vec![
+                    ch(holder::ToHolder::Goodbye(holder::Goodbye { handover: false })),
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 3,
+                        core_build: "e4a3".into(),
+                        instance: 2,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 3,
+                        build: "e4a3".into(),
+                        pid: 4243,
+                        previous: Previous::Crash,
+                        sessions: vec![holder::HeldSession {
+                            session: 2,
+                            pid: 5002,
+                            cols: 0,
+                            rows: 0,
+                            exit: None,
+                            meta: meta("detach", AGENT),
+                            truncated: false,
+                            mode: holder::SpawnMode::Pipes,
+                        }],
+                    })),
+                ],
+                adopted(2, &[APPEND_BASE, APPEND_FIRST, APPEND_SECOND].concat(), b"{\"jsonrpc\"", 16),
+            ]
+            .concat(),
+        },
+        Transcript {
+            name: "holder-checkpoint-append-refused",
+            protocol: Protocol::Holder,
+            about: "H1 with appended checkpoints refused: an append onto a session with no stored checkpoint, one announcing more than the 64 MiB limit, and on the next core's connection one from a core that negotiated version 2.",
+            steps: [
+                vec![
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 3,
+                        core_build: "e4a3".into(),
+                        instance: 1,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 3,
+                        build: "e4a3".into(),
+                        pid: 4243,
+                        previous: Previous::None,
+                        sessions: Vec::new(),
+                    })),
+                    ch(holder::ToHolder::SpawnPipes(holder::SpawnPipes {
+                        session: 2,
+                        command: "fake-acp-agent".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        env: BTreeMap::new(),
+                        meta: meta("detach", AGENT),
+                    })),
+                    h(holder::ToCore::Spawned(holder::Spawned { session: 2, pid: 5002 })),
+                ],
+                append_to_holder(2, APPEND_FIRST, 16, 64),
+                vec![
+                    h(holder::ToCore::Error(holder::ErrorMessage {
+                        session: Some(2),
+                        message: "the checkpoint append was refused: nothing to append to".into(),
+                    })),
+                    ch(holder::ToHolder::CheckpointAppend(holder::BlobBegin {
+                        session: 2,
+                        len: holder::MAX_CHECKPOINT_LEN + 1,
+                    })),
+                    h(holder::ToCore::Error(holder::ErrorMessage {
+                        session: Some(2),
+                        message: "session 2's blob is 67108865 bytes; the limit is 67108864".into(),
+                    })),
+                    ch(holder::ToHolder::Goodbye(holder::Goodbye { handover: false })),
+                    ch(holder::ToHolder::Hello(holder::Hello {
+                        min: 1,
+                        max: 2,
+                        core_build: "d3f2".into(),
+                        instance: 2,
+                    })),
+                    h(holder::ToCore::Welcome(holder::Welcome {
+                        protocol: 2,
+                        build: "e4a3".into(),
+                        pid: 4243,
+                        previous: Previous::Crash,
+                        sessions: Vec::new(),
+                    })),
+                    ch(holder::ToHolder::CheckpointAppend(holder::BlobBegin { session: 2, len: 5 })),
+                    h(holder::ToCore::Error(holder::ErrorMessage {
+                        session: Some(2),
+                        message: "CHECKPOINT_APPEND needs H1 version 3".into(),
+                    })),
+                ],
+            ]
+            .concat(),
+        },
+    ]
+}
+
+/// A checkpoint's base and two appended segments, as the core's format 2
+/// would write them (the holder reads none of it).
+const APPEND_BASE: &[u8] = b"BACP\x00\x02B\x00\x00\x00\x00{\"log\":[]}";
+const APPEND_FIRST: &[u8] = b"S\x00\x00\x00\x01{\"events\":[1]}";
+const APPEND_SECOND: &[u8] = b"S\x00\x00\x00\x02{\"events\":[2]}";
+
+fn append_to_holder(session: u32, bytes: &[u8], chunk_len: usize, covers: u64) -> Vec<Step> {
+    let mut steps = checkpoint_to_holder(session, bytes, chunk_len, covers);
+    let Step::CoreToHolder(holder::ToHolder::CheckpointBegin(begin)) = steps[0].clone() else {
+        unreachable!("a checkpoint starts with its begin");
+    };
+    steps[0] = ch(holder::ToHolder::CheckpointAppend(begin));
+    steps
 }
 
 fn agent_transcripts() -> Vec<Transcript> {
@@ -1952,6 +2294,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     session: 2,
                     cols: 0,
                     rows: 0,
+                    page: None,
                 })),
                 s(client::ToClient::ReplayStart(client::ReplayStart {
                     req: Some(2),
@@ -2056,6 +2399,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     session: 2,
                     cols: 80,
                     rows: 24,
+                    page: None,
                 })),
                 error(
                     Some(2),

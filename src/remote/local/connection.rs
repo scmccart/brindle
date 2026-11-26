@@ -340,7 +340,7 @@ impl AttachRequest {
             // own, unless a listing gives one first.
             Attaching::Recorded => (0, 0, Awaits::Listing),
         };
-        let attach = client::Attach { req, session: self.session, cols, rows };
+        let attach = client::Attach { req, session: self.session, cols, rows, page: None };
         let message = match awaits {
             Awaits::Replay => Some(ToCore::Attach(attach.clone())),
             Awaits::Listing => None,
@@ -1928,6 +1928,10 @@ impl Connection {
                     self.break_session(session, &sink, &reason);
                 }
             }
+            // TODO(agents-log-paging 4.1): route to the session's sink.
+            ToClient::AgentPage(page) => {
+                log::debug!("terminal server: a page for session {}, dropped", page.session);
+            }
         }
     }
 
@@ -2335,7 +2339,8 @@ impl Connection {
             | ToCore::AgentUnqueue(AgentRequest { req, .. })
             | ToCore::AgentResend(AgentRequest { req, .. })
             | ToCore::AgentRestart(AgentRestart { req, .. })
-            | ToCore::AgentLogin(client::AgentLogin { req, .. }) => Some(*req),
+            | ToCore::AgentLogin(client::AgentLogin { req, .. })
+            | ToCore::AgentFetch(client::AgentFetch { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2676,6 +2681,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentResend(_)
         | ToCore::AgentRestart(_)
         | ToCore::AgentLogin(_)
+        | ToCore::AgentFetch(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -5512,12 +5518,12 @@ mod tests {
         assert!(gone.is_empty(), "{gone:?}");
         again.sort_by_key(|(attach, _)| attach.req);
         let [(at_listed, told), (as_requested, untold)] = <[_; 2]>::try_from(again).ok().expect("two attaches");
-        assert_eq!(at_listed, client::Attach { req: 1, session: 5, cols: 132, rows: 43 });
+        assert_eq!(at_listed, client::Attach { req: 1, session: 5, cols: 132, rows: 43, page: None });
         let (sink, size) = told.expect("its sink is told the size");
         assert!(Arc::ptr_eq(&sink, &carried.sinks[&1]));
         assert_eq!(size, (132, 43));
         // The request's size: none, which the core takes as the session's.
-        assert_eq!(as_requested, client::Attach { req: 2, session: 6, cols: 0, rows: 0 });
+        assert_eq!(as_requested, client::Attach { req: 2, session: 6, cols: 0, rows: 0, page: None });
         assert!(untold.is_none());
         for req in [1, 2] {
             assert_eq!(carried.awaits(req), Some(Awaits::Replay));
@@ -5583,7 +5589,7 @@ mod tests {
         let (again, gone) = carried.decide(&[listed_at(7, "k7", Some((132, 43)))]);
         assert!(gone.is_empty(), "{gone:?}");
         let [(attach, told)] = <[_; 1]>::try_from(again).ok().expect("one attach");
-        assert_eq!(attach, client::Attach { req: 1, session: 7, cols: 100, rows: 30 });
+        assert_eq!(attach, client::Attach { req: 1, session: 7, cols: 100, rows: 30, page: None });
         assert!(told.is_none());
         assert_eq!(carried.awaits(1), Some(Awaits::Replay));
         assert_eq!(carried.requests[&1].sent, Sent::Queued);

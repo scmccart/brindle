@@ -777,7 +777,9 @@ pub(super) fn unsent(message: &ToHolder, error: &io::Error) -> Unsent {
         ToHolder::Input(data) => session(data.session, "input"),
         ToHolder::Resize(resize) => session(resize.session, "a resize"),
         ToHolder::Hangup(target) => session(target.session, "a hang-up"),
-        ToHolder::CheckpointBegin(begin) => session(begin.session, "a checkpoint"),
+        ToHolder::CheckpointBegin(begin) | ToHolder::CheckpointAppend(begin) => {
+            session(begin.session, "a checkpoint")
+        }
         ToHolder::CheckpointChunk(chunk) => session(chunk.session, "a checkpoint"),
         ToHolder::CheckpointEnd(end) => session(end.session, "a checkpoint"),
         ToHolder::Reparent(reparent) => session(reparent.session, "the window that owns its console"),

@@ -155,7 +155,8 @@ impl AgentShared {
             | Event::Turn { .. }
             | Event::Agent { .. }
             | Event::Conversation { .. }
-            | Event::Trimmed { .. } => None,
+            | Event::Trimmed { .. }
+            | Event::Window { .. } => None,
         };
         self.transcript
             .apply(event)
@@ -170,6 +171,9 @@ impl AgentShared {
             // The conversation decides whether a continue is offered.
             Event::Turn { .. } | Event::Agent { .. } | Event::Conversation { .. } => changes.turn_or_agent = true,
             Event::Trimmed { through, .. } => changes.trimmed(*through),
+            // Only in a replay, after its reset: the zone reads the window
+            // from the transcript on every absorb.
+            Event::Window { .. } => {}
         }
         Ok(())
     }

@@ -217,7 +217,7 @@ fn conversation(rng: &mut XorShift) -> Conversation {
 /// Any event, with ids near the log's, valid or not.
 fn event(rng: &mut XorShift, near: u64) -> Event {
     let id = EntryId(near.saturating_sub(3) + rng.below(6) as u64);
-    match rng.below(9) {
+    match rng.below(10) {
         0 => Event::Added {
             id,
             entry: entry(rng),
@@ -246,9 +246,13 @@ fn event(rng: &mut XorShift, near: u64) -> Event {
         7 => Event::Conversation {
             conversation: conversation(rng),
         },
-        _ => Event::Trimmed {
+        8 => Event::Trimmed {
             through: id,
             dropped: rng.below(4) as u64,
+        },
+        _ => Event::Window {
+            from: id,
+            earlier: rng.below(4) as u64,
         },
     }
 }
@@ -258,76 +262,75 @@ fn event(rng: &mut XorShift, near: u64) -> Event {
 pub(crate) fn random_transcript(rng: &mut XorShift) -> Transcript {
     let mut transcript = Transcript::new();
     for _ in 0..rng.below(40) {
-        let ids: Vec<(EntryId, Entry)> = transcript
-            .entries()
-            .map(|(id, entry)| (id, entry.clone()))
-            .collect();
-        let event = match rng.below(9) {
-            0..=2 => Event::Added {
-                id: transcript.next_id(),
-                entry: entry(rng),
-            },
-            3 => {
-                let Some((id, _)) = ids.iter().rev().find(|(_, entry)| {
-                    matches!(
-                        entry,
-                        Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. }
-                    )
-                }) else {
-                    continue;
-                };
-                Event::Appended {
-                    id: *id,
-                    text: text(rng),
-                }
-            }
-            4 => {
-                let Some((id, _)) = ids
-                    .iter()
-                    .find(|(_, entry)| matches!(entry, Entry::Tool { .. }))
-                else {
-                    continue;
-                };
-                Event::ToolChanged {
-                    id: *id,
-                    title: rng.chance(2).then(|| text(rng)),
-                    kind: rng
-                        .chance(2)
-                        .then(|| TOOL_KINDS[rng.below(TOOL_KINDS.len())]),
-                    status: rng
-                        .chance(2)
-                        .then(|| TOOL_STATUSES[rng.below(TOOL_STATUSES.len())]),
-                }
-            }
-            5 => {
-                let Some((id, _)) = ids
-                    .iter()
-                    .find(|(_, entry)| matches!(entry, Entry::Permission { outcome: None, .. }))
-                else {
-                    continue;
-                };
-                Event::Answered {
-                    id: *id,
-                    outcome: outcome(rng),
-                }
-            }
-            6 => Event::Queue { slot: slot(rng) },
-            7 => match rng.below(3) {
-                0 => Event::Turn { state: turn(rng) },
-                1 => Event::Agent { state: agent(rng) },
-                _ => Event::Conversation {
-                    conversation: conversation(rng),
-                },
-            },
-            _ => {
-                let limit = transcript.encoded_len() / (1 + rng.below(4));
-                transcript.trim_to(limit);
-                continue;
-            }
-        };
-        assert_eq!(transcript.apply(&event), Ok(()), "{event:?}");
+        step(rng, &mut transcript);
     }
     transcript
+}
+
+/// One random valid change to a log, applied, and the event that made it
+/// (a trim's `Trimmed` included); `None` when the change drawn had nothing
+/// to act on.
+fn step(rng: &mut XorShift, transcript: &mut Transcript) -> Option<Event> {
+    let ids: Vec<(EntryId, Entry)> = transcript
+        .entries()
+        .map(|(id, entry)| (id, entry.clone()))
+        .collect();
+    let event = match rng.below(9) {
+        0..=2 => Event::Added {
+            id: transcript.next_id(),
+            entry: entry(rng),
+        },
+        3 => {
+            let (id, _) = ids.iter().rev().find(|(_, entry)| {
+                matches!(
+                    entry,
+                    Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. }
+                )
+            })?;
+            Event::Appended {
+                id: *id,
+                text: text(rng),
+            }
+        }
+        4 => {
+            let (id, _) = ids
+                .iter()
+                .find(|(_, entry)| matches!(entry, Entry::Tool { .. }))?;
+            Event::ToolChanged {
+                id: *id,
+                title: rng.chance(2).then(|| text(rng)),
+                kind: rng
+                    .chance(2)
+                    .then(|| TOOL_KINDS[rng.below(TOOL_KINDS.len())]),
+                status: rng
+                    .chance(2)
+                    .then(|| TOOL_STATUSES[rng.below(TOOL_STATUSES.len())]),
+            }
+        }
+        5 => {
+            let (id, _) = ids
+                .iter()
+                .find(|(_, entry)| matches!(entry, Entry::Permission { outcome: None, .. }))?;
+            Event::Answered {
+                id: *id,
+                outcome: outcome(rng),
+            }
+        }
+        6 => Event::Queue { slot: slot(rng) },
+        7 => match rng.below(3) {
+            0 => Event::Turn { state: turn(rng) },
+            1 => Event::Agent { state: agent(rng) },
+            _ => Event::Conversation {
+                conversation: conversation(rng),
+            },
+        },
+        _ => {
+            let limit = transcript.encoded_len() / (1 + rng.below(4));
+            return transcript.trim_to(limit);
+        }
+    };
+    assert_eq!(transcript.apply(&event), Ok(()), "{event:?}");
+    Some(event)
 }
 
 /// Field names and tag values of the encoding, so random objects reach the
@@ -401,6 +404,9 @@ const WORDS: &[&str] = &[
     "args",
     "env",
     "description",
+    "window",
+    "from",
+    "earlier",
 ];
 
 fn random_json(rng: &mut XorShift, depth: usize) -> Value {
@@ -519,6 +525,20 @@ fn the_fold_never_panics_and_a_refused_event_changes_nothing() {
             if rng.chance(8) {
                 transcript.trim_to(rng.below(4096));
             }
+            if rng.chance(6) {
+                // A fetched page of arbitrary events, more or not.
+                let page: Vec<Event> = (0..rng.below(5))
+                    .map(|_| self::event(&mut rng, transcript.next_id().0.saturating_sub(4)))
+                    .collect();
+                let before = transcript.clone();
+                match transcript.prepend(&page, rng.chance(2)) {
+                    Ok(()) => applied += 1,
+                    Err(error) => {
+                        assert_eq!(transcript, before, "{error}");
+                        refused += 1;
+                    }
+                }
+            }
             let _ = transcript.activity();
         }
         assert_eq!(
@@ -536,4 +556,166 @@ fn the_fold_never_panics_and_a_refused_event_changes_nothing() {
         applied > 0 && refused > 0,
         "{applied} applied, {refused} refused"
     );
+}
+
+// The paging laws (OpenSpec change `agents-log-paging`, design decision 4),
+// each over at least 1,000 random logs.
+
+const LOGS: usize = 1200;
+
+/// Budgets from nothing to past the log: 0, a random part of it,
+/// `PAGE_BYTES` and the whole log.
+fn budgets(rng: &mut XorShift, log: &Transcript) -> [usize; 4] {
+    [
+        0,
+        1 + rng.below(log.encoded_len().max(1)),
+        PAGE_BYTES,
+        log.encoded_len() + 1,
+    ]
+}
+
+/// A copy folded from `events`, which must fold.
+fn folded(events: &[Event]) -> Transcript {
+    let mut copy = Transcript::new();
+    for event in events {
+        assert_eq!(copy.apply(event), Ok(()), "{event:?}");
+    }
+    copy
+}
+
+/// Where a copy's held entries start, for [`Transcript::suffix`]: its
+/// window's `from`, or the start of time when it holds everything.
+fn held_from(copy: &Transcript) -> EntryId {
+    copy.window().map_or(EntryId(0), |window| window.from)
+}
+
+/// Fetches back from the server until nothing more remains, folding each
+/// page in front, with random budgets.
+fn fetch_to_start(rng: &mut XorShift, server: &Transcript, copy: &mut Transcript) {
+    while let Some(window) = copy.window() {
+        let budget = budgets(rng, server)[rng.below(4)];
+        let fetched = server.fetch(window.from, budget);
+        assert_eq!(copy.prepend(&fetched.events, fetched.more), Ok(()));
+        assert_eq!(copy, &server.suffix(held_from(copy)));
+    }
+}
+
+#[test]
+fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
+    let mut rng = XorShift::new(0x7e57_0003);
+    let mut paged = 0usize;
+    for _ in 0..LOGS {
+        let log = random_transcript(&mut rng);
+        for budget in budgets(&mut rng, &log) {
+            let page = log.page(budget);
+            let copy = folded(&page);
+            let from = held_from(&copy);
+            assert_eq!(copy, log.suffix(from));
+            paged += usize::from(copy.window().is_some());
+            // Every pending permission and the newest entry are held.
+            for (id, entry) in log.entries() {
+                if matches!(entry, Entry::Permission { outcome: None, .. }) {
+                    assert!(copy.entry(id).is_some(), "pending permission {id}");
+                }
+            }
+            assert_eq!(
+                copy.entries().last().map(|(id, _)| id),
+                log.entries().last().map(|(id, _)| id)
+            );
+            // The state events are all there (the equality above holds
+            // them too), and the entries fit unless one alone or the
+            // oldest pending permission pushed them past.
+            assert_eq!(
+                (copy.slot(), copy.turn(), copy.agent(), copy.conversation()),
+                (log.slot(), log.turn(), log.agent(), log.conversation())
+            );
+            let oldest_pending = log.entries().find_map(|(id, entry)| {
+                matches!(entry, Entry::Permission { outcome: None, .. }).then_some(id)
+            });
+            if copy.encoded_len() > budget {
+                assert!(
+                    copy.entries().count() == 1
+                        || copy.entries().next().map(|(id, _)| id) == oldest_pending,
+                    "a page past its budget of {budget}"
+                );
+            }
+        }
+    }
+    assert!(paged > LOGS / 2, "only {paged} pages had a window");
+}
+
+#[test]
+fn fetched_pages_folded_in_front_give_the_whole_log() {
+    let mut rng = XorShift::new(0x7e57_0004);
+    for _ in 0..LOGS {
+        let log = random_transcript(&mut rng);
+        let budget = budgets(&mut rng, &log)[rng.below(2)];
+        let mut copy = folded(&log.page(budget));
+        fetch_to_start(&mut rng, &log, &mut copy);
+        assert_eq!(copy, log);
+    }
+}
+
+#[test]
+fn live_events_after_a_page_keep_the_copy_equal_to_the_servers_suffix() {
+    let mut rng = XorShift::new(0x7e57_0005);
+    for _ in 0..LOGS {
+        let mut log = random_transcript(&mut rng);
+        let budget = budgets(&mut rng, &log)[rng.below(2)];
+        let mut copy = folded(&log.page(budget));
+        let mut from = held_from(&copy);
+        for _ in 0..rng.below(12) {
+            let Some(event) = step(&mut rng, &mut log) else {
+                continue;
+            };
+            assert_eq!(copy.apply(&event), Ok(()), "{event:?}");
+            // The floor moves only by a trim, and only by taking the window.
+            if matches!(event, Event::Trimmed { .. }) && held_from(&copy) != from {
+                assert_eq!(copy.window(), None, "{event:?}");
+                from = held_from(&copy);
+            }
+            assert_eq!(held_from(&copy), from, "{event:?}");
+            assert_eq!(copy, log.suffix(held_from(&copy)), "{event:?}");
+        }
+        // A fetch after them returns the entries as the log holds them now.
+        fetch_to_start(&mut rng, &log, &mut copy);
+        assert_eq!(copy, log);
+    }
+}
+
+#[test]
+fn a_trim_between_fetches_never_makes_a_fold_error() {
+    let mut rng = XorShift::new(0x7e57_0006);
+    let mut raced = 0usize;
+    for _ in 0..LOGS {
+        let mut log = random_transcript(&mut rng);
+        let mut copy = folded(&log.page(rng.below(log.encoded_len().max(1))));
+        while let Some(window) = copy.window() {
+            let budget = budgets(&mut rng, &log)[rng.below(3)];
+            // Through the floor, past it, or anywhere below it.
+            let limit = log.encoded_len() / (1 + rng.below(6));
+            if rng.chance(2) {
+                // The core handled the fetch first: its page arrives, then
+                // the trim.
+                let fetched = log.fetch(window.from, budget);
+                assert_eq!(copy.prepend(&fetched.events, fetched.more), Ok(()));
+                if let Some(trimmed) = log.trim_to(limit) {
+                    assert_eq!(copy.apply(&trimmed), Ok(()));
+                    raced += 1;
+                }
+            } else {
+                // The trim came first: the fetch, sent before it, reads
+                // the trimmed log.
+                if let Some(trimmed) = log.trim_to(limit) {
+                    assert_eq!(copy.apply(&trimmed), Ok(()));
+                    raced += 1;
+                }
+                let fetched = log.fetch(window.from, budget);
+                assert_eq!(copy.prepend(&fetched.events, fetched.more), Ok(()));
+            }
+            assert_eq!(copy, log.suffix(held_from(&copy)));
+        }
+        assert_eq!(copy, log);
+    }
+    assert!(raced > LOGS / 2, "only {raced} trims raced a fetch");
 }

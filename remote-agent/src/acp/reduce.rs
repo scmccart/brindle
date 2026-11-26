@@ -2184,7 +2184,8 @@ impl Step<'_> {
             | Event::Queue { .. }
             | Event::Turn { .. }
             | Event::Agent { .. }
-            | Event::Conversation { .. } => return,
+            | Event::Conversation { .. }
+            | Event::Window { .. } => return,
         };
         self.out.events.push(event);
         self.s.tools.retain(|_, entry| *entry > through);
@@ -2608,6 +2609,7 @@ mod tests {
                 Event::Agent { state } => format!("agent {}", agent_name(state)),
                 Event::Conversation { .. } => "conversation".into(),
                 Event::Trimmed { .. } => "trimmed".into(),
+                Event::Window { .. } => "window".into(),
             })
             .collect()
     }
@@ -2826,7 +2828,8 @@ mod tests {
             | Event::Queue { .. }
             | Event::Turn { .. }
             | Event::Conversation { .. }
-            | Event::Trimmed { .. } => None,
+            | Event::Trimmed { .. }
+            | Event::Window { .. } => None,
         });
         assert!(matches!(last_agent, Some(AgentState::Failed { .. })));
     }
@@ -3741,7 +3744,8 @@ mod tests {
                 | Event::Turn { .. }
                 | Event::Agent { .. }
                 | Event::Conversation { .. }
-                | Event::Trimmed { .. } => None,
+                | Event::Trimmed { .. }
+                | Event::Window { .. } => None,
             })
             .collect();
         assert_eq!(

@@ -658,6 +658,7 @@ fn shape(event: &Event) -> String {
         Event::Agent { state } => format!("state {state:?}"),
         Event::Conversation { conversation } => format!("conversation {}", conversation.id),
         Event::Trimmed { dropped, .. } => format!("trimmed {dropped}"),
+        Event::Window { from, earlier } => format!("window {from} {earlier}"),
     }
 }
 
@@ -1959,6 +1960,7 @@ fn kind(event: &Event) -> &'static str {
         Event::Agent { .. } => "agent",
         Event::Conversation { .. } => "conversation",
         Event::Trimmed { .. } => "trimmed",
+        Event::Window { .. } => "window",
     }
 }
 

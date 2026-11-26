@@ -48,7 +48,7 @@ macro_rules! forms {
 }
 
 forms!(event_form, EVENT_FORMS, Event, "Event::":
-    Added, Appended, ToolChanged, Answered, Queue, Turn, Agent, Conversation, Trimmed);
+    Added, Appended, ToolChanged, Answered, Queue, Turn, Agent, Conversation, Trimmed, Window);
 forms!(entry_form, ENTRY_FORMS, Entry, "Entry::": User, Agent, Thought, Tool, Permission, Notice);
 forms!(tool_kind_form, TOOL_KIND_FORMS, ToolKind, "ToolKind::":
     Read, Edit, Delete, Move, Search, Execute, Think, Fetch, SwitchMode, Other);
@@ -151,7 +151,7 @@ fn forms(event: &Event) -> Vec<&'static str> {
         Event::Conversation { conversation } => {
             forms.push(continuation_form(&conversation.continuation));
         }
-        Event::Appended { .. } | Event::Trimmed { .. } => {}
+        Event::Appended { .. } | Event::Trimmed { .. } | Event::Window { .. } => {}
     }
     forms
 }
@@ -555,6 +555,15 @@ fn fixtures() -> Vec<(&'static str, Event)> {
                 "Hello.txt file creation",
             ),
         ),
+        // Added by `agents-log-paging`, within protocol 4 before it shipped
+        // (its design decision 2): a page's window.
+        (
+            "window",
+            Event::Window {
+                from: id(120),
+                earlier: 79,
+            },
+        ),
     ]
 }
 
@@ -841,7 +850,15 @@ fn an_unknown_kind_or_value_is_a_decode_error() {
 /// `brindle-remote-protocol`'s fixtures: their session and events, in order.
 /// That crate carries the events without reading them, so this is where the
 /// two crates' fixtures are checked to agree.
-fn protocol_transcripts() -> Vec<(String, u32, Vec<Value>)> {
+/// A frame of remote-protocol's fixtures that carries transcript events:
+/// a `TRANSCRIPT`'s, or an `AGENT_PAGE`'s with its `last.more` when it is a
+/// fetch's last frame.
+enum Carried {
+    Live(Vec<Value>),
+    Page(Vec<Value>, Option<bool>),
+}
+
+fn protocol_transcripts() -> Vec<(String, u32, Carried)> {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../remote-protocol/tests/fixtures");
     let mut found = Vec::new();
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -854,7 +871,7 @@ fn protocol_transcripts() -> Vec<(String, u32, Vec<Value>)> {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         for line in std::fs::read_to_string(&path).unwrap().lines() {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            let ["core", "2a", _, payload] = fields[..] else {
+            let ["core", kind @ ("2a" | "2b"), _, payload] = fields[..] else {
                 continue;
             };
             let bytes: Vec<u8> = (0..payload.len())
@@ -864,29 +881,57 @@ fn protocol_transcripts() -> Vec<(String, u32, Vec<Value>)> {
             let message: Value = serde_json::from_slice(&bytes).unwrap();
             let session = message["session"].as_u64().unwrap() as u32;
             let events = message["events"].as_array().unwrap().clone();
-            found.push((name.clone(), session, events));
+            let carried = match kind {
+                "2a" => Carried::Live(events),
+                _ => Carried::Page(events, message["last"]["more"].as_bool()),
+            };
+            found.push((name.clone(), session, carried));
         }
     }
     found
 }
 
+/// Every `TRANSCRIPT` in remote-protocol's fixtures folds onto its
+/// session's log, and every fetch's `AGENT_PAGE`s fold in front of it
+/// (`Transcript::prepend`) at their last frame.
 #[test]
 fn the_protocols_transcript_fixtures_carry_v4_events_that_fold() {
-    let mut logs: std::collections::BTreeMap<(String, u32), brindle_transcript::Transcript> =
-        Default::default();
+    let mut logs: BTreeMap<(String, u32), brindle_transcript::Transcript> = BTreeMap::new();
+    let mut pages: BTreeMap<(String, u32), Vec<Event>> = BTreeMap::new();
     let mut events = 0usize;
-    for (fixture, session, values) in protocol_transcripts() {
-        let log = logs.entry((fixture.clone(), session)).or_default();
-        for value in values {
-            let event =
-                Event::from_value(&value).unwrap_or_else(|e| panic!("{fixture}: {value}: {e}"));
-            log.apply(&event)
-                .unwrap_or_else(|e| panic!("{fixture}: {event:?}: {e}"));
-            events += 1;
+    let mut prepended = 0usize;
+    for (fixture, session, carried) in protocol_transcripts() {
+        let key = (fixture.clone(), session);
+        let decode = |value: &Value| {
+            Event::from_value(value).unwrap_or_else(|e| panic!("{fixture}: {value}: {e}"))
+        };
+        match carried {
+            Carried::Live(values) => {
+                let log = logs.entry(key).or_default();
+                for value in values {
+                    let event = decode(&value);
+                    log.apply(&event)
+                        .unwrap_or_else(|e| panic!("{fixture}: {event:?}: {e}"));
+                    events += 1;
+                }
+            }
+            Carried::Page(values, last) => {
+                let buffered = pages.entry(key.clone()).or_default();
+                buffered.extend(values.iter().map(decode));
+                if let Some(more) = last {
+                    let page = pages.remove(&key).unwrap_or_default();
+                    logs.entry(key)
+                        .or_default()
+                        .prepend(&page, more)
+                        .unwrap_or_else(|e| panic!("{fixture}: a page: {e}"));
+                    prepended += 1;
+                }
+            }
         }
     }
     assert!(
         events > 0,
         "no TRANSCRIPT frame in remote-protocol's fixtures"
     );
+    assert!(prepended > 0, "no fetch's page in remote-protocol's fixtures");
 }

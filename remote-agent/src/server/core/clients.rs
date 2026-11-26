@@ -350,6 +350,15 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentLogin(login) => {
                 self.client_agent_command(client, AgentCommand::login(login))
             }
+            // TODO(agents-log-paging 3.3): answer with AGENT_PAGE.
+            ToCore::AgentFetch(fetch) => self.send_client(
+                client,
+                error(
+                    Some(fetch.req),
+                    Some(fetch.session),
+                    "this terminal server can't fetch earlier entries yet",
+                ),
+            ),
         }
     }
 
@@ -495,6 +504,7 @@ pub(super) fn unsendable(message: &ToClient, failure: &io::Error) -> ToClient {
         ToClient::Ok(m) => (Some(m.req), None),
         ToClient::Process(m) => (None, Some(m.session)),
         ToClient::Transcript(m) => (None, Some(m.session)),
+        ToClient::AgentPage(m) => (Some(m.req), Some(m.session)),
     };
     error(req, session, unsendable_text(message, failure))
 }
@@ -513,6 +523,7 @@ fn unsendable_text(message: &ToClient, failure: &io::Error) -> String {
         ToClient::Ok(_) => "answer",
         ToClient::Process(_) => "process info",
         ToClient::Transcript(_) => "transcript",
+        ToClient::AgentPage(_) => "page of earlier entries",
     };
     format!("the terminal server couldn't send its {what}: {failure}")
 }

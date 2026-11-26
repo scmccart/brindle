@@ -373,6 +373,27 @@ fn the_agent_messages_reject_bad_values_without_panicking() {
             client::MSG_TRANSCRIPT,
             format!(r#"{{"session":1,"events":[{{"event":"turn"}},{value}]}}"#),
         ));
+        // Paging (`agents-log-paging`).
+        cases.push((
+            client::MSG_ATTACH,
+            format!(r#"{{"req":1,"session":1,"cols":0,"rows":0,"page":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_FETCH,
+            format!(r#"{{"req":{value},"session":{value},"before":{value},"max_bytes":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_FETCH,
+            format!(r#"{{"req":1,"session":1,"before":1,"max_bytes":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_PAGE,
+            format!(r#"{{"req":{value},"session":{value},"events":{value},"last":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_PAGE,
+            format!(r#"{{"req":1,"session":1,"events":[{{"event":"turn"}},{value}],"last":{{"more":{value}}}}}"#),
+        ));
     }
     let decoders = decoders();
     for (msg_type, payload) in cases {

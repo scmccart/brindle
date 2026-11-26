@@ -1080,6 +1080,7 @@ impl TestClient {
             session,
             cols,
             rows,
+            page: None,
         }));
         let mut kept = Vec::new();
         let start = loop {
@@ -1385,6 +1386,7 @@ impl TestClient {
             session,
             cols: 0,
             rows: 0,
+            page: None,
         }));
         let mut kept = Vec::new();
         let start = loop {

@@ -54,7 +54,7 @@
 
 mod policy;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -420,6 +420,10 @@ struct Core {
     /// starts empty, so under.
     over: bool,
     checkpoints: Assembler,
+    /// The sessions whose open checkpoint blob is an append
+    /// (`CHECKPOINT_APPEND`): its `CHECKPOINT_END` appends to the stored
+    /// checkpoint instead of replacing it.
+    appends: HashSet<SessionId>,
     farewell: Farewell,
 }
 
@@ -707,6 +711,7 @@ impl<L: EventLoop> Holder<L> {
             protocol,
             over: false,
             checkpoints: Assembler::new(h1::MAX_CHECKPOINT_LEN),
+            appends: HashSet::new(),
             farewell: Farewell::Staying,
         };
         let shown = |session: &Session| policy::shown(protocol, session.held.mode);
@@ -951,8 +956,23 @@ impl<L: EventLoop> Holder<L> {
             }
             ToHolder::CheckpointBegin(begin) => {
                 let core = self.core.as_mut().expect("a core sent this");
-                if let Err(error) = core.checkpoints.begin(begin) {
-                    self.send_error(Some(begin.session), error.to_string());
+                match core.checkpoints.begin(begin) {
+                    Ok(()) => {
+                        core.appends.remove(&begin.session);
+                    }
+                    Err(error) => self.send_error(Some(begin.session), error.to_string()),
+                }
+            }
+            ToHolder::CheckpointAppend(begin) => {
+                let core = self.core.as_mut().expect("a core sent this");
+                if let Some(refusal) = policy::append_open_refusal(core.protocol) {
+                    return self.send_error(Some(begin.session), refusal.to_string());
+                }
+                match core.checkpoints.begin(begin) {
+                    Ok(()) => {
+                        core.appends.insert(begin.session);
+                    }
+                    Err(error) => self.send_error(Some(begin.session), error.to_string()),
                 }
             }
             ToHolder::CheckpointChunk(chunk) => {
@@ -963,12 +983,23 @@ impl<L: EventLoop> Holder<L> {
             }
             ToHolder::CheckpointEnd(end) => {
                 let core = self.core.as_mut().expect("a core sent this");
+                let append = core.appends.remove(&end.session);
                 match core.checkpoints.end(end.blob_end()) {
                     Ok(bytes) => {
-                        if let Some(session) = self.sessions.get_mut(&end.session) {
+                        let Some(session) = self.sessions.get_mut(&end.session) else {
+                            return;
+                        };
+                        if !append {
                             session.checkpoint = bytes;
-                            session.tail.cover(end.covers);
+                        } else if let Some(refusal) = policy::append_refusal(
+                            session.checkpoint.len() as u64,
+                            bytes.len() as u64,
+                        ) {
+                            return self.send_error(Some(end.session), refusal.to_string());
+                        } else {
+                            session.checkpoint.extend_from_slice(&bytes);
                         }
+                        session.tail.cover(end.covers);
                     }
                     Err(error) => self.send_error(Some(end.session), error.to_string()),
                 }
@@ -1828,7 +1859,9 @@ fn unit_of(message: &ToHolder) -> Unit {
         ToHolder::Reparent(reparent) => Unit::Session(reparent.session),
         ToHolder::SetMeta(update) => Unit::Session(update.session),
         ToHolder::SpawnPipes(spawn) => Unit::Spawn(spawn.session),
-        ToHolder::CheckpointBegin(begin) => Unit::Checkpoint(begin.session),
+        ToHolder::CheckpointBegin(begin) | ToHolder::CheckpointAppend(begin) => {
+            Unit::Checkpoint(begin.session)
+        }
         ToHolder::CheckpointChunk(chunk) => Unit::Checkpoint(chunk.session),
         ToHolder::CheckpointEnd(end) => Unit::Checkpoint(end.session),
         ToHolder::Hello(_) | ToHolder::Drain(_) | ToHolder::Goodbye(_) => Unit::Holder,
@@ -1853,6 +1886,7 @@ fn name_of(message: &ToHolder) -> &'static str {
         ToHolder::Resume(_) => "RESUME",
         ToHolder::SetMeta(_) => "SET_META",
         ToHolder::SpawnPipes(_) => "SPAWN_PIPES",
+        ToHolder::CheckpointAppend(_) => "CHECKPOINT_APPEND",
     }
 }
 
