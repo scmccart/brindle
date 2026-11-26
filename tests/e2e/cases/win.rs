@@ -82,6 +82,8 @@ pub fn all() -> Vec<Case> {
         display("windows-agent-batch-hint", agent_batch_hint),
         display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
         display("windows-agent-markdown", agent_markdown).needs_fake_agent(),
+        // A diff and its permission detail through the holder on Windows.
+        display("windows-agent-tool-diff", super::agent::permission_detail).needs_fake_agent(),
         display("windows-agent-continue", agent_continue).needs_fake_agent(),
         display("windows-agent-login", agent_login).needs_fake_agent(),
         display("windows-agent-login-withheld", agent_login_withheld).needs_fake_agent(),

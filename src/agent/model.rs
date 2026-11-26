@@ -2758,12 +2758,14 @@ impl ChatModel {
             Entry::User { text } => format!("user {text:?}"),
             Entry::Agent { text } => format!("agent {text:?}"),
             Entry::Thought { text } => format!("thought open={} {text:?}", self.thought_open(id)),
-            Entry::Tool { call, title, kind, status, content, .. } => {
-                // The row's summary, only when it has one (flag 31), after
-                // `items=` so the `open=… items=N` prefixes still match.
+            Entry::Tool { call, title, kind, status, content, more, .. } => {
+                // The items left out and the row's summary, each only when
+                // there is one (flags 31 and 33), after `items=` so the
+                // `open=… items=N` prefixes still match.
+                let more = if *more > 0 { format!(" more={more}") } else { String::new() };
                 let summary = tool::summary(entry).map(|s| format!(" summary={:?}", s.as_ref())).unwrap_or_default();
                 format!(
-                    "tool call={call:?} kind={} status={} open={} items={}{summary} {title:?}",
+                    "tool call={call:?} kind={} status={} open={} items={}{more}{summary} {title:?}",
                     tool_kind_word(*kind),
                     tool_status_word(*status),
                     self.tool_state(id, entry).word(),
@@ -5332,9 +5334,9 @@ mod tests {
         assert_eq!(shown_with(&zone.model, 23), 1);
     }
 
-    /// Decision 12: the tool line's `open=`, `items=` and `summary=` (flag
-    /// 31, only with one), and its content's lines, escaped onto one line
-    /// each.
+    /// Decision 12: the tool line's `open=`, `items=`, `more=` and
+    /// `summary=` (flags 31 and 33, each only with one), and its content's
+    /// lines, escaped onto one line each.
     #[test]
     fn the_dump_lists_a_tool_calls_content() {
         let mut zone = Zone::ready();
@@ -5345,16 +5347,17 @@ mod tests {
             ToolItem::Text { text: "a \"quote\"\nb".into(), cut: true },
             ToolItem::Diff(FileChange { op: FileOp::Move { from: "/p/old".into() }, path: "/p/new".into(), hunks: vec![], omitted: 3 }),
         ]);
-        if let Entry::Tool { locations, input, .. } = &mut entry {
+        if let Entry::Tool { locations, input, more, .. } = &mut entry {
             locations.push(Location { path: "/p/main.rs".into(), line: Some(10) });
             locations.push(Location { path: "/p/lib.rs".into(), line: None });
             *input = Some("{\"x\":1}".into());
+            *more = 8;
         }
         zone.feed(&[added(1, entry)]);
         let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
         let lines: Vec<&str> = dump.lines().filter(|line| line.contains("entry=1") || line.starts_with("--- entry 1")).collect();
         assert_eq!(lines, [
-            "--- entry 1 tool call=\"c1\" kind=edit status=completed open=no items=5 summary=\"+1 \u{2212}1 · SIGKILL\" \"Edit c1\"",
+            "--- entry 1 tool call=\"c1\" kind=edit status=completed open=no items=5 more=8 summary=\"+1 \u{2212}1 · SIGKILL\" \"Edit c1\"",
             "--- item entry=1 index=0 kind=diff op=modify path=\"/p/main.rs\" added=1 removed=1 omitted=0",
             "--- hunk entry=1 index=0 old=10 new=10 \" fn main() {\\n-    old();\\n+    new();\\n }\"",
             "--- item entry=1 index=1 kind=output command=\"cargo test\" exit=0 omitted=0 \"ok\\n\"",

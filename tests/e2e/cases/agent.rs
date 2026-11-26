@@ -3314,6 +3314,12 @@ const ZONE_DIFF_REMOVED: crate::capture::Rgb = crate::capture::Rgb(0x45, 0x28, 0
 /// A diff item editing `/w/notes.txt` from apple to banana, as ACP's JSON.
 const NOTES_DIFF: &str = r#"{"type":"diff","path":"/w/notes.txt","oldText":"first\nan apple a day\nlast\n","newText":"first\nan banana a day\nlast\n"}"#;
 
+/// [`NOTES_DIFF`]'s `--- item` line, without `item entry=N `.
+const NOTES_ITEM: &str = "index=0 kind=diff op=modify path=\"/w/notes.txt\" added=1 removed=1 omitted=0";
+
+/// A tool line holding [`NOTES_DIFF`]'s count and summary.
+const NOTES_COUNTS: &str = "items=1 summary=\"+1 \u{2212}1\"";
+
 /// A `tool_call` for `call`, titled `title`, with `status` and `content`
 /// (a JSON array) and any `more` fields (`,"rawInput":…`).
 fn tool_call(call: &str, title: &str, status: &str, content: &str, more: &str) -> String {
@@ -3366,7 +3372,7 @@ pub fn tool_diff(ctx: &Ctx) -> Result<Outcome> {
         "tool call=\"c1\" kind=edit status=in_progress open=yes items=1 summary=\"+1 \u{2212}1\" \"Edit notes.txt\"",
     )?;
     let items = out.dump.agent_items(2);
-    ensure!(items == ["index=0 kind=diff op=modify path=\"/w/notes.txt\" added=1 removed=1 omitted=0"], "items {items:?}");
+    ensure!(items == [NOTES_ITEM], "items {items:?}");
     let hunks = out.dump.agent_hunks(2);
     ensure!(
         hunks.len() == 1 && hunks[0].contains("\\n-an apple a day\\n+an banana a day\\n"),
@@ -3506,6 +3512,8 @@ pub fn permission_detail(ctx: &Ctx) -> Result<Outcome> {
         waited(&out)?;
         tool_line(&out, 2, "status=in_progress open=permission items=1")?;
         tool_line(&out, 3, "outcome=pending detail=1 \"Write a file\"")?;
+        let items = out.dump.agent_items(2);
+        ensure!(items == [NOTES_ITEM], "{label}: items {items:?}");
     }
     let out = Run::new(ctx, "allowed")
         .config(&profile)
@@ -3585,5 +3593,193 @@ pub fn tool_settings(ctx: &Ctx) -> Result<Outcome> {
     let out = Run::new(ctx, "bad").config(&agent("tool_details = \"maybe\"")).dump_at(3.0).run()?;
     let line = out.dump.config.as_deref().unwrap_or_default();
     ensure!(line.contains("agent.tool_details") && line.contains("`open` or `closed`"), "config line {:?}", out.dump.config);
+    Ok(Outcome::Pass)
+}
+
+/// `agent-tool-bounds`' output: lines of [`BOUNDS_LINE_BYTES`] bytes,
+/// some 200 KiB in all, sent [`BOUNDS_PER_DELTA`] lines a `_meta` delta.
+const BOUNDS_LINES: usize = 18_600;
+const BOUNDS_PER_DELTA: usize = 400;
+/// `out 000000\n`.
+const BOUNDS_LINE_BYTES: usize = 11;
+/// What an output item keeps (`brindle_transcript::ITEM_LIMIT`).
+const BOUNDS_ITEM_LIMIT: usize = 64 * 1024;
+
+/// A tool call's bounds (design decision 5): 200 KiB of output keeps its
+/// newest whole lines within 64 KiB and counts the bytes it dropped, and
+/// a call with 40 items keeps 32 and counts the rest.
+pub fn tool_bounds(ctx: &Ctx) -> Result<Outcome> {
+    let mut script = Script::ready(&ctx.dir.join("received.jsonl")).step("expect session/prompt").step(update(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Run tests","kind":"execute","status":"in_progress","content":[{"type":"terminal","terminalId":"t1"}],"_meta":{"terminal_info":{"terminal_id":"t1","cwd":"/w","command":"cargo test"}}}"#,
+    ));
+    for start in (0..BOUNDS_LINES).step_by(BOUNDS_PER_DELTA) {
+        let data: String = (start..(start + BOUNDS_PER_DELTA).min(BOUNDS_LINES)).map(|n| format!("out {n:06}\\n")).collect();
+        script = script.step(tool_meta("c1", &format!(r#""terminal_output_delta":{{"terminal_id":"t1","data":"{data}"}}"#), ""));
+    }
+    let items: Vec<String> =
+        (0..40).map(|n| format!(r#"{{"type":"content","content":{{"type":"text","text":"item {n}"}}}}"#)).collect();
+    let profile = script
+        .step(tool_meta("c1", r#""terminal_exit":{"terminal_id":"t1","exit_code":0,"signal":null}"#, r#","status":"completed""#))
+        .step(tool_call("c2", "Many items", "completed", &format!("[{}]", items.join(",")), ""))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "bounds")?;
+    let out = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(ENDED).dump_at(6.0).run()?;
+    waited(&out)?;
+
+    tool_line(&out, 2, "status=completed open=no items=1 summary=\"exit 0\"")?;
+    let items = out.dump.agent_items(2);
+    let item = match items.as_slice() {
+        [item] => *item,
+        _ => return Err(format!("items {items:?}")),
+    };
+    let omitted: usize = item
+        .split(' ')
+        .find_map(|field| field.strip_prefix("omitted="))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("no omitted= in {item:.200}"))?;
+    // The kept text is escaped onto the line: one `\n` per line kept.
+    let kept = item.matches("\\n").count() * BOUNDS_LINE_BYTES;
+    ensure!(
+        omitted > 0 && kept <= BOUNDS_ITEM_LIMIT && omitted + kept == BOUNDS_LINES * BOUNDS_LINE_BYTES,
+        "omitted={omitted} with {kept} bytes kept, of {}",
+        BOUNDS_LINES * BOUNDS_LINE_BYTES
+    );
+    ensure!(item.ends_with(&format!("out {:06}\\n\"", BOUNDS_LINES - 1)), "the output's end: …{}", &item[item.len().saturating_sub(80)..]);
+
+    tool_line(&out, 3, "status=completed open=no items=32 more=8 \"Many items\"")?;
+    let items = out.dump.agent_items(3);
+    ensure!(
+        items.len() == 32 && items[31] == "index=31 kind=text cut=no \"item 31\"",
+        "{} items, the last {:?}",
+        items.len(),
+        items.last()
+    );
+    Ok(Outcome::Pass)
+}
+
+/// A turn holding a running call with a diff and a pending permission
+/// about it: the agent's script, recording what it was sent, never ends it.
+fn diff_then_permission(ctx: &Ctx, name: &str, between: &[String]) -> Result<String> {
+    between
+        .iter()
+        .cloned()
+        .fold(
+            Script::ready(&ctx.dir.join(format!("{name}.jsonl")))
+                .step("expect session/prompt")
+                .step(tool_call("c1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), "")),
+            Script::step,
+        )
+        .step(ask_with("p1", "c1", ""))
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, name)
+}
+
+/// What a pending permission showing its call's diff reads as.
+const DIFF_PENDING: &str = "outcome=pending detail=1";
+
+/// Quitting mid-turn with a diff and a pending permission, the next
+/// launch restores the zone with both: the call's diff, shown with the
+/// permission while it waits.
+pub fn tool_restore(ctx: &Ctx) -> Result<Outcome> {
+    let profile = diff_then_permission(ctx, "restore", &[])?;
+    Run::new(ctx, "quit")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .keep_detached()
+        .wait_for(DIFF_PENDING)
+        .action("quit")
+        .expect_exit()
+        .dump_at(8.0)
+        .run()?;
+    let out = Run::new(ctx, "restored").config(&profile).restore().wait_for(DIFF_PENDING).dump_at(5.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, &format!("tool call=\"c1\" kind=edit status=in_progress open=permission {NOTES_COUNTS} \"Edit notes.txt\""))?;
+    let items = out.dump.agent_items(2);
+    ensure!(items == [NOTES_ITEM], "items {items:?}");
+    let hunks = out.dump.agent_hunks(2);
+    ensure!(hunks.len() == 1 && hunks[0].contains("\\n-an apple a day\\n+an banana a day\\n"), "hunks {hunks:?}");
+    tool_line(&out, 3, "permission call=\"c1\" options=")?;
+    tool_line(&out, 3, &format!("{DIFF_PENDING} \"Write a file\""))?;
+    Ok(Outcome::Pass)
+}
+
+/// The entries between `agent-tool-page`'s call and its permission: 80
+/// thoughts of 5 KiB and 80 short messages, some 400 KiB, more than a
+/// page (`PAGE_BYTES`, 256 KiB).
+const PAGE_BETWEEN: usize = 160;
+
+/// A session waiting on a permission whose tool call is more than a page
+/// back (design decision 15): attached again, the zone's first entry is
+/// that call, with the entry before it left to fetch, and the permission
+/// shows its diff.
+pub fn tool_page(ctx: &Ctx) -> Result<Outcome> {
+    let turn = long_turn(PAGE_BETWEEN, LONG_SIZE, None);
+    // `long_turn`'s entries, without its prompt and its end.
+    let profile = diff_then_permission(ctx, "page", &turn[1..turn.len() - 1])?;
+    let out = Run::new(ctx, "live")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("go")
+        .keep_detached()
+        .wait_for(DIFF_PENDING)
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(earlier(&out) == Some("none"), "a live zone holds the whole conversation: {:?}", out.dump.agent.last());
+
+    let out = Run::new(ctx, "attached").config(&profile).restore().wait_for(DIFF_PENDING).dump_at(6.0).run()?;
+    waited(&out)?;
+    let ids = entry_ids(&out);
+    let asked = 2 + PAGE_BETWEEN as u64 + 1;
+    ensure!(
+        ids.first() == Some(&2) && ids.last() == Some(&asked),
+        "entry ids {:?}…{:?}, not 2…{asked}",
+        ids.first(),
+        ids.last()
+    );
+    ensure!(earlier(&out) == Some("1"), "earlier={:?} with the call first", earlier(&out));
+    tool_line(&out, 2, &format!("status=in_progress open=permission {NOTES_COUNTS}"))?;
+    ensure!(out.dump.agent_items(2) == [NOTES_ITEM], "items {:?}", out.dump.agent_items(2));
+    tool_line(&out, asked, &format!("{DIFF_PENDING} \"Write a file\""))?;
+    Ok(Outcome::Pass)
+}
+
+/// A dark profile theme in a light window (ui-theme-tokens' "A profile
+/// theme unlike the window's"): an agent profile with the `e2e` theme in a
+/// `brindle-light` window draws a diff's added and removed lines in the
+/// `e2e` zone set's `diff_added` and `diff_removed`, as an `e2e` window's
+/// agent zone does.
+pub fn tool_theme(ctx: &Ctx) -> Result<Outcome> {
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(tool_call("c1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), ""))
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, "theme")?;
+    let out = Run::new(ctx, "run")
+        .initial_theme("brindle-light")
+        .config(&format!("{profile}theme = \"e2e\"\n"))
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("open=yes items=1")
+        .capture_at(5.0)
+        .dump_at(5.5)
+        .run()?;
+    waited(&out)?;
+    tool_line(&out, 2, &format!("status=in_progress open=yes {NOTES_COUNTS}"))?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    // The zone's card border is its profile theme's (`e2e`).
+    let scale = window_scale(image, crate::brindle::theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    for (what, colour) in [("added", ZONE_DIFF_ADDED), ("removed", ZONE_DIFF_REMOVED)] {
+        let count = image.count_near(zone, colour, TOKEN_NEAR);
+        ensure!(
+            count as f32 >= 2_000.0 * scale * scale,
+            "the {what} line: {count} pixels of {} in {zone:?}; found {}",
+            colour.hex(),
+            image.summary(zone)
+        );
+    }
     Ok(Outcome::Pass)
 }

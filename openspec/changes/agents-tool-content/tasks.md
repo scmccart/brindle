@@ -279,7 +279,7 @@ Before starting, check these:
 
 ## 7. The zone
 
-- [ ] 7.1 **Draw the detail parts** in `src/agent/view.rs`:
+- [x] 7.1 **Draw the detail parts** in `src/agent/view.rs`:
   - text items through `Response`;
   - diffs through `Diff`;
   - output and raw values through `CodeBlock`, with the command and exit in its header;
@@ -306,21 +306,22 @@ Before starting, check these:
   - a pixel check of the added and removed colours against the `e2e` theme.
 - [x] 8.2 **`agent-tool-output`**: output streamed in Codex's `_meta` pieces behind a `Gate`; its text and exit; the conversation staying at its end (`at=end`).
 - [x] 8.3 **`agent-tool-raw`**: a call with only a raw input shows it; a call with content doesn't.
-- [ ] 8.4 **`agent-tool-bounds`**: 200 KiB of output and a 40-item call show their counts.
+- [x] 8.4 **`agent-tool-bounds`**: 200 KiB of output and a 40-item call show their counts (the output item's `omitted=`, the tool line's `more=`, flag 33).
 - [x] 8.5 **`agent-permission-detail`**:
   - a pending request shows its call's diff while the call's own line reads `open=permission`, also with `tool_details = "closed"`;
   - after `Allow once`, the detail is gone from the permission and back in the running call's row;
   - content sent only in the request shows too.
-- [ ] 8.6 **`agent-tool-restore`**: quit mid-turn with a diff and a pending permission, relaunch, and the restored zone shows both.
-- [ ] 8.7 **`agent-tool-page`**: a session waits on a permission for a tool call with more than a page of entries after it; the restored zone's first entry is that tool call, and the permission shows its diff (`earlier=` present).
+- [x] 8.6 **`agent-tool-restore`**: quit mid-turn with a diff and a pending permission, relaunch, and the restored zone shows both.
+- [x] 8.7 **`agent-tool-page`**: a session waits on a permission for a tool call with more than a page of entries after it; the restored zone's first entry is that tool call, and the permission shows its diff (`earlier=` present).
 - [x] 8.8 **`agent-tool-settings`**:
   - `tool_details = "closed"` keeps a running call's row closed;
   - `tool_details_when_done = "open"` keeps a finished one open;
   - rewriting the config while Brindle runs opens the finished rows without a restart;
   - a bad value shows the config line.
-- [ ] 8.9 **`agent-tool-theme`**: an agent profile with a dark theme in a light window; a pixel check that a diff's added line is the dark zone set's `diff_added`.
+- [x] 8.9 **`agent-tool-theme`**: an agent profile with a dark theme in a light window; a pixel check that a diff's added line is the dark zone set's `diff_added`.
 - [ ] 8.10 **`windows-agent-tool-diff`** in `tests/e2e/cases/win.rs`: a diff and its permission detail through ConPTY.
   - Verify: it is listed on Windows, and the archive jobs (`e2e-archive`, `windows-e2e-archive`) pick up the new `agent-*` and `windows-agent-*` cases by their filters.
+  - Written: it runs `agent-permission-detail`'s function, which now also checks the diff's `--- item` line. The archive filters (`agent-` in `e2e-archive`, `windows-agent-` in `windows-e2e-archive`) take the new cases. Still to verify on Windows: its listing and run (the PR's `windows-e2e` job); `win.rs` can't be checked from Linux (the Windows target's build scripts need MSVC).
 - [ ] 8.11 **The perf case `agent-tool-output`** in `tests/perf/agent.rs` (flag 13): 1 MiB of output in 4 KiB `_meta` deltas into an open row, timed from the gate to the last line shown. Its case name goes in `tests/perf/main.rs`'s list.
   - Verify: `BRINDLE_PERF=1 cargo test --test perf -- --list` lists it, and a run under `scripts/with-xvfb` writes its numbers to `summary.toml`.
 

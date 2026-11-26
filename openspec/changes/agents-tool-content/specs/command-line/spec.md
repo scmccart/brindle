@@ -1,23 +1,30 @@
 ## ADDED Requirements
 
 ### Requirement: Tool call rows in the dump
-In an agent zone's dump, a tool call's `--- entry` line SHALL say, after its status and before its title, whether its row is open (`open=yes`, `open=no`, `open=permission` while a pending permission request shows its detail, or `open=none` when it has nothing to open) and how many content items it holds (`items=N`). When the row's line has a summary, the `--- entry` line SHALL give it after `items=N` (`summary="…"`), and SHALL print no `summary=` field when it has none.
+In an agent zone's dump, a tool call's `--- entry` line SHALL say, after its status and before its title, whether its row is open (`open=yes`, `open=no`, `open=permission` while a pending permission request shows its detail, or `open=none` when it has nothing to open) and how many content items it holds (`items=N`).
 
 #### Scenario: A running tool call
 - **WHEN** the fake ACP agent reports a tool call with one diff as in progress, and the dump is taken
 - **THEN** the tool call's `--- entry` line has `open=yes items=1`
 
+#### Scenario: A finished tool call
+- **WHEN** the fake ACP agent then reports that tool call as completed, and the dump is taken
+- **THEN** the tool call's `--- entry` line has `open=no items=1`
+
+### Requirement: Tool call counts and summaries in the dump
+A tool call's `--- entry` line SHALL give, after `items=N`, the number of items it left out past its bounds (`more=M`), then its row's summary (`summary="…"`), each only when there is one.
+
 #### Scenario: A row's summary
 - **WHEN** the fake ACP agent reports a tool call whose one diff replaces one line, and the dump is taken
 - **THEN** the tool call's `--- entry` line has `items=1 summary="+1 −1"` before its title
 
+#### Scenario: Items left out
+- **WHEN** the fake ACP agent reports a tool call with 40 text items, and the dump is taken
+- **THEN** the tool call's `--- entry` line has `items=32 more=8`
+
 #### Scenario: A row with no summary
 - **WHEN** the fake ACP agent reports a tool call with no content, and the dump is taken
-- **THEN** the tool call's `--- entry` line has `open=none items=0` followed by its title, with no `summary=` field
-
-#### Scenario: A finished tool call
-- **WHEN** the fake ACP agent then reports that tool call as completed, and the dump is taken
-- **THEN** the tool call's `--- entry` line has `open=no items=1`
+- **THEN** the tool call's `--- entry` line has `open=none items=0` followed by its title, with no `more=` or `summary=` field
 
 ### Requirement: Permission details in the dump
 A permission request's `--- entry` line SHALL say, after its outcome, how many parts of its tool call's detail it shows (`detail=N`), and SHALL print nothing more when it shows none, so its line reads as before tool call content existed.
