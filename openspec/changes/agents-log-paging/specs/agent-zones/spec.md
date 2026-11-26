@@ -26,6 +26,21 @@ Attaching an agent session, at launch or from the sessions palette, SHALL show t
 - **WHEN** the user scrolls up a restored zone and the fetched entries hold a permission request answered long ago and turns that ended
 - **THEN** no notification appears, and the zone's status is unchanged
 
+### Requirement: Motion only while an agent works
+Spinners and shimmering text SHALL advance in steps, at most 10 a second, from one clock for the whole window. The clock SHALL run only while some agent zone of the window is working or loading earlier messages, and SHALL NOT wake or redraw the window when none is.
+
+#### Scenario: Stops at the end of the turn
+- **WHEN** the only working agent zone's turn ends
+- **THEN** the window's motion clock stops, and nothing in the window moves until an agent works again
+
+#### Scenario: One clock for many zones
+- **WHEN** two agent zones in different tabs are working
+- **THEN** the window redraws for motion at most 10 times a second, not once per zone
+
+#### Scenario: Loading earlier messages
+- **WHEN** an idle agent zone's "Earlier messages" item is loading, and the page then arrives
+- **THEN** the item's spinner turns while it loads, and the window's motion clock stops once the page is shown
+
 ## ADDED Requirements
 
 ### Requirement: Earlier messages

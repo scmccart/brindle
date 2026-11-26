@@ -43,7 +43,7 @@ The refresh keeps every answer. What it adds (design.md decision 16, items 13–
 
 ### Modified Capabilities
 - `agent-sessions`: "Attach replays the transcript" and "The log is bounded", and new requirements for fetching older entries, keeping unfetched entries current, and appended checkpoints.
-- `agent-zones`: "Scrolling the conversation", for entries fetched on demand, "Replays raise nothing", for the newest page and fetched pages, and a new requirement for the "Earlier messages" row. Once `agents-zone-attention` is archived, also its "Motion only while an agent works", for the row's spinner (design.md decision 16, item 17; task 8.3).
+- `agent-zones`: "Scrolling the conversation", for entries fetched on demand, "Replays raise nothing", for the newest page and fetched pages, and a new requirement for the "Earlier messages" row. "Motion only while an agent works" (from `agents-zone-attention`, now archived), for the row's spinner (design.md decision 16, item 17; task 8.3).
 - `command-line`: "Debug hooks in an agent zone", for the dump's `earlier=`, carrying `agents-zone-attention`'s `--- working` line.
 - `session-restore`: "Restored agent zones get their sessions back", for the newest page in place of the whole conversation.
 - `terminal-server`: "Protocol versions", for what client protocol 4 and holder protocol 3 now carry.
