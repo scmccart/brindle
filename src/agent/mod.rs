@@ -512,6 +512,11 @@ impl Agent {
                 self.model.server_note(text);
                 return;
             }
+            AgentEvent::EndpointNote(text) => {
+                self.model.set_endpoint_note(text);
+                cx.notify();
+                return;
+            }
         };
         self.apply_absorbed(absorbed, cx);
     }

@@ -31,6 +31,7 @@
 
 mod agent;
 mod connection;
+mod endpoint_env;
 mod link;
 #[cfg(windows)]
 mod pipe;

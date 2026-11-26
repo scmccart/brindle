@@ -8,7 +8,7 @@
 //!
 //! | type | name              | direction        | payload                                                         |
 //! |-----:|-------------------|------------------|-----------------------------------------------------------------|
-//! | 0xF0 | `RELAY_HOST`      | relay → Brindle  | `version, build, env, shell, home, server_dir, core_pid`        |
+//! | 0xF0 | `RELAY_HOST`      | relay → Brindle  | `version, build, env, shell, home, server_dir, core_pid, login?` |
 //! | 0xF1 | `RELAY_HEARTBEAT` | both             | empty                                                           |
 //! | 0xF2 | `RELAY_ERROR`     | relay → Brindle  | `message`                                                       |
 //!
@@ -46,8 +46,11 @@ pub struct RelayHost {
     /// The relay's build id.
     #[serde(default)]
     pub build: String,
-    /// The relay's own environment: a fresh login's, which Brindle builds
-    /// a remote program's environment from.
+    /// The relay's own environment (over SSH what sshd gives a command, in
+    /// a container the engine's `exec`), with `HOME`, `USER`, `LOGNAME` and
+    /// `SHELL` filled in from the passwd entry where it left them unset or
+    /// empty. Brindle builds a remote program's environment from it, or
+    /// from [`Self::login`].
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// The login shell, from `SHELL`, else the passwd entry.
@@ -61,6 +64,24 @@ pub struct RelayHost {
     /// The core's process id on the host.
     #[serde(default)]
     pub core_pid: u32,
+    /// The user's login shell's environment, when the relay was started
+    /// with `--login-environment`; absent otherwise, and then the frame
+    /// encodes byte for byte as before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<LoginEnv>,
+}
+
+/// What reading the login shell's environment came to.
+///
+/// `{"captured":{"HOME":"/root",…}}` or `{"failed":"it took longer than 10 s"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoginEnv {
+    /// The environment the login shell exported, keys sorted.
+    Captured(BTreeMap<String, String>),
+    /// Why it wasn't read, as text to show beside the program that falls
+    /// back (`railway R4`: its one consumer shows it).
+    Failed(String),
 }
 
 /// The relay could not reach or start the core.
@@ -122,6 +143,25 @@ pub(crate) mod samples {
                 home: "/home/u".into(),
                 server_dir: "/run/user/1000/brindle".into(),
                 core_pid: 4242,
+                login: None,
+            }),
+            RelayMessage::Host(RelayHost {
+                version: "0.3.0".into(),
+                build: "b1d0".into(),
+                env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                shell: "/bin/bash".into(),
+                home: "/home/u".into(),
+                server_dir: "/run/user/1000/brindle".into(),
+                core_pid: 4242,
+                login: Some(LoginEnv::Captured(BTreeMap::from([
+                    ("HOME".into(), "/home/u".into()),
+                    ("PATH".into(), "/home/u/.local/bin:/usr/bin".into()),
+                ]))),
+            }),
+            RelayMessage::Host(RelayHost {
+                version: "0.3.0".into(),
+                login: Some(LoginEnv::Failed("it took longer than 10 s".into())),
+                ..Default::default()
             }),
             RelayMessage::Heartbeat,
             RelayMessage::Error(RelayError {
@@ -187,6 +227,7 @@ mod tests {
             home: "/root".into(),
             server_dir: "/tmp/b".into(),
             core_pid: 7,
+            login: None,
         })
         .encode()
         .unwrap();
@@ -199,6 +240,49 @@ mod tests {
         assert_eq!((frame.msg_type, &frame.payload[..]), (0xF2, &br#"{"message":"m"}"#[..]));
         let frame = RelayMessage::Heartbeat.encode().unwrap();
         assert_eq!((frame.msg_type, frame.payload.len()), (0xF1, 0));
+    }
+
+    #[test]
+    fn a_login_environment_is_tagged_and_absent_when_not_asked() {
+        let host = |login| RelayHost {
+            version: "1".into(),
+            login,
+            ..Default::default()
+        };
+        let encoded = |login| RelayMessage::Host(host(login)).encode().unwrap().payload;
+        let captured = Some(LoginEnv::Captured(BTreeMap::from([
+            ("B".into(), "2".into()),
+            ("A".into(), "1".into()),
+        ])));
+        let failed = Some(LoginEnv::Failed("why".into()));
+        let none = String::from_utf8(encoded(None)).unwrap();
+        assert!(!none.contains("login"), "{none}");
+        assert!(
+            String::from_utf8(encoded(captured.clone()))
+                .unwrap()
+                .ends_with(r#","login":{"captured":{"A":"1","B":"2"}}}"#)
+        );
+        assert!(
+            String::from_utf8(encoded(failed.clone()))
+                .unwrap()
+                .ends_with(r#","login":{"failed":"why"}}"#)
+        );
+        for login in [None, captured, failed] {
+            let frame = RelayMessage::Host(host(login.clone())).encode().unwrap();
+            assert_eq!(
+                RelayMessage::decode(&frame).unwrap(),
+                RelayMessage::Host(host(login))
+            );
+        }
+        // A login of another form is refused, never taken as absent.
+        for payload in [
+            &br#"{"login":{"later":{}}}"#[..],
+            br#"{"login":{"captured":{"A":1}}}"#,
+            br#"{"login":"captured"}"#,
+        ] {
+            let frame = Frame::new(MSG_RELAY_HOST, payload.to_vec()).unwrap();
+            assert!(RelayMessage::decode(&frame).is_err());
+        }
     }
 
     #[test]

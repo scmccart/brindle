@@ -146,16 +146,29 @@ pub fn home_dir(env: &BTreeMap<String, String>) -> Option<PathBuf> {
         env.get("HOME").map(String::as_str),
         std::env::var_os("HOME").as_deref(),
     )
-    .or_else(|| passwd_entry().map(|(_, home)| home))
+    .or_else(|| passwd_entry().map(|entry| entry.home))
 }
 
-/// The login shell and home directory of the current user from the passwd
-/// database. `docker exec` sets no `SHELL`.
-pub fn passwd_entry() -> Option<(OsString, PathBuf)> {
+/// The current user's passwd entry, as far as Brindle reads it.
+pub struct PasswdEntry {
+    /// The user's name; may be empty.
+    pub name: OsString,
+    /// The login shell. `docker exec` sets no `SHELL`.
+    pub shell: OsString,
+    pub home: PathBuf,
+}
+
+/// The name, login shell and home directory of the current user from the
+/// passwd database.
+pub fn passwd_entry() -> Option<PasswdEntry> {
     with_passwd(|entry| {
         let shell = passwd_field(entry.pw_shell)?;
         let dir = passwd_field(entry.pw_dir)?;
-        Some((shell, PathBuf::from(dir)))
+        Some(PasswdEntry {
+            name: passwd_field(entry.pw_name).unwrap_or_default(),
+            shell,
+            home: PathBuf::from(dir),
+        })
     })
 }
 
@@ -209,7 +222,7 @@ fn default_shell(env: &BTreeMap<String, String>) -> OsString {
         std::env::var_os("SHELL").as_deref(),
     )
     .unwrap_or_else(|| {
-        passwd_shell(passwd_entry().map(|(shell, _)| shell), |path| {
+        passwd_shell(passwd_entry().map(|entry| entry.shell), |path| {
             path.exists()
         })
     })

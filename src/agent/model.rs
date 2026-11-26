@@ -863,6 +863,9 @@ pub struct ChatModel {
     seen: bool,
     /// A restore's note, shown above the conversation.
     note: Option<String>,
+    /// The endpoint's note, shown below a restore's: the agent got the SSH
+    /// session's environment because the login shell's wasn't read.
+    endpoint_note: Option<String>,
     /// The agent's conversation as the zone last knew it: the transcript's,
     /// kept while a new session's transcript has none yet.
     conversation: Option<Conversation>,
@@ -911,6 +914,7 @@ impl ChatModel {
             refusal: None,
             seen: false,
             note: None,
+            endpoint_note: None,
             conversation: None,
             command: AgentCommand::default(),
             login_note: None,
@@ -965,8 +969,22 @@ impl ChatModel {
         &self.queue
     }
 
+    /// A restore's note alone; the view shows [`ChatModel::notes`].
+    #[cfg(test)]
     pub fn note(&self) -> Option<&str> {
         self.note.as_deref()
+    }
+
+    /// The agent's start fell back to the endpoint's SSH environment, as
+    /// `text` says. The latest start's word replaces an earlier one's.
+    pub fn set_endpoint_note(&mut self, text: impl Into<String>) {
+        self.endpoint_note = Some(text.into());
+    }
+
+    /// The notes shown above the conversation, one line each: a restore's,
+    /// then the endpoint's.
+    pub fn notes(&self) -> impl Iterator<Item = &str> {
+        self.note.as_deref().into_iter().chain(self.endpoint_note.as_deref())
     }
 
     /// The refusal shown beside the prompt input.
@@ -1959,7 +1977,7 @@ impl ChatModel {
             offer.word()
         ));
         out.push_str(&self.login_lines());
-        if let Some(note) = &self.note {
+        for note in self.notes() {
             out.push_str(&format!("--- note {note:?}\n"));
         }
         for (id, entry) in &self.entries {
@@ -2858,6 +2876,39 @@ mod tests {
         assert_eq!(held.model.link(), Link::Reconnecting);
         assert_eq!(held.model.banner("A8").as_deref(), Some("reconnecting to A8…"));
         assert!(held.model.describe(1, true, &found(&held.model), &linux).contains("link=reconnecting"));
+    }
+
+    /// `remote-login-environment` 5.4: an endpoint note shows below a
+    /// restore's, each its own dump line, and a later start's replaces it.
+    #[test]
+    fn an_endpoint_note_shows_below_a_restores_note() {
+        const FELL_BACK: &str = "the login shell's environment on A8 wasn't read (it took longer than 10 s), \
+                                 so this program has the SSH session's environment";
+        let mut zone = Zone::ready();
+        assert_eq!(zone.model.notes().count(), 0);
+        zone.model.set_endpoint_note(FELL_BACK);
+        assert_eq!(zone.model.notes().collect::<Vec<_>>(), [FELL_BACK]);
+        assert_eq!(zone.model.note(), None);
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        assert!(dump.contains(&format!("--- note {FELL_BACK:?}\n")), "{dump}");
+
+        zone.model.set_note("the profile \"Old\" is gone; this tab uses \"Fake\"");
+        let again = "the login shell's environment on A8 wasn't read (no login shell is set), \
+                     so this program has the SSH session's environment";
+        zone.model.set_endpoint_note(again);
+        assert_eq!(
+            zone.model.notes().collect::<Vec<_>>(),
+            ["the profile \"Old\" is gone; this tab uses \"Fake\"", again]
+        );
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        let notes: Vec<&str> = dump.lines().filter(|line| line.starts_with("--- note ")).collect();
+        assert_eq!(
+            notes,
+            [
+                "--- note \"the profile \\\"Old\\\" is gone; this tab uses \\\"Fake\\\"\"".to_string(),
+                format!("--- note {again:?}"),
+            ]
+        );
     }
 
     fn held_slot() -> Slot {

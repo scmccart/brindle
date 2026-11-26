@@ -54,6 +54,9 @@ pub enum AgentEvent {
     /// The core's word about the session that answers no request (a
     /// refused cancel, a holder's fault report).
     Note(String),
+    /// The agent got the endpoint's SSH environment because the login
+    /// shell's wasn't read: an endpoint note above the conversation.
+    EndpointNote(String),
 }
 
 /// What `event` is to the gate: [`AgentEvent::Changed`] merged, every
@@ -68,7 +71,8 @@ pub fn kind_of(event: &AgentEvent) -> Kind {
         | AgentEvent::Failed(_)
         | AgentEvent::Broken(_)
         | AgentEvent::Reply { .. }
-        | AgentEvent::Note(_) => Kind::Life,
+        | AgentEvent::Note(_)
+        | AgentEvent::EndpointNote(_) => Kind::Life,
     }
 }
 
@@ -222,6 +226,10 @@ impl Sink {
 
     pub fn note(&mut self, text: &str) {
         self.send(AgentEvent::Note(text.to_string()));
+    }
+
+    pub fn endpoint_note(&mut self, text: &str) {
+        self.send(AgentEvent::EndpointNote(text.to_string()));
     }
 }
 

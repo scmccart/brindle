@@ -14,13 +14,14 @@
 //! - **[`Timings`]:** heartbeats, the dead-link limit, the bootstrap limit,
 //!   the reconnect backoff, how long an unused connection is kept and how
 //!   long an unwritten `CLOSE` keeps it trying, which tests shorten.
-//! - **The program's environment** ([`relay_env`], [`SpawnRequest::remote`]):
-//!   a remote `SPAWN` carries the relay's environment (`RELAY_HOST`, a fresh
-//!   login's) with the profile's ([`child_env`]) over it.
+//! - **The program's environment** ([`SpawnRequest::remote`]): a remote
+//!   `SPAWN` asks for the profile's ([`child_env`]), which the connection's
+//!   writer lays over the endpoint's (`super::endpoint_env`: the login
+//!   shell's for a program, the SSH session's or container's own for a login
+//!   shell session).
 //!
 //! [`child_env`]: crate::terminal::child_env
 
-use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
@@ -439,15 +440,6 @@ impl Drop for ChildWire {
     }
 }
 
-/// A remote session's environment: `host`'s (`RELAY_HOST`'s: a fresh
-/// login's on the endpoint) with `own` over it. Names are compared as
-/// given, since endpoints are Linux whatever this machine is.
-pub fn relay_env(host: &BTreeMap<String, String>, own: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let mut env = host.clone();
-    env.extend(own.iter().map(|(name, value)| (name.clone(), value.clone())));
-    env
-}
-
 impl SpawnRequest {
     /// What a remote profile's session runs, for a relay connection: the
     /// profile's command, or none (the endpoint's login shell, as for an
@@ -492,6 +484,7 @@ impl SpawnRequest {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Instant;
 
     use super::*;
@@ -504,35 +497,6 @@ mod tests {
         assert_eq!(pauses, [1, 1, 2, 4, 8, 16, 30, 30, 30]);
         assert_eq!(backoff(u32::MAX, second, cap), cap);
         assert_eq!(backoff(9, second, Duration::from_secs(60)).as_secs(), 60);
-    }
-
-    #[test]
-    fn the_endpoints_environment_is_under_the_profiles() {
-        let host = BTreeMap::from([
-            ("LANG".to_string(), "en_GB.UTF-8".to_string()),
-            ("HOME".to_string(), "/home/ubuntu".to_string()),
-            ("TERM".to_string(), "dumb".to_string()),
-            ("path".to_string(), "/lower".to_string()),
-        ]);
-        let profile = Profile {
-            name: "A8".into(),
-            env: BTreeMap::from([("FOO".to_string(), "1".to_string()), ("PATH".to_string(), "/usr/bin".to_string())]),
-            ..Default::default()
-        };
-        let own: BTreeMap<String, String> = crate::terminal::child_env(&profile).into_iter().collect();
-        let env = relay_env(&host, &own);
-        assert_eq!(env["LANG"], "en_GB.UTF-8");
-        assert_eq!(env["HOME"], "/home/ubuntu");
-        assert_eq!(env["FOO"], "1");
-        // Brindle's terminal variables win over a tty-less login's.
-        assert_eq!(env["TERM"], "xterm-256color");
-        assert_eq!(env["COLORTERM"], "truecolor");
-        assert_eq!(env["TERM_PROGRAM"], "Brindle");
-        // Linux names: `PATH` doesn't replace `path`, even on Windows.
-        assert_eq!((env["PATH"].as_str(), env["path"].as_str()), ("/usr/bin", "/lower"));
-        // Nothing of Brindle's own environment.
-        let keys: Vec<&str> = env.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["COLORTERM", "FOO", "HOME", "LANG", "PATH", "TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "path"]);
     }
 
     fn profile() -> Profile {

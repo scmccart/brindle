@@ -850,7 +850,7 @@ impl Render for AgentView {
         let model = self.agent.read(cx).model();
         let endpoint = self.agent.read(cx).names().1;
         let banner = model.banner(&endpoint);
-        let note = model.note().map(str::to_string);
+        let notes: Vec<String> = model.notes().map(str::to_string).collect();
         let alert = self.alert(cx);
         let login = self.login_row(cx);
         let settings = Settings::get(cx);
@@ -898,7 +898,7 @@ impl Render for AgentView {
                             .opacity(0.8)
                             .child(banner)
                     }))
-                    .children(note.map(|note| {
+                    .children(notes.into_iter().map(|note| {
                         div()
                             .debug_selector(|| "agent-note".into())
                             .flex_none()

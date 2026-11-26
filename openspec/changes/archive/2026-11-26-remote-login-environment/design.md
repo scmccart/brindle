@@ -243,6 +243,24 @@ No exception is needed. The design relies on these rules:
 - `railway R3` and `types R2`: `start_of` has no wildcard.
 - `types R1`, `R6` and `R7`: `Login::NotAsked` is a variant, parsed at the boundary.
 
+## As built (2026-11-25)
+
+The smallest fixes where the design met the code:
+- **`busybox`** as `SHELL` is run as `busybox sh -l -i -c …`, since a multi-call binary takes the applet's name first. `ash`, the usual Alpine `SHELL`, is in the POSIX family as designed.
+- **The failure's stderr line** is the last line that says something, not the first, and the kept 4 KiB are the last ones. An interactive bash with no terminal always starts its stderr with "cannot set terminal process group" and "no job control in this shell", so the first line would never name the cause. An rc's `exec tmux` then reads "…before printing it: open terminal failed: not a terminal". This answers the Open Question for bash; busybox's warnings are handled the same way. The quoted line is cut to 300 characters.
+- **`TooLarge`'s text** names both bounds: "it was larger than 256 KiB or had more than 4096 variables".
+- **A test's limit** is shown in milliseconds when it isn't whole seconds ("it took longer than 300 ms").
+- **The capture's process** is the relay's own Linux seam code: a `poll` over the dump pipe, the stderr pipe and an exit pipe that the reaper thread closes once `wait` returns. When the shell has exited, both pipes are drained before the outcome is decided, so a dump written just before the exit is never lost to a race with the reaper.
+- **The missing-shell test** names `/nonexistent/relay-test/bash`. A name that isn't in decision 3's table, such as the planned `/bin/relay-test-shell`, is `Unsupported` before it is looked for.
+- **4.2's role test** parses the dump by hand, since the helper is a binary crate and its tests can't name `login_env`. The parser's own cases are `login_env`'s unit tests.
+- **4.5's test** is Linux-only (`cfg(target_os = "linux")`), as remote endpoints are: a Windows program needs more than two variables to start.
+- **The dump pipe is file descriptor 63, not 3** (decision 3, 4.2, 4.3). An interactive login bash marks descriptors 3 to 19 close-on-exec (seen with bash 5.2 and 5.3), so the role it `exec`s found fd 3 closed and every bash endpoint failed with "file descriptor 3 isn't open". The Docker transport test's SSH scenario found it (4.4's tests ran `/bin/sh`, which is dash on the test machine). bash, dash, zsh, fish, ksh93, mksh and busybox `sh` all keep 63 open across `-l -i -c`. `remote-agent/tests/relay.rs` gains a bash login shell case, which fails with fd 3, and the role test runs bash, since dash's redirections take one digit.
+- **5.6's SSH login scenario runs first** in `ssh_transport_scenarios`: the endpoint's one connection reads the login environment when its link comes up, so startup files changed after the round trip's session would not be seen. The noise scenarios check the login environment through a fresh relay (`connect`), whose `RELAY_HOST.login` must still be `Captured` with `~/.profile`'s variable.
+- **5.1's `encode`** takes only the link's `EndpointEnv`, which replaced `Current`'s `RelayHost` (nothing else read it), and returns the frame with its `Fallback`. The match on `start_of` lives in `endpoint_env::over_endpoint`, so the shell only calls it.
+- **5.3's record** is a map of its own in the connection's state (`State::fallbacks`, by request id), not a field of `Pending`, set or cleared each time the writer writes the start, so a start written again on a later link has that link's word. `SPAWNED` takes it out and tells it before the reply, `ERROR` drops it.
+- **5.4's delivery** goes through a new `SessionSink::endpoint_note`, which a terminal's sink leaves as its dim note line and an agent's sink sends as `AgentEvent::EndpointNote`. A new agent's note comes with its `SPAWNED`, a restart's with its `OK`. The model keeps it beside the restore's note (`ChatModel::notes`), the view shows both, and the dump prints a `--- note` line for each.
+- **3.3's check** found one `Debug` print that could carry a `RelayHost`: the reader's line for a relay frame after `HOST`. It now names the frame (a second `RELAY_HOST`, or a `RELAY_ERROR` with its message) and prints no host.
+
 ## Risks / Trade-offs
 
 - [Startup files run once more per connection, with their side effects (an `ssh-agent` per connect, a `fortune`)] → Each SSH login does the same, and the output is discarded. A user can guard with `[ -t 0 ]`.

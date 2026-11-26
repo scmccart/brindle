@@ -3,7 +3,8 @@
 //! start, the build id, framed connections, the event loop and fault
 //! confinement. What they need from the operating system is in
 //! [`platform`]. On Linux, the relay (`relay`) reaches the core for a
-//! client on another machine.
+//! client on another machine, and reads the login shell's environment
+//! with [`login_env`]'s decisions.
 
 pub mod build_id;
 pub mod check;
@@ -15,6 +16,7 @@ pub mod dir;
 pub mod event_loop;
 pub mod fault;
 pub mod holder;
+pub mod login_env;
 pub mod platform;
 #[cfg(target_os = "linux")]
 pub mod relay;

@@ -48,6 +48,9 @@ fn run() -> Result<(), String> {
         Some("serve") => serve(&rest),
         Some("hold") => hold(&rest),
         Some("relay") => relay(&rest),
+        // What the relay's login shell `exec`s to report its environment.
+        #[cfg(target_os = "linux")]
+        Some("login-env") => server::relay::login_env_role(&rest),
         // The trampoline that starts a role detached, for the role's starter.
         #[cfg(windows)]
         Some("launch") => server::daemon::launch(&rest),

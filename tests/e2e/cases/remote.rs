@@ -389,7 +389,12 @@ pub fn agent_ssh(ctx: &Ctx) -> Result<Outcome> {
 /// command, takes a new conversation (it had none) and answers the `-p`
 /// prompt, which waited through the login and is sent once. After the
 /// quit, root's server lists the agent's session alone, detached: the
-/// login program's ended with it. Skips as [`agent_ssh`] does.
+/// login program's ended with it. The agent is on the login shell's `PATH`
+/// alone (root's `~/.bashrc` adds its directory) and named bare, and the
+/// agent started again after the login has the login shell's environment
+/// (`HOME`, `~/.profile`'s and `~/.bashrc`'s variables, that `PATH`), the
+/// same as the first agent's and the login program's (OpenSpec change
+/// `remote-login-environment`). Skips as [`agent_ssh`] does.
 pub fn agent_login_terminal(ctx: &Ctx) -> Result<Outcome> {
     let needs = match Needs::check(ctx)? {
         Ok(needs) => needs,
@@ -404,19 +409,38 @@ pub fn agent_login_terminal(ctx: &Ctx) -> Result<Outcome> {
     };
     let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
     use super::agent::{NEEDS_LOGIN, NEITHER, Script, TERMINAL_CHOICE, TERMINAL_LOGIN};
-    let agent = "/usr/local/bin/brindle-fake-acp-agent";
+    // The agent is on the login shell's `PATH` alone, which root's
+    // `~/.bashrc` sets (below Ubuntu's interactive guard, as installers
+    // put it), and the profile names it bare: the agent, its login program
+    // and the agent started again after the login each need the login
+    // shell's environment to be found at all.
+    let (agent_dir, agent) = ("/root/.local/agent-bin", "brindle-fake-acp-agent");
+    let installed = format!("{agent_dir}/{agent}");
+    ssh.container.exec(&[
+        "sh",
+        "-c",
+        &format!(
+            "printf 'export BRINDLE_E2E_PROFILE=1\\n' >> /root/.profile && \
+             printf 'export BRINDLE_E2E_BASHRC=1\\nexport PATH={agent_dir}:$PATH\\n' >> /root/.bashrc && \
+             mkdir -p {agent_dir}"
+        ),
+    ])?;
     let (script, next, env, gate) = ("/root/agent.script", "/root/next.script", "/root/login.env", "/root/login-done");
     let (first, second) = ("/root/first.jsonl", "/root/second.jsonl");
-    ssh.container.copy_to(&fake, agent)?;
-    ssh.container.exec(&["chmod", "755", agent])?;
+    let (first_env, second_env) = ("/root/first.env", "/root/second.env");
+    ssh.container.copy_to(&fake, &installed)?;
+    ssh.container.exec(&["chmod", "755", &installed])?;
     // The login program records its environment, then exits 0 once the
     // case opens `gate`; the agent started again after it runs the
     // profile's command, so the case first puts the second agent's script
     // in the first's place in the container.
     let login = [format!("wait-file {gate}"), "exit 0".to_string()];
-    let first_agent = Script::login_at_start(Path::new(first), TERMINAL_LOGIN);
+    let first_agent = Script::login_at_start(Path::new(first), TERMINAL_LOGIN).recording_env(Path::new(first_env));
     let first_agent = super::agent::with_terminal_login(first_agent, Path::new(env), &login).write(ctx, "agent")?;
-    let second_agent = Script::initialized(Path::new(second), NEITHER).then_hello().write(ctx, "next")?;
+    let second_agent = Script::initialized(Path::new(second), NEITHER)
+        .then_hello()
+        .recording_env(Path::new(second_env))
+        .write(ctx, "next")?;
     ssh.container.copy_to(&first_agent, script)?;
     ssh.container.copy_to(&second_agent, next)?;
 
@@ -465,6 +489,31 @@ pub fn agent_login_terminal(ctx: &Ctx) -> Result<Outcome> {
     ensure!(sent.contains("\"session/new\""), "no new conversation: {sent}");
     let listed = parse_list(&ssh.container.helper(&["list"])?);
     ensure!(listed.len() == 1 && !listed[0].attached, "root's server lists {listed:?}");
+    // `remote-login-environment`: the agent started again after the login
+    // got the login shell's environment, as the first agent and the login
+    // program did.
+    let read = |path: &str| -> Result<Vec<String>> {
+        Ok(ssh.container.exec(&["cat", path])?.lines().map(str::to_string).collect())
+    };
+    let (first_vars, second_vars, login_vars) = (read(first_env)?, read(second_env)?, read(env)?);
+    ctx.save("second.env", second_vars.join("\n"));
+    let value = |vars: &[String], name: &str| {
+        vars.iter().find_map(|line| line.strip_prefix(&format!("{name}=")).map(str::to_string))
+    };
+    let path = value(&second_vars, "PATH").unwrap_or_default();
+    ensure!(path.starts_with(&format!("{agent_dir}:")), "the restarted agent's PATH: {path:?}");
+    for (name, expected) in [("HOME", Some("/root")), ("BRINDLE_E2E_PROFILE", Some("1")), ("BRINDLE_E2E_BASHRC", Some("1"))] {
+        let got = value(&second_vars, name);
+        ensure!(got.as_deref() == expected, "the restarted agent's {name}: {got:?}");
+    }
+    for name in ["HOME", "BRINDLE_E2E_PROFILE", "BRINDLE_E2E_BASHRC", "PATH"] {
+        let (restarted, started, login) =
+            (value(&second_vars, name), value(&first_vars, name), value(&login_vars, name));
+        ensure!(
+            restarted == started && restarted == login,
+            "{name}: restarted {restarted:?}, first {started:?}, login program {login:?}"
+        );
+    }
     Ok(Outcome::Pass)
 }
 

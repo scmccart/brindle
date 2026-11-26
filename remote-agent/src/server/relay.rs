@@ -5,7 +5,19 @@
 //! In order:
 //! 1. **Marker:** stdout gets `FRAME_STREAM_MARKER` and from then on only
 //!    frames. A login shell may print before the relay runs; the client skips
-//!    that (`skip_preamble`).
+//!    that (`skip_preamble`). With `--login-environment` (the SSH launch
+//!    passes it, a container's doesn't), the relay then starts reading the
+//!    user's login shell's environment on a thread of its own: the shell
+//!    ([`login_env::invocation`], `$SHELL -l -i -c`) runs in a session of its
+//!    own with stdin and stdout on `/dev/null`, stderr on a pipe whose last
+//!    4 KiB are kept for the reason, and file descriptor 63 ([`DUMP_FD`]) on
+//!    the dump pipe;
+//!    it `exec`s this binary's hidden `login-env` role, which writes its
+//!    environment there ([`login_env::encode_dump`]). Nothing the startup
+//!    files print reaches stdout. The dump is read up to its terminator, for
+//!    at most [`login_env::LIMIT`] (`BRINDLE_TEST_RELAY_LOGIN_ENV_MS` for
+//!    tests), after which the shell's process group gets `SIGKILL`; a thread
+//!    reaps the shell either way.
 //! 2. **Core:** the server directory is resolved as a local client resolves
 //!    it (created if missing), and the relay connects to the core, starting
 //!    one from its own binary (`/proc/<pid>/exe serve`) when none listens. The
@@ -29,11 +41,17 @@
 //!    for the core to exit, starts `serve` as in step 2 and connects again,
 //!    waiting for the holders' own core if its own won't start. A refused
 //!    check or step-down leaves the running core, which it relays to.
-//! 4. **Host:** `RELAY_HOST` (version, build, its own environment, the
-//!    login shell from `SHELL` else passwd, home, server directory, core
-//!    pid), or `RELAY_ERROR` naming the problem and the core's log, after
-//!    which it exits. The client's connection to the core is open by then,
-//!    so the client's `HELLO` must follow within the core's limit (5 s).
+//! 4. **Host:** before it opens the client's connection to the core, the
+//!    relay waits for the login environment it was asked for, so that wait
+//!    isn't spent from the core's `HELLO` limit; a failure gets one
+//!    `core.log` line naming it, never the environment's values. Then
+//!    `RELAY_HOST` (version, build, its own environment with the passwd
+//!    basics ([`login_env::with_basics`]), the login shell from `SHELL` else
+//!    passwd, home, server directory, core pid, and the login environment
+//!    or why it wasn't read), or `RELAY_ERROR` naming the problem and the
+//!    core's log, after which it exits. The client's connection to the core
+//!    is open by then, so the client's `HELLO` must follow within the core's
+//!    limit (5 s).
 //! 5. **Pipe:** whole frames are copied both ways by their headers. The
 //!    client's relay frames (`RELAY_HEARTBEAT`) are dropped, so no core ever
 //!    sees one. The relay ends when either side closes.
@@ -48,14 +66,19 @@
 //! reader or the watch, so a slow reader isn't silence. For tests,
 //! `BRINDLE_TEST_RELAY_HEARTBEAT_MS` and `BRINDLE_TEST_RELAY_IDLE_MS` replace
 //! the two timings.
+//!
+//! **`login-env`** ([`login_env_role`]), hidden from the usage text, is the
+//! role the login shell `exec`s: it writes its environment to file
+//! descriptor 63 and exits.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read as _, Write as _};
-use std::os::fd::AsFd as _;
+use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -65,10 +88,11 @@ use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{self, Hello, Request, ToClient, ToCore, Welcome};
 use brindle_remote_protocol::ready::ReadyRead;
-use brindle_remote_protocol::relay::{self, RelayError, RelayHost, RelayMessage};
+use brindle_remote_protocol::relay::{self, LoginEnv, RelayError, RelayHost, RelayMessage};
 use brindle_remote_protocol::upgrade::{self, Build};
 use brindle_remote_protocol::{FRAME_STREAM_MARKER, Frame, HEARTBEAT_INTERVAL, scope, server_dir};
 
+use super::login_env::{self, DumpRead, LoginEnvFailure};
 use super::{build_id, check, daemon, dir};
 use crate::liveness::Liveness;
 
@@ -78,6 +102,16 @@ pub const HEARTBEAT_AFTER: Duration = HEARTBEAT_INTERVAL;
 pub const IDLE_LIMIT: Duration = Duration::from_secs(60);
 const HEARTBEAT_ENV: &str = "BRINDLE_TEST_RELAY_HEARTBEAT_MS";
 const IDLE_ENV: &str = "BRINDLE_TEST_RELAY_IDLE_MS";
+const LOGIN_ENV_ENV: &str = "BRINDLE_TEST_RELAY_LOGIN_ENV_MS";
+/// The argument that asks the relay for the login shell's environment.
+pub const LOGIN_ENVIRONMENT_ARG: &str = "--login-environment";
+/// The file descriptor the `login-env` role writes its dump to. Not a low
+/// one: bash marks descriptors 3 to 19 close-on-exec in an interactive login
+/// shell, so the role, which it `exec`s, would find a low one closed. Every
+/// shell `invocation` runs keeps 63 (bash, dash, zsh, fish, ksh93, mksh,
+/// busybox), and each moves its own descriptors to free ones, never onto an
+/// open one.
+const DUMP_FD: RawFd = 63;
 /// How long a started core may take to say it is ready.
 const START_LIMIT: Duration = Duration::from_secs(5);
 /// How long the relay keeps trying a core it started: one that lost a start
@@ -97,15 +131,15 @@ const EXIT_LIMIT: Duration = Duration::from_secs(10);
 const LINGER_DIR: &str = "/var/lib/systemd/linger";
 
 pub fn run(args: &[String]) -> Result<(), String> {
-    if !args.is_empty() {
-        return Err("usage: brindle-remote relay".into());
-    }
+    let asked = login_asked(args)?;
     let timings = Timings::from_env();
     let output = Arc::new(Output::stdout().map_err(|error| format!("relay: no stdout: {error}"))?);
     output
         .raw(FRAME_STREAM_MARKER)
         .map_err(|error| format!("relay: can't write to the client: {error}"))?;
-    let reached = match reach() {
+    let env = login_env::with_basics(own_env(), passwd().as_ref());
+    let capture = asked.then(|| Capture::start(&env, timings.login));
+    let reached = match reach(capture) {
         Ok(reached) => reached,
         Err(message) => {
             let error = RelayMessage::Error(RelayError {
@@ -116,9 +150,311 @@ pub fn run(args: &[String]) -> Result<(), String> {
         }
     };
     output
-        .message(&RelayMessage::Host(reached.host()))
+        .message(&RelayMessage::Host(reached.host(env)))
         .map_err(|error| format!("relay: can't write to the client: {error}"))?;
     pipe(reached, output, timings)
+}
+
+/// Whether the relay's arguments ask for the login shell's environment:
+/// none, or [`LOGIN_ENVIRONMENT_ARG`] alone; anything else is a usage error.
+fn login_asked(args: &[String]) -> Result<bool, String> {
+    match args {
+        [] => Ok(false),
+        [arg] if arg == LOGIN_ENVIRONMENT_ARG => Ok(true),
+        _ => Err(format!("usage: brindle-remote relay [{LOGIN_ENVIRONMENT_ARG}]")),
+    }
+}
+
+/// The relay's own environment, without the variables that aren't UTF-8.
+fn own_env() -> BTreeMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+/// The current user's passwd entry, for [`login_env::with_basics`].
+fn passwd() -> Option<login_env::Passwd> {
+    crate::pty::passwd_entry().map(|entry| login_env::Passwd {
+        name: entry.name.to_string_lossy().into_owned(),
+        home: entry.home.to_string_lossy().into_owned(),
+        shell: entry.shell.to_string_lossy().into_owned(),
+    })
+}
+
+/// `brindle-remote login-env`: writes this process's environment to file
+/// descriptor [`DUMP_FD`] ([`login_env::encode_dump`]) and exits. The login
+/// shell `exec`s it; it takes no arguments, and fails when that descriptor
+/// isn't open.
+pub fn login_env_role(args: &[String]) -> Result<(), String> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    if !args.is_empty() {
+        return Err(format!("usage: brindle-remote {}", login_env::ROLE));
+    }
+    // SAFETY: `F_GETFD` only asks whether the descriptor is open.
+    if unsafe { libc::fcntl(DUMP_FD, libc::F_GETFD) } == -1 {
+        return Err(format!(
+            "{}: file descriptor {DUMP_FD} isn't open: {}",
+            login_env::ROLE,
+            io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: the descriptor is open (above), and this process owns it
+    // from here: nothing else in it uses that descriptor.
+    let mut out = unsafe { File::from_raw_fd(DUMP_FD) };
+    let dump = login_env::encode_dump(
+        std::env::vars_os().map(|(name, value)| (name.into_vec(), value.into_vec())),
+    );
+    out.write_all(&dump)
+        .map_err(|error| format!("{}: can't write the environment: {error}", login_env::ROLE))
+}
+
+/// The login shell's environment being read on its own thread.
+struct Capture(mpsc::Receiver<Result<BTreeMap<String, String>, LoginEnvFailure>>);
+
+impl Capture {
+    /// Starts reading it, the shell started from `env`, for at most `limit`.
+    fn start(env: &BTreeMap<String, String>, limit: Duration) -> Self {
+        let (done, outcome) = mpsc::channel();
+        let env = env.clone();
+        thread::spawn(move || {
+            let _ = done.send(capture(&env, limit));
+        });
+        Self(outcome)
+    }
+
+    /// Waits for the outcome, which [`capture`] bounds by its limit.
+    fn join(self) -> Result<BTreeMap<String, String>, LoginEnvFailure> {
+        self.0.recv().unwrap_or_else(|_| {
+            Err(LoginEnvFailure::Exited {
+                status: login_env::exit_text(None, None),
+                stderr: "the relay's reading thread stopped".into(),
+            })
+        })
+    }
+}
+
+/// Runs the login shell (`env`'s `SHELL`, which the passwd basics filled)
+/// and reads its environment, killing its process group after `limit`.
+fn capture(
+    env: &BTreeMap<String, String>,
+    limit: Duration,
+) -> Result<BTreeMap<String, String>, LoginEnvFailure> {
+    let deadline = Instant::now() + limit;
+    let shell = env.get("SHELL").cloned().unwrap_or_default();
+    let spawn_failed = |error: String| LoginEnvFailure::Spawn {
+        shell: shell.clone(),
+        error,
+    };
+    let helper = std::env::current_exe()
+        .map_err(|error| spawn_failed(format!("can't find this helper: {error}")))?;
+    let helper = helper
+        .to_str()
+        .ok_or_else(|| spawn_failed(format!("this helper's path {} isn't UTF-8", helper.display())))?;
+    let command = login_env::invocation(&shell, helper)?;
+    let started = LoginShell::spawn(&command, env).map_err(|error| spawn_failed(error.to_string()))?;
+    started.read(deadline, limit, env)
+}
+
+/// A login shell started by [`capture`], before its dump is read.
+struct LoginShell {
+    /// Its process id, which is its process group's (it has a session of
+    /// its own).
+    pid: u32,
+    dump: File,
+    stderr: File,
+    /// Readable, then at its end, once the shell has exited and been
+    /// reaped: a thread waits for it.
+    exited: File,
+    status: mpsc::Receiver<io::Result<std::process::ExitStatus>>,
+}
+
+impl LoginShell {
+    fn spawn(command: &[String], env: &BTreeMap<String, String>) -> io::Result<Self> {
+        let (program, args) = command
+            .split_first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no program"))?;
+        let (dump_read, dump_write) = os_pipe()?;
+        let mut shell = std::process::Command::new(program);
+        shell
+            .args(args)
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(home) = env.get("HOME").filter(|home| Path::new(home).is_dir()) {
+            shell.current_dir(home);
+        }
+        let dump_fd = dump_write.as_raw_fd();
+        // Asked here, since the child may make only async-signal-safe calls.
+        let last_signal = libc::SIGRTMAX();
+        // SAFETY: the closure makes only async-signal-safe calls.
+        unsafe {
+            shell.pre_exec(move || {
+                crate::pty::default_signals(last_signal)?;
+                // Its own session and process group, with no controlling
+                // terminal, so a timeout can end the whole group.
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                // The dump pipe on `DUMP_FD`, open across the exec (`dup2`
+                // leaves the copy without close-on-exec).
+                let kept = if dump_fd == DUMP_FD {
+                    libc::fcntl(DUMP_FD, libc::F_SETFD, 0)
+                } else {
+                    libc::dup2(dump_fd, DUMP_FD)
+                };
+                if kept == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = shell.spawn()?;
+        drop(dump_write);
+        let stderr = child
+            .stderr
+            .take()
+            .map(OwnedFd::from)
+            .ok_or_else(|| io::Error::other("no stderr pipe"))?;
+        let (exited, exited_write) = os_pipe()?;
+        for fd in [&dump_read, &stderr, &exited] {
+            set_nonblocking(fd)?;
+        }
+        let pid = child.id();
+        let (reaped, status) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = reaped.send(child.wait());
+            drop(exited_write);
+        });
+        Ok(Self {
+            pid,
+            dump: File::from(dump_read),
+            stderr: File::from(stderr),
+            exited: File::from(exited),
+            status,
+        })
+    }
+
+    /// Reads the dump up to its terminator, until `deadline`.
+    fn read(
+        mut self,
+        deadline: Instant,
+        limit: Duration,
+        own: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, LoginEnvFailure> {
+        let mut dump = Vec::new();
+        let mut tail = Vec::new();
+        let (mut dump_open, mut stderr_open) = (true, true);
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                self.kill();
+                return Err(LoginEnvFailure::TimedOut { after: limit });
+            }
+            let wait = (deadline - now).as_millis().saturating_add(1).min(i32::MAX as u128) as i32;
+            let fd = |file: &File, open: bool| if open { file.as_raw_fd() } else { -1 };
+            let mut fds = [
+                pollfd(fd(&self.dump, dump_open)),
+                pollfd(fd(&self.stderr, stderr_open)),
+                pollfd(self.exited.as_raw_fd()),
+            ];
+            // SAFETY: `fds` is a valid array of its length.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.kill();
+                return Err(LoginEnvFailure::Exited {
+                    status: login_env::exit_text(None, None),
+                    stderr: format!("the relay couldn't wait for it: {error}"),
+                });
+            }
+            if fds[1].revents != 0 {
+                stderr_open = drain(&mut self.stderr, |bytes| login_env::keep_tail(&mut tail, bytes));
+            }
+            if fds[0].revents != 0 {
+                dump_open = drain(&mut self.dump, |bytes| dump.extend_from_slice(bytes));
+                match login_env::parse_dump(&dump) {
+                    DumpRead::Complete(vars) => return Ok(login_env::captured(own, vars)),
+                    DumpRead::TooLarge => {
+                        self.kill();
+                        return Err(LoginEnvFailure::TooLarge);
+                    }
+                    DumpRead::Incomplete => {}
+                }
+            }
+            if fds[2].revents != 0 {
+                // It exited: what it wrote is in the pipes already.
+                drain(&mut self.dump, |bytes| dump.extend_from_slice(bytes));
+                drain(&mut self.stderr, |bytes| login_env::keep_tail(&mut tail, bytes));
+                let status = match self.status.recv() {
+                    Ok(Ok(status)) => {
+                        use std::os::unix::process::ExitStatusExt as _;
+                        login_env::exit_text(status.code(), status.signal())
+                    }
+                    Ok(Err(_)) | Err(_) => login_env::exit_text(None, None),
+                };
+                return login_env::after_exit(&dump, status, &tail)
+                    .map(|vars| login_env::captured(own, vars));
+            }
+        }
+    }
+
+    /// Ends the shell's process group. What double-forked out of it keeps
+    /// running, as after an SSH login.
+    fn kill(&self) {
+        if let Ok(pid) = libc::pid_t::try_from(self.pid) {
+            // SAFETY: a signal to the group this shell leads.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+}
+
+fn pollfd(fd: RawFd) -> libc::pollfd {
+    libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    }
+}
+
+/// Reads what `file` (non-blocking) has into `take`; whether it is still
+/// open (no end or error seen).
+fn drain(file: &mut File, mut take: impl FnMut(&[u8])) -> bool {
+    let mut buffer = [0u8; 16 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => return false,
+            Ok(read) => take(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return true,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// A pipe's ends, both close-on-exec: `(read, write)`.
+fn os_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [-1; 2];
+    // SAFETY: `fds` has room for the two fds `pipe2` writes.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both fds are new and owned by nothing else.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: flag queries and changes on an open fd.
+    unsafe {
+        let flags = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+        if flags == -1 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// The timings, as tests may shorten them.
@@ -126,6 +462,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
 struct Timings {
     heartbeat: Duration,
     idle: Duration,
+    /// How long the login shell's environment may take.
+    login: Duration,
 }
 
 impl Timings {
@@ -141,6 +479,7 @@ impl Timings {
         Self {
             heartbeat: millis(HEARTBEAT_ENV).unwrap_or(HEARTBEAT_AFTER),
             idle: millis(IDLE_ENV).unwrap_or(IDLE_LIMIT),
+            login: millis(LOGIN_ENV_ENV).unwrap_or(login_env::LIMIT),
         }
     }
 }
@@ -216,15 +555,16 @@ struct Reached {
     core: UnixStream,
     /// 0 when the core shares no protocol version with the relay.
     core_pid: u32,
+    /// The login shell's environment, when it was asked for.
+    login: Option<LoginEnv>,
 }
 
 impl Reached {
-    fn host(&self) -> RelayHost {
-        let env: BTreeMap<String, String> = std::env::vars_os()
-            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-            .collect();
+    /// The host frame, with `env`, the relay's own environment with the
+    /// passwd basics.
+    fn host(&self, env: BTreeMap<String, String>) -> RelayHost {
         let passwd_shell = crate::pty::passwd_entry()
-            .map(|(shell, _)| shell.to_string_lossy().into_owned());
+            .map(|entry| entry.shell.to_string_lossy().into_owned());
         // No shell is the wire's empty field (`types R9`).
         let shell = login_shell(env.get("SHELL").cloned(), passwd_shell).unwrap_or_default();
         let home = crate::pty::home_dir(&BTreeMap::new())
@@ -238,6 +578,22 @@ impl Reached {
             home,
             server_dir: self.dir.display().to_string(),
             core_pid: self.core_pid,
+            login: self.login.clone(),
+        }
+    }
+}
+
+/// What `RELAY_HOST` says of a capture, and the `core.log` line for a
+/// failed one, which names the reason and never a value.
+fn login_outcome(
+    outcome: Result<BTreeMap<String, String>, LoginEnvFailure>,
+) -> (LoginEnv, Option<String>) {
+    match outcome {
+        Ok(env) => (LoginEnv::Captured(env), None),
+        Err(failure) => {
+            let text = failure.text();
+            let line = format!("the login shell's environment wasn't read: {text}");
+            (LoginEnv::Failed(text), Some(line))
         }
     }
 }
@@ -256,9 +612,10 @@ fn host_build(build: &Result<String, String>) -> &str {
 }
 
 /// Resolves the server directory, reaches the core (starting or upgrading
-/// it), and opens the client's connection; or says what went wrong, with
-/// the core's log when there is a directory for it.
-fn reach() -> Result<Reached, String> {
+/// it), waits for the login environment's `capture` when there is one, and
+/// opens the client's connection; or says what went wrong, with the core's
+/// log when there is a directory for it.
+fn reach(capture: Option<Capture>) -> Result<Reached, String> {
     let dir = dir::from_env()
         .map_err(|error| format!("terminal server unreachable: {error}"))?
         .path()
@@ -282,6 +639,15 @@ fn reach() -> Result<Reached, String> {
     };
     let probe = server.probe(false).map_err(failure)?;
     let probe = server.offer_upgrade(probe).map_err(failure)?;
+    // Before the client's connection opens, so the wait isn't spent from the
+    // core's limit for its `HELLO`.
+    let login = capture.map(|capture| {
+        let (login, line) = login_outcome(capture.join());
+        if let Some(line) = line {
+            server.log.line(line);
+        }
+        login
+    });
     // The probe stays open until then, so a core with nothing else to do
     // doesn't exit in between.
     let core = server.connect().map_err(failure)?;
@@ -293,6 +659,7 @@ fn reach() -> Result<Reached, String> {
         log: server.log,
         core,
         core_pid,
+        login,
     })
 }
 
@@ -771,6 +1138,41 @@ fn heartbeats(output: &Output, every: Duration, ended: &Sender<End>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_relay_takes_only_the_login_environment_argument() {
+        let args = |items: &[&str]| items.iter().map(|item| item.to_string()).collect::<Vec<_>>();
+        assert_eq!(login_asked(&args(&[])), Ok(false));
+        assert_eq!(login_asked(&args(&["--login-environment"])), Ok(true));
+        for bad in [
+            &["--login-environment", "--login-environment"][..],
+            &["--login"],
+            &["x"],
+            &["--login-environment", "x"],
+        ] {
+            let error = login_asked(&args(bad)).unwrap_err();
+            assert_eq!(error, "usage: brindle-remote relay [--login-environment]");
+        }
+    }
+
+    /// A capture's outcome is what the host frame says; a failure's log
+    /// line names its reason and carries no value.
+    #[test]
+    fn a_failed_capture_is_reported_and_logged_by_its_reason() {
+        let env = BTreeMap::from([("SECRET".to_string(), "hunter2".to_string())]);
+        assert_eq!(
+            login_outcome(Ok(env.clone())),
+            (LoginEnv::Captured(env), None)
+        );
+        let (login, line) = login_outcome(Err(LoginEnvFailure::TimedOut {
+            after: Duration::from_secs(10),
+        }));
+        assert_eq!(login, LoginEnv::Failed("it took longer than 10 s".into()));
+        assert_eq!(
+            line.as_deref(),
+            Some("the login shell's environment wasn't read: it took longer than 10 s")
+        );
+    }
 
     #[test]
     fn an_unreadable_build_id_is_sent_as_unknown() {

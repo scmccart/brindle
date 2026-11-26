@@ -105,6 +105,20 @@ const EXIT_STATUS_FORMS: &[&str] = &[
     "holder::ExitStatus.code=None",
 ];
 
+/// Whether a relay's host frame carries a login environment, and which.
+fn login_form(host: &relay::RelayHost) -> &'static str {
+    match host.login {
+        None => "relay::RelayHost.login=None",
+        Some(relay::LoginEnv::Captured(_)) => "relay::RelayHost.login=Captured",
+        Some(relay::LoginEnv::Failed(_)) => "relay::RelayHost.login=Failed",
+    }
+}
+const LOGIN_FORMS: &[&str] = &[
+    "relay::RelayHost.login=None",
+    "relay::RelayHost.login=Captured",
+    "relay::RelayHost.login=Failed",
+];
+
 /// Every form some transcript must have.
 fn expected_forms() -> Vec<&'static str> {
     [
@@ -113,6 +127,7 @@ fn expected_forms() -> Vec<&'static str> {
         TO_HOLDER_FORMS,
         HOLDER_TO_CORE_FORMS,
         RELAY_FORMS,
+        LOGIN_FORMS,
         POLICY_FORMS,
         KILL_TARGET_FORMS,
         PREVIOUS_FORMS,
@@ -226,7 +241,13 @@ impl Step {
                 }
                 forms
             }
-            Self::Relay(message) => vec![relay_form(message)],
+            Self::Relay(message) => {
+                let mut forms = vec![relay_form(message)];
+                if let relay::RelayMessage::Host(host) = message {
+                    forms.push(login_form(host));
+                }
+                forms
+            }
         }
     }
 }
@@ -1066,6 +1087,7 @@ fn transcripts() -> Vec<Transcript> {
                     home: "/home/u".into(),
                     server_dir: "/run/user/1000/brindle".into(),
                     core_pid: 4242,
+                    login: None,
                 })),
                 hello_2(TOKEN),
                 welcome_2(),
@@ -1074,6 +1096,46 @@ fn transcripts() -> Vec<Transcript> {
                 spawned(1, 1, 5000),
                 process(1, Some("bash"), Some("/home/u")),
                 Step::Relay(relay::RelayMessage::Heartbeat),
+            ],
+        },
+        Transcript {
+            name: "relay-host-login",
+            protocol: Protocol::Relay,
+            about: "A relay started with --login-environment reports the login shell's environment, and on another connection why it wasn't read.",
+            steps: vec![
+                Step::Relay(relay::RelayMessage::Host(relay::RelayHost {
+                    version: "0.5.0".into(),
+                    build: "d3f2".into(),
+                    env: BTreeMap::from([
+                        ("HOME".into(), "/home/u".into()),
+                        ("PATH".into(), "/usr/local/bin:/usr/bin".into()),
+                        ("SHELL".into(), "/bin/bash".into()),
+                    ]),
+                    shell: "/bin/bash".into(),
+                    home: "/home/u".into(),
+                    server_dir: "/run/user/1000/brindle".into(),
+                    core_pid: 4242,
+                    login: Some(relay::LoginEnv::Captured(BTreeMap::from([
+                        ("EDITOR".into(), "vim".into()),
+                        ("HOME".into(), "/home/u".into()),
+                        ("PATH".into(), "/home/u/.local/bin:/usr/local/bin:/usr/bin".into()),
+                        ("SHELL".into(), "/bin/bash".into()),
+                    ]))),
+                })),
+                Step::Relay(relay::RelayMessage::Host(relay::RelayHost {
+                    version: "0.5.0".into(),
+                    build: "d3f2".into(),
+                    env: BTreeMap::from([
+                        ("HOME".into(), "/home/u".into()),
+                        ("PATH".into(), "/usr/local/bin:/usr/bin".into()),
+                        ("SHELL".into(), "/bin/bash".into()),
+                    ]),
+                    shell: "/bin/bash".into(),
+                    home: "/home/u".into(),
+                    server_dir: "/run/user/1000/brindle".into(),
+                    core_pid: 4242,
+                    login: Some(relay::LoginEnv::Failed("it took longer than 10 s".into())),
+                })),
             ],
         },
         Transcript {

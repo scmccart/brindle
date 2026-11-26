@@ -39,13 +39,28 @@ impl Relay {
     /// holders of that core start only `--version` as a core of their own.
     /// Its stderr goes to a log in `dir`.
     pub fn start(bin: &Path, dir: &Path, env: &[(&str, &str)]) -> Self {
+        Self::start_with(bin, dir, &[], env, &[])
+    }
+
+    /// [`Relay::start`] with `args` after `relay`, and the variables named
+    /// in `removed` taken out of the environment it inherits.
+    pub fn start_with(
+        bin: &Path,
+        dir: &Path,
+        args: &[&str],
+        env: &[(&str, &str)],
+        removed: &[&str],
+    ) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let (ours, theirs) = UnixStream::pair().unwrap();
         let stderr = File::create(dir.join(format!("relay-{n}.log"))).unwrap();
         let mut command = Command::new(bin);
+        command.arg("relay").args(args);
+        for name in removed {
+            command.env_remove(name);
+        }
         command
-            .arg("relay")
             .env("BRINDLE_SERVER_DIR", dir)
             .env("BRINDLE_NO_SCOPE", "1")
             .env("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")
