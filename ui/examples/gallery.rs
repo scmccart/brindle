@@ -298,6 +298,7 @@ fn owner_card_colors() -> CardColors {
         muted: Some(rgb(0x737aa2).into()),
         border: Some(rgb(0x2e303f).into()),
         surround: Some(rgb(OWNER_CARD_SURROUND).into()),
+        ring: None,
     }
 }
 

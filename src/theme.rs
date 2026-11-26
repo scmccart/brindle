@@ -292,6 +292,9 @@ impl Theme {
             muted: Some(self.card_muted_foreground().hsla()),
             border: Some(self.card_border().hsla()),
             surround: Some(background),
+            // The active tokens' ring; an agent zone, drawn in a theme
+            // scope, sets the window's.
+            ring: None,
         }
     }
 
