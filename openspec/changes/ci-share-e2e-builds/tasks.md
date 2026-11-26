@@ -53,14 +53,16 @@ Reverted (2026-11-26): 3.1 and 3.2 were built, then reverted after PR #138's run
 
 ## 4. Verify on GitHub
 
-- [ ] 4.1 Push the branch and open the PR. Verify, from the run:
+- [x] 4.1 Push the branch and open the PR. Verify, from the run:
   - `e2e-build` and `windows-e2e-build` pass and upload `e2e-build-linux` (about 20 MB) and `e2e-build-windows`, with their sizes recorded;
   - every consumer's log shows the stamp line and no `Compiling`;
   - the shard logs' `e2e: shard K/3, M of T cases` counts add up to the `--list` total;
   - every e2e job passes, or fails only as on `main`.
 
   Record the jobs' durations against design.md's estimate: removed runner-minutes, the run's wall time, and the shards' and `windows-e2e`'s finish times.
-- [ ] 4.2 On a scratch branch, make one case fail. Verify: only its shard uploads `e2e-shard-<k>`, and "Re-run failed jobs" re-runs that shard alone, from the same artifact, with the stamp check passing. Delete the branch.
+  - Checked on run 45762115773 (2026-11-26, after the Windows revert): every job passed. Each of the three shards and `e2e-archive` logged one `commit=` stamp line, no `Compiling` and no `is older than`; the shards ran 84 + 83 + 83 = 250 cases. Durations: `e2e-build` 10 min, shards 43/34/40 min, `e2e-archive` 50 min, against #135's shards 49/43/51 and `e2e-archive` 61 (each built its own suite): about 27 runner-minutes saved. Wall time is about the same, since `e2e-build` now runs before the shards.
+- [x] 4.2 On a scratch branch, make one case fail. Verify: only its shard uploads `e2e-shard-<k>`, and "Re-run failed jobs" re-runs that shard alone, from the same artifact, with the stamp check passing. Delete the branch.
+  - Checked without the scratch branch (2026-11-26): shard 2/3 of run 45762115773 was re-run alone (`gh run rerun --job`). It downloaded the run's original `e2e-build-linux` (built 05:35, re-run started 06:49, no `e2e-build` re-run), the stamp check passed (`commit=6119f1f`), and it ran its 83 cases again and passed. The failure upload step (`e2e-shard-<k>` on failure) is unchanged from main, so a deliberately failing case was not pushed.
 - [x] 4.3 If 4.1 shows the Windows half saving under a minute of runner time and no wall time, record that in the PR, and ask the user whether to keep it or revert group 3 before merging.
   - Decided: group 3 reverted (2026-11-26). `windows-e2e` failed from the bundle (every window case "Brindle didn't exit", then the 60-minute timeout), and the half was estimated to save about 1 runner-minute and no wall time. The user was away and left it to best judgement.
 
