@@ -85,7 +85,7 @@ impl Styled for Switch {
 
 impl RenderOnce for Switch {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let (ring, ring_color) = (t.ring, focus_ring(t));
         let style = switch_style(self.checked, t);
         let (checked, disabled) = (self.checked, self.disabled);

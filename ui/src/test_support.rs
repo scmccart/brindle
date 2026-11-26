@@ -5,6 +5,12 @@ use gpui::TestAppContext;
 
 use crate::theme::{Tokens, UiTheme};
 
+/// The debug selector of a tooltip drawn in `tokens` (`Tooltip::tokens`),
+/// which names the set by its background.
+pub(crate) fn tooltip_in(tokens: &Tokens) -> &'static str {
+    Box::leak(format!("tooltip-in {:?}", tokens.background).into_boxed_str())
+}
+
 /// A test app with the crate set up: `init`, the default bindings and the
 /// light tokens. Open the test's view with `add_window_view`.
 pub(crate) fn app() -> TestAppContext {

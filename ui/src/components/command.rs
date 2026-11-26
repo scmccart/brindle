@@ -562,7 +562,7 @@ impl Command {
     /// groups beside it bring the space above and below.
     fn render_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if let Some(CommandRow::Separator(_)) = self.rows.rows().get(row) {
-            let style = command_style(cx.ui_theme());
+            let style = command_style(&cx.ui_theme());
             return div().w_full().h(COMMAND_SEPARATOR_HEIGHT).bg(style.separator).into_any_element();
         }
         let Some((first, last)) = self.rows.group_edges(row) else {
@@ -581,7 +581,7 @@ impl Command {
 
     /// A row's heading or item, filling the group's inner width.
     fn render_row_content(&mut self, row: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let style = command_style(cx.ui_theme());
+        let style = command_style(&cx.ui_theme());
         match self.rows.rows().get(row) {
             // `render_row` draws separators.
             None | Some(CommandRow::Separator(_)) => div().into_any_element(),
@@ -661,7 +661,7 @@ impl Command {
 
 impl Render for Command {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let style = command_style(cx.ui_theme());
+        let style = command_style(&cx.ui_theme());
         let empty = self.rows.is_empty();
         if let Some(row) = self.reveal_pending.take() {
             // The rows are measured by this frame's paint; the reveal then

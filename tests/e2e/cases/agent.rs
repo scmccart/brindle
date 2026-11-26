@@ -929,7 +929,9 @@ pub fn markdown_layout(ctx: &Ctx) -> Result<Outcome> {
     let image = out.image.as_ref().ok_or("no capture")?;
     // The zone's rem is its font size, the default 14px; the label is
     // 0.75rem at gpui's default line height (the golden ratio).
-    let layout = measure_layout(image, theme::CHROME_BORDER, theme::MUTED, ZONE_REM)?;
+    // The zone is drawn in the `e2e` theme's zone set: its border is the
+    // window's, its `muted` the theme's own background's mix.
+    let layout = measure_layout(image, theme::CHROME_BORDER, theme::ZONE_MUTED, ZONE_REM)?;
     let label_line = 0.75 * ZONE_REM * 1.618 * layout.scale;
     ensure!(
         layout.header as f32 <= 2.0 * label_line,
@@ -1060,6 +1062,171 @@ pub fn self_test_layout() -> Result {
     ensure!(got == want, "one bubble: {got:?}, want {want:?}");
     let jagged = measure_layout(&Image::painted(200, 120, paint(true)), LINE, MUTED, 16.0);
     ensure!(jagged.is_err(), "a jagged bubble measured {jagged:?}");
+    Ok(())
+}
+
+/// `agent-zone-theme`'s profile theme: `e2e-alt`'s foreground and
+/// background with an accent of its own (`ZONE_ACCENT`; `e2e-alt` shares
+/// `e2e`'s, which would hide a primary drawn in the window's), set on the
+/// `Fake` profile `profile` ends with.
+fn zone_theme_config(profile: &str) -> String {
+    use super::zones::ZONE_ACCENT;
+    use crate::brindle::theme::{ALT_BACKGROUND, ALT_FOREGROUND};
+    format!(
+        "{profile}theme = \"e2e-agent\"\n\n[themes.e2e-agent]\nforeground = \"{}\"\nbackground = \"{}\"\naccent = \"{}\"\n",
+        ALT_FOREGROUND.hex(),
+        ALT_BACKGROUND.hex(),
+        ZONE_ACCENT.hex()
+    )
+}
+
+/// How close a pixel must be to a token's colour to count as it here:
+/// the two sets' surfaces are closer than [`Image::count`]'s 24 apart.
+///
+/// [`Image::count`]: crate::capture::Image::count
+const TOKEN_NEAR: u8 = 3;
+
+/// The spec's "A profile theme unlike the window's" (`agents-ui`) and
+/// "Tooltips and overlays in a theme scope" (`ui-components`), in pixels
+/// (OpenSpec change `agents-zone-theme-scope`): an agent zone whose profile
+/// theme isn't the window's draws its components in that theme's zone
+/// set. Its agent bubble and permission (`card`), code block and the
+/// person's bubble (`muted`) and allow button (the profile's accent) show
+/// inside the zone, and the window set's `card` and `muted` and the global
+/// accent don't, while the strip keeps the window's background. Then, split
+/// and with the zone header's menu open, no pixel of the window set's
+/// `popover` is in either zone, and the zone set's is in the active one.
+pub fn zone_theme(ctx: &Ctx) -> Result<Outcome> {
+    use super::zones::ZONE_ACCENT;
+    use crate::brindle::theme;
+    let profile = Script::ready(&ctx.dir.join("theme.jsonl"))
+        .step("expect session/prompt")
+        .step(says("Here:\n\n```rust\nlet x = 1;\n```\n"))
+        .step(ask("p1"))
+        .profile(ctx, "theme")?;
+    let config = zone_theme_config(&profile);
+    let pending = "outcome=pending";
+    let started = |label| Run::new(ctx, label).config(&config).agent("Fake").first_prompt("hi").wait_for(pending);
+
+    let out = started("zone").capture_at(5.0).dump_at(5.5).run()?;
+    waited(&out)?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::ALT_CARD_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    let present = [
+        ("the zone set's card", theme::ALT_ZONE_CARD),
+        ("the zone set's muted", theme::ALT_ZONE_MUTED),
+        ("the profile's accent", ZONE_ACCENT),
+    ];
+    for (what, color) in present {
+        let n = image.count_near(zone, color, TOKEN_NEAR);
+        ensure!(n >= 100, "{what}: {n} pixels of {} in the zone {zone:?}; found {}", color.hex(), image.summary(zone));
+    }
+    for (what, color) in [("the window set's card", theme::WINDOW_CARD), ("the window set's muted", theme::WINDOW_MUTED)] {
+        let n = image.count_near(zone, color, TOKEN_NEAR);
+        ensure!(n <= 2, "{what}: {n} pixels of {} in the zone {zone:?}; found {}", color.hex(), image.summary(zone));
+    }
+    image.expect_none("the window's accent in the zone", zone, theme::ACCENT)?;
+    // The empty caption left of the window controls, as `tab-faces` reads it.
+    let caption = {
+        let right = image.width as f32 / scale - (8.0 + 3.0 * 32.0 + 2.0 * 4.0) - 30.0;
+        logical_rect(scale, [right - 40.0, 12.0, 40.0, 14.0])
+    };
+    let got = image.dominant(caption);
+    ensure!(
+        got.is_some_and(|c| c.near(theme::CHROME_BACKGROUND, 2)),
+        "the strip: dominant {:?} in {caption:?}, want the window's {}; found {}",
+        got.map(crate::capture::Rgb::hex),
+        theme::CHROME_BACKGROUND.hex(),
+        image.summary(caption)
+    );
+
+    let out = started("menu")
+        .action("split_zone_right")
+        .wait_for("conversation entries=0")
+        .wait_for(READY)
+        .modality("pointer")
+        .action("open_zone_menu")
+        .capture_at(8.5)
+        .dump_at(9.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
+    ensure!(!out.dump.menu.is_empty(), "no menu open: focus {:?}", out.dump.focus);
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::ALT_CARD_BORDER)?;
+    for line in &out.dump.zone_list {
+        let rect = parse_zone_rect(line).ok_or_else(|| format!("no rect in the zone line {line:?}"))?;
+        let zone = zone_inner(image, scale, rect);
+        let n = image.count_near(zone, theme::WINDOW_POPOVER, TOKEN_NEAR);
+        ensure!(n <= 2, "the window set's popover: {n} pixels in zone {line:?} ({zone:?}); found {}", image.summary(zone));
+        if line.ends_with(" active") {
+            // The menu's panel is some 240 × 120 logical pixels (about
+            // 20,000 of its colour at scale 1); the empty zone round it
+            // shows next to none.
+            let n = image.count_near(zone, theme::ALT_ZONE_POPOVER, TOKEN_NEAR);
+            ensure!(n >= (10_000.0 * scale * scale) as usize,"the menu: {n} pixels of the zone set's popover in {line:?}; found {}", image.summary(zone));
+        }
+    }
+    Ok(Outcome::Pass)
+}
+
+/// The window's scale, device pixels per logical one, from the gap right
+/// of the rightmost card: the last run of `border` (the card's border)
+/// along the middle row ends `ZONE_GAP` from the window's right edge.
+pub(super) fn window_scale(image: &crate::capture::Image, border: crate::capture::Rgb) -> Result<f32> {
+    let mid = image.height / 2;
+    let runs = image.runs_in_row(mid, (0, image.width), border, 2);
+    let &(_, after) = runs.last().ok_or_else(|| format!("no card border along row {mid}"))?;
+    let scale = (image.width - after) as f32 / super::ZONE_GAP;
+    ensure!(scale > 0.0, "no gap right of the card (it ends at {after} of {})", image.width);
+    Ok(scale)
+}
+
+/// `[x, y, width, height]` logical pixels, in device pixels at `scale`.
+fn logical_rect(scale: f32, [x, y, w, h]: [f32; 4]) -> crate::capture::PxRect {
+    let px = |v: f32| (v * scale).round().max(0.0) as u32;
+    crate::capture::PxRect { x0: px(x), y0: px(y), x1: px(x + w), y1: px(y + h) }
+}
+
+/// A zone's inside, in device pixels: its dump `rect` (`[x, y, width,
+/// height]` in `[0, 1]` of the tab's area, the window below the strip)
+/// less the gap, the card's border and 12px more, clear of the card's
+/// 10px rounded corners and their edge blending.
+pub(super) fn zone_inner(image: &crate::capture::Image, scale: f32, [x, y, w, h]: [f32; 4]) -> crate::capture::PxRect {
+    use super::tabs::STRIP_HEIGHT;
+    const INSET: f32 = super::CARD_INSET + 12.0;
+    let (width, height) = (image.width as f32 / scale, image.height as f32 / scale - STRIP_HEIGHT);
+    let (left, top) = (x * width, STRIP_HEIGHT + y * height);
+    logical_rect(scale, [left + INSET, top + INSET, w * width - 2.0 * INSET, h * height - 2.0 * INSET])
+}
+
+/// A dump zone line's `rect=X,Y,W,H`, as `[x, y, width, height]`.
+pub(super) fn parse_zone_rect(line: &str) -> Option<[f32; 4]> {
+    let rect = line.split(' ').find_map(|word| word.strip_prefix("rect="))?;
+    let values: Vec<f32> = rect.split(',').map(str::parse).collect::<std::result::Result<_, _>>().ok()?;
+    values.try_into().ok()
+}
+
+/// [`window_scale`], [`zone_inner`] and [`parse_zone_rect`] on painted
+/// captures and dump lines.
+pub fn self_test_zone_theme() -> Result {
+    use crate::capture::{Image, PxRect, Rgb};
+    const GAP: Rgb = Rgb(0x0a, 0x0d, 0x10);
+    const LINE: Rgb = Rgb(0x36, 0x2f, 0x2f);
+    // A 400 × 300 window at scale 2: a card's borders at columns 12 and
+    // 387, the gap 12 device pixels right of it.
+    let painted = Image::painted(400, 300, |x, _| if x == 12 || x == 387 { LINE } else { GAP });
+    let scale = window_scale(&painted, LINE)?;
+    ensure!(scale == 2.0, "scale {scale}");
+    // 200 × 150 logical; the tab's area is 200 × 108 below the strip.
+    let got = zone_inner(&painted, scale, [0.5, 0.0, 0.5, 1.0]);
+    let want = PxRect { x0: 238, y0: 122, x1: 362, y1: 262 };
+    ensure!(got == want, "the right zone's inside {got:?}, want {want:?}");
+    ensure!(window_scale(&Image::painted(40, 20, |_, _| GAP), LINE).is_err(), "a scale with no card");
+    ensure!(parse_zone_rect("id=2 rect=0.5,0,0.5,1 active") == Some([0.5, 0.0, 0.5, 1.0]), "a zone line");
+    ensure!(parse_zone_rect("id=1 rect=0,0,1").is_none(), "three values");
+    ensure!(parse_zone_rect("id=1").is_none(), "no rect");
     Ok(())
 }
 

@@ -42,7 +42,7 @@ use gpui::{
 };
 
 use crate::actions::{PromptStop, PromptSubmit};
-use crate::components::{Button, Textarea, TooltipFor, trigger_label};
+use crate::components::{Button, Textarea, Tooltip, TooltipFor, trigger_label};
 use crate::icon::Icon;
 use crate::style::{ButtonSize, ButtonVariant};
 use crate::text_area::{TextArea, TextAreaEvent};
@@ -436,10 +436,15 @@ impl PromptInput {
                         ),
                     // A disabled button shows no tooltip; its frame says
                     // why it is disabled.
-                    Resend::Unavailable(why) => div()
-                        .id("prompt-queue-resend-frame")
-                        .tooltip_for(why.clone(), None)
-                        .child(resend_button.disabled(true)),
+                    // On a plain element, so the theme scope's set is
+                    // carried by hand, as a component's tooltip carries it.
+                    Resend::Unavailable(why) => {
+                        let (why, scope) = (why.clone(), cx.scoped_theme());
+                        div()
+                            .id("prompt-queue-resend-frame")
+                            .tooltip_with(move |_, _| Tooltip::new(why.clone()).in_scope(scope))
+                            .child(resend_button.disabled(true))
+                    }
                 };
                 vec![
                     resend.debug_selector(|| "prompt-queue-resend".into()).into_any_element(),

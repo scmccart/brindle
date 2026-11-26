@@ -335,7 +335,7 @@ impl TerminalView {
     /// when the tooltip is shown.
     pub fn render_find_bar(&self, _window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let bar = self.find.as_ref()?;
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let query_focus = bar.query.focus_handle(cx);
 
         let status: (SharedString, Hsla) = if bar.invalid {

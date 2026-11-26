@@ -36,7 +36,7 @@ fn alt_profile() -> String {
 /// strip's 6px (`ZONE_GAP`) top padding, with no border under it; its
 /// background runs on into the cards' margin) and the test config's
 /// terminal padding, in logical pixels.
-const STRIP_HEIGHT: f32 = 42.0;
+pub(super) const STRIP_HEIGHT: f32 = 42.0;
 const PADDING: f32 = 6.0;
 
 /// The strip's padding above and left of the tab list (`ZONE_GAP`).

@@ -54,6 +54,8 @@ use crate::actions::Dismiss;
 use crate::primitives::focus_scope::{FocusScope, FocusStops};
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::primitives::layer::{self, LayerId, LayerStack};
+use crate::primitives::theme_scope::ThemeScope;
+use crate::theme::Tokens;
 
 /// A modal layer's backdrop: black at 50%, shadcn's `bg-black/50`. It isn't
 /// a token.
@@ -118,6 +120,9 @@ pub struct Overlay<V: ManagedView + FocusStops> {
     outside_press_dismisses: bool,
     /// How many times the slot has opened, which keys the entry animation.
     opens: u64,
+    /// The token set the view is drawn in, when not the window's: the
+    /// theme scope's set of what opened it (a zone's menu).
+    tokens: Option<Tokens>,
     open: Option<Open<V>>,
 }
 
@@ -132,7 +137,28 @@ struct Open<V> {
 impl<V: ManagedView + FocusStops> Overlay<V> {
     /// A slot for a view of `kind`.
     pub fn new(kind: OverlayKind) -> Self {
-        Self { kind, outside_press_dismisses: true, opens: 0, open: None }
+        Self { kind, outside_press_dismisses: true, opens: 0, tokens: None, open: None }
+    }
+
+    /// Draws the view in `tokens` (`None`: the window's set). The set is
+    /// applied inside the `deferred` the view may be lifted into, so it
+    /// covers the view's prepaint and paint too, which a
+    /// [`ThemeScope`] round the owner's render couldn't.
+    pub fn tokens(mut self, tokens: Option<Tokens>) -> Self {
+        self.set_tokens(tokens);
+        self
+    }
+
+    /// [`Overlay::tokens`] on a slot the owner already keeps, for a slot
+    /// whose views differ (a menu opened from an agent zone and one opened
+    /// from the tab strip). It takes effect from the next frame.
+    pub fn set_tokens(&mut self, tokens: Option<Tokens>) {
+        self.tokens = tokens;
+    }
+
+    /// The set the view is drawn in, when not the window's.
+    pub fn token_set(&self) -> Option<&Tokens> {
+        self.tokens.as_ref()
     }
 
     /// A slot for a modal view: it covers the window with a backdrop that
@@ -343,6 +369,12 @@ impl<V: ManagedView + FocusStops> Overlay<V> {
                 }
             }
         };
+        // The scope inside the deferred, never round it: a deferred element
+        // is prepainted and painted after the tree around it.
+        let element = match self.tokens {
+            Some(tokens) => ThemeScope::new(tokens, element).into_any_element(),
+            None => element,
+        };
         Some(match lift {
             Some(priority) => deferred(element).with_priority(priority).into_any_element(),
             None => element,
@@ -423,6 +455,118 @@ pub fn restore_focus<W, H>(recorded: Option<&W>, upgrade: impl FnOnce(&W) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::primitives::theme_scope::tests::{Phase, Probe, Readings, read};
+    use crate::test_support;
+    use gpui::AppContext;
+
+    /// An overlay view that is a probe of the active set.
+    struct Panel {
+        name: &'static str,
+        readings: Readings,
+        focus: gpui::FocusHandle,
+    }
+
+    impl EventEmitter<DismissEvent> for Panel {}
+    impl Focusable for Panel {
+        fn focus_handle(&self, _: &App) -> gpui::FocusHandle {
+            self.focus.clone()
+        }
+    }
+    impl FocusStops for Panel {
+        fn stops(&self, _: &App) -> Vec<gpui::FocusHandle> {
+            Vec::new()
+        }
+    }
+    impl gpui::Render for Panel {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().track_focus(&self.focus).child(Probe::new(self.name, &self.readings))
+        }
+    }
+
+    /// Two non-modal slots: the first opened is lifted into a `deferred`,
+    /// the second, opened above it, renders inline.
+    struct Owner {
+        first: Overlay<Panel>,
+        second: Overlay<Panel>,
+    }
+
+    impl gpui::Render for Owner {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .children(self.first.render(window, cx))
+                .children(self.second.render(window, cx))
+        }
+    }
+
+    /// Opens `first` and then `second` (when given) with these sets and
+    /// draws a frame, returning what their probes read.
+    fn draw(first: Option<Tokens>, second: Option<Option<Tokens>>) -> Readings {
+        let mut app = test_support::app();
+        let readings = Readings::default();
+        let (owner, cx) = app.add_window_view(|_, _| Owner {
+            first: Overlay::non_modal().tokens(first),
+            second: Overlay::non_modal().tokens(second.flatten()),
+        });
+        let panel = |name, readings: &Readings, cx: &mut gpui::VisualTestContext| {
+            let readings = readings.clone();
+            cx.new(|cx| Panel { name, readings, focus: cx.focus_handle() })
+        };
+        let view = panel("first", &readings, cx);
+        cx.update(|window, cx| owner.update(cx, |o, cx| o.first.open(view, |o: &mut Owner| &mut o.first, window, cx)));
+        if second.is_some() {
+            let view = panel("second", &readings, cx);
+            cx.update(|window, cx| {
+                owner.update(cx, |o, cx| o.second.open(view, |o: &mut Owner| &mut o.second, window, cx))
+            });
+        }
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let stack = layer::stack(window, cx).expect("layers open");
+            let first = owner.read(cx).first.layer().expect("open");
+            assert!(wrap_in_deferred(stack, first), "the first slot is lifted");
+            if let Some(second) = owner.read(cx).second.layer() {
+                assert!(!wrap_in_deferred(stack, second), "the second slot renders inline");
+            }
+        });
+        readings
+    }
+
+    fn last_frame(readings: &Readings, name: &str) -> Vec<(Phase, Hsla)> {
+        let all = read(readings, name);
+        let start = all.iter().rposition(|(phase, _)| *phase == Phase::Layout).expect("drawn");
+        all[start..].to_vec()
+    }
+
+    fn every_phase(bg: Hsla) -> Vec<(Phase, Hsla)> {
+        vec![(Phase::Layout, bg), (Phase::Prepaint, bg), (Phase::Paint, bg)]
+    }
+
+    /// The spec's "Menu with a token set": a lifted overlay and an inline
+    /// one, each given a set, draw their views in it in every phase.
+    #[test]
+    fn an_overlay_given_a_set_draws_its_view_in_it_lifted_and_inline() {
+        let lifted = Tokens { background: gpui::red(), ..Tokens::neutral_dark() };
+        let inline = Tokens { background: gpui::blue(), ..Tokens::neutral_dark() };
+        let readings = draw(Some(lifted), Some(Some(inline)));
+        assert_eq!(last_frame(&readings, "first"), every_phase(lifted.background));
+        assert_eq!(last_frame(&readings, "second"), every_phase(inline.background));
+    }
+
+    /// One opened without a set draws in the window's, lifted and inline.
+    #[test]
+    fn an_overlay_without_a_set_draws_in_the_windows() {
+        let window = Tokens::neutral_light();
+        let readings = draw(None, Some(None));
+        assert_eq!(last_frame(&readings, "first"), every_phase(window.background));
+        assert_eq!(last_frame(&readings, "second"), every_phase(window.background));
+        let slot = Overlay::<Panel>::non_modal();
+        assert_eq!(slot.token_set(), None);
+        let mut slot = slot.tokens(Some(window));
+        assert_eq!(slot.token_set(), Some(&window));
+        slot.set_tokens(None);
+        assert_eq!(slot.token_set(), None);
+    }
 
     #[test]
     fn a_slot_can_ignore_outside_presses() {

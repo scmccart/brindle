@@ -43,7 +43,7 @@ use crate::settings::Zoom;
 use brindle_ui::{
     ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
-    TabWidth, TextInput, Tooltip, TooltipFor as _, button_style, entry_keyed,
+    TabWidth, TextInput, Tokens, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
 use crate::remote::Host;
 use crate::remote::hosts::{HostState, Hosts};
@@ -446,6 +446,17 @@ enum MenuFor {
     /// A zone header (or the active zone, from `OpenZoneMenu`), focused by
     /// then: its items run their actions from there.
     Zone,
+}
+
+/// The token set a context menu on `on` is drawn in (`None`: the
+/// window's): a zone's menu takes what its request carries, its zone's
+/// theme scope (`ZoneMenuRequest::tokens`), and a tab's menu, opened from
+/// the strip, the window's whatever it was given.
+fn menu_tokens(on: MenuFor, requested: Option<Tokens>) -> Option<Tokens> {
+    match on {
+        MenuFor::Tab(_) => None,
+        MenuFor::Zone => requested,
+    }
 }
 
 /// How long the sessions palette waits for a remote endpoint's listing
@@ -1453,7 +1464,8 @@ impl Workspace {
             return;
         }
         let menu = ActionMenu::new(request.rows.clone(), &menu_shortcuts(&request.rows, cx));
-        self.open_context_menu(menu, MenuFor::Zone, request.at, request.press.as_ref(), window, cx);
+        let at = request.at;
+        self.open_context_menu(menu, MenuFor::Zone, request.tokens, at, request.press.as_ref(), window, cx);
     }
 
     fn on_zone_tree_event(
@@ -1955,17 +1967,23 @@ impl Workspace {
         let Some(ix) = self.tab_ix(id) else { return };
         let rows = tab_menu_rows(ix, self.tabs.len());
         let menu = ActionMenu::new(rows.clone(), &menu_shortcuts(&rows, cx));
-        self.open_context_menu(menu, MenuFor::Tab(id), at, press, window, cx);
+        self.open_context_menu(menu, MenuFor::Tab(id), None, at, press, window, cx);
     }
 
     /// Opens `menu`, for what it is `on`, in the context menu slot at `at`,
-    /// or at the pointer of `press`, replacing any overlay. Focus goes to the
-    /// active tab first: the menu gives it back there on closing, and a
-    /// chosen item's action runs from there.
+    /// or at the pointer of `press`, replacing any overlay, drawn in the
+    /// set [`menu_tokens`] picks from `tokens`. Focus goes to the active tab
+    /// first: the menu gives it back there on closing, and a chosen item's
+    /// action runs from there.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the two callers hold each of these apart (a zone's request, a tab's id and press); a struct would be built only to be taken apart here"
+    )]
     fn open_context_menu(
         &mut self,
         menu: ActionMenu,
         on: MenuFor,
+        tokens: Option<Tokens>,
         at: Point<Pixels>,
         press: Option<&MouseDownEvent>,
         window: &mut Window,
@@ -1975,9 +1993,12 @@ impl Workspace {
         self.focus_active_tab(window, cx);
         let entries = menu.entries.clone();
         self.overlay = Overlay::ContextMenu { menu, on };
-        self.context_menu.update(cx, |context_menu, cx| match press {
-            Some(event) => context_menu.open_on_press(event, entries, window, cx),
-            None => context_menu.open(at, entries, window, cx),
+        self.context_menu.update(cx, |context_menu, cx| {
+            context_menu.set_tokens(menu_tokens(on, tokens));
+            match press {
+                Some(event) => context_menu.open_on_press(event, entries, window, cx),
+                None => context_menu.open(at, entries, window, cx),
+            }
         });
         cx.notify();
     }
@@ -2762,7 +2783,7 @@ impl Workspace {
     /// and escape. A press on a tab activates it and leaves focus in its
     /// terminal.
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = *cx.ui_theme();
+        let tokens = cx.ui_theme();
         let decorations = window.window_decorations();
         // Windows always shows Brindle's own caption (see `window_control_area`
         // below); GPUI reports server decorations there.
@@ -4258,6 +4279,18 @@ mod tests {
             rows.iter().map(|row| row.action().and_then(|action| tab_keys(&keymap, action))).collect();
         let menu = ActionMenu::new(rows, &shortcuts);
         describe_menu(&menu.entries, None)
+    }
+
+    /// A zone's menu is drawn in the set its request carries (an agent
+    /// zone's scope, or none for a terminal zone), a tab's menu always in
+    /// the window's.
+    #[test]
+    fn a_zone_menu_takes_its_requests_set_and_a_tab_menu_the_windows() {
+        let set = brindle_ui::Tokens::neutral_dark();
+        assert_eq!(menu_tokens(MenuFor::Zone, Some(set)), Some(set));
+        assert_eq!(menu_tokens(MenuFor::Zone, None), None);
+        assert_eq!(menu_tokens(MenuFor::Tab(TabId(1)), Some(set)), None);
+        assert_eq!(menu_tokens(MenuFor::Tab(TabId(1)), None), None);
     }
 
     /// Each tab menu row's action maps to the item that acts on the menu's

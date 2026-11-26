@@ -25,7 +25,7 @@ use gpui::{
 };
 
 use brindle_ui::{
-    Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
+    ActiveTheme as _, Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
     ConfirmationState, FocusScope, FocusStops, Icon, ItemKey, Message, MessageFrom, MessageScroller, PageDirection,
     PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning, Resend as UiResend,
     Response, RichBlock, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
@@ -379,10 +379,14 @@ impl AgentView {
         &self.scroller
     }
 
-    /// Takes the tab's profile's theme (the card's background and text,
-    /// and the held row's warning colour) and font size (`None`: the
-    /// terminal size in effect), as the config now has them or the
-    /// settings dialog previews them.
+    /// Takes the tab's profile's theme (the notices' red and the held
+    /// row's warning colour, the ANSI red and yellow, as there are no
+    /// warning tokens) and font size (`None`: the terminal size in effect),
+    /// as the config now has them or the settings dialog previews them.
+    /// Everything else the zone draws, its root's background and text
+    /// included, takes the theme scope's tokens it is drawn in: the
+    /// theme's zone tokens, which `ZoneTreeView` keeps and wraps the zone
+    /// in.
     pub fn set_profile(&mut self, theme: Theme, font_size_override: Option<f32>, cx: &mut Context<Self>) {
         let held = theme.ansi[3].hsla();
         self.prompt.update(cx, |prompt, cx| prompt.set_held_color(held, cx));
@@ -855,7 +859,10 @@ impl Render for AgentView {
         let login = self.login_row(cx);
         let settings = Settings::get(cx);
         let (size, family) = (self.text_size(cx), settings.ui_font_family());
-        let (bg, fg) = (self.theme.background.hsla(), self.theme.foreground.hsla());
+        // The scope's set (the zone's tokens), one source with the
+        // components inside.
+        let tokens = cx.ui_theme();
+        let (bg, fg) = (tokens.background, tokens.foreground);
         let content = div()
             .key_context("AgentZone")
             .on_action(cx.listener(Self::submit))

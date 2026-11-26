@@ -292,6 +292,9 @@ impl Theme {
             muted: Some(self.card_muted_foreground().hsla()),
             border: Some(self.card_border().hsla()),
             surround: Some(background),
+            // The active tokens' ring; an agent zone, drawn in a theme
+            // scope, sets the window's.
+            ring: None,
         }
     }
 
@@ -302,10 +305,31 @@ impl Theme {
     /// helpers above are inputs to them (`card_border` and
     /// `card_muted_foreground` also colour the zone cards).
     pub fn ui_tokens(&self) -> brindle_ui::Tokens {
-        let bg = self.chrome_background();
-        let fg = self.foreground.legible_on(bg, 4.5);
-        let raised = bg.mix(fg, 0.04);
-        let surface = bg.mix(fg, 0.08);
+        self.tokens_over(self.chrome_background())
+    }
+
+    /// The token set an agent zone drawn in this theme uses: derived as
+    /// [`Theme::ui_tokens`] is, but over the theme's own background, the
+    /// one the zone's card shows, so its `card` and `muted` surfaces are
+    /// faint steps up from what the zone shows rather than from the darker
+    /// chrome (`agents-zone-theme-scope` decision 2).
+    pub fn zone_tokens(&self) -> brindle_ui::Tokens {
+        self.tokens_over(self.background)
+    }
+
+    /// The token derivation both sets share, over `bg`: `card` and
+    /// `popover` are `bg` mixed 4% towards the foreground, `muted` and
+    /// `secondary` 8%, `accent` 12%; the border is `card_border`; primary,
+    /// ring and link come from the accent and destructive from the red.
+    fn tokens_over(&self, bg: Color) -> brindle_ui::Tokens {
+        let base = self.foreground.legible_on(bg, 4.5);
+        let raised = bg.mix(base, 0.04);
+        let surface = bg.mix(base, 0.08);
+        // Text on the muted surface (a code block) must read too: a low
+        // contrast theme's own background (solarized-dark's zone set) can
+        // leave the foreground just short there. The surfaces are mixed
+        // from the unpushed colour, so pushing it doesn't move them.
+        let fg = base.legible_on(surface, 4.5);
         let accent = self.accent();
         let destructive = self.ansi[1];
         let border = self.card_border();
@@ -325,7 +349,9 @@ impl Theme {
         tokens.secondary = surface.hsla();
         tokens.secondary_foreground = fg.legible_on(surface, 4.5).hsla();
         tokens.muted = surface.hsla();
-        tokens.muted_foreground = self.muted_foreground().legible_on(bg, 3.0).hsla();
+        // On the card too (an agent message's labels), pushed only when the
+        // background's push leaves it short there.
+        tokens.muted_foreground = self.muted_foreground().legible_on(bg, 3.0).legible_on(raised, 3.0).hsla();
         tokens.accent = bg.mix(fg, 0.12).hsla();
         tokens.accent_foreground = fg.legible_on(bg.mix(fg, 0.12), 4.5).hsla();
         tokens.destructive = destructive.hsla();
@@ -798,10 +824,76 @@ mod tests {
         assert!(mixes.contains(&link), "{link:?} is not a mix of the accent towards black");
     }
 
+    /// The window set keeps the values it had before its derivation was
+    /// shared with the zone set (`brindle --export-ui-tokens` at e301fad).
+    #[test]
+    fn ui_tokens_keep_their_values() {
+        let cases = [
+            ("brindle-dark", ["#121110", "#1a1918", "#22211f", "#2a2827", "#83807b", "#32302e"]),
+            ("brindle-light", ["#faf7f3", "#f2efeb", "#eae7e3", "#e2dfdb", "#888580", "#dfdbd4"]),
+        ];
+        for (name, [background, card, muted, accent, muted_foreground, border]) in cases {
+            let t = builtin_theme(name).unwrap().ui_tokens();
+            assert_eq!(css_color(t.background), background, "{name}");
+            assert_eq!(css_color(t.card), card, "{name}");
+            assert_eq!(css_color(t.popover), card, "{name}");
+            assert_eq!(css_color(t.muted), muted, "{name}");
+            assert_eq!(css_color(t.secondary), muted, "{name}");
+            assert_eq!(css_color(t.accent), accent, "{name}");
+            assert_eq!(css_color(t.muted_foreground), muted_foreground, "{name}");
+            assert_eq!(css_color(t.border), border, "{name}");
+        }
+    }
+
+    /// The zone set is the window set's derivation over the theme's own
+    /// background: its surfaces are mixes of that background, and its
+    /// accent-derived and red-derived colours match the window set's.
+    #[test]
+    fn zone_tokens_sit_on_the_themes_own_background() {
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            let (zone, window) = (theme.zone_tokens(), theme.ui_tokens());
+            let fg = theme.foreground.legible_on(theme.background, 4.5);
+            assert_eq!(zone.background, theme.background.hsla(), "{name}");
+            assert_eq!(zone.card, theme.background.mix(fg, 0.04).hsla(), "{name}");
+            assert_eq!(zone.popover, zone.card, "{name}");
+            assert_eq!(zone.muted, theme.background.mix(fg, 0.08).hsla(), "{name}");
+            assert_eq!(zone.secondary, zone.muted, "{name}");
+            assert_eq!(zone.accent, theme.background.mix(fg, 0.12).hsla(), "{name}");
+            assert_eq!(zone.border, theme.card_border().hsla(), "{name}");
+            assert_eq!(zone.input, zone.border, "{name}");
+            assert_eq!(color_of(zone.primary), theme.accent(), "{name}");
+            assert_eq!(color_of(zone.ring), theme.accent(), "{name}");
+            assert_eq!(color_of(zone.destructive), theme.ansi[1], "{name}");
+            assert_eq!(zone.dark, window.dark, "{name}");
+            assert_ne!(zone.background, window.background, "{name}: the zone set is on the chrome background");
+        }
+    }
+
+    /// The spec's scenarios: a background of `#282020` stays the zone
+    /// set's background and is darkened for the window's, and an accent
+    /// of `#7aa2f7` is the zone set's primary and ring.
+    #[test]
+    fn zone_tokens_follow_the_spec_scenarios() {
+        let theme = Theme {
+            background: Color::hex(0x282020),
+            accent: Some(Color::hex(0x7aa2f7)),
+            ..Theme::default()
+        };
+        let zone = theme.zone_tokens();
+        assert_eq!(css_color(zone.background), "#282020");
+        let darkened = Color::hex(0x282020).mix(Color::hex(0x000000), 0.35);
+        assert_eq!(css_color(theme.ui_tokens().background), css_color(darkened.hsla()));
+        assert_eq!(css_color(zone.primary), "#7aa2f7");
+        assert_eq!(css_color(zone.ring), "#7aa2f7");
+    }
+
     #[test]
     fn ui_tokens_are_legible_for_every_builtin() {
-        for name in BUILTIN_THEMES {
-            let t = builtin_theme(name).unwrap().ui_tokens();
+        for (name, set, t) in BUILTIN_THEMES.iter().flat_map(|name| {
+            let theme = builtin_theme(name).unwrap();
+            [(*name, "window", theme.ui_tokens()), (*name, "zone", theme.zone_tokens())]
+        }) {
             let pairs = [
                 ("foreground", t.foreground, t.background, 4.5),
                 ("muted_foreground", t.muted_foreground, t.background, 3.0),
@@ -818,7 +910,7 @@ mod tests {
             ];
             for (label, fg, bg, min) in pairs {
                 let ratio = color_of(fg).contrast(color_of(bg));
-                assert!(ratio >= min, "{name}: {label} contrast {ratio:.2} < {min}");
+                assert!(ratio >= min, "{name} ({set} set): {label} contrast {ratio:.2} < {min}");
             }
         }
     }

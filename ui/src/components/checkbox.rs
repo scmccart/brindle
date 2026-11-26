@@ -114,7 +114,7 @@ pub(crate) fn click_key(event: &ClickEvent) -> Option<KeyboardButton> {
 
 impl RenderOnce for Checkbox {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let (ring, ring_color) = (t.ring, focus_ring(t));
         let style = checkbox_style(self.checked, t);
         let (checked, disabled) = (self.checked, self.disabled);
