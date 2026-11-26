@@ -1370,7 +1370,7 @@ mod tests {
         use crate::remote::local::{self, Link, Session, SessionSink, SpawnRequest, dial_with, start_relay};
         use crate::remote::protocol::Frame;
         use crate::remote::protocol::client::Policy;
-        use crate::remote::protocol::relay::{RelayHost, RelayMessage};
+        use crate::remote::protocol::relay::{LoginEnv, RelayHost, RelayMessage};
         use crate::terminal::GridSize;
 
         type Scenario = std::result::Result<(), String>;
@@ -1934,6 +1934,23 @@ mod tests {
             Ok(reply.lines().next().unwrap_or_default().to_string())
         }
 
+        /// `remote-login-environment` 5.6: a container's relay isn't asked
+        /// for a login environment, so a program there runs in the
+        /// container's own, which `/root/.profile` doesn't change, with the
+        /// passwd home.
+        fn scenario_container_has_no_login_environment(c: &Container, profile: &Profile) -> Scenario {
+            c.exec_sh("printf 'export BRINDLE_LOGIN_PROFILE=1\\n' >> /root/.profile");
+            let command = ["sh", "-c", "echo \"V1 P=$BRINDLE_LOGIN_PROFILE H=$HOME E$((1+1))\""];
+            let mut tab = Tab::start(profile, &command, None);
+            if !matches!(tab.run_to_end(Duration::from_secs(60)), End::Exited(_)) {
+                return Err(format!("no exit; output ends {:?}", tab.tail()));
+            }
+            match tab.output.contains("V1 P= H=/root E2") {
+                true => Ok(()),
+                false => Err(format!("output ends {:?}", tab.tail())),
+            }
+        }
+
         #[test]
         fn docker_transport_scenarios() {
             let Some(_turn) = opted_in() else { return };
@@ -1960,6 +1977,10 @@ mod tests {
                 ),
                 Err(e) => failures.record("default shell, missing cwd", Err(e)),
             }
+            failures.record(
+                "a container's program has no login environment",
+                scenario_container_has_no_login_environment(&ubuntu, &profile),
+            );
             failures.record("d the one helper is kept, root's own", scenario_one_helper_kept(&ubuntu, static_helper()));
             failures.record("g bad helper", scenario_bad_helper(&ubuntu, &scratch));
             // Deploying another build removed the first one's directory.
@@ -2013,6 +2034,72 @@ mod tests {
             result.map(drop)
         }
 
+        /// What a session's program sees of the login files' work, on one
+        /// line: `P=` and `R=` the variables `~/.profile` and `~/.bashrc`
+        /// export, and `PATH`.
+        fn login_view(profile: &Profile, command: &[&str]) -> std::result::Result<String, String> {
+            let mut tab = Tab::start(profile, command, None);
+            if command.is_empty() {
+                tab.input("echo \"V1 P=$BRINDLE_LOGIN_PROFILE R=$BRINDLE_LOGIN_RC PATH=$PATH E$((1+1))\"\n");
+                tab.wait_for("E2\r\n")?;
+                tab.input("exit\n");
+            } else if !matches!(tab.run_to_end(Duration::from_secs(60)), End::Exited(_)) {
+                return Err(format!("no exit; output ends {:?}", tab.tail()));
+            }
+            let out = &tab.output;
+            let reply = out.rfind("V1 P=").map_or(out.as_str(), |at| &out[at..]);
+            Ok(reply.lines().next().unwrap_or_default().trim_end().to_string())
+        }
+
+        /// The command that prints [`login_view`]'s line and exits.
+        const LOGIN_VIEW: [&str; 3] =
+            ["sh", "-c", "echo \"V1 P=$BRINDLE_LOGIN_PROFILE R=$BRINDLE_LOGIN_RC PATH=$PATH E$((1+1))\""];
+
+        /// `remote-login-environment` 5.6: over SSH a program runs in the
+        /// login shell's environment, `~/.profile`'s and `~/.bashrc`'s
+        /// variables included (the latter after Ubuntu root's interactive
+        /// guard), while a session with no command runs the login shell,
+        /// which reads them itself, so `PATH` gets its directory once. It
+        /// runs before any session, since the endpoint's connection reads the
+        /// login environment once per link, and the files stay as changed,
+        /// for the noise scenarios after.
+        fn scenario_ssh_login_environment(fx: &SshFixture) -> Scenario {
+            let c = &fx.container;
+            c.exec_sh(
+                "printf 'export BRINDLE_LOGIN_PROFILE=1\\nexport PATH=/root/login-bin:$PATH\\n' >> /root/.profile; \
+                 printf 'export BRINDLE_LOGIN_RC=1\\n' >> /root/.bashrc; mkdir -p /root/login-bin",
+            );
+            let profile = profile_for(&fx.target);
+            let program = login_view(&profile, &LOGIN_VIEW)?;
+            if !(program.contains(" P=1 R=1 PATH=/root/login-bin:") && program.ends_with(" E2")) {
+                return Err(format!("a program's view: {program:?}"));
+            }
+            let shell = login_view(&profile, &[])?;
+            if !(shell.contains(" P=1 R=1 PATH=/root/login-bin:") && shell.matches("/root/login-bin").count() == 1) {
+                return Err(format!("the login shell's view: {shell:?}"));
+            }
+            Ok(())
+        }
+
+        /// A noisy startup file doesn't keep its login shell's environment
+        /// from the relay: what [`scenario_ssh_login_environment`] exported
+        /// is still captured.
+        fn scenario_ssh_noise_keeps_the_login_environment(fx: &SshFixture, file: &str, line: &str) -> Scenario {
+            let c = &fx.container;
+            c.exec_sh(&format!(
+                "cp {file} {file}.orig; printf '{line}\\n' | cat - {file}.orig > {file}"
+            ));
+            let result = connect(&fx.target);
+            c.exec_sh(&format!("mv {file}.orig {file}"));
+            match result?.login {
+                Some(LoginEnv::Captured(env)) if env.get("BRINDLE_LOGIN_PROFILE").is_some_and(|v| v == "1") => Ok(()),
+                other => Err(format!("login {:?}", other.map(|login| match login {
+                    LoginEnv::Captured(env) => format!("captured {} variables", env.len()),
+                    LoginEnv::Failed(why) => format!("failed: {why}"),
+                }))),
+            }
+        }
+
         #[test]
         fn ssh_transport_scenarios() {
             let Some(_turn) = opted_in() else { return };
@@ -2020,11 +2107,23 @@ mod tests {
             let fx = SshFixture::start(&scratch, "ssh").expect("ssh fixture");
             let profile = profile_for(&fx.target);
             let mut failures = Failures::default();
+            // First: the endpoint's one connection reads the login
+            // environment when its link comes up, so the startup files
+            // change before any session.
+            failures.record("ssh login environment", scenario_ssh_login_environment(&fx));
             failures.record("ssh round trip and exit", scenario_round_trip(&profile));
             failures.record("ssh ctrl-c during flood", scenario_ctrl_c_during_flood(&profile));
             failures.record("ssh wrong key", scenario_ssh_wrong_key(&fx));
             failures.record("ssh ~/.profile noise", scenario_ssh_noise(&fx, "/root/.profile", "echo NOISE_PROFILE"));
             failures.record("ssh ~/.bashrc noise", scenario_ssh_noise(&fx, "/root/.bashrc", "echo NOISE_BASHRC"));
+            failures.record(
+                "ssh ~/.profile noise, login environment",
+                scenario_ssh_noise_keeps_the_login_environment(&fx, "/root/.profile", "echo NOISE_PROFILE"),
+            );
+            failures.record(
+                "ssh ~/.bashrc noise, login environment",
+                scenario_ssh_noise_keeps_the_login_environment(&fx, "/root/.bashrc", "echo NOISE_BASHRC"),
+            );
             std::fs::remove_dir_all(&scratch).ok();
             failures.check();
         }
