@@ -45,6 +45,10 @@ pub struct Changes {
     /// Some of these changes were folded during a replay: what they hold
     /// already happened, and raises nothing.
     pub from_replay: bool,
+    /// Fetched entries were folded in front of the held ones
+    /// ([`AgentShared::prepend`], OpenSpec change `agents-log-paging`):
+    /// this many, every one before the entries the zone already shows.
+    pub prepended: Option<usize>,
 }
 
 impl Changes {
@@ -175,6 +179,27 @@ impl AgentShared {
             // from the transcript on every absorb.
             Event::Window { .. } => {}
         }
+        Ok(())
+    }
+
+    /// Decodes a fetched page's events and folds them in front of the held
+    /// entries ([`Transcript::prepend`]); `more` says whether entries are
+    /// still earlier. Recorded as `prepended`, and as from a replay: they
+    /// already happened and raise nothing. One that doesn't decode or fit
+    /// leaves the transcript as it was, and the session is [`Broken`].
+    pub fn prepend(&mut self, values: &[Value], more: bool) -> Result<(), Broken> {
+        let events = values
+            .iter()
+            .map(Event::from_value)
+            .collect::<Result<Vec<Event>, _>>()
+            .map_err(|why| Broken(format!("an event from the terminal server couldn't be read: {why}")))?;
+        let before = self.transcript.entries().count();
+        self.transcript
+            .prepend(&events, more)
+            .map_err(|why| Broken(format!("a page from the terminal server couldn't be applied: {why}")))?;
+        let added = self.transcript.entries().count() - before;
+        self.changes.prepended = Some(self.changes.prepended.unwrap_or(0) + added);
+        self.changes.from_replay = true;
         Ok(())
     }
 
@@ -341,5 +366,35 @@ mod tests {
         let Broken(why) = shared.apply(&values(&[Event::Appended { id: EntryId(9), text: "x".into() }])).unwrap_err();
         assert!(why.ends_with("there is no entry 9"), "{why}");
         assert_eq!(Broken("x".into()).to_string(), "x");
+    }
+
+    // agents-log-paging 4.2: a fetched page folded in front.
+
+    #[test]
+    fn a_prepended_page_is_recorded_as_from_a_replay_and_a_bad_one_changes_nothing() {
+        let mut shared = AgentShared::new();
+        shared.replay_start();
+        let window = Event::Window { from: EntryId(3), earlier: 2 };
+        shared.apply(&values(&[window, added(3, agent("three"))])).unwrap();
+        shared.replay_end();
+        shared.take_changes();
+
+        // Entry 2 alone leaves entry 1 earlier: `more` must say so.
+        let refused = shared.prepend(&values(&[added(2, agent("two"))]), false).unwrap_err();
+        assert!(refused.0.contains("couldn't be applied"), "{refused}");
+        assert_eq!(shared.transcript().entries().count(), 1);
+        assert!(shared.take_changes().is_empty());
+        // Not an event at all.
+        let refused = shared.prepend(&[serde_json::json!({"event": "nope"})], false).unwrap_err();
+        assert!(refused.0.contains("couldn't be read"), "{refused}");
+
+        shared.prepend(&values(&[added(2, agent("two"))]), true).unwrap();
+        shared.prepend(&values(&[added(1, agent("one"))]), false).unwrap();
+        let changes = shared.take_changes();
+        assert_eq!(changes.prepended, Some(2));
+        assert!(changes.from_replay);
+        assert_eq!(changes.added_from, None, "nothing new after the shown entries");
+        assert!(shared.transcript().window().is_none());
+        assert_eq!(shared.transcript().entries().count(), 3);
     }
 }

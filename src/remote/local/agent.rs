@@ -49,6 +49,10 @@ impl SessionSink for Sink {
         Sink::reply(self, request, outcome);
     }
 
+    fn page(&mut self, request: RequestId, events: Vec<serde_json::Value>, last: Option<bool>) -> Result<(), String> {
+        Sink::page(self, request, events, last)
+    }
+
     fn link_down(&mut self) {
         Sink::link_down(self);
     }

@@ -369,6 +369,13 @@ impl Session {
         self.running(|running| running.login(method))
     }
 
+    /// Fetches the whole entries before `before` within `max_bytes`
+    /// (`AGENT_FETCH`), as [`Session::prompt`]; its pages reach the sink
+    /// before its reply.
+    pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+        self.running(|running| running.fetch(before, max_bytes))
+    }
+
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`), as [`Session::prompt`].
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
@@ -2133,6 +2140,105 @@ mod tests {
         let changes = feed.shared.lock().take_changes();
         assert!(changes.reset && changes.from_replay, "{changes:?}");
         assert!(matches!(recv(&core), ToCore::Attach(_)));
+    }
+
+    /// `agents-log-paging` 4.1: an attached session's replay is its newest
+    /// page; a fetch's `AGENT_PAGE` frames reach the sink in order and are
+    /// folded in front, all before the fetch's reply.
+    #[test]
+    fn a_fetchs_frames_are_folded_in_front_before_its_reply() {
+        let dir = temp_dir("agent-fetch");
+        let added = |id: u64, text: &str| Event::Added { id: EntryId(id), entry: Entry::Agent { text: text.into() } };
+        let core = scripted_core_at(&dir, 4, move |message, stream| match message {
+            ToCore::Attach(attach) => {
+                let start = client::ReplayStart { req: Some(attach.req), session: AGENT, pid: 4242 };
+                send(stream, ToClient::ReplayStart(start));
+                transcript(stream, &[Event::Window { from: EntryId(3), earlier: 2 }, added(3, "three"), added(4, "four")]);
+                send(stream, ToClient::ReplayEnd(client::SessionRef { session: AGENT }));
+            }
+            ToCore::AgentFetch(fetch) => {
+                assert_eq!((fetch.session, fetch.before, fetch.max_bytes), (AGENT, 3, 1024));
+                let frame = |events: Vec<Event>, last| {
+                    let events = events.iter().map(Event::to_value).collect();
+                    ToClient::AgentPage(client::AgentPage { req: fetch.req, session: AGENT, events, last })
+                };
+                send(stream, frame(vec![added(1, "one")], None));
+                send(stream, frame(vec![added(2, "two")], Some(client::PageEnd { more: false })));
+            }
+            _ => {}
+        });
+        let connection = connected(&dir);
+        let (sink, mut feed) = AgentSink::with_fault(None);
+        let request = AttachRequest { session: AGENT, key: SessionKey::from_wire("k7"), when: Attaching::Now { cols: 0, rows: 0 } };
+        let session = Session::attach_with(move || Ok(connection), request, Box::new(sink));
+        shows(&mut feed, "the page", |log| log.entries().count() == 2 && log.window().is_some());
+        assert!(matches!(recv(&core), ToCore::Attach(_)));
+        feed.shared.lock().take_changes();
+
+        let req = session.fetch(3, 1024).expect("sent while shown");
+        assert!(matches!(recv(&core), ToCore::AgentFetch(_)));
+        // When the reply comes, the whole page is folded in front.
+        let reply = until("the fetch's reply", Duration::from_secs(10), || {
+            while let Ok(Some(event)) = feed.events.try_next() {
+                feed.took([&event]);
+                if let AgentEvent::Reply { request, outcome } = event {
+                    return Some((request, outcome, says(feed.shared.lock().transcript())));
+                }
+            }
+            None
+        });
+        assert_eq!(reply, (req, Ok(()), ["agent: one", "agent: two", "agent: three", "agent: four"].map(String::from).to_vec()));
+        let shared = feed.shared.lock();
+        assert!(shared.transcript().window().is_none());
+        drop(shared);
+        let changes = feed.shared.lock().take_changes();
+        assert_eq!(changes.prepended, Some(2));
+        assert!(changes.from_replay);
+    }
+
+    /// `agents-log-paging` 4.1: a fetch written when the link drops is
+    /// answered with the link's failure.
+    #[test]
+    fn a_fetch_in_flight_fails_with_the_link() {
+        let mut agent = MiniAgent::default();
+        let Agent { _dir, session, mut feed, connection, core } =
+            agent_session_with("agent-fetch-lost", None, move |message, stream| agent.answer(message, stream));
+        // The core goes after reading the fetch, never answering it.
+        drop(core);
+        let req = session.fetch(1, 1024).unwrap();
+        let AgentEvent::Reply { request, outcome: Err(why) } = next_life(&mut feed) else { panic!("not failed") };
+        assert_eq!(request, req);
+        assert!(why.starts_with("the terminal server went away"), "{why}");
+        assert_eq!(next_life(&mut feed), AgentEvent::LinkDown);
+        drop(connection);
+    }
+
+    /// `agents-log-paging` 4.1: a fetch while the link is down is answered
+    /// at once with the link's failure.
+    #[test]
+    fn a_fetch_while_the_link_is_down_fails_at_once() {
+        let mut agent = MiniAgent::default();
+        let Agent { _dir, session, mut feed, connection, core } =
+            agent_session_with("agent-fetch-down", None, move |message, stream| agent.answer(message, stream));
+        drop(core);
+        // The core goes after reading the next message, never answering it.
+        session.prompt("unanswered");
+        until("the link down", Duration::from_secs(10), || {
+            while let Ok(Some(event)) = feed.events.try_next() {
+                feed.took([&event]);
+                if event == AgentEvent::LinkDown {
+                    return Some(());
+                }
+            }
+            None
+        });
+        let req = session.fetch(1, 1024).expect("the session is still shown");
+        let reply = next_life(&mut feed);
+        assert_eq!(
+            reply,
+            AgentEvent::Reply { request: req, outcome: Err("the connection to the terminal server is down".into()) }
+        );
+        drop(connection);
     }
 
     /// 4.3: a transcript the sink can't follow (`bad`, sent in answer to a
