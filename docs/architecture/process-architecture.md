@@ -55,14 +55,14 @@ let Some(lock) = Lock::acquire(&dir.join("core.lock"))? else {
 
 | Process or thread | Owns | Rules that bind it most |
 | --- | --- | --- |
-| holder (`brindle-remote hold`) | PTYs and pseudoconsoles, pipe sessions (a program on plain pipes, with a 16 KiB ring of its stderr), programs, each session's meta, checkpoint and tail | R1, R9, R10 |
+| holder (`brindle-remote hold`) | PTYs and pseudoconsoles, pipe sessions (a program on plain pipes, with a 16 KiB ring of its stderr), programs, each session's meta, checkpoint (a whole one and the segments appended to it, bytes it doesn't read) and tail | R1, R9, R10 |
 | server core (`brindle-remote serve`) | an `Emulator` per terminal session, an ACP client per agent session (`acp::reduce` and its log), the client protocol (`brindle-remote-protocol`) and the transcript events it carries (`brindle-transcript`), policy | R2, R3, R4–R8, R12, R19 |
 | relay (`brindle-remote relay`; Linux only: built under `target_os = "linux"`, and refused with "relay runs only on Linux" on every other platform, macOS included) | one endpoint's link, copied by frame | R7, R18 |
 | Brindle's connection threads (`src/remote/local/`) | one reader and one writer per endpoint | R13, R14, R18 |
 | Brindle's UI thread | entities, painting | R13, R14, R16 |
 | the instance (`src/instance.rs`) | `session.lock`, the launch socket | R11 |
 
-Protocols: client protocol versions 1–4 (4 adds agent sessions: `SPAWN_AGENT`, the `AGENT_*` commands and `TRANSCRIPT`, whose events are frozen per version; Brindle offers 1–4) and core↔holder H1 at versions 1–3 (3 adds pipe sessions: `SPAWN_PIPES`, `STDERR_TAIL`, `HeldSession.mode`), both in `remote-protocol/src/{client,holder,wire,version}.rs`; the relay's frames in `relay.rs`. Files read across versions: `config.toml`, `session.toml`, the layout blob stored in a session's meta, and an agent session's checkpoint (`acp::checkpoint`, the `BACP` header with format 1; a format a core can't read is adopted as a conversation that could not be restored).
+Protocols: client protocol versions 1–4 (4 adds agent sessions: `SPAWN_AGENT`, the `AGENT_*` commands, `TRANSCRIPT`, whose events are frozen per version, and the log's pages: `ATTACH.page`, `AGENT_FETCH` and `AGENT_PAGE`; Brindle offers 1–4) and core↔holder H1 at versions 1–3 (3 adds pipe sessions: `SPAWN_PIPES`, `STDERR_TAIL`, `HeldSession.mode`, and `CHECKPOINT_APPEND`, which adds a segment to the stored checkpoint by length alone), both in `remote-protocol/src/{client,holder,wire,version}.rs`; the relay's frames in `relay.rs`. Files read across versions: `config.toml`, `session.toml`, the layout blob stored in a session's meta, and an agent session's checkpoint (`acp::checkpoint`, the `BACP` header with format 2, a base and segments; format 1 is still read; a format a core can't read is adopted as a conversation that could not be restored). What the core knows of a holder's stored checkpoint (`Stored`) and the events since (`unsaved`) live in its memory only: a new core starts from what the holder stores and writes whole first (R2).
 
 ## Rules
 

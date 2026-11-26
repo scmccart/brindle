@@ -2782,3 +2782,236 @@ fn a_close_before_the_old_agent_exits_drops_the_restart() {
     assert!(!record.exists(), "no new agent was started");
     assert!(matches!(agent_states(&client.events(id)).last(), Some(AgentState::Exited { .. })));
 }
+
+// OpenSpec change `agents-log-paging`, tasks 3.2–3.4: paged replays,
+// fetches and appended checkpoints.
+
+/// Adds `count` agent messages of `size` bytes to `script`'s turn, each its
+/// own entry (a thought between them), numbered so their texts differ.
+fn long_reply(script: &mut AgentScript, count: usize, size: usize) {
+    for n in 0..count {
+        script
+            .step(said(&format!("{n:03}:{}", "x".repeat(size))))
+            .step(update(json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "next"}})));
+    }
+}
+
+/// Whether the log holds `count` of [`long_reply`]'s messages.
+fn said_all(count: usize) -> impl FnMut(&Transcript) -> bool {
+    move |log| says(log).iter().filter(|line| line.starts_with("agent: ")).count() >= count
+}
+
+/// The log's entries with their ids, to compare two copies.
+fn held_entries(log: &Transcript) -> Vec<(EntryId, Entry)> {
+    log.entries().map(|(id, entry)| (id, entry.clone())).collect()
+}
+
+/// The ids run from 1 with no gap.
+fn assert_contiguous_from_1(log: &Transcript) {
+    let ids: Vec<u64> = log.entries().map(|(id, _)| id.0).collect();
+    let expected: Vec<u64> = (1..=ids.len() as u64).collect();
+    assert_eq!(ids, expected);
+}
+
+const MESSAGES: usize = 64;
+const MESSAGE_BYTES: usize = 64 * 1024;
+
+/// A titled session whose one turn said [`MESSAGES`] messages of 64 KiB
+/// (4 MiB), still attached; gives the session and the log its client
+/// folded.
+fn long_session(client: &mut TestClient, dir: &mut TempDir, name: &str) -> (SessionId, Transcript) {
+    let (mut script, _) = started(&dir.path, name);
+    script.step("expect session/prompt").step(title(Some("Long talk")));
+    long_reply(&mut script, MESSAGES, MESSAGE_BYTES);
+    script.step(stop("end_turn"));
+    let (id, _) = spawned(client, dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "talk").unwrap();
+    let live = client.transcript_until(id, "has the turn's end", |log| {
+        said_all(MESSAGES)(log) && *log.turn() == end(StopReason::EndTurn)
+    });
+    assert!(live.window().is_none(), "the live client holds every entry");
+    assert!(live.encoded_len() > 4 * 1024 * 1024, "{}", live.encoded_len());
+    (id, live)
+}
+
+#[test]
+fn a_long_session_attaches_with_its_newest_page_and_fetches_the_rest_back() {
+    let (mut dir, mut client) = agent_core("agent-page", &[]);
+    let (id, live) = long_session(&mut client, &mut dir, "page");
+    client.detach(id);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    let events = later.events(id);
+    let page = later.transcript(id);
+    let window = page.window().expect("a 4 MiB log is paged");
+    assert!(events.iter().any(|event| matches!(event, Event::Window { .. })));
+    assert!(page.encoded_len() <= brindle_transcript::PAGE_BYTES, "{}", page.encoded_len());
+    // The state events follow the entries (an empty slot has none).
+    for wanted in ["conversation", "turn", "agent"] {
+        assert!(events.iter().any(|event| kind(event) == wanted), "no {wanted} in the page");
+    }
+    assert_eq!(title_of(&page), Some("Long talk"), "the page carries the title");
+    assert_eq!(*page.turn(), end(StopReason::EndTurn));
+    let newest: Vec<_> = held_entries(&live).into_iter().filter(|(id, _)| *id >= window.from).collect();
+    assert_eq!(held_entries(&page), newest);
+    assert_eq!(window.earlier as usize + page.entries().count(), live.entries().count());
+
+    // Fetched back to the start, a page at a time, it is the live log.
+    let whole = later.fetch_to_start(id);
+    assert!(whole.window().is_none());
+    assert_eq!(held_entries(&whole), held_entries(&live));
+    assert_contiguous_from_1(&whole);
+
+    // Only the attached client may fetch, and only from an agent session.
+    let refusal = client.fetch(id, 5, 1024).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id} isn't attached to this client"));
+    let (terminal, _) = later.spawn(client::Spawn { policy: client::Policy::Detach, ..programs::sleeps() });
+    let refusal = later.fetch(terminal, 5, 1024).unwrap_err();
+    assert_eq!(refusal.message, format!("session {terminal} isn't an agent session"));
+    later.send(client::ToCore::Close(client::SessionRef { session: terminal }));
+
+    // A smaller page when asked for one.
+    later.detach(id);
+    let mut small = TestClient::hello(&dir.path, "small");
+    small.attach_agent_paged(id, Some(16_384)).unwrap();
+    let small_page = small.transcript(id);
+    assert!(small_page.encoded_len() <= 16_384, "{}", small_page.encoded_len());
+    assert!(small_page.entries().count() < page.entries().count());
+}
+
+#[test]
+fn a_short_sessions_replay_is_its_whole_log() {
+    let (mut dir, mut client) = agent_core("agent-page-short", &[]);
+    let (mut script, _) = started(&dir.path, "short");
+    script.step("expect session/prompt").step(said("hello")).step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "hi").unwrap();
+    let live = client.transcript_until(id, "has the turn", ended(1));
+    client.detach(id);
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    assert!(later.events(id).iter().all(|event| !matches!(event, Event::Window { .. })));
+    assert_eq!(later.transcript(id), live);
+    // A fetch before its first entry is answered with nothing more.
+    assert_eq!(later.fetch(id, 1, 1024).unwrap(), (Vec::new(), false));
+}
+
+#[test]
+fn a_pending_permission_behind_2_mib_is_in_the_page_and_answerable() {
+    let (mut dir, mut client) = agent_core("agent-page-permission", &[]);
+    let (mut script, _) = started(&dir.path, "page-permission");
+    script.step("expect session/prompt").step(ask("perm-1"));
+    long_reply(&mut script, 32, MESSAGE_BYTES);
+    script
+        .step(r#"expect-response "perm-1""#)
+        .step(said("done"))
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "has the reply, still blocked", |log| said_all(32)(log) && blocked(log));
+    client.detach(id);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    let page = later.transcript(id);
+    let window = page.window().expect("2 MiB passes a page");
+    let pending = permissions(&page);
+    assert_eq!(pending.len(), 1, "the pending permission is in the page");
+    let entry = pending[0].0;
+    assert_eq!(window.from, EntryId(entry), "the page starts at it");
+    later.answer(id, entry, Some("allow-once")).unwrap();
+    let log = later.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    assert_eq!(says(&log).last().map(String::as_str), Some("agent: done"));
+}
+
+#[test]
+fn a_tool_call_finished_outside_the_page_is_fetched_as_it_stands_now() {
+    let (mut dir, mut client) = agent_core("agent-page-tool", &[]);
+    let (mut script, _) = started(&dir.path, "page-tool");
+    script.step("expect session/prompt").step(update(json!({"sessionUpdate": "tool_call",
+        "toolCallId": "c1", "title": "Run", "kind": "execute", "status": "in_progress"})));
+    long_reply(&mut script, 32, MESSAGE_BYTES);
+    let gate = script.gate();
+    script
+        .step(update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"})))
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "has the reply", said_all(32));
+    client.detach(id);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    let tool_in = |log: &Transcript| {
+        log.entries().find_map(|(_, entry)| match entry {
+            Entry::Tool { status, .. } => Some(*status),
+            _ => None,
+        })
+    };
+    assert_eq!(tool_in(&later.transcript(id)), None, "the tool call is before the page");
+    gate.open();
+    later.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    let whole = later.fetch_to_start(id);
+    assert_eq!(tool_in(&whole), Some(ToolStatus::Completed));
+    assert_contiguous_from_1(&whole);
+}
+
+#[test]
+fn an_ended_agents_session_is_fetched_from_before_and_after_it_is_continued() {
+    let (mut dir, mut client) = agent_core("agent-page-ended", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "page-ended", RESUME_AND_LOAD);
+    let (events, more) = client.fetch(id, 2, 1024).unwrap();
+    assert!(!more);
+    assert!(matches!(events.as_slice(), [Event::Added { entry: Entry::User { text }, .. }] if text == "one"));
+
+    let (mut again, _) = initialized(&dir.path, "page-ended-again", RESUME_ONLY);
+    again.step("expect session/resume").step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    let (events, more) = client.fetch(id, 2, 1024).unwrap();
+    assert!(!more);
+    assert_eq!(events.len(), 1);
+}
+
+#[test]
+fn appended_checkpoints_survive_a_core_kill_and_fetch_back_to_the_same_log() {
+    let token = "token-agent-page-kill";
+    let (mut dir, mut client) = agent_core("agent-page-kill", &[]);
+    let (id, live) = long_session(&mut client, &mut dir, "page-kill");
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    // Its owner gets it back with the newest page.
+    let (start, _) = client.reconnect_replay();
+    assert_eq!(start.session, id);
+    assert!(client.transcript(id).window().is_some());
+    let whole = client.fetch_to_start(id);
+    assert_eq!(held_entries(&whole), held_entries(&live), "the same entries with the same ids");
+    assert_eq!(title_of(&whole), Some("Long talk"));
+}
+
+#[test]
+fn a_continued_sessions_first_checkpoint_is_whole_and_keeps_its_earlier_entries() {
+    let token = "token-agent-page-continued";
+    let (mut dir, mut client) = agent_core("agent-page-continued", &[]);
+    let id = ended_and_kept(&mut client, &mut dir, "continued", RESUME_AND_LOAD);
+    let (mut again, _) = initialized(&dir.path, "continued-again", RESUME_ONLY);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("second"))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the second turn", ended(2));
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    client.reconnect_replay();
+    let log = client.transcript_until(id, "is ready", ready);
+    assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: second"]);
+}

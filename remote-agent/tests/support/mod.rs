@@ -1329,6 +1329,66 @@ impl TestClient {
         self.agent_reply(req)
     }
 
+    /// `AGENT_FETCH` (OpenSpec change `agents-log-paging`): the entries
+    /// before `before` within `max_bytes`, as the `AGENT_PAGE` frames
+    /// answering it carry them, and whether more are earlier; or the
+    /// refusal. Other messages are kept for later.
+    pub fn fetch(
+        &mut self,
+        session: SessionId,
+        before: u64,
+        max_bytes: u32,
+    ) -> Result<(Vec<Event>, bool), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentFetch(client::AgentFetch {
+            req,
+            session,
+            before,
+            max_bytes,
+        }));
+        let mut kept = Vec::new();
+        let mut events = Vec::new();
+        let result = loop {
+            match self.recv() {
+                ToClient::AgentPage(page) if page.req == req => {
+                    assert_eq!(page.session, session);
+                    for value in &page.events {
+                        let event = Event::from_value(value)
+                            .unwrap_or_else(|error| panic!("AGENT_PAGE event {value}: {error}"));
+                        assert_eq!(event.to_value(), *value, "AGENT_PAGE event {value} isn't one of protocol 4's forms");
+                        events.push(event);
+                    }
+                    if let Some(last) = page.last {
+                        break Ok((std::mem::take(&mut events), last.more));
+                    }
+                }
+                ToClient::Error(error) if error.req == Some(req) => break Err(error),
+                other => kept.push(other),
+            }
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        result
+    }
+
+    /// Fetches the pages before the session's log's window, a whole page
+    /// at a time, folding each in front ([`Transcript::prepend`]) until the
+    /// core says none are earlier; gives the log, now held from its start
+    /// (or its trim). Live events read meanwhile are folded as they come.
+    pub fn fetch_to_start(&mut self, session: SessionId) -> Transcript {
+        while let Some(window) = self.transcript(session).window() {
+            let (events, more) = self
+                .fetch(session, window.from.0, brindle_transcript::PAGE_BYTES as u32)
+                .unwrap_or_else(|error| panic!("the fetch was refused: {}", error.message));
+            self.transcripts
+                .entry(session)
+                .or_default()
+                .prepend(&events, more)
+                .unwrap_or_else(|error| panic!("a fetched page doesn't fold: {error}"));
+        }
+        self.transcript(session)
+    }
+
     /// The agent session's log as this client has folded it so far.
     pub fn transcript(&self, session: SessionId) -> Transcript {
         self.transcripts.get(&session).cloned().unwrap_or_default()
@@ -1380,13 +1440,23 @@ impl TestClient {
         &mut self,
         session: SessionId,
     ) -> Result<client::ReplayStart, client::ErrorMessage> {
+        self.attach_agent_paged(session, None)
+    }
+
+    /// [`TestClient::attach_agent`] asking for a replay page of `page`
+    /// bytes (`ATTACH.page`, OpenSpec change `agents-log-paging`).
+    pub fn attach_agent_paged(
+        &mut self,
+        session: SessionId,
+        page: Option<u32>,
+    ) -> Result<client::ReplayStart, client::ErrorMessage> {
         let req = self.take_req();
         self.send(client::ToCore::Attach(client::Attach {
             req,
             session,
             cols: 0,
             rows: 0,
-            page: None,
+            page,
         }));
         let mut kept = Vec::new();
         let start = loop {

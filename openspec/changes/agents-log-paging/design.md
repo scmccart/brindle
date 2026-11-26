@@ -311,6 +311,16 @@ From the refresh (2026-11-26), against the built stack:
 20. **A segment merges consecutive `Appended`s of one entry** (decision 7). Recommend: accept; it costs a loop in the encoder and keeps a streamed reply's segment near the reply's size.
 21. **`AGENT_FETCH` joins `policy::AgentRequest`** for the protocol 4 refusal, and a session being adopted is refused as "replay hasn't ended" (decision 5).
 
+From the implementation (2026-11-26):
+
+22. **A `Window` with `earlier: 0` is refused** (`FoldError::WindowEmpty`, "a page's window at entry N has no earlier entries"), beside decision 4's errors. A window over nothing would move `next` with no record of why, and the replay round trip would then differ; the server never sends one (`replay_from` writes a window only when entries are earlier). Recommend: accept.
+23. **The holder refuses `CHECKPOINT_APPEND` below H1 3 by an explicit version check** (`holder::policy::append_open_refusal`, "CHECKPOINT_APPEND needs H1 version 3"). Decision 8 said "as `SPAWN_PIPES` is", but the holder doesn't refuse `SPAWN_PIPES` by version: the core simply never sends it below 3 (`placement`). The append is a storage change, so the holder checks it itself. Recommend: accept.
+24. **The holder transcripts run two connections**: `holder-checkpoint-append` ends with a `GOODBYE` and a second connection whose adoption returns the concatenation, as decision 8's "an adoption returning their concatenation" needs.
+25. **`policy::agent_appendable` is split out of `agent_checkpoint_form`**, so the core encodes a segment only when it could be appended (a step-down, a trim, an unknown store or a draining holder skip the encoding); `agent_checkpoint_form` takes the segment's length as `Option<u64>`, `None` for none encoded or too large. Same rules as decision 9.
+26. **A holder that hasn't welcomed the core counts as another build's** (`Holder::adoption` gives `Drain`), so its agent checkpoints are whole; the core places spawns only on welcomed holders, so this is unreachable in practice.
+27. **`Content::Agent` is boxed** (`Box<Agent>`): `Stored` and `unsaved` made the agent variant large enough for clippy's `large_enum_variant`, and the terminal's `Screen` was boxed for the same reason.
+28. **Real-role coverage left to pure tests:** a fetch refused while the replay is pending, a step-down writing whole, and a draining holder getting only whole checkpoints are pinned by the policy's unit tests and the `client-agent-fetch-refused` transcript; the real roles have no deterministic way to hold a replay pending or to observe which form a checkpoint took. The existing `upgrade.rs` agent cases (a turn, then a step-down, then the new core carrying the turn on) pass with appends in force.
+
 ## Risks / Trade-offs
 
 - [A release is cut before this change lands, freezing protocol 4 and H1 3 without paging] → hold the release PR until this change merges; if it happens anyway, this change moves to protocol 5 and H1 4 (decision 2).
