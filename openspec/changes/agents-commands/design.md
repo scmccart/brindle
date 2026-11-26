@@ -86,7 +86,7 @@ Event::Options  { options: Vec<SessionOption> } // the whole list, replacing the
 - The core sends an event only when the list differs from the one it holds (agents repeat them).
 - **Bounds** (`railway R5`), applied by the reducer before the event: at most `MAX_COMMANDS` = 256 commands and `MAX_OPTIONS` = 32 options with `MAX_CHOICES` = 256 choices each; names, values, ids, hints and group names bounded as ids are, descriptions at 1 KiB; every text cleaned. A list is also cut so its event stays under `TEXT_CHUNK` (64 KiB). What is dropped is said once in a notice ("the agent offered N commands; the first 256 are kept").
 - **A command's name must be typeable:** a name that is empty, or holds whitespace, a control character or `/`, is left out.
-- **Versions.** Client protocol 4 is unreleased and amended, as `agents-tool-content`'s decision 8 says: two event kinds, with new `tests/fixtures/v4/` files and none edited. The checkpoint keeps format 1, with the two lists and the option keys (decision 3) in its state; a checkpoint from before this change decodes with both empty.
+- **Versions.** Client protocol 4 is unreleased and amended, as `agents-tool-content`'s decision 8 says: two event kinds, with new `tests/fixtures/v4/` files and none edited. The checkpoint is format 2 (`agents-log-paging`), amended: the two lists travel as events in its base and segments, and the option keys (decision 3) are in its state; a checkpoint from before this change decodes with both empty (decision 12).
 
 ### 3. Options come from the dialect, each with its key (`acp/forms.rs`, `acp/v1/`)
 
@@ -110,12 +110,12 @@ Request::SetOption { session: &str, key: &OptionKey, value: OptionValue }
 
 ### 4. Setting an option (`acp/reduce.rs`, the core; `railway R1`, `R6`)
 
-- **The message.** `AGENT_SET_OPTION { session, option, value }` with `OptionValue::{ Choice { value: String }, Toggle { on: bool } }`, a new client message of protocol 4 (amended; its number is the next free one when the stack is assembled, after `AGENT_RESTART`, `AGENT_LOGIN` and `AGENT_FETCH`). Transcript tests pin its encoding, and it joins the protocol's fuzzing.
+- **The message.** `AGENT_SET_OPTION { session, option, value }` with `OptionValue::{ Choice { value: String }, Toggle { on: bool } }`, a new client message of protocol 4 (amended), numbered 24: `AGENT_RESTART` is 21, `AGENT_LOGIN` 22 and `AGENT_FETCH` 23. Transcript tests pin its encoding, and it joins the protocol's fuzzing.
 - **Checked before anything is sent** (the outcome is `Result<(), SetRefusal>`, answered `OK` or `ERROR` with the reason): `NotReady` (the agent isn't ready), `UnknownOption { id }`, `NotOffered { id, value }` (a choice the option doesn't list, or the wrong kind of value), `Busy` (an earlier set for this session hasn't been answered). A set naming the current value is `OK` and sends nothing.
 - **Any time the agent is ready**, during a turn too: ACP lets an agent take a change mid-turn or refuse it.
 - **The agent's answer is the truth.** Its result carries the whole list, which becomes `Event::Options` if it differs. For `session/set_mode` and `session/set_model`, whose results are empty, the reducer sets that option's current value itself. Brindle shows nothing as changed until the event arrives.
 - **The agent refuses** (a JSON-RPC error): the options stay, and the log gets a notice, "the agent didn't change NAME to VALUE: MESSAGE". The client's `OK` meant "asked", so the failure is shown where the session's other failures are, in the conversation.
-- **The agent never answers:** `Busy` holds until the agent's exit or the session's end clears it, as for any pending request.
+- **The agent never answers:** `Busy` holds until the agent stops, which clears it with the lists (decision 12), as for any pending request.
 
 ### 5. A mode change is on the record
 
@@ -167,7 +167,7 @@ In the second stage the line names the option command, and the rows are its choi
 
 ### 10. Restarts, crashes and upgrades (`process R1`–`R3`, `R12`)
 
-Commands, options and their keys are in the session's checkpoint. A core restart adopts them; a set in flight at the restart is lost with its `Busy` mark, and the option shows its old value until the user sets it again or the agent reports it. A Brindle crash loses nothing: both lists replay on attach. An upgrade's next core reads the same format 1.
+Commands, options and their keys are in the session's checkpoint. A core restart adopts them; a set in flight at the restart is lost with its `Busy` mark, and the option shows its old value until the user sets it again or the agent reports it. A Brindle crash loses nothing: both lists replay on attach. An upgrade's next core reads the same format 2. An agent that stops and is continued is decision 12's.
 
 ### 11. Tests
 
@@ -178,7 +178,25 @@ Commands, options and their keys are in the session's checkpoint. A core restart
 - **E2E:** `agent-command-completion`, `agent-option-set`, `agent-option-modes`, `agent-option-refused`, `agent-option-restore`.
 - **Manual:** pointer presses on a suggestion row and a footer item; a real agent's `/compact` and a mode switch.
 
+### 12. The built agent stack (refresh, 2026-11-26)
+
+This design was written before `agents-session-recovery`, `agents-login`, `agents-session-title`, `agents-zone-attention`, `agents-zone-theme-scope` and `agents-log-paging` were built. What they change here, each a decision of this design from now on:
+
+- **The lists belong to one run of the agent** (the user's decision, 2026-11-26). An agent zone now outlives its agent: an exited or lost agent's zone stays, with Continue, and a terminal login hangs the agent up and starts it again. When the agent stops, whatever the reason (`Exited`, `Lost`, `Refused`, `Broken`, `Restarting`), the reducer empties both lists, sending `Commands` and `Options` with empty lists when they held anything, and drops the keys and the `Busy` mark. The agent that runs next fills them again. So a stopped agent's zone shows no labels and offers no commands, and nothing stale can be set. *Rejected:* keeping the last lists on view, greyed, until the next agent answers.
+- **Every start answers with options.** ACP's `session/load` and `session/resume` answers carry `modes` and `configOptions` as `session/new`'s does (schema crate 1.22.0, `LoadSessionResponse`, `ResumeSessionResponse`), and the unstable `models` list is read from them the same way. The v1 module decodes all three answers through one function, and the reducer takes the options from whichever start the run made (`ready`).
+- **A load's replay changes the lists and nothing else.** During `session/load` the agent replays its conversation, `available_commands_update`, `config_option_update` and `current_mode_update` among it. As a replayed title is (`agents-session-title`), they are state, not log: they apply whether the replay is muted or shown, aren't counted among the muted updates, and add no notice. The load's answer comes after the replay, and its options are the ones that stand.
+- **A mode change across runs is still on the record** (decision 5). The reducer keeps, across a stop and in the checkpoint, the current value of each `Mode` option by its id as last in effect. The first list of a run adds "Mode: NAME" for a mode option whose value differs from the one kept, so an agent that comes back from a Continue in another mode says so. A session's first run has nothing kept and adds none, as before. Nothing is compared during a load's replay, only once the run is ready.
+- **`NotReady`** (decision 4) is every phase but `Ready`: spawning, initializing, creating, resuming, loading, needing or running a login, restarting, and stopped. With no options listed there are no option commands, so `/mode plan` typed at a stopped agent is text, refused as any prompt to a stopped agent is.
+- **The number** is 24 (decision 4).
+- **The checkpoint is format 2** (`agents-log-paging`, a base and appended segments). `Commands` and `Options` are log events: in the base's log as `replay()` emits them, and in a segment's `events`. The option keys, the `Busy` mark and the kept mode values are state fields, written whole in every record; with at most 32 options they stay small. A format 1 or format 2 checkpoint from before this change decodes with empty lists.
+- **Pages.** Both lists are state outside the entries, so `Transcript::page` emits them where `replay()` does, after `Agent`, in every page and outside the page's budget (each event is under 64 KiB). A fetch (`AGENT_FETCH`) carries entries only. The page laws (`fold(page(t, b)) == t.suffix(from)`) gain both lists.
+- **`initialize`.** `clientCapabilities` is `{"auth":{"terminal":true}}` today; the boolean option capability is added beside it.
+- **Drawing.** The suggestion list and the footer are parts of the zone, drawn from the zone's token set in the profile's theme (`agents-zone-theme-scope`); the options palette is the window's. Neither moves, so "Motion only while an agent works" is untouched.
+- **The dump.** `--- commands` and the `--- option` lines follow the `--- agent` line and its `--- note`; `agents-zone-attention`'s `--- working`, `--- spinner` and `--- motion` lines and paging's `earlier=` are unaffected.
+
 ## The user's decisions
+
+On 2026-11-26, after the stack under this change was built: while an agent is stopped its zone hides the labels and commands, the server dropping both lists and the continued agent filling them again, which the user chose over keeping the last known ones on view (decision 12).
 
 None is open. The user settled each on 2026-11-25, one at a time: options show as small labels under the prompt input, with palette actions, on the user's condition that slash commands change them too, which the option commands of decision 6 do.
 
