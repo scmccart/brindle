@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use gpui::{EntityInputHandler as _, FocusHandle, VisualTestContext};
+use gpui::{AnyElement, EntityInputHandler as _, FocusHandle, VisualTestContext, px};
 
 use super::*;
 use crate::agent::test_support::{Call, FAKE_PROFILE, Zone, added, app, ready, set_config, settle, user};
@@ -755,4 +755,76 @@ fn the_login_rows_words() {
     );
     let withheld = MethodOffer::Withheld(Withheld { why: "the login can't be run through `ssh`".into() });
     assert_eq!(words(method_description(&choice(None, withheld))).as_deref(), Some("the login can't be run through `ssh`"));
+}
+
+/// An agent view in a zone's card, as `zone_view.rs` draws one: alone, or
+/// as the first of a horizontal split's two zones.
+struct SplitHost {
+    view: Entity<AgentView>,
+    split: bool,
+}
+
+impl Render for SplitHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let card = |id: usize, child: AnyElement| {
+            brindle_ui::Card::new(("zone", id)).size_full().min_w_0().min_h_0().child(
+                div().id(("agent-zone", id)).size_full().min_w_0().min_h_0().child(child),
+            )
+        };
+        let zone = card(1, self.view.clone().into_any_element());
+        let root = div().w(px(800.)).h(px(500.)).flex().flex_col();
+        if !self.split {
+            return root.child(zone);
+        }
+        let half = |child: AnyElement| div().flex_1().min_w_0().min_h_0().size_full().child(child);
+        root.child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(crate::zone_view::ZONE_GAP))
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .child(half(zone.into_any_element()))
+                .child(half(card(2, div().into_any_element()).into_any_element())),
+        )
+    }
+}
+
+/// The spec's "Connecting after a split" in a view test: a connecting
+/// agent zone's reason line reads across the zone at its full width and,
+/// in the next frame, at half of it: at least as wide as `connecting`
+/// (0.6em a character in gpui's test text system) and at most two of the
+/// lines it takes at full width.
+#[test]
+fn the_connecting_line_reads_across_a_split_zone() {
+    let mut app = app();
+    let zone = Zone::new(None, &mut app);
+    let agent = zone.agent.clone();
+    let (host, cx) = app.add_window_view(|window, cx| {
+        let view = cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx));
+        SplitHost { view, split: false }
+    });
+    settle(cx);
+    let view = host.read_with(cx, |host, _| host.view.clone());
+    assert_eq!(
+        view.read_with(cx, |view, cx| view.prompt.read(cx).reason().map(|reason| reason.to_string())).as_deref(),
+        Some("connecting to the terminal server")
+    );
+    let size = f32::from(view.read_with(cx, |view, cx| view.text_size(cx)));
+    let connecting = px("connecting".len() as f32 * 0.6 * 0.75 * size);
+    let full = cx.debug_bounds("prompt-reason").expect("drawn");
+    assert!(full.size.height < px(2. * 0.75 * size), "at full width the reason isn't one line: {full:?}");
+    assert!(full.size.width >= connecting, "{full:?}");
+    cx.update(|_, cx| {
+        host.update(cx, |host, cx| {
+            host.split = true;
+            cx.notify();
+        })
+    });
+    settle(cx);
+    let half = cx.debug_bounds("prompt-reason").expect("drawn");
+    assert!(half.right() < px(400.), "the reason isn't in the split's first zone: {half:?}");
+    assert!(half.size.width >= connecting, "after the split: {half:?}");
+    assert!(half.size.height <= full.size.height * 2., "after the split: {half:?}, at full width {full:?}");
 }
