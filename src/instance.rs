@@ -11,7 +11,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Command, TabKind, TerminalLaunch};
+use crate::{AgentLaunch, Command, FirstPrompt, PromptArg, TabKind, TerminalLaunch};
+
+/// What an instance answers a request of the `agent` kind without its
+/// `agent` fields.
+const NO_AGENT_FIELDS: &str = "an agent request needs its agent fields";
 
 /// How long a launch waits for the instance to take its request.
 pub const FORWARD_LIMIT: Duration = Duration::from_secs(5);
@@ -41,6 +45,11 @@ pub struct Request {
     /// `brindle terminal -e`: the program and its arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
+    /// `brindle agent`'s fields, with `kind` `agent`. An agent request
+    /// fills none of `profile`, `cwd` and `command`, so an instance that
+    /// reads only those never takes it for a terminal launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentRequest>,
     /// `--attach`: a terminal server session id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach: Option<u32>,
@@ -52,6 +61,34 @@ pub struct Request {
     /// `DESKTOP_STARTUP_ID`), which lets the instance take focus on Wayland.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation_token: Option<String>,
+}
+
+/// `brindle agent [PROFILE] [-d DIR] [-p PROMPT]` in a request: the prompt
+/// is always text by then (the launch read `-p -`), and the directory is
+/// made absolute by the launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+impl AgentRequest {
+    /// The launch the request carries, its prompt checked again
+    /// ([`FirstPrompt::new`]).
+    fn launch(&self) -> Result<AgentLaunch, String> {
+        let prompt = match &self.prompt {
+            Some(text) => Some(PromptArg::Text(
+                FirstPrompt::new(text.clone()).map_err(|why| format!("the agent request's prompt: {why}"))?,
+            )),
+            None => None,
+        };
+        Ok(AgentLaunch { profile: self.profile.clone(), cwd: self.cwd.clone(), prompt })
+    }
 }
 
 impl Request {
@@ -68,8 +105,9 @@ impl Request {
     /// What the request asks for, from this version's launches and older
     /// and newer ones: `attach` wins (an older launch may send it with a
     /// profile); the `terminal` kind, or no kind with a profile, directory
-    /// or command (an older launch), is a terminal tab; no kind and none of
-    /// those only raises; any other kind is refused by name.
+    /// or command (an older launch), is a terminal tab; the `agent` kind,
+    /// with its `agent` fields, an agent tab; no kind and none of those
+    /// only raises; any other kind is refused by name.
     pub fn asked(&self) -> Result<Forward, String> {
         if let Some(session) = self.attach {
             return Ok(Forward::Attach(session));
@@ -83,6 +121,10 @@ impl Request {
         };
         match self.kind.as_deref() {
             Some(kind) if kind == TabKind::Terminal.word() => Ok(terminal()),
+            Some(kind) if kind == TabKind::Agent.word() => match &self.agent {
+                Some(agent) => agent.launch().map(Forward::Agent),
+                None => Err(NO_AGENT_FIELDS.into()),
+            },
             Some(kind) => Err(format!(
                 "this Brindle ({}) can't open {kind} tabs; quit it and launch again",
                 env!("CARGO_PKG_VERSION")
@@ -100,6 +142,8 @@ pub enum Forward {
     Raise,
     /// A terminal tab.
     Terminal(TerminalLaunch),
+    /// An agent tab; its prompt, if any, is [`PromptArg::Text`].
+    Agent(AgentLaunch),
     /// `--attach`: a tab on that detached session.
     Attach(u32),
 }
@@ -120,7 +164,7 @@ pub enum Answer {
 
 impl Answer {
     /// The answer's line.
-    fn line(&self) -> String {
+    pub fn line(&self) -> String {
         match self {
             Self::Accepted => "ok\n".to_string(),
             Self::Refused(why) => format!("error: {}\n", why.replace('\n', " ")),
@@ -528,6 +572,7 @@ mod tests {
             profile: Some("work".into()),
             cwd: Some("/srv".into()),
             command: Some(vec!["htop".into(), "-d".into(), "10".into()]),
+            agent: Some(AgentRequest { profile: Some("Fake".into()), cwd: Some("/src".into()), prompt: Some("hi".into()) }),
             attach: Some(7),
             launch_dir: Some("/home/u".into()),
             activation_token: Some("tok".into()),
@@ -599,9 +644,93 @@ mod tests {
 
     #[test]
     fn a_kind_this_brindle_cant_open_is_refused_by_name() {
-        let refused = Request::decode("{\"kind\":\"agent\",\"agent\":{}}\n").and_then(|request| request.asked());
+        let refused = Request::decode("{\"kind\":\"chat\",\"chat\":{}}\n").and_then(|request| request.asked());
         let why = refused.unwrap_err();
-        assert!(why.contains("agent") && why.contains(env!("CARGO_PKG_VERSION")), "{why}");
+        assert!(why.contains("can't open chat tabs") && why.contains(env!("CARGO_PKG_VERSION")), "{why}");
+    }
+
+    fn agent_launch(profile: Option<&str>, cwd: Option<&str>, prompt: Option<&str>) -> Result<Forward, String> {
+        Ok(Forward::Agent(AgentLaunch {
+            profile: profile.map(Into::into),
+            cwd: cwd.map(Into::into),
+            prompt: prompt.map(|text| PromptArg::Text(FirstPrompt::new(text.into()).unwrap())),
+        }))
+    }
+
+    /// `process R6`: an agent request's line, byte for byte, with each
+    /// field and with none, and what it decodes to.
+    #[test]
+    fn agent_requests_are_pinned() {
+        let full = Request {
+            kind: Some("agent".into()),
+            agent: Some(AgentRequest {
+                profile: Some("Fake".into()),
+                cwd: Some("/src".into()),
+                prompt: Some("run the tests".into()),
+            }),
+            launch_dir: Some("/home/u/src".into()),
+            ..Default::default()
+        };
+        let line = "{\"kind\":\"agent\",\"agent\":{\"profile\":\"Fake\",\"cwd\":\"/src\",\"prompt\":\"run the tests\"},\
+                    \"launch_dir\":\"/home/u/src\"}\n";
+        assert_eq!(full.encode(), line, "brindle agent Fake -d /src -p 'run the tests', launched in /home/u/src");
+        assert_eq!(Request::decode(line), Ok(full.clone()));
+        assert_eq!(full.asked(), agent_launch(Some("Fake"), Some("/src"), Some("run the tests")));
+        let bare = Request { kind: Some("agent".into()), agent: Some(AgentRequest::default()), ..Default::default() };
+        assert_eq!(bare.encode(), "{\"kind\":\"agent\",\"agent\":{}}\n", "brindle agent alone");
+        assert_eq!(bare.asked(), agent_launch(None, None, None));
+        let asked = |line: &str| Request::decode(line).and_then(|request| request.asked());
+        assert_eq!(asked("{\"kind\":\"agent\",\"agent\":{\"profile\":\"F\"}}\n"), agent_launch(Some("F"), None, None));
+        assert_eq!(asked("{\"kind\":\"agent\",\"agent\":{\"prompt\":\"hi\"}}\n"), agent_launch(None, None, Some("hi")));
+        assert_eq!(asked("{\"kind\":\"agent\",\"agent\":{\"cwd\":\"/srv\"}}\n"), agent_launch(None, Some("/srv"), None));
+        assert_eq!(
+            asked("{\"kind\":\"agent\",\"agent\":{\"profile\":\"F\",\"future\":1}}\n"),
+            agent_launch(Some("F"), None, None),
+            "unknown fields inside the agent fields are ignored"
+        );
+    }
+
+    #[test]
+    fn an_agent_request_without_its_fields_or_with_a_bad_prompt_is_refused() {
+        let asked = |line: &str| Request::decode(line).and_then(|request| request.asked());
+        assert_eq!(asked("{\"kind\":\"agent\"}\n"), Err("an agent request needs its agent fields".into()));
+        assert_eq!(
+            asked("{\"kind\":\"agent\",\"profile\":\"Fake\"}\n"),
+            Err("an agent request needs its agent fields".into()),
+            "the terminal fields don't stand in for them"
+        );
+        assert_eq!(
+            asked("{\"kind\":\"agent\",\"agent\":{\"prompt\":\" \"}}\n"),
+            Err("the agent request's prompt: the prompt is blank".into())
+        );
+        assert_eq!(
+            asked("{\"attach\":7,\"kind\":\"agent\"}\n"),
+            Ok(Forward::Attach(7)),
+            "attach wins, as for any request"
+        );
+    }
+
+    /// An agent request goes through `fits`, the one size check: 256 KiB
+    /// of ordinary text fits; 256 KiB of control characters, each escaped
+    /// as six bytes, doesn't, and is refused before connecting.
+    #[test]
+    fn an_agent_requests_size_is_checked_by_fits() {
+        let with_prompt = |prompt: String| Request {
+            kind: Some("agent".into()),
+            agent: Some(AgentRequest { profile: Some("Fake".into()), cwd: None, prompt: Some(prompt) }),
+            launch_dir: Some("/home/u".into()),
+            ..Default::default()
+        };
+        let plain = with_prompt("x".repeat(crate::PROMPT_LIMIT));
+        assert_eq!(fits(&plain.encode()), Ok(()));
+        assert_eq!(Request::decode(&plain.encode()).map(|r| r.asked().is_ok()), Ok(true));
+        let controls = with_prompt("\u{1}".repeat(crate::PROMPT_LIMIT));
+        assert!(FirstPrompt::new("\u{1}".repeat(crate::PROMPT_LIMIT)).is_ok(), "a prompt the launch took");
+        assert_eq!(controls.agent.as_ref().and_then(|a| a.prompt.as_ref()).map(String::len), Some(crate::PROMPT_LIMIT));
+        let line = controls.encode();
+        assert!(line.len() > 1 << 20, "{} bytes", line.len());
+        let why = fits(&line).unwrap_err();
+        assert!(why.contains("over the 1 MiB a running Brindle takes"), "{why}");
     }
 
     /// `process R6`: the three answer lines, written and read back.

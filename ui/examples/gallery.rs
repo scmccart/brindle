@@ -34,6 +34,10 @@ use brindle_ui::{
     Switch, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger, TabWidth, TextInput, Toggle, ToggleSize,
     ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
+use brindle_ui::{
+    Alert, AlertVariant, BubblePart, Confirmation, ConfirmationAction, ConfirmationState, Message, MessageFrom,
+    MessageScroller, PromptInput, PromptInputEvent, PromptStatus, Reasoning, Tool, ToolStatus,
+};
 use gpui::{
     App, Application, Bounds, ClickEvent, Context, DismissEvent, Div, ElementId, Entity, EventEmitter, FocusHandle,
     Focusable, Hsla,
@@ -363,8 +367,68 @@ pub struct Gallery {
     tab_log: Vec<String>,
     /// Each corner popover's panel bounds while it is open.
     corners: [Rc<Cell<Option<Bounds<Pixels>>>>; 4],
+    /// The AI elements: a conversation and its items, a prompt input, a
+    /// reasoning block and a permission.
+    conversation: Entity<MessageScroller>,
+    conversation_items: Rc<RefCell<Vec<DemoItem>>>,
+    prompt: Entity<PromptInput>,
+    /// What the prompt input asked, in order: `submit:TEXT`, `stop`,
+    /// `remove`, `resend`.
+    prompt_log: Vec<String>,
+    thought_open: bool,
+    permission: ConfirmationState,
+    /// The permission's actions pressed, by label, in order.
+    permission_log: Vec<String>,
     scroll: ScrollHandle,
     _subscriptions: Vec<Subscription>,
+}
+
+/// One item of the demo conversation.
+#[derive(Clone)]
+enum DemoItem {
+    Message(MessageFrom, BubblePart, SharedString),
+    Tool(Icon, &'static str, ToolStatus),
+}
+
+fn demo_conversation() -> Vec<DemoItem> {
+    use DemoItem::{Message, Tool};
+    let mut items = vec![
+        Message(MessageFrom::User, BubblePart::Whole, "Why does the build fail on Windows?".into()),
+        Tool(Icon::FileText, "Read build-windows.yml", ToolStatus::Done),
+        Tool(Icon::Terminal, "cargo build --release --locked --target x86_64-pc-windows-msvc", ToolStatus::Failed),
+        Message(MessageFrom::Assistant, BubblePart::First, "The release build needs the SDK's fxc.exe.".into()),
+        Message(
+            MessageFrom::Assistant,
+            BubblePart::Middle,
+            "It is looked for on PATH, then in SDK 10.0.26100.0, then where GPUI_FXC_PATH says.".into(),
+        ),
+        Message(MessageFrom::Assistant, BubblePart::Last, "Set GPUI_FXC_PATH from the runner's newest SDK.".into()),
+    ];
+    for n in 1..=6 {
+        items.push(Message(MessageFrom::User, BubblePart::Whole, format!("Another question, number {n}.").into()));
+        items.push(Message(MessageFrom::Assistant, BubblePart::Whole, format!("Another answer,\nnumber {n}.").into()));
+    }
+    items
+}
+
+fn render_demo_item(item: &DemoItem, ix: usize) -> gpui::AnyElement {
+    let item = match item {
+        DemoItem::Message(from, part, text) => {
+            let message = Message::text(("demo-message", ix), *from, text.clone()).part(*part);
+            let message = match (from, part) {
+                (MessageFrom::Assistant, BubblePart::Whole | BubblePart::Last) => message.action(
+                    Button::icon_only(("demo-copy", ix), Icon::Copy)
+                        .variant(ButtonVariant::Ghost)
+                        .size(ButtonSize::IconXs)
+                        .tooltip_for("Copy", None),
+                ),
+                (MessageFrom::Assistant, BubblePart::First | BubblePart::Middle) | (MessageFrom::User, _) => message,
+            };
+            message.into_any_element()
+        }
+        DemoItem::Tool(icon, title, status) => div().py_1().child(Tool::new(*icon, *title, *status)).into_any_element(),
+    };
+    div().px_4().child(item).into_any_element()
 }
 
 impl Gallery {
@@ -379,7 +443,7 @@ impl Gallery {
                 "disabled", "icon-label", "behind", "open-dialog", "open-stubborn", "open-sticky", "open-command-dialog",
                 "command-popover", "corner-0", "corner-1", "corner-2", "corner-3", "checkbox", "checkbox-off", "switch",
                 "switch-off", "theme", "toggle", "toggle-off", "dropdown-trigger", "long-dropdown-trigger", "tabs-default",
-                "tabs-plain", "tabs-strip",
+                "tabs-plain", "tabs-strip", "confirm-allow", "confirm-reject",
             ]
             .map(String::from),
         );
@@ -422,6 +486,17 @@ impl Gallery {
                 .with_empty_message("No font found.")
         });
         let command = cx.new(|cx| Command::new(command_groups(), cx));
+        let conversation_items = Rc::new(RefCell::new(demo_conversation()));
+        let conversation = {
+            let count = conversation_items.borrow().len();
+            let items = conversation_items.clone();
+            cx.new(|cx| MessageScroller::new(count, move |ix, _, _| render_demo_item(&items.borrow()[ix], ix), cx))
+        };
+        let prompt = cx.new(|cx| {
+            let mut prompt = PromptInput::new(cx);
+            prompt.set_placeholder("Ask anything…", cx);
+            prompt
+        });
         // Focus starts on the gallery itself, inside its focus scope, so the
         // first Tab reaches the first control.
         let focus = cx.focus_handle();
@@ -471,6 +546,27 @@ impl Gallery {
                 this.menu_log.push(format!("long:{label}"));
                 cx.notify();
             }),
+            // The demo's owner: a submitted text joins the conversation and
+            // leaves the draft, as an app would once the prompt is taken.
+            cx.subscribe(&prompt, |this, prompt, event: &PromptInputEvent, cx| {
+                let entry = match event {
+                    PromptInputEvent::Submit(text) => {
+                        let count = {
+                            let mut items = this.conversation_items.borrow_mut();
+                            items.push(DemoItem::Message(MessageFrom::User, BubblePart::Whole, text.clone().into()));
+                            items.len()
+                        };
+                        this.conversation.update(cx, |scroller, cx| scroller.splice(count - 1..count - 1, 1, cx));
+                        prompt.update(cx, |prompt, cx| prompt.set_text("", cx));
+                        format!("submit:{text}")
+                    }
+                    PromptInputEvent::Stop => "stop".to_string(),
+                    PromptInputEvent::RemoveQueued => "remove".to_string(),
+                    PromptInputEvent::ResendQueued => "resend".to_string(),
+                };
+                this.prompt_log.push(entry);
+                cx.notify();
+            }),
         ];
         Self {
             focus,
@@ -502,6 +598,13 @@ impl Gallery {
             tabs: initial_tabs(),
             tab_log: Vec::new(),
             corners: Default::default(),
+            conversation,
+            conversation_items,
+            prompt,
+            prompt_log: Vec::new(),
+            thought_open: false,
+            permission: ConfirmationState::Requested,
+            permission_log: Vec::new(),
             scroll: ScrollHandle::new(),
             _subscriptions: subscriptions,
         }
@@ -1329,6 +1432,120 @@ impl Gallery {
             )
     }
 
+    /// The AI elements: a conversation over a prompt input, and beside it a
+    /// reasoning block, tool rows, a permission and two alerts.
+    fn ai_section(&self, cx: &mut Context<Self>) -> Div {
+        let t = *cx.ui_theme();
+        let gallery = cx.weak_entity();
+        let toggled = gallery.clone();
+        let permission = Confirmation::new("demo-permission", "Run `cargo test --workspace`?", self.permission.clone())
+            .action(
+                ConfirmationAction::new("Allow once")
+                    .key("allow-once")
+                    .variant(ButtonVariant::Default)
+                    .focus(&self.handle("confirm-allow")),
+            )
+            .action(ConfirmationAction::new("Reject").key("reject").focus(&self.handle("confirm-reject")))
+            .on_action(move |key, _, cx| {
+                let (label, state): (SharedString, fn(SharedString) -> ConfirmationState) = match key.as_str() {
+                    "allow-once" => ("Allow once".into(), |label| ConfirmationState::Accepted { label }),
+                    _ => ("Reject".into(), |label| ConfirmationState::Rejected { label }),
+                };
+                gallery
+                    .update(cx, |gallery, cx| {
+                        gallery.permission_log.push(label.to_string());
+                        gallery.permission = state(label);
+                        cx.notify();
+                    })
+                    .ok();
+            });
+        let thought = Reasoning::new("demo-thought", self.thought_open)
+            .label(if self.thought_open { "Thought for 4s" } else { "Thinking…" })
+            .on_toggle(move |open, _, cx| {
+                toggled
+                    .update(cx, |gallery, cx| {
+                        gallery.thought_open = open;
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .child("The workflow names fxc.exe; the SDK path moved with 10.0.26100.0.");
+        div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(heading("AI elements", cx))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_6()
+                    .child(
+                        div()
+                            .w(px(480.))
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .h(px(260.))
+                                    .flex()
+                                    .flex_col()
+                                    .rounded(t.radius_lg())
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .overflow_hidden()
+                                    .child(self.conversation.clone()),
+                            )
+                            .child(recorded(self.prompt.clone(), "prompt-input", &self.records)),
+                    )
+                    .child(
+                        div()
+                            .w(px(380.))
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(thought)
+                            .child(Tool::new(Icon::Search, "Search for fxc.exe", ToolStatus::Pending))
+                            .child(Tool::new(Icon::Globe, "Fetch the Windows SDK release notes", ToolStatus::Running))
+                            .child(Tool::new(Icon::Pencil, "Edit .github/workflows/build-windows.yml", ToolStatus::Failed))
+                            .child(permission)
+                            .child(Alert::new("Heads up").description("The agent edits files in this directory."))
+                            .child(
+                                Alert::new("Brindle could not start the agent")
+                                    .variant(AlertVariant::Destructive)
+                                    .description("npx: command not found"),
+                            ),
+                    ),
+            )
+            .child(div().text_size(px(12.)).text_color(t.muted_foreground).child(format!(
+                "Prompt: {}  Permission: {}",
+                self.prompt_log.last().map_or("—", String::as_str),
+                self.permission_log.last().map_or("—", String::as_str)
+            )))
+    }
+
+    /// Puts the AI elements back as they started (the checks' reset).
+    pub fn reset_ai(&mut self, cx: &mut Context<Self>) {
+        self.prompt.update(cx, |prompt, cx| {
+            prompt.set_text("", cx);
+            prompt.set_status(PromptStatus::Ready, cx);
+            prompt.set_queued(None, cx);
+            prompt.set_reason(None, cx);
+        });
+        let count = {
+            let mut items = self.conversation_items.borrow_mut();
+            *items = demo_conversation();
+            items.len()
+        };
+        self.conversation.update(cx, |scroller, cx| scroller.reset(count, cx));
+        self.prompt_log.clear();
+        self.thought_open = false;
+        self.permission = ConfirmationState::Requested;
+        self.permission_log.clear();
+        cx.notify();
+    }
+
     fn status(&self, cx: &mut Context<Self>) -> Div {
         let t = cx.ui_theme();
         let shell = self.shell.read(cx);
@@ -1417,10 +1634,18 @@ impl FocusStops for Gallery {
         stops.extend(named(&["icon-label"]));
         stops.push(self.name.focus_handle(cx));
         stops.push(self.email.focus_handle(cx));
-        stops.extend(named(&[
-            "checkbox", "switch", "toggle", "tabs-default", "tabs-plain", "tabs-strip", "corner-0", "corner-1", "corner-2",
-            "corner-3",
-        ]));
+        stops.extend(named(&["checkbox", "switch", "toggle", "tabs-default", "tabs-plain", "tabs-strip"]));
+        // The AI elements, as an agent's zone orders them: the prompt, its
+        // queue row's buttons, the permission's while requested, and the
+        // stop button while streaming.
+        let prompt = self.prompt.read(cx);
+        stops.push(prompt.focus_handle(cx));
+        stops.extend(prompt.row_stops());
+        if self.permission == ConfirmationState::Requested {
+            stops.extend(named(&["confirm-allow", "confirm-reject"]));
+        }
+        stops.extend(prompt.stop_button());
+        stops.extend(named(&["corner-0", "corner-1", "corner-2", "corner-3"]));
         stops
     }
 }
@@ -1451,6 +1676,7 @@ impl Render for Gallery {
             .child(self.toggle_tooltip_section(cx))
             .child(self.tabs_section(cx))
             .child(self.cards_section(cx))
+            .child(self.ai_section(cx))
             .child(self.status(cx));
         // The scope's Tab binding is reached only from focus inside it, so
         // the gallery's own handle, focused at start and by the checks'
@@ -2340,6 +2566,7 @@ mod check {
             self.with(|gallery, window, cx| {
                 gallery.close_all(window, cx);
                 gallery.reset_tabs(cx);
+                gallery.reset_ai(cx);
                 gallery.scroll.set_offset(point(px(0.), px(0.)));
                 // Back to the gallery itself, as a page's body.
                 window.focus(&gallery.focus);
@@ -2612,6 +2839,18 @@ mod check {
         c.run_check("card-ring-is-a-band-outside-the-border-taking-no-room", check).await;
         let check = card_corners(&mut c).await;
         c.run_check("card-corners-show-the-surround-over-square-content", check).await;
+        let check = textarea_line_keys(&mut c).await;
+        c.run_check("textarea-shift-enter-breaks-the-line-and-up-down-keep-the-column", check).await;
+        let check = prompt_enter_submits_and_blank_asks_nothing(&mut c).await;
+        c.run_check("prompt-input-blank-enter-asks-nothing-then-enter-submits", check).await;
+        let check = prompt_stop_while_streaming(&mut c).await;
+        c.run_check("prompt-input-escape-and-the-stop-button-stop-while-streaming", check).await;
+        let check = prompt_queue_row(&mut c).await;
+        c.run_check("prompt-input-queue-row-buttons-are-stops-asking-the-owner", check).await;
+        let check = confirmation_space_on_reject(&mut c).await;
+        c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
+        let check = scroller_keeps_the_view_while_away(&mut c).await;
+        c.run_check("message-scroller-item-added-while-away-keeps-the-view", check).await;
 
         println!("--- {} ok, {} skipped, {} failed", c.ok, c.skipped, c.failed);
         let _ = std::io::stdout().flush();
@@ -4125,6 +4364,16 @@ mod check {
     /// gives focus back to the trigger. Up, left, right, home, end and
     /// ctrl-n don't open it.
     async fn dropdown_keys(c: &mut Checker) -> Check {
+        // Room below the trigger for the whole menu: the sections above it
+        // put it low enough in the window that the menu would flip above.
+        let low = dropdown_trigger(c, Which::Dropdown)?;
+        c.with(move |gallery, window, _| {
+            let offset = gallery.scroll.offset();
+            gallery.scroll.set_offset(point(offset.x, offset.y - (low.top() - px(120.))));
+            window.refresh();
+        })?;
+        c.tick().await;
+        c.tick().await;
         let trigger = dropdown_trigger(c, Which::Dropdown)?;
         let handle = c.handle("dropdown-trigger")?;
         for key in ["enter", "space", "down"] {
@@ -4488,10 +4737,14 @@ mod check {
     /// trigger to trigger) and on past the last; shift-Tab comes back.
     async fn tabs_one_stop(c: &mut Checker) -> Check {
         c.focus("toggle").await?;
-        for name in ["tabs-default", "tabs-plain", "tabs-strip", "corner-0"] {
+        for name in ["tabs-default", "tabs-plain", "tabs-strip"] {
             c.key("tab").await?;
             ensure!(c.focused_name(name)?, "Tab didn't move on to {name}");
         }
+        // Past the last list, on to the next stop: the prompt input.
+        c.key("tab").await?;
+        let prompt = c.with(|gallery, _, cx| gallery.prompt.focus_handle(cx))?;
+        ensure!(c.focused(&prompt)?, "Tab didn't move on past the strip list to the prompt input");
         c.key("shift-tab").await?;
         ensure!(c.focused_name("tabs-strip")?, "shift-Tab didn't come back to the strip list");
         Ok(())
@@ -4996,6 +5249,183 @@ mod check {
         }
         ensure!(near(shown[4], square), "the content shows {:?}, not its square {square:?}", shown[4]);
         ensure!(near(shown[5], border), "the border over the content is {:?}, not {border:?}", shown[5]);
+        Ok(())
+    }
+
+    // ---- the AI elements ----------------------------------------------------
+
+    use brindle_ui::{ConfirmationState, Follow, PageDirection, PromptStatus, Queued, Resend};
+
+    /// The prompt input's text, cursor and what it asked the gallery.
+    fn prompt_state(c: &mut Checker) -> Result<(String, usize, Vec<String>), Failure> {
+        c.with(|gallery, _, cx| {
+            let area = gallery.prompt.read(cx).area().read(cx);
+            (area.text().to_string(), area.cursor(), gallery.prompt_log.clone())
+        })
+    }
+
+    async fn focus_prompt(c: &mut Checker) -> Result<(), Failure> {
+        let handle = c.with(|gallery, _, cx| gallery.prompt.focus_handle(cx))?;
+        c.focus_handle(&handle).await
+    }
+
+    async fn type_text(c: &mut Checker, text: &str) -> Result<(), Failure> {
+        for ch in text.chars() {
+            c.key(&ch.to_string()).await?;
+        }
+        Ok(())
+    }
+
+    /// The `text-input` scenarios keys drive in a text area, through the
+    /// app's keymap: shift-enter breaks the line, up and down keep the
+    /// column, and enter goes on to the owner.
+    async fn textarea_line_keys(c: &mut Checker) -> Check {
+        focus_prompt(c).await?;
+        type_text(c, "abc").await?;
+        c.key("shift-enter").await?;
+        type_text(c, "d").await?;
+        let (text, cursor, _) = prompt_state(c)?;
+        ensure!(text == "abc\nd" && cursor == 5, "shift-enter and d gave {text:?} at {cursor}");
+        c.key("up").await?;
+        let (_, cursor, _) = prompt_state(c)?;
+        ensure!(cursor == 1, "up from the second line's column 1 went to {cursor}, not 1");
+        c.key("end").await?;
+        c.key("down").await?;
+        let (_, cursor, _) = prompt_state(c)?;
+        ensure!(cursor == 5, "down from the end of `abc` went to {cursor}, not the end of `d` (5)");
+        Ok(())
+    }
+
+    /// The spec's "Blank text", then enter with text submits it, and the
+    /// gallery, as owner, clears the draft.
+    async fn prompt_enter_submits_and_blank_asks_nothing(c: &mut Checker) -> Check {
+        focus_prompt(c).await?;
+        c.key("enter").await?;
+        c.key("space").await?;
+        c.key("enter").await?;
+        let (text, _, log) = prompt_state(c)?;
+        ensure!(log.is_empty(), "enter in a blank prompt asked {log:?}");
+        ensure!(text == " ", "the blank prompt's text is {text:?}");
+        let items = c.with(|gallery, _, _| gallery.conversation_items.borrow().len())?;
+        type_text(c, "hi").await?;
+        c.key("enter").await?;
+        let (text, _, log) = prompt_state(c)?;
+        ensure!(log == [" hi"].map(|t| format!("submit:{t}")), "enter with text asked {log:?}");
+        ensure!(text.is_empty(), "the owner's clear left {text:?}");
+        let after = c.with(|gallery, _, cx| (gallery.conversation_items.borrow().len(), gallery.conversation.read(cx).follow()))?;
+        ensure!(after == (items + 1, Follow::AtEnd), "the conversation is {after:?}, not one longer and at its end");
+        Ok(())
+    }
+
+    /// The spec's "Stop while streaming", by its keys: escape in the text
+    /// area and enter on the stop button ask to stop; ready, escape asks
+    /// nothing.
+    async fn prompt_stop_while_streaming(c: &mut Checker) -> Check {
+        c.with(|gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_status(PromptStatus::Streaming, cx)))?;
+        focus_prompt(c).await?;
+        c.key("escape").await?;
+        let stop = c.with(|gallery, _, cx| gallery.prompt.read(cx).stop_button())?;
+        let Some(stop) = stop else { fail!("streaming, the prompt input has no stop button") };
+        // The stop button is the last stop before the corners: Tab from the
+        // permission's last button lands on it.
+        c.focus("confirm-reject").await?;
+        c.key("tab").await?;
+        ensure!(c.focused(&stop)?, "Tab from the permission's last button didn't reach the stop button");
+        c.key("enter").await?;
+        let (_, _, log) = prompt_state(c)?;
+        ensure!(log == ["stop", "stop"], "escape and enter on the stop button asked {log:?}");
+        c.with(|gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_status(PromptStatus::Ready, cx)))?;
+        focus_prompt(c).await?;
+        c.key("escape").await?;
+        let (_, _, log) = prompt_state(c)?;
+        ensure!(log.len() == 2, "escape while ready asked {log:?}");
+        Ok(())
+    }
+
+    /// The spec's "Queued row" and "Held row", by keys: the row's buttons
+    /// follow the text area in Tab order, each asks the owner, and the
+    /// draft is untouched.
+    async fn prompt_queue_row(c: &mut Checker) -> Check {
+        focus_prompt(c).await?;
+        type_text(c, "draft").await?;
+        let held = Queued::Held { text: "next".into(), reason: "the turn was stopped".into(), resend: Resend::Available };
+        c.with(move |gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_queued(Some(held), cx)))?;
+        c.tick().await;
+        let stops = c.with(|gallery, _, cx| gallery.prompt.read(cx).row_stops())?;
+        ensure!(stops.len() == 2, "a held row has {} stops, not send again and discard", stops.len());
+        c.key("tab").await?;
+        ensure!(c.focused(&stops[0])?, "Tab from the text area didn't reach send again");
+        c.key("space").await?;
+        c.key("tab").await?;
+        ensure!(c.focused(&stops[1])?, "Tab from send again didn't reach discard");
+        c.key("enter").await?;
+        let waiting = Queued::Waiting { text: "next".into() };
+        c.with(move |gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_queued(Some(waiting), cx)))?;
+        c.tick().await;
+        let stops = c.with(|gallery, _, cx| gallery.prompt.read(cx).row_stops())?;
+        ensure!(stops.len() == 1, "a waiting row has {} stops, not its remove button", stops.len());
+        c.focus_handle(&stops[0]).await?;
+        c.key("space").await?;
+        let (text, _, log) = prompt_state(c)?;
+        ensure!(log == ["resend", "remove", "remove"], "the row's buttons asked {log:?}");
+        ensure!(text == "draft", "the row changed the draft to {text:?}");
+        Ok(())
+    }
+
+    /// The spec's "Requested" and "Answered": space on the focused Reject
+    /// asks for it; answered, the outcome shows and the buttons are no
+    /// stops.
+    async fn confirmation_space_on_reject(c: &mut Checker) -> Check {
+        c.focus("confirm-reject").await?;
+        c.key("space").await?;
+        let (log, state) = c.with(|gallery, _, _| (gallery.permission_log.clone(), gallery.permission.clone()))?;
+        ensure!(log == ["Reject"], "space on Reject asked {log:?}");
+        ensure!(
+            state == ConfirmationState::Rejected { label: "Reject".into() },
+            "the permission is {state:?}, not rejected with Reject"
+        );
+        let reject = c.handle("confirm-reject")?;
+        let listed = c.with(move |gallery, _, cx| {
+            use brindle_ui::FocusStops as _;
+            gallery.stops(cx).contains(&reject)
+        })?;
+        ensure!(!listed, "an answered permission's button is still a stop");
+        Ok(())
+    }
+
+    /// The spec's "Scrolled away": paged up, an item added at the end
+    /// leaves the list's position alone; the end follows again after.
+    async fn scroller_keeps_the_view_while_away(c: &mut Checker) -> Check {
+        c.with(|gallery, _, cx| gallery.conversation.update(cx, |s, cx| s.scroll_page(PageDirection::Up, cx)))?;
+        c.tick().await;
+        let top = |c: &mut Checker| {
+            c.with(|gallery, _, cx| {
+                let s = gallery.conversation.read(cx);
+                let top = s.scroll_top();
+                (s.follow(), top.item_ix, top.offset_in_item)
+            })
+        };
+        let before = top(c)?;
+        ensure!(before.0 == Follow::Away, "a page up left the scroller following its end");
+        c.with(|gallery, _, cx| {
+            let count = {
+                let mut items = gallery.conversation_items.borrow_mut();
+                items.push(super::DemoItem::Message(
+                    brindle_ui::MessageFrom::Assistant,
+                    brindle_ui::BubblePart::Whole,
+                    "A late answer.".into(),
+                ));
+                items.len()
+            };
+            gallery.conversation.update(cx, |s, cx| s.splice(count - 1..count - 1, 1, cx));
+        })?;
+        c.tick().await;
+        let after = top(c)?;
+        ensure!(after == before, "an item added while away moved the list from {before:?} to {after:?}");
+        c.with(|gallery, _, cx| gallery.conversation.update(cx, |s, cx| s.scroll_to_end(cx)))?;
+        c.tick().await;
+        let end = top(c)?;
+        ensure!(end.0 == Follow::AtEnd, "scrolling to the end didn't follow it ({end:?})");
         Ok(())
     }
 }

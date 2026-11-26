@@ -29,6 +29,7 @@
 //! and each remote connection tells [`watch_hosts`]' callback how it
 //! stands, for `remote::hosts::Hosts`.
 
+mod agent;
 mod connection;
 mod link;
 #[cfg(windows)]
@@ -89,11 +90,12 @@ const BUSY_LIMIT: Duration = HELLO_LIMIT;
 /// after a relay link drops, for the reconnect to get them back.
 const RELAY_LINGER_SECS: u32 = 300;
 
-/// The client protocols Brindle offers: 1 to 3. Protocol 4 adds agent
-/// sessions, which Brindle doesn't show yet (`agents-sessions` section 8
-/// lifts this), so it never negotiates a version whose sessions it would
-/// list or attach without being able to show them.
-const BRINDLE_PROTOCOLS: client::VersionRange = client::VersionRange::new(1, 3);
+/// The client protocols Brindle offers: every one the codec knows, 1 to 4.
+/// Protocol 4 adds agent sessions, which restore, the sweep, `--attach`
+/// and the sessions palette tell apart from terminals (`agents-profiles`
+/// design.md decision 6). With a core that can't go past 3, agent zones
+/// say the server is too old (`agent_start`).
+const BRINDLE_PROTOCOLS: client::VersionRange = client::PROTOCOLS;
 /// How long an exiting Brindle waits, at most, for its connections to write
 /// what its closing tabs sent ([`flush`]). Writing to a link that is up
 /// takes far less.
@@ -171,7 +173,7 @@ pub(crate) fn shared_with(host: &Host, helper: &HelperLookup) -> Result<Arc<Conn
                 }) as Report
             });
             let token = host_token(client_token(), host);
-            Connection::relay_with(dial, &token, relay::Timings::default(), eager, report)
+            Connection::relay_with(dial, &token, BRINDLE_PROTOCOLS, relay::Timings::default(), eager, report)
         }
     })
 }
@@ -558,10 +560,20 @@ impl Endpoint {
 pub struct Connected {
     pub stream: Stream,
     pub welcome: Welcome,
+    /// The client protocols its `HELLO` offered, which a connection made on
+    /// it offers again when it reconnects.
+    pub offer: client::VersionRange,
 }
 
-/// Connects to the core, starting one if none is listening, and negotiates.
+/// Connects to the core, starting one if none is listening, and negotiates
+/// Brindle's protocols ([`BRINDLE_PROTOCOLS`]).
 pub fn connect(endpoint: &Endpoint, token: &str) -> Result<Connected> {
+    connect_offering(endpoint, token, BRINDLE_PROTOCOLS)
+}
+
+/// [`connect`], offering the client protocols `offer`: the tests' way to
+/// reach protocol 4 while Brindle's own offer stops below it.
+pub fn connect_offering(endpoint: &Endpoint, token: &str, offer: client::VersionRange) -> Result<Connected> {
     let stream = match try_connect(endpoint)? {
         Some(stream) => stream,
         None => {
@@ -569,7 +581,7 @@ pub fn connect(endpoint: &Endpoint, token: &str) -> Result<Connected> {
             connect_started(endpoint)?
         }
     };
-    hello(stream, token)
+    hello_offering(stream, token, offer)
 }
 
 /// Connects to a listening core; `None` when none is listening.
@@ -670,10 +682,10 @@ pub fn start_core(endpoint: &Endpoint) -> Result<()> {
 /// its `kill` sessions for [`RELAY_LINGER_SECS`] after the link drops, and
 /// for `PROCESS` reports, since this machine can't read the endpoint's
 /// `/proc`.
-fn hello_message(token: &str, relay: bool) -> Hello {
+fn hello_message(token: &str, relay: bool, offer: client::VersionRange) -> Hello {
     Hello {
-        min: BRINDLE_PROTOCOLS.min,
-        max: BRINDLE_PROTOCOLS.max,
+        min: offer.min,
+        max: offer.max,
         client_version: format!("brindle {}", env!("CARGO_PKG_VERSION")),
         client_token: token.to_string(),
         linger_secs: if relay { RELAY_LINGER_SECS } else { 0 },
@@ -681,14 +693,20 @@ fn hello_message(token: &str, relay: bool) -> Hello {
     }
 }
 
-/// Says `HELLO` and waits for `WELCOME`. An `ERROR` (no common version)
-/// names both sides' ranges.
+/// Says `HELLO`, offering Brindle's protocols ([`BRINDLE_PROTOCOLS`]), and
+/// waits for `WELCOME`.
+pub fn hello(stream: Stream, token: &str) -> Result<Connected> {
+    hello_offering(stream, token, BRINDLE_PROTOCOLS)
+}
+
+/// Says `HELLO` offering the client protocols `offer` and waits for
+/// `WELCOME`. An `ERROR` (no common version) names both sides' ranges.
 #[allow(
     clippy::wildcard_enum_match_arm,
     reason = "railway R3 exception: any answer to HELLO but `Welcome` or `Error` fails it, naming the answer"
 )]
-pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
-    let hello = ToCore::Hello(hello_message(token, false));
+pub fn hello_offering(mut stream: Stream, token: &str, offer: client::VersionRange) -> Result<Connected> {
+    let hello = ToCore::Hello(hello_message(token, false, offer));
     let talk = |error: io::Error| anyhow!("terminal server unreachable: {error}");
     stream.set_read_timeout(Some(HELLO_LIMIT)).map_err(talk)?;
     hello.encode().and_then(|frame| frame.write_to(&mut stream)).map_err(talk)?;
@@ -702,7 +720,7 @@ pub fn hello(mut stream: Stream, token: &str) -> Result<Connected> {
     };
     stream.set_read_timeout(None).map_err(talk)?;
     match ToClient::decode(&frame).map_err(talk)? {
-        ToClient::Welcome(welcome) => Ok(Connected { stream, welcome }),
+        ToClient::Welcome(welcome) => Ok(Connected { stream, welcome, offer }),
         ToClient::Error(error) => Err(refused(&error.message)),
         other => bail!("terminal server answered HELLO with {other:?}"),
     }
@@ -1076,14 +1094,14 @@ mod tests {
             let frame = Frame::read_from(&mut stream).unwrap();
             let ToCore::Hello(hello) = ToCore::decode(&frame).unwrap() else { panic!("not HELLO") };
             assert_eq!(hello.client_token, "tok");
-            let refusal = client::answer_hello(&hello, client::VersionRange::new(4, 5)).unwrap_err();
+            let refusal = client::answer_hello(&hello, client::VersionRange::new(5, 6)).unwrap_err();
             ToClient::Error(refusal).encode().unwrap().write_to(&mut stream).unwrap();
         });
         let endpoint = Endpoint::at(temp.0.join("unused"), dir);
         let error = connect(&endpoint, "tok").unwrap_err().to_string();
         core.join().unwrap();
         assert!(error.contains("refused Brindle"), "{error}");
-        assert!(error.contains("offered 1–3, supported 4–5"), "{error}");
+        assert!(error.contains("offered 1–4, supported 5–6"), "{error}");
         assert!(error.contains("brindle-remote stop"), "{error}");
     }
 
@@ -1315,20 +1333,25 @@ mod tests {
 
     #[test]
     fn only_a_relay_asks_for_linger_and_process_info() {
-        let local = hello_message("tok", false);
+        let local = hello_message("tok", false, BRINDLE_PROTOCOLS);
         assert_eq!((local.linger_secs, local.process_info), (0, false));
-        let relay = hello_message("tok", true);
+        let relay = hello_message("tok", true, BRINDLE_PROTOCOLS);
         assert_eq!((relay.linger_secs, relay.process_info), (300, true));
         assert_eq!((relay.min, relay.max), (BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max));
         assert_eq!(relay.client_token, "tok");
     }
 
+    /// Brindle offers every protocol the codec knows, agent sessions' 4
+    /// included (`agents-profiles` task 6.5), down to 1 for the oldest
+    /// cores; a connection made with another offer says that one.
     #[test]
-    fn brindle_offers_no_protocol_with_agent_sessions_yet() {
-        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (1, 3));
-        const { assert!(BRINDLE_PROTOCOLS.max < client::PROTOCOLS.max, "the codec knows protocol 4") };
-        let hello = hello_message("tok", false);
-        assert_eq!(hello.max, 3);
+    fn brindle_offers_every_protocol_up_to_agent_sessions() {
+        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (1, 4));
+        assert_eq!((BRINDLE_PROTOCOLS.min, BRINDLE_PROTOCOLS.max), (client::PROTOCOLS.min, client::PROTOCOLS.max));
+        let hello = hello_message("tok", false, BRINDLE_PROTOCOLS);
+        assert_eq!((hello.min, hello.max), (1, 4));
+        let older = hello_message("tok", true, client::VersionRange::new(1, 3));
+        assert_eq!((older.min, older.max), (1, 3));
     }
 
     #[test]

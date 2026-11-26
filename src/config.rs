@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 use crate::theme::{Theme, builtin_theme};
@@ -295,12 +295,22 @@ pub struct NotificationConfig {
     /// A program status record (OSC 7501) that becomes blocked, done or
     /// error.
     pub osc7501: bool,
+    /// An agent zone whose status becomes blocked, done or error.
+    pub agent: bool,
     pub when: NotifyWhen,
 }
 
 impl Default for NotificationConfig {
     fn default() -> Self {
-        Self { bell: true, osc9: true, osc777: true, osc99: true, osc7501: true, when: NotifyWhen::Unfocused }
+        Self {
+            bell: true,
+            osc9: true,
+            osc777: true,
+            osc99: true,
+            osc7501: true,
+            agent: true,
+            when: NotifyWhen::Unfocused,
+        }
     }
 }
 
@@ -412,6 +422,13 @@ impl fmt::Display for ProfileKey {
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Profile {
+    /// What the profile opens (`type`, lowercase; `terminal` when absent).
+    /// Read through [`Profile::kind`]; an agent profile always has a
+    /// command ([`Config::parse`] refuses one without).
+    /// `pub(crate)` only so other modules can still build a profile with
+    /// `..Default::default()`; nothing outside this module sets it.
+    #[serde(rename = "type")]
+    pub(crate) kind: ProfileKind,
     #[serde(default)]
     pub remote: Option<RemoteTarget>,
     pub name: String,
@@ -438,11 +455,16 @@ pub struct Profile {
     pub(crate) removed_tmux_args: Option<toml::Value>,
 }
 
-/// What kind of tab a profile opens.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What kind of tab a profile opens: its `type` key.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
 pub enum ProfileKind {
     /// A terminal tab, running the profile's program.
+    #[default]
     Terminal,
+    /// An agent zone, running the profile's command as an ACP agent in the
+    /// terminal server.
+    Agent,
 }
 
 impl Profile {
@@ -450,21 +472,34 @@ impl Profile {
         Self { name: "Shell".into(), ..Default::default() }
     }
 
-    /// The kind of tab the profile opens. Every profile is a terminal
-    /// profile for now: `agents-profiles` adds the profile's `type` key and
-    /// makes this read it.
+    /// The kind of tab the profile opens, from its `type` key.
     pub fn kind(&self) -> ProfileKind {
-        ProfileKind::Terminal
+        self.kind
     }
 
-    /// A short description of what the profile runs.
+    /// Whether the profile names what its kind needs to run: a terminal
+    /// profile always does (no command runs the default shell); an agent
+    /// profile only with a command that isn't blank.
+    fn runnable(&self) -> bool {
+        match self.kind {
+            ProfileKind::Terminal => true,
+            ProfileKind::Agent => self.command.as_deref().is_some_and(|command| !command.trim().is_empty()),
+        }
+    }
+
+    /// A short description of what the profile runs:
+    /// `[<target> · ]<command>` for a terminal profile (`default shell`
+    /// without one), `[<target> · ]agent · <command>` for an agent profile.
     pub fn description(&self) -> String {
         let target_prefix = match &self.remote {
             Some(RemoteTarget::Ssh { host, .. }) => format!("ssh:{host} · "),
             Some(RemoteTarget::Container { container, .. }) => format!("container:{container} · "),
             None => String::new(),
         };
-        let base = self.command.clone().unwrap_or_else(|| "default shell".into());
+        let base = match self.kind {
+            ProfileKind::Terminal => self.command.clone().unwrap_or_else(|| "default shell".into()),
+            ProfileKind::Agent => format!("agent · {}", self.command.as_deref().unwrap_or_default()),
+        };
         format!("{target_prefix}{base}")
     }
 
@@ -545,10 +580,15 @@ impl Config {
 
     /// Parses `text`: the config, with what was clamped and the removed keys
     /// it still sets as findings. Unknown themes are [`Config::findings`].
+    /// An agent profile without a command (absent, or only blanks) is an
+    /// error naming the profile, as an invalid value is.
     pub fn parse(text: &str) -> Result<Loaded> {
         let config: Self = toml::from_str(text)?;
         let mut findings = config.removed_findings();
         let (config, clamped) = config.normalized();
+        if let Some(profile) = config.profiles.iter().find(|profile| !profile.runnable()) {
+            bail!("profile {:?}: an agent profile needs a command", profile.name);
+        }
         findings.extend(clamped);
         Ok(Loaded { config, findings })
     }
@@ -995,6 +1035,39 @@ mod tests {
         .is_err());
     }
 
+    /// agents-profiles 6.10: the README's agent profile example loads as
+    /// the agent profile it describes.
+    #[test]
+    fn the_readme_agent_example_parses() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("\n### Agent tabs\n").expect("the agent section");
+        let section = &readme[start..];
+        let block = &section[section.find("```toml\n").expect("its example") + 8..];
+        let toml = &block[..block.find("```").expect("the example's end")];
+        let config = parsed(toml).unwrap();
+        let [profile] = &config.profiles[..] else { panic!("one profile: {:?}", config.profiles) };
+        assert_eq!(profile.kind(), ProfileKind::Agent);
+        assert_eq!((profile.name.as_str(), profile.command.as_deref()), ("Agent", Some("my-acp-agent")));
+        assert_eq!(profile.args, ["--acp"]);
+        assert_eq!(profile.description(), "agent · my-acp-agent");
+    }
+
+    /// agents-profiles 7.2: the README's `[notifications]` example names
+    /// every source's key, each at its default, and parses as the defaults.
+    /// The destructuring fails to compile when a key is added, so the
+    /// README is updated with it.
+    #[test]
+    fn the_readme_notifications_example_names_every_key() {
+        let readme = include_str!("../README.md");
+        let start = readme.find("```toml\n[notifications]\n").expect("the notifications example") + 8;
+        let toml = &readme[start..start + readme[start..].find("```").expect("the example's end")];
+        let config = parsed(toml).unwrap();
+        assert_eq!(config.notifications, NotificationConfig::default());
+        let NotificationConfig { bell: _, osc9: _, osc777: _, osc99: _, osc7501: _, agent: _, when: _ } = config.notifications;
+        let keys: Vec<&str> = toml.lines().skip(1).filter_map(|line| line.split_once(" =").map(|(key, _)| key)).collect();
+        assert_eq!(keys, ["bell", "osc9", "osc777", "osc99", "osc7501", "agent", "when"]);
+    }
+
     /// 8.5: the config examples in the README's remote section, together,
     /// load as the profiles they describe.
     #[test]
@@ -1055,6 +1128,126 @@ mod tests {
                 "{old}: {findings:?}"
             );
         }
+    }
+
+    /// 1.1: `type` picks the profile's kind, `terminal` when absent.
+    #[test]
+    fn a_profile_type_picks_its_kind() {
+        let config = parsed(
+            r#"
+            [[profiles]]
+            name = "Shell"
+
+            [[profiles]]
+            name = "Fake"
+            type = "agent"
+            command = "agent-acp"
+            args = ["--stdio"]
+
+            [[profiles]]
+            name = "Plain"
+            type = "terminal"
+            "#,
+        )
+        .unwrap();
+        let kinds: Vec<ProfileKind> = config.profiles.iter().map(Profile::kind).collect();
+        assert_eq!(kinds, [ProfileKind::Terminal, ProfileKind::Agent, ProfileKind::Terminal]);
+        assert_eq!(config.profiles[1].command.as_deref(), Some("agent-acp"));
+        assert_eq!(config.profiles[1].args, ["--stdio"]);
+        assert_eq!(Profile::default().kind(), ProfileKind::Terminal);
+        assert_eq!(Profile::default_shell().kind(), ProfileKind::Terminal);
+    }
+
+    /// 1.1: a `type` outside the two is an error naming both values.
+    #[test]
+    fn an_unknown_profile_type_names_both_kinds() {
+        let error = parsed("[[profiles]]\nname = \"Chat\"\ntype = \"chat\"\ncommand = \"x\"").unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains("chat"), "{text}");
+        assert!(text.contains("terminal") && text.contains("agent"), "{text}");
+        // Case matters: the key is lowercase.
+        assert!(parsed("[[profiles]]\nname = \"A\"\ntype = \"Agent\"\ncommand = \"x\"").is_err());
+    }
+
+    /// 1.1: an agent profile without a command (or with a blank one) is an
+    /// error naming the profile; a terminal profile needs none.
+    #[test]
+    fn an_agent_profile_needs_a_command() {
+        for text in [
+            "[[profiles]]\nname = \"Agent\"\ntype = \"agent\"",
+            "[[profiles]]\nname = \"Agent\"\ntype = \"agent\"\ncommand = \"  \"",
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Agent\"\ntype = \"agent\"\nargs = [\"--stdio\"]",
+        ] {
+            let error = parsed(text).unwrap_err();
+            assert_eq!(format!("{error:#}"), "profile \"Agent\": an agent profile needs a command", "{text}");
+        }
+        assert!(parsed("[[profiles]]\nname = \"Shell\"\ntype = \"terminal\"").is_ok());
+    }
+
+    /// 1.1: the profile's `type` and its remote target's live apart: the
+    /// target's `type` is inside its inline table.
+    #[test]
+    fn an_agent_profile_takes_a_remote_target() {
+        let config = parsed(
+            r#"
+            [[profiles]]
+            name = "A8 agent"
+            type = "agent"
+            command = "agent-acp"
+            remote = { type = "ssh", host = "A8" }
+            "#,
+        )
+        .unwrap();
+        let profile = &config.profiles[0];
+        assert_eq!(profile.kind(), ProfileKind::Agent);
+        assert!(matches!(&profile.remote, Some(RemoteTarget::Ssh { host, .. }) if host == "A8"));
+    }
+
+    /// 1.2: an agent profile reads `[<target> · ]agent · <command>`; a
+    /// terminal profile's description is unchanged.
+    #[test]
+    fn an_agent_profile_describes_its_command() {
+        let config = parsed(
+            r#"
+            [[profiles]]
+            name = "Local"
+            type = "agent"
+            command = "agent-acp"
+            args = ["--stdio"]
+
+            [[profiles]]
+            name = "Remote"
+            type = "agent"
+            command = "agent-acp"
+            remote = { type = "ssh", host = "A8" }
+
+            [[profiles]]
+            name = "Box"
+            type = "agent"
+            command = "agent-acp"
+            remote = { type = "container", engine = "docker", container = "rust-box" }
+
+            [[profiles]]
+            name = "Shell"
+
+            [[profiles]]
+            name = "Top"
+            command = "htop"
+            remote = { type = "ssh", host = "A8" }
+            "#,
+        )
+        .unwrap();
+        let descriptions: Vec<String> = config.profiles.iter().map(Profile::description).collect();
+        assert_eq!(
+            descriptions,
+            [
+                "agent · agent-acp",
+                "ssh:A8 · agent · agent-acp",
+                "container:rust-box · agent · agent-acp",
+                "default shell",
+                "ssh:A8 · htop",
+            ]
+        );
     }
 
     #[test]
@@ -1214,8 +1407,12 @@ mod tests {
         let config = parsed("").unwrap();
         assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.notifications.bell && config.notifications.osc9 && config.notifications.osc777);
-        assert!(config.notifications.osc7501 && config.notifications.osc99);
+        assert!(config.notifications.osc7501 && config.notifications.osc99 && config.notifications.agent);
+        let config = parsed("[notifications]\nagent = false").unwrap();
+        assert!(!config.notifications.agent);
+        assert!(config.notifications.osc7501 && config.notifications.bell);
         let config = parsed("[notifications]\nbell = false\nosc7501 = false\nwhen = \"always\"").unwrap();
+        assert!(config.notifications.agent);
         assert!(!config.notifications.bell);
         assert!(config.notifications.osc9 && config.notifications.osc99);
         assert!(!config.notifications.osc7501);

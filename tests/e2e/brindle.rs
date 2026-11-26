@@ -197,6 +197,19 @@ pub struct Run<'a> {
     /// Run with no state directory, from the case directory
     /// ([`Run::no_state_dir`]).
     no_state_dir: bool,
+    /// The run opens `brindle agent PROFILE` rather than `brindle
+    /// terminal PROFILE` ([`Run::agent`]).
+    agent: bool,
+    /// Brindle's standard input ([`Run::stdin`]), else the harness's.
+    stdin: Option<Stdin>,
+}
+
+/// What a run gives Brindle as its standard input ([`Run::stdin`]).
+pub enum Stdin {
+    /// A file, opened for reading.
+    File(std::path::PathBuf),
+    /// A pipe the harness writes these bytes into, then closes.
+    Pipe(Vec<u8>),
 }
 
 /// The case server's sessions as `brindle-remote list` prints them
@@ -312,7 +325,31 @@ impl<'a> Run<'a> {
             padding: None,
             interval: None,
             no_state_dir: false,
+            agent: false,
+            stdin: None,
         }
+    }
+
+    /// Starts with `brindle agent PROFILE` (an agent profile from
+    /// [`Run::config`]) instead of `brindle terminal PROFILE`.
+    pub fn agent(mut self, profile: &'static str) -> Self {
+        self.profile = profile;
+        self.agent = true;
+        self
+    }
+
+    /// `brindle agent`'s first prompt (`-p TEXT`), for a run started with
+    /// [`Run::agent`]. Not `prompt`: that name waits for a shell's prompt.
+    pub fn first_prompt(mut self, text: &str) -> Self {
+        self.args.extend(["-p".to_string(), text.to_string()]);
+        self
+    }
+
+    /// Gives Brindle `stdin` as its standard input (for `-p -`), in place
+    /// of the harness's own.
+    pub fn stdin(mut self, stdin: Stdin) -> Self {
+        self.stdin = Some(stdin);
+        self
     }
 
     /// Runs with no state directory: without the `BRINDLE_STATE_DIR` every
@@ -611,7 +648,8 @@ impl<'a> Run<'a> {
             if self.args.iter().any(|arg| arg == "--attach") {
                 command.arg("--no-restore");
             } else {
-                command.args(["terminal", self.profile, "--no-restore"]);
+                let subcommand = if self.agent { "agent" } else { "terminal" };
+                command.args([subcommand, self.profile, "--no-restore"]);
             }
         }
         // A restoring run with a command still needs the subcommand, which
@@ -622,6 +660,16 @@ impl<'a> Run<'a> {
         }
         if self.no_state_dir {
             command.env_remove("BRINDLE_STATE_DIR").env_remove("HOME").env_remove("XDG_STATE_HOME").current_dir(&ctx.dir);
+        }
+        match &self.stdin {
+            Some(Stdin::File(path)) => {
+                let file = std::fs::File::open(path).map_err(|e| format!("opening {}: {e}", path.display()))?;
+                command.stdin(file);
+            }
+            Some(Stdin::Pipe(_)) => {
+                command.stdin(Stdio::piped());
+            }
+            None => {}
         }
         let mut child = command
             .args(&self.args)
@@ -640,6 +688,11 @@ impl<'a> Run<'a> {
             .spawn()
             .map(Reaped)
             .map_err(|e| format!("starting {}: {e}", ctx.bin.display()))?;
+        if let (Some(Stdin::Pipe(bytes)), Some(mut pipe)) = (&self.stdin, child.stdin.take()) {
+            // Brindle reads it before it opens a window; the pipe closes
+            // when `pipe` drops.
+            std::io::Write::write_all(&mut pipe, bytes).map_err(|e| format!("writing Brindle's stdin: {e}"))?;
+        }
         let started = Instant::now();
         // Captures count from the window's first appearance, as Brindle's
         // steps and dump do; the rest of the timeline counts from the spawn.
@@ -723,7 +776,7 @@ impl<'a> Run<'a> {
             ensure!(status.success(), "Brindle exited with {status}; see {}.log", self.label);
             return Ok(Output { dump, image });
         }
-        ensure!(dump.size.is_some(), "no screen in the dump; see {}.log", self.label);
+        ensure!(dump.size.is_some() || !dump.agent.is_empty(), "no screen or agent zone in the dump; see {}.log", self.label);
         Ok(Output { dump, image })
     }
 }
@@ -770,6 +823,9 @@ pub struct Grid {
     pub line_height: f32,
     pub scale: f32,
 }
+
+/// The first words of an agent zone's dump lines ([`Dump::agent`]).
+const AGENT_LINES: [&str; 6] = ["agent ", "note ", "entry ", "queued ", "conversation ", "prompt "];
 
 /// Parsed `--dump-screen-after` output.
 #[derive(Debug, Default)]
@@ -835,8 +891,13 @@ pub struct Dump {
     /// `settings`, `tabs` (the tab strip), `menu`, `none` or `other`.
     pub focus: Option<String>,
     /// The focused settings-dialog control (`--- focus settings stop=…`):
-    /// `sections`, `list`, `close`, a field's or a button's label.
+    /// `sections`, `list`, `close`, a field's or a button's label; an
+    /// agent zone's stop (`--- focus agent stop=prompt|queued:remove|…`);
+    /// the close confirmation's button (`--- focus confirm stop=cancel|close`).
     pub focus_stop: Option<String>,
+    /// The close confirmation's line while it is open (`--- confirm close
+    /// target=zone:ID|tab:N busy=…`), without the `--- confirm `.
+    pub confirm: Option<String>,
     /// The window's focus-visible modality (`modality=`): `keyboard` or
     /// `pointer`.
     pub modality: Option<String>,
@@ -844,6 +905,10 @@ pub struct Dump {
     pub wait_timeouts: Vec<String>,
     /// The `--wait-for` texts still waiting at the dump (`--- wait-for pending "TEXT"`).
     pub wait_pending: Vec<String>,
+    /// An active agent zone's block (`--- agent …`, `--- note …`, `--- entry …`,
+    /// `--- queued …`, `--- conversation …`, `--- prompt …`), in place of a
+    /// screen: one line each without the `--- `.
+    pub agent: Vec<String>,
 }
 
 /// `--- fonts terminal="DejaVu Sans Mono" ui="Inter"`
@@ -870,8 +935,8 @@ fn parse_input(rest: &str) -> Option<Input> {
     let (text, fields) = rest.strip_prefix("text=")?.rsplit_once(" cursor=")?;
     let (cursor, selection) = fields.split_once(" selection=")?;
     let (start, end) = selection.split_once("..")?;
-    // The text is Rust-debug quoted; tests use plain ASCII without escapes.
-    let text = text.strip_prefix('"')?.strip_suffix('"')?.replace("\\\"", "\"");
+    // The text is Rust-debug quoted (an agent's prompt can hold line breaks).
+    let text = unquote(text)?;
     Some(Input { text, cursor: cursor.parse().ok()?, selection: (start.parse().ok()?, end.parse().ok()?) })
 }
 
@@ -921,6 +986,11 @@ impl Dump {
                 dump.pointer = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- grid-pointer ") {
                 dump.grid_pointer = Some(rest.to_string());
+            } else if let Some(rest) =
+                line.strip_prefix("--- ").filter(|rest| AGENT_LINES.iter().any(|word| rest.starts_with(word)))
+            {
+                dump.agent.push(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- zones ") {
                 dump.zones = Some(rest.to_string());
             } else if let Some(rest) = line.strip_prefix("--- zone ") {
@@ -940,9 +1010,15 @@ impl Dump {
             } else if let Some(rest) = line.strip_prefix("--- find ") {
                 dump.find = Some(rest.to_string());
                 in_screen = false;
+            } else if let Some(rest) = line.strip_prefix("--- confirm ") {
+                dump.confirm = Some(rest.to_string());
+                in_screen = false;
             } else if let Some(rest) = line.strip_prefix("--- focus ") {
                 let (rest, modality) = rest.rsplit_once(" modality=").map_or((rest, None), |(r, m)| (r, Some(m)));
-                let (place, stop) = rest.split_once(" stop=").map_or((rest, None), |(p, s)| (p, unquote(s)));
+                // The settings dialog quotes its stop (a label); an agent
+                // zone's and the close confirmation's are bare words.
+                let (place, stop) =
+                    rest.split_once(" stop=").map_or((rest, None), |(p, s)| (p, unquote(s).or_else(|| Some(s.to_string()))));
                 dump.focus = Some(place.to_string());
                 dump.focus_stop = stop;
                 dump.modality = modality.map(str::to_string);
@@ -957,6 +1033,22 @@ impl Dump {
         }
         dump.screen = trim_screen(screen.into_iter());
         dump
+    }
+
+    /// A `key=value` field of the agent zone's `--- agent` line (values
+    /// without spaces: `state`, `turn`, `session`, …).
+    pub fn agent_field(&self, key: &str) -> Option<&str> {
+        let line = self.agent.iter().find_map(|line| line.strip_prefix("agent "))?;
+        line.split(' ').find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// The agent zone's entries (`--- entry N KIND …`), each as `KIND …`
+    /// without its id: `user "hi"`, `agent "Hello!"`.
+    pub fn agent_entries(&self) -> Vec<&str> {
+        self.agent
+            .iter()
+            .filter_map(|line| line.strip_prefix("entry ")?.split_once(' ').map(|(_, rest)| rest))
+            .collect()
     }
 
     /// A `key=value` field of the find line (values without spaces).
@@ -1051,6 +1143,7 @@ pub fn self_test_dump_after_last_step() -> Result {
         helper: std::path::PathBuf::new(),
         display: String::new(),
         server_dir: std::env::temp_dir(),
+        fake_agent: std::path::PathBuf::new(),
         scale: crate::Scale::new(3.0),
     };
     let run = Run::new(&ctx, "self-test").action("new_tab").key("enter").dump_after_last_step(0.7);
@@ -1183,6 +1276,21 @@ pub fn self_test_dump() -> Result {
     ensure!(dump.pointer.as_deref() == Some("shape=crosshair screen=alternate"), "pointer {:?}", dump.pointer);
     ensure!(dump.grid_pointer.as_deref() == Some("text"), "grid pointer {:?}", dump.grid_pointer);
     ensure!(dump.screen == ["hi"], "screen after the pointer {:?}", dump.screen);
+    // An agent zone's block, in place of a screen, before the palette and
+    // focus lines.
+    let dump = Dump::parse(
+        "--- tab 1 \"Fake Agent\" (active)\n--- fonts terminal=\"A\" ui=\"B\"\n\
+         --- agent zone=1 state=ready name=\"Fake Agent\" turn=ended:end_turn activity=done status=done link=up session=open\n\
+         --- note \"gone\"\n--- entry 1 user \"hi there\"\n--- entry 2 agent \"Hello!\"\n--- queued waiting \"next\"\n\
+         --- conversation entries=2 at=end\n--- prompt status=ready\n--- focus other modality=keyboard\n",
+    );
+    ensure!(dump.agent.len() == 7, "agent lines {:?}", dump.agent);
+    ensure!(dump.agent_field("state") == Some("ready") && dump.agent_field("session") == Some("open"), "{:?}", dump.agent);
+    ensure!(dump.agent_field("zone") == Some("1") && dump.agent_field("missing").is_none(), "{:?}", dump.agent);
+    ensure!(dump.agent_entries() == ["user \"hi there\"", "agent \"Hello!\""], "entries {:?}", dump.agent_entries());
+    ensure!(dump.size.is_none() && dump.screen.is_empty(), "no screen {:?}", dump.screen);
+    ensure!(dump.focus.as_deref() == Some("other"), "focus after the agent block {:?}", dump.focus);
+    ensure!(Dump::parse("--- palette prompt \"Name\" text=\"\"\n").agent.is_empty(), "a palette prompt isn't an agent line");
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\n--- zones count=2 active=2\n\
          --- zone id=1 rect=0,0,0.5,1\n--- zone id=2 rect=0.5,0,0.5,1 active\nhi\n",
@@ -1244,6 +1352,17 @@ pub fn self_test_dump() -> Result {
     let dump = Dump::parse("--- focus settings stop=\"Font size\" modality=keyboard\n");
     ensure!(dump.focus.as_deref() == Some("settings"), "focus {:?}", dump.focus);
     ensure!(dump.focus_stop.as_deref() == Some("Font size"), "stop {:?}", dump.focus_stop);
+    ensure!(dump.confirm.is_none(), "no confirmation {:?}", dump.confirm);
+    // The close confirmation's line and its bare-word stop.
+    let dump = Dump::parse(
+        "--- tab 1 \"Fake Agent\" (active)\n--- prompt status=streaming\n\
+         --- confirm close target=zone:1 busy=1:working\n--- focus confirm stop=cancel modality=keyboard\n",
+    );
+    ensure!(dump.confirm.as_deref() == Some("close target=zone:1 busy=1:working"), "confirm {:?}", dump.confirm);
+    ensure!(dump.focus.as_deref() == Some("confirm") && dump.focus_stop.as_deref() == Some("cancel"), "{:?}", dump.focus_stop);
+    let dump = Dump::parse("--- focus agent stop=permission:5:allow-once modality=keyboard\n");
+    ensure!(dump.focus.as_deref() == Some("agent"), "focus {:?}", dump.focus);
+    ensure!(dump.focus_stop.as_deref() == Some("permission:5:allow-once"), "stop {:?}", dump.focus_stop);
     let dump = Dump::parse(
         "--- screen 2x1 mode TermMode(SHOW_CURSOR)\nhi\n--- menu items=Shell|[Off]|Other highlighted=0\n\
          Shell  bash  [ctrl-alt-1]\nOff\nOther  sh · /tmp  [ctrl-alt-3]\n--- focus menu modality=keyboard\n",

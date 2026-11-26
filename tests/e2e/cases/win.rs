@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use super::local_server;
-use crate::brindle::Dump;
+use crate::brindle::{Dump, Run, Stdin};
 use crate::common::server::{Isolation, isolate};
 use crate::switches::TestSwitch;
 use crate::{Case, Ctx, Outcome, Result, ensure, winproc};
@@ -76,6 +76,11 @@ pub fn all() -> Vec<Case> {
         display("local-server-elevated", local_server::elevated),
         display("windows-elevated-instances", elevated_instances),
         display("windows-elevation-badge", elevation_badge),
+        display("windows-agent-turn", super::agent::turn).needs_fake_agent(),
+        display("windows-agent-close-confirm", super::agent::close_confirm).needs_fake_agent(),
+        // The agent never starts: no fake agent is run.
+        display("windows-agent-batch-hint", agent_batch_hint),
+        display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
         display("remote-container-exec", super::remote::container_exec),
         display("remote-ssh-container", super::remote::ssh_container),
     ]
@@ -1192,4 +1197,172 @@ fn unelevated_beside(
     let leftover = leftover.map_err(|e| format!("can't tell whether roles are left running: {e}"))?;
     ensure!(leftover.is_empty(), "left running after `brindle-remote stop`: {leftover:?}");
     Ok(outcome)
+}
+
+/// An agent profile whose command is a batch file on the `PATH` (`my-agent`,
+/// with `my-agent.cmd` in a directory the profile's `PATH` starts with)
+/// isn't started: the zone says the server's cause, which names the file
+/// and the `cmd /c my-agent` form that runs it, and offers no prompt.
+fn agent_batch_hint(ctx: &Ctx) -> Result<Outcome> {
+    let bin = ctx.dir.join("bin");
+    std::fs::create_dir_all(&bin).map_err(|e| format!("creating {}: {e}", bin.display()))?;
+    let batch = bin.join("my-agent.cmd");
+    std::fs::write(&batch, "@echo off\r\nexit /b 0\r\n").map_err(|e| format!("writing {}: {e}", batch.display()))?;
+    let path = format!("{};{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    // A TOML literal string takes the path as it is, backslashes included.
+    ensure!(!path.contains('\''), "PATH has a quote in it: {path}");
+    let profile =
+        format!("\n[[profiles]]\nname = \"Batch\"\ntype = \"agent\"\ncommand = \"my-agent\"\nenv = {{ PATH = '{path}' }}\n");
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Batch")
+        .wait_for("state=not-started")
+        .dump_at(4.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    let line = out.dump.agent.first().map(String::as_str).unwrap_or_default();
+    ensure!(
+        // The server's refusal reads "cannot run my-agent: …" (the holder's
+        // spawn-failure form), after the zone's own prefix.
+        line.starts_with("agent zone=1 state=not-started message=\"the agent my-agent didn't start: ")
+            && line.contains("my-agent is a batch file (")
+            && line.contains("my-agent.cmd); run it as `cmd /c my-agent`\""),
+        "not the batch file's hint: {line}"
+    );
+    super::agent::agent_has(&out, "prompt status=disabled")?;
+    ensure!(crate::brindle::listed_sessions(ctx)?.is_empty(), "sessions left: {:?}", crate::brindle::listed_sessions(ctx)?);
+    Ok(Outcome::Pass)
+}
+
+/// `brindle agent Fake -p -` reads its first prompt from the standard input
+/// a parent gives it, though `brindle.exe` is a GUI program: a file handed
+/// to the child directly, and cmd's `< file`; each sends the file's text,
+/// its line ending dropped. With no standard input handle at all, as a GUI
+/// program started from a console with nothing redirected has, it is a
+/// usage error (status 2) at once. PowerShell's pipeline is a manual check:
+/// PowerShell doesn't wait for a GUI program.
+fn agent_prompt_stdin(ctx: &Ctx) -> Result<Outcome> {
+    let (profile, received) = super::agent::hello_agent(ctx)?;
+    let file = ctx.dir.join("prompt.txt");
+    std::fs::write(&file, "from a file\r\n").map_err(|e| format!("writing {}: {e}", file.display()))?;
+    let wanted = ["user \"from a file\"", "agent \"Hello!\""];
+
+    let out = Run::new(ctx, "file")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("-")
+        .stdin(Stdin::File(file.clone()))
+        .wait_for(&super::agent::answered())
+        .dump_at(5.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    ensure!(out.dump.agent_entries() == wanted, "a file: entries {:?}", out.dump.agent);
+
+    let config = ctx.dir.join("config.toml");
+    std::fs::write(&config, crate::brindle::config("e2e") + &profile).map_err(|e| format!("writing the config: {e}"))?;
+    std::fs::remove_file(&received).ok();
+    let dump = agent_through_cmd(ctx, "cmd", &config, &file, 5.0)?;
+    ensure!(dump.wait_timeouts.is_empty() && dump.wait_pending.is_empty(), "cmd: waits {:?} {:?}", dump.wait_timeouts, dump.wait_pending);
+    ensure!(dump.agent_entries() == wanted, "cmd's `<`: entries {:?}", dump.agent);
+
+    let said = refused_without_stdin(ctx, "absent", &config)?;
+    ensure!(said == "brindle: -p - needs a file or pipe on standard input", "no standard input: {said:?}");
+    Ok(Outcome::Pass)
+}
+
+/// Runs `cmd /d /v:off /c "BRINDLE agent Fake --no-restore -p - … < FILE >
+/// DUMP 2> LOG"` with the case's isolation and `config`, so cmd's `<` gives
+/// Brindle its standard input, and returns Brindle's dump once it has
+/// exited. Brindle is cmd's child; it is waited for as such, whether or not
+/// cmd waits for a GUI program, and ended with cmd if the run overruns.
+fn agent_through_cmd(ctx: &Ctx, label: &str, config: &std::path::Path, file: &std::path::Path, dump_at: f64) -> Result<Dump> {
+    use std::os::windows::process::CommandExt as _;
+    let (dump, log) = (ctx.dir.join(format!("{label}.dump")), ctx.dir.join(format!("{label}.log")));
+    let quote = |path: &std::path::Path| format!("\"{}\"", path.display());
+    // `Hello!` is in the answer's entry line; no quotes or spaces, so cmd
+    // passes it as it is (`!` is plain with delayed expansion off).
+    let inner = format!(
+        "{} agent Fake --no-restore -p - {} --wait-for Hello! --dump-screen-after {} < {} > {} 2> {}",
+        quote(&ctx.bin),
+        ctx.step_interval().join(" "),
+        ctx.secs(dump_at),
+        quote(file),
+        quote(&dump),
+        quote(&log)
+    );
+    let mut command = Command::new("cmd.exe");
+    isolate(
+        &mut command,
+        &Isolation {
+            config,
+            state_dir: &crate::brindle::state_dir(ctx),
+            server_dir: &ctx.server_dir,
+            display: &ctx.display,
+        },
+    );
+    let mut cmd = command
+        .raw_arg(format!("/d /v:off /c \"{inner}\""))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("starting cmd: {e}"))?;
+    let (pid, name) = (cmd.id(), ctx.bin.file_name().unwrap_or_default().to_string_lossy().into_owned());
+    let brindles = || -> Result<Vec<u32>> {
+        Ok(winproc::all()
+            .map_err(|e| format!("listing processes: {e}"))?
+            .into_iter()
+            .filter(|p| p.parent == pid && p.name.eq_ignore_ascii_case(&name))
+            .map(|p| p.pid)
+            .collect())
+    };
+    // The dump's time, then 30 s to print it and quit (stretched).
+    let finished = ctx.scale().poll(dump_at + 30.0, "Brindle started through cmd exiting", || {
+        if cmd.try_wait().map_err(|e| e.to_string())?.is_none() {
+            return Ok(None);
+        }
+        Ok(brindles()?.into_iter().all(|brindle| !winproc::alive(brindle)).then_some(()))
+    });
+    if let Err(why) = finished {
+        brindles().unwrap_or_default().into_iter().for_each(winproc::kill);
+        cmd.kill().ok();
+        cmd.wait().ok();
+        return Err(format!("{why}; see {label}.log"));
+    }
+    let text = std::fs::read_to_string(&dump).map_err(|e| format!("reading {}: {e}; see {label}.log", dump.display()))?;
+    crate::brindle::hang_up_detached(ctx)?;
+    Ok(Dump::parse(&text))
+}
+
+/// Runs `brindle agent Fake -p -` with `config` and no standard input or
+/// output handle ([`winproc::start_without_stdin`]), and returns the
+/// `brindle: ` line it printed, once it has exited with status 2.
+fn refused_without_stdin(ctx: &Ctx, label: &str, config: &std::path::Path) -> Result<String> {
+    let path = ctx.dir.join(format!("{label}.log"));
+    let log = std::fs::File::create(&path).map_err(|e| format!("creating {}: {e}", path.display()))?;
+    let mut command = Command::new(&ctx.bin);
+    isolate(
+        &mut command,
+        &Isolation {
+            config,
+            state_dir: &crate::brindle::state_dir(ctx),
+            server_dir: &ctx.server_dir,
+            display: &ctx.display,
+        },
+    );
+    command.args(["agent", "Fake", "-p", "-"]);
+    let started = winproc::start_without_stdin(&command, &log)?;
+    drop(log);
+    let code = ctx.scale().poll(10.0, "brindle agent Fake -p - with no standard input exiting", || Ok(started.exit_code()));
+    let code = match code {
+        Ok(code) => code,
+        Err(why) => {
+            started.kill();
+            return Err(format!("{why}; see {label}.log"));
+        }
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    ensure!(code == 2, "brindle agent Fake -p - with no standard input exited with {code}; see {label}.log");
+    let said = text.lines().find(|line| line.starts_with("brindle: "));
+    Ok(said.ok_or_else(|| format!("no `brindle: ` line; see {label}.log"))?.to_string())
 }

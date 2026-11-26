@@ -9,9 +9,10 @@ use crate::brindle::{Run, state_dir};
 use crate::common::server::{Isolation, isolate};
 use crate::{Ctx, Outcome, Result, Scale, ensure};
 
-/// A later launch from `cwd`, sharing the case's state directory.
+/// A later launch from `cwd`, sharing the case's state directory. The
+/// agent cases hand launches over with it too.
 #[derive(Clone)]
-struct Launcher {
+pub(super) struct Launcher {
     bin: PathBuf,
     state: PathBuf,
     config: PathBuf,
@@ -24,7 +25,7 @@ struct Launcher {
 }
 
 impl Launcher {
-    fn of(ctx: &Ctx) -> Self {
+    pub(super) fn of(ctx: &Ctx) -> Self {
         Self {
             bin: ctx.bin.clone(),
             state: state_dir(ctx),
@@ -39,7 +40,7 @@ impl Launcher {
     /// Runs `brindle ARGS` in `cwd` and waits for it to exit, which it must
     /// do with status 0 within 8 s (stretched). It passes no debug option,
     /// so it hands itself to the running Brindle.
-    fn launch(&self, cwd: &std::path::Path, args: &[&str]) -> Result {
+    pub(super) fn launch(&self, cwd: &std::path::Path, args: &[&str]) -> Result {
         let (status, _) = self.exit_of(cwd, args)?;
         ensure!(status == Some(0), "brindle {args:?} exited with {status:?}; see launches.log");
         Ok(())
@@ -88,7 +89,7 @@ impl Launcher {
 
     /// Runs `brindle ARGS` in `cwd`, which must be refused with status 2,
     /// and returns the first line it printed.
-    fn refused(&self, cwd: &std::path::Path, args: &[&str]) -> Result<String> {
+    pub(super) fn refused(&self, cwd: &std::path::Path, args: &[&str]) -> Result<String> {
         let (status, stderr) = self.exit_of(cwd, args)?;
         ensure!(status == Some(2), "brindle {args:?} exited with {status:?}, not 2: {stderr:?}");
         Ok(stderr.lines().next().unwrap_or_default().to_string())

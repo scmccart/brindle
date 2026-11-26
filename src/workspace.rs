@@ -22,12 +22,15 @@ mod tabs;
 
 pub use tabs::{TabId, TabTarget};
 
-use self::launch::{NewTabCwd, new_tab_cwd};
+pub use self::launch::LaunchWith;
+use self::launch::{LaunchPlan, NewTabCwd, agent_cwd, launch_plan, new_tab_cwd};
 use self::notices::Notices;
 use self::overlays::{Opens, OverlayKind, PaletteRole, Toggle, toggle};
 use self::previews::Previews;
 use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
+use crate::agent::Agent;
+use crate::agent::spawn::OpenedBy;
 use crate::config::{Config, Profile, ProfileKey, ProfileKind};
 use crate::TabKind;
 use crate::config_edit;
@@ -56,7 +59,11 @@ use crate::terminal::status::State;
 use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
-use crate::zone_view::{ZONE_GAP, ZoneMenuRequest, ZoneTreeView, describe_badge, ui_badge};
+use crate::zone_view::{
+    CloseZoneAsk, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneStart, ZoneTreeView, describe_badge, ui_badge,
+};
+use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
+use crate::close_confirm::{CloseConfirm, Confirmed};
 
 /// The tab strip's height in logical pixels: the pill tab list's
 /// (`TAB_LIST_HEIGHT`, shadcn's `h-9`, at the default rem,
@@ -179,9 +186,10 @@ impl Tab {
         self.zones.read(cx).active_terminal(cx)
     }
 
-    /// The view of the terminal that has (or last had) focus in this tab.
+    /// The view of the terminal that has (or last had) focus in this tab;
+    /// `None` when that zone is an agent's.
     fn active_view(&self, cx: &App) -> Option<Entity<TerminalView>> {
-        self.zones.read(cx).active_view()
+        self.zones.read(cx).active_terminal_view()
     }
 
     /// Where the active terminal was last painted.
@@ -195,16 +203,17 @@ impl Tab {
     }
 }
 
-/// What to run in a new tab.
+/// What to run in a new tab: profile `profile`, in `cwd` when given, with
+/// what the launch asks beyond it.
 pub struct LaunchRequest {
     pub profile: usize,
-    pub command: Option<(String, Vec<String>)>,
+    pub with: LaunchWith,
     pub cwd: Option<PathBuf>,
 }
 
 impl LaunchRequest {
     pub fn profile(profile: usize) -> Self {
-        Self { profile, command: None, cwd: None }
+        Self { profile, with: LaunchWith::Profile, cwd: None }
     }
 }
 
@@ -217,10 +226,12 @@ pub enum LaunchRefusal {
     /// the default config's.
     UnknownProfile { name: String, known: Vec<String>, config_error: bool },
     /// The profile is of another kind than the subcommand's: `kind` is the
-    /// profile's. Nothing builds it until `agents-profiles` adds a second
-    /// kind.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// profile's.
     KindMismatch { profile: String, kind: ProfileKind },
+    /// The launch names no profile and the config has none of the
+    /// subcommand's `kind`. `known` and `config_error` as for
+    /// [`Self::UnknownProfile`].
+    NoProfileOfKind { kind: ProfileKind, known: Vec<String>, config_error: bool },
 }
 
 impl std::fmt::Display for LaunchRefusal {
@@ -237,32 +248,70 @@ impl std::fmt::Display for LaunchRefusal {
             ),
             Self::KindMismatch { profile, kind } => {
                 let (kind, subcommand) = match kind {
-                    ProfileKind::Terminal => ("terminal", "terminal"),
+                    ProfileKind::Terminal => ("a terminal", "terminal"),
+                    ProfileKind::Agent => ("an agent", "agent"),
                 };
-                write!(f, "{profile:?} is a {kind} profile: open it with brindle {subcommand} {profile}")
+                write!(f, "{profile:?} is {kind} profile: open it with brindle {subcommand} {profile}")
+            }
+            Self::NoProfileOfKind { kind, known, config_error } => {
+                let (kind, add) = match kind {
+                    ProfileKind::Terminal => ("terminal", "no type, or type = \"terminal\""),
+                    ProfileKind::Agent => ("agent", "type = \"agent\""),
+                };
+                let whose = if *config_error {
+                    "the config has an error, so Brindle is using the default config, whose profiles are"
+                } else {
+                    "the profiles are"
+                };
+                write!(f, "the config has no {kind} profile (add one with {add}; {whose}: {})", known.join(", "))
             }
         }
     }
 }
 
+/// The profile kind a `kind` launch opens.
+fn profile_kind(kind: TabKind) -> ProfileKind {
+    match kind {
+        TabKind::Terminal => ProfileKind::Terminal,
+        TabKind::Agent => ProfileKind::Agent,
+    }
+}
+
 /// The profile a `kind` launch opens: the one `name` names (matched without
-/// regard to case), else the default one when there is no name. A name no
-/// profile has, or a profile of another kind, is refused: the one rule for
-/// a launch's first window and a later launch forwarded to it.
-/// `config_error` says the config failed to load, for the refusal's words.
+/// regard to case); with no name, the default one when it is of the kind,
+/// else the first of the kind in config order. A name no profile has, a
+/// profile of another kind, and no profile of the kind are refused, with no
+/// fallback: the one rule for a launch's first window and a later launch
+/// forwarded to it. `config_error` says the config failed to load, for the
+/// refusal's words.
 pub fn profile_for(
     config: &Config,
     kind: TabKind,
     name: Option<&str>,
     config_error: bool,
 ) -> Result<usize, LaunchRefusal> {
-    let Some(name) = name else { return Ok(config.default_profile_index()) };
-    let Some(index) = config.profile_index(name) else {
-        let known = config.profiles.iter().map(|profile| profile.name.clone()).collect();
-        return Err(LaunchRefusal::UnknownProfile { name: name.to_string(), known, config_error });
+    let wanted = profile_kind(kind);
+    let known = || config.profiles.iter().map(|profile| profile.name.clone()).collect();
+    let Some(name) = name else {
+        let default = config.default_profile_index();
+        if config.profiles.get(default).is_some_and(|profile| profile.kind() == wanted) {
+            return Ok(default);
+        }
+        return config
+            .profiles
+            .iter()
+            .position(|profile| profile.kind() == wanted)
+            .ok_or_else(|| LaunchRefusal::NoProfileOfKind { kind: wanted, known: known(), config_error });
     };
-    match (kind, config.profiles[index].kind()) {
-        (TabKind::Terminal, ProfileKind::Terminal) => Ok(index),
+    let Some(index) = config.profile_index(name) else {
+        return Err(LaunchRefusal::UnknownProfile { name: name.to_string(), known: known(), config_error });
+    };
+    let profile = &config.profiles[index];
+    match (kind, profile.kind()) {
+        (TabKind::Terminal, ProfileKind::Terminal) | (TabKind::Agent, ProfileKind::Agent) => Ok(index),
+        (TabKind::Terminal, ProfileKind::Agent) | (TabKind::Agent, ProfileKind::Terminal) => {
+            Err(LaunchRefusal::KindMismatch { profile: profile.name.clone(), kind: profile.kind() })
+        }
     }
 }
 
@@ -335,6 +384,18 @@ enum Overlay {
     /// A tab's or a zone header's menu: its entries and what its items
     /// run, and what it was opened on.
     ContextMenu { menu: ActionMenu, on: MenuFor },
+    /// The close confirmation: what a Close closes, and the busy agents it
+    /// names.
+    CloseConfirm { target: CloseTarget, busy: Vec<BusyAgent> },
+}
+
+/// What the close confirmation closes once the user confirms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseTarget {
+    /// One zone of tab `tab` (Close Zone, the header's ×, its menu).
+    Zone { tab: TabId, zone: ZoneId },
+    /// A whole tab (Close Tab, the tab's ×, a middle click, its menu).
+    Tab(TabId),
 }
 
 impl Overlay {
@@ -347,6 +408,24 @@ impl Overlay {
             Self::Settings => Some(OverlayKind::Settings),
             Self::ProfileMenu => Some(OverlayKind::ProfileMenu),
             Self::ContextMenu { .. } => Some(OverlayKind::ContextMenu),
+            Self::CloseConfirm { .. } => Some(OverlayKind::CloseConfirm),
+        }
+    }
+}
+
+/// The text input `--send` types into and the dump's `--- input` line
+/// describes: a one-line input (a palette's, the settings dialog's, the
+/// find bar's) or an agent zone's prompt, a text area.
+enum FocusedInput {
+    Line(Entity<TextInput>),
+    Area(Entity<brindle_ui::TextArea>),
+}
+
+impl FocusedInput {
+    fn describe(&self, cx: &App) -> String {
+        match self {
+            Self::Line(input) => input.read(cx).describe(),
+            Self::Area(area) => area.read(cx).describe(),
         }
     }
 }
@@ -480,6 +559,10 @@ pub struct Workspace {
     /// nothing, so a stray click never throws away a preview or an edit.
     settings: UiOverlay<SettingsDialog>,
     _settings_subscriptions: Vec<Subscription>,
+    /// The close confirmation's modal slot (design.md decision 12), open
+    /// while `overlay` is [`Overlay::CloseConfirm`].
+    confirm: UiOverlay<CloseConfirm>,
+    _confirm_subscriptions: Vec<Subscription>,
     /// The strip's `⌄` button and its profile menu, the third overlay: at
     /// most one of the palette, the settings dialog and this menu is open.
     /// Its items are rebuilt each time it opens (`refresh_profile_menu`),
@@ -567,6 +650,8 @@ impl Workspace {
             sessions_listing: 0,
             settings: UiOverlay::modal().ignore_outside_press(),
             _settings_subscriptions: Vec::new(),
+            confirm: UiOverlay::modal(),
+            _confirm_subscriptions: Vec::new(),
             profile_menu,
             _profile_menu_subscription: profile_menu_subscription,
             context_menu,
@@ -702,22 +787,29 @@ impl Workspace {
                         self.restored_hosts.push(host.clone());
                     }
                     match (zones, session) {
-                        (Some(zones), _) => self.restore_zones(profile, host, zones, window, cx),
+                        (Some(zones), _) => {
+                            if !self.restore_zones(profile, host, zones, window, cx) {
+                                continue;
+                            }
+                        }
                         (None, Some(recorded)) => {
                             let profile = config.profiles[profile].clone();
-                            let terminal = self.restored_terminal(&profile, &host, cwd, Some(&recorded), &config, cx);
-                            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
+                            // A tab whose one session is of the other kind
+                            // isn't restored: the session opens on its own.
+                            let Some(start) = self.restored_zone(&profile, &host, cwd, Some(&recorded), &config, cx)
+                            else {
+                                continue;
+                            };
+                            self.insert_zone_tab(profile, host, start, true, window, cx);
                         }
                         // No record: the tab follows its profile.
                         (None, None) => {
-                            self.launch(LaunchRequest { profile, command: None, cwd: Some(cwd) }, window, cx)
+                            self.launch(LaunchRequest { profile, with: LaunchWith::Profile, cwd: Some(cwd) }, window, cx)
                         }
                     }
                     let Some(tab) = self.active_ix().and_then(|ix| self.tabs.get_mut(ix)) else { continue };
-                    if let Some(note) = &missing_note
-                        && let Some(terminal) = tab.active_terminal(cx)
-                    {
-                        terminal.update(cx, |terminal, cx| terminal.note(note, cx));
+                    if let Some(note) = &missing_note {
+                        tab.zones.update(cx, |zones, cx| zones.note_active(note, cx));
                     }
                     if let Some(title) = title {
                         tab.set_manual_title(&title, cx);
@@ -734,7 +826,10 @@ impl Workspace {
     }
 
     /// A restored split tab on `host`: the endpoint its zones recorded
-    /// sessions on, else its profile's (`session::resolve_tab`).
+    /// sessions on, else its profile's (`session::resolve_tab`). A zone
+    /// whose listed session is of the other kind is left out of the split
+    /// ([`Workspace::restored_zone`]); `false` when none is left, and no
+    /// tab opened.
     fn restore_zones(
         &mut self,
         profile_ix: usize,
@@ -742,17 +837,23 @@ impl Workspace {
         zones: RestoredZoneNode,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> bool {
         let config = Self::settings(cx).clone();
-        let Some(profile) = config.profiles.get(profile_ix).cloned() else { return };
-        let (tree, leaves, active_id) = zones.into_tree();
-        let terminals: Vec<_> = leaves
-            .into_iter()
-            .map(|(id, cwd, session)| {
-                let terminal = self.restored_terminal(&profile, &host, cwd, session.as_ref(), &config, cx);
-                (id, terminal)
-            })
-            .collect();
+        let Some(profile) = config.profiles.get(profile_ix).cloned() else { return false };
+        let (mut tree, leaves, mut active_id) = zones.into_tree();
+        let mut terminals = Vec::new();
+        for (id, cwd, session) in leaves {
+            match self.restored_zone(&profile, &host, cwd, session.as_ref(), &config, cx) {
+                Some(start) => terminals.push((id, start)),
+                None => {
+                    tree.remove(id);
+                }
+            }
+        }
+        let Some(first) = terminals.first().map(|(id, _)| *id) else { return false };
+        if !terminals.iter().any(|(id, _)| *id == active_id) {
+            active_id = first;
+        }
         let font_size = profile.font_size;
         let theme = self.previews.theme_for(&profile, &config);
         let p_clone = profile.clone();
@@ -763,6 +864,7 @@ impl Workspace {
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         self.insert_tab(tab, None, window, cx);
+        true
     }
 
     /// This window as session restore records it.
@@ -895,7 +997,7 @@ impl Workspace {
         if !same_endpoint(&tab.host, host) {
             return None;
         }
-        tab.active_terminal(cx)?.read(cx).working_directory()
+        tab.zones.read(cx).active_content()?.working_directory(cx)
     }
 
     /// Opens a tab for the request on its profile's endpoint.
@@ -923,34 +1025,34 @@ impl Workspace {
             log::warn!("no profile #{}", request.profile + 1);
             return;
         };
-        let command = request.command;
-        // New tabs follow the current directory only on the same endpoint,
-        // unless the destination profile pins one.
-        let cwd = match new_tab_cwd(request.cwd, &host, profile.cwd.is_some()) {
-            NewTabCwd::Given(cwd) => Some(cwd),
-            NewTabCwd::FollowActive => self.active_cwd_for(&host, cx),
-            NewTabCwd::ProfileDefault => None,
+        let start = match launch_plan(profile.kind(), request.with) {
+            LaunchPlan::Terminal { command } => {
+                // New tabs follow the current directory only on the same
+                // endpoint, unless the destination profile pins one.
+                let cwd = match new_tab_cwd(request.cwd, &host, profile.cwd.is_some()) {
+                    NewTabCwd::Given(cwd) => Some(cwd),
+                    NewTabCwd::FollowActive => self.active_cwd_for(&host, cx),
+                    NewTabCwd::ProfileDefault => None,
+                };
+                ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx)))
+            }
+            LaunchPlan::Agent { opened, first } => {
+                let cwd = agent_cwd(request.cwd, &host);
+                ZoneStart::Agent(cx.new(|cx| Agent::spawn(&profile, &host, cwd, opened, first, cx)))
+            }
         };
-
-        let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
-        let font_size = profile.font_size;
-        let theme = self.previews.theme_for(&profile, &config);
-        let p_clone = profile.clone();
-        let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
-        let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
-        let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
-        self.insert_tab(tab, None, window, cx);
+        self.insert_zone_tab(profile, host, start, true, window, cx);
     }
 
-    /// A tab on `host` showing `terminal` alone: inserted after the active
-    /// tab and activated when `activate`, else at the end. Attached and
-    /// restored sessions open this way: `host` is the one they run on.
-    fn insert_terminal_tab(
+    /// A tab on `host` showing `start`'s zone alone: inserted after the
+    /// active tab and activated when `activate`, else at the end. Launched,
+    /// attached and restored sessions open this way: `host` is the one
+    /// they run on.
+    fn insert_zone_tab(
         &mut self,
         profile: Profile,
         host: Host,
-        terminal: Entity<Terminal>,
+        start: ZoneStart,
         activate: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -960,7 +1062,7 @@ impl Workspace {
         let font_size = profile.font_size;
         let p_clone = profile.clone();
         let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, terminal, window, cx));
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, font_size, start, window, cx));
         let subscriptions = Self::zone_tab_subscriptions(&view, window, cx);
         let tab = Tab::new(profile, host, view, TabOrigin::Local, subscriptions, cx);
         let id = tab.id;
@@ -975,7 +1077,7 @@ impl Workspace {
 
     /// Opens a tab a sweep grouped from `host`'s detached sessions
     /// ([`crate::layout::group`]) at the end, with `profile`: one session as
-    /// [`Workspace::insert_terminal_tab`] does, several in their recorded
+    /// [`Workspace::insert_zone_tab`] does, several in their recorded
     /// split with its active zone focused, either way with the recorded
     /// title. It is activated only when it is the window's first tab.
     #[cfg(any(target_os = "linux", windows))]
@@ -992,14 +1094,15 @@ impl Workspace {
         let title = tab.title.clone();
         let id = match tab.into_single() {
             Ok(info) => {
-                let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
-                self.insert_terminal_tab(profile, host, terminal, activate, window, cx)
+                let start = Self::attached_zone(&host, &info, &profile, &config, cx);
+                self.insert_zone_tab(profile, host, start, activate, window, cx)
             }
             Err(tab) => {
                 let (tree, leaves, active) = tab.into_tree();
                 let terminals: Vec<_> = leaves
                     .into_iter()
-                    .map(|(id, info)| (id, Self::attached_terminal(&host, &info, &profile, &config, cx)))
+                    // `layout::group` grouped sessions of one kind.
+                    .map(|(id, info)| (id, Self::attached_zone(&host, &info, &profile, &config, cx)))
                     .collect();
                 let theme = self.previews.theme_for(&profile, &config);
                 let font_size = profile.font_size;
@@ -1026,12 +1129,38 @@ impl Workspace {
         }
     }
 
-    /// The detached session a restored zone recorded, when the launch's
-    /// listing still has it ([`crate::reattach::Detached`]).
-    fn take_detached(recorded: Option<&session::ServerSession>, cx: &mut App) -> Option<SessionInfo> {
-        let recorded = recorded?;
-        cx.try_global::<crate::reattach::Detached>()?;
-        cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take(recorded))
+    /// The detached session a restored zone of a tab of `kind` recorded,
+    /// when the launch's listing still has it and it is of that kind
+    /// ([`crate::reattach::Detached::take_of_kind`]).
+    #[cfg(any(target_os = "linux", windows))]
+    fn take_detached(recorded: &session::ServerSession, kind: TabKind, cx: &mut App) -> crate::reattach::Taken {
+        if cx.try_global::<crate::reattach::Detached>().is_none() {
+            return crate::reattach::Taken::Missing;
+        }
+        cx.update_global(|detached: &mut crate::reattach::Detached, _| detached.take_of_kind(recorded, kind))
+    }
+
+    /// A zone attached to the detached session `info` of `host`'s server,
+    /// of the session's kind: a terminal closing as `profile` says, or an
+    /// agent zone showing its conversation.
+    #[cfg(any(target_os = "linux", windows))]
+    fn attached_zone(
+        host: &Host,
+        info: &SessionInfo,
+        profile: &Profile,
+        config: &Config,
+        cx: &mut Context<Self>,
+    ) -> ZoneStart {
+        match crate::reattach::session_kind(info) {
+            TabKind::Terminal => ZoneStart::Terminal(Self::attached_terminal(host, info, profile, config, cx)),
+            TabKind::Agent => {
+                let listed = crate::remote::ListedSession::of(info);
+                let directory = info.cwd.as_ref().map(PathBuf::from);
+                ZoneStart::Agent(cx.new(|cx| {
+                    Agent::attach(profile, host, listed.session, listed.key, false, directory, cx)
+                }))
+            }
+        }
     }
 
     /// A terminal attached to the detached session `info` of `host`'s
@@ -1057,12 +1186,14 @@ impl Workspace {
         cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx))
     }
 
-    /// A restored zone's terminal on `host`. Its recorded session is
-    /// attached: on this machine when the launch's listing found it still
-    /// detached; on a remote endpoint once its listing there confirms it,
-    /// which the zone waits for, saying it is connecting. Otherwise
-    /// `profile` is spawned in `cwd`.
-    fn restored_terminal(
+    /// A restored zone on `host`, of the kind its tab's `profile` opens.
+    /// Its recorded session is attached: on this machine when the launch's
+    /// listing found it still detached and of that kind; on a remote
+    /// endpoint once its listing there confirms it, which the zone waits
+    /// for, saying it is connecting. A listed session of the other kind
+    /// isn't restored into the tab (`None`): it opens as a tab of its own.
+    /// Otherwise `profile` is started anew in `cwd`.
+    fn restored_zone(
         &mut self,
         profile: &Profile,
         host: &Host,
@@ -1070,29 +1201,45 @@ impl Workspace {
         recorded: Option<&session::ServerSession>,
         config: &Config,
         cx: &mut Context<Self>,
-    ) -> Entity<Terminal> {
+    ) -> Option<ZoneStart> {
+        let kind = TabKind::of(profile.kind());
         #[cfg(any(target_os = "linux", windows))]
         match recorded {
             Some(recorded) if !host.is_local() => {
                 self.restored_sessions.push((host.clone(), recorded.clone()));
-                let request = crate::remote::local::AttachRequest {
-                    session: recorded.id,
-                    key: crate::remote::SessionKey::from_wire(&recorded.key),
-                    when: crate::remote::local::Attaching::Recorded,
-                };
-                let what = host.name();
-                return cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx));
+                let key = crate::remote::SessionKey::from_wire(&recorded.key);
+                return Some(match kind {
+                    TabKind::Terminal => {
+                        let request = crate::remote::local::AttachRequest {
+                            session: recorded.id,
+                            key,
+                            when: crate::remote::local::Attaching::Recorded,
+                        };
+                        let what = host.name();
+                        ZoneStart::Terminal(cx.new(|cx| Terminal::attach(host, request, what, profile, config, cx)))
+                    }
+                    TabKind::Agent => ZoneStart::Agent(cx.new(|cx| {
+                        Agent::attach(profile, host, recorded.id, key, true, Some(cwd), cx)
+                    })),
+                });
             }
-            Some(recorded) => {
-                if let Some(info) = Self::take_detached(Some(recorded), cx) {
-                    return Self::attached_terminal(host, &info, profile, config, cx);
+            Some(recorded) => match Self::take_detached(recorded, kind, cx) {
+                crate::reattach::Taken::Session(info) => {
+                    return Some(Self::attached_zone(host, &info, profile, config, cx));
                 }
-            }
+                crate::reattach::Taken::OtherKind => return None,
+                crate::reattach::Taken::Missing => {}
+            },
             None => {}
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = recorded;
-        cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))
+        Some(match kind {
+            TabKind::Terminal => ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(profile, host, None, Some(cwd), config, cx))),
+            TabKind::Agent => {
+                ZoneStart::Agent(cx.new(|cx| Agent::spawn(profile, host, Some(cwd), OpenedBy::Window, None, cx)))
+            }
+        })
     }
 
     /// Opens `sessions` (detached sessions of this machine nothing restored
@@ -1210,6 +1357,10 @@ impl Workspace {
             cx.subscribe_in(view, window, |this, view, request: &ZoneMenuRequest, window, cx| {
                 this.open_zone_menu(view, request, window, cx)
             }),
+            cx.subscribe_in(view, window, |this, view, ask: &CloseZoneAsk, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.open_close_confirm(CloseTarget::Zone { tab, zone: ask.zone }, ask.busy.clone(), window, cx);
+            }),
             // From any tab: an opener can fail after its tab went to the
             // background.
             cx.subscribe(view, |this, _, LinkFailed(text): &LinkFailed, cx| this.show_notice(text.clone(), cx)),
@@ -1303,6 +1454,9 @@ impl Workspace {
                 if self.tabs[ix].refresh_title(cx) | self.refresh_badge(ix, cx) {
                     cx.notify();
                 }
+                // And when a zone closed, which may be the one the close
+                // confirmation asks about.
+                self.drop_stale_confirm(window, cx);
             }
         }
     }
@@ -1477,6 +1631,7 @@ impl Workspace {
             }
             Removed::Active(active) => self.activate(Pick::Tab(active), window, cx),
         }
+        self.drop_stale_confirm(window, cx);
     }
 
     // ---- actions ----------------------------------------------------------------
@@ -1488,7 +1643,8 @@ impl Workspace {
         let p_clone = profile.clone();
         let host = Host::of(&profile);
         let tree_host = host.clone();
-        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, terminal, window, cx));
+        let start = ZoneStart::Terminal(terminal);
+        let view = cx.new(|cx| ZoneTreeView::new(p_clone, tree_host, theme, profile.font_size, start, window, cx));
         let tab = Tab::new(profile, host, view, TabOrigin::Message, Vec::new(), cx);
         self.insert_tab(tab, None, window, cx);
     }
@@ -1504,7 +1660,79 @@ impl Workspace {
 
     fn close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(active) = self.strip.active() {
-            self.remove_tab(active, window, cx);
+            self.request_close_tab(active, window, cx);
+        }
+    }
+
+    /// The user asked to close tab `id` (Close Tab, its ×, a middle click,
+    /// its menu): at once, or after the confirmation when one of its agent
+    /// zones is busy ([`close_plan`]). A background tab isn't activated.
+    fn request_close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ix) = self.tab_ix(id) else { return };
+        let closing = self.tabs[ix].zones.read(cx).closing(cx);
+        match close_plan(&closing) {
+            ClosePlan::Now => self.remove_tab(id, window, cx),
+            ClosePlan::Ask(busy) => self.open_close_confirm(CloseTarget::Tab(id), busy, window, cx),
+        }
+    }
+
+    /// Opens the close confirmation for `target`, naming `busy`, in place
+    /// of any overlay. Cancel, escape and the backdrop leave everything as
+    /// it was, focus going back to where it was; Close closes `target`.
+    fn open_close_confirm(&mut self, target: CloseTarget, busy: Vec<BusyAgent>, window: &mut Window, cx: &mut Context<Self>) {
+        self.replace_overlay(OverlayKind::CloseConfirm, window, cx);
+        let dialog = cx.new(|cx| CloseConfirm::new(close_text(&busy), cx));
+        let confirmed = cx.subscribe_in(&dialog, window, |this, _, _: &Confirmed, window, cx| this.confirm_close(window, cx));
+        // The slot closes itself on the dialog's `DismissEvent` (Cancel,
+        // escape, the backdrop).
+        let dismissed = cx.subscribe_in(&dialog, window, |this, _, _: &gpui::DismissEvent, _, cx| {
+            if matches!(this.overlay, Overlay::CloseConfirm { .. }) {
+                this.overlay = Overlay::Closed;
+            }
+            cx.notify();
+        });
+        self._confirm_subscriptions = vec![confirmed, dismissed];
+        self.overlay = Overlay::CloseConfirm { target, busy };
+        self.confirm.open(dialog, |this| &mut this.confirm, window, cx);
+        cx.notify();
+    }
+
+    /// Close in the confirmation: it closes, giving focus back, then what
+    /// it asked about closes, if it is still there. Nothing is asked
+    /// again, even if the agent went idle meanwhile.
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::CloseConfirm { target, .. } = std::mem::replace(&mut self.overlay, Overlay::Closed) else {
+            return;
+        };
+        self.confirm.close(window, cx);
+        self._confirm_subscriptions.clear();
+        match target {
+            CloseTarget::Tab(id) => self.remove_tab(id, window, cx),
+            CloseTarget::Zone { tab, zone } => {
+                if let Some(zones) = self.tab_ix(tab).map(|ix| self.tabs[ix].zones.clone()) {
+                    zones.update(cx, |zones, cx| zones.close_zone_by_id(zone, window, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The close confirmation's target, while it is open and still there.
+    /// One whose tab or zone went by another path (closed, exited) closes
+    /// itself.
+    fn drop_stale_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::CloseConfirm { target, .. } = &self.overlay else { return };
+        let there = match *target {
+            CloseTarget::Tab(id) => self.tab_ix(id).is_some(),
+            CloseTarget::Zone { tab, zone } => {
+                self.tab_ix(tab).is_some_and(|ix| self.tabs[ix].zones.read(cx).has_zone(zone))
+            }
+        };
+        if !there {
+            self.overlay = Overlay::Closed;
+            self.confirm.close(window, cx);
+            self._confirm_subscriptions.clear();
+            cx.notify();
         }
     }
 
@@ -1710,7 +1938,7 @@ impl Workspace {
                 TabMenuItem::Rename => self.rename_tab_at(id, window, cx),
                 TabMenuItem::MoveLeft => self.shift_tab(id, Shift::Within(-1), cx),
                 TabMenuItem::MoveRight => self.shift_tab(id, Shift::Within(1), cx),
-                TabMenuItem::Close => self.remove_tab(id, window, cx),
+                TabMenuItem::Close => self.request_close_tab(id, window, cx),
             }
             return;
         }
@@ -1727,7 +1955,9 @@ impl Workspace {
         let types: std::collections::HashSet<std::any::TypeId> =
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
         // The palette lists what the tab can run: GPUI's answer, applied.
+        let agent = self.active_tab().is_some_and(|t| t.zones.read(cx).active_content().is_some_and(|c| c.agent_view().is_some()));
         let facts = PaletteFacts {
+            zone: if agent { PaletteZone::Agent } else { PaletteZone::Terminal },
             prompt_marks: self
                 .active_tab()
                 .and_then(|t| t.active_terminal(cx))
@@ -1950,7 +2180,8 @@ impl Workspace {
             | Overlay::Palette { kind: PaletteKind::NewTab { .. } | PaletteKind::Commands { .. } | PaletteKind::Prompt, .. }
             | Overlay::Settings
             | Overlay::ProfileMenu
-            | Overlay::ContextMenu { .. } => {}
+            | Overlay::ContextMenu { .. }
+            | Overlay::CloseConfirm { .. } => {}
         }
     }
 
@@ -2001,8 +2232,8 @@ impl Workspace {
             let first = self.profile_on(&host);
             let index = crate::reattach::session_profile(&info, &host, &config, first.as_deref());
             let profile = config.profiles[index].clone();
-            let terminal = Self::attached_terminal(&host, &info, &profile, &config, cx);
-            self.insert_terminal_tab(profile, host, terminal, true, window, cx);
+            let start = Self::attached_zone(&host, &info, &profile, &config, cx);
+            self.insert_zone_tab(profile, host, start, true, window, cx);
         }
         #[cfg(not(any(target_os = "linux", windows)))]
         let _ = (host, info, window, cx);
@@ -2065,6 +2296,7 @@ impl Workspace {
     fn has_overlay(&self, cx: &App) -> bool {
         self.palette.is_open()
             || self.settings.is_open()
+            || self.confirm.is_open()
             || self.profile_menu.read(cx).is_open()
             || self.context_menu.read(cx).is_open()
     }
@@ -2079,6 +2311,7 @@ impl Workspace {
             OverlayKind::Settings => self.settings.is_open(),
             OverlayKind::ProfileMenu => self.profile_menu.read(cx).is_open(),
             OverlayKind::ContextMenu => self.context_menu.read(cx).is_open(),
+            OverlayKind::CloseConfirm => self.confirm.is_open(),
         };
         open.then_some(kind)
     }
@@ -2105,6 +2338,8 @@ impl Workspace {
         self.overlay = Overlay::Closed;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
+        self.confirm.close(window, cx);
+        self._confirm_subscriptions.clear();
         self.profile_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.context_menu.update(cx, |menu, cx| menu.close(window, cx));
         self.end_previews(cx);
@@ -2213,27 +2448,48 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The text input that has keyboard focus, if any: the overlay's, or
-    /// the find bar's in the active terminal.
-    fn focused_input(&self, window: &Window, cx: &App) -> Option<Entity<TextInput>> {
+    /// The text input that has keyboard focus, if any: the overlay's, the
+    /// find bar's in the active terminal, or the active agent zone's
+    /// prompt.
+    fn focused_input(&self, window: &Window, cx: &App) -> Option<FocusedInput> {
         if let Some(palette) = self.palette.view() {
             let input = palette.read(cx).input(cx);
-            return input.read(cx).is_focused(window).then_some(input);
+            return input.read(cx).is_focused(window).then_some(FocusedInput::Line(input));
         }
         if self.settings.is_open() {
-            return self.settings.view()?.read(cx).focused_input(window, cx);
+            return self.settings.view()?.read(cx).focused_input(window, cx).map(FocusedInput::Line);
+        }
+        if let Some(area) = self.active_prompt_area(cx) {
+            return area.read(cx).is_focused(window).then_some(FocusedInput::Area(area));
         }
         let input = self.active_tab()?.active_view(cx)?.read(cx).find_input()?;
-        input.read(cx).is_focused(window).then_some(input)
+        input.read(cx).is_focused(window).then_some(FocusedInput::Line(input))
+    }
+
+    /// The active agent zone's prompt input's text area.
+    fn active_prompt_area(&self, cx: &App) -> Option<Entity<brindle_ui::TextArea>> {
+        let zones = self.active_tab()?.zones.read(cx);
+        let view = zones.active_content()?.agent_view()?;
+        Some(view.read(cx).prompt().read(cx).area().clone())
     }
 
     /// Debug hook for `--send`: types into the focused text input, or else
-    /// the active tab.
+    /// the active tab: its terminal, or its agent zone's prompt input.
     pub fn send_to_active(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(input) = self.focused_input(window, cx) {
-            let text: String = String::from_utf8_lossy(bytes).chars().filter(|c| !c.is_control()).collect();
-            input.update(cx, |input, cx| input.insert(&text, cx));
-            return;
+        let text = String::from_utf8_lossy(bytes);
+        let input = self.focused_input(window, cx).or_else(|| self.active_prompt_area(cx).map(FocusedInput::Area));
+        match input {
+            Some(FocusedInput::Line(input)) => {
+                let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                input.update(cx, |input, cx| input.insert(&text, cx));
+                return;
+            }
+            // A text area keeps line breaks and tabs, as a paste does.
+            Some(FocusedInput::Area(area)) => {
+                area.update(cx, |area, cx| area.insert(&text, cx));
+                return;
+            }
+            None => {}
         }
         if let Some(terminal) = self.active_tab().and_then(|t| t.active_terminal(cx)) {
             let bytes = bytes.to_vec();
@@ -2258,9 +2514,10 @@ impl Workspace {
         }
     }
 
-    /// The active terminal's visible screen text, for `--wait-for`.
+    /// What `--wait-for` matches in the active zone: the terminal's visible
+    /// screen text, or the agent zone's dump lines.
     pub fn active_screen_text(&self, cx: &App) -> Option<String> {
-        Some(self.active_tab()?.active_terminal(cx)?.read(cx).screen_text())
+        Some(self.active_tab()?.zones.read(cx).active_content()?.wait_text(cx))
     }
 
     /// Debug hook for `--dump-screen-after`.
@@ -2313,6 +2570,20 @@ impl Workspace {
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&terminal.screen_text());
+        } else if let Some(agent) = self.active_tab().and_then(|t| t.zones.read(cx).describe_active_agent(cx)) {
+            // An agent zone (design.md decision 15): the fonts, progress,
+            // badges and zone lines, then its block in place of a screen.
+            out.push_str(&describe_fonts(cx));
+            out.push_str(&describe_tab_progress(self.tabs.iter().map(|tab| tab.progress)));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_progress());
+            }
+            out.push_str(&describe_tab_badges(self.tabs.iter().map(|tab| tab.badge.as_ref())));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_badges());
+                out.push_str(&tab.zones.read(cx).describe_zones());
+            }
+            out.push_str(&agent);
         } else {
             out.push_str(&describe_fonts(cx));
         }
@@ -2329,30 +2600,51 @@ impl Workspace {
             let menu = menu.read(cx);
             out.push_str(&describe_menu(menu.entries(), menu.highlighted()));
         }
+        if let (Overlay::CloseConfirm { target, busy }, true) = (&self.overlay, self.confirm.is_open()) {
+            let target = match *target {
+                CloseTarget::Zone { zone, .. } => format!("zone:{}", zone.0),
+                CloseTarget::Tab(id) => format!("tab:{}", self.tab_ix(id).map_or(0, |ix| ix + 1)),
+            };
+            out.push_str(&format!("--- confirm close target={target} busy={}\n", describe_busy(busy)));
+        }
         if let Some(input) = self.focused_input(window, cx) {
-            out.push_str(&format!("--- input {}\n", input.read(cx).describe()));
+            out.push_str(&format!("--- input {}\n", input.describe(cx)));
         }
         out.push_str(&format!("--- focus {}\n", self.describe_focus(window, cx)));
         out
     }
 
     /// Where keyboard focus is, for `--dump-screen-after`: `terminal` (the
-    /// active tab's active terminal), `palette` (inside an open palette),
-    /// `settings stop=NAME` (inside the settings dialog, on the control
+    /// active tab's active terminal), `agent stop=STOP` (on one of the
+    /// active agent zone's stops: `prompt`, `queued:remove`,
+    /// `queued:send-again`, `queued:discard`, `permission:ENTRY:OPTION`,
+    /// `stop`), `palette` (inside an open palette), `confirm stop=cancel|close`
+    /// (the close confirmation), `settings stop=NAME` (inside the settings dialog, on the control
     /// `NAME`), `tabs` (the tab strip, on the active tab), `menu` (an open
     /// menu: the profile menu, or a tab or zone menu), `none`, or
     /// `other`; then the window's `modality=keyboard|pointer`, which
     /// decides whether the focused control shows its ring.
     fn describe_focus(&self, window: &Window, cx: &App) -> String {
         let terminal = self.active_tab().and_then(|t| t.active_view(cx));
+        let agent_stop = self.active_tab().and_then(|t| {
+            let zones = t.zones.read(cx);
+            zones.active_content()?.agent_view()?.read(cx).focused_stop(window, cx)
+        });
         let place = if terminal.is_some_and(|v| v.read(cx).focus_handle.is_focused(window)) {
             "terminal".to_string()
+        } else if let Some(stop) = agent_stop {
+            format!("agent stop={stop}")
         } else if self.palette.view().is_some_and(|p| p.read(cx).focus_handle(cx).contains_focused(window, cx)) {
             "palette".to_string()
         } else if let Some(dialog) =
             self.settings.view().filter(|d| d.read(cx).focus_handle(cx).contains_focused(window, cx))
         {
             format!("settings stop={:?}", dialog.read(cx).focused_label(window, cx).unwrap_or(""))
+        } else if let Some(dialog) = self.confirm.view().filter(|d| d.read(cx).contains_focused(window, cx)) {
+            match dialog.read(cx).focused_stop(window) {
+                Some(stop) => format!("confirm stop={}", stop.word()),
+                None => "confirm".to_string(),
+            }
         } else if self.strip_focus.is_focused(window) {
             "tabs".to_string()
         } else if self.open_menu(cx).is_some_and(|m| m.read(cx).focus_handle(cx).contains_focused(window, cx)) {
@@ -2454,7 +2746,7 @@ impl Workspace {
             .on_activate(cx.listener(|this, request: &TabActivate, window, cx| this.activate_from_strip(request, window, cx)))
             .on_close(cx.listener(|this, ix: &usize, window, cx| {
                 if let Some(id) = this.tabs.get(*ix).map(|tab| tab.id) {
-                    this.remove_tab(id, window, cx);
+                    this.request_close_tab(id, window, cx);
                 }
             }))
             .on_move(cx.listener(|this, request: &TabMove, _, cx| this.move_dragged_tab(request, cx)))
@@ -2764,9 +3056,14 @@ fn same_endpoint(tab: &Host, host: &Host) -> bool {
 /// still runs here.
 fn config_editor_launch(config: &Config, editor: (String, Vec<String>)) -> (LaunchRequest, Host) {
     let default = config.default_profile_index();
-    let local = |index: &usize| config.profiles.get(*index).is_some_and(|profile| Host::of(profile).is_local());
+    // A terminal profile: an agent tab runs no editor.
+    let local = |index: &usize| {
+        config.profiles.get(*index).is_some_and(|profile| {
+            Host::of(profile).is_local() && profile.kind() == ProfileKind::Terminal
+        })
+    };
     let profile = Some(default).filter(local).or_else(|| (0..config.profiles.len()).find(local)).unwrap_or(default);
-    (LaunchRequest { profile, command: Some(editor), cwd: None }, Host::Local)
+    (LaunchRequest { profile, with: LaunchWith::Command(editor.0, editor.1), cwd: None }, Host::Local)
 }
 
 /// A tab's profile once the config is reloaded: the config's profile of
@@ -3106,7 +3403,9 @@ impl Render for Workspace {
 
         // While the settings dialog previews a theme, only the overlay
         // toggles act, so nothing (such as a new tab) changes underneath it.
-        let settings_open = self.settings.is_open();
+        // The close confirmation holds them back the same way: its own
+        // buttons, escape and backdrop are what act.
+        let settings_open = self.settings.is_open() || self.confirm.is_open();
         let body = div()
             .id("workspace")
             .key_context("Workspace")
@@ -3191,6 +3490,7 @@ impl Render for Workspace {
             // deferred from the strip, and only while neither is open).
             .children(self.palette.render(window, cx))
             .children(self.settings.render(window, cx))
+            .children(self.confirm.render(window, cx))
             // The tab and zone menus: drawn deferred, taking no room here.
             .child(self.context_menu.clone());
 
@@ -3333,11 +3633,115 @@ mod tests {
         assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(1));
     }
 
-    /// No profile can be of another kind yet, so the refusal is built here.
     #[test]
     fn a_kind_mismatch_names_the_profile_its_kind_and_its_subcommand() {
         let refusal = LaunchRefusal::KindMismatch { profile: "Work".into(), kind: ProfileKind::Terminal };
         assert_eq!(refusal.to_string(), "\"Work\" is a terminal profile: open it with brindle terminal Work");
+        let refusal = LaunchRefusal::KindMismatch { profile: "Fake".into(), kind: ProfileKind::Agent };
+        assert_eq!(refusal.to_string(), "\"Fake\" is an agent profile: open it with brindle agent Fake");
+    }
+
+    /// `brindle terminal NAME` naming an agent profile is refused.
+    #[test]
+    fn a_terminal_launch_naming_an_agent_profile_is_refused() {
+        let config = Config::parse(
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"",
+        )
+        .unwrap()
+        .config;
+        assert_eq!(
+            profile_for(&config, TabKind::Terminal, Some("fake"), false),
+            Err(LaunchRefusal::KindMismatch { profile: "Fake".into(), kind: ProfileKind::Agent })
+        );
+    }
+
+    /// Profiles `Shell` (terminal), `Fake` (agent), `Work` (terminal) and
+    /// `Other` (agent), `default` the default one.
+    fn both_kinds(default: &str) -> Config {
+        let text = format!(
+            "default_profile = \"{default}\"\n\
+             [[profiles]]\nname = \"Shell\"\n\n\
+             [[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n\n\
+             [[profiles]]\nname = \"Work\"\n\n\
+             [[profiles]]\nname = \"Other\"\ntype = \"agent\"\ncommand = \"other\"\n"
+        );
+        Config::parse(&text).unwrap().config
+    }
+
+    #[test]
+    fn a_profile_of_the_other_kind_is_refused_under_either_subcommand() {
+        let config = both_kinds("Shell");
+        assert_eq!(profile_for(&config, TabKind::Agent, Some("fake"), false), Ok(1));
+        assert_eq!(profile_for(&config, TabKind::Terminal, Some("work"), false), Ok(2));
+        let refusal = profile_for(&config, TabKind::Agent, Some("shell"), false).unwrap_err();
+        assert_eq!(refusal, LaunchRefusal::KindMismatch { profile: "Shell".into(), kind: ProfileKind::Terminal });
+        assert_eq!(refusal.to_string(), "\"Shell\" is a terminal profile: open it with brindle terminal Shell");
+        let refusal = profile_for(&config, TabKind::Terminal, Some("Other"), false).unwrap_err();
+        assert_eq!(refusal.to_string(), "\"Other\" is an agent profile: open it with brindle agent Other");
+    }
+
+    /// With no name: the default profile when it is of the kind, else the
+    /// first profile of the kind in config order.
+    #[test]
+    fn no_name_is_the_default_profile_of_the_kind() {
+        let config = both_kinds("Shell");
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(0), "the default is a terminal");
+        assert_eq!(profile_for(&config, TabKind::Agent, None, false), Ok(1), "the first agent profile");
+        let config = both_kinds("Other");
+        assert_eq!(profile_for(&config, TabKind::Agent, None, false), Ok(3), "the default is an agent");
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(0), "the first terminal profile");
+        let config = both_kinds("Work");
+        assert_eq!(profile_for(&config, TabKind::Terminal, None, false), Ok(2));
+        assert_eq!(profile_for(&config, TabKind::Agent, None, false), Ok(1));
+    }
+
+    /// An unknown name is refused under both subcommands, listing every
+    /// profile, with no fallback to a default of the kind.
+    #[test]
+    fn an_unknown_name_is_refused_under_either_subcommand() {
+        let config = both_kinds("Shell");
+        for kind in [TabKind::Terminal, TabKind::Agent] {
+            let refusal = profile_for(&config, kind, Some("agnt"), false).unwrap_err();
+            assert_eq!(refusal.to_string(), "no profile is named \"agnt\" (the profiles are: Shell, Fake, Work, Other)");
+            let defaults = Config::parse("").unwrap().config;
+            let refusal = profile_for(&defaults, kind, Some("agnt"), true).unwrap_err();
+            assert_eq!(
+                refusal.to_string(),
+                "no profile is named \"agnt\" (the config has an error, so Brindle is using the default config, \
+                 whose profiles are: Shell)",
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_profile_of_the_kind_is_refused() {
+        let refusal = profile_for(&shell_and_work(), TabKind::Agent, None, false).unwrap_err();
+        assert_eq!(
+            refusal,
+            LaunchRefusal::NoProfileOfKind {
+                kind: ProfileKind::Agent,
+                known: vec!["Shell".into(), "Work".into()],
+                config_error: false
+            }
+        );
+        assert_eq!(
+            refusal.to_string(),
+            "the config has no agent profile (add one with type = \"agent\"; the profiles are: Shell, Work)"
+        );
+        let defaults = Config::parse("").unwrap().config;
+        assert_eq!(
+            profile_for(&defaults, TabKind::Agent, None, true).unwrap_err().to_string(),
+            "the config has no agent profile (add one with type = \"agent\"; the config has an error, so Brindle \
+             is using the default config, whose profiles are: Shell)"
+        );
+        let agents_only =
+            Config::parse("[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n").unwrap().config;
+        assert_eq!(
+            profile_for(&agents_only, TabKind::Terminal, None, false).unwrap_err().to_string(),
+            "the config has no terminal profile (add one with no type, or type = \"terminal\"; \
+             the profiles are: Fake)"
+        );
     }
 
     #[test]
@@ -3363,7 +3767,7 @@ mod tests {
     fn editor_tab(config: &Config) -> usize {
         let (request, host) = config_editor_launch(config, editor());
         assert_eq!(host, Host::Local);
-        assert_eq!(request.command, Some(editor()));
+        assert_eq!(request.with, LaunchWith::Command(editor().0, editor().1));
         assert_eq!(request.cwd, None);
         let profile = &config.profiles[request.profile];
         let (spawn, doing) = crate::terminal::spawn_request(profile, &host, Some(editor()), None, config, None);

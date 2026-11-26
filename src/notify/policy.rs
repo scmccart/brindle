@@ -15,6 +15,7 @@ pub fn enabled(config: &NotificationConfig, source: Source) -> bool {
         Source::Osc777 => config.osc777,
         Source::Osc99 => config.osc99,
         Source::Osc7501 => config.osc7501,
+        Source::Agent => config.agent,
     }
 }
 
@@ -41,7 +42,7 @@ pub fn layout(source: Source, title: &str, body: &str, tab_title: &str) -> (Stri
     let summary = if title.is_empty() { tab_title.to_string() } else { format!("{title} — {tab_title}") };
     let body = match source {
         Source::Bell => "Bell".to_string(),
-        Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 => body.to_string(),
+        Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 | Source::Agent => body.to_string(),
     };
     (truncate(&summary, MAX_TITLE_CHARS), body)
 }
@@ -215,7 +216,7 @@ mod tests {
     fn focus_rule() {
         let unfocused = config(NotifyWhen::Unfocused);
         let always = config(NotifyWhen::Always);
-        for source in [Source::Bell, Source::Osc9, Source::Osc777, Source::Osc99] {
+        for source in [Source::Bell, Source::Osc9, Source::Osc777, Source::Osc99, Source::Osc7501, Source::Agent] {
             assert!(!plain(&unfocused, source, true), "{source:?} visible");
             assert!(plain(&unfocused, source, false), "{source:?} hidden");
             assert!(plain(&always, source, true), "{source:?} always");
@@ -237,6 +238,23 @@ mod tests {
         c.osc99 = false;
         assert!(!enabled(&c, Source::Osc99));
         assert!(!wanted(&c, Source::Osc99, Occasion::Always, false, false));
+    }
+
+    /// `notifications.agent` is on by default and turns agent zones'
+    /// notifications off alone.
+    #[test]
+    fn agent_notifications_have_their_own_switch() {
+        let mut c = config(NotifyWhen::Always);
+        assert!(c.agent);
+        assert!(plain(&c, Source::Agent, false));
+        c.agent = false;
+        assert!(!enabled(&c, Source::Agent));
+        assert!(!plain(&c, Source::Agent, false));
+        assert!(!plain(&c, Source::Agent, true));
+        assert!(plain(&c, Source::Osc7501, false), "osc7501 is a switch of its own");
+        c.agent = true;
+        c.osc7501 = false;
+        assert!(plain(&c, Source::Agent, false), "osc7501 doesn't silence agents");
     }
 
     /// Each occasion under both `when` values, for a tab in each place: in
@@ -274,6 +292,29 @@ mod tests {
         assert_eq!(layout(Source::Osc777, "Build", "ok", "bash"), ("Build — bash".into(), "ok".into()));
         assert_eq!(layout(Source::Bell, "", "", "vim"), ("vim".into(), "Bell".into()));
         assert_eq!(layout(Source::Osc9, "", "x", " "), ("Brindle".into(), "x".into()));
+    }
+
+    /// An agent's notice (`ChatModel::notice`): the agent's name, then the
+    /// tab's title; the body as the model worded it.
+    #[test]
+    fn agent_notices_name_the_agent_then_the_tab() {
+        let permission = layout(Source::Agent, "Fake Agent", "Run cargo test?", "Fake Agent");
+        assert_eq!(permission, ("Fake Agent — Fake Agent".into(), "Run cargo test?".into()));
+        assert_eq!(layout(Source::Agent, "Fake Agent", "Done", "review"), ("Fake Agent — review".into(), "Done".into()));
+        assert_eq!(layout(Source::Agent, "Fake", "bad", ""), ("Fake — Brindle".into(), "bad".into()));
+        let long = "a".repeat(MAX_TITLE_CHARS * 2);
+        let (summary, _) = layout(Source::Agent, &long, "Done", "tab");
+        assert!(summary.chars().count() <= MAX_TITLE_CHARS, "{summary}");
+    }
+
+    /// Agent notices share the programs' per-tab bucket, not the bell's.
+    #[test]
+    fn agent_notices_take_the_program_rate_limit() {
+        let mut limiter = RateLimiter::new();
+        let t0 = Instant::now();
+        let allowed = (0..5).filter(|_| limiter.allow(1, Source::Agent, t0)).count();
+        assert_eq!(allowed, OSC_PER_TAB.capacity as usize);
+        assert!(limiter.allow(1, Source::Bell, t0), "the bell's bucket is apart");
     }
 
     #[test]

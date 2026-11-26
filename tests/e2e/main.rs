@@ -36,6 +36,7 @@ use std::time::Instant;
 
 #[cfg(windows)]
 use common::server::under;
+use common::fake_agent;
 use common::server::{Suite, check_helper, end_roles, helper, private_dir, server_processes};
 #[cfg(windows)]
 use common::winproc;
@@ -56,24 +57,40 @@ pub struct Case {
     /// The fault switches the case sets, which its binaries must list
     /// (`--list-fault-switches`) for it to run (`testing R18`).
     pub needs: &'static [TestSwitch],
+    /// Runs the fake ACP agent ([`Ctx::fake_agent`]), which the runner
+    /// checks is built and fresh before any case that needs it runs.
+    pub fake_agent: bool,
     pub run: fn(&Ctx) -> Result<Outcome>,
 }
 
 impl Case {
     /// A case that opens windows and needs no switch.
     pub fn display(name: &'static str, run: fn(&Ctx) -> Result<Outcome>) -> Self {
-        Case { name, display: true, needs: &[], run }
+        Case { name, display: true, needs: &[], fake_agent: false, run }
     }
 
     /// A case that opens no window.
     pub fn headless(name: &'static str, run: fn(&Ctx) -> Result<Outcome>) -> Self {
-        Case { name, display: false, needs: &[], run }
+        Case { name, display: false, needs: &[], fake_agent: false, run }
     }
 
     /// A case that opens windows and sets the fault switches `needs`.
     pub fn needing(name: &'static str, needs: &'static [TestSwitch], run: fn(&Ctx) -> Result<Outcome>) -> Self {
-        Case { name, display: true, needs, run }
+        Case { name, display: true, needs, fake_agent: false, run }
     }
+
+    /// The case runs the fake ACP agent: a declaration beside
+    /// [`Case::needs`], not a fault switch.
+    pub fn needs_fake_agent(self) -> Self {
+        Case { fake_agent: true, ..self }
+    }
+}
+
+/// Whether a run must find the fake ACP agent: a selected case that opens
+/// windows runs it, and there is a display to run that case on. `--list`
+/// and a selection with no such case never look.
+fn wants_fake_agent(selected: &[&Case], has_display: bool) -> bool {
+    has_display && selected.iter().any(|case| case.display && case.fake_agent)
 }
 
 /// What a case gets from the runner.
@@ -96,6 +113,10 @@ pub struct Ctx {
     /// system temp directory, not `dir`, because a holder's socket path must
     /// fit in `sun_path` (108 bytes); on Windows it is `dir`'s `server`.
     pub server_dir: PathBuf,
+    /// The fake ACP agent (`common::fake_agent`): `BRINDLE_FAKE_ACP_AGENT`,
+    /// else beside the suite's own build, never beside `bin`. Checked
+    /// before the run only when a selected case needs it.
+    pub fake_agent: PathBuf,
     scale: Scale,
 }
 
@@ -176,6 +197,14 @@ fn main() {
     if std::env::var_os("BRINDLE_E2E_BIN").is_some() {
         println!("e2e: {} with {}", bin.display(), helper.display());
     }
+    let own_build = Path::new(env!("CARGO_BIN_EXE_brindle"));
+    let fake_agent = fake_agent::find(own_build);
+    if wants_fake_agent(&selected, has_display)
+        && let Err(why) = fake_agent::check(&fake_agent, own_build)
+    {
+        eprintln!("e2e: {why}");
+        std::process::exit(1);
+    }
 
     let required = std::env::var("BRINDLE_E2E_SWITCHES_REQUIRED").as_deref() == Ok("1");
     let mut probes = Probes::new(&bin, &helper, &root, &display, Scale::new(slow));
@@ -209,6 +238,7 @@ fn main() {
                 helper: helper.clone(),
                 display: display.clone(),
                 server_dir,
+                fake_agent: fake_agent.path.clone(),
                 scale: Scale::new(slow),
             };
             let outcome = cleaned.and_then(|()| (case.run)(&ctx));
@@ -337,6 +367,26 @@ fn usage(why: &str) -> ! {
 /// One of the harness's own unit tests.
 type SelfTest = fn() -> Result;
 
+/// Only a selected case that declares the fake agent and opens windows,
+/// with a display to open them on, makes the run look for it.
+fn self_test_wants_fake_agent() -> Result {
+    fn pass(_: &Ctx) -> Result<Outcome> {
+        Ok(Outcome::Pass)
+    }
+    let plain = Case::display("plain", pass);
+    let agent = Case::display("agent", pass).needs_fake_agent();
+    let headless = Case::headless("headless", pass).needs_fake_agent();
+    let switched = Case::needing("switched", &[], pass);
+    ensure!(agent.fake_agent && !plain.fake_agent && !switched.fake_agent, "the declaration");
+    ensure!(agent.display && agent.name == "agent", "the declaration keeps the rest of the case");
+    ensure!(wants_fake_agent(&[&plain, &agent], true), "an agent case selected");
+    ensure!(!wants_fake_agent(&[&plain, &switched], true), "no agent case selected");
+    ensure!(!wants_fake_agent(&[&agent], false), "no display to run it on");
+    ensure!(!wants_fake_agent(&[&headless], true), "a headless case runs no agent");
+    ensure!(!wants_fake_agent(&[], true), "nothing selected");
+    Ok(())
+}
+
 /// The harness's own unit tests (`--self-test`); there is no libtest here.
 fn self_test() -> i32 {
     let tests: &[(&str, SelfTest)] = &[
@@ -351,6 +401,8 @@ fn self_test() -> i32 {
         ("remote parsing", cases::self_test_remote),
         ("clipboard helpers", cases::self_test_clipboard),
         ("server helpers", common::server::self_test),
+        ("fake agent lookup", fake_agent::self_test),
+        ("fake agent selection", self_test_wants_fake_agent),
         ("fault switches", switches::self_test),
         #[cfg(windows)]
         ("windows processes", winproc::self_test),

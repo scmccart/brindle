@@ -1,9 +1,69 @@
 //! Where a new tab starts, apart from GPUI: the directory a launch asked
-//! for, the active tab's, or its profile's own.
+//! for, the active tab's, or its profile's own; and what it runs, by its
+//! profile's kind.
 
 use std::path::PathBuf;
 
+use crate::FirstPrompt;
+use crate::agent::spawn::OpenedBy;
+use crate::config::ProfileKind;
 use crate::remote::Host;
+
+/// What a launch asks of its tab beyond its profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchWith {
+    /// The profile as it is: what the window opens (the profile menu, the
+    /// picker, a shortcut, ctrl-shift-t, the default tab at launch, a
+    /// restore's).
+    Profile,
+    /// `brindle terminal -e`: this program and its arguments instead of
+    /// the profile's.
+    Command(String, Vec<String>),
+    /// `brindle agent`, run in `launched_in` (`None` when that couldn't be
+    /// read), with its first prompt.
+    Agent { launched_in: Option<PathBuf>, first: Option<FirstPrompt> },
+}
+
+/// What a launch's tab runs (design.md decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchPlan {
+    /// A terminal tab, running `command` or the profile's own.
+    Terminal { command: Option<(String, Vec<String>)> },
+    /// An agent tab, opened as `opened` says, with its first prompt.
+    Agent { opened: OpenedBy, first: Option<FirstPrompt> },
+}
+
+/// What a launch opens for a profile of `kind`: the profile's kind decides
+/// the tab's. A launch's own profile check (`profile_for`) already matched
+/// the kinds, so what the other kind asked (a command for an agent, a
+/// first prompt for a terminal) only comes with a profile whose kind a
+/// reload changed in between, and is dropped.
+pub fn launch_plan(kind: ProfileKind, with: LaunchWith) -> LaunchPlan {
+    match (kind, with) {
+        (ProfileKind::Terminal, LaunchWith::Command(program, args)) => {
+            LaunchPlan::Terminal { command: Some((program, args)) }
+        }
+        (ProfileKind::Terminal, LaunchWith::Profile | LaunchWith::Agent { .. }) => LaunchPlan::Terminal { command: None },
+        (ProfileKind::Agent, LaunchWith::Agent { launched_in, first }) => {
+            LaunchPlan::Agent { opened: OpenedBy::AgentCommand(launched_in), first }
+        }
+        (ProfileKind::Agent, LaunchWith::Profile | LaunchWith::Command(..)) => {
+            LaunchPlan::Agent { opened: OpenedBy::Window, first: None }
+        }
+    }
+}
+
+/// The directory an agent tab on `host` is asked to start in: the one the
+/// launch gave, when it means something there ([`new_tab_cwd`]). An agent
+/// tab never follows the active tab's directory: without one, its profile's
+/// `cwd`, the launching command's directory or the home directory decide
+/// (`agent::spawn::directory`).
+pub fn agent_cwd(requested: Option<PathBuf>, host: &Host) -> Option<PathBuf> {
+    match new_tab_cwd(requested, host, true) {
+        NewTabCwd::Given(cwd) => Some(cwd),
+        NewTabCwd::FollowActive | NewTabCwd::ProfileDefault => None,
+    }
+}
 
 /// The directory a new tab on some host starts in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +168,42 @@ mod tests {
         }
         assert_eq!(new_tab_cwd(Some("src".into()), &local, true), given("src"));
         assert_eq!(new_tab_cwd(Some(r"C:\src".into()), &local, false), given(r"C:\src"));
+    }
+
+    /// The profile's kind decides the tab's: a terminal profile keeps a
+    /// command and drops an agent launch's extras; an agent profile is
+    /// opened by its command (with the launch's directory and prompt) or
+    /// by the window.
+    #[test]
+    fn the_profile_kind_decides_what_a_launch_runs() {
+        let first = FirstPrompt::new("hi".into()).ok();
+        let here = Some(PathBuf::from("/work"));
+        let agent = LaunchWith::Agent { launched_in: here.clone(), first: first.clone() };
+        let command = LaunchWith::Command("htop".into(), vec!["-d".into()]);
+        let terminal = |command: Option<(&str, &[&str])>| LaunchPlan::Terminal {
+            command: command.map(|(p, a)| (p.to_string(), a.iter().map(|a| a.to_string()).collect())),
+        };
+        assert_eq!(launch_plan(ProfileKind::Terminal, LaunchWith::Profile), terminal(None));
+        assert_eq!(launch_plan(ProfileKind::Terminal, command.clone()), terminal(Some(("htop", &["-d"]))));
+        assert_eq!(launch_plan(ProfileKind::Terminal, agent.clone()), terminal(None));
+        assert_eq!(
+            launch_plan(ProfileKind::Agent, agent),
+            LaunchPlan::Agent { opened: OpenedBy::AgentCommand(here), first }
+        );
+        let window = LaunchPlan::Agent { opened: OpenedBy::Window, first: None };
+        assert_eq!(launch_plan(ProfileKind::Agent, LaunchWith::Profile), window);
+        assert_eq!(launch_plan(ProfileKind::Agent, command), window);
+    }
+
+    /// An agent tab takes a launch's directory where it means something,
+    /// and never the active tab's.
+    #[test]
+    fn an_agent_tab_takes_only_the_directory_it_was_given() {
+        let [local, ssh, _] = hosts();
+        assert_eq!(agent_cwd(None, &local), None);
+        assert_eq!(agent_cwd(Some("/srv".into()), &local), Some("/srv".into()));
+        assert_eq!(agent_cwd(Some("/srv".into()), &ssh), Some("/srv".into()));
+        assert_eq!(agent_cwd(Some("src".into()), &ssh), None);
     }
 
     #[test]

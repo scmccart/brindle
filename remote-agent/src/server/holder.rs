@@ -38,7 +38,8 @@
 //!   starts `serve` from its own binary (which survives the file being
 //!   replaced), retrying with backoff up to [`CORE_BACKOFF_MAX`]
 //!   ([`CoreStart`]).
-//! - **Exit:** once it has no sessions (after having one, after `DRAIN`, or
+//! - **Exit:** once it has no sessions (after having one, after `DRAIN`,
+//!   with no core after failing to start a program, or
 //!   when no core used it within [`UNUSED_LIMIT`] of starting).
 //! - **Pipe sessions** (H1 version 3's `SPAWN_PIPES`): a program on plain
 //!   pipes, no terminal. Its stdout is the session's output, as a PTY's is;
@@ -462,6 +463,10 @@ struct Holder<L: EventLoop> {
     previous: Previous,
     draining: bool,
     had_session: bool,
+    /// A core asked it to start a program it couldn't run: a core used it,
+    /// so with no session and no core it exits without waiting out
+    /// [`UNUSED_LIMIT`], while a core still there can use it again.
+    spawn_failed: bool,
     started: Instant,
     /// When it starts a core of its own, with no core connected.
     core_start: CoreStart,
@@ -501,6 +506,7 @@ impl<L: EventLoop> Holder<L> {
             previous: Previous::None,
             draining: false,
             had_session: false,
+            spawn_failed: false,
             started: Instant::now(),
             core_start: CoreStart::new(),
             core_args,
@@ -1068,6 +1074,7 @@ impl<L: EventLoop> Holder<L> {
             Err(error) => {
                 let message = format!("{}: {error}", pty::program_name(&request).to_string_lossy());
                 log!("session {id}: {message}");
+                self.spawn_failed = true;
                 return self.send(ToCore::SpawnFailed(SpawnFailed {
                     session: id,
                     message,
@@ -1153,6 +1160,7 @@ impl<L: EventLoop> Holder<L> {
             Err(error) => {
                 let message = format!("cannot run {}: {error}", spawn.command);
                 log!("session {id}: {message}");
+                self.spawn_failed = true;
                 return self.send(ToCore::SpawnFailed(SpawnFailed {
                     session: id,
                     message,
@@ -1683,7 +1691,7 @@ impl<L: EventLoop> Holder<L> {
             && self.hang_ups.is_empty()
             && (self.had_session
                 || self.draining
-                || (self.core.is_none() && now >= self.started + UNUSED_LIMIT))
+                || (self.core.is_none() && (self.spawn_failed || now >= self.started + UNUSED_LIMIT)))
     }
 
     /// Exits. The core gets everything queued for it (the last session's

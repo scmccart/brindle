@@ -35,12 +35,14 @@
 //! component keeps across a refresh and what its events name the chosen
 //! item by, never a position.
 
+pub mod alert;
 pub mod badge;
 pub mod button;
 pub mod card;
 pub mod checkbox;
 pub mod combobox;
 pub mod command;
+pub mod confirmation;
 pub mod context_menu;
 pub mod dialog;
 pub mod dropdown_menu;
@@ -48,12 +50,18 @@ pub mod edge_bar;
 pub mod input;
 pub mod kbd;
 pub mod menu;
+pub mod message;
+pub mod message_scroller;
 pub mod popover;
+pub mod prompt_input;
+pub mod reasoning;
 pub mod select;
 pub mod separator;
 pub mod switch;
 pub mod tabs;
+pub mod textarea;
 pub mod toggle;
+pub mod tool;
 pub mod tooltip;
 
 use std::rc::Rc;
@@ -66,7 +74,11 @@ use gpui::{
 use crate::primitives::focus_visible::{Modality, set_modality};
 use crate::style::ring_geometry;
 
+pub use alert::{Alert, AlertStyle, AlertVariant, alert_style};
 pub use badge::{Badge, BadgeContent, TITLE_KEEPS, kept_title};
+pub use confirmation::{Confirmation, ConfirmationAction, ConfirmationState};
+pub use reasoning::Reasoning;
+pub use tool::{Tool, ToolStatus, tool_status_colors};
 pub use button::Button;
 pub use card::{Card, CardHeader, CornerCutout, corner_cutouts};
 pub use checkbox::{Checkbox, toggle_request, toggles};
@@ -84,6 +96,13 @@ pub use menu::{
     Menu, MenuAnchor, MenuEntry, MenuEvent, MenuItem, MenuJump, MenuNav, MenuPress, chosen, entry_keyed, menu_item_release,
     menu_overlay, page_key, release_over, render_menu,
 };
+pub use message::{Bubble, BubbleEdges, BubblePart, BubbleStyle, From as MessageFrom, Message, bubble_style};
+pub use message_scroller::{Follow, MessageScroller, PageDirection, PageScroll, page_scroll};
+pub use prompt_input::{
+    PromptFocus, PromptInput, PromptInputEvent, PromptRequest, PromptStatus, Queued, Resend, button_request,
+    enter_submits,
+    escape_stops, first_line, is_blank,
+};
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};
 pub use select::{
     Activation, DRAG_THRESHOLD, ListKey, MenuRelease, ReleaseOver, Select, SelectEvent, SelectOption, Selection,
@@ -96,6 +115,7 @@ pub use tabs::{
     drop_side, drop_target,
     tab_key, tab_target, trigger_label, trigger_press,
 };
+pub use textarea::Textarea;
 pub use toggle::Toggle;
 pub use tooltip::{Tooltip, TooltipFor, TooltipView};
 

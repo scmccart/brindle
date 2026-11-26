@@ -19,9 +19,11 @@ use parking_lot::Mutex;
 
 use super::connection::{Abandon, Budget, Running, Sink};
 use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
+use crate::agent::model::StartFailure;
+use crate::agent::spawn::AgentSpawnRequest;
 use crate::remote::SessionKey;
 use crate::remote::budget::{Delivery, Offer};
-use crate::remote::protocol::SessionId;
+use crate::remote::protocol::{RequestId, SessionId};
 
 /// How a tab let its session go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,6 +122,10 @@ enum Start {
     /// to start in exists), which must not hold up the thread that opened
     /// the tab.
     Spawn(Box<dyn FnOnce() -> SpawnRequest + Send>),
+    /// An agent session's start (`SPAWN_AGENT`), said on the session's
+    /// thread as a spawn's is. The connection's writer checks the link's
+    /// protocol first ([`agent_start`](crate::agent::model::agent_start)).
+    SpawnAgent(Box<dyn FnOnce() -> AgentSpawnRequest + Send>),
     Attach(AttachRequest),
 }
 
@@ -180,6 +186,30 @@ impl Session {
         Self::begin(connect, Start::Spawn(Box::new(request)), sink)
     }
 
+    /// Starts an agent session on `host`, through the process's connection
+    /// to it, as [`Session::start`] does a terminal's: `request` says what
+    /// to run, on the session's own thread. Its transcript goes to `sink`.
+    /// A failure to start reaches the sink as a
+    /// [`StartFailure`] ([`SessionSink::failed`]'s error downcasts to it).
+    pub fn start_agent(
+        host: Host,
+        request: impl FnOnce() -> AgentSpawnRequest + Send + 'static,
+        sink: Box<dyn SessionSink>,
+    ) -> Self {
+        Self::begin(move || super::shared(&host), Start::SpawnAgent(Box::new(request)), sink)
+    }
+
+    /// [`Session::start_agent`] in the connection `connect` gives: the
+    /// tests' way in.
+    #[cfg(test)]
+    pub fn start_agent_with(
+        connect: impl FnOnce() -> Result<Arc<Connection>> + Send + 'static,
+        request: AgentSpawnRequest,
+        sink: Box<dyn SessionSink>,
+    ) -> Self {
+        Self::begin(connect, Start::SpawnAgent(Box::new(move || request)), sink)
+    }
+
     /// Attaches a detached session on `host`, through the process's
     /// connection to it; its replay and then its live output go to `sink`.
     pub fn attach(host: Host, request: AttachRequest, sink: Box<dyn SessionSink>) -> Self {
@@ -203,7 +233,7 @@ impl Session {
     ) -> Self {
         let requested = match &start {
             Start::Attach(request) => Some((request.session, request.key.clone())),
-            Start::Spawn(_) => None,
+            Start::Spawn(_) | Start::SpawnAgent(_) => None,
         };
         let phase = Arc::new(Mutex::new(Phase::Starting(Queued::default())));
         let abandon = Arc::new(Abandon::default());
@@ -298,6 +328,47 @@ impl Session {
         }
     }
 
+    /// What an agent session's request is sent through: the running
+    /// session's handle, or nothing while it starts, after it went, or
+    /// when it never started. Agent requests aren't held while starting:
+    /// the zone offers none until its agent is ready.
+    fn running<T>(&self, call: impl FnOnce(&Running) -> Option<T>) -> Option<T> {
+        match &*self.phase.lock() {
+            Phase::Running(running) => call(running),
+            Phase::Starting(_) | Phase::Left(_) | Phase::Gone => None,
+        }
+    }
+
+    /// Sends the agent a prompt (`AGENT_PROMPT`) while the session runs;
+    /// the request's id, which its answer comes back under
+    /// ([`SessionSink::reply`]), or `None` when nothing was sent.
+    pub fn prompt(&self, text: &str) -> Option<RequestId> {
+        self.running(|running| running.prompt(text))
+    }
+
+    /// Sends the held prompt again (`AGENT_RESEND`), as [`Session::prompt`].
+    pub fn resend(&self) -> Option<RequestId> {
+        self.running(Running::resend)
+    }
+
+    /// Discards the queued prompt, waiting or held (`AGENT_UNQUEUE`), as
+    /// [`Session::prompt`].
+    pub fn unqueue(&self) -> Option<RequestId> {
+        self.running(Running::unqueue)
+    }
+
+    /// Answers the permission request in entry `entry` with `option`, or
+    /// cancelled with none (`AGENT_PERMISSION`), as [`Session::prompt`].
+    pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
+        self.running(|running| running.answer(entry, option))
+    }
+
+    /// Cancels the running turn (`AGENT_CANCEL`) while the session runs;
+    /// true when it was sent.
+    pub fn cancel(&self) -> bool {
+        self.running(|running| running.cancel().then_some(())).is_some()
+    }
+
     /// Ends the session (`CLOSE`), or makes sure it ends as soon as it
     /// starts. A session that already exited sends nothing.
     pub fn close(&self) {
@@ -351,17 +422,26 @@ fn run(
     budget: Budget,
 ) {
     let left = || matches!(&*phase.lock(), Phase::Left(_));
-    let started = connect().and_then(|connection| {
+    let started = match connect() {
+        // An agent zone tells a server it couldn't reach from one that
+        // refused the spawn.
+        Err(error) => match start {
+            Start::SpawnAgent(_) => Err(anyhow::Error::new(StartFailure::NoServer(format!("{error:#}")))),
+            Start::Spawn(_) | Start::Attach(_) => Err(error),
+        },
         // A tab closed while connecting needs no session: a spawn doesn't
         // start one, and an attach leaves it detached.
-        if left() {
-            anyhow::bail!("closed before it started");
-        }
-        match start {
+        Ok(_) if left() => Err(anyhow::anyhow!("closed before it started")),
+        Ok(connection) => match start {
             Start::Spawn(request) => connection.spawn(request(), sink.clone(), Some(abandon)),
+            Start::SpawnAgent(request) => {
+                let request = request();
+                let command = request.command.clone();
+                connection.spawn_agent(request, sink.clone(), Some(abandon)).map_err(|error| agent_refused(error, command))
+            }
             Start::Attach(request) => connection.attach(request, sink.clone(), Some(abandon)),
-        }
-    });
+        },
+    };
     let mut phase = phase.lock();
     let running = match started {
         Ok(running) => running.with_budget(budget),
@@ -394,6 +474,16 @@ fn run(
     *phase = Phase::Running(running);
 }
 
+/// An agent spawn's failure as its zone tells it: the gate's own refusal
+/// (a server too old) as it is, anything else the server's (or the link's)
+/// refusal of `command`, verbatim.
+fn agent_refused(error: anyhow::Error, command: String) -> anyhow::Error {
+    match error.downcast::<StartFailure>() {
+        Ok(failure) => anyhow::Error::new(failure),
+        Err(error) => anyhow::Error::new(StartFailure::Refused { command, cause: format!("{error:#}") }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -401,6 +491,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::agent::sink::{AgentEvent, Feed, Sink as AgentSink};
+    use crate::agent::transcript::{
+        AgentState, Entry, EntryId, Event, HoldReason, PermissionOutcome, Slot, StopReason, Transcript, TurnState,
+    };
     use crate::remote::local::sys::Listener;
     use crate::remote::local::{Attaching, Endpoint, Stream, connect};
     use crate::remote::protocol::Frame;
@@ -1354,5 +1448,585 @@ mod tests {
         // thread drops the tab's sink having told it nothing.
         let heard = seen.recv_timeout(limit(Duration::from_secs(10)));
         assert_eq!(heard, Err(mpsc::RecvTimeoutError::Disconnected));
+    }
+
+    // Agent sessions (`agents-profiles` group 4), against scripted protocol
+    // 4 cores. The core's own decisions (the queue slot, holds, resends)
+    // are `remote-agent`'s `agents.rs` tests; these check what the client
+    // sends, when, and where the answers and the transcript go.
+
+    /// The agent session a scripted core starts.
+    const AGENT: SessionId = 7;
+
+    fn agent_request() -> AgentSpawnRequest {
+        AgentSpawnRequest {
+            command: "fake-agent".into(),
+            args: vec!["--acp".into()],
+            cwd: Some("/work".into()),
+            env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
+            profile: "Claude".into(),
+        }
+    }
+
+    fn transcript(stream: &mut Stream, events: &[Event]) {
+        let events = events.iter().map(Event::to_value).collect();
+        send(stream, ToClient::Transcript(client::Transcript { session: AGENT, events }));
+    }
+
+    fn values(stream: &mut Stream, events: Vec<serde_json::Value>) {
+        send(stream, ToClient::Transcript(client::Transcript { session: AGENT, events }));
+    }
+
+    fn ok(stream: &mut Stream, req: RequestId) {
+        send(stream, ToClient::Ok(client::Request { req }));
+    }
+
+    fn refuse(stream: &mut Stream, req: RequestId, message: &str) {
+        let error = client::ErrorMessage { req: Some(req), session: Some(AGENT), message: message.into() };
+        send(stream, ToClient::Error(error));
+    }
+
+    /// A scripted core's stand-in for one agent session's turn and queue
+    /// slot, answering as the core does: a prompt with no turn running
+    /// starts one ("hi" ends at once, "ask" waits on a permission request,
+    /// any other runs until cancelled), one during a turn waits in the
+    /// slot, and one more is refused; a cancel holds the waiting prompt; a
+    /// resend sends the held prompt when idle and queues it during a turn.
+    #[derive(Default)]
+    struct MiniAgent {
+        running: bool,
+        slot: Slot,
+        next: u64,
+    }
+
+    impl MiniAgent {
+        fn added(&mut self, entry: Entry) -> Event {
+            self.next += 1;
+            Event::Added { id: EntryId(self.next), entry }
+        }
+
+        fn start_turn(&mut self, text: &str) -> Vec<Event> {
+            self.running = true;
+            let mut events = vec![self.added(Entry::User { text: text.into() }), Event::Turn { state: TurnState::Working }];
+            match text {
+                "hi" => {
+                    events.push(self.added(Entry::Agent { text: "hello back".into() }));
+                    events.push(Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } });
+                    self.running = false;
+                }
+                "ask" => {
+                    let title = "Write a file".to_string();
+                    let permission = Entry::Permission { call: Some("call_1".into()), title, options: Vec::new(), outcome: None };
+                    events.push(self.added(permission));
+                    events.push(Event::Turn { state: TurnState::Blocked });
+                }
+                _ => {}
+            }
+            events
+        }
+
+        fn set_slot(&mut self, slot: Slot) -> Event {
+            self.slot = slot.clone();
+            Event::Queue { slot }
+        }
+
+        fn answer(&mut self, message: &ToCore, stream: &mut Stream) {
+            match message {
+                ToCore::SpawnAgent(spawn) => {
+                    send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: AGENT, pid: 4242, key: "k7".into() }));
+                    let ready = AgentState::Ready { name: Some("fake".into()), version: Some("1.0".into()) };
+                    transcript(stream, &[Event::Agent { state: ready }]);
+                }
+                ToCore::AgentPrompt(prompt) if !self.running => {
+                    ok(stream, prompt.req);
+                    let events = self.start_turn(&prompt.text);
+                    transcript(stream, &events);
+                }
+                ToCore::AgentPrompt(prompt) if self.slot == Slot::Empty => {
+                    ok(stream, prompt.req);
+                    let event = self.set_slot(Slot::Waiting { text: prompt.text.clone() });
+                    transcript(stream, &[event]);
+                }
+                ToCore::AgentPrompt(prompt) => refuse(stream, prompt.req, "a prompt is already queued"),
+                ToCore::AgentCancel(_) if self.running => {
+                    self.running = false;
+                    let mut events = vec![Event::Turn { state: TurnState::Ended { stop: StopReason::Cancelled } }];
+                    if let Slot::Waiting { text } = self.slot.clone() {
+                        events.push(self.set_slot(Slot::Held { text, reason: HoldReason::Cancelled }));
+                    }
+                    transcript(stream, &events);
+                }
+                ToCore::AgentResend(request) => match self.slot.clone() {
+                    Slot::Held { text, .. } if self.running => {
+                        ok(stream, request.req);
+                        let event = self.set_slot(Slot::Waiting { text });
+                        transcript(stream, &[event]);
+                    }
+                    Slot::Held { text, .. } => {
+                        ok(stream, request.req);
+                        let mut events = vec![self.set_slot(Slot::Empty)];
+                        events.extend(self.start_turn(&text));
+                        transcript(stream, &events);
+                    }
+                    Slot::Empty | Slot::Waiting { .. } => refuse(stream, request.req, "no prompt is held"),
+                },
+                ToCore::AgentUnqueue(request) => {
+                    ok(stream, request.req);
+                    let event = self.set_slot(Slot::Empty);
+                    transcript(stream, &[event]);
+                }
+                ToCore::AgentPermission(answer) => {
+                    ok(stream, answer.req);
+                    let outcome = answer.option.clone().map_or(PermissionOutcome::Cancelled, |option| {
+                        PermissionOutcome::Selected { option }
+                    });
+                    let answered = Event::Answered { id: EntryId(answer.entry), outcome };
+                    transcript(stream, &[answered, Event::Turn { state: TurnState::Working }]);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Takes the feed's events until `done` holds for the shared fold;
+    /// gives the life events (all but `Changed`) taken on the way.
+    fn shows(feed: &mut Feed, what: &str, mut done: impl FnMut(&Transcript) -> bool) -> Vec<AgentEvent> {
+        let mut life = Vec::new();
+        until(what, Duration::from_secs(10), || {
+            while let Ok(Some(event)) = feed.events.try_next() {
+                feed.took([&event]);
+                if event != AgentEvent::Changed {
+                    life.push(event);
+                }
+            }
+            done(feed.shared.lock().transcript()).then_some(())
+        });
+        life
+    }
+
+    /// The next life event (`Changed` skipped).
+    fn next_life(feed: &mut Feed) -> AgentEvent {
+        until("an agent life event", Duration::from_secs(10), || {
+            while let Ok(Some(event)) = feed.events.try_next() {
+                feed.took([&event]);
+                if event != AgentEvent::Changed {
+                    return Some(event);
+                }
+            }
+            None
+        })
+    }
+
+    /// The log's user and agent entries, as `user: …` and `agent: …`.
+    fn says(log: &Transcript) -> Vec<String> {
+        log.entries()
+            .filter_map(|(_, entry)| match entry {
+                Entry::User { text } => Some(format!("user: {text}")),
+                Entry::Agent { text } => Some(format!("agent: {text}")),
+                Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
+            })
+            .collect()
+    }
+
+    fn reply(request: RequestId) -> AgentEvent {
+        AgentEvent::Reply { request, outcome: Ok(()) }
+    }
+
+    /// What a test drives: the session, its zone's end, the connection and
+    /// what the core got.
+    struct Agent {
+        _dir: TempDir,
+        session: Session,
+        feed: Feed,
+        connection: Arc<Connection>,
+        core: mpsc::Receiver<ToCore>,
+    }
+
+    /// An agent session started on a scripted protocol 4 core answering
+    /// as `answer` does, once it runs and its agent is ready. Checks the
+    /// `SPAWN_AGENT` it sent.
+    fn agent_session_with(
+        tag: &str,
+        fault: Option<Vec<u8>>,
+        answer: impl FnMut(&ToCore, &mut Stream) + Send + 'static,
+    ) -> Agent {
+        let dir = temp_dir(tag);
+        let core = scripted_core_at(&dir, 4, answer);
+        let connection = connected(&dir);
+        let starting = connection.clone();
+        let (sink, mut feed) = AgentSink::with_fault(fault);
+        let session = Session::start_agent_with(move || Ok(starting), agent_request(), Box::new(sink));
+        let ToCore::SpawnAgent(spawn) = recv(&core) else { panic!("not SPAWN_AGENT") };
+        let expected = client::SpawnAgent {
+            req: spawn.req,
+            command: "fake-agent".into(),
+            args: vec!["--acp".into()],
+            cwd: Some("/work".into()),
+            env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
+            policy: client::Policy::Detach,
+            profile: Some("Claude".into()),
+        };
+        assert_eq!(spawn, expected);
+        shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
+        eventually(|| session.id_and_key() == Some((AGENT, SessionKey::from_wire("k7"))));
+        Agent { _dir: dir, session, feed, connection, core }
+    }
+
+    fn agent_session(tag: &str) -> Agent {
+        let mut agent = MiniAgent::default();
+        agent_session_with(tag, None, move |message, stream| agent.answer(message, stream))
+    }
+
+    /// 4.1 and 4.2: a protocol 4 core is sent `SPAWN_AGENT` with the
+    /// request, and a prompt; the prompt's `OK` comes back under its id and
+    /// the turn's transcript is folded.
+    #[test]
+    fn an_agent_session_starts_and_runs_a_turn() {
+        let mut agent = agent_session("agent-turn");
+        let req = agent.session.prompt("hi").unwrap();
+        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(client::AgentPrompt { req, session: AGENT, text: "hi".into() }));
+        let ended = |log: &Transcript| *log.turn() == TurnState::Ended { stop: StopReason::EndTurn };
+        assert_eq!(shows(&mut agent.feed, "the turn's end", ended), [reply(req)]);
+        assert_eq!(says(agent.feed.shared.lock().transcript()), ["user: hi", "agent: hello back"]);
+        agent.session.close();
+        assert_eq!(recv(&agent.core), ToCore::Close(client::SessionRef { session: AGENT }));
+    }
+
+    /// 4.2: a prompt during a turn waits in the slot and can be removed;
+    /// one more while it waits is refused, the refusal coming back under
+    /// that prompt's id.
+    #[test]
+    fn a_queued_prompt_is_removed_and_a_third_refused() {
+        let mut agent = agent_session("agent-queue");
+        let first = agent.session.prompt("long").unwrap();
+        let working = |log: &Transcript| *log.turn() == TurnState::Working;
+        assert_eq!(shows(&mut agent.feed, "the turn", working), [reply(first)]);
+        let second = agent.session.prompt("next").unwrap();
+        let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
+        assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(second)]);
+        let third = agent.session.prompt("third").unwrap();
+        let refused = AgentEvent::Reply { request: third, outcome: Err("a prompt is already queued".into()) };
+        assert_eq!(next_life(&mut agent.feed), refused);
+        let removed = agent.session.unqueue().unwrap();
+        let empty = |log: &Transcript| *log.slot() == Slot::Empty;
+        assert_eq!(shows(&mut agent.feed, "the slot emptied", empty), [reply(removed)]);
+        let sent: Vec<ToCore> = settled(&agent.connection, &agent.core);
+        assert_eq!(
+            sent,
+            [
+                ToCore::AgentPrompt(client::AgentPrompt { req: first, session: AGENT, text: "long".into() }),
+                ToCore::AgentPrompt(client::AgentPrompt { req: second, session: AGENT, text: "next".into() }),
+                ToCore::AgentPrompt(client::AgentPrompt { req: third, session: AGENT, text: "third".into() }),
+                ToCore::AgentUnqueue(client::AgentRequest { req: removed, session: AGENT }),
+            ]
+        );
+    }
+
+    /// 4.2: a cancel (`AGENT_CANCEL`, which nothing answers) holds the
+    /// queued prompt; a new prompt goes out beside the held one; a resend
+    /// during that turn queues the held prompt, and one when idle sends
+    /// it; a held prompt can be discarded.
+    #[test]
+    fn a_cancel_holds_the_queued_prompt_which_is_resent_or_discarded() {
+        let mut agent = agent_session("agent-held");
+        let held = |text: &str| Slot::Held { text: text.into(), reason: HoldReason::Cancelled };
+        let first = agent.session.prompt("long").unwrap();
+        let second = agent.session.prompt("next").unwrap();
+        let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
+        assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(first), reply(second)]);
+
+        assert!(agent.session.cancel());
+        let cancelled = |log: &Transcript| {
+            *log.turn() == TurnState::Ended { stop: StopReason::Cancelled } && *log.slot() == held("next")
+        };
+        assert_eq!(shows(&mut agent.feed, "the prompt held", cancelled), []);
+
+        // A new prompt beside the held one starts a turn; the held one stays.
+        let beside = agent.session.prompt("beside").unwrap();
+        let working = |log: &Transcript| *log.turn() == TurnState::Working;
+        assert_eq!(shows(&mut agent.feed, "the new turn", working), [reply(beside)]);
+        assert_eq!(*agent.feed.shared.lock().transcript().slot(), held("next"));
+
+        // Sent again during a turn, it waits for that turn.
+        let during = agent.session.resend().unwrap();
+        assert_eq!(shows(&mut agent.feed, "the held prompt queued", waiting), [reply(during)]);
+
+        // Held again, and sent again when idle: a turn of its own.
+        assert!(agent.session.cancel());
+        let held_again = |log: &Transcript| *log.slot() == held("next");
+        shows(&mut agent.feed, "the prompt held again", held_again);
+        let idle = agent.session.resend().unwrap();
+        let resent = |log: &Transcript| *log.slot() == Slot::Empty && *log.turn() == TurnState::Working;
+        assert_eq!(shows(&mut agent.feed, "the held prompt's turn", resent), [reply(idle)]);
+        assert_eq!(says(agent.feed.shared.lock().transcript()), ["user: long", "user: beside", "user: next"]);
+
+        // A held prompt discarded.
+        let more = agent.session.prompt("more").unwrap();
+        let queued = |log: &Transcript| *log.slot() == Slot::Waiting { text: "more".into() };
+        assert_eq!(shows(&mut agent.feed, "another queued", queued), [reply(more)]);
+        assert!(agent.session.cancel());
+        shows(&mut agent.feed, "it held", |log| *log.slot() == held("more"));
+        let discard = agent.session.unqueue().unwrap();
+        assert_eq!(shows(&mut agent.feed, "the held prompt discarded", |log| *log.slot() == Slot::Empty), [
+            reply(discard)
+        ]);
+
+        let sent = settled(&agent.connection, &agent.core);
+        let cancels = sent.iter().filter(|message| **message == ToCore::AgentCancel(client::SessionRef { session: AGENT }));
+        assert_eq!(cancels.count(), 3);
+        let resends: Vec<&ToCore> = sent.iter().filter(|message| matches!(message, ToCore::AgentResend(_))).collect();
+        assert_eq!(
+            resends,
+            [
+                &ToCore::AgentResend(client::AgentRequest { req: during, session: AGENT }),
+                &ToCore::AgentResend(client::AgentRequest { req: idle, session: AGENT }),
+            ]
+        );
+    }
+
+    /// 4.2: a permission answer names the entry and the option, and its
+    /// `OK` comes back under its id.
+    #[test]
+    fn a_permission_answer_goes_out_and_is_folded() {
+        let mut agent = agent_session("agent-permission");
+        let asked = agent.session.prompt("ask").unwrap();
+        let blocked = |log: &Transcript| *log.turn() == TurnState::Blocked;
+        assert_eq!(shows(&mut agent.feed, "the permission request", blocked), [reply(asked)]);
+        let entry = 2;
+        let answer = agent.session.answer(entry, Some("allow-once".into())).unwrap();
+        let answered = |log: &Transcript| {
+            log.entries().any(|(id, entry)| {
+                id == EntryId(2)
+                    && matches!(entry, Entry::Permission { outcome: Some(PermissionOutcome::Selected { option }), .. } if option == "allow-once")
+            })
+        };
+        assert_eq!(shows(&mut agent.feed, "the answer", answered), [reply(answer)]);
+        let sent = settled(&agent.connection, &agent.core);
+        let permission = client::AgentPermission { req: answer, session: AGENT, entry, option: Some("allow-once".into()) };
+        assert_eq!(sent.last(), Some(&ToCore::AgentPermission(permission)));
+    }
+
+    /// 4.1 and 4.3 against a real core: a connection offering client
+    /// protocol 4 (the offer passed to the dial; Brindle's own stays at 1–3)
+    /// starts `brindle-fake-acp-agent`, runs a turn through it, and a panic
+    /// in the sink (the fault switch's marker in the agent's answer) breaks
+    /// the session, which is detached and still listed. Ignored only
+    /// because it needs the built helpers:
+    /// `BRINDLE_TEST_SERVER_HELPER=target/debug/brindle-remote
+    /// BRINDLE_FAKE_ACP_AGENT=target/debug/brindle-fake-acp-agent
+    /// cargo test -p brindle a_real_core_runs -- --ignored`.
+    #[test]
+    #[ignore = "needs BRINDLE_TEST_SERVER_HELPER and BRINDLE_FAKE_ACP_AGENT, built helpers"]
+    fn a_real_core_runs_an_agent_session_and_a_broken_one_stays_listed() {
+        let helper = std::path::PathBuf::from(std::env::var_os("BRINDLE_TEST_SERVER_HELPER").expect("the helper"));
+        let fake = std::env::var("BRINDLE_FAKE_ACP_AGENT").expect("the fake agent");
+        let temp = temp_dir("agent-real");
+        let script = temp.join("agent.script");
+        let chunk = |text: &str| {
+            let update = serde_json::json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": text}});
+            let message = serde_json::json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": update}});
+            format!("send {message}")
+        };
+        let lines = [
+            "expect initialize".to_string(),
+            r#"respond {"protocolVersion":1,"agentInfo":{"name":"fake","version":"1.0"}}"#.into(),
+            "expect session/new".into(),
+            r#"respond {"sessionId":"s1"}"#.into(),
+            "expect session/prompt".into(),
+            chunk("hello back"),
+            r#"respond {"stopReason":"end_turn"}"#.into(),
+            "expect session/prompt".into(),
+            chunk("says BRINDLE-FAULT-REAL"),
+            r#"respond {"stopReason":"end_turn"}"#.into(),
+        ];
+        std::fs::write(&script, lines.join("\n") + "\n").unwrap();
+
+        // Left for the core to make: a Linux core refuses a directory that
+        // isn't private.
+        let dir = temp.join("server");
+        let endpoint = Endpoint::at(helper.clone(), dir.clone());
+        let connected = crate::remote::local::connect_offering(&endpoint, "agent-real", client::PROTOCOLS).unwrap();
+        assert_eq!(connected.welcome.protocol, 4);
+        let connection = Connection::start(endpoint, "agent-real", connected).unwrap();
+        let starting = connection.clone();
+        let request = AgentSpawnRequest {
+            command: fake,
+            args: vec![script.display().to_string()],
+            cwd: None,
+            env: BTreeMap::new(),
+            profile: "Fake".into(),
+        };
+        let (sink, mut feed) = AgentSink::with_fault(Some(b"BRINDLE-FAULT-REAL".to_vec()));
+        let session = Session::start_agent_with(move || Ok(starting), request, Box::new(sink));
+        let ready = |log: &Transcript| matches!(log.agent(), AgentState::Ready { .. });
+        shows(&mut feed, "the agent ready", ready);
+        let (id, _) = until("the session running", Duration::from_secs(10), || session.id_and_key());
+
+        let req = session.prompt("hi").unwrap();
+        let ended = |log: &Transcript| says(log).len() == 2 && *log.turn() == TurnState::Ended { stop: StopReason::EndTurn };
+        assert_eq!(shows(&mut feed, "the turn's end", ended), [reply(req)]);
+        assert_eq!(says(feed.shared.lock().transcript()), ["user: hi", "agent: hello back"]);
+        let listed = connection.list().unwrap();
+        let info = listed.iter().find(|info| info.session == id).expect("listed");
+        assert_eq!(info.profile.as_deref(), Some("Fake"));
+
+        // The marker in the next answer panics the sink: broken, detached.
+        let req = session.prompt("again").unwrap();
+        let mut heard = Vec::new();
+        let why = until("the session broken", Duration::from_secs(10), || {
+            match feed.events.try_next() {
+                Ok(Some(AgentEvent::Broken(why))) => return Some(why),
+                Ok(Some(event)) => heard.push(event),
+                Ok(None) | Err(_) => {}
+            }
+            None
+        });
+        assert!(why.contains(crate::terminal::SINK_PANIC), "{why}");
+        assert!(heard.contains(&reply(req)), "{heard:?}");
+        assert_eq!(session.prompt("more"), None, "no longer shown");
+        let detached = || {
+            let listed = connection.list().ok()?;
+            listed.into_iter().find(|info| info.session == id).filter(|info| !info.attached)
+        };
+        until("the session listed, detached", Duration::from_secs(10), detached);
+
+        let stop = crate::remote::hide_window(&mut std::process::Command::new(&helper))
+            .arg("stop")
+            .env("BRINDLE_SERVER_DIR", &dir)
+            .output()
+            .unwrap();
+        assert!(stop.status.success(), "{stop:?}");
+    }
+
+    /// 4.2: a request written when the link drops is answered all the same,
+    /// with the link's failure, and the zone hears the link went down.
+    #[test]
+    fn an_agent_request_fails_with_the_link_and_the_zone_hears_it() {
+        let mut agent = MiniAgent::default();
+        let answer = move |message: &ToCore, stream: &mut Stream| match message {
+            ToCore::AgentPrompt(_) => {}
+            _ => agent.answer(message, stream),
+        };
+        let Agent { _dir, session, mut feed, connection, core } = agent_session_with("agent-link", None, answer);
+        // The scripted core goes once its report channel is gone: after
+        // reading the next message, which it never answers.
+        drop(core);
+        let req = session.prompt("unanswered").unwrap();
+        let AgentEvent::Reply { request, outcome: Err(why) } = next_life(&mut feed) else { panic!("not failed") };
+        assert_eq!(request, req);
+        assert!(why.starts_with("the terminal server went away"), "{why}");
+        assert_eq!(next_life(&mut feed), AgentEvent::LinkDown);
+        drop(connection);
+    }
+
+    /// 4.2: nothing is sent for a session that doesn't run yet, or any more.
+    #[test]
+    fn agent_requests_go_only_while_the_session_runs() {
+        let (release, wait) = mpsc::channel::<()>();
+        let (sink, mut feed) = AgentSink::with_fault(None);
+        let session = Session::start_agent_with(
+            move || {
+                wait.recv().ok();
+                anyhow::bail!("offline")
+            },
+            agent_request(),
+            Box::new(sink),
+        );
+        assert_eq!(session.prompt("hi"), None);
+        assert_eq!((session.resend(), session.unqueue(), session.answer(1, None)), (None, None, None));
+        assert!(!session.cancel());
+        release.send(()).unwrap();
+        // A connection that fails is no server.
+        assert_eq!(next_life(&mut feed), AgentEvent::Failed(StartFailure::NoServer("offline".into())));
+        assert_eq!(session.prompt("hi"), None);
+    }
+
+    /// 4.1: below client protocol 4 the gate refuses the spawn before it is
+    /// sent, and the zone is told the server is too old.
+    #[test]
+    fn a_protocol_3_core_is_sent_no_agent_session() {
+        let dir = temp_dir("agent-protocol-3");
+        let core = scripted_core_at(&dir, 3, |_, _| {});
+        let connection = connected(&dir);
+        let starting = connection.clone();
+        let (sink, mut feed) = AgentSink::with_fault(None);
+        let session = Session::start_agent_with(move || Ok(starting), agent_request(), Box::new(sink));
+        let AgentEvent::Failed(StartFailure::TooOld { endpoint }) = next_life(&mut feed) else {
+            panic!("not refused as too old")
+        };
+        assert_eq!(endpoint, connection.name());
+        assert_eq!(settled(&connection, &core), [], "no SPAWN_AGENT went out");
+        assert_eq!(session.id_and_key(), None);
+    }
+
+    /// 4.3: an attached agent session's replay starts the fold over, and the
+    /// live events after it follow.
+    #[test]
+    fn an_attached_agent_session_replays_its_transcript() {
+        let dir = temp_dir("agent-replay");
+        let core = scripted_core_at(&dir, 4, |message, stream| {
+            if let ToCore::Attach(attach) = message {
+                let start = client::ReplayStart { req: Some(attach.req), session: AGENT, pid: 4242 };
+                send(stream, ToClient::ReplayStart(start));
+                let said = Event::Added { id: EntryId(1), entry: Entry::Agent { text: "earlier".into() } };
+                transcript(stream, &[said]);
+                send(stream, ToClient::ReplayEnd(client::SessionRef { session: AGENT }));
+                let live = Event::Added { id: EntryId(2), entry: Entry::Agent { text: "now".into() } };
+                transcript(stream, &[live]);
+            }
+        });
+        let connection = connected(&dir);
+        let (sink, mut feed) = AgentSink::with_fault(None);
+        let request = AttachRequest { session: AGENT, key: SessionKey::from_wire("k7"), when: Attaching::Now { cols: 0, rows: 0 } };
+        let _session = Session::attach_with(move || Ok(connection), request, Box::new(sink));
+        let both = |log: &Transcript| log.entries().count() == 2;
+        let life = shows(&mut feed, "the replay and the live event", both);
+        assert_eq!(life, [AgentEvent::Replay(true), AgentEvent::Replay(false)]);
+        assert_eq!(says(feed.shared.lock().transcript()), ["agent: earlier", "agent: now"]);
+        let changes = feed.shared.lock().take_changes();
+        assert!(changes.reset && changes.from_replay, "{changes:?}");
+        assert!(matches!(recv(&core), ToCore::Attach(_)));
+    }
+
+    /// 4.3: a transcript the sink can't follow (`bad`, sent in answer to a
+    /// prompt) breaks the session: it is detached, never closed, and the
+    /// zone is told why; nothing more is sent for it.
+    fn broken_by(tag: &str, fault: Option<Vec<u8>>, bad: serde_json::Value) -> String {
+        let mut agent = MiniAgent::default();
+        let mut agent = agent_session_with(tag, fault, move |message, stream| match message {
+            ToCore::AgentPrompt(prompt) if prompt.text == "break" => values(stream, vec![bad.clone()]),
+            _ => agent.answer(message, stream),
+        });
+        agent.session.prompt("break").unwrap();
+        assert!(matches!(recv(&agent.core), ToCore::AgentPrompt(_)));
+        let AgentEvent::Broken(why) = next_life(&mut agent.feed) else { panic!("not broken") };
+        assert_eq!(recv(&agent.core), ToCore::Detach(client::Detach { session: AGENT, layout: None }));
+        assert_eq!(agent.session.prompt("again"), None, "no longer shown");
+        assert_eq!(settled(&agent.connection, &agent.core), []);
+        why
+    }
+
+    #[test]
+    fn an_undecodable_event_breaks_the_agent_session() {
+        let why = broken_by("agent-undecodable", None, serde_json::json!({"event": "no_such_kind"}));
+        assert!(why.starts_with("an event from the terminal server couldn't be read"), "{why}");
+    }
+
+    #[test]
+    fn an_event_that_does_not_fold_breaks_the_agent_session() {
+        let bad = Event::Appended { id: EntryId(99), text: "more".into() }.to_value();
+        let why = broken_by("agent-fold", None, bad);
+        assert_eq!(why, "an event from the terminal server couldn't be applied: there is no entry 99");
+    }
+
+    /// The fault switch (`TestSwitch::SinkPanic`'s marker, given to the
+    /// sink as the switch's variable gives it) panics the fold: the
+    /// connection's guard catches it and breaks only that session.
+    #[test]
+    fn a_panic_in_the_agent_sink_breaks_the_agent_session() {
+        let marker = b"BRINDLE-FAULT-7".to_vec();
+        let bad = Event::Added { id: EntryId(1), entry: Entry::Agent { text: "says BRINDLE-FAULT-7".into() } }.to_value();
+        let why = broken_by("agent-panic", Some(marker), bad);
+        assert!(why.contains(crate::terminal::SINK_PANIC), "{why}");
     }
 }

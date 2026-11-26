@@ -33,7 +33,168 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::agent::sink::Sink as AgentSink;
+use crate::agent::spawn::AgentSpawnRequest;
 use crate::config::RemoteTarget;
+
+/// What an agent zone's session starts from ([`agent_link`]).
+pub enum AgentStart {
+    /// A new agent session: what it runs, said on the session's own
+    /// thread, as a terminal spawn's request is.
+    Spawn(Box<dyn FnOnce() -> AgentSpawnRequest + Send>),
+    /// A detached agent session, listed now (`recorded: false`: attached at
+    /// once) or recorded by a restored zone (`recorded: true`: attached
+    /// once the core's listing still has it).
+    Attach { session: protocol::SessionId, key: Option<SessionKey>, recorded: bool },
+}
+
+/// An agent zone's session in a terminal server, as [`agent_link`] starts
+/// it: on Linux and Windows the session in `remote::local`, which its
+/// requests go through. Elsewhere none is ever made.
+#[cfg(any(target_os = "linux", windows))]
+pub struct AgentLink(local::Session);
+
+/// Where there is no terminal server, no agent session is ever made.
+#[cfg(not(any(target_os = "linux", windows)))]
+pub enum AgentLink {}
+
+#[cfg(any(target_os = "linux", windows))]
+impl AgentLink {
+    /// Sends a prompt while the session runs; the request's id, which its
+    /// answer comes back under (`AgentEvent::Reply`), or `None`.
+    pub fn prompt(&self, text: &str) -> Option<protocol::RequestId> {
+        self.0.prompt(text)
+    }
+
+    /// Sends the held prompt again, as [`AgentLink::prompt`].
+    pub fn resend(&self) -> Option<protocol::RequestId> {
+        self.0.resend()
+    }
+
+    /// Discards the queued prompt, waiting or held, as [`AgentLink::prompt`].
+    pub fn unqueue(&self) -> Option<protocol::RequestId> {
+        self.0.unqueue()
+    }
+
+    /// Answers the permission request in entry `entry` (`None`: cancelled),
+    /// as [`AgentLink::prompt`].
+    pub fn answer(&self, entry: u64, option: Option<String>) -> Option<protocol::RequestId> {
+        self.0.answer(entry, option)
+    }
+
+    /// Cancels the running turn; true when it was sent.
+    pub fn cancel(&self) -> bool {
+        self.0.cancel()
+    }
+
+    /// Ends the session (`CLOSE`): the core hangs the agent up.
+    pub fn close(&self) {
+        self.0.close();
+    }
+
+    /// Leaves the session running with no client (`DETACH`), with its
+    /// tab's layout: a quit's.
+    pub fn detach_with(&self, layout: Option<serde_json::Value>) {
+        self.0.detach_with(layout);
+    }
+
+    /// Keeps the core's copy of the tab's layout current.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>) {
+        self.0.set_layout(layout);
+    }
+
+    /// The session's id and key, once it exists (an attach's as asked).
+    pub fn id_and_key(&self) -> Option<(protocol::SessionId, Option<SessionKey>)> {
+        self.0.id_and_key()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+impl AgentLink {
+    pub fn prompt(&self, _text: &str) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn resend(&self) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn unqueue(&self) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn answer(&self, _entry: u64, _option: Option<String>) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn cancel(&self) -> bool {
+        match *self {}
+    }
+
+    pub fn close(&self) {
+        match *self {}
+    }
+
+    pub fn detach_with(&self, _layout: Option<serde_json::Value>) {
+        match *self {}
+    }
+
+    pub fn set_layout(&self, _layout: Option<serde_json::Value>) {
+        match *self {}
+    }
+
+    pub fn id_and_key(&self) -> Option<(protocol::SessionId, Option<SessionKey>)> {
+        match *self {}
+    }
+}
+
+/// Why [`agent_link`] can't start an agent session here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unsupported {
+    reason: &'static str,
+}
+
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason)
+    }
+}
+
+impl std::error::Error for Unsupported {}
+
+/// What [`agent_link`] answers where the terminal server can't run.
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
+const NEEDS_THE_SERVER: Unsupported =
+    Unsupported { reason: "agent sessions run in the terminal server, which needs Linux or Windows" };
+
+/// Starts (or attaches) an agent zone's session on `host`'s terminal
+/// server: the platform-neutral entry point `src/agent/` uses, so it names
+/// no platform itself. `start` says what the session's thread asks the
+/// core for, and `sink` gets what the session reports, on the connection's
+/// reader thread. It returns at once: connecting, the protocol gate and
+/// the spawn or attach happen on the session's own thread, and a failure
+/// reaches the sink (`AgentEvent::Failed`).
+#[cfg(any(target_os = "linux", windows))]
+pub fn agent_link(host: Host, start: AgentStart, sink: AgentSink) -> Result<AgentLink, Unsupported> {
+    let sink: Box<dyn local::SessionSink> = Box::new(sink);
+    let session = match start {
+        AgentStart::Spawn(request) => local::Session::start_agent(host, request, sink),
+        AgentStart::Attach { session, key, recorded } => {
+            // An agent session has no size: the listed 0×0 goes back, and
+            // the core ignores it.
+            let when = if recorded { local::Attaching::Recorded } else { local::Attaching::Now { cols: 0, rows: 0 } };
+            local::Session::attach(host, local::AttachRequest { session, key, when }, sink)
+        }
+    };
+    Ok(AgentLink(session))
+}
+
+/// [`agent_link`] where there is no terminal server: always refused.
+#[cfg(not(any(target_os = "linux", windows)))]
+pub fn agent_link(host: Host, start: AgentStart, sink: AgentSink) -> Result<AgentLink, Unsupported> {
+    let _ = (host, start, sink);
+    Err(NEEDS_THE_SERVER)
+}
 
 /// Keeps a process Brindle starts outside a tab from opening a console
 /// window of its own: Brindle has no console to share, so a console program
@@ -234,6 +395,23 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where the terminal server can't run, the seam item says so. (On
+    /// Linux and Windows it starts a real session, which the client's own
+    /// tests cover against scripted cores and a real helper.)
+    #[test]
+    fn agent_link_says_why_it_cannot_start_without_the_server() {
+        assert_eq!(
+            NEEDS_THE_SERVER.to_string(),
+            "agent sessions run in the terminal server, which needs Linux or Windows"
+        );
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let (sink, _feed) = AgentSink::with_fault(None);
+            let start = AgentStart::Attach { session: 1, key: None, recorded: false };
+            assert_eq!(agent_link(Host::Local, start, sink).err(), Some(NEEDS_THE_SERVER));
+        }
+    }
 
     #[test]
     fn ssh_command_uses_config_alias_and_quotes_remote_argv() {

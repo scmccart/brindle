@@ -19,7 +19,14 @@ use gpui::{
 use serde::{Deserialize, Serialize};
 
 use crate::actions::*;
-use crate::config::{Config, Profile};
+use crate::TabKind;
+use crate::agent::Agent;
+use crate::agent::close::{AgentBusy, BusyAgent, ClosePlan, Closing, close_plan};
+use crate::agent::spawn::OpenedBy;
+use crate::agent::view::AgentView;
+use brindle_ui::FocusStops as _;
+use gpui::Focusable as _;
+use crate::config::{Config, Profile, ProfileKind};
 use crate::remote::Host;
 use crate::settings::Settings;
 use crate::terminal::MIN_COLS;
@@ -29,7 +36,7 @@ use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
-use crate::terminal_view::{LinkFailed, TerminalView};
+use crate::terminal_view::{GridLayout, LinkFailed, TerminalView};
 use crate::theme::Theme;
 use crate::workspace::{program_title, shortcut, terminal_automatic_title};
 
@@ -290,6 +297,38 @@ pub fn can_split_zone(
     }
 }
 
+/// What a split of a tab starts (design.md decision 4): a zone of the
+/// tab's kind, or nothing, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitPlan {
+    Terminal,
+    Agent,
+    Refused(SplitRefusal),
+}
+
+/// Why a tab can't start a zone of its kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SplitRefusal {
+    /// The tab's profile is gone from the config.
+    ProfileGone,
+    /// The tab's profile, as the config has it now, is of the other kind.
+    ProfileKindChanged,
+}
+
+/// What splitting a tab of kind `tab` starts, `profile` being the kind of
+/// the tab's profile as the config has it now (`None`: gone). A tab starts
+/// a zone of its own kind only, from a profile of that kind.
+pub fn split_plan(tab: TabKind, profile: Option<ProfileKind>) -> SplitPlan {
+    match (tab, profile) {
+        (TabKind::Terminal, Some(ProfileKind::Terminal)) => SplitPlan::Terminal,
+        (TabKind::Agent, Some(ProfileKind::Agent)) => SplitPlan::Agent,
+        (TabKind::Terminal, Some(ProfileKind::Agent)) | (TabKind::Agent, Some(ProfileKind::Terminal)) => {
+            SplitPlan::Refused(SplitRefusal::ProfileKindChanged)
+        }
+        (TabKind::Terminal | TabKind::Agent, None) => SplitPlan::Refused(SplitRefusal::ProfileGone),
+    }
+}
+
 /// A zone header's menu: Split Zone Right, Split Zone Down, a separator and
 /// Close Zone. Each split item is enabled only when the zone can be split
 /// along its axis (`split_right`, `split_down`: [`can_split_zone`] for the
@@ -314,6 +353,15 @@ pub struct ZoneMenuRequest {
     pub at: Point<Pixels>,
     /// The secondary press that asked, whose release ends the gesture.
     pub press: Option<MouseDownEvent>,
+}
+
+/// A zone's close asks first (design.md decision 12): its agent is busy.
+/// The tab's window opens the confirmation, and closes the zone
+/// ([`ZoneTreeView::close_zone_by_id`]) once the user confirms.
+#[derive(Clone, Debug)]
+pub struct CloseZoneAsk {
+    pub zone: ZoneId,
+    pub busy: Vec<BusyAgent>,
 }
 
 /// Formats `--dump-screen-after` zone lines when a tab has 2 or more zones,
@@ -423,16 +471,225 @@ fn fmt_unit(v: f64) -> String {
     if v == 0.0 { "0".into() } else { format!("{v}") }
 }
 
-/// What a zone holds. Starting with terminals; structured as an enum so future
-/// zone types (diff viewers, previews, etc.) can live in the same split tree.
+/// What a new zone shows, as its tab or a split starts it: a terminal, or
+/// an agent session's entity, for which the tree makes the view.
+pub enum ZoneStart {
+    Terminal(Entity<Terminal>),
+    Agent(Entity<Agent>),
+}
+
+impl ZoneStart {
+    /// The kind of tab a zone like this one belongs in.
+    pub fn kind(&self) -> TabKind {
+        match self {
+            Self::Terminal(_) => TabKind::Terminal,
+            Self::Agent(_) => TabKind::Agent,
+        }
+    }
+}
+
+/// What a zone holds: a terminal, or an agent session's conversation
+/// (`agent-zones`). Every question the tree and the window ask of a zone is
+/// a method here, each an exhaustive `match` (`types R2`, design.md
+/// decision 5).
 pub enum ZoneContent {
     Terminal(Entity<TerminalView>),
+    Agent(Entity<AgentView>),
 }
 
 impl ZoneContent {
-    pub fn as_terminal_view(&self) -> &Entity<TerminalView> {
+    /// The terminal's view; `None` for an agent zone.
+    pub fn terminal_view(&self) -> Option<&Entity<TerminalView>> {
         match self {
-            Self::Terminal(view) => view,
+            Self::Terminal(view) => Some(view),
+            Self::Agent(_) => None,
+        }
+    }
+
+    /// The agent zone's view; `None` for a terminal zone.
+    pub fn agent_view(&self) -> Option<&Entity<AgentView>> {
+        match self {
+            Self::Terminal(_) => None,
+            Self::Agent(view) => Some(view),
+        }
+    }
+
+    /// The terminal; `None` for an agent zone.
+    pub fn terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
+        Some(self.terminal_view()?.read(cx).terminal.clone())
+    }
+
+    /// The handle focusing the zone focuses: the terminal's, or the agent
+    /// zone's prompt input.
+    pub fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match self {
+            Self::Terminal(view) => view.read(cx).focus_handle.clone(),
+            Self::Agent(view) => view.read(cx).focus_handle(cx),
+        }
+    }
+
+    /// Whether keyboard focus is in the zone: in the terminal, or on one of
+    /// the agent zone's stops (its prompt, its buttons).
+    pub fn contains_focused(&self, window: &Window, cx: &App) -> bool {
+        match self {
+            Self::Terminal(view) => view.read(cx).focus_handle.contains_focused(window, cx),
+            Self::Agent(view) => view.read(cx).stops(cx).iter().any(|stop| stop.contains_focused(window, cx)),
+        }
+    }
+
+    /// Where a split of the zone, or a new tab following it, starts: the
+    /// terminal's directory, or the one the agent session was started in.
+    pub fn working_directory(&self, cx: &App) -> Option<PathBuf> {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.read(cx).working_directory(),
+            Self::Agent(view) => view.read(cx).agent().read(cx).directory().cloned(),
+        }
+    }
+
+    /// Whether session restore leaves the zone out: a terminal that only
+    /// shows a message (a failed attach), or an agent zone whose session
+    /// isn't open any more (ended, never started, lost or broken).
+    pub fn unrecorded(&self, cx: &App) -> bool {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.read(cx).shows_only_message(),
+            Self::Agent(view) => !view.read(cx).agent().read(cx).model().keeps_session(),
+        }
+    }
+
+    /// The terminal server session (id and key) the zone shows.
+    #[cfg(any(target_os = "linux", windows))]
+    pub fn server_session(
+        &self,
+        cx: &App,
+    ) -> Option<(crate::remote::protocol::SessionId, Option<crate::remote::SessionKey>)> {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.read(cx).server_session(),
+            Self::Agent(view) => view.read(cx).agent().read(cx).server_session(),
+        }
+    }
+
+    /// The zone's title: the terminal's automatic title in a tab of
+    /// `profile_name`, or the agent's name, else the profile's.
+    pub fn title(&self, profile_name: &str, cx: &App) -> SharedString {
+        match self {
+            Self::Terminal(view) => {
+                let terminal = view.read(cx).terminal.read(cx);
+                // The process name can cost a read of `/proc`: only when the
+                // program set no title of its own. On Windows it is what the
+                // title tick found off the UI thread.
+                let process_name = match program_title(terminal.title(), LOCAL_PATH_STYLE) {
+                    Some(_) => None,
+                    None => terminal.foreground_process_name(),
+                };
+                terminal_automatic_title(terminal.title(), profile_name, LOCAL_PATH_STYLE, process_name).into()
+            }
+            Self::Agent(view) => view.read(cx).agent().read(cx).title().into(),
+        }
+    }
+
+    /// The status the zone's dot shows, its progress and its context badge:
+    /// a terminal's program status, or the agent zone's shown status with
+    /// no progress or badge. `idle` shows no dot, as a program's `idle`
+    /// record shows none.
+    pub fn status(&self, cx: &App) -> (Option<State>, Option<Progress>, Option<Badge>) {
+        match self {
+            Self::Terminal(view) => {
+                let terminal = view.read(cx).terminal.read(cx);
+                (terminal.status().summary(), terminal.progress(), terminal.badge().cloned())
+            }
+            Self::Agent(view) => {
+                let status = view.read(cx).agent().read(cx).status().filter(|&state| state != State::Idle);
+                (status, None, None)
+            }
+        }
+    }
+
+    /// Takes the tab's profile's theme and font size, and an agent zone its
+    /// name (a title that is the profile's follows a rename).
+    pub fn set_profile(&self, name: &str, theme: Theme, font_size: Option<f32>, cx: &mut App) {
+        match self {
+            Self::Terminal(view) => view.update(cx, |view, cx| {
+                view.font_size_override = font_size;
+                view.terminal.update(cx, |t, _| t.theme = theme);
+            }),
+            Self::Agent(view) => {
+                view.update(cx, |view, cx| view.set_profile(theme, font_size, cx));
+                let agent = view.read(cx).agent().clone();
+                agent.update(cx, |agent, cx| agent.set_profile_name(name, cx));
+            }
+        }
+    }
+
+    /// The user closed the zone: its program or agent session ends.
+    pub fn close(&self, cx: &mut App) {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.clone().update(cx, |t, _| t.close()),
+            Self::Agent(view) => view.read(cx).agent().clone().update(cx, |agent, _| agent.close()),
+        }
+    }
+
+    /// Brindle is quitting: the session is left as the zone's kind says,
+    /// a kept one detached with its tab's `layout`.
+    pub fn quit_with(&self, layout: Option<serde_json::Value>, cx: &mut App) {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.clone().update(cx, |t, _| t.quit_with(layout)),
+            Self::Agent(view) => view.read(cx).agent().clone().update(cx, |agent, _| agent.quit_with(layout)),
+        }
+    }
+
+    /// Keeps the session's copy of its tab's layout current.
+    pub fn set_layout(&self, layout: Option<serde_json::Value>, cx: &App) {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.read(cx).set_layout(layout),
+            Self::Agent(view) => view.read(cx).agent().read(cx).set_layout(layout),
+        }
+    }
+
+    /// A restore's note: a dim line in the terminal, or a notice row above
+    /// the agent zone's conversation.
+    pub fn note(&self, text: &str, cx: &mut App) {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.clone().update(cx, |t, cx| t.note(text, cx)),
+            Self::Agent(view) => view.read(cx).agent().clone().update(cx, |agent, cx| agent.note(text, cx)),
+        }
+    }
+
+    /// The agent zone's dump block as zone `zone` (design.md decision 15),
+    /// with where its conversation is scrolled; `None` for a terminal.
+    pub fn describe_agent(&self, zone: ZoneId, cx: &App) -> Option<String> {
+        match self {
+            Self::Terminal(_) => None,
+            Self::Agent(view) => {
+                let view = view.read(cx);
+                let at_end = view.scroller().read(cx).follow() == brindle_ui::Follow::AtEnd;
+                Some(view.agent().read(cx).model().describe(zone.0, at_end))
+            }
+        }
+    }
+
+    /// What `--wait-for` matches: the terminal's screen, or the agent
+    /// zone's dump lines without its id and scroll position.
+    pub fn wait_text(&self, cx: &App) -> String {
+        match self {
+            Self::Terminal(view) => view.read(cx).terminal.read(cx).screen_text(),
+            Self::Agent(view) => view.read(cx).agent().read(cx).model().wait_text(),
+        }
+    }
+
+    /// Where the terminal's grid was last painted; `None` for an agent
+    /// zone, whose size the tree estimates from its rectangle.
+    fn grid(&self, cx: &App) -> Option<GridLayout> {
+        match self {
+            Self::Terminal(view) => view.read(cx).layout.get(),
+            Self::Agent(_) => None,
+        }
+    }
+
+    /// The element the zone's card holds.
+    fn element(&self) -> AnyElement {
+        match self {
+            Self::Terminal(view) => view.clone().into_any_element(),
+            Self::Agent(view) => view.clone().into_any_element(),
         }
     }
 }
@@ -456,6 +713,9 @@ pub struct ZoneTreeView {
     /// The endpoint the tab opened on, where its splits start too, whatever
     /// the profile targets now. It never changes.
     host: Host,
+    /// What the tab's zones are, fixed when it opens as its host is: a
+    /// split starts a zone of this kind only ([`split_plan`]).
+    kind: TabKind,
     /// The tab's theme, for its terminals and the cards round them (their
     /// headers, borders and the gaps between them). The focus ring and the
     /// status dots stay on the window's tokens and global theme.
@@ -483,19 +743,20 @@ struct LaidOut {
 
 impl EventEmitter<TerminalEvent> for ZoneTreeView {}
 impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
+impl EventEmitter<CloseZoneAsk> for ZoneTreeView {}
 /// A zone's link wasn't opened, passed on to the window (whichever tab the
 /// zone is in: an opener can fail after its tab went to the background).
 impl EventEmitter<LinkFailed> for ZoneTreeView {}
 
 impl ZoneTreeView {
-    /// Creates a `ZoneTreeView` with a single initial terminal zone, which
-    /// runs on `host`.
+    /// Creates a `ZoneTreeView` with a single initial zone, which runs on
+    /// `host`.
     pub fn new(
         profile: Profile,
         host: Host,
         theme: Theme,
         font_size_override: Option<f32>,
-        terminal: Entity<Terminal>,
+        start: ZoneStart,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -503,6 +764,7 @@ impl ZoneTreeView {
         let mut this = Self {
             profile,
             host,
+            kind: start.kind(),
             theme,
             font_size_override,
             tree: ZoneTree::new(id),
@@ -514,12 +776,12 @@ impl ZoneTreeView {
             focus_handle: cx.focus_handle(),
             laid_out: Rc::default(),
         };
-        this.insert_terminal_zone(id, terminal, window, cx);
+        this.insert_zone(id, start, window, cx);
         this
     }
 
-    /// Creates a `ZoneTreeView` from a restored split tree and pre-spawned
-    /// terminals for each leaf, which run on `host`.
+    /// Creates a `ZoneTreeView` from a restored split tree and the zones
+    /// started for each leaf, which run on `host`.
     #[allow(
         clippy::too_many_arguments,
         reason = "both call sites (`Workspace`'s restore and layout tab) already hold each of these as separate values (profile, host, theme, tree, terminals, active zone); a parameter struct would be built only to be taken apart here"
@@ -530,15 +792,19 @@ impl ZoneTreeView {
         theme: Theme,
         font_size_override: Option<f32>,
         tree: ZoneTree,
-        terminals: Vec<(ZoneId, Entity<Terminal>)>,
+        zones: Vec<(ZoneId, ZoneStart)>,
         active: ZoneId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let max_id = terminals.iter().map(|(id, _)| id.0).max().unwrap_or(1);
+        let max_id = zones.iter().map(|(id, _)| id.0).max().unwrap_or(1);
+        // The callers start every zone of a tree as one kind
+        // (`layout::group` splits a recorded layout by kind).
+        let kind = zones.first().map_or(TabKind::Terminal, |(_, start)| start.kind());
         let mut this = Self {
             profile,
             host,
+            kind,
             theme,
             font_size_override,
             tree,
@@ -550,8 +816,8 @@ impl ZoneTreeView {
             focus_handle: cx.focus_handle(),
             laid_out: Rc::default(),
         };
-        for (id, terminal) in terminals {
-            this.insert_terminal_zone(id, terminal, window, cx);
+        for (id, start) in zones {
+            this.insert_zone(id, start, window, cx);
         }
         // Give the recorded active zone the highest focus serial.
         this.focus_serial += 1;
@@ -561,41 +827,51 @@ impl ZoneTreeView {
         this
     }
 
-    fn insert_terminal_zone(
-        &mut self,
-        id: ZoneId,
-        terminal: Entity<Terminal>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Puts zone `id` in the tree's map, showing what `start` started, in
+    /// the tab's theme and font size, with the subscriptions its kind has.
+    fn insert_zone(&mut self, id: ZoneId, start: ZoneStart, window: &mut Window, cx: &mut Context<Self>) {
         let theme = self.theme.clone();
-        terminal.update(cx, |t, _| t.theme = theme);
         let font_size = self.font_size_override;
-        let view = cx.new(|cx| TerminalView::new(terminal.clone(), font_size, window, cx));
-        let focus = view.read(cx).focus_handle.clone();
-        let focus_in = cx.on_focus_in(&focus, window, move |this, _, cx| {
-            this.on_zone_focused(id, cx);
-        });
-        let events = cx.subscribe_in(&terminal, window, move |this, _, event, window, cx| {
-            this.on_zone_terminal_event(id, event, window, cx);
-        });
-        let link_failed = cx.subscribe(&view, |_, _, failed: &LinkFailed, cx| cx.emit(failed.clone()));
-        self.focus_serial += 1;
-        let initial_title: SharedString = {
-            let t = terminal.read(cx);
-            terminal_automatic_title(t.title(), &self.profile.name, LOCAL_PATH_STYLE, None).into()
+        let (content, initial_title, mut subscriptions) = match start {
+            ZoneStart::Terminal(terminal) => {
+                terminal.update(cx, |t, _| t.theme = theme);
+                let view = cx.new(|cx| TerminalView::new(terminal.clone(), font_size, window, cx));
+                let events = cx.subscribe_in(&terminal, window, move |this, _, event, window, cx| {
+                    this.on_zone_terminal_event(id, event, window, cx);
+                });
+                let link_failed = cx.subscribe(&view, |_, _, failed: &LinkFailed, cx| cx.emit(failed.clone()));
+                // Without the process name, which the next refresh reads.
+                let title: SharedString = {
+                    let t = terminal.read(cx);
+                    terminal_automatic_title(t.title(), &self.profile.name, LOCAL_PATH_STYLE, None).into()
+                };
+                (ZoneContent::Terminal(view), title, vec![events, link_failed])
+            }
+            ZoneStart::Agent(agent) => {
+                let view = cx.new(|cx| AgentView::new(agent.clone(), theme, font_size, window, cx));
+                // The agent emits the terminals' status and title events,
+                // never `Exited`: its zone stays until the user closes it.
+                let events = cx.subscribe_in(&agent, window, move |this, _, event, window, cx| {
+                    this.on_zone_terminal_event(id, event, window, cx);
+                });
+                let title: SharedString = agent.read(cx).title().into();
+                (ZoneContent::Agent(view), title, vec![events])
+            }
         };
-        let status = terminal.read(cx).status().summary();
-        let progress = terminal.read(cx).progress();
-        let badge = terminal.read(cx).badge().cloned();
+        let focus = content.focus_handle(cx);
+        subscriptions.push(cx.on_focus_in(&focus, window, move |this, _, cx| {
+            this.on_zone_focused(id, cx);
+        }));
+        self.focus_serial += 1;
+        let (status, progress, badge) = content.status(cx);
         let zone = Zone {
-            content: ZoneContent::Terminal(view),
+            content,
             title: initial_title,
             status,
             progress,
             badge,
             last_focused: self.focus_serial,
-            _subscriptions: vec![focus_in, events, link_failed],
+            _subscriptions: subscriptions,
         };
         self.zones.insert(id, zone);
     }
@@ -630,9 +906,7 @@ impl ZoneTreeView {
             }
             TerminalEvent::Status(_) => {
                 if let Some(zone) = self.zones.get_mut(&id) {
-                    let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-                    (zone.status, zone.progress) = (terminal.status().summary(), terminal.progress());
-                    zone.badge = terminal.badge().cloned();
+                    (zone.status, zone.progress, zone.badge) = zone.content.status(cx);
                 }
                 cx.emit(event.clone());
                 cx.notify();
@@ -651,16 +925,28 @@ impl ZoneTreeView {
     pub fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.zones
             .get(&self.active)
-            .map(|z| z.content.as_terminal_view().read(cx).focus_handle.clone())
+            .map(|z| z.content.focus_handle(cx))
             .unwrap_or_else(|| self.focus_handle.clone())
     }
 
-    pub fn active_view(&self) -> Option<Entity<TerminalView>> {
-        self.zones.get(&self.active).map(|z| z.content.as_terminal_view().clone())
+    /// The active zone's terminal view; `None` for an agent zone.
+    pub fn active_terminal_view(&self) -> Option<Entity<TerminalView>> {
+        self.zones.get(&self.active)?.content.terminal_view().cloned()
     }
 
+    /// The active zone's terminal; `None` for an agent zone.
     pub fn active_terminal(&self, cx: &App) -> Option<Entity<Terminal>> {
-        Some(self.active_view()?.read(cx).terminal.clone())
+        self.zones.get(&self.active)?.content.terminal(cx)
+    }
+
+    /// The active zone's content.
+    pub fn active_content(&self) -> Option<&ZoneContent> {
+        Some(&self.zones.get(&self.active)?.content)
+    }
+
+    /// The active zone's agent dump block; `None` for a terminal zone.
+    pub fn describe_active_agent(&self, cx: &App) -> Option<String> {
+        self.active_content()?.describe_agent(self.active, cx)
     }
 
     pub fn active_id(&self) -> ZoneId {
@@ -673,23 +959,19 @@ impl ZoneTreeView {
 
 
     pub fn zone_working_directory(&self, id: ZoneId, cx: &App) -> Option<PathBuf> {
-        let zone = self.zones.get(&id)?;
-        zone.content.as_terminal_view().read(cx).terminal.read(cx).working_directory()
+        self.zones.get(&id)?.content.working_directory(cx)
     }
 
     /// What session restore records for each zone (its directory and its
     /// session), for `session::record_zones`. A zone that only shows a
-    /// message (an attach that failed) has no entry.
+    /// message (an attach that failed), and an agent zone whose session
+    /// isn't open, has no entry ([`ZoneContent::unrecorded`]).
     pub fn zone_records(&self, cx: &App) -> HashMap<ZoneId, crate::session::ZoneRecord> {
-        let shows_only_message = |id: &ZoneId| {
-            self.zones
-                .get(id)
-                .is_some_and(|zone| zone.content.as_terminal_view().read(cx).terminal.read(cx).shows_only_message())
-        };
+        let unrecorded = |id: &ZoneId| self.zones.get(id).is_some_and(|zone| zone.content.unrecorded(cx));
         self.tree
             .leaves()
             .into_iter()
-            .filter(|id| !shows_only_message(id))
+            .filter(|id| !unrecorded(id))
             .map(|id| {
                 let record = crate::session::ZoneRecord {
                     cwd: self.zone_working_directory(id, cx),
@@ -705,7 +987,7 @@ impl ZoneTreeView {
         #[cfg(any(target_os = "linux", windows))]
         {
             let zone = self.zones.get(&id)?;
-            let (id, key) = zone.content.as_terminal_view().read(cx).terminal.read(cx).server_session()?;
+            let (id, key) = zone.content.server_session(cx)?;
             // The state file's form: an empty key for none.
             let key = key.map(crate::remote::SessionKey::into_string).unwrap_or_default();
             Some(crate::session::ServerSession { id, key })
@@ -740,27 +1022,16 @@ impl ZoneTreeView {
     fn refresh_zone_title(&mut self, id: ZoneId, cx: &App) -> bool {
         let profile_name = self.profile.name.clone();
         let Some(zone) = self.zones.get_mut(&id) else { return false };
-        let terminal = zone.content.as_terminal_view().read(cx).terminal.read(cx);
-        // The process name can cost a read of `/proc`: only when the
-        // program set no title of its own. On Windows it is what the title
-        // tick found off the UI thread.
-        let process_name = match program_title(terminal.title(), LOCAL_PATH_STYLE) {
-            Some(_) => None,
-            None => terminal.foreground_process_name(),
-        };
-        let title: SharedString =
-            terminal_automatic_title(terminal.title(), &profile_name, LOCAL_PATH_STYLE, process_name).into();
+        let title = zone.content.title(&profile_name, cx);
         let changed = zone.title != title;
         zone.title = title;
         changed
     }
 
-    /// The most pressing program status across all zones in this tab.
+    /// The most pressing status across all zones in this tab: the
+    /// terminals' program status and the agent zones' shown status.
     pub fn status_summary(&self, cx: &App) -> Option<State> {
-        self.zones
-            .values()
-            .filter_map(|z| z.content.as_terminal_view().read(cx).terminal.read(cx).status().summary())
-            .max()
+        self.zones.values().filter_map(|z| z.content.status(cx).0).max()
     }
 
     /// The most pressing progress across all zones in this tab
@@ -794,21 +1065,17 @@ impl ZoneTreeView {
         self.theme = theme.clone();
         self.font_size_override = font_size;
         for zone in self.zones.values() {
-            let theme = theme.clone();
-            zone.content.as_terminal_view().update(cx, |view, cx| {
-                view.font_size_override = font_size;
-                view.terminal.update(cx, |t, _| t.theme = theme);
-            });
+            zone.content.set_profile(&self.profile.name, theme.clone(), font_size, cx);
         }
         cx.notify();
     }
 
-    /// Closes every zone's terminal, ending its program, when the user
-    /// closes the tab.
+    /// Closes every zone's terminal or agent session, ending it, when the
+    /// user closes the tab.
     pub fn shutdown_all(&mut self, cx: &mut Context<Self>) {
         self.shutting_down = true;
-        for terminal in self.terminals(cx) {
-            terminal.update(cx, |t, _| t.close());
+        for zone in self.zones.values() {
+            zone.content.close(cx);
         }
     }
 
@@ -820,9 +1087,8 @@ impl ZoneTreeView {
     pub fn quit_all(&mut self, origin: &str, index: usize, title: Option<&str>, cx: &mut Context<Self>) {
         self.shutting_down = true;
         let layout = self.layout(origin, index, title, cx);
-        for terminal in self.terminals(cx) {
-            let layout = layout.clone();
-            terminal.update(cx, |t, _| t.quit_with(layout));
+        for zone in self.zones.values() {
+            zone.content.quit_with(layout.clone(), cx);
         }
     }
 
@@ -853,14 +1119,21 @@ impl ZoneTreeView {
             return;
         }
         let layout = self.layout(origin, index, title, cx);
-        for terminal in self.terminals(cx) {
-            terminal.read(cx).set_layout(layout.clone());
+        for zone in self.zones.values() {
+            zone.content.set_layout(layout.clone(), cx);
         }
     }
 
-    /// Every zone's terminal.
+    /// Every terminal zone's terminal (agent zones have none).
     pub fn terminals(&self, cx: &App) -> Vec<Entity<Terminal>> {
-        self.zones.values().map(|z| z.content.as_terminal_view().read(cx).terminal.clone()).collect()
+        self.zones.values().filter_map(|z| z.content.terminal(cx)).collect()
+    }
+
+    /// A restore's note for the active zone ([`ZoneContent::note`]).
+    pub fn note_active(&self, text: &str, cx: &mut App) {
+        if let Some(zone) = self.zones.get(&self.active) {
+            zone.content.note(text, cx);
+        }
     }
 
     pub fn describe_zones(&self) -> String {
@@ -873,7 +1146,7 @@ impl ZoneTreeView {
         let padding = px(Settings::get(cx).config.padding);
         let border = brindle_ui::CARD_BORDER * 2.0;
         let has_header = self.zones.len() >= 2;
-        if let Some(grid) = self.zones.get(&id).and_then(|z| z.content.as_terminal_view().read(cx).layout.get()) {
+        if let Some(grid) = self.zones.get(&id).and_then(|z| z.content.grid(cx)) {
             let w = grid.cell_width * grid.cols as f32 + padding * 2.0 + border;
             let h = grid.line_height * grid.rows as f32
                 + padding * 2.0
@@ -881,8 +1154,9 @@ impl ZoneTreeView {
                 + if has_header { px(ZONE_HEADER_HEIGHT) } else { px(0.0) };
             return Some(size(w, h));
         }
-        // Fallback before the first paint: estimate from the window's inner
-        // bounds, less the cards' margin, and the zone's normalized rectangle.
+        // Before a terminal's first paint, and for an agent zone (which has
+        // no grid): estimate from the window's inner bounds, less the
+        // cards' margin, and the zone's normalized rectangle.
         let (_, rect) = self.tree.rects().into_iter().find(|(zid, _)| *zid == id)?;
         let win_size = window.inner_window_bounds().get_bounds().size;
         let content_w = (f32::from(win_size.width) - ZONE_GAP * 2.0).max(0.0);
@@ -890,9 +1164,22 @@ impl ZoneTreeView {
         Some(size(px(content_w * rect.w as f32), px(content_h * rect.h as f32)))
     }
 
-    /// Whether zone `id` is big enough, at its current size, to split along
-    /// `axis` ([`can_split_zone`]). A zone whose size isn't known yet can.
+    /// What a split of this tab starts, from its profile as the config has
+    /// it now ([`split_plan`]).
+    fn split_plan(&self, cx: &App) -> SplitPlan {
+        let config = &Settings::get(cx).config;
+        split_plan(self.kind, config.profile(&self.profile.name).map(Profile::kind))
+    }
+
+    /// Whether zone `id` can be split along `axis`: the tab can start a
+    /// zone of its kind ([`split_plan`]) and the zone is big enough, at its
+    /// current size ([`can_split_zone`]). A zone whose size isn't known yet
+    /// is.
     pub fn can_split(&self, id: ZoneId, axis: SplitAxis, window: &Window, cx: &App) -> bool {
+        match self.split_plan(cx) {
+            SplitPlan::Terminal | SplitPlan::Agent => {}
+            SplitPlan::Refused(_) => return false,
+        }
         let metrics = cell_metrics(self.font_size_override, window, cx);
         let padding = px(Settings::get(cx).config.padding);
         let has_header = self.zones.len() >= 2;
@@ -942,9 +1229,11 @@ impl ZoneTreeView {
 
         let config: Config = Settings::get(cx).config.clone();
         // A split runs on the tab's host and inherits the target zone's
-        // current working directory there; if unavailable, `Terminal::spawn`
-        // falls back to the profile's cwd or home.
+        // current working directory there (an agent zone's: the one its
+        // session started in); if unavailable, the spawn falls back to the
+        // profile's cwd or home.
         let cwd = self.zone_working_directory(target, cx);
+        let plan = self.split_plan(cx);
 
         let new_id = ZoneId(self.next_id);
         self.next_id += 1;
@@ -953,11 +1242,24 @@ impl ZoneTreeView {
         }
 
         let host = self.host.clone();
-        let terminal = cx.new(|cx| Terminal::spawn(&self.profile, &host, None, cwd, &config, cx));
+        let start = match plan {
+            SplitPlan::Terminal => {
+                ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&self.profile, &host, None, cwd, &config, cx)))
+            }
+            SplitPlan::Agent => {
+                ZoneStart::Agent(cx.new(|cx| Agent::spawn(&self.profile, &host, cwd, OpenedBy::Window, None, cx)))
+            }
+            // `can_split` refused this above; should it get here, the tree
+            // loses the leaf it just gained.
+            SplitPlan::Refused(_) => {
+                self.tree.remove(new_id);
+                return;
+            }
+        };
 
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         self.refresh_zone_title(target, cx);
-        self.insert_terminal_zone(new_id, terminal, window, cx);
+        self.insert_zone(new_id, start, window, cx);
         self.refresh_zone_title(new_id, cx);
         self.active = new_id;
         let focus = self.focus_handle(cx);
@@ -966,10 +1268,11 @@ impl ZoneTreeView {
         cx.notify();
     }
 
-    /// Closes zone `target`, ending its terminal's program.
+    /// Closes zone `target`, ending its terminal's program or its agent
+    /// session.
     pub fn close_zone_by_id(&mut self, target: ZoneId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(removed) = self.zones.remove(&target) else { return };
-        removed.content.as_terminal_view().read(cx).terminal.clone().update(cx, |t, _| t.close());
+        removed.content.close(cx);
 
         if self.zones.is_empty() {
             cx.emit(TerminalEvent::Exited);
@@ -1037,8 +1340,47 @@ impl ZoneTreeView {
         self.split_zone(self.active, SplitAxis::Vertical, window, cx);
     }
 
+    /// Close Zone (its key, the header's ×, the header menu's item): at
+    /// once, or after the window's confirmation when its agent is busy
+    /// ([`close_plan`]).
     fn close_active_zone(&mut self, _: &CloseZone, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_zone_by_id(self.active, window, cx);
+        self.request_close_zone(self.active, window, cx);
+    }
+
+    /// The user asked to close zone `target`: [`close_plan`] decides
+    /// whether it closes now or the window asks first ([`CloseZoneAsk`]).
+    pub fn request_close_zone(&mut self, target: ZoneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(closing) = self.closing_zone(target, cx) else { return };
+        match close_plan(&[closing]) {
+            ClosePlan::Now => self.close_zone_by_id(target, window, cx),
+            ClosePlan::Ask(busy) => cx.emit(CloseZoneAsk { zone: target, busy }),
+        }
+    }
+
+    /// What closing zone `id` would end, for [`close_plan`]: a terminal, or
+    /// an agent with its title and whether the status it shows is busy.
+    fn closing_zone(&self, id: ZoneId, cx: &App) -> Option<Closing> {
+        let zone = self.zones.get(&id)?;
+        Some(match &zone.content {
+            ZoneContent::Terminal(_) => Closing::Terminal(id),
+            ZoneContent::Agent(_) => Closing::Agent {
+                zone: id,
+                name: zone.title.to_string(),
+                busy: AgentBusy::of(zone.content.status(cx).0),
+            },
+        })
+    }
+
+    /// What closing the whole tab would end: every zone, in the tree's
+    /// order.
+    pub fn closing(&self, cx: &App) -> Vec<Closing> {
+        self.tree.leaves().into_iter().filter_map(|id| self.closing_zone(id, cx)).collect()
+    }
+
+    /// Whether the tab still has zone `id` (a confirmation open on it
+    /// closes itself once it is gone).
+    pub fn has_zone(&self, id: ZoneId) -> bool {
+        self.zones.contains_key(&id)
     }
 
     /// `OpenZoneMenu`: the active zone's header menu, below its header (see
@@ -1100,7 +1442,26 @@ impl ZoneTreeView {
         let Some(zone) = self.zones.get(&id) else {
             return div().size_full().into_any_element();
         };
-        let view = zone.content.as_terminal_view().clone();
+        let view = match &zone.content {
+            ZoneContent::Terminal(_) => zone.content.element(),
+            // A terminal focuses itself on a press; the agent zone's
+            // conversation has nothing focusable outside its buttons, so a
+            // press anywhere in an inactive agent zone makes it the active
+            // one first (focusing its prompt), before a button it reached
+            // takes focus for itself.
+            ZoneContent::Agent(_) => div()
+                .id(("agent-zone", id.0 as usize))
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .capture_any_mouse_down(cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    if this.active != id {
+                        this.focus_zone(id, window, cx);
+                    }
+                }))
+                .child(zone.content.element())
+                .into_any_element(),
+        };
         // The gap round the cards is the strip's colour (the chrome
         // background), so the corner cutouts match it.
         let mut colors = self.theme.card_colors();
@@ -1111,8 +1472,8 @@ impl ZoneTreeView {
         }
 
         let active = id == self.active;
-        let focus = view.read(cx).focus_handle.clone();
-        let ring = active && shows_ring(focus.contains_focused(window, cx), modality(window, cx), false);
+        let focus = zone.content.focus_handle(cx);
+        let ring = active && shows_ring(zone.content.contains_focused(window, cx), modality(window, cx), false);
         // Status dots in the chrome theme's colours, like the strip's.
         let status_color =
             zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
@@ -1153,15 +1514,24 @@ impl ZoneTreeView {
                 })
                 .child(control)
         };
+        // A tab that can't start a zone of its kind shows its split
+        // buttons disabled (a zone too small to split finds out on a press,
+        // as before: that needs the font's metrics).
+        let refused = match self.split_plan(cx) {
+            SplitPlan::Terminal | SplitPlan::Agent => false,
+            SplitPlan::Refused(_) => true,
+        };
         let split_right = button("zone-split-right", Icon::Columns2)
+            .disabled(refused)
             .tooltip_with(tip("Split right", Box::new(SplitZoneRight)))
             .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Horizontal, window, cx)));
         let split_down = button("zone-split-down", Icon::Rows2)
+            .disabled(refused)
             .tooltip_with(tip("Split down", Box::new(SplitZoneDown)))
             .on_click(cx.listener(move |this, _, window, cx| this.split_zone(id, SplitAxis::Vertical, window, cx)));
         let close = button("zone-close", Icon::X)
             .tooltip_with(tip("Close zone", Box::new(CloseZone)))
-            .on_click(cx.listener(move |this, _, window, cx| this.close_zone_by_id(id, window, cx)));
+            .on_click(cx.listener(move |this, _, window, cx| this.request_close_zone(id, window, cx)));
 
         // The title in the terminal's foreground on the active zone, muted
         // on the others (`trigger_label` cuts it, as `truncate` can't).
@@ -1219,10 +1589,8 @@ impl Render for ZoneTreeView {
             .track_focus(&self.focus_handle)
             .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, window, cx| {
                 let position = window.mouse_position();
-                for zone in this.zones.values() {
-                    zone.content.as_terminal_view().update(cx, |view, cx| {
-                        view.modifiers_changed(position, e.modifiers, cx);
-                    });
+                for view in this.zones.values().filter_map(|zone| zone.content.terminal_view()) {
+                    view.update(cx, |view, cx| view.modifiers_changed(position, e.modifiers, cx));
                 }
             }))
             .on_action(cx.listener(Self::split_right))
@@ -1248,6 +1616,23 @@ impl Render for ZoneTreeView {
 mod tests {
     use super::*;
     use gpui::size;
+
+    /// Every (tab kind, profile kind or gone) pair: a tab starts a zone of
+    /// its own kind from a profile of that kind, and nothing otherwise.
+    #[test]
+    fn a_split_starts_a_zone_of_the_tabs_kind_only() {
+        let table = [
+            (TabKind::Terminal, Some(ProfileKind::Terminal), SplitPlan::Terminal),
+            (TabKind::Terminal, Some(ProfileKind::Agent), SplitPlan::Refused(SplitRefusal::ProfileKindChanged)),
+            (TabKind::Terminal, None, SplitPlan::Refused(SplitRefusal::ProfileGone)),
+            (TabKind::Agent, Some(ProfileKind::Agent), SplitPlan::Agent),
+            (TabKind::Agent, Some(ProfileKind::Terminal), SplitPlan::Refused(SplitRefusal::ProfileKindChanged)),
+            (TabKind::Agent, None, SplitPlan::Refused(SplitRefusal::ProfileGone)),
+        ];
+        for (tab, profile, plan) in table {
+            assert_eq!(split_plan(tab, profile), plan, "{tab:?} tab, {profile:?} profile");
+        }
+    }
 
     #[test]
     fn tree_split_remove_and_rects() {
@@ -1461,6 +1846,305 @@ mod tests {
         assert_eq!(drawn.color(), theme.badge_color(BadgeKind::Elsewhere));
         assert_eq!(drawn.tooltip_text(), None);
         assert_eq!(describe_badge(&web), "kind=elsewhere label=\"web\" draw=text");
+    }
+
+    /// A tab of one agent zone (task 6.1): no terminal paths, the agent's
+    /// title and status, its directory, a record while its session is
+    /// open, and a close ending the session.
+    #[test]
+    fn an_agent_zone_answers_every_question_without_a_terminal() {
+        use crate::agent::test_support::{Call, Zone, app, ready, settle};
+        let mut app = app();
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let profile = Profile::default_shell();
+        let (view, cx) = app.add_window_view(|window, cx| {
+            ZoneTreeView::new(profile, Host::Local, Theme::default(), None, ZoneStart::Agent(agent), window, cx)
+        });
+        let mut zone = zone;
+        zone.feed(&[ready()]);
+        settle(cx);
+        view.update(cx, |view, cx| {
+            assert!(view.active_terminal_view().is_none());
+            assert!(view.active_terminal(cx).is_none());
+            assert!(view.terminals(cx).is_empty());
+            let content = view.active_content().expect("the agent zone");
+            assert!(content.terminal_view().is_none());
+            assert_eq!(content.title("Shell", cx).as_ref(), "Fake Agent");
+            assert_eq!(content.working_directory(cx), None);
+            assert!(!content.unrecorded(cx), "an open session is recorded");
+            assert_eq!(view.zone_records(cx).len(), 1);
+            let (_, progress, badge) = content.status(cx);
+            assert!(progress.is_none() && badge.is_none());
+        });
+        view.update(cx, |view, cx| view.shutdown_all(cx));
+        assert_eq!(zone.take_calls(), vec![Call::Close]);
+    }
+
+    use std::cell::Cell;
+
+    use crate::agent::close::describe_busy;
+
+    /// Puts `toml`'s config in the test app's settings.
+    fn use_config(cx: &mut gpui::TestAppContext, toml: &str) {
+        let config = Config::parse(toml).expect("the test config").config;
+        cx.update(|cx| cx.set_global(Settings::new(config, crate::config::ConfigReport::default(), Vec::new())));
+    }
+
+    /// Whether each split item of a zone menu is enabled.
+    fn split_items(rows: &[ActionRow]) -> Vec<bool> {
+        rows.iter()
+            .filter_map(|row| match row {
+                ActionRow::Item { action, enabled } if action.name() != CloseZone.name() => Some(*enabled),
+                ActionRow::Item { .. } | ActionRow::Separator => None,
+            })
+            .collect()
+    }
+
+    /// A tab of one zone in a test window, and the split items of every
+    /// menu it asks for.
+    struct Tab {
+        view: Entity<ZoneTreeView>,
+        cx: &'static mut gpui::VisualTestContext,
+        menus: Rc<RefCell<Vec<Vec<bool>>>>,
+        exited: Rc<Cell<bool>>,
+        _subscriptions: Vec<Subscription>,
+    }
+
+    impl Tab {
+        fn new(app: &mut gpui::TestAppContext, profile: Profile, start: impl FnOnce(&mut App) -> ZoneStart) -> Self {
+            let start = app.update(start);
+            let (view, cx) = app.add_window_view(|window, cx| {
+                ZoneTreeView::new(profile, Host::Local, Theme::default(), None, start, window, cx)
+            });
+            let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+            let (menus, exited) = (Rc::<RefCell<Vec<Vec<bool>>>>::default(), Rc::new(Cell::new(false)));
+            let subscriptions = cx.update(|_, cx| {
+                let menus = menus.clone();
+                let exited = exited.clone();
+                vec![
+                    cx.subscribe(&view, move |_, request: &ZoneMenuRequest, _| {
+                        menus.borrow_mut().push(split_items(&request.rows))
+                    }),
+                    cx.subscribe(&view, move |_, event: &TerminalEvent, _| {
+                        if matches!(event, TerminalEvent::Exited) {
+                            exited.set(true);
+                        }
+                    }),
+                ]
+            });
+            Self { view, cx, menus, exited, _subscriptions: subscriptions }
+        }
+
+        /// Whether the only zone can split right and down, as
+        /// [`ZoneTreeView::can_split`] says and as its menu shows.
+        fn splits(&mut self) -> (bool, bool, Vec<bool>) {
+            let view = self.view.clone();
+            let can = self.cx.update(|window, cx| {
+                let view = view.read(cx);
+                let id = view.active;
+                (view.can_split(id, SplitAxis::Horizontal, window, cx), view.can_split(id, SplitAxis::Vertical, window, cx))
+            });
+            view.update_in(self.cx, |view, window, cx| view.open_menu(view.active, Point::default(), None, window, cx));
+            let menu = self.menus.borrow_mut().pop().expect("the zone asked for its menu");
+            (can.0, can.1, menu)
+        }
+
+        fn zones(&mut self) -> usize {
+            self.view.read_with(self.cx, |view, _| view.zones.len())
+        }
+    }
+
+    /// An agent tab whose profile is now a terminal profile, and a terminal
+    /// tab whose profile is gone, refuse splits: `can_split` says no, the
+    /// header menu's split items are disabled, and the split actions do
+    /// nothing. An agent tab of an agent profile can split.
+    #[test]
+    fn a_tab_refuses_splits_of_the_other_kind_or_a_gone_profile() {
+        use crate::agent::test_support::{Zone, app};
+        let mut app = app();
+        use_config(
+            &mut app,
+            "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n",
+        );
+        let profile = |name: &str| app.update(|cx| Settings::get(cx).config.profile(name).cloned().unwrap());
+        let (shell, fake) = (profile("Shell"), profile("Fake"));
+
+        // An agent tab whose profile (by name) is a terminal profile now.
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let mut changed = Tab::new(&mut app, shell, |_| ZoneStart::Agent(agent));
+        assert_eq!(changed.splits(), (false, false, vec![false, false]));
+        changed.view.update_in(changed.cx, |view, window, cx| {
+            view.split_right(&SplitZoneRight, window, cx);
+            view.split_down(&SplitZoneDown, window, cx);
+        });
+        assert_eq!(changed.zones(), 1, "no zone was started");
+
+        // A terminal tab whose profile is gone from the config.
+        let mut gone_profile = Profile::default_shell();
+        gone_profile.name = "Gone".into();
+        let mut gone = Tab::new(&mut app, gone_profile, |cx| {
+            let config = Settings::get(cx).config.clone();
+            ZoneStart::Terminal(cx.new(|cx| Terminal::message("gone", Theme::default(), &config, cx)))
+        });
+        assert_eq!(gone.splits(), (false, false, vec![false, false]));
+        gone.view.update_in(gone.cx, |view, window, cx| view.split_right(&SplitZoneRight, window, cx));
+        assert_eq!(gone.zones(), 1, "no zone was started");
+
+        // An agent tab of an agent profile: its size isn't known yet, so it
+        // can split either way.
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let mut same = Tab::new(&mut app, fake, |_| ZoneStart::Agent(agent));
+        assert_eq!(same.splits(), (true, true, vec![true, true]));
+    }
+
+    /// An agent tab a launch opened (`brindle agent -p hi`, task 6.3) sends
+    /// its first prompt once the agent is ready, and only then, once.
+    #[test]
+    fn a_launched_agent_tab_sends_its_first_prompt_once_ready() {
+        use crate::agent::test_support::{Call, Zone, app, ready, settle};
+        let mut app = app();
+        let mut zone = Zone::new(Some("hi"), &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), Vec::new(), "nothing before the agent is ready");
+        zone.feed(&[ready()]);
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), vec![Call::Prompt("hi".into())]);
+        zone.feed(&[ready()]);
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), Vec::new(), "sent once");
+    }
+
+    /// Close Zone (its key and the header menu's item, both the
+    /// `CloseZone` action) and the header's × (`request_close_zone`) on a
+    /// working agent zone ask the window first and close nothing; on an
+    /// idle one they close it at once, ending its session.
+    #[test]
+    fn closing_a_busy_agent_zone_asks_and_an_idle_one_closes_at_once() {
+        use crate::agent::test_support::{Call, Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        let asks = Rc::<RefCell<Vec<CloseZoneAsk>>>::default();
+        let _asked = tab.cx.update(|_, cx| {
+            let asks = asks.clone();
+            cx.subscribe(&tab.view, move |_, ask: &CloseZoneAsk, _| asks.borrow_mut().push(ask.clone()))
+        });
+        zone.feed(&[ready(), Event::Turn { state: TurnState::Working }]);
+        settle(tab.cx);
+
+        // The action, as ctrl-shift-x and the header menu's item run it.
+        tab.view.update_in(tab.cx, |view, window, cx| view.close_active_zone(&CloseZone, window, cx));
+        // The header's ×.
+        tab.view.update_in(tab.cx, |view, window, cx| view.request_close_zone(view.active, window, cx));
+        let asked: Vec<_> = asks.borrow().iter().map(|ask| (ask.zone, describe_busy(&ask.busy))).collect();
+        assert_eq!(asked, [(ZoneId(1), "1:working".to_string()), (ZoneId(1), "1:working".to_string())]);
+        assert!(!tab.exited.get(), "nothing closed");
+        assert!(!zone.take_calls().contains(&Call::Close), "the session wasn't ended");
+
+        // Closing the whole tab would name it too.
+        let closing = tab.view.read_with(tab.cx, |view, cx| view.closing(cx));
+        assert!(matches!(close_plan(&closing), ClosePlan::Ask(busy) if describe_busy(&busy) == "1:working"));
+
+        // Once the turn has ended, the same close is at once.
+        zone.feed(&[Event::Turn { state: TurnState::Ended { stop: crate::agent::transcript::StopReason::EndTurn } }]);
+        settle(tab.cx);
+        tab.view.update_in(tab.cx, |view, window, cx| view.close_active_zone(&CloseZone, window, cx));
+        assert_eq!(asks.borrow().len(), 2, "nothing more asked");
+        assert!(tab.exited.get(), "the only zone closed, and the tab with it");
+        assert_eq!(zone.take_calls(), vec![Call::Close]);
+    }
+
+    /// A zone waiting on a permission request is busy too, and a terminal
+    /// zone never is: what a tab's close names.
+    #[test]
+    fn a_tab_names_only_its_busy_agents() {
+        use crate::agent::test_support::{Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        zone.feed(&[ready(), Event::Turn { state: TurnState::Blocked }]);
+        settle(tab.cx);
+        let closing = tab.view.read_with(tab.cx, |view, cx| view.closing(cx));
+        assert!(matches!(&closing[..], [Closing::Agent { name, .. }] if name == "Fake Agent"));
+        assert!(matches!(close_plan(&closing), ClosePlan::Ask(busy) if describe_busy(&busy) == "1:blocked"));
+
+        let shell = Tab::new(&mut app, Profile::default_shell(), |cx| {
+            let config = Settings::get(cx).config.clone();
+            ZoneStart::Terminal(cx.new(|cx| Terminal::message("shell", Theme::default(), &config, cx)))
+        });
+        let closing = shell.view.read_with(shell.cx, |view, cx| view.closing(cx));
+        assert_eq!(close_plan(&closing), ClosePlan::Now);
+    }
+
+    /// An agent zone's dot follows its activity, drops `done` once the
+    /// user types into the prompt input, and shows nothing while idle: what
+    /// the zone header draws and the tab's dot summarises.
+    #[test]
+    fn an_agent_zones_dot_follows_its_status_and_the_seen_rule() {
+        use crate::agent::test_support::{Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, StopReason, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent.clone()));
+        let dot = |tab: &Tab| {
+            tab.view.read_with(tab.cx, |view, cx| (view.zones[&view.active].status, view.status_summary(cx)))
+        };
+        zone.feed(&[ready()]);
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (None, None), "idle shows no dot");
+        zone.feed(&[Event::Turn { state: TurnState::Blocked }]);
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (Some(State::Blocked), Some(State::Blocked)));
+        zone.feed(&[Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } }]);
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (Some(State::Done), Some(State::Done)));
+        tab.cx.update(|_, cx| agent.update(cx, |agent, cx| agent.seen(cx)));
+        settle(tab.cx);
+        assert_eq!(dot(&tab), (None, None), "seen");
+    }
+
+    /// A renamed profile reaches an agent zone whose agent hasn't named
+    /// itself: its title follows the new name.
+    #[test]
+    fn an_agent_zones_title_follows_its_profiles_rename() {
+        use crate::agent::test_support::{Zone, app, settle};
+        let mut app = app();
+        let zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        let renamed = Profile { name: "Renamed".into(), ..Profile::default_shell() };
+        tab.view.update(tab.cx, |view, cx| view.set_profile(renamed, Theme::default(), None, cx));
+        settle(tab.cx);
+        let title = tab.view.read_with(tab.cx, |view, _| view.zones[&view.active].title.clone());
+        assert_eq!(title.as_ref(), "Renamed");
+    }
+
+    /// An agent zone whose agent exits stays open, its tab with it: the
+    /// agent emits no `Exited`.
+    #[test]
+    fn an_agent_zone_stays_open_when_its_agent_exits() {
+        use crate::agent::test_support::{Zone, app, ready, settle};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let mut tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        zone.feed(&[ready()]);
+        zone.sink.exited(Some(0));
+        settle(tab.cx);
+        assert_eq!(tab.zones(), 1);
+        assert!(!tab.exited.get(), "the tab didn't close");
+        let unrecorded = tab.view.read_with(tab.cx, |view, cx| view.zones[&view.active].content.unrecorded(cx));
+        assert!(unrecorded, "an ended session isn't recorded");
     }
 
     /// Zone progress lines: none for one zone (the tab's line says it),

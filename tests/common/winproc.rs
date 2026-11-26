@@ -341,8 +341,169 @@ pub fn start_unelevated(command_line: &str) -> crate::Result<u32> {
     Ok(info.dwProcessId)
 }
 
+/// A process [`start_without_stdin`] started; its handle is closed on drop.
+pub struct Started {
+    pub pid: u32,
+    process: HANDLE,
+}
+
+impl Started {
+    /// Its exit code once it has exited, `None` while it runs.
+    pub fn exit_code(&self) -> Option<u32> {
+        use windows::Win32::Foundation::STILL_ACTIVE;
+        use windows::Win32::System::Threading::GetExitCodeProcess;
+        let mut code = 0;
+        // SAFETY: our open handle to the process.
+        unsafe { GetExitCodeProcess(self.process, &mut code) }.ok()?;
+        (code != STILL_ACTIVE.0 as u32).then_some(code)
+    }
+
+    /// Ends it at once.
+    pub fn kill(&self) {
+        // SAFETY: our open handle, which has every right to the process.
+        unsafe { TerminateProcess(self.process, 1) }.ok();
+    }
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        // SAFETY: this handle is ours and open.
+        unsafe { CloseHandle(self.process) }.ok();
+    }
+}
+
+/// `arg` quoted for a Windows command line, as the C runtime and Rust
+/// split one: as it is when it has no space, tab or quote and isn't empty,
+/// else in quotes, with the backslashes before a quote (or the closing
+/// one) doubled and each quote escaped.
+pub fn quote_argument(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        if c == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        let escaped = if c == '"' { 2 * backslashes + 1 } else { backslashes };
+        out.extend(std::iter::repeat_n('\\', escaped));
+        out.push(c);
+        backslashes = 0;
+    }
+    out.extend(std::iter::repeat_n('\\', 2 * backslashes));
+    out.push('"');
+    out
+}
+
+/// The environment `command` gives its program, as a `CreateProcessW`
+/// block: this process's, with the command's additions and removals,
+/// names compared without case, sorted.
+fn environment_block(command: &std::process::Command) -> Vec<u16> {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStrExt as _;
+    let key = |name: &std::ffi::OsStr| name.to_string_lossy().to_uppercase();
+    let mut vars: BTreeMap<String, (OsString, OsString)> =
+        std::env::vars_os().map(|(name, value)| (key(&name), (name, value))).collect();
+    for (name, value) in command.get_envs() {
+        match value {
+            Some(value) => vars.insert(key(name), (name.to_owned(), value.to_owned())),
+            None => vars.remove(&key(name)),
+        };
+    }
+    let mut block = Vec::new();
+    for (name, value) in vars.values() {
+        block.extend(name.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(value.encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+/// Starts `command` (its program, arguments and environment) with no
+/// standard input or output handle at all and `stderr` as its standard
+/// error, as a GUI program started from a console with nothing redirected
+/// can be: `STARTF_USESTDHANDLES` with null handles, which `std::process`
+/// can't give (its `Stdio::null` is the `NUL` device). Arguments with a
+/// quote in them aren't needed, so they are refused.
+pub fn start_without_stdin(command: &std::process::Command, stderr: &std::fs::File) -> crate::Result<Started> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows::Win32::System::Threading::{
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    };
+    use windows::core::PWSTR;
+
+    let words: Vec<String> = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|word| word.to_string_lossy().into_owned())
+        .collect();
+    if let Some(word) = words.iter().find(|word| word.contains('"')) {
+        return Err(format!("start_without_stdin: {word:?} has a quote in it"));
+    }
+    let command_line = words.iter().map(|word| quote_argument(word)).collect::<Vec<_>>().join(" ");
+    let mut line: Vec<u16> = command_line.encode_utf16().chain(Some(0)).collect();
+    let environment = environment_block(command);
+    // An inheritable copy of `stderr`'s handle, open until the child has it.
+    let stderr = stderr.try_clone().map_err(|e| format!("copying the standard error handle: {e}"))?;
+    let stderr_handle = HANDLE(stderr.as_raw_handle());
+    // SAFETY: an open handle of ours, made inheritable.
+    unsafe { SetHandleInformation(stderr_handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT) }
+        .map_err(|e| format!("making the standard error handle inheritable: {e}"))?;
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESTDHANDLES,
+        hStdInput: HANDLE::default(),
+        hStdOutput: HANDLE::default(),
+        hStdError: stderr_handle,
+        ..Default::default()
+    };
+    let mut info = PROCESS_INFORMATION::default();
+    // SAFETY: the command line is writable and NUL-terminated, the
+    // environment block is a UTF-16 one ending in two NULs, and both
+    // outlive the call; the handles returned are ours.
+    unsafe {
+        CreateProcessW(
+            None,
+            Some(PWSTR(line.as_mut_ptr())),
+            None,
+            None,
+            true,
+            CREATE_UNICODE_ENVIRONMENT,
+            Some(environment.as_ptr().cast()),
+            None,
+            &startup,
+            &mut info,
+        )
+    }
+    .map_err(|e| format!("starting {command_line}: {e}"))?;
+    drop(stderr);
+    // SAFETY: the thread's handle is ours and not needed.
+    unsafe { CloseHandle(info.hThread) }.ok();
+    Ok(Started { pid: info.dwProcessId, process: info.hProcess })
+}
+
 pub fn self_test() -> crate::Result {
     use crate::ensure;
+    for (arg, want) in [
+        ("plain", "plain"),
+        ("", "\"\""),
+        ("two words", "\"two words\""),
+        (r"C:\a b\brindle.exe", r#""C:\a b\brindle.exe""#),
+        (r"ends in a slash\", r#""ends in a slash\\""#),
+        (r#"say "hi""#, r#""say \"hi\"""#),
+        (r#"a\"b c"#, r#""a\\\"b c""#),
+        (r"no\spaces", r"no\spaces"),
+    ] {
+        ensure!(quote_argument(arg) == want, "{arg:?} quoted as {}, not {want}", quote_argument(arg));
+    }
     for (line, want) in [
         (r#""C:\a b\brindle-remote.exe" hold --ready-handle 5"#, Some("hold")),
         (r"C:\a\brindle-remote.exe serve", Some("serve")),

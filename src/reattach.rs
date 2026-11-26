@@ -8,7 +8,8 @@
 //! whose owner may still come back is left alone ([`sweepable`], decision
 //! 13).
 
-use crate::config::{Config, Profile};
+use crate::TabKind;
+use crate::config::{Config, Profile, ProfileKind};
 use crate::layout::LayoutTab;
 use crate::remote::Host;
 use crate::remote::protocol::client::SessionInfo;
@@ -25,14 +26,47 @@ pub fn sweepable(info: &SessionInfo) -> bool {
     !info.attached && (!info.owned || info.detached_secs > OWNER_GRACE_SECS)
 }
 
+/// The kind of tab a listed session opens as: an agent tab for an agent
+/// session (its listing carries `agent`), else a terminal tab.
+pub fn session_kind(info: &SessionInfo) -> TabKind {
+    match info.agent {
+        Some(_) => TabKind::Agent,
+        None => TabKind::Terminal,
+    }
+}
+
+/// For an agent session, the first of `candidates` (in the order the rules
+/// consider them) that is an agent profile, else `existing`, the answer
+/// the rules give; for a terminal session, `existing`.
+fn prefer_kind(
+    info: &SessionInfo,
+    config: &Config,
+    candidates: impl IntoIterator<Item = usize>,
+    existing: usize,
+) -> usize {
+    match session_kind(info) {
+        TabKind::Terminal => existing,
+        TabKind::Agent => candidates
+            .into_iter()
+            .find(|&index| config.profiles.get(index).is_some_and(|p| p.kind() == ProfileKind::Agent))
+            .unwrap_or(existing),
+    }
+}
+
 /// The profile a session of this machine's server opens with: the one it
 /// was started with, unless that is gone or a remote one; then the default.
+/// An agent session prefers an agent profile: of those, then the first
+/// agent profile of this machine (a renamed profile's session finds its
+/// kind), falling back to the same answer when the config has none.
 pub fn local_profile(info: &SessionInfo, config: &Config) -> usize {
-    info.profile
+    let recorded = info
+        .profile
         .as_deref()
         .and_then(|name| config.profile_index(name))
-        .filter(|&index| config.profiles[index].remote.is_none())
-        .unwrap_or_else(|| config.default_profile_index())
+        .filter(|&index| config.profiles[index].remote.is_none());
+    let default = config.default_profile_index();
+    let local = (0..config.profiles.len()).filter(|&index| config.profiles[index].remote.is_none());
+    prefer_kind(info, config, recorded.into_iter().chain([default]).chain(local), recorded.unwrap_or(default))
 }
 
 /// The profile a session of `host`'s server opens with: the one it was
@@ -54,12 +88,24 @@ pub fn remote_profile(info: &SessionInfo, host: &Host, config: &Config) -> Optio
 /// first profile that targets `host`; `first_tab_profile` (the name of the
 /// profile of the first tab on `host`), when that profile exists; the
 /// default profile. The tab runs on `host` whatever the profile targets.
+/// An agent session takes the first agent profile among those, in that
+/// order (each profile that targets `host` counted), else the same answer.
 pub fn session_profile(info: &SessionInfo, host: &Host, config: &Config, first_tab_profile: Option<&str>) -> usize {
     match host {
         Host::Local => local_profile(info, config),
-        Host::Remote(_) => remote_profile(info, host, config)
-            .or_else(|| first_tab_profile.and_then(|name| config.profile_index(name)))
-            .unwrap_or_else(|| config.default_profile_index()),
+        Host::Remote(_) => {
+            let first_tab = first_tab_profile.and_then(|name| config.profile_index(name));
+            let default = config.default_profile_index();
+            let existing = remote_profile(info, host, config).or(first_tab).unwrap_or(default);
+            let on_host = |index: &usize| Host::of(&config.profiles[*index]) == *host;
+            let recorded = info.profile.as_deref().and_then(|name| config.profile_index(name)).filter(on_host);
+            let candidates = recorded
+                .into_iter()
+                .chain((0..config.profiles.len()).filter(on_host))
+                .chain(first_tab)
+                .chain([default]);
+            prefer_kind(info, config, candidates, existing)
+        }
     }
 }
 
@@ -143,6 +189,18 @@ pub fn endpoints_without_tabs(before: &[Host], after: &[Host], eager: &[Host]) -
     left
 }
 
+/// What [`Detached::take_of_kind`] found for a restored zone.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Taken {
+    /// Its session, of the tab's kind: the zone attaches it.
+    Session(Box<SessionInfo>),
+    /// Its session is listed but of the other kind: the zone isn't
+    /// restored, and the session opens as a tab of its own.
+    OtherKind,
+    /// Not listed as detached (or no listing): the zone starts anew.
+    Missing,
+}
+
 /// A GPUI global: what is left to attach. Empty for `--no-restore`
 /// launches, for a Brindle that doesn't own the session state, and where
 /// no terminal server runs (macOS).
@@ -158,11 +216,17 @@ impl Detached {
         Self { sessions }
     }
 
-    /// The listed session a restored zone recorded: same id and same key
-    /// (an empty key never matches, so a reused id is never taken for it).
-    pub fn take(&mut self, recorded: &ServerSession) -> Option<SessionInfo> {
-        let ix = self.position(recorded)?;
-        Some(self.sessions.remove(ix))
+    /// The listed session a restored zone of a tab of `kind` recorded: same
+    /// id and same key (an empty key never matches, so a reused id is never
+    /// taken for it), when it is of that kind ([`session_kind`]). One of
+    /// the other kind isn't taken: it is left for the launch to attach as a
+    /// tab of its own.
+    pub fn take_of_kind(&mut self, recorded: &ServerSession, kind: TabKind) -> Taken {
+        let Some(ix) = self.position(recorded) else { return Taken::Missing };
+        if session_kind(&self.sessions[ix]) != kind {
+            return Taken::OtherKind;
+        }
+        Taken::Session(Box::new(self.sessions.remove(ix)))
     }
 
     /// Whether [`Detached::take`] would find `recorded`.
@@ -269,15 +333,24 @@ mod tests {
         SessionInfo { session, key: key.into(), started, ..Default::default() }
     }
 
+    /// What a restored zone of a tab of `kind` takes for `id` and `key`.
+    fn take(detached: &mut Detached, id: u32, key: &str, kind: TabKind) -> Taken {
+        detached.take_of_kind(&ServerSession { id, key: key.into() }, kind)
+    }
+
+    fn taken(session: SessionInfo) -> Taken {
+        Taken::Session(Box::new(session))
+    }
+
     #[test]
     fn a_zone_takes_only_its_own_session_and_the_rest_come_oldest_first() {
         let mut detached = Detached::new(vec![info(3, "c", 30), info(1, "a", 10), info(2, "", 5), info(4, "d", 10)]);
         // Same id, another key: a session that reused the id.
-        assert!(detached.take(&ServerSession { id: 1, key: "old".into() }).is_none());
+        assert_eq!(take(&mut detached, 1, "old", TabKind::Terminal), Taken::Missing);
         // A core that predates keys: never matched.
-        assert!(detached.take(&ServerSession { id: 2, key: String::new() }).is_none());
-        assert_eq!(detached.take(&ServerSession { id: 3, key: "c".into() }).map(|s| s.session), Some(3));
-        assert!(detached.take(&ServerSession { id: 3, key: "c".into() }).is_none(), "taken once");
+        assert_eq!(take(&mut detached, 2, "", TabKind::Terminal), Taken::Missing);
+        assert_eq!(take(&mut detached, 3, "c", TabKind::Terminal), taken(info(3, "c", 30)));
+        assert_eq!(take(&mut detached, 3, "c", TabKind::Terminal), Taken::Missing, "taken once");
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [2, 1, 4]);
         assert!(detached.take_rest().is_empty());
@@ -299,9 +372,38 @@ mod tests {
             owned(4, "d", 1, OWNER_GRACE_SECS),
             owned(5, "e", 2, 30),
         ]);
-        assert_eq!(detached.take(&ServerSession { id: 5, key: "e".into() }).map(|s| s.session), Some(5));
+        assert_eq!(take(&mut detached, 5, "e", TabKind::Terminal), taken(owned(5, "e", 2, 30)));
         let rest: Vec<u32> = detached.take_rest().iter().map(|s| s.session).collect();
         assert_eq!(rest, [3, 2]);
+    }
+
+    fn agent_info(session: u32, key: &str, started: u64) -> SessionInfo {
+        let agent = crate::remote::protocol::client::AgentInfo {
+            activity: crate::remote::protocol::client::AgentActivity::Idle,
+            name: None,
+        };
+        SessionInfo { agent: Some(agent), ..info(session, key, started) }
+    }
+
+    /// Task 6.4: over a listing holding both kinds, a restored zone takes
+    /// only a session of its tab's kind. One of the other kind stays, and
+    /// the launch attaches it with the rest, as a tab of its kind.
+    #[test]
+    fn a_restored_zone_takes_only_a_session_of_its_tabs_kind() {
+        let listing = || Detached::new(vec![info(1, "t", 10), agent_info(2, "a", 20)]);
+        let mut detached = listing();
+        assert_eq!(take(&mut detached, 2, "a", TabKind::Agent), taken(agent_info(2, "a", 20)));
+        assert_eq!(take(&mut detached, 1, "t", TabKind::Agent), Taken::OtherKind);
+        let rest = detached.take_rest();
+        assert_eq!(rest, [info(1, "t", 10)], "left for the launch");
+        assert_eq!(session_kind(&rest[0]), TabKind::Terminal);
+
+        let mut detached = listing();
+        assert_eq!(take(&mut detached, 2, "a", TabKind::Terminal), Taken::OtherKind);
+        assert_eq!(take(&mut detached, 1, "t", TabKind::Terminal), taken(info(1, "t", 10)));
+        let rest = detached.take_rest();
+        assert_eq!(rest, [agent_info(2, "a", 20)]);
+        assert_eq!(session_kind(&rest[0]), TabKind::Agent);
     }
 
     /// 7.2: a remote endpoint's first listing attaches its detached
@@ -407,6 +509,78 @@ mod tests {
             assert_eq!(session_profile(&started_with(Some("A8")), &Host::Local, &config, first), 0);
             assert_eq!(session_profile(&started_with(None), &Host::Local, &config, first), 0);
         }
+    }
+
+    fn agent_session(profile: Option<&str>) -> SessionInfo {
+        use crate::remote::protocol::client::{AgentActivity, AgentInfo};
+        SessionInfo { agent: Some(AgentInfo { activity: AgentActivity::Idle, name: None }), ..started_with(profile) }
+    }
+
+    /// `profiles()` with agent profiles: `Fake` here, `Agent on A8` and
+    /// `Remote fake` on A8, and `Other` here, the default `default`.
+    fn with_agents(default: &str) -> Config {
+        Config::parse(&format!(
+            "default_profile = \"{default}\"\n\
+             [[profiles]]\nname = \"Shell\"\n\
+             [[profiles]]\nname = \"A8\"\nremote = {{ type = \"ssh\", host = \"A8\" }}\n\
+             [[profiles]]\nname = \"Fake\"\ntype = \"agent\"\ncommand = \"fake\"\n\
+             [[profiles]]\nname = \"Agent on A8\"\ntype = \"agent\"\ncommand = \"fake\"\nremote = {{ type = \"ssh\", host = \"A8\" }}\n\
+             [[profiles]]\nname = \"Other\"\ntype = \"agent\"\ncommand = \"other\"\n",
+        ))
+        .unwrap()
+        .config
+    }
+
+    #[test]
+    fn a_session_is_an_agent_tab_when_its_listing_says_so() {
+        assert_eq!(session_kind(&started_with(None)), TabKind::Terminal);
+        assert_eq!(session_kind(&agent_session(None)), TabKind::Agent);
+    }
+
+    /// An agent session here prefers an agent profile: the one it started
+    /// with, the default, then the first agent profile of this machine.
+    #[test]
+    fn a_local_agent_session_prefers_an_agent_profile() {
+        let config = with_agents("Shell");
+        assert_eq!(local_profile(&agent_session(Some("Other")), &config), 4, "the one it started with");
+        assert_eq!(local_profile(&agent_session(Some("Gone")), &config), 2, "renamed: the first agent profile here");
+        assert_eq!(local_profile(&agent_session(None), &config), 2);
+        assert_eq!(local_profile(&agent_session(Some("Shell")), &config), 2, "started with what is now a terminal profile");
+        assert_eq!(local_profile(&agent_session(Some("Agent on A8")), &config), 2, "a remote profile isn't this machine's");
+        let config = with_agents("Other");
+        assert_eq!(local_profile(&agent_session(Some("Gone")), &config), 4, "the default, when it is an agent profile");
+        // A terminal session is unchanged.
+        assert_eq!(local_profile(&started_with(Some("Gone")), &config), 4);
+        assert_eq!(local_profile(&started_with(Some("Shell")), &config), 0);
+    }
+
+    /// With no agent profile, an agent session takes the answer the rules
+    /// give a terminal session.
+    #[test]
+    fn an_agent_session_without_an_agent_profile_falls_back() {
+        let config = profiles();
+        assert_eq!(local_profile(&agent_session(Some("Work")), &config), 4);
+        assert_eq!(local_profile(&agent_session(None), &config), 0);
+        let a8 = Host::of(&config.profiles[2]);
+        assert_eq!(session_profile(&agent_session(Some("A8")), &a8, &config, None), 2);
+        assert_eq!(session_profile(&agent_session(None), &ssh("C3"), &config, Some("Work")), 4);
+    }
+
+    /// On an endpoint, an agent session takes the first agent profile among
+    /// those the rules consider: the one it started with, those targeting
+    /// the endpoint, the first tab's, the default.
+    #[test]
+    fn a_remote_agent_session_prefers_an_agent_profile() {
+        let config = with_agents("Shell");
+        let a8 = Host::of(&config.profiles[1]);
+        assert_eq!(session_profile(&agent_session(Some("A8")), &a8, &config, None), 3, "the agent profile on A8");
+        assert_eq!(session_profile(&agent_session(None), &a8, &config, None), 3);
+        assert_eq!(session_profile(&started_with(None), &a8, &config, None), 1, "a terminal session as before");
+        let c3 = ssh("C3");
+        assert_eq!(session_profile(&agent_session(None), &c3, &config, Some("Fake")), 2, "the first tab's");
+        assert_eq!(session_profile(&agent_session(None), &c3, &config, Some("Shell")), 0, "no agent candidate");
+        let config = with_agents("Other");
+        assert_eq!(session_profile(&agent_session(None), &c3, &config, Some("Shell")), 4, "the default");
     }
 
     /// 6.1: the swept tabs keep the sweep's order and skips, each with the

@@ -25,11 +25,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
-use super::{Connected, Endpoint, Stream, connection::RECONNECT_LIMIT, hello, start_core, sys, try_connect};
+use super::{Connected, Endpoint, Stream, connection::RECONNECT_LIMIT, hello_offering, start_core, sys, try_connect};
 use crate::remote::hide_window;
 use crate::remote::protocol::build_id;
 use crate::remote::protocol::upgrade::{Build, is_newer};
-use crate::remote::protocol::client::{Request, ToClient, ToCore, Welcome};
+use crate::remote::protocol::client::{self, Request, ToClient, ToCore, Welcome};
 use crate::remote::protocol::Frame;
 
 /// How long a stepping-down core may take to checkpoint its sessions and
@@ -113,12 +113,12 @@ pub fn offer(endpoint: &Endpoint, token: &str, connected: Connected) -> Result<O
             helper.build
         );
     }
-    let Connected { mut stream, welcome } = connected;
+    let Connected { mut stream, welcome, offer } = connected;
     if let Err(error) = step_down(&mut stream) {
-        return Ok(Offered::Kept { connected: Connected { stream, welcome }, why: format!("{error:#}") });
+        return Ok(Offered::Kept { connected: Connected { stream, welcome, offer }, why: format!("{error:#}") });
     }
     drop(stream);
-    connect_new(endpoint, token).map(Offered::Upgraded)
+    connect_new(endpoint, token, offer).map(Offered::Upgraded)
 }
 
 fn helper_build(helper: &Path) -> Result<Build> {
@@ -206,12 +206,12 @@ fn step_down(stream: &mut Stream) -> Result<()> {
 
 /// Starts the new core and connects to it. If it won't start, the holders
 /// start one of their own build within a few seconds; connect to that.
-fn connect_new(endpoint: &Endpoint, token: &str) -> Result<Connected> {
+fn connect_new(endpoint: &Endpoint, token: &str, offer: client::VersionRange) -> Result<Connected> {
     let deadline = Instant::now() + RECONNECT_LIMIT;
     let mut started = false;
     loop {
         if let Some(stream) = try_connect(endpoint)? {
-            match hello(stream, token) {
+            match hello_offering(stream, token, offer) {
                 Ok(connected) => return Ok(connected),
                 Err(error) if Instant::now() >= deadline => return Err(error),
                 // A core still exiting, or one starting.

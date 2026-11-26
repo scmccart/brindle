@@ -30,6 +30,18 @@ pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Windows;
 #[cfg(not(windows))]
 pub const LOCAL_PATH_STYLE: PathStyle = PathStyle::Posix;
 
+/// Whether a program's environment on this machine names its variables
+/// case-insensitively, as Windows does: an agent's environment is merged
+/// that way (`agent::spawn`).
+#[cfg(windows)]
+pub const LOCAL_ENV_IGNORES_CASE: bool = true;
+
+/// Whether a program's environment on this machine names its variables
+/// case-insensitively, as Windows does: an agent's environment is merged
+/// that way (`agent::spawn`).
+#[cfg(not(windows))]
+pub const LOCAL_ENV_IGNORES_CASE: bool = false;
+
 /// The line end of text copied from a grid on this machine.
 #[cfg(windows)]
 pub const LOCAL_LINE_END: LineEnd = LineEnd::CrLf;

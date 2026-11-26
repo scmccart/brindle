@@ -1997,8 +1997,9 @@ pub fn server_env(
     merged_env(vars, child_env(profile), cfg!(windows))
 }
 
-/// `vars` with `set` over them; see [`server_env`].
-fn merged_env(
+/// `vars` with `set` over them; see [`server_env`]. An agent's environment
+/// is merged the same way (`agent::spawn`).
+pub(crate) fn merged_env(
     vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
     set: HashMap<String, String>,
     ignore_case: bool,

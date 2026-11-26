@@ -38,19 +38,72 @@ actions!(
         ListFirst,
         ListLast,
         ListConfirm,
+        // Text areas: the shown line's keys and a line break; every other
+        // edit is a `TextInput*` action, bound in the `TextArea` context too.
+        TextAreaUp,
+        TextAreaDown,
+        TextAreaSelectUp,
+        TextAreaSelectDown,
+        TextAreaLineStart,
+        TextAreaLineEnd,
+        TextAreaSelectLineStart,
+        TextAreaSelectLineEnd,
+        TextAreaNewline,
+        // Enter in a text area: kept from the owner while an input method
+        // is composing, passed on to the owner's own enter otherwise.
+        TextAreaEnter,
+        // A prompt input: enter asks the owner to submit, escape to stop
+        // (each only when the input's status allows it).
+        PromptSubmit,
+        PromptStop,
     ]
 );
+
+/// The editing keys a text input and a text area share, in `context`:
+/// everything but home and end, which a text area gives to the shown line.
+fn editing_bindings(context: Option<&str>) -> Vec<KeyBinding> {
+    let i = context;
+    vec![
+        KeyBinding::new("left", TextInputLeft, i),
+        KeyBinding::new("right", TextInputRight, i),
+        KeyBinding::new("ctrl-left", TextInputWordLeft, i),
+        KeyBinding::new("ctrl-right", TextInputWordRight, i),
+        KeyBinding::new("shift-left", TextInputSelectLeft, i),
+        KeyBinding::new("shift-right", TextInputSelectRight, i),
+        KeyBinding::new("ctrl-shift-left", TextInputSelectWordLeft, i),
+        KeyBinding::new("ctrl-shift-right", TextInputSelectWordRight, i),
+        // Select all, as in desktop text boxes; ctrl-shift-a is also the
+        // terminal's select-all key.
+        KeyBinding::new("ctrl-a", TextInputSelectAll, i),
+        KeyBinding::new("ctrl-shift-a", TextInputSelectAll, i),
+        KeyBinding::new("backspace", TextInputBackspace, i),
+        KeyBinding::new("shift-backspace", TextInputBackspace, i),
+        KeyBinding::new("delete", TextInputDelete, i),
+        KeyBinding::new("ctrl-backspace", TextInputDeleteWordBack, i),
+        KeyBinding::new("ctrl-w", TextInputDeleteWordBack, i),
+        KeyBinding::new("ctrl-insert", TextInputCopy, i),
+        KeyBinding::new("ctrl-shift-c", TextInputCopy, i),
+        KeyBinding::new("ctrl-c", TextInputCopy, i),
+        KeyBinding::new("shift-delete", TextInputCut, i),
+        KeyBinding::new("ctrl-x", TextInputCut, i),
+        KeyBinding::new("shift-insert", TextInputPaste, i),
+        KeyBinding::new("ctrl-shift-v", TextInputPaste, i),
+        KeyBinding::new("ctrl-v", TextInputPaste, i),
+    ]
+}
 
 /// The crate's default keybindings. The crate binds none itself: the app
 /// chains these into its own defaults, so rebinding on a config reload
 /// restores them.
 pub fn default_bindings() -> Vec<KeyBinding> {
     let i = Some("TextInput");
+    let a = Some("TextArea");
+    let p = Some("PromptInput");
     let l = Some("UiLayer");
     let f = Some("UiFocusScope");
     let s = Some("UiList");
     let c = Some("UiCommand");
-    vec![
+    let mut bindings = vec![
         // Escape asks the overlay to close. Bound in the layer around the
         // view, so an inner context that handles escape itself wins.
         KeyBinding::new("escape", Dismiss, l),
@@ -74,38 +127,42 @@ pub fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("enter", ListConfirm, s),
         // Text inputs leave enter, escape, tab, up/down and ctrl-p/ctrl-n
         // to the palette or dialog around them.
-        KeyBinding::new("left", TextInputLeft, i),
-        KeyBinding::new("right", TextInputRight, i),
-        KeyBinding::new("ctrl-left", TextInputWordLeft, i),
-        KeyBinding::new("ctrl-right", TextInputWordRight, i),
         KeyBinding::new("home", TextInputHome, i),
         KeyBinding::new("end", TextInputEnd, i),
         KeyBinding::new("ctrl-e", TextInputEnd, i),
-        KeyBinding::new("shift-left", TextInputSelectLeft, i),
-        KeyBinding::new("shift-right", TextInputSelectRight, i),
-        KeyBinding::new("ctrl-shift-left", TextInputSelectWordLeft, i),
-        KeyBinding::new("ctrl-shift-right", TextInputSelectWordRight, i),
         KeyBinding::new("shift-home", TextInputSelectHome, i),
         KeyBinding::new("shift-end", TextInputSelectEnd, i),
         KeyBinding::new("ctrl-shift-e", TextInputSelectEnd, i),
-        // Select all, as in desktop text boxes; ctrl-shift-a is also the
-        // terminal's select-all key.
-        KeyBinding::new("ctrl-a", TextInputSelectAll, i),
-        KeyBinding::new("ctrl-shift-a", TextInputSelectAll, i),
-        KeyBinding::new("backspace", TextInputBackspace, i),
-        KeyBinding::new("shift-backspace", TextInputBackspace, i),
-        KeyBinding::new("delete", TextInputDelete, i),
-        KeyBinding::new("ctrl-backspace", TextInputDeleteWordBack, i),
-        KeyBinding::new("ctrl-w", TextInputDeleteWordBack, i),
-        KeyBinding::new("ctrl-insert", TextInputCopy, i),
-        KeyBinding::new("ctrl-shift-c", TextInputCopy, i),
-        KeyBinding::new("ctrl-c", TextInputCopy, i),
-        KeyBinding::new("shift-delete", TextInputCut, i),
-        KeyBinding::new("ctrl-x", TextInputCut, i),
-        KeyBinding::new("shift-insert", TextInputPaste, i),
-        KeyBinding::new("ctrl-shift-v", TextInputPaste, i),
-        KeyBinding::new("ctrl-v", TextInputPaste, i),
-    ]
+        // Text areas: up and down by shown line (on the first or last row
+        // they go on to the owner), home and end of the shown line, the
+        // text's start and end with ctrl, and shift-enter for a line break.
+        // Enter, escape, tab and shift-tab stay the owner's.
+        KeyBinding::new("up", TextAreaUp, a),
+        KeyBinding::new("down", TextAreaDown, a),
+        KeyBinding::new("shift-up", TextAreaSelectUp, a),
+        KeyBinding::new("shift-down", TextAreaSelectDown, a),
+        KeyBinding::new("home", TextAreaLineStart, a),
+        KeyBinding::new("end", TextAreaLineEnd, a),
+        KeyBinding::new("ctrl-e", TextAreaLineEnd, a),
+        KeyBinding::new("shift-home", TextAreaSelectLineStart, a),
+        KeyBinding::new("shift-end", TextAreaSelectLineEnd, a),
+        KeyBinding::new("ctrl-shift-e", TextAreaSelectLineEnd, a),
+        KeyBinding::new("ctrl-home", TextInputHome, a),
+        KeyBinding::new("ctrl-end", TextInputEnd, a),
+        KeyBinding::new("ctrl-shift-home", TextInputSelectHome, a),
+        KeyBinding::new("ctrl-shift-end", TextInputSelectEnd, a),
+        KeyBinding::new("shift-enter", TextAreaNewline, a),
+        // Enter goes on to the owner's binding, unless an input method is
+        // composing.
+        KeyBinding::new("enter", TextAreaEnter, a),
+        // Around a prompt input's text area: the enter it passed on, and
+        // escape while a turn streams.
+        KeyBinding::new("enter", PromptSubmit, p),
+        KeyBinding::new("escape", PromptStop, p),
+    ];
+    bindings.extend(editing_bindings(i));
+    bindings.extend(editing_bindings(a));
+    bindings
 }
 
 #[cfg(test)]
@@ -153,7 +210,34 @@ mod tests {
                 "brindle_ui::ListConfirm",
             ]
         );
+        // A text area shares every editing key but home and end, which go
+        // to the shown line, and adds the line keys and shift-enter; it
+        // binds no escape, tab or shift-tab, and enter only to pass it on.
+        let text_area = in_context(&bindings, "TextArea");
+        assert_eq!(text_area.len(), 23 + 16);
+        let named = |keys: &str| {
+            bindings
+                .iter()
+                .filter(|b| b.predicate().is_some_and(|p| p.to_string() == "TextArea"))
+                .find(|b| b.keystrokes().iter().map(|k| k.unparse()).eq([keys.to_string()]))
+                .map(|b| b.action().name())
+        };
+        assert_eq!(named("home"), Some("brindle_ui::TextAreaLineStart"));
+        assert_eq!(named("ctrl-home"), Some("brindle_ui::TextInputHome"));
+        assert_eq!(named("shift-enter"), Some("brindle_ui::TextAreaNewline"));
+        assert_eq!(named("down"), Some("brindle_ui::TextAreaDown"));
+        assert_eq!(named("ctrl-v"), Some("brindle_ui::TextInputPaste"));
+        assert_eq!(named("enter"), Some("brindle_ui::TextAreaEnter"));
+        for owners in ["escape", "tab", "shift-tab"] {
+            assert_eq!(named(owners), None, "{owners}");
+        }
+        let prompt = in_context(&bindings, "PromptInput");
+        let prompt: Vec<&str> = prompt.iter().map(|(_, name)| name.as_str()).collect();
+        assert_eq!(prompt, ["brindle_ui::PromptSubmit", "brindle_ui::PromptStop"]);
         // Every binding is in one of the crate's contexts.
-        assert_eq!(bindings.len(), text_input.len() + layer.len() + command.len() + scope.len() + list.len());
+        assert_eq!(
+            bindings.len(),
+            text_input.len() + text_area.len() + layer.len() + command.len() + scope.len() + list.len() + prompt.len()
+        );
     }
 }

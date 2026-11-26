@@ -94,6 +94,24 @@ actions!(
         SettingsDuplicate,
         SettingsMoveUp,
         SettingsMoveDown,
+        // An agent zone's (`AgentView`), available only while one has
+        // focus.
+        /// Sends the prompt input's text, as enter does.
+        AgentSubmit,
+        /// Stops the agent's running turn, as escape does.
+        AgentCancel,
+        /// Removes the queued prompt, or discards a held one.
+        AgentUnqueue,
+        /// Sends the held prompt again.
+        AgentResend,
+        /// Copies the queued prompt's text, waiting or held.
+        CopyQueuedPrompt,
+        /// Copies the agent's latest message.
+        CopyLastAgentMessage,
+        /// Opens every thought when one is closed, else closes them all.
+        ToggleAgentThoughts,
+        /// Scrolls the conversation to its end, which it then follows.
+        AgentScrollToBottom,
     ]
 );
 
@@ -168,6 +186,15 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("focus_zone_down", Some("Focus Zone Down"), || Box::new(FocusZoneDown)),
     ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
     ("quit", Some("Quit"), || Box::new(Quit)),
+    // An agent zone's: the palette lists them only while one has focus.
+    ("agent_submit", Some("Send Prompt"), || Box::new(AgentSubmit)),
+    ("agent_cancel", Some("Stop Agent Turn"), || Box::new(AgentCancel)),
+    ("agent_unqueue", Some("Remove Queued Prompt"), || Box::new(AgentUnqueue)),
+    ("agent_resend", Some("Send Held Prompt Again"), || Box::new(AgentResend)),
+    ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
+    ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
+    ("toggle_agent_thoughts", Some("Toggle Agent Thoughts"), || Box::new(ToggleAgentThoughts)),
+    ("agent_scroll_to_bottom", Some("Scroll Agent to Bottom"), || Box::new(AgentScrollToBottom)),
     // The tab strip as a keyboard stop: unlabelled, for `--action` and user
     // bindings (its keys are the tab list's own).
     ("focus_tab_strip", None, || Box::new(FocusTabStrip)),
@@ -268,12 +295,49 @@ pub fn palette_commands() -> Vec<(&'static str, Box<dyn Action>)> {
     ACTIONS.iter().filter_map(|(_, label, build)| Some(((*label)?, build()))).collect()
 }
 
-/// What the active terminal says about which commands make sense for it.
+/// What the active zone says about which commands make sense for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaletteFacts {
+    /// What the active zone holds.
+    pub zone: PaletteZone,
     /// It has sent a prompt mark (OSC 133/633 `A`): a shell with
-    /// integration runs in it.
+    /// integration runs in it. Never in an agent zone.
     pub prompt_marks: bool,
+}
+
+/// What the active zone holds, for the palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaletteZone {
+    Terminal,
+    Agent,
+}
+
+/// Whether `action` acts on a terminal: its selection, clipboard, links,
+/// scrollback, prompts or find bar. An agent zone answers some of the
+/// scrolling ones (its own keys reach them), but the palette lists the
+/// agent's own commands there instead.
+fn acts_on_terminal(action: &dyn Action) -> bool {
+    let terminal: [&dyn Action; 18] = [
+        &Copy,
+        &Paste,
+        &PastePrimary,
+        &SelectAll,
+        &CopyLink,
+        &ScrollLineUp,
+        &ScrollLineDown,
+        &ScrollPageUp,
+        &ScrollPageDown,
+        &ScrollToTop,
+        &ScrollToBottom,
+        &ClearScrollback,
+        &JumpToPreviousPrompt,
+        &JumpToNextPrompt,
+        &SelectLastOutput,
+        &CopyLastOutput,
+        &CopyLastCommand,
+        &Find,
+    ];
+    terminal.iter().any(|t| action.partial_eq(*t))
 }
 
 /// Whether `action` reads the marks of a shell with integration, and so does
@@ -283,12 +347,16 @@ fn needs_prompt_marks(action: &dyn Action) -> bool {
     action.partial_eq(&CopyLastCommand) || action.partial_eq(&SelectLastOutput) || action.partial_eq(&CopyLastOutput)
 }
 
-/// Whether the palette lists `action` for a terminal with these `facts`.
-/// The commands that read shell-integration marks are hidden until a prompt
-/// mark has arrived (without one they would do nothing); every other action
-/// is the focused tab's to answer.
+/// Whether the palette lists `action` for a zone with these `facts`. In a
+/// terminal zone, the commands that read shell-integration marks are hidden
+/// until a prompt mark has arrived (without one they would do nothing); in
+/// an agent zone, every command that acts on a terminal is. Every other
+/// action is the focused tab's to answer.
 pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
-    facts.prompt_marks || !needs_prompt_marks(action)
+    match facts.zone {
+        PaletteZone::Terminal => facts.prompt_marks || !needs_prompt_marks(action),
+        PaletteZone::Agent => !acts_on_terminal(action),
+    }
 }
 
 /// An action's label as a menu item shows it: its command palette label.
@@ -384,6 +452,7 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
     let l = Some("SettingsList");
     let sl = Some("SettingsSections");
     let f = Some("FindBar");
+    let a = Some("AgentZone");
     let mut bindings = vec![
         KeyBinding::new("ctrl-shift-t", NewTab, w),
         KeyBinding::new("ctrl-shift-w", CloseTab, w),
@@ -436,6 +505,13 @@ pub(crate) fn default_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("alt-right", FocusZoneRight, z),
         KeyBinding::new("alt-up", FocusZoneUp, z),
         KeyBinding::new("alt-down", FocusZoneDown, z),
+        // An agent zone: escape stops the turn (the prompt input's own
+        // escape does while it shows the stop button, and passes it on
+        // otherwise), and the page keys scroll the conversation. Enter and
+        // shift-enter are the prompt input's and its text area's.
+        KeyBinding::new("escape", AgentCancel, a),
+        KeyBinding::new("shift-pageup", ScrollPageUp, a),
+        KeyBinding::new("shift-pagedown", ScrollPageDown, a),
         // A palette's list keys and escape come from its command list
         // (`UiList`, `UiCommand`) and overlay (`UiLayer`). The host adds
         // the sessions palette's kill, and enter for a prompt, which submits
@@ -776,7 +852,10 @@ mod tests {
     /// sent a prompt mark. The jump-to-prompt actions stay listed.
     #[test]
     fn the_last_command_actions_are_listed_only_after_a_prompt_mark() {
-        let (without, with) = (PaletteFacts { prompt_marks: false }, PaletteFacts { prompt_marks: true });
+        let (without, with) = (
+            PaletteFacts { zone: PaletteZone::Terminal, prompt_marks: false },
+            PaletteFacts { zone: PaletteZone::Terminal, prompt_marks: true },
+        );
         let listed = |facts| -> Vec<&'static str> {
             palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, facts)).map(|(l, _)| l).collect()
         };
@@ -792,6 +871,35 @@ mod tests {
         let jumps = palette_commands().into_iter().filter(|(_, a)| a.partial_eq(&JumpToPreviousPrompt) || a.partial_eq(&JumpToNextPrompt));
         for (label, action) in jumps {
             assert!(palette_lists(&*action, without), "{label} stays listed");
+        }
+    }
+
+    /// In an agent zone the palette keeps the agent's, zone, tab and window
+    /// commands and drops every command that acts on a terminal, the
+    /// scrolling ones the agent view answers included.
+    #[test]
+    fn an_agent_zone_lists_no_terminal_commands() {
+        let agent = PaletteFacts { zone: PaletteZone::Agent, prompt_marks: false };
+        let listed: Vec<&str> =
+            palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, agent)).map(|(l, _)| l).collect();
+        for label in [
+            "Stop Agent Turn",
+            "Remove Queued Prompt",
+            "Send Held Prompt Again",
+            "Copy Queued Prompt",
+            "Copy Last Agent Message",
+            "Toggle Agent Thoughts",
+            "Scroll Agent to Bottom",
+            "Split Zone Right",
+            "Close Zone",
+            "New Tab",
+            "Close Tab",
+            "Quit",
+        ] {
+            assert!(listed.contains(&label), "{label} is listed");
+        }
+        for label in ["Clear Scrollback", "Find", "Copy", "Paste", "Scroll to Bottom", "Scroll Page Up", "Jump to Next Prompt"] {
+            assert!(!listed.contains(&label), "{label} isn't listed");
         }
     }
 

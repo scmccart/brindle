@@ -20,6 +20,20 @@ pub const APP_ID: &str = "Brindle.Terminal";
 /// Where an app with no shortcut registers its toast name and icon.
 const APP_ID_KEY: &str = r"Software\Classes\AppUserModelId\Brindle.Terminal";
 
+/// Whether this process has no standard input handle: a GUI program started
+/// from a console with nothing redirected usually has none (`GetStdHandle`
+/// null or invalid). A handle a parent passed, a file's or a pipe's (or its
+/// console's, which `IsTerminal` catches), is there.
+pub fn stdin_absent() -> bool {
+    use windows::Win32::System::Console::STD_INPUT_HANDLE;
+    // SAFETY: reads this process's standard handle; nothing is borrowed.
+    match unsafe { GetStdHandle(STD_INPUT_HANDLE) } {
+        // Null or INVALID_HANDLE_VALUE.
+        Ok(handle) => handle.is_invalid(),
+        Err(_) => true,
+    }
+}
+
 /// Writes `bytes` to a temporary file beside `path`, then renames it over
 /// `path`, so a concurrent Brindle never reads half a file.
 pub fn write_replacing(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {

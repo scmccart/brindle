@@ -3,6 +3,7 @@
 
 #![allow(dead_code)]
 
+pub mod fake_agent;
 pub mod server;
 #[cfg(windows)]
 pub mod winproc;

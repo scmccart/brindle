@@ -6,6 +6,7 @@
 
 #[cfg(windows)]
 mod win;
+mod agent;
 mod cards;
 mod clipboard;
 mod cli;
@@ -62,6 +63,7 @@ fn unix() -> Vec<Case> {
         display("dump-wait-for-clean", dump::wait_for_clean),
         display("remote-container-exec", remote::container_exec),
         display("remote-ssh-container", remote::ssh_container),
+        display("remote-agent-ssh", remote::agent_ssh),
         display("remote-ssh-quit", remote::ssh_quit),
         display("remote-ssh-reattach-size", remote::ssh_reattach_size),
         display("remote-ssh-reattach-background", remote::ssh_reattach_background),
@@ -253,6 +255,35 @@ fn unix() -> Vec<Case> {
         display("local-server-no-helper", local_server::no_helper),
         display("local-server-upgrade", local_server::upgrade),
         display("local-server-manage", local_server::manage),
+        display("agent-first-prompt", agent::first_prompt).needs_fake_agent(),
+        display("agent-launch-kinds", agent::launch_kinds).needs_fake_agent(),
+        display("agent-handoff", agent::handoff).needs_fake_agent(),
+        display("agent-turn", agent::turn).needs_fake_agent(),
+        display("agent-prompt-stdin", agent::prompt_stdin).needs_fake_agent(),
+        display("agent-seen", agent::seen).needs_fake_agent(),
+        display("agent-palette-commands", agent::palette_commands).needs_fake_agent(),
+        display("agent-close-confirm", agent::close_confirm).needs_fake_agent(),
+        display("agent-close-idle", agent::close_idle).needs_fake_agent(),
+        display("agent-multiline", agent::multiline).needs_fake_agent(),
+        display("agent-cancel", agent::cancel).needs_fake_agent(),
+        display("agent-permission-keys", agent::permission_keys).needs_fake_agent(),
+        display("agent-thoughts", agent::thoughts).needs_fake_agent(),
+        display("agent-scroll", agent::scroll).needs_fake_agent(),
+        display("agent-copy", agent::copy).needs_fake_agent(),
+        display("agent-split", agent::split).needs_fake_agent(),
+        display("agent-no-command", agent::no_command).needs_fake_agent(),
+        display("agent-first-prompt-login", agent::first_prompt_login).needs_fake_agent(),
+        display("agent-login", agent::login).needs_fake_agent(),
+        display("agent-acp-version", agent::acp_version).needs_fake_agent(),
+        display("agent-exit", agent::exit).needs_fake_agent(),
+        display("agent-queue", agent::queue).needs_fake_agent(),
+        display("agent-quit-restore", agent::quit_restore).needs_fake_agent(),
+        display("agent-sweep", agent::sweep).needs_fake_agent(),
+        display("agent-sessions-palette", agent::sessions_palette).needs_fake_agent(),
+        display("agent-notify", agent::notify).needs_fake_agent(),
+        // The agent profile is only listed: its agent never runs.
+        display("agent-settings-profiles", agent::settings_profiles),
+        needing("agent-broken", &[TestSwitch::SinkPanic], agent::broken).needs_fake_agent(),
     ]
 }
 

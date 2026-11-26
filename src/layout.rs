@@ -286,12 +286,19 @@ pub fn group(sessions: Vec<SessionInfo>) -> Vec<LayoutTab> {
         if !zones.has_active() {
             zones.activate_first();
         }
+        // A tab holds zones of one kind: those of the active zone's kind
+        // stay, and the others are tabs of their own.
+        let kind = crate::reattach::session_kind(zones.active());
+        let mut other_kind = Vec::new();
+        let Some(zones) = retain(zones, &|info| crate::reattach::session_kind(info) == kind, &mut other_kind) else {
+            continue;
+        };
         let oldest = zones.items().into_iter().map(|s| (s.started, s.session)).min().unwrap_or_default();
         let title = layout.title.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
         tabs.push(((oldest.0, oldest.1, origin, index), LayoutTab { title, zones }));
         // Members its tree doesn't name (another detach of the same tab
         // can't make these; kept anyway) are tabs of their own.
-        let mut left: Vec<SessionInfo> = members.into_values().collect();
+        let mut left: Vec<SessionInfo> = members.into_values().chain(other_kind).collect();
         left.sort_by_key(|s| (s.started, s.session));
         left.into_iter().for_each(|info| flat(info, &mut tabs));
     }
@@ -317,6 +324,30 @@ fn prune(node: Node, members: &mut HashMap<String, SessionInfo>) -> Option<Tree<
         Node::Leaf { key, active } => members.remove(&key).map(|item| Tree::Leaf { item, active }),
         Node::Split { split, first, second } => match (prune(*first, members), prune(*second, members)) {
             (Some(first), Some(second)) => Some(Tree::Split { axis: split, first: Box::new(first), second: Box::new(second) }),
+            (one, other) => one.or(other),
+        },
+    }
+}
+
+/// `tree` with only the leaves `keep` keeps, a split's sibling taking a
+/// dropped leaf's place; the dropped ones go to `dropped`. `None` when
+/// nothing is kept.
+fn retain(
+    tree: Tree<SessionInfo>,
+    keep: &impl Fn(&SessionInfo) -> bool,
+    dropped: &mut Vec<SessionInfo>,
+) -> Option<Tree<SessionInfo>> {
+    match tree {
+        Tree::Leaf { item, active } => {
+            if keep(&item) {
+                Some(Tree::Leaf { item, active })
+            } else {
+                dropped.push(item);
+                None
+            }
+        }
+        Tree::Split { axis, first, second } => match (retain(*first, keep, dropped), retain(*second, keep, dropped)) {
+            (Some(first), Some(second)) => Some(Tree::Split { axis, first: Box::new(first), second: Box::new(second) }),
             (one, other) => one.or(other),
         },
     }
@@ -469,6 +500,46 @@ mod tests {
         ]);
         let order: Vec<Vec<&str>> = tabs.iter().map(keys).collect();
         assert_eq!(order, [vec!["f"], vec!["a", "b"], vec!["c"], vec!["g"], vec!["d", "e"], vec!["h"]]);
+    }
+
+    fn agent(info: SessionInfo) -> SessionInfo {
+        use crate::remote::protocol::client::{AgentActivity, AgentInfo};
+        SessionInfo { agent: Some(AgentInfo { activity: AgentActivity::Done, name: None }), ..info }
+    }
+
+    /// A layout of `a | (b / c)`, `active` the active key.
+    fn three(active: &str) -> serde_json::Value {
+        let leaf = |key: &str| json!({"key": key, "active": key == active});
+        json!({
+            "v": 1, "origin": "q", "index": 0,
+            "zones": {"split": "horizontal", "first": leaf("a"),
+                      "second": {"split": "vertical", "first": leaf("b"), "second": leaf("c")}},
+        })
+    }
+
+    /// A tab holds one kind: a recorded layout keeps the zones of its
+    /// active zone's kind, and the others become tabs of their own.
+    #[test]
+    fn a_mixed_layout_keeps_the_active_zones_kind() {
+        let sessions = |active: &str| {
+            vec![laid_out(1, "a", 10, three(active)), agent(laid_out(2, "b", 20, three(active))), laid_out(3, "c", 30, three(active))]
+        };
+        let tabs = group(sessions("c"));
+        let order: Vec<Vec<&str>> = tabs.iter().map(keys).collect();
+        assert_eq!(order, [vec!["a", "c"], vec!["b"]], "the terminals stay together, the agent alone");
+        assert_eq!(tabs[0].active().key, "c");
+        assert_eq!(tabs[0].zones, Tree::Split {
+            axis: SplitAxis::Horizontal,
+            first: Box::new(Tree::Leaf { item: laid_out(1, "a", 10, three("c")), active: false }),
+            second: Box::new(Tree::Leaf { item: laid_out(3, "c", 30, three("c")), active: true }),
+        }, "the dropped zone's sibling takes its place");
+        let tabs = group(sessions("b"));
+        let order: Vec<Vec<&str>> = tabs.iter().map(keys).collect();
+        assert_eq!(order, [vec!["a"], vec!["b"], vec!["c"]], "the agent active: the terminals are tabs of their own");
+        assert!(crate::reattach::session_kind(tabs[1].active()) == crate::TabKind::Agent);
+        // One kind throughout is unchanged.
+        let agents: Vec<SessionInfo> = sessions("a").into_iter().map(agent).collect();
+        assert_eq!(group(agents).iter().map(keys).collect::<Vec<_>>(), [vec!["a", "b", "c"]]);
     }
 
     #[test]
