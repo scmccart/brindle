@@ -6,12 +6,16 @@ in its own pane (the `clipboard-*` cases, which use `xclip` or `Get-Clipboard`),
 but it sends no real keys and can't cross into another application's window,
 so these stay manual.
 
-Try a build without touching your config, saved session or terminal server:
+Try a build without touching your saved session or terminal server:
 
 - Linux: `scripts/run-throwaway.sh`, with `--config FILE`, `--keep` and
   `-- <brindle args>`.
 - Windows: `scripts/run-throwaway.ps1`, with `-Config FILE`, `-Keep` and
   `-BrindleArgs 'terminal','-d','C:/Temp'`.
+
+Without the config option the run gets a fresh private config. With it, the
+run uses FILE in place: edits to it apply live and the settings dialog writes
+it, so pass a copy to keep an original.
 
 Record each row in the Result column as Pass, Fail or Not run, with the app
 you used. Rows that name a setting assume `right_click` and `copy_on_select`

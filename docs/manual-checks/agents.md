@@ -6,7 +6,7 @@ Tick each box as you go. Note anything odd under the check, with the platform an
 
 ## Setup
 
-Build from `main` and run against a private config, state and server, so your daily Brindle and its saved session aren't touched:
+Build from `main` and run against a private state and server, so your daily Brindle and its saved session aren't touched. The run uses the config file you name in place, so edits to it apply live:
 
 ```sh
 cargo build --release

@@ -134,3 +134,13 @@ None that block the tasks. The user didn't make these choices; each is this desi
 - a stale helper is not used when Docker is missing;
 - the build is on by default, with a `-NoLinuxHelper` opt-out;
 - `remote-agent/Cargo.toml` and `Cargo.lock` are freshness inputs.
+
+## As built (2026-11-25)
+
+- **`linux-helper.ps1` has two more modes than the parameter list above.** `-Helper PATH` checks a given file by rules 1 and 3 only; it is `install.ps1`'s `-RemoteAgent`. `-ProbeDocker` only runs the Docker test (`Ready` or `Unavailable`), so `install.ps1` can still fail before its long builds without a second copy of that test.
+- **`install.ps1` checks `-RemoteAgent` against the binary's release**, through `-Bin target\release\brindle.exe` after its cargo build, instead of `Cargo.toml`'s version. The two agree for an install, since the build just made the binary.
+- **`install.ps1`'s Docker messages end with ", or pass -RemoteAgent with a Linux brindle-remote X.Y.Z"** for all three causes. Before, only "docker not found" carried it. The helper script returns the cause, and install adds its own remedy.
+- **`-Check` prints one line, `linux-helper: <decision>: <message>`**, and returns nothing. Its decisions are `ready`, `usable, version unchecked`, `unavailable`, `failed` and `would build`. The last one exists only in `-Check`'s output: callers never pass `-Check`, so the result object keeps its four states.
+- **With Docker usable, a fresh helper's rule 1 failure is rebuilt once like a rule 3 failure.** Without Docker, that helper is `Unavailable`, not `Unchecked`.
+- **The table's "fresh, no usable Docker" row is `Unchecked`**, so task 1.1's "with Docker Desktop stopped it reports `Unavailable`" holds for a missing or stale helper. A fresh one reports `usable, version unchecked`.
+- **Verified on Linux, not Windows.** pwsh 7 on Linux ran `linux-helper.ps1`, `run-throwaway.ps1` (against a stub `brindle` that prints its environment, started through `Start-Process`) and `install.ps1`'s early Docker failure, with the real Docker build. Docker was made unusable with `DOCKER_HOST` naming no socket, and with `docker` off `PATH`. Docker Desktop, Windows paths, Windows PowerShell 5.1, `install.ps1` past its Docker check, and the window runs remain the user's Windows checks.
