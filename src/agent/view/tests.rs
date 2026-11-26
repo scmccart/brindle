@@ -132,13 +132,112 @@ fn permission() -> Entry {
     }
 }
 
+/// `agents-zone-attention` decision 2: the working row is inserted after
+/// the blocks when it appears, removed from there when it goes, and left
+/// alone otherwise; an allow option is destructive, a reject an outline.
+#[test]
+fn the_working_rows_splice_and_the_permission_variants() {
+    assert_eq!(working_splice(false, true, 4), Some(Splice { range: 4..4, count: 1 }));
+    assert_eq!(working_splice(true, false, 4), Some(Splice { range: 4..5, count: 0 }));
+    assert_eq!(working_splice(false, true, 0), Some(Splice { range: 0..0, count: 1 }));
+    assert_eq!(working_splice(true, true, 4), None, "its text may change, its place doesn't");
+    assert_eq!(working_splice(false, false, 4), None);
+    assert_eq!(permission_variant(PermissionKind::AllowOnce), ButtonVariant::Destructive);
+    assert_eq!(permission_variant(PermissionKind::AllowAlways), ButtonVariant::Destructive);
+    assert_eq!(permission_variant(PermissionKind::RejectOnce), ButtonVariant::Outline);
+    assert_eq!(permission_variant(PermissionKind::RejectAlways), ButtonVariant::Outline);
+}
+
+/// `agents-zone-attention` decisions 1 and 2: the working row is the
+/// scroller's last item after a prompt, follows a tool call in progress,
+/// hides while a permission waits (which is drawn destructive), reads
+/// `Stopping…` while a cancel is on its way and goes at the end, the view
+/// wanting the motion clock exactly while it shows.
+#[test]
+fn the_working_row_ends_the_conversation_while_the_turn_works() {
+    let mut f = Fixture::new();
+    let shown = |f: &mut Fixture| {
+        f.view.read_with(f.cx, |view, cx| {
+            let blocks = view.agent.read(cx).model().blocks().len();
+            let items = view.scroller.read(cx).item_count();
+            assert!(items == blocks || items == blocks + 1, "{items} items for {blocks} blocks");
+            assert_eq!(items == blocks + 1, view.working.is_some(), "the row is the last item exactly while it shows");
+            view.working.as_ref().map(|row| row.text().to_string())
+        })
+    };
+    let running = |f: &mut Fixture| f.cx.update(|_, cx| Motion::running(cx));
+    f.feed(&[ready()]);
+    assert_eq!(shown(&mut f), None);
+    assert!(!running(&mut f));
+    f.feed(&[added(1, user("hi")), working()]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Working…"));
+    assert!(running(&mut f), "the view wants the clock");
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("agent-working").is_some(), "the row is drawn");
+    let tool = |status| Entry::Tool {
+        call: "call_1".into(),
+        title: "Read main.rs".into(),
+        kind: crate::agent::transcript::ToolKind::Read,
+        status,
+    };
+    f.feed(&[added(2, tool(crate::agent::transcript::ToolStatus::InProgress))]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Read main.rs"));
+    f.feed(&[Event::Turn { state: TurnState::Blocked }, added(3, permission())]);
+    assert_eq!(shown(&mut f), None, "the permission row is the call to action");
+    assert!(!running(&mut f));
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("confirmation-destructive").is_some(), "a pending request is drawn as a risk");
+    f.feed(&[
+        Event::Answered {
+            id: EntryId(3),
+            outcome: crate::agent::transcript::PermissionOutcome::Selected { option: "reject-once".into() },
+        },
+        working(),
+    ]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Read main.rs"), "back once answered");
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("confirmation-destructive").is_none(), "answered, it is plain");
+    f.feed(&[Event::Turn { state: TurnState::Cancelling }]);
+    assert_eq!(shown(&mut f).as_deref(), Some("Stopping…"));
+    f.feed(&[ended(StopReason::Cancelled)]);
+    assert_eq!(shown(&mut f), None, "gone at the end");
+    assert!(!running(&mut f), "the view stopped wanting the clock");
+
+    // A view released while its row shows doesn't keep wanting the clock.
+    f.feed(&[added(4, user("again")), working()]);
+    let agent = f.zone.agent.clone();
+    let second = f.cx.update(|window, cx| cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx)));
+    let id = second.entity_id();
+    assert!(f.cx.update(|_, cx| Motion::wants(id, cx)), "a new view of a working zone wants it");
+    drop(second);
+    f.cx.update(|_, _| {});
+    f.cx.run_until_parked();
+    assert!(!f.cx.update(|_, cx| Motion::wants(id, cx)), "released, it no longer wants the clock");
+    assert!(running(&mut f), "the first view still does");
+}
+
+/// The agent's order put allow first: the row turns it round.
+fn permission_allow_first() -> Entry {
+    let option = |id: &str, name: &str, kind| PermissionOption { id: id.into(), name: name.into(), kind };
+    Entry::Permission {
+        call: Some("call_1".into()),
+        title: "Run cargo test?".into(),
+        options: vec![
+            option("allow-once", "Allow once", PermissionKind::AllowOnce),
+            option("reject-once", "Reject", PermissionKind::RejectOnce),
+        ],
+        outcome: None,
+    }
+}
+
 /// Tab walks the prompt, the waiting row's remove, the pending permission's
-/// buttons (allow first) and the stop button, and wraps; with a held row
-/// and no turn, the prompt, send again and discard.
+/// buttons (reject first, `agents-zone-attention` decision 4) and the stop
+/// button, and wraps; with a held row and no turn, the prompt, send again
+/// and discard.
 #[test]
 fn tab_walks_the_prompt_the_row_the_permissions_and_stop() {
     let mut f = Fixture::new();
-    f.feed(&[ready(), added(1, user("hi")), working(), slot(waiting()), added(2, permission())]);
+    f.feed(&[ready(), added(1, user("hi")), working(), slot(waiting()), added(2, permission_allow_first())]);
     let prompt = f.prompt_handle();
     let remove = f.row_stops();
     assert_eq!(remove.len(), 1);
@@ -147,7 +246,7 @@ fn tab_walks_the_prompt_the_row_the_permissions_and_stop() {
         (handle("allow-once"), handle("reject-once"))
     });
     let stop = f.stop_button().expect("a turn runs");
-    assert_eq!(f.tabs(5), [remove[0].clone(), allow, reject, stop, prompt.clone()]);
+    assert_eq!(f.tabs(5), [remove[0].clone(), reject, allow, stop, prompt.clone()]);
     f.cx.simulate_keystrokes("shift-tab");
     assert_eq!(f.focused(), f.stop_button(), "shift-tab goes back");
 
@@ -180,7 +279,7 @@ fn the_focus_line_names_each_stop() {
         names.push(f.cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).unwrap_or_default());
         f.cx.simulate_keystrokes("tab");
     }
-    assert_eq!(names, ["prompt", "queued:remove", "permission:2:allow-once", "permission:2:reject-once", "stop"]);
+    assert_eq!(names, ["prompt", "queued:remove", "permission:2:reject-once", "permission:2:allow-once", "stop"]);
     f.focus_prompt();
     f.feed(&[
         Event::Answered {

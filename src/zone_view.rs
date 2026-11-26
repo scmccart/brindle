@@ -8,7 +8,7 @@ use std::rc::Rc;
 
 use brindle_ui::{
     ActiveTheme as _, Button, ButtonSize, ButtonVariant, Card, CardColors, CardHeader, ContextMenuTarget as _, EdgeBar,
-    Icon, Modality, ThemeScope, Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
+    Icon, Loader, Modality, ThemeScope, Tokens, Tooltip, TooltipFor as _, modality, shows_ring,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -41,6 +41,8 @@ use crate::terminal_element::cell_metrics;
 use crate::terminal_view::{GridLayout, LinkFailed, TerminalView};
 use crate::theme::Theme;
 use crate::workspace::{program_title, shortcut, terminal_automatic_title};
+use crate::workspace::mark::{Mark, mark};
+use crate::motion::{self, Motion};
 
 /// Height of a zone card's header bar, shown when a tab has 2+ zones, its
 /// bottom line included (`brindle_ui::CARD_HEADER_HEIGHT`).
@@ -811,8 +813,15 @@ impl ZoneTreeView {
             focus_handle: cx.focus_handle(),
             laid_out: Rc::default(),
         };
+        Self::unwant_on_release(cx);
         this.insert_zone(id, start, window, cx);
         this
+    }
+
+    /// A closed tab can't keep the motion clock running.
+    fn unwant_on_release(cx: &mut Context<Self>) {
+        let id = cx.entity_id();
+        cx.on_release(move |_, cx| Motion::want(id, false, cx)).detach();
     }
 
     /// Creates a `ZoneTreeView` from a restored split tree and the zones
@@ -852,6 +861,7 @@ impl ZoneTreeView {
             focus_handle: cx.focus_handle(),
             laid_out: Rc::default(),
         };
+        Self::unwant_on_release(cx);
         for (id, start) in zones {
             this.insert_zone(id, start, window, cx);
         }
@@ -919,6 +929,47 @@ impl ZoneTreeView {
             _subscriptions: subscriptions,
         };
         self.zones.insert(id, zone);
+        self.refresh_motion(cx);
+    }
+
+    /// Zone `id`'s status mark (OpenSpec change `agents-zone-attention`,
+    /// decision 3): an agent zone's `working` is a spinner.
+    fn zone_mark(zone: &Zone) -> Mark {
+        let agent = match zone.content {
+            ZoneContent::Agent(_) => true,
+            ZoneContent::Terminal(_) => false,
+        };
+        mark(zone.status, agent)
+    }
+
+    /// Whether one of the tab's working zones is an agent zone: what the
+    /// tab's face needs to draw its `working` as a spinner.
+    pub fn agent_working(&self) -> bool {
+        self.zones.values().any(|zone| Self::zone_mark(zone).is_spinner())
+    }
+
+    /// Whether a zone header shows a spinner: the tab has 2+ zones and one
+    /// is an agent working.
+    fn header_spins(&self) -> bool {
+        self.zones.len() >= 2 && self.agent_working()
+    }
+
+    /// Wants the motion clock while a header shows a spinner (decision 1).
+    fn refresh_motion(&self, cx: &mut Context<Self>) {
+        Motion::want(cx.entity_id(), self.header_spins(), cx);
+    }
+
+    /// The headers' spinner lines for `--dump-screen-after` (`--- spinner
+    /// zone=ID`, the active zone first, then by id), none for a tab of one
+    /// zone, which has no headers.
+    pub fn describe_spinners(&self) -> String {
+        if self.zones.len() < 2 {
+            return String::new();
+        }
+        let mut ids: Vec<ZoneId> =
+            self.zones.iter().filter(|(_, zone)| Self::zone_mark(zone).is_spinner()).map(|(id, _)| *id).collect();
+        ids.sort_by_key(|id| (*id != self.active, id.0));
+        ids.into_iter().map(|id| format!("--- spinner zone={}\n", id.0)).collect()
     }
 
     /// Agent zone `agent_zone` asks for its terminal login's zone, or for
@@ -1029,6 +1080,7 @@ impl ZoneTreeView {
                 if let Some(zone) = self.zones.get_mut(&id) {
                     (zone.status, zone.progress, zone.badge) = zone.content.status(cx);
                 }
+                self.refresh_motion(cx);
                 cx.emit(event.clone());
                 cx.notify();
             }
@@ -1434,6 +1486,7 @@ impl ZoneTreeView {
         }
         let Some(removed) = self.zones.remove(&target) else { return };
         removed.content.close(cx);
+        self.refresh_motion(cx);
 
         if self.zones.is_empty() {
             cx.emit(TerminalEvent::Exited);
@@ -1641,9 +1694,20 @@ impl ZoneTreeView {
         let active = id == self.active;
         let focus = zone.content.focus_handle(cx);
         let ring = active && shows_ring(zone.content.contains_focused(window, cx), modality(window, cx), false);
-        // Status dots in the chrome theme's colours, like the strip's.
-        let status_color =
-            zone.status.map(|state| Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground));
+        // Status dots in the chrome theme's colours, like the strip's; an
+        // agent's `working` is a spinner in the working dot's colour, at
+        // the motion clock's step.
+        let status_mark = match Self::zone_mark(zone) {
+            Mark::None => None,
+            Mark::Dot(state) => {
+                let color = Settings::chrome_theme(cx).status_color(state, tokens.muted_foreground);
+                Some(div().flex_none().size(px(6.0)).rounded_full().bg(color).into_any_element())
+            }
+            Mark::Spinner => {
+                let color = Settings::chrome_theme(cx).status_color(State::Working, tokens.muted_foreground);
+                Some(Loader::new().step(motion::loader_step(Motion::step(cx))).color(color).into_any_element())
+            }
+        };
         // Its progress bar, drawn as the tab's is, from the same colours.
         let progress_bar = zone.progress.map(|progress| {
             let (length, color) = Settings::chrome_theme(cx).progress_bar(progress, tokens.muted_foreground);
@@ -1703,8 +1767,8 @@ impl ZoneTreeView {
         // The title in the terminal's foreground on the active zone, muted
         // on the others (`trigger_label` cuts it, as `truncate` can't).
         let mut header = CardHeader::new(("zone-header", id.0 as usize));
-        if let Some(color) = status_color {
-            header = header.leading(div().flex_none().size(px(6.0)).rounded_full().bg(color));
+        if let Some(status_mark) = status_mark {
+            header = header.leading(status_mark);
         }
         if let Some(bar) = progress_bar {
             header = header.edge_bar(bar);
@@ -2346,6 +2410,39 @@ mod tests {
         tab.cx.update(|_, cx| agent.update(cx, |agent, cx| agent.seen(cx)));
         settle(tab.cx);
         assert_eq!(dot(&tab), (None, None), "seen");
+    }
+
+    /// `agents-zone-attention` decision 3: a working agent zone makes its
+    /// tab's face a spinner (`agent_working`), a terminal's zones never do;
+    /// a tab of one zone has no header, so it lists no header spinner and
+    /// doesn't want the motion clock for one.
+    #[test]
+    fn a_working_agent_spins_on_its_tabs_face() {
+        use crate::agent::test_support::{Zone, app, ready, settle};
+        use crate::agent::transcript::{Event, StopReason, TurnState};
+        let mut app = app();
+        let mut zone = Zone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(&mut app, Profile::default_shell(), |_| ZoneStart::Agent(agent.clone()));
+        let face = |tab: &Tab| {
+            tab.view.read_with(tab.cx, |view, cx| {
+                (mark(view.status_summary(cx), view.agent_working()), view.describe_spinners())
+            })
+        };
+        zone.feed(&[ready(), Event::Turn { state: TurnState::Working }]);
+        settle(tab.cx);
+        assert_eq!(face(&tab), (Mark::Spinner, String::new()));
+        let id = tab.view.entity_id();
+        assert!(!tab.cx.update(|_, cx| Motion::wants(id, cx)), "no header to spin");
+        zone.feed(&[Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } }]);
+        settle(tab.cx);
+        assert_eq!(face(&tab), (Mark::Dot(State::Done), String::new()), "the green dot once the turn ends");
+
+        let shell = Tab::new(&mut app, Profile::default_shell(), |cx| {
+            let config = Settings::get(cx).config.clone();
+            ZoneStart::Terminal(cx.new(|cx| Terminal::message("shell", Theme::default(), &config, cx)))
+        });
+        assert!(!shell.view.read_with(shell.cx, |view, _| view.agent_working()), "a terminal never spins");
     }
 
     /// A renamed profile reaches an agent zone whose agent hasn't named
