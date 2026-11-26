@@ -242,11 +242,23 @@ An agent zone SHALL be drawn as a card in its profile's theme, as a terminal zon
 - **THEN** its ring is the window's ring colour and its status dot the global theme's colour for working
 
 ### Requirement: Agent zone title
-An agent zone's title SHALL be the name the agent gave, else its profile's name. A tab whose active zone is an agent zone SHALL take that title, unless it has a manual title.
+An agent zone's title SHALL be its conversation's title once the agent has given one, else its profile's name; the name the agent gave in `initialize` SHALL NOT title it. A tab whose active zone is an agent zone SHALL take that title, unless it has a manual title, which SHALL win over every later conversation title.
 
 #### Scenario: Agent's name
-- **WHEN** the fake ACP agent names itself `Fake Agent` in its answer to `initialize`
-- **THEN** the zone's title and its tab's title are `Fake Agent`
+- **WHEN** a zone of profile `Fake` runs a fake ACP agent that names itself `Fake Agent` in its answer to `initialize`
+- **THEN** the zone's title and its tab's title are `Fake`
+
+#### Scenario: The agent names the conversation
+- **WHEN** that agent then sends `session_info_update` with title `Hello.txt file creation`
+- **THEN** the zone's title and its tab's title are `Hello.txt file creation`
+
+#### Scenario: Title cleared
+- **WHEN** the agent then clears the title with `null`
+- **THEN** the zone's title and its tab's title are `Fake` again
+
+#### Scenario: A renamed tab
+- **WHEN** the user renames the agent's tab `Build`, and the agent then titles its conversation `Hello.txt file creation`
+- **THEN** the tab's title stays `Build`, and the zone's own title is `Hello.txt file creation`
 
 ### Requirement: Agent zone status
 An agent zone SHALL hold its session's activity as a status: `working` (starting, logging in, a turn running), `blocked` (a permission waiting), `done` (a turn ended normally), `error` (a turn ended for a refusal or a limit, or failed; the agent needs a login, failed or exited) or `idle` (a cancelled turn included). The zone header's and tab's dots SHALL show it as a program status record's state.

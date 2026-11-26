@@ -178,6 +178,10 @@ On a connection that negotiated client protocol 4, the server SHALL send only th
 - **WHEN** a protocol 4 client decodes the "login required" agent state with a message and no methods
 - **THEN** its encoding is the same as before login methods existed
 
+#### Scenario: A conversation without a title
+- **WHEN** a protocol 4 client decodes a conversation event the agent gave no title
+- **THEN** its encoding is the same as before conversation titles existed
+
 ### Requirement: Permission requests wait for the client's choice
 A permission request from the agent SHALL be added to the log with its options and mark the turn blocked. The server SHALL answer it only with the option an attached client chose, or `cancelled` on a cancel, never on its own. With no client attached it SHALL wait, however long. An answer to a request already answered, or naming an option the request does not offer, SHALL be refused with an error.
 
@@ -339,15 +343,19 @@ An agent session's log SHALL stay within 16 MiB in its stored form. When it woul
 - **THEN** its oldest entries are gone, a replay starts with a notice saying how many were dropped, and the latest entries are intact
 
 ### Requirement: The transcript names the agent's conversation
-Once the agent has given an ACP session, the transcript SHALL hold that session's id, the absolute directory it works in, and whether the agent offered `session/load`, `session/resume`, both or neither, and every replay SHALL carry them.
+Once the agent has given an ACP session, the transcript SHALL hold that session's id, the absolute directory it works in, whether the agent offered `session/load`, `session/resume`, both or neither, and the conversation's title once the agent has given one, and every replay SHALL carry them.
 
 #### Scenario: Conversation named after session/new
 - **WHEN** the fake ACP agent offers `loadSession` and `sessionCapabilities.resume` in `initialize` and answers `session/new` with session id `s1`
-- **THEN** the client receives the conversation `s1` with the session's directory, marked as offering both load and resume, before the agent's ready state
+- **THEN** the client receives the conversation `s1` with the session's directory, marked as offering both load and resume and with no title, before the agent's ready state
 
 #### Scenario: Conversation in a replay
 - **WHEN** a client attaches an agent session whose agent answered `session/new` with session id `s1`
 - **THEN** the replay holds the conversation `s1`
+
+#### Scenario: Titled conversation in a replay
+- **WHEN** a client attaches an agent session whose agent titled its conversation `Hello.txt file creation`
+- **THEN** the replay holds the conversation with that title
 
 ### Requirement: A session whose agent ended is kept for its conversation
 When an agent exits, or its holder ends, after it gave an ACP session and offered `session/load` or `session/resume`, the server SHALL keep the session with its log, queue slot, conversation and directory, listed with activity `error`, while its client has it attached or its owner may still return. A detach SHALL end such a session, and so SHALL its close, a `KILL` or a `STOP`.
@@ -555,3 +563,52 @@ A client's restart request while the agent needs a login SHALL hang up the runni
 #### Scenario: Restarted after a terminal login
 - **WHEN** a ready agent answered a prompt with `-32000`, and the client asks to restart it with its command, arguments and environment
 - **THEN** the old agent is hung up, a new agent process is sent `initialize` with `auth.terminal`, the conversation and the held prompt are kept, and the session becomes ready in the same ACP session
+
+### Requirement: The agent names the conversation
+When the agent sends `session_info_update` with a string `title`, the server SHALL keep it as the conversation's title, its control characters dropped, each run of whitespace made one space, trimmed, and cut at 256 characters with `…`, and SHALL send the conversation with it to attached clients. A `null` or blank `title` SHALL clear the title; an update without `title`, or a title equal to the one kept, SHALL send nothing.
+
+#### Scenario: A title
+- **WHEN** the fake ACP agent sends `session_info_update` with title `Hello.txt file creation` during a turn
+- **THEN** the client receives the conversation with title `Hello.txt file creation`
+
+#### Scenario: No title in the update
+- **WHEN** the agent sends `session_info_update` with only `_meta`
+- **THEN** the client receives nothing for it, and the conversation keeps its title
+
+#### Scenario: Cleared
+- **WHEN** a titled conversation's agent sends `session_info_update` with title `null`
+- **THEN** the client receives the conversation with no title
+
+#### Scenario: A long title on several lines
+- **WHEN** the agent sends a title of 400 characters with line breaks in it
+- **THEN** the kept title is one line of at most 256 characters, ending `…`
+
+#### Scenario: The same title again
+- **WHEN** the agent sends `session_info_update` with the title already kept
+- **THEN** the client receives nothing for it
+
+### Requirement: A conversation keeps its title
+The conversation's title SHALL survive a core restart and an upgrade, and an agent restart that continues the same ACP session, including a load whose replayed updates aren't shown. A new ACP session SHALL start with no title.
+
+#### Scenario: Core killed after a title
+- **WHEN** the agent has titled its conversation, the core is killed with SIGKILL, and a new core adopts the session
+- **THEN** a client attaching afterwards receives the conversation with its title
+
+#### Scenario: Restarted after a login
+- **WHEN** a titled conversation's agent asks for a login on a prompt, and the session is restarted and resumes the same ACP session
+- **THEN** the conversation keeps its title
+
+#### Scenario: A new session
+- **WHEN** an agent session continues a conversation the server no longer has, in a new server session
+- **THEN** its conversation has no title until the agent sends one
+
+### Requirement: The agent's readable name
+The agent's name in its ready state, and in the session list, SHALL be `initialize`'s `agentInfo.title` when it is given and not blank, else its `agentInfo.name`.
+
+#### Scenario: A title is given
+- **WHEN** the agent answers `initialize` with `agentInfo` name `@agentclientprotocol/codex-acp` and title `Codex`
+- **THEN** the client receives the ready state with the name `Codex`
+
+#### Scenario: No title
+- **WHEN** the agent answers `initialize` with `agentInfo` name `Antigravity ACP Server` and no title
+- **THEN** the client receives the ready state with the name `Antigravity ACP Server`
