@@ -50,7 +50,7 @@ Lands after `agents-session-recovery` (its `AGENT_RESTART` is used by the termin
 
 ## 8. Windows, remote and manual checks
 
-- [ ] 8.1 Add `windows-agent-login` to `tests/e2e/cases/win.rs` (an `agent` login through the fake agent on Windows) and, (terminal), `windows-agent-login-withheld` (a `cmd /c` profile's terminal method shown unavailable). Verify they pass on the `windows-e2e` job.
+- [x] 8.1 Add `windows-agent-login` to `tests/e2e/cases/win.rs` (an `agent` login through the fake agent on Windows) and, (terminal), `windows-agent-login-withheld` (a `cmd /c` profile's terminal method shown unavailable). Verify they pass on the `windows-e2e` job.
 - [x] 8.2 (terminal) Add `remote-agent-login-terminal` to `tests/e2e/cases/remote.rs`: an SSH agent profile whose terminal login runs on the container and restarts the agent there. Verify it passes with `BRINDLE_REMOTE_E2E_REQUIRED=1` under `scripts/with-xvfb`.
 - [x] 8.3 Add the manual checks to `CLAUDE.md`'s list: a real Codex ChatGPT login and an Antigravity Google OAuth login from a zone that needs one, at start and after a session expired, with Cancel login once; pointer presses on the method buttons and Cancel login on Linux and Windows; (terminal) Antigravity's terminal login (`terminal-login`, `agy acp --login`) in its login zone, on Linux and over SSH. Verify the list names each.
 
