@@ -50,6 +50,6 @@ Before starting:
 
 ## 7. Docs and checks
 
-- [ ] 7.1 Update `README.md` (keys, splitting, a tab of both kinds), `docs/code-map.md` (the zone tree, the tab model, restore and sweeps; fix the stale `as_terminal_view()` mention), `CLAUDE.md` (the dump's zone lines, and its manual checks' "an agent profile opened from the `⌄` menu, with its split buttons disabled", which no longer holds), and `docs/manual-checks/agents.md` (the same line).
+- [x] 7.1 Update `README.md` (keys, splitting, a tab of both kinds), `docs/code-map.md` (the zone tree, the tab model, restore and sweeps; fix the stale `as_terminal_view()` mention), `CLAUDE.md` (the dump's zone lines, and its manual checks' "an agent profile opened from the `⌄` menu, with its split buttons disabled", which no longer holds), and `docs/manual-checks/agents.md` (the same line).
 - [ ] 7.2 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate zones-mixed-tabs --strict`.
 - [ ] 7.3 Manual checks for the user, with `scripts/run-throwaway.sh`: a pointer press on each header split button and each header menu item in a mixed tab; the tab's face changing as focus moves between zones of different themes; ctrl-shift-alt-e and ctrl-shift-alt-o on Linux and on Windows, with a keyboard layout that has AltGr; a real agent beside a shell in the same directory; a local shell beside a shell on a real SSH host, quit and relaunched.
