@@ -66,7 +66,14 @@ impl Image {
 
     /// How many pixels in `r` are close to `color`.
     pub fn count(&self, r: PxRect, color: Rgb) -> usize {
-        self.pixels(r).filter(|p| p.near(color, 24)).count()
+        self.count_near(r, color, 24)
+    }
+
+    /// How many pixels in `r` are within `tolerance` per channel of
+    /// `color`, for colours closer together than [`Image::count`] tells
+    /// apart (two token sets' surfaces).
+    pub fn count_near(&self, r: PxRect, color: Rgb, tolerance: u8) -> usize {
+        self.pixels(r).filter(|p| p.near(color, tolerance)).count()
     }
 
     /// The most common color in `r`, or `None` when `r` is empty or two
@@ -431,6 +438,12 @@ pub fn self_test_scan() -> Result {
     ensure!(cards.runs_in_row(25, (0, 30), LINE, 2).is_empty(), "a row past the bottom");
     // A tight tolerance tells the border from a near colour.
     ensure!(cards.runs_in_row(3, (0, 30), Rgb(0x25, 0x29, 0x2c), 2).is_empty(), "near colour matched");
+    // A count as tight: the border's two columns, and no background
+    // pixel counted as the near window surface.
+    let whole = PxRect { x0: 0, y0: 0, x1: 30, y1: 20 };
+    ensure!(cards.count_near(whole, LINE, 3) == 40, "border pixels: {}", cards.count_near(whole, LINE, 3));
+    ensure!(cards.count_near(whole, Rgb(0x11, 0x14, 0x17), 3) == 0, "a near colour counted");
+    ensure!(cards.count(whole, Rgb(0x11, 0x14, 0x17)) > 0, "the loose count takes it");
 
     // A ring 1px wide round columns 3..=8, rows 2..=6, added to `cards`.
     let ringed = image(&|x, y| {

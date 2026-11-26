@@ -49,11 +49,24 @@ pub mod theme {
     /// terminal theme's colours (`Theme::card_border`), so an `e2e` tab's
     /// cards are drawn in it too.
     pub const CHROME_BORDER: Rgb = Rgb(0x25, 0x29, 0x2c);
-    /// The `muted` token for the `e2e` theme, a code block's surface and
-    /// the person's bubble: `CHROME_BACKGROUND` mixed 8% towards the
-    /// foreground (`Theme::ui_tokens`; `FOREGROUND` is legible on the
-    /// chrome's background as it is).
-    pub const MUTED: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    /// The window set's `muted` token for the `e2e` theme, a code block's
+    /// surface and the person's bubble outside an agent zone:
+    /// `CHROME_BACKGROUND` mixed 8% towards the foreground
+    /// (`Theme::ui_tokens`; `FOREGROUND` is legible on the chrome's
+    /// background as it is).
+    pub const WINDOW_MUTED: Rgb = Rgb(0x19, 0x1b, 0x1e);
+    /// The window set's `card` token for the `e2e` theme, an agent's
+    /// bubble and a permission outside an agent zone: `CHROME_BACKGROUND`
+    /// mixed 4% towards the foreground.
+    pub const WINDOW_CARD: Rgb = Rgb(0x11, 0x14, 0x17);
+    /// The window set's `popover` token for the `e2e` theme, a menu's
+    /// panel: the same mix as its `card`.
+    pub const WINDOW_POPOVER: Rgb = WINDOW_CARD;
+    /// The zone set's `muted` token for the `e2e` theme, an agent zone's
+    /// code block and the person's bubble in an `e2e` tab: `BACKGROUND`
+    /// (the theme's own, `Theme::zone_tokens`) mixed 8% towards the
+    /// foreground.
+    pub const ZONE_MUTED: Rgb = Rgb(0x1e, 0x22, 0x25);
 
     /// Find bar highlights in the `e2e` theme.
     pub const SEARCH_MATCH_BG: Rgb = Rgb(0x20, 0x50, 0x90);
@@ -79,6 +92,17 @@ pub mod theme {
     /// mixed 45% towards the background (#6a6666, 2.8:1 on it), pushed 5%
     /// towards white to reach 3:1 (`Theme::card_muted_foreground`).
     pub const ALT_CARD_MUTED: Rgb = Rgb(0x71, 0x6e, 0x6e);
+    /// The zone set's `card` token in such a theme, an agent zone's agent
+    /// bubble and permission: `ALT_BACKGROUND` (the theme's own,
+    /// `Theme::zone_tokens`) mixed 4% towards `ALT_FOREGROUND`, which is
+    /// legible on it as it is.
+    pub const ALT_ZONE_CARD: Rgb = Rgb(0x2d, 0x25, 0x25);
+    /// The zone set's `popover` token in such a theme, the zone header's
+    /// menu: the same mix as its `card`.
+    pub const ALT_ZONE_POPOVER: Rgb = ALT_ZONE_CARD;
+    /// The zone set's `muted` token in such a theme, an agent zone's code
+    /// block: `ALT_BACKGROUND` mixed 8% towards `ALT_FOREGROUND`.
+    pub const ALT_ZONE_MUTED: Rgb = Rgb(0x32, 0x2a, 0x2a);
 }
 
 /// The test config, with `theme_name` as the global theme. Its one profile,

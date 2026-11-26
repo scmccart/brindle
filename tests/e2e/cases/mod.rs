@@ -276,6 +276,7 @@ fn unix() -> Vec<Case> {
         display("agent-markdown-copy", agent::markdown_copy).needs_fake_agent(),
         display("agent-markdown-links", agent::markdown_links).needs_fake_agent(),
         display("agent-markdown-layout", agent::markdown_layout).needs_fake_agent(),
+        display("agent-zone-theme", agent::zone_theme).needs_fake_agent(),
         display("agent-split", agent::split).needs_fake_agent(),
         display("agent-no-command", agent::no_command).needs_fake_agent(),
         display("agent-first-prompt-login", agent::first_prompt_login).needs_fake_agent(),
@@ -317,9 +318,11 @@ pub fn self_test_clipboard() -> Result {
     clipboard::self_test()
 }
 
-/// `agent-markdown-layout`'s capture measure (`--self-test`).
+/// `agent-markdown-layout`'s and `agent-zone-theme`'s capture measures
+/// (`--self-test`).
 pub fn self_test_agent_layout() -> Result {
-    agent::self_test_layout()
+    agent::self_test_layout()?;
+    agent::self_test_zone_theme()
 }
 
 /// The remote cases' parsers (`--self-test`).
