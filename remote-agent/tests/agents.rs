@@ -2820,10 +2820,21 @@ const MESSAGE_BYTES: usize = 64 * 1024;
 /// (4 MiB), still attached; gives the session and the log its client
 /// folded.
 fn long_session(client: &mut TestClient, dir: &mut TempDir, name: &str) -> (SessionId, Transcript) {
+    long_session_then(client, dir, name, |_| {})
+}
+
+/// [`long_session`], with `then` adding the agent's steps after its turn.
+fn long_session_then(
+    client: &mut TestClient,
+    dir: &mut TempDir,
+    name: &str,
+    then: impl FnOnce(&mut AgentScript),
+) -> (SessionId, Transcript) {
     let (mut script, _) = started(&dir.path, name);
     script.step("expect session/prompt").step(title(Some("Long talk")));
     long_reply(&mut script, MESSAGES, MESSAGE_BYTES);
     script.step(stop("end_turn"));
+    then(&mut script);
     let (id, _) = spawned(client, dir, detached(&script.write()));
     client.transcript_until(id, "is ready", ready);
     client.prompt(id, "talk").unwrap();
@@ -2982,7 +2993,21 @@ fn an_ended_agents_session_is_fetched_from_before_and_after_it_is_continued() {
 fn appended_checkpoints_survive_a_core_kill_and_fetch_back_to_the_same_log() {
     let token = "token-agent-page-kill";
     let (mut dir, mut client) = agent_core("agent-page-kill", &[]);
-    let (id, live) = long_session(&mut client, &mut dir, "page-kill");
+    let mut prompted = None;
+    let (id, _) = long_session_then(&mut client, &mut dir, "page-kill", |script| {
+        script.step("expect session/prompt");
+        prompted = Some(script.reached());
+    });
+    // The turn's end reaching the client says nothing of the holder: the
+    // core may still have megabytes of checkpoints queued for it, which a
+    // SIGKILL loses (design decision 10). A prompt's checkpoint and then its
+    // bytes are queued behind them, and the holder handles its messages in
+    // order, so once the agent has the prompt the holder stores the whole log.
+    client.prompt(id, "again").unwrap();
+    reaches(&prompted.expect("the script was built"));
+    let live = client.transcript_until(id, "has the prompt", |log| {
+        says(log).last().map(String::as_str) == Some("user: again")
+    });
     let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
     // Its owner gets it back with the newest page.
     let (start, _) = client.reconnect_replay();
