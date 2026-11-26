@@ -322,8 +322,9 @@ Before starting, check these:
 - [ ] 8.10 **`windows-agent-tool-diff`** in `tests/e2e/cases/win.rs`: a diff and its permission detail through ConPTY.
   - Verify: it is listed on Windows, and the archive jobs (`e2e-archive`, `windows-e2e-archive`) pick up the new `agent-*` and `windows-agent-*` cases by their filters.
   - Written: it runs `agent-permission-detail`'s function, which now also checks the diff's `--- item` line. The archive filters (`agent-` in `e2e-archive`, `windows-agent-` in `windows-e2e-archive`) take the new cases. Still to verify on Windows: its listing and run (the PR's `windows-e2e` job); `win.rs` can't be checked from Linux (the Windows target's build scripts need MSVC).
-- [ ] 8.11 **The perf case `agent-tool-output`** in `tests/perf/agent.rs` (flag 13): 1 MiB of output in 4 KiB `_meta` deltas into an open row, timed from the gate to the last line shown. Its case name goes in `tests/perf/main.rs`'s list.
+- [x] 8.11 **The perf case `agent-tool-output`** in `tests/perf/agent.rs` (flag 13): 1 MiB of output in 4 KiB `_meta` deltas into an open row, timed from the gate to the last line shown. Its case name goes in `tests/perf/main.rs`'s list.
   - Verify: `BRINDLE_PERF=1 cargo test --test perf -- --list` lists it, and a run under `scripts/with-xvfb` writes its numbers to `summary.toml`.
+  - Done with a second run in one delta, both in `[stream]` (flag 34); its first run found flag 36's frame bug.
 
 ## 9. Docs
 

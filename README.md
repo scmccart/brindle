@@ -376,6 +376,10 @@ and one in an agent zone:
   to its restored agent tab showing the end of a conversation of about
   15 MiB, which it attaches again and pages, until Brindle quits on it. It
   needs the same test agent.
+- **Tool output streaming** (`agent-tool-output`): the time an agent zone
+  takes to show the end of a command's 1 MiB output in its tool call's open
+  row, streamed in 4 KiB pieces and again in one, and the difference. It
+  needs the same test agent.
 
 The suite reports numbers and never fails on them. Run it on an idle machine and
 compare runs made on the same machine. Each run is kept in
