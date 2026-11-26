@@ -491,6 +491,8 @@ fn hold_word(reason: &HoldReason) -> String {
 const EXITED: &str = "the agent has exited";
 const NEEDS_LOGIN: &str = "the agent needs a login";
 const LOGGING_IN: &str = "the agent is logging in";
+/// A choosing agent's reason line (`agents-session-list` decision 6).
+const CHOOSING: &str = "choose a conversation, or start a new one";
 
 /// Whether a held prompt can be sent again, for the phase and the
 /// session's life: only to a ready agent whose session is open.
@@ -500,6 +502,7 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
         SessionLife::Open => match phase {
             AgentPhase::Live(AgentState::Ready { .. }) => return Resend::Available,
             AgentPhase::Live(AgentState::Starting) => "the agent is starting",
+            AgentPhase::Live(AgentState::Choosing { .. }) => CHOOSING,
             AgentPhase::Live(AgentState::LoggingIn { .. }) => LOGGING_IN,
             AgentPhase::Live(AgentState::LoginRequired { .. }) => NEEDS_LOGIN,
             AgentPhase::Live(AgentState::Failed { .. }) => "the agent failed",
@@ -582,7 +585,9 @@ pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>, log
         }),
         AgentPhase::NotStarted(StartFailure::TooOld { endpoint }) => Some(alert(too_old_text(endpoint), true, None)),
         // A login running says so on its row, not in an alert.
-        AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match life {
+        AgentPhase::Live(
+            AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. } | AgentState::Choosing { .. },
+        ) => match life {
             SessionLife::Open => None,
             SessionLife::Ended => {
                 Some(alert(format!("the agent session on {} has ended", names.endpoint), true, None))
@@ -631,6 +636,9 @@ pub enum DisabledWhy {
     Connecting,
     NotStarted,
     Starting,
+    /// The agent waits for a conversation to be chosen (OpenSpec change
+    /// `agents-session-list`).
+    Choosing,
     /// The agent needs a login, which the zone's login row offers.
     LoginRequired,
     /// The agent needs a login the zone can't run: it offers no method
@@ -653,6 +661,7 @@ impl DisabledWhy {
             Self::Connecting => "connecting to the terminal server",
             Self::NotStarted => "the agent didn't start",
             Self::Starting => "the agent is starting",
+            Self::Choosing => CHOOSING,
             Self::LoginRequired => NEEDS_LOGIN,
             Self::LoginElsewhere => {
                 "the agent needs a login; log in through its own command line, then open the profile again"
@@ -766,7 +775,8 @@ pub fn continue_offer(
                 | AgentState::Ready { .. }
                 | AgentState::LoginRequired { .. }
                 | AgentState::LoggingIn { .. }
-                | AgentState::Failed { .. },
+                | AgentState::Failed { .. }
+                | AgentState::Choosing { .. },
             ),
             SessionLife::Open | SessionLife::Ended,
         ) => return Offer::None(NoOffer::NotEnded),
@@ -1257,7 +1267,8 @@ impl ChatModel {
                     | AgentState::LoggingIn { .. }
                     | AgentState::Failed { .. }
                     | AgentState::Exited { .. }
-                    | AgentState::Lost { .. },
+                    | AgentState::Lost { .. }
+                    | AgentState::Choosing { .. },
                 )
                 | AgentPhase::Connecting
                 | AgentPhase::NotStarted(_)
@@ -2026,7 +2037,8 @@ impl ChatModel {
                 (false, Link::Reconnecting) => return None,
             },
             (
-                AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. }),
+                AgentPhase::Connecting
+                | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. } | AgentState::Choosing { .. }),
                 SessionLife::Open,
             ) => return None,
             (AgentPhase::Live(AgentState::LoginRequired { .. }), SessionLife::Open) if self.logins_usable() => {
@@ -2070,7 +2082,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::Failed { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::NotStarted(_)
@@ -2112,7 +2125,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::Failed { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::NotStarted(_)
@@ -2134,7 +2148,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::Failed { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::NotStarted(_)
@@ -2231,6 +2246,7 @@ impl ChatModel {
             AgentPhase::Lost { .. } => disabled(DisabledWhy::Lost),
             AgentPhase::Broken { .. } => disabled(DisabledWhy::Broken),
             AgentPhase::Live(AgentState::Starting) => disabled(DisabledWhy::Starting),
+            AgentPhase::Live(AgentState::Choosing { .. }) => disabled(DisabledWhy::Choosing),
             AgentPhase::Live(AgentState::LoggingIn { .. }) => disabled(DisabledWhy::LoggingIn),
             AgentPhase::Live(AgentState::LoginRequired { .. }) if self.terminal_login.is_some() => {
                 disabled(DisabledWhy::LoggingIn)
@@ -2335,7 +2351,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::LoginRequired { .. }
                 | AgentState::LoggingIn { .. }
-                | AgentState::Failed { .. },
+                | AgentState::Failed { .. }
+                | AgentState::Choosing { .. },
             ) => true,
             AgentPhase::Live(AgentState::Exited { .. } | AgentState::Lost { .. })
             | AgentPhase::NotStarted(_)
@@ -2523,8 +2540,9 @@ impl ChatModel {
             ) => message.clone(),
             AgentPhase::Live(AgentState::Exited { code: Some(code), .. }) => format!("exited with status {code}"),
             AgentPhase::Live(AgentState::Exited { code: None, .. }) => "ended by a signal".into(),
-            AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match &self
-                .turn
+            AgentPhase::Live(
+                AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. } | AgentState::Choosing { .. },
+            ) => match &self.turn
             {
                 TurnState::Failed { message } => message.clone(),
                 TurnState::Ended { stop } => format!("the turn ended: {}", stop_word(stop)),
@@ -2632,7 +2650,11 @@ impl ChatModel {
         }
         out.push_str(&format!(" state={}", state_word(&self.phase)));
         match &self.phase {
-            AgentPhase::Live(AgentState::LoginRequired { message, .. } | AgentState::Failed { message }) => {
+            AgentPhase::Live(
+                AgentState::LoginRequired { message, .. }
+                | AgentState::Failed { message }
+                | AgentState::Choosing { message: Some(message) },
+            ) => {
                 out.push_str(&format!(" message={message:?}"));
             }
             // The failure as logged, the server's cause verbatim (on
@@ -2643,7 +2665,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::LoggingIn { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { message: None },
             )
             | AgentPhase::Connecting
             | AgentPhase::Lost { .. }
@@ -2889,6 +2912,7 @@ fn state_word(phase: &AgentPhase) -> String {
         AgentPhase::Connecting => "connecting".into(),
         AgentPhase::NotStarted(_) => "not-started".into(),
         AgentPhase::Live(AgentState::Starting) => "starting".into(),
+        AgentPhase::Live(AgentState::Choosing { .. }) => "choosing".into(),
         AgentPhase::Live(AgentState::Ready { .. }) => "ready".into(),
         AgentPhase::Live(AgentState::LoginRequired { .. }) => "login-required".into(),
         AgentPhase::Live(AgentState::LoggingIn { .. }) => "logging-in".into(),
@@ -4362,7 +4386,8 @@ mod tests {
                                 | AgentState::Ready { .. }
                                 | AgentState::LoginRequired { .. }
                                 | AgentState::LoggingIn { .. }
-                                | AgentState::Failed { .. },
+                                | AgentState::Failed { .. }
+                                | AgentState::Choosing { .. },
                             ) => false,
                         };
                         let kept = matches!(phase, AgentPhase::Live(_)) && life == SessionLife::Open;

@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 
+use brindle_remote_protocol::RequestId;
 use brindle_transcript::EntryId;
 
 use super::dialect::Dialect;
@@ -32,6 +33,9 @@ pub enum Purpose {
     /// `authenticate`: a login the agent runs itself (OpenSpec change
     /// `agents-login`).
     Authenticate,
+    /// A list of the agent's conversations, for the client's request `req`
+    /// (`agents-session-list` decision 2). Never checkpointed (flag 4).
+    List { req: RequestId },
 }
 
 /// The cap of [`MAX_PENDING_PERMISSIONS`] is reached: answer this request
@@ -177,6 +181,33 @@ impl Rpc {
             session,
             cwd,
         })
+    }
+
+    /// A page of the agent's conversations in `cwd` after `cursor`, for
+    /// the client's request `req`.
+    pub fn list(&mut self, req: RequestId, cwd: &str, cursor: Option<&str>) -> Vec<u8> {
+        let id = self.request(Purpose::List { req });
+        self.dialect.encode(Request::List { id, cwd, cursor })
+    }
+
+    /// The client request a list awaited by the agent answers, if one is.
+    pub fn listing(&self) -> Option<RequestId> {
+        self.outgoing.values().find_map(|purpose| match purpose {
+            Purpose::List { req } => Some(*req),
+            Purpose::Initialize
+            | Purpose::NewSession
+            | Purpose::Prompt
+            | Purpose::Resume
+            | Purpose::Load
+            | Purpose::Authenticate => None,
+        })
+    }
+
+    /// Stops awaiting the list, if one is out, giving its client request.
+    pub fn forget_list(&mut self) -> Option<RequestId> {
+        let req = self.listing()?;
+        self.forget(Purpose::List { req });
+        Some(req)
     }
 
     /// A prompt of one text block.

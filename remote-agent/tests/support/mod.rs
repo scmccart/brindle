@@ -1655,6 +1655,7 @@ pub fn client_agent(script: &Path) -> client::SpawnAgent {
         policy: client::Policy::Kill,
         profile: None,
         conversation: None,
+        start: None,
     }
 }
 

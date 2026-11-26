@@ -360,6 +360,14 @@ fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
     if !session.methods.is_empty() {
         state.insert("methods".into(), json!(session.methods));
     }
+    // Left out when false, so a state written before
+    // `agents-session-list` reads as one whose agent lists nothing.
+    if session.lists {
+        state.insert("lists".into(), json!(true));
+    }
+    if session.chose {
+        state.insert("chose".into(), json!(true));
+    }
     (state, bytes)
 }
 
@@ -432,6 +440,7 @@ fn phase_value(phase: &Phase) -> Value {
             value
         }
         Phase::Ready { session } => json!({ "phase": "ready", "session": session }),
+        Phase::Choosing { greeting } => greeting_value("choosing", greeting),
         Phase::LoginRequired(login) => login_value("login_required", login),
         Phase::LoggingIn { login, method } => {
             let mut value = login_value("logging_in", login);
@@ -454,6 +463,7 @@ fn with_start(mut value: Value, start: &Start) -> Value {
                 "log": log_name(*log),
             });
         }
+        Start::Choose => value["start"] = json!("choose"),
     }
     value
 }
@@ -507,15 +517,18 @@ fn log_name(log: Log) -> &'static str {
     }
 }
 
-fn purpose_name(purpose: Purpose) -> &'static str {
-    match purpose {
+/// A request's purpose as checkpointed; none for a list, which isn't
+/// (`agents-session-list` flag 4): its late answer is ignored.
+fn purpose_name(purpose: Purpose) -> Option<&'static str> {
+    Some(match purpose {
         Purpose::Initialize => "initialize",
         Purpose::NewSession => "new_session",
         Purpose::Prompt => "prompt",
         Purpose::Resume => "resume",
         Purpose::Load => "load",
         Purpose::Authenticate => "authenticate",
-    }
+        Purpose::List { .. } => return None,
+    })
 }
 
 fn run_kind_name(kind: RunKind) -> &'static str {
@@ -530,7 +543,7 @@ fn rpc_value(rpc: &Rpc) -> Value {
     let outgoing: Vec<Value> = rpc
         .outgoing()
         .iter()
-        .map(|(id, purpose)| json!([id, purpose_name(*purpose)]))
+        .filter_map(|(id, purpose)| Some(json!([id, purpose_name(*purpose)?])))
         .collect();
     let permissions: Vec<Value> = rpc
         .permissions()
@@ -766,6 +779,11 @@ fn restore(
         Some(methods) => serde_json::from_value(methods.clone())
             .map_err(|_| Unreadable::Field { name: "methods" })?,
     };
+    let flag = |name: &'static str| match state.get(name) {
+        None => Ok(false),
+        Some(value) => value.as_bool().ok_or(Unreadable::Field { name }),
+    };
+    let (lists, chose) = (flag("lists")?, flag("chose")?);
 
     // Each entry the state names is the log's, of the kind it is named as.
     if let Some(run) = run {
@@ -830,6 +848,8 @@ fn restore(
             last: now,
         }),
         methods,
+        lists,
+        chose,
     })
 }
 
@@ -924,6 +944,9 @@ fn restore_phase(phase: &Map<String, Value>) -> Result<Phase, Unreadable> {
         "ready" => Phase::Ready {
             session: text(phase, "session")?.to_owned(),
         },
+        "choosing" => Phase::Choosing {
+            greeting: restore_greeting(phase)?,
+        },
         "login_required" => Phase::LoginRequired(restore_login(phase)?),
         "logging_in" => Phase::LoggingIn {
             login: restore_login(phase)?,
@@ -942,6 +965,7 @@ fn restore_start(phase: &Map<String, Value>) -> Result<Start, Unreadable> {
     let name = "start";
     let start = match phase.get(name) {
         None | Some(Value::Null) => return Ok(Start::New),
+        Some(Value::String(choose)) if choose == "choose" => return Ok(Start::Choose),
         Some(start) => object(start, name)?,
     };
     let conversation = object(field(start, "conversation")?, "conversation")?;
@@ -1454,6 +1478,16 @@ mod tests {
             Phase::Ready {
                 session: "s1".into(),
             },
+            Phase::Spawning {
+                start: Start::Choose,
+            },
+            Phase::Initializing {
+                start: Start::Choose,
+            },
+            Phase::Choosing {
+                greeting: greeting(Some("fake"), Some("1.0"), Continuation::ResumeAndLoad),
+            },
+            Phase::LoginRequired(login(AfterLogin::Start(Start::Choose))),
             Phase::LoginRequired(login(AfterLogin::Start(Start::New))),
             Phase::LoginRequired(login(AfterLogin::Start(continuing(Log::Kept)))),
             Phase::LoginRequired(login(AfterLogin::Ready {
@@ -1591,6 +1625,53 @@ mod tests {
         agent.step(Input::Command(Command::Login {
             method: method.into(),
         }))
+    }
+
+    /// `agents-session-list`: a choosing session keeps that its agent
+    /// lists and that a continue out was chosen; a list out isn't kept, so
+    /// its late answer is ignored (flag 4).
+    #[test]
+    fn a_choosing_session_round_trips_without_its_list() {
+        let mut agent = Agent {
+            s: AgentSession::choosing("/home/u/src".into(), "0.3.0".into()),
+            now: Instant::now(),
+        };
+        agent.step(Input::Spawned);
+        agent.feed(&result(
+            1,
+            json!({"protocolVersion": 1,
+            "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"list": {}}},
+            "agentInfo": {"name": "fake", "version": "1.0"}}),
+        ));
+        assert!(matches!(agent.s.phase, Phase::Choosing { .. }));
+        assert_eq!(agent.round_trip(), agent.s);
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        assert_eq!(state["lists"], json!(true));
+        let listed = agent.step(Input::Command(Command::List { req: 9, cursor: None }));
+        assert_eq!(listed.reply, Some(Ok(())));
+        let mut restored = Agent {
+            s: agent.round_trip(),
+            now: agent.now,
+        };
+        assert_eq!(restored.s.rpc.listing(), None, "a list isn't checkpointed");
+        let late = restored.feed(&result(2, json!({"sessions": []})));
+        assert_eq!(late.listed, None);
+        assert!(restored.s.lists);
+        // A choice out is kept as one.
+        agent.step(Input::Command(Command::Choose {
+            conversation: Some("c1".into()),
+        }));
+        assert!(agent.s.chose);
+        assert!(agent.round_trip().chose);
+        // A state written before reads as an agent that lists nothing.
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        state.as_object_mut().unwrap().remove("lists");
+        assert!(!decode(&rebuild(&state, &partial), agent.now).unwrap().lists);
+        state["lists"] = json!("yes");
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field { name: "lists" })
+        );
     }
 
     #[test]

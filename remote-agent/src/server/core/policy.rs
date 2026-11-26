@@ -776,6 +776,8 @@ pub(super) enum AgentRequest {
     Restart,
     Login,
     Fetch,
+    List,
+    Choose,
 }
 
 impl AgentRequest {
@@ -790,6 +792,8 @@ impl AgentRequest {
             Self::Restart => "AGENT_RESTART",
             Self::Login => "AGENT_LOGIN",
             Self::Fetch => "AGENT_FETCH",
+            Self::List => "AGENT_LIST",
+            Self::Choose => "AGENT_CHOOSE",
         }
     }
 }
@@ -1531,6 +1535,8 @@ mod tests {
             (AgentRequest::Restart, "AGENT_RESTART needs client protocol 4"),
             (AgentRequest::Login, "AGENT_LOGIN needs client protocol 4"),
             (AgentRequest::Fetch, "AGENT_FETCH needs client protocol 4"),
+            (AgentRequest::List, "AGENT_LIST needs client protocol 4"),
+            (AgentRequest::Choose, "AGENT_CHOOSE needs client protocol 4"),
         ];
         for (request, text) in cases {
             for protocol in 1..AGENT_PROTOCOL {

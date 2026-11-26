@@ -72,7 +72,7 @@ forms!(turn_form, TURN_FORMS, TurnState, "TurnState::":
 forms!(stop_form, STOP_FORMS, StopReason, "StopReason::":
     EndTurn, MaxTokens, MaxTurnRequests, Refusal, Cancelled, Other);
 forms!(agent_form, AGENT_FORMS, AgentState, "AgentState::":
-    Starting, Ready, LoginRequired, LoggingIn, Failed, Exited, Lost);
+    Starting, Ready, LoginRequired, LoggingIn, Failed, Exited, Lost, Choosing);
 forms!(continuation_form, CONTINUATION_FORMS, Continuation, "Continuation::":
     ResumeAndLoad, Resume, Load, Neither);
 forms!(login_kind_form, LOGIN_KIND_FORMS, LoginKind, "LoginKind::": Agent, Terminal);
@@ -569,6 +569,15 @@ fn fixtures() -> Vec<(&'static str, Event)> {
         (
             "conversation-resume-and-load",
             conversation("sess-1", Continuation::ResumeAndLoad),
+        ),
+        // Added by `agents-session-list`, within protocol 4 before it
+        // shipped (its design decision 9).
+        ("agent-choosing", agent(AgentState::Choosing { message: None })),
+        (
+            "agent-choosing-refused",
+            agent(AgentState::Choosing {
+                message: Some("no such session".into()),
+            }),
         ),
         (
             "conversation-resume",

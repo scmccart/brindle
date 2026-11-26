@@ -53,10 +53,10 @@ macro_rules! forms {
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
     Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
-    AgentResend, AgentRestart, AgentLogin, AgentFetch);
+    AgentResend, AgentRestart, AgentLogin, AgentFetch, AgentList, AgentChoose);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
-    Process, Transcript, AgentPage);
+    Process, Transcript, AgentPage, AgentConversations);
 forms!(to_holder_form, TO_HOLDER_FORMS, holder::ToHolder, "holder::ToHolder::":
     Hello, Spawn, Input, Resize, Hangup, CheckpointBegin, CheckpointChunk, CheckpointEnd, Drain,
     Goodbye, Reparent, Pause, Resume, SetMeta, SpawnPipes, CheckpointAppend);
@@ -1533,7 +1533,198 @@ fn transcripts() -> Vec<Transcript> {
     .into_iter()
     .chain(agent_transcripts())
     .chain(paging_transcripts())
+    .chain(session_list_transcripts())
     .collect()
+}
+
+/// A `SPAWN_AGENT` of the fake agent in `~/src` that chooses before it
+/// starts a conversation.
+fn spawn_choosing(req: u64) -> Step {
+    c(client::ToCore::SpawnAgent(client::SpawnAgent {
+        req,
+        command: "fake-acp-agent".into(),
+        args: vec!["--script".into(), "/home/u/list.script".into()],
+        cwd: Some("~/src".into()),
+        env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+        policy: Policy::Detach,
+        profile: Some("Agent".into()),
+        conversation: None,
+        start: Some(client::SpawnStart::Choose),
+    }))
+}
+
+fn choosing(message: Option<&str>) -> serde_json::Value {
+    match message {
+        Some(message) => json!({"event": "agent", "state": {"agent": "choosing", "message": message}}),
+        None => json!({"event": "agent", "state": {"agent": "choosing"}}),
+    }
+}
+
+fn list(req: u64, session: u32, cursor: Option<&str>) -> Step {
+    c(client::ToCore::AgentList(client::AgentList {
+        req,
+        session,
+        cursor: cursor.map(str::to_owned),
+    }))
+}
+
+fn choose(req: u64, session: u32, conversation: Option<&str>) -> Step {
+    c(client::ToCore::AgentChoose(client::AgentChoose {
+        req,
+        session,
+        conversation: conversation.map(str::to_owned),
+    }))
+}
+
+fn listed(id: &str, title: Option<&str>, updated: Option<&str>) -> client::ListedConversation {
+    client::ListedConversation {
+        id: id.into(),
+        title: title.map(str::to_owned),
+        updated: updated.map(str::to_owned),
+    }
+}
+
+fn conversations(
+    req: u64,
+    session: u32,
+    conversations: Vec<client::ListedConversation>,
+    next: Option<&str>,
+) -> Step {
+    s(client::ToClient::AgentConversations(client::AgentConversations {
+        req,
+        session,
+        conversations,
+        next: next.map(str::to_owned),
+    }))
+}
+
+/// Transcripts added by `agents-session-list`, within protocol 4 before it
+/// shipped (its design decision 9).
+fn session_list_transcripts() -> Vec<Transcript> {
+    vec![
+        Transcript {
+            name: "client-agent-choose",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with listing: an agent session started to choose, two pages of its conversations, then one chosen, which the agent continues with its replay shown.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                spawn_choosing(1),
+                spawned(1, 1, 5000),
+                transcript(1, vec![choosing(None)]),
+                list(2, 1, None),
+                conversations(
+                    2,
+                    1,
+                    vec![
+                        listed("sess-9a", Some("Fix the upload test"), Some("2026-11-26T18:05:00Z")),
+                        listed("sess-7f", None, None),
+                    ],
+                    Some("page-2"),
+                ),
+                list(3, 1, Some("page-2")),
+                conversations(
+                    3,
+                    1,
+                    vec![listed(CONVERSATION, Some("Add paging"), Some("2026-11-20T09:00:00.125Z"))],
+                    None,
+                ),
+                choose(4, 1, Some(CONVERSATION)),
+                ok(4),
+                transcript(
+                    1,
+                    vec![
+                        added(
+                            1,
+                            notice("this continues an earlier conversation; what follows is the agent's replay of it"),
+                        ),
+                        added(2, text_entry("user", "add paging")),
+                        added(3, text_entry("agent", "Paging is in.")),
+                        conversation("resume_and_load"),
+                        ready(),
+                    ],
+                ),
+            ],
+        },
+        Transcript {
+            name: "client-agent-choose-new",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with listing: a choosing agent with no conversations in its directory, and a new conversation chosen.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                spawn_choosing(1),
+                spawned(1, 1, 5000),
+                transcript(1, vec![choosing(None)]),
+                list(2, 1, None),
+                conversations(2, 1, vec![], None),
+                choose(3, 1, None),
+                ok(3),
+                transcript(1, vec![conversation("resume_and_load"), ready()]),
+            ],
+        },
+        Transcript {
+            name: "client-agent-list-refused",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with listing: a prompt while choosing, a second list before the first is answered, the agent's error to a list, a refused choice returning to choosing with its message, a choice once ready, and a list from an agent that offers none.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                spawn_choosing(1),
+                spawned(1, 1, 5000),
+                transcript(1, vec![choosing(None)]),
+                c(client::ToCore::AgentPrompt(client::AgentPrompt {
+                    req: 2,
+                    session: 1,
+                    text: "hi".into(),
+                })),
+                error(Some(2), Some(1), "session 1: the agent isn't ready"),
+                list(3, 1, None),
+                list(4, 1, None),
+                error(Some(4), Some(1), "session 1: a list of conversations is already being answered"),
+                error(
+                    Some(3),
+                    Some(1),
+                    "session 1: the agent couldn't list its conversations: index unavailable",
+                ),
+                choose(5, 1, Some("sess-gone")),
+                ok(5),
+                transcript(1, vec![choosing(Some("no such session"))]),
+                choose(6, 1, None),
+                ok(6),
+                transcript(1, vec![conversation("resume_and_load"), ready()]),
+                choose(7, 1, None),
+                error(Some(7), Some(1), "session 1: the agent isn't choosing"),
+                list(8, 2, None),
+                error(Some(8), Some(2), "session 2: the agent can't list conversations"),
+            ],
+        },
+        Transcript {
+            name: "client-agent-list-old-client",
+            protocol: Protocol::Client3,
+            about: "A protocol 3 client sending AGENT_LIST and AGENT_CHOOSE is refused.",
+            steps: vec![
+                c(client::ToCore::Hello(client::Hello {
+                    min: 1,
+                    max: 3,
+                    client_version: "0.5.0".into(),
+                    client_token: TOKEN.into(),
+                    ..Default::default()
+                })),
+                s(client::ToClient::Welcome(client::Welcome {
+                    protocol: 3,
+                    core_version: "0.6.0".into(),
+                    core_build: "e4a3".into(),
+                    pid: 4242,
+                    holder_protocols: vec![3],
+                })),
+                list(2, 2, None),
+                error(Some(2), Some(2), "AGENT_LIST needs client protocol 4"),
+                choose(3, 2, None),
+                error(Some(3), Some(2), "AGENT_CHOOSE needs client protocol 4"),
+            ],
+        },
+    ]
 }
 
 // Agent sessions: client protocol 4 and H1 version 3.
@@ -2041,6 +2232,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     policy: Policy::Detach,
                     profile: Some("Agent".into()),
                     conversation: None,
+                    start: None,
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 1,
@@ -2177,6 +2369,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                         id: CONVERSATION.into(),
                         cwd: "/home/u/src".into(),
                     }),
+                    start: None,
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 13,
@@ -2226,6 +2419,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     policy: Policy::Detach,
                     profile: Some("Agent".into()),
                     conversation: None,
+                    start: None,
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 1,

@@ -39,7 +39,8 @@ use brindle_transcript::{
 
 use crate::acp::envelope::{BadParams, Id, RpcError};
 use crate::acp::forms::{
-    AgentInfo, Content, ContentKind, Continued, Initialized, MAX_LOGIN_ARG, MAX_LOGIN_ARGS,
+    AgentInfo, Content, ContentKind, Continued, Initialized, Listed, Listing, MAX_LOGIN_ARG,
+    MAX_LOGIN_ARGS,
     MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
     NewSession, NotificationKind, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
     RequestedOption, SessionUpdate, ToolCall, ToolChange, ToolDetail, ToolItemForm,
@@ -79,6 +80,7 @@ pub fn initialize_result(result: &Value) -> Result<Initialized, BadParams> {
             capabilities.load_session,
             capabilities.session_capabilities.resume.is_some(),
         ),
+        lists: capabilities.session_capabilities.list.is_some(),
         agent: response.agent_info.map(|info| AgentInfo {
             name: info.name,
             title: info.title,
@@ -245,6 +247,37 @@ pub fn new_session_result(result: &Value) -> Result<NewSession, BadParams> {
     Ok(NewSession {
         session_id: response.session_id.0.to_string(),
     })
+}
+
+/// `session/list`'s answer (`{sessions: [{sessionId, cwd, title?,
+/// updatedAt?}], nextCursor?}`), read by hand one entry at a time
+/// (`agents-session-list` decision 2), so an unreadable entry (not an
+/// object, no string `sessionId` or `cwd`) is counted and the others kept.
+/// A `title` or `updatedAt` that isn't a string reads as none, and so does
+/// a `nextCursor`. An answer that isn't an object, or whose `sessions`
+/// isn't a list, is unreadable as a whole.
+pub fn list_result(result: &Value) -> Result<Listing, BadParams> {
+    let sessions = result
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BadParams::missing("sessions"))?;
+    let text = |entry: &Value, key: &str| entry.get(key).and_then(Value::as_str).map(str::to_owned);
+    let mut listing = Listing {
+        next: text(result, "nextCursor"),
+        ..Listing::default()
+    };
+    for entry in sessions {
+        match (text(entry, "sessionId"), text(entry, "cwd")) {
+            (Some(id), Some(cwd)) => listing.conversations.push(Listed {
+                id,
+                cwd,
+                title: text(entry, "title"),
+                updated: text(entry, "updatedAt"),
+            }),
+            (None, _) | (_, None) => listing.unreadable += 1,
+        }
+    }
+    Ok(listing)
 }
 
 /// That `session/resume` succeeded: its result has nothing the reducer
@@ -832,6 +865,125 @@ mod tests {
             Ok(r#""1""#.into())
         );
         assert!(cancel_request(&json!({})).is_err());
+    }
+
+    /// `agents-session-list`'s captures (its task 1.1): each agent's
+    /// `session/list` answers.
+    const LIST_CAPTURES: [(&str, &[u8]); 4] = [
+        (
+            "antigravity-1.5.16-list",
+            include_bytes!("../../../tests/fixtures/acp/antigravity-1.5.16-list.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-list",
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.112.0-list.log"),
+        ),
+        (
+            "codex-acp-2.12.0-list",
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.0-list.log"),
+        ),
+        (
+            "copilot-1.0.116-list",
+            include_bytes!("../../../tests/fixtures/acp/copilot-1.0.116-list.log"),
+        ),
+    ];
+
+    /// Each agent of the list captures offers `list`, and each of its
+    /// answers reads whole, entry for entry, with the cursor it sent.
+    #[test]
+    fn the_captured_lists_read_whole() {
+        for (name, log) in LIST_CAPTURES {
+            let text = std::str::from_utf8(log).unwrap();
+            let mut lists = Vec::new();
+            let mut answers = 0;
+            for line in text.lines() {
+                let (dir, json) = line.split_once('\t').unwrap();
+                let value: Value = serde_json::from_str(json).unwrap();
+                if dir == "c>a" && value["method"] == "session/list" {
+                    lists.push(value["id"].clone());
+                }
+                if dir != "a>c" {
+                    continue;
+                }
+                if value["id"] == json!(1) {
+                    let initialized = initialize_result(&value["result"]).unwrap();
+                    assert!(initialized.lists, "{name}: lists");
+                }
+                if lists.contains(&value["id"]) {
+                    let result = &value["result"];
+                    let listing = list_result(result).unwrap();
+                    let sent = result["sessions"].as_array().unwrap();
+                    assert_eq!(listing.unreadable, 0, "{name}");
+                    assert_eq!(listing.conversations.len(), sent.len(), "{name}");
+                    for (listed, sent) in listing.conversations.iter().zip(sent) {
+                        assert_eq!(listed.id, sent["sessionId"].as_str().unwrap(), "{name}");
+                        assert_eq!(listed.cwd, sent["cwd"].as_str().unwrap(), "{name}");
+                        assert_eq!(listed.title.as_deref(), sent["title"].as_str(), "{name}");
+                        assert_eq!(listed.updated.as_deref(), sent["updatedAt"].as_str(), "{name}");
+                    }
+                    assert_eq!(listing.next.as_deref(), result["nextCursor"].as_str(), "{name}");
+                    answers += 1;
+                }
+            }
+            assert_eq!(answers, 3, "{name}: an answer to each list");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_conversation_is_lost_alone() {
+        let listing = list_result(&json!({
+            "sessions": [
+                {"sessionId": "a", "cwd": "/w", "title": "First", "updatedAt": "2026-11-26T18:05:00Z"},
+                {"cwd": "/w", "title": "no id"},
+                {"sessionId": "c", "cwd": "/w", "title": 7, "updatedAt": null},
+                "not an object",
+                {"sessionId": "e"}
+            ],
+            "nextCursor": "p2"
+        }))
+        .unwrap();
+        let ids: Vec<&str> = listing.conversations.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c"]);
+        assert_eq!(listing.unreadable, 3);
+        assert_eq!(listing.conversations[1].title, None);
+        assert_eq!(listing.conversations[1].updated, None);
+        assert_eq!(listing.next.as_deref(), Some("p2"));
+        assert_eq!(list_result(&json!({"sessions": []})).unwrap(), Listing::default());
+        assert!(list_result(&json!({"sessions": {}})).is_err());
+        assert!(list_result(&json!([])).is_err());
+        assert_eq!(list_result(&json!({"sessions": [], "nextCursor": 3})).unwrap().next, None);
+    }
+
+    #[test]
+    fn a_list_request_names_its_directory_and_cursor() {
+        let line = |cursor| {
+            String::from_utf8(crate::acp::v1::encode::encode(crate::acp::forms::Request::List {
+                id: 9,
+                cwd: "/home/u/src",
+                cursor,
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            line(None),
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"session/list\",\"params\":{\"cwd\":\"/home/u/src\"}}\n"
+        );
+        assert_eq!(
+            line(Some("p\"2")),
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"session/list\",\"params\":{\"cwd\":\"/home/u/src\",\"cursor\":\"p\\\"2\"}}\n"
+        );
+    }
+
+    #[test]
+    fn a_list_capability_is_read_from_initialize() {
+        let lists = |caps: Value| {
+            initialize_result(&json!({"protocolVersion": 1, "agentCapabilities": {"sessionCapabilities": caps}}))
+                .unwrap()
+                .lists
+        };
+        assert!(lists(json!({"list": {}})));
+        assert!(!lists(json!({})));
+        assert!(!lists(json!({"resume": {}})));
     }
 
     /// The captured sessions (task 1.2 and the later captures), each line

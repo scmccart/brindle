@@ -59,7 +59,9 @@ pub fn start_of(message: &ToCore) -> Option<Start> {
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
         | ToCore::AgentLogin(_)
-        | ToCore::AgentFetch(_) => None,
+        | ToCore::AgentFetch(_)
+        | ToCore::AgentList(_)
+        | ToCore::AgentChoose(_) => None,
     }
 }
 
@@ -179,7 +181,9 @@ pub fn over_endpoint(message: &ToCore, endpoint: &EndpointEnv) -> Option<(ToCore
         | ToCore::AgentUnqueue(_)
         | ToCore::AgentResend(_)
         | ToCore::AgentLogin(_)
-        | ToCore::AgentFetch(_) => return None,
+        | ToCore::AgentFetch(_)
+        | ToCore::AgentList(_)
+        | ToCore::AgentChoose(_) => return None,
     };
     Some((message, fallback))
 }
@@ -242,6 +246,7 @@ mod tests {
             policy: Policy::Detach,
             profile: Some("Agy".into()),
             conversation: None,
+            start: None,
         }
     }
 

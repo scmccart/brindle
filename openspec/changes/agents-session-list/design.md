@@ -136,7 +136,7 @@ One screen serves every pane that has no conversation running, drawn where the p
 
 ### 8. The command line (`src/main.rs`, `src/instance.rs`)
 
-- **`brindle agent [PROFILE] -c`** (`--continue`): the tab's zone starts a chooser in the launch's directory; when it is `Choosing`, the model asks for the first page and `latest_plan(conversations) -> Latest::{Continue(id), None}` takes the first entry. `Continue` chooses it; `None` leaves the zone on the choosing screen with "no earlier conversation in DIR" (the user's decision). An agent that can't list leaves it there with that reason.
+- **`brindle agent [PROFILE] -c`** (`--continue`): the tab's zone starts a chooser in the launch's directory; when it is `Choosing`, the model asks for the first page and `latest_plan(conversations) -> Latest::{Continue(id), None}` takes the entry with the newest `updated`, else the first listed (Antigravity doesn't list newest first; decision 15). `Continue` chooses it; `None` leaves the zone on the choosing screen with "no earlier conversation in DIR" (the user's decision). An agent that can't list leaves it there with that reason.
 - **`brindle agent [PROFILE] -r`** (`--resume`): the same start, and the palette opens on the zone once it is `Choosing`. A choice is taken `Here`; escape leaves the choosing screen.
 - `-c` and `-r` together are a usage error (status 2). Either may come with `-d`, and with `-p`, whose prompt is sent on the first `Ready`, after the choice.
 - **The hand-off** to a running Brindle carries the choice in the agent fields (`AgentRequest::choose: Some(Last | List)`) under a kind of its own, `agent-choose`, not `agent` (flag 2). The request is never versioned and an older Brindle ignores a field it doesn't know, so under `agent` it would open a new conversation the user didn't ask for; a kind it doesn't know it refuses by name (`Request::asked`), opening nothing. The launch then prints that the running Brindle is older and can't continue a conversation, with that answer, and exits with status 1 (`command-line`'s "The hand-off across versions"). This version reads `agent-choose` as `agent` with the choice.
@@ -202,7 +202,16 @@ The state word `choosing` joins the agent line's states. The conversations palet
 
 Filled in as the tasks land.
 
-- **The captures (task 1.1).** To be written: each agent's order, whether it honours `cwd`, the form of `updatedAt`, its page size, and whether listing needs a login.
+- **The captures (task 1.1)**, `remote-agent/tests/fixtures/acp/*-list.log`, 2026-11-26. Each made two conversations in a new directory, then listed with that `cwd`, with none, and with an empty directory's. A list answer in the fixtures keeps only the conversations made in capture directories; the user's others are dropped (Claude's answer without `cwd` held 188).
+
+  | Agent | Honours `cwd` | Order | `updatedAt` | Paging | Login to list |
+  | --- | --- | --- | --- | --- | --- |
+  | Codex (`codex-acp` 2.12.0) | yes | newest first | `2026-11-26T20:35:14.000Z` | none seen (5 in all) | not asked |
+  | Antigravity (`agy` 1.5.16) | **no**: the same 8 for every `cwd` and for none | **not** newest first | `2026-11-26T20:35:37Z` | none seen | not asked |
+  | Claude (`claude-agent-acp` 0.112.0) | yes | newest first | `2026-11-26T20:35:49.824Z` | **none**: 188 in one answer | not asked |
+  | Copilot (`copilot` 1.0.116) | yes | newest first | `2026-11-25T02:42:30.315Z` | none seen | **no**: it listed while `session/new` failed on its GitHub credential |
+
+  Every answer's entries have exactly `sessionId`, `cwd`, `title` and `updatedAt`; an empty directory is `sessions: []` (Antigravity's is everything, filtered to nothing by decision 2). So the reducer's directory filter is needed, the 256 bound can be reached, and `latest_plan` takes the entry with the newest `updated` (the first listed when none parses), not simply the first (decision 8). Copilot's capture is a list only: its `session/new` failed, as in `agents-tool-content`.
 
 ### 16. Flags
 
@@ -216,6 +225,11 @@ The user asked for open questions to be decided and flagged. Each is decided as 
 6. **`updated` is the agent's text**, at most 64 bytes; `ago` reads RFC 3339 (with or without fractional seconds, `Z` or an offset), and shows nothing for anything else.
 7. **`AGENT_CHOOSE` takes any bounded id**: the server keeps no list, so it can't check that the id was listed; an id the agent doesn't know is the agent's refusal, as for any continue.
 8. **A list through a ready agent may run during its turn**: ACP allows concurrent requests, and `Busy` refuses only a second list.
+9. **The reducer drops entries of other directories** (decision 2, `reduce::page`): Antigravity ignores `cwd` (decision 15). Directories compare without a trailing separator; nothing else is normalized (no symlinks resolved, no case folded), since the server can't know what the agent meant. An entry with an empty, control-bearing or over-1 KiB id is left out and counted in the core's log, as are the decoder's unreadable entries.
+10. **A login a list needs changes the phase only while choosing** (decisions 1, 11): a choosing agent waits for the login and then chooses again (`AfterLogin::Start(Start::Choose)`); a ready agent keeps its conversation and the list is refused "the agent needs a login", since its next prompt finds the login needed as any prompt would. The alternative, a ready agent going to `LoginRequired` on a list's error, would stop a conversation for a side request.
+11. **A list out when the agent stops being read is answered** with why (`the agent has exited`, `the agent was lost with its holder`, the start's failure, `the terminal server's ACP handling failed`), so a palette waiting on it never hangs.
+12. **A `SPAWN_AGENT` naming both a `conversation` and `start: "choose"` is refused** ("SPAWN_AGENT can't both continue a conversation and choose one").
+13. **A chosen conversation continues as a fresh log's continue does**, so an agent offering both loads it with its replay shown (decision 2 of `agents-session-recovery`), and a resume-only agent resumes it with the notice that its earlier turns aren't shown.
 
 ## The user's decisions
 
@@ -243,7 +257,7 @@ Choices made here, for review:
 - A chooser is a whole agent process waiting on a palette → it is closed when the palette is, and it is the process the conversation then uses.
 - A list through a running agent, then a continue in a new zone, starts a second agent → that zone needs its own agent in any case.
 - Two actions with similar names → the older one is renamed for this conversation, the new one says it lists.
-- The newest conversation is "the first the agent lists" → every captured agent lists newest first; task 1.1 confirms it, and "As built" records any that doesn't, for which `latest_plan` then compares `updated`.
+- The newest conversation isn't always "the first the agent lists" → Antigravity lists another order (decision 15), so `latest_plan` compares `updated`, keeping the agent's first when no time parses. The palette keeps the agent's order, as decision 7 says.
 - A conversation continued while another tool has it open → that is the agent's to handle, as for any continue.
 
 ## Migration Plan

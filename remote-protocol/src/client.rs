@@ -25,7 +25,7 @@
 //! |   12 | `STEP_DOWN`     | client → core | `req`                                                          |
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
 //! |   14 | `SET_LAYOUT`    | client → core | `session, layout?` (protocol 3 only)                           |
-//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?, conversation?` (protocol 4) |
+//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?, conversation?, start?` (protocol 4) |
 //! |   16 | `AGENT_PROMPT`  | client → core | `req, session, text` (protocol 4)                              |
 //! |   17 | `AGENT_CANCEL`  | client → core | `session` (protocol 4)                                         |
 //! |   18 | `AGENT_PERMISSION` | client → core | `req, session, entry, option?` (protocol 4)                 |
@@ -34,6 +34,8 @@
 //! |   21 | `AGENT_RESTART` | client → core | `req, session, command, args, env` (protocol 4)                |
 //! |   22 | `AGENT_LOGIN`   | client → core | `req, session, method` (protocol 4)                            |
 //! |   23 | `AGENT_FETCH`   | client → core | `req, session, before, max_bytes` (protocol 4)                 |
+//! |   31 | `AGENT_LIST`    | client → core | `req, session, cursor?` (protocol 4)                           |
+//! |   64 | `AGENT_CHOOSE`  | client → core | `req, session, conversation?` (protocol 4)                     |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
 //! |   33 | `ERROR`         | core → client | `req?, session?, message`                                      |
 //! |   34 | `SPAWNED`       | core → client | `req, session, pid, key?`                                      |
@@ -46,6 +48,10 @@
 //! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
 //! |   42 | `TRANSCRIPT`    | core → client | `session, events: [object]` (protocol 4)                       |
 //! |   43 | `AGENT_PAGE`    | core → client | `req, session, events: [object], last?: {more}` (protocol 4)   |
+//! |   45 | `AGENT_CONVERSATIONS` | core → client | `req, session, conversations: [{id, title?, updated?}], next?` (protocol 4) |
+//!
+//! The two directions share one number space: clients' messages are below
+//! 32 and from 64, the core's from 32 to 63.
 //!
 //! Exchanges:
 //! - `HELLO` → `WELCOME`, or `ERROR` naming both ranges ([`negotiate`]).
@@ -144,6 +150,16 @@
 //!   which only protocol 4 lists, with size 0×0; it is left out otherwise.
 //!   [`AgentActivity`] is this crate's own closed enum, in program status's
 //!   names.
+//! - Listing (OpenSpec change `agents-session-list`, amending protocol 4
+//!   before it shipped): `SPAWN_AGENT`'s `start: "choose"` starts an agent
+//!   that answers `initialize` and then waits, its state `choosing`, with
+//!   no conversation. `AGENT_CHOOSE` → `OK` or `ERROR` ends the wait:
+//!   with `conversation`, the agent continues that conversation in the
+//!   session's directory; without, it starts a new one. `AGENT_LIST` →
+//!   `AGENT_CONVERSATIONS` or `ERROR` asks a ready or choosing agent for a
+//!   page of its conversations in the session's directory, `cursor` being
+//!   an earlier reply's `next`; the core keeps no list. Only the client
+//!   that has the session attached may send either.
 //!
 //! A client below 4 isn't shown agent sessions, and is refused an `ATTACH`
 //! of one with an `ERROR` naming the session. Nothing else differs from
@@ -195,6 +211,12 @@ pub const MSG_AGENT_RESTART: u8 = 21;
 pub const MSG_AGENT_LOGIN: u8 = 22;
 /// Protocol 4.
 pub const MSG_AGENT_FETCH: u8 = 23;
+/// Protocol 4 (`agents-session-list`; 24 to 30 are kept for the changes
+/// planned before it).
+pub const MSG_AGENT_LIST: u8 = 31;
+/// Protocol 4 (`agents-session-list`): the first of the clients' second
+/// block, since 32 to 63 are the core's.
+pub const MSG_AGENT_CHOOSE: u8 = 64;
 pub const MSG_WELCOME: u8 = 32;
 pub const MSG_ERROR: u8 = 33;
 pub const MSG_SPAWNED: u8 = 34;
@@ -210,6 +232,9 @@ pub const MSG_PROCESS: u8 = 41;
 pub const MSG_TRANSCRIPT: u8 = 42;
 /// Protocol 4.
 pub const MSG_AGENT_PAGE: u8 = 43;
+/// Protocol 4 (`agents-session-list`; 44 is kept for a change planned
+/// before it).
+pub const MSG_AGENT_CONVERSATIONS: u8 = 45;
 
 /// Bytes for one session: input from the client, output from the core.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,6 +530,64 @@ pub struct SpawnAgent {
     /// the conversation to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation: Option<AgentConversation>,
+    /// How the agent starts when no `conversation` is named: left out, a
+    /// new conversation; `choose`, none until a client sends
+    /// `AGENT_CHOOSE` (OpenSpec change `agents-session-list`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<SpawnStart>,
+}
+
+/// `SPAWN_AGENT`'s `start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpawnStart {
+    /// Initialize the agent, then wait for a choice.
+    Choose,
+}
+
+/// `AGENT_LIST` (protocol 4): a page of the agent's earlier conversations
+/// in the session's directory, after `cursor` (an earlier reply's `next`),
+/// answered by `AGENT_CONVERSATIONS`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentList {
+    pub req: RequestId,
+    pub session: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// `AGENT_CHOOSE` (protocol 4): ends a choosing session's wait, continuing
+/// the agent's conversation `conversation` in the session's directory, or
+/// starting a new one when it is left out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentChoose {
+    pub req: RequestId,
+    pub session: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation: Option<String>,
+}
+
+/// `AGENT_CONVERSATIONS` (protocol 4): the answer to an `AGENT_LIST`, in the
+/// agent's order, with `next` to ask for the page after it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConversations {
+    pub req: RequestId,
+    pub session: SessionId,
+    #[serde(default)]
+    pub conversations: Vec<ListedConversation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+/// One conversation of an `AGENT_CONVERSATIONS`: the agent's id for it, its
+/// title, and when it was last active, as the agent's text.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListedConversation {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated: Option<String>,
 }
 
 /// An agent's conversation, as `SPAWN_AGENT` names one to continue: the ACP
@@ -825,6 +908,10 @@ pub enum ToCore {
     AgentLogin(AgentLogin),
     /// Protocol 4: fetch entries older than the client holds.
     AgentFetch(AgentFetch),
+    /// Protocol 4: list the agent's earlier conversations.
+    AgentList(AgentList),
+    /// Protocol 4: end a choosing agent's wait.
+    AgentChoose(AgentChoose),
 }
 
 impl ToCore {
@@ -853,6 +940,8 @@ impl ToCore {
             Self::AgentRestart(m) => wire::json(MSG_AGENT_RESTART, m),
             Self::AgentLogin(m) => wire::json(MSG_AGENT_LOGIN, m),
             Self::AgentFetch(m) => wire::json(MSG_AGENT_FETCH, m),
+            Self::AgentList(m) => wire::json(MSG_AGENT_LIST, m),
+            Self::AgentChoose(m) => wire::json(MSG_AGENT_CHOOSE, m),
         }
     }
 
@@ -883,6 +972,8 @@ impl ToCore {
             MSG_AGENT_RESTART => Self::AgentRestart(wire::from_json("AGENT_RESTART", frame)?),
             MSG_AGENT_LOGIN => Self::AgentLogin(wire::from_json("AGENT_LOGIN", frame)?),
             MSG_AGENT_FETCH => Self::AgentFetch(wire::from_json("AGENT_FETCH", frame)?),
+            MSG_AGENT_LIST => Self::AgentList(wire::from_json("AGENT_LIST", frame)?),
+            MSG_AGENT_CHOOSE => Self::AgentChoose(wire::from_json("AGENT_CHOOSE", frame)?),
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -909,6 +1000,8 @@ pub enum ToClient {
     Transcript(Transcript),
     /// Protocol 4: a frame of an `AGENT_FETCH`'s answer.
     AgentPage(AgentPage),
+    /// Protocol 4: the answer to an `AGENT_LIST`.
+    AgentConversations(AgentConversations),
 }
 
 impl ToClient {
@@ -935,6 +1028,7 @@ impl ToClient {
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
                 wire::json(MSG_AGENT_PAGE, m)
             }
+            Self::AgentConversations(m) => wire::json(MSG_AGENT_CONVERSATIONS, m),
         }
     }
 
@@ -960,6 +1054,9 @@ impl ToClient {
                 let page: AgentPage = wire::from_json("AGENT_PAGE", frame)?;
                 page.check()?;
                 Self::AgentPage(page)
+            }
+            MSG_AGENT_CONVERSATIONS => {
+                Self::AgentConversations(wire::from_json("AGENT_CONVERSATIONS", frame)?)
             }
             other => return Err(wire::unknown_type("core-to-client", other)),
         })
@@ -1090,6 +1187,7 @@ pub(crate) mod samples {
                 policy: Policy::Detach,
                 profile: Some("Claude".into()),
                 conversation: None,
+                start: None,
             }),
             ToCore::SpawnAgent(SpawnAgent {
                 req: 15,
@@ -1103,6 +1201,7 @@ pub(crate) mod samples {
                     id: "sess-4f1c".into(),
                     cwd: "/home/u/src".into(),
                 }),
+                start: None,
             }),
             ToCore::AgentPrompt(AgentPrompt {
                 req: 10,
@@ -1147,6 +1246,32 @@ pub(crate) mod samples {
                 session: 9,
                 before: 120,
                 max_bytes: 262_144,
+            }),
+            ToCore::AgentList(AgentList {
+                req: 19,
+                session: 9,
+                cursor: None,
+            }),
+            ToCore::AgentList(AgentList {
+                req: 20,
+                session: 9,
+                cursor: Some("page-2".into()),
+            }),
+            ToCore::AgentChoose(AgentChoose {
+                req: 21,
+                session: 9,
+                conversation: Some("sess-9a".into()),
+            }),
+            ToCore::AgentChoose(AgentChoose {
+                req: 22,
+                session: 9,
+                conversation: None,
+            }),
+            ToCore::SpawnAgent(SpawnAgent {
+                req: 23,
+                command: "fake-acp-agent".into(),
+                start: Some(SpawnStart::Choose),
+                ..Default::default()
             }),
         ]
     }
@@ -1262,6 +1387,29 @@ pub(crate) mod samples {
                 events: Vec::new(),
                 last: Some(PageEnd { more: true }),
             }),
+            ToClient::AgentConversations(AgentConversations {
+                req: 19,
+                session: 9,
+                conversations: vec![
+                    ListedConversation {
+                        id: "sess-9a".into(),
+                        title: Some("Fix the upload test".into()),
+                        updated: Some("2026-11-26T18:05:00Z".into()),
+                    },
+                    ListedConversation {
+                        id: "sess-7f".into(),
+                        title: None,
+                        updated: None,
+                    },
+                ],
+                next: Some("page-2".into()),
+            }),
+            ToClient::AgentConversations(AgentConversations {
+                req: 20,
+                session: 9,
+                conversations: Vec::new(),
+                next: None,
+            }),
             ToClient::ServerStatus(ServerStatus {
                 req: 6,
                 core_version: "0.3.0".into(),
@@ -1315,7 +1463,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in MSG_DATA..=MSG_AGENT_LOGIN {
+        for expected in (MSG_DATA..=MSG_AGENT_FETCH).chain([MSG_AGENT_LIST, MSG_AGENT_CHOOSE]) {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -1329,7 +1477,7 @@ mod tests {
             assert_eq!(&ToClient::decode(&frame).unwrap(), message);
         }
         assert!(types.contains(&MSG_DATA));
-        for expected in MSG_WELCOME..=MSG_TRANSCRIPT {
+        for expected in (MSG_WELCOME..=MSG_AGENT_PAGE).chain([MSG_AGENT_CONVERSATIONS]) {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -1456,7 +1604,7 @@ mod tests {
 
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, 23, 31, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, 255] {
+        for msg_type in [0, 23, 30, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, 45, 63, 65, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             let error = ToCore::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1469,8 +1617,10 @@ mod tests {
             MSG_AGENT_RESEND,
             MSG_AGENT_RESTART,
             MSG_AGENT_LOGIN,
-            31,
+            MSG_AGENT_LIST,
+            MSG_AGENT_CHOOSE,
             43,
+            44,
             255,
         ] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();

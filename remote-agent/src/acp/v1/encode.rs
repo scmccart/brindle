@@ -62,6 +62,10 @@ pub fn encode(request: Request<'_>) -> Vec<u8> {
                 quote(text)
             ),
         ),
+        Request::List { id, cwd, cursor } => {
+            let cursor = cursor.map_or_else(String::new, |cursor| format!(r#","cursor":{}"#, quote(cursor)));
+            call(id, "session/list", &format!(r#"{{"cwd":{}{cursor}}}"#, quote(cwd)))
+        }
         Request::Cancel { session } => line(format!(
             r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":{}}}}}"#,
             quote(session)

@@ -394,6 +394,27 @@ fn the_agent_messages_reject_bad_values_without_panicking() {
             client::MSG_AGENT_PAGE,
             format!(r#"{{"req":1,"session":1,"events":[{{"event":"turn"}},{value}],"last":{{"more":{value}}}}}"#),
         ));
+        // Listing (`agents-session-list`).
+        cases.push((
+            client::MSG_SPAWN_AGENT,
+            format!(r#"{{"req":1,"command":"a","start":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_LIST,
+            format!(r#"{{"req":{value},"session":{value},"cursor":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_CHOOSE,
+            format!(r#"{{"req":{value},"session":{value},"conversation":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_CONVERSATIONS,
+            format!(r#"{{"req":{value},"session":{value},"conversations":{value},"next":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_CONVERSATIONS,
+            format!(r#"{{"req":1,"session":1,"conversations":[{{"id":{value},"title":{value},"updated":{value}}}]}}"#),
+        ));
     }
     let decoders = decoders();
     for (msg_type, payload) in cases {
