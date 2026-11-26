@@ -41,6 +41,12 @@ pub struct Tokens {
     /// in v4. A token, not an alpha computed in the component, so a
     /// source's legibility checks see the colour drawn.
     pub destructive_tint: Hsla,
+    /// The background of a diff's added lines: `muted` tinted green, the
+    /// foreground legible on it. Not one of shadcn's variables (AI
+    /// Elements' diffs use Tailwind's greens).
+    pub diff_added: Hsla,
+    /// The background of a diff's removed lines: `muted` tinted red.
+    pub diff_removed: Hsla,
     pub border: Hsla,
     /// The border of form controls.
     pub input: Hsla,
@@ -98,6 +104,8 @@ impl Tokens {
             destructive: hex(0xe7000b),            // oklch(0.577 0.245 27.325), clamped to sRGB
             destructive_foreground: hex(0xffffff), // text-white
             destructive_tint: hex(0xfce0e2),       // card 12% towards destructive
+            diff_added: hex(0xd4e9db),             // muted 15% towards green-600 (0x16a34a)
+            diff_removed: hex(0xf3d0d2),           // muted 15% towards destructive
             border: hex(0xe5e5e5),                 // oklch(0.922 0 0)
             input: hex(0xe5e5e5),                  // oklch(0.922 0 0)
             ring: hex(0xa1a1a1),                   // oklch(0.708 0 0)
@@ -128,6 +136,8 @@ impl Tokens {
             destructive: hex(0xff6467),            // oklch(0.704 0.191 22.216), clamped to sRGB
             destructive_foreground: hex(0xffffff), // text-white
             destructive_tint: hex(0x332021),       // card 12% towards destructive
+            diff_added: hex(0x2d4b38),             // muted 20% towards green-400 (0x4ade80)
+            diff_removed: hex(0x513233),           // muted 20% towards destructive
             border: hsla(0., 0., 1., 0.10),        // oklch(1 0 0 / 10%)
             input: hsla(0., 0., 1., 0.15),         // oklch(1 0 0 / 15%)
             ring: hex(0x737373),                   // oklch(0.556 0 0)
@@ -380,6 +390,22 @@ mod tests {
             assert!(text >= 4.5, "{name}: card_foreground on the tint {text:.2}");
             let icon = contrast(set.destructive, set.destructive_tint);
             assert!(icon >= 3.0, "{name}: destructive on the tint {icon:.2}");
+        }
+    }
+
+    /// The neutral sets' diff tints are green and red, apart from `muted`,
+    /// with the foreground at 4.5:1 on each.
+    #[test]
+    fn the_neutral_diff_tints_are_green_and_red_and_legible() {
+        for (name, set) in [("light", Tokens::neutral_light()), ("dark", Tokens::neutral_dark())] {
+            let (added, removed, muted) = (bytes(set.diff_added), bytes(set.diff_removed), bytes(set.muted));
+            assert!(added != muted && removed != muted && added != removed, "{name}");
+            assert!(added[1] > added[0] && added[1] > added[2], "{name}: added is green {added:?}");
+            assert!(removed[0] > removed[1] && removed[0] > removed[2], "{name}: removed is red {removed:?}");
+            for (what, tint) in [("added", set.diff_added), ("removed", set.diff_removed)] {
+                let text = contrast(set.foreground, tint);
+                assert!(text >= 4.5, "{name}: foreground on diff_{what} {text:.2}");
+            }
         }
     }
 

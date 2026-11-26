@@ -143,6 +143,8 @@ pub struct Config {
     /// Desktop notifications from bells, OSC 9/777, kitty's OSC 99 and
     /// program status records.
     pub notifications: NotificationConfig,
+    /// Agent zones' settings (OpenSpec change `agents-tool-content`).
+    pub agent: AgentConfig,
     pub profiles: Vec<Profile>,
     pub themes: BTreeMap<String, Theme>,
     /// Extra keybindings: `"ctrl-shift-x" = "action_name"`.
@@ -166,6 +168,7 @@ impl Default for Config {
             mark_failed_commands: true,
             removed_tmux_session_end: None,
             notifications: NotificationConfig::default(),
+            agent: AgentConfig::default(),
             profiles: Vec::new(),
             themes: BTreeMap::new(),
             keybindings: BTreeMap::new(),
@@ -311,6 +314,56 @@ impl Default for NotificationConfig {
             agent: true,
             when: NotifyWhen::Unfocused,
         }
+    }
+}
+
+/// Whether a tool call row in an agent zone is open on its own (`[agent]`'s
+/// `tool_details` and `tool_details_when_done`, OpenSpec change
+/// `agents-tool-content` decision 10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shown {
+    Open,
+    Closed,
+}
+
+impl Shown {
+    /// The value `key` holds, or an error naming the key and both values
+    /// (the config line's text for a bad one: TOML's own names neither).
+    fn read<'de, D: serde::Deserializer<'de>>(key: &str, deserializer: D) -> Result<Self, D::Error> {
+        let value = toml::Value::deserialize(deserializer)?;
+        match value.as_str() {
+            Some("open") => Ok(Self::Open),
+            Some("closed") => Ok(Self::Closed),
+            Some(_) | None => Err(serde::de::Error::custom(format!(
+                "agent.{key} is `open` or `closed`, not {value}"
+            ))),
+        }
+    }
+}
+
+fn tool_details<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Shown, D::Error> {
+    Shown::read("tool_details", deserializer)
+}
+
+fn tool_details_when_done<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Shown, D::Error> {
+    Shown::read("tool_details_when_done", deserializer)
+}
+
+/// `[agent]`: agent zones' settings, global to every agent profile.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    /// A running tool call's row.
+    #[serde(deserialize_with = "tool_details")]
+    pub tool_details: Shown,
+    /// A finished tool call's row.
+    #[serde(deserialize_with = "tool_details_when_done")]
+    pub tool_details_when_done: Shown,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self { tool_details: Shown::Open, tool_details_when_done: Shown::Closed }
     }
 }
 
@@ -1422,6 +1475,48 @@ mod tests {
         assert!(config.notifications.osc9 && config.notifications.osc777 && config.notifications.osc7501);
         assert!(parsed("[notifications]\nwhen = \"sometimes\"").is_err());
         assert!(parsed("[notifications]\nsound = true").is_err());
+    }
+
+    // agents-tool-content 5.1: the `[agent]` table.
+
+    #[test]
+    fn agent_tool_details_default_open_while_running_and_closed_when_done() {
+        let defaults = AgentConfig { tool_details: Shown::Open, tool_details_when_done: Shown::Closed };
+        assert_eq!(AgentConfig::default(), defaults);
+        assert_eq!(parsed("").unwrap().agent, defaults);
+        assert_eq!(parsed("[agent]").unwrap().agent, defaults);
+        assert_eq!(parsed(DEFAULT_CONFIG).unwrap().agent, defaults, "the shipped config says the defaults");
+    }
+
+    #[test]
+    fn agent_tool_details_take_open_and_closed() {
+        for (word, shown) in [("open", Shown::Open), ("closed", Shown::Closed)] {
+            let config = parsed(&format!("[agent]\ntool_details = {word:?}")).unwrap();
+            assert_eq!(config.agent.tool_details, shown);
+            assert_eq!(config.agent.tool_details_when_done, Shown::Closed);
+            let config = parsed(&format!("[agent]\ntool_details_when_done = {word:?}")).unwrap();
+            assert_eq!(config.agent.tool_details_when_done, shown);
+            assert_eq!(config.agent.tool_details, Shown::Open);
+        }
+    }
+
+    /// A value that isn't one of the two names the key and both values,
+    /// and loads the defaults, as every invalid config does.
+    #[test]
+    fn a_bad_tool_details_value_names_the_key_and_its_values() {
+        for key in ["tool_details", "tool_details_when_done"] {
+            let err = format!("{:#}", parsed(&format!("[agent]\n{key} = \"maybe\"")).unwrap_err());
+            assert!(err.contains(&format!("agent.{key}")), "{err}");
+            assert!(err.contains("maybe") && err.contains("`open`") && err.contains("`closed`"), "{err}");
+        }
+        let err = format!("{:#}", parsed("[agent]\ntool_details = true").unwrap_err());
+        assert!(err.contains("agent.tool_details"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_under_agent_is_an_error() {
+        let err = format!("{:#}", parsed("[agent]\ntool_detail = \"open\"").unwrap_err());
+        assert!(err.contains("tool_detail"), "{err}");
     }
 
     #[test]

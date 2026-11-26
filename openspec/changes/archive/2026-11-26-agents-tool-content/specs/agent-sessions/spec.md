@@ -1,3 +1,90 @@
+## MODIFIED Requirements
+
+### Requirement: Transcript event forms are fixed for each protocol version
+On a connection that negotiated client protocol 4, the server SHALL send only the transcript event kinds and enumerated values of protocol 4 as first released; once a release has shipped protocol 4, a new kind or value SHALL come with a new client protocol version. Within protocol 4 an event MAY gain optional fields, which a protocol 4 client SHALL be able to ignore.
+
+#### Scenario: Every event decodes
+- **WHEN** a protocol 4 client decodes every transcript event of an agent session's turn, queue, permission, cancel, login, trim and exit
+- **THEN** each decodes as one of protocol 4's event forms
+
+#### Scenario: An unknown field is ignored
+- **WHEN** a protocol 4 client decodes a protocol 4 event that carries an extra field it doesn't know
+- **THEN** it decodes to the same event as without the field
+
+#### Scenario: A login demand without methods
+- **WHEN** a protocol 4 client decodes the "login required" agent state with a message and no methods
+- **THEN** its encoding is the same as before login methods existed
+
+#### Scenario: A conversation without a title
+- **WHEN** a protocol 4 client decodes a conversation event the agent gave no title
+- **THEN** its encoding is the same as before conversation titles existed
+
+#### Scenario: A tool call without content
+- **WHEN** a protocol 4 client decodes a tool call entry with no content, locations, raw input or raw result
+- **THEN** its encoding is the same as before tool call content existed
+
+#### Scenario: Tool content decodes
+- **WHEN** a protocol 4 client decodes every transcript event of a turn whose tool calls hold text, a file change and command output
+- **THEN** each decodes as one of protocol 4's event forms
+
+### Requirement: Attach replays the transcript
+A client on protocol 4 SHALL be able to attach a detached agent session. Before any live event the server SHALL send a delimited replay of a page of the log, the queue slot, the conversation, the turn state and the agent's state as transcript events. The page SHALL hold the newest whole entries up to the page budget (256 KiB of encoded entries, or less when the client's `ATTACH` asks for less), and always at least the newest entry, every entry from the oldest permission request still waiting for an answer, and every entry from the tool call each such request names. When older entries exist, the replay SHALL say from which entry the page starts and how many entries before it can be fetched. After the replay the client's copy SHALL equal the server's log from the page's first entry on, tool call content included. Attaching follows the ownership and close policy rules of terminal sessions.
+
+#### Scenario: Replay after a turn
+- **WHEN** a session finished a turn while detached, and a client attaches it
+- **THEN** the replay holds the user message, the agent message and the turn's end, and folding it gives the server's log
+
+#### Scenario: Live after replay
+- **WHEN** a client attaches a session in the middle of a turn
+- **THEN** it receives the replay, then the turn's later chunks as live events, and none twice
+
+#### Scenario: Attaching again replays from the start
+- **WHEN** a client detaches an agent session after receiving part of a turn, and attaches it again
+- **THEN** the new replay holds the newest page of the log, whatever the client had received or fetched before
+
+#### Scenario: A long conversation sends a page
+- **WHEN** a client attaches a session whose log holds 4 MiB of entries
+- **THEN** the replay holds the newest entries up to 256 KiB, says that the entries before its first one can be fetched and how many there are, and ends with the slot, the conversation, the turn and the agent's state
+
+#### Scenario: A smaller budget
+- **WHEN** a client attaches a long session asking for a 16 KiB page
+- **THEN** the replay holds the newest entries up to 16 KiB, and at least the newest entry
+
+#### Scenario: An entry larger than the page
+- **WHEN** a client attaches a session whose newest entry is a 1 MiB agent message
+- **THEN** the replay holds that whole entry, and no older one
+
+#### Scenario: A waiting permission is always in the page
+- **WHEN** a client attaches a session waiting on a permission request that has 2 MiB of entries after it
+- **THEN** the replay starts at or before the permission request's entry, and the client can answer it
+
+#### Scenario: A waiting permission's tool call is in the page
+- **WHEN** a client attaches a session waiting on a permission request for tool call `call_1`, whose entry holds a file change and has 2 MiB of entries between it and the request
+- **THEN** the replay starts at or before `call_1`'s entry, and holds its file change
+
+#### Scenario: A titled conversation's page
+- **WHEN** a client attaches a long session whose agent titled its conversation `Hello.txt file creation` near its start
+- **THEN** the replay holds the conversation with that title, however few of the entries the page holds
+
+### Requirement: Entries a client hasn't fetched stay current
+The server SHALL keep updating every entry of its log, whether or not the attached client has fetched it. A client SHALL ignore live changes to entries older than the oldest one it holds, tool call content included, and a later fetch SHALL return those entries with every change made to them.
+
+#### Scenario: A tool call finishes outside the page
+- **WHEN** a tool call entry older than the attached client's page is updated to `completed`, and the client then fetches the entries before its page
+- **THEN** the fetched tool call entry has status `completed`
+
+#### Scenario: Output outside the page
+- **WHEN** a tool call entry older than the attached client's page gets more command output, and the client then fetches the entries before its page
+- **THEN** the fetched entry's output item holds that output, and the client received nothing for it before the fetch
+
+#### Scenario: Live after a fetch
+- **WHEN** a client fetches an older page that holds a tool call still running, and the tool call is then updated
+- **THEN** the client's copy of that entry shows the update
+
+#### Scenario: A fetch after a trim took the page
+- **WHEN** a client has fetched back to entries the server then drops past 16 MiB, and its next fetch is answered after the drop
+- **THEN** it receives no entries and is told nothing earlier remains, and its copy keeps the entries the server still has
+
 ## ADDED Requirements
 
 ### Requirement: Tool calls keep their content

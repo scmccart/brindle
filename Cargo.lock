@@ -774,6 +774,7 @@ dependencies = [
  "brindle-transcript",
  "embed-resource",
  "libc",
+ "similar",
  "windows 0.61.3",
 ]
 
@@ -5372,6 +5373,12 @@ checksum = "95890f873bec569a0362c235787f3aca6e1e887302ba4840839bcc6459c42da6"
 dependencies = [
  "quote",
 ]
+
+[[package]]
+name = "similar"
+version = "3.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
 
 [[package]]
 name = "simplecss"

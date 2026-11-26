@@ -52,12 +52,22 @@ pub struct CodeBlock {
     code: Code,
     font: Option<SharedString>,
     on_copy: Option<OnCopy>,
+    joined: (bool, bool),
 }
 
 impl CodeBlock {
     /// `id` is unique among its siblings.
     pub fn new(id: impl Into<ElementId>, code: Code) -> Self {
-        Self { id: id.into(), code, font: None, on_copy: None }
+        Self { id: id.into(), code, font: None, on_copy: None, joined: (false, false) }
+    }
+
+    /// Whether the block continues another above it and below it, as a
+    /// long output drawn a run of lines at a time: a block joined above has
+    /// no header, and a joined edge no rounding, border or padding, so the
+    /// blocks read as one frame.
+    pub fn joined(mut self, above: bool, below: bool) -> Self {
+        self.joined = (above, below);
+        self
     }
 
     /// The family the code is drawn in: the owner's monospace one. Without
@@ -99,42 +109,48 @@ impl RenderOnce for CodeBlock {
             .flex_none()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .child(copy);
+        let (above, below) = self.joined;
+        let radius = t.radius_md();
+        let header = (!above).then(|| {
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .pl_3()
+                .pr_1()
+                .py_1()
+                // One line, cut with an ellipsis when it doesn't fit beside
+                // the button: its width comes from the row, never from its
+                // own measure, which gpui 0.2.2 can keep from a narrower pass
+                // (the wrapping text pitfall).
+                .child(
+                    trigger_label(label.unwrap_or_default())
+                        .debug_selector(|| "code-block-label".into())
+                        .text_size(rems(0.75))
+                        .text_color(t.muted_foreground),
+                )
+                .child(copy)
+        });
         div()
             .id(self.id)
             .flex()
             .flex_col()
             .w_full()
             .min_w_0()
-            .rounded(t.radius_md())
-            .border_1()
+            .border_l_1()
+            .border_r_1()
             .border_color(t.border)
+            .when(!above, |d| d.border_t_1().rounded_t(radius))
+            .when(!below, |d| d.border_b_1().rounded_b(radius))
             .overflow_hidden()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .pl_3()
-                    .pr_1()
-                    .py_1()
-                    // One line, cut with an ellipsis when it doesn't fit
-                    // beside the button: its width comes from the row, never
-                    // from its own measure, which gpui 0.2.2 can keep from a
-                    // narrower pass (the wrapping text pitfall).
-                    .child(
-                        trigger_label(label.unwrap_or_default())
-                            .debug_selector(|| "code-block-label".into())
-                            .text_size(rems(0.75))
-                            .text_color(t.muted_foreground),
-                    )
-                    .child(copy),
-            )
+            .children(header)
             .child(
                 div()
                     .debug_selector(|| "code-block-code".into())
                     .px_3()
-                    .py_2()
+                    .when(!above, |d| d.pt_2())
+                    .when(!below, |d| d.pb_2())
                     .bg(t.muted)
                     .text_color(t.foreground)
                     .when_some(self.font, |d, family| d.font_family(family))
@@ -158,6 +174,35 @@ mod tests {
         assert_eq!(shown_code(&"a\n\n".into()).as_ref(), "a\n");
         assert_eq!(shown_code(&"unclosed".into()).as_ref(), "unclosed");
         assert_eq!(shown_code(&"".into()).as_ref(), "");
+    }
+
+    struct Joined;
+
+    impl Render for Joined {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let code = |text: &str| Code { label: Some("cargo test".into()), text: text.to_string().into() };
+            div()
+                .w(px(400.))
+                .flex()
+                .flex_col()
+                .child(div().debug_selector(|| "first".into()).child(CodeBlock::new("a", code("1\n2\n")).joined(false, true)))
+                .child(div().debug_selector(|| "second".into()).child(CodeBlock::new("b", code("3\n4\n")).joined(true, false)))
+        }
+    }
+
+    /// A block joined above has no header: the second run of a long output
+    /// is its lines alone, right under the first's.
+    #[test]
+    fn a_block_joined_above_has_no_header() {
+        let mut app = test_support::app();
+        let (_, cx) = app.add_window_view(|_, _| Joined);
+        cx.run_until_parked();
+        let (first, second) = (cx.debug_bounds("first").expect("drawn"), cx.debug_bounds("second").expect("drawn"));
+        assert_eq!(first.bottom(), second.top());
+        // The same two lines, less the header's height.
+        let label = cx.debug_bounds("code-block-label").expect("the first block's header");
+        assert!(label.bottom() <= second.top());
+        assert!(second.size.height + label.size.height <= first.size.height, "{first:?} {second:?}");
     }
 
     struct Host {

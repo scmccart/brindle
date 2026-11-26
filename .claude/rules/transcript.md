@@ -12,6 +12,7 @@ You are editing the crate that holds the agent transcript's events and their fol
 - The encoding fixtures (`tests/fixtures/v4/`) are written only when missing and never edited once shipped, as `remote-protocol`'s are. Never edit one to make a change pass.
 - Decoding and folding return this crate's own errors (`DecodeError`, `FoldError`), never a panic, on any input: these values come over the wire (`railway R2`, `R5`). Every decoder and the fold are in `fuzz.rs`.
 - No `_ =>` on the crate's own enums, and no `unwrap` or `expect` outside tests; the root's lints hold this (`railway R3`, `R9`).
+- A tool entry's content (`ToolItem::{Text, Diff, Output}`, locations, raw values) is bounded in the fold, and every bound says what it left out (`cut`, `omitted`, `more`, `partial`), so a client can tell the reader; folding pieces equals folding their concatenation (`agents-tool-content`). A page that holds a waiting permission reaches back to that permission's tool entry.
 - Every change ships with unit tests in the same file, with no sleep (`fcis R8`).
 
 If the code needs IO, a clock, ACP's types or GPUI, it belongs in `src/` or `remote-agent/`, and this crate gets the values as arguments.

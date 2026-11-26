@@ -25,9 +25,10 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use brindle_transcript::{
-    AgentState, Continuation, Conversation, Entry, EntryId, Event, HoldReason, LoginKind,
-    LoginMethod, NoticeLevel, PermissionKind, PermissionOption, PermissionOutcome, Slot,
-    StopReason, ToolKind, ToolStatus, TurnState,
+    AgentState, Continuation, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange,
+    FileOp, HoldReason, Hunk, Location, LoginKind, LoginMethod, NoticeLevel, Output,
+    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind,
+    ToolStatus, TurnState,
 };
 use serde_json::Value;
 
@@ -48,7 +49,12 @@ macro_rules! forms {
 }
 
 forms!(event_form, EVENT_FORMS, Event, "Event::":
-    Added, Appended, ToolChanged, Answered, Queue, Turn, Agent, Conversation, Trimmed, Window);
+    Added, Appended, ToolChanged, ToolItems, ToolOutput, Answered, Queue, Turn, Agent,
+    Conversation, Trimmed, Window);
+forms!(tool_item_form, TOOL_ITEM_FORMS, ToolItem, "ToolItem::": Text, Diff, Output);
+forms!(file_op_form, FILE_OP_FORMS, FileOp, "FileOp::": Add, Delete, Modify, Move, Copy, Other);
+forms!(diff_line_form, DIFF_LINE_FORMS, DiffLine, "DiffLine::": Context, Added, Removed);
+forms!(exit_form, EXIT_FORMS, Exit, "Exit::": Code, Signal);
 forms!(entry_form, ENTRY_FORMS, Entry, "Entry::": User, Agent, Thought, Tool, Permission, Notice);
 forms!(tool_kind_form, TOOL_KIND_FORMS, ToolKind, "ToolKind::":
     Read, Edit, Delete, Move, Search, Execute, Think, Fetch, SwitchMode, Other);
@@ -87,8 +93,30 @@ fn expected_forms() -> Vec<&'static str> {
         AGENT_FORMS,
         CONTINUATION_FORMS,
         LOGIN_KIND_FORMS,
+        TOOL_ITEM_FORMS,
+        FILE_OP_FORMS,
+        DIFF_LINE_FORMS,
+        EXIT_FORMS,
     ]
     .concat()
+}
+
+fn item_forms(item: &ToolItem, forms: &mut Vec<&'static str>) {
+    forms.push(tool_item_form(item));
+    match item {
+        ToolItem::Diff(change) => {
+            forms.push(file_op_form(&change.op));
+            forms.extend(
+                change
+                    .hunks
+                    .iter()
+                    .flat_map(|hunk| &hunk.lines)
+                    .map(diff_line_form),
+            );
+        }
+        ToolItem::Output(output) => forms.extend(output.exit.iter().map(exit_form)),
+        ToolItem::Text { .. } => {}
+    }
 }
 
 fn stop_forms(stop: &StopReason, forms: &mut Vec<&'static str>) {
@@ -98,9 +126,17 @@ fn stop_forms(stop: &StopReason, forms: &mut Vec<&'static str>) {
 fn entry_forms(entry: &Entry, forms: &mut Vec<&'static str>) {
     forms.push(entry_form(entry));
     match entry {
-        Entry::Tool { kind, status, .. } => {
+        Entry::Tool {
+            kind,
+            status,
+            content,
+            ..
+        } => {
             forms.push(tool_kind_form(kind));
             forms.push(tool_status_form(status));
+            for item in content {
+                item_forms(item, forms);
+            }
         }
         Entry::Permission {
             options, outcome, ..
@@ -126,6 +162,12 @@ fn forms(event: &Event) -> Vec<&'static str> {
             forms.extend(kind.iter().map(tool_kind_form));
             forms.extend(status.iter().map(tool_status_form));
         }
+        Event::ToolItems { items, .. } => {
+            for item in items {
+                item_forms(item, &mut forms);
+            }
+        }
+        Event::ToolOutput { exit, .. } => forms.extend(exit.iter().map(exit_form)),
         Event::Answered { outcome, .. } => forms.push(outcome_form(outcome)),
         Event::Queue { slot } => {
             forms.push(slot_form(slot));
@@ -167,11 +209,63 @@ fn added(n: u64, entry: Entry) -> Event {
 }
 
 fn tool_changed(kind: ToolKind, status: ToolStatus) -> Event {
+    changed(None, Some(kind), Some(status))
+}
+
+/// A `ToolChanged` of entry 4's title, kind and status alone.
+fn changed(title: Option<&str>, kind: Option<ToolKind>, status: Option<ToolStatus>) -> Event {
+    Event::ToolChanged {
+        id: id(4),
+        title: title.map(Into::into),
+        kind,
+        status,
+        locations: None,
+        input: None,
+        result: None,
+        more: None,
+    }
+}
+
+/// A `ToolChanged` of entry 4's content fields alone.
+fn changed_content(
+    locations: Option<Vec<Location>>,
+    input: Option<Option<String>>,
+    result: Option<Option<String>>,
+    more: Option<u32>,
+) -> Event {
     Event::ToolChanged {
         id: id(4),
         title: None,
-        kind: Some(kind),
-        status: Some(status),
+        kind: None,
+        status: None,
+        locations,
+        input,
+        result,
+        more,
+    }
+}
+
+fn text_item(text: &str) -> ToolItem {
+    ToolItem::Text {
+        text: text.into(),
+        cut: false,
+    }
+}
+
+fn change(op: FileOp, path: &str, hunks: Vec<Hunk>, omitted: u32) -> ToolItem {
+    ToolItem::Diff(FileChange {
+        op,
+        path: path.into(),
+        hunks,
+        omitted,
+    })
+}
+
+fn tool_items(from: u32, items: Vec<ToolItem>) -> Event {
+    Event::ToolItems {
+        id: id(4),
+        from,
+        items,
     }
 }
 
@@ -237,12 +331,12 @@ fn fixtures() -> Vec<(&'static str, Event)> {
             "added-tool",
             added(
                 4,
-                Entry::Tool {
-                    call: "call_1".into(),
-                    title: "Write notes.md".into(),
-                    kind: ToolKind::Edit,
-                    status: ToolStatus::Pending,
-                },
+                Entry::tool(
+                    "call_1".into(),
+                    "Write notes.md".into(),
+                    ToolKind::Edit,
+                    ToolStatus::Pending,
+                ),
             ),
         ),
         (
@@ -312,22 +406,13 @@ fn fixtures() -> Vec<(&'static str, Event)> {
         ),
         (
             "tool-changed",
-            Event::ToolChanged {
-                id: id(4),
-                title: Some("Write notes.md (3 lines)".into()),
-                kind: Some(ToolKind::Edit),
-                status: Some(ToolStatus::InProgress),
-            },
+            changed(
+                Some("Write notes.md (3 lines)"),
+                Some(ToolKind::Edit),
+                Some(ToolStatus::InProgress),
+            ),
         ),
-        (
-            "tool-changed-nothing",
-            Event::ToolChanged {
-                id: id(4),
-                title: None,
-                kind: None,
-                status: None,
-            },
-        ),
+        ("tool-changed-nothing", changed(None, None, None)),
         (
             "tool-changed-read",
             tool_changed(ToolKind::Read, ToolStatus::Pending),
@@ -564,6 +649,158 @@ fn fixtures() -> Vec<(&'static str, Event)> {
                 earlier: 79,
             },
         ),
+        // Added by `agents-tool-content`, within protocol 4 before it
+        // shipped (its design decision 8).
+        (
+            "added-tool-content",
+            added(
+                4,
+                Entry::Tool {
+                    call: "call_1".into(),
+                    title: "Edit main.rs".into(),
+                    kind: ToolKind::Edit,
+                    status: ToolStatus::Completed,
+                    content: vec![
+                        ToolItem::Text {
+                            text: "```\nok\n```".into(),
+                            cut: true,
+                        },
+                        change(
+                            FileOp::Modify,
+                            "/p/main.rs",
+                            vec![Hunk {
+                                old_start: 10,
+                                new_start: 10,
+                                lines: vec![
+                                    DiffLine::Context("fn main() {".into()),
+                                    DiffLine::Removed("    old();".into()),
+                                    DiffLine::Added("    new();".into()),
+                                ],
+                            }],
+                            2,
+                        ),
+                        change(FileOp::Add, "/p/new.txt", Vec::new(), 0),
+                        change(FileOp::Delete, "/p/old.txt", Vec::new(), 0),
+                        change(
+                            FileOp::Move {
+                                from: "/p/a.rs".into(),
+                            },
+                            "/p/b.rs",
+                            Vec::new(),
+                            0,
+                        ),
+                        change(
+                            FileOp::Copy {
+                                from: "/p/c.rs".into(),
+                            },
+                            "/p/d.rs",
+                            Vec::new(),
+                            0,
+                        ),
+                        change(
+                            FileOp::Other {
+                                name: "chmod".into(),
+                            },
+                            "/p/e.sh",
+                            Vec::new(),
+                            0,
+                        ),
+                        ToolItem::Output(Output {
+                            command: Some("cargo test".into()),
+                            cwd: Some("/p".into()),
+                            text: "test result: ok\n".into(),
+                            omitted: 4096,
+                            partial: true,
+                            exit: Some(Exit::Code { code: 0 }),
+                        }),
+                        ToolItem::Output(Output {
+                            command: None,
+                            cwd: None,
+                            text: String::new(),
+                            omitted: 0,
+                            partial: false,
+                            exit: Some(Exit::Signal {
+                                name: "KILL".into(),
+                            }),
+                        }),
+                    ],
+                    more: 3,
+                    locations: vec![
+                        Location {
+                            path: "/p/main.rs".into(),
+                            line: Some(10),
+                        },
+                        Location {
+                            path: "/p/b.rs".into(),
+                            line: None,
+                        },
+                    ],
+                    input: Some("{\n  \"path\": \"/p/main.rs\"\n}".into()),
+                    result: Some("done".into()),
+                },
+            ),
+        ),
+        (
+            "tool-items-replaced",
+            tool_items(0, vec![text_item("a"), text_item("b")]),
+        ),
+        (
+            "tool-items-appended",
+            tool_items(
+                2,
+                vec![ToolItem::Output(Output {
+                    command: None,
+                    cwd: Some("/p".into()),
+                    text: String::new(),
+                    omitted: 0,
+                    partial: false,
+                    exit: None,
+                })],
+            ),
+        ),
+        ("tool-items-cleared", tool_items(0, Vec::new())),
+        (
+            "tool-output",
+            Event::ToolOutput {
+                id: id(4),
+                item: 2,
+                text: "running 3 tests\n".into(),
+                exit: None,
+            },
+        ),
+        (
+            "tool-output-exit",
+            Event::ToolOutput {
+                id: id(4),
+                item: 2,
+                text: "test result: FAILED\n".into(),
+                exit: Some(Exit::Code { code: 101 }),
+            },
+        ),
+        (
+            "tool-changed-locations",
+            changed_content(
+                Some(vec![Location {
+                    path: "/p/main.rs".into(),
+                    line: Some(3),
+                }]),
+                None,
+                None,
+                None,
+            ),
+        ),
+        (
+            "tool-changed-input",
+            changed_content(None, Some(Some("{\"command\":\"ls\"}".into())), None, None),
+        ),
+        (
+            "tool-changed-result",
+            changed_content(None, None, Some(None), None),
+        ),
+        (
+            "tool-changed-more",
+            changed_content(None, None, None, Some(5)),
+        ),
     ]
 }
 
@@ -776,7 +1013,10 @@ fn a_conversation_with_a_field_it_doesnt_know_decodes_the_same() {
 
 /// The fields whose strings are a closed enum's values: the tags and the
 /// fieldless enums. Every other string is free text.
-const ENUM_FIELDS: [&str; 12] = [
+const ENUM_FIELDS: [&str; 15] = [
+    "item",
+    "op",
+    "exit",
     "event",
     "type",
     "turn",

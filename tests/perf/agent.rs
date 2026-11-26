@@ -188,28 +188,18 @@ fn end(mut child: Child) {
 
 /// One run: Brindle opens `Fake` with the first prompt `go`, the case
 /// opens the gate once the record shows the prompt, and Brindle quits on
-/// the last line. Its files are `LABEL.*` in the case directory, and its
-/// terminal server is stopped before the next run, its logs kept in
-/// `LABEL/`. Returns the time from the gate to the exit.
-fn run(ctx: &Ctx, agent: &Path, label: &str, pieces: &[&str]) -> Result<Duration> {
+/// `last`. The agent's script is `make(record, gate)`. Its files are
+/// `LABEL.*` in the case directory, and its terminal server is stopped
+/// before the next run, its logs kept in `LABEL/`. Returns the time from
+/// the gate to the exit.
+fn run(ctx: &Ctx, agent: &Path, label: &str, last: &str, make: &dyn Fn(&Path, &Path) -> String) -> Result<Duration> {
     let record = ctx.dir.join(format!("{label}.jsonl"));
     let gate = ctx.dir.join(format!("{label}.gate"));
     let script_path = ctx.dir.join(format!("{label}.script"));
-    std::fs::write(&script_path, script(&record, &gate, pieces)).map_err(|e| format!("writing the script: {e}"))?;
+    std::fs::write(&script_path, make(&record, &gate)).map_err(|e| format!("writing the script: {e}"))?;
     let interval = STEP_INTERVAL.as_secs_f64().to_string();
-    let args = [
-        "agent",
-        "Fake",
-        "--no-restore",
-        "-p",
-        "go",
-        "--step-interval",
-        &interval,
-        "--wait-for",
-        LAST_LINE,
-        "--action",
-        "quit",
-    ];
+    let args =
+        ["agent", "Fake", "--no-restore", "-p", "go", "--step-interval", &interval, "--wait-for", last, "--action", "quit"];
     let mut child = spawn_with(ctx, label, &config(agent, &script_path), &args)?;
 
     let asked = Instant::now();
@@ -254,8 +244,8 @@ pub fn markdown_stream(ctx: &Ctx) -> Result<Measured> {
     }
     let text = answer();
     let streamed = chunks(&text, CHUNK_BYTES);
-    let streamed_time = run(ctx, &agent.path, "streamed", &streamed)?;
-    let whole_time = run(ctx, &agent.path, "whole", &[text.as_str()])?;
+    let streamed_time = run(ctx, &agent.path, "streamed", LAST_LINE, &|record, gate| script(record, gate, &streamed))?;
+    let whole_time = run(ctx, &agent.path, "whole", LAST_LINE, &|record, gate| script(record, gate, &[text.as_str()]))?;
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     Ok(Measured::Stream(StreamResult {
         bytes: text.len() as u64,
@@ -445,5 +435,133 @@ pub fn self_test_attach() -> Result {
     let value: serde_json::Value = serde_json::from_str(&sends[0][5..]).map_err(|e| e.to_string())?;
     ensure!(value["params"]["update"]["content"]["text"] == replies[0].1, "the first send's text");
     ensure!(lines.last().is_some_and(|l| l == r#"respond {"stopReason":"end_turn"}"#), "no end of turn");
+    Ok(())
+}
+
+// `agent-tool-output` (OpenSpec change `agents-tool-content`, design.md
+// decision 17, flag 13): how long an agent zone takes to show a command's
+// output streamed into its tool call's open row, in Codex's `_meta`
+// deltas, against the same output sent in one delta. The row keeps its
+// newest 64 KiB, so the check is that a long output costs the view only
+// what it keeps and shows.
+
+/// The output's length, exactly.
+pub const OUTPUT_BYTES: usize = 1024 * 1024;
+/// The streamed run's delta size, the last delta excepted.
+pub const DELTA_BYTES: usize = 4 * 1024;
+/// The output's last line, and what Brindle's `--wait-for` waits for: the
+/// output's `--- item` line holds it only once the last delta is in.
+pub const OUTPUT_LAST_LINE: &str = "End of the streamed output.";
+
+/// The output: numbered test lines, a filler line, and
+/// [`OUTPUT_LAST_LINE`] with its line break, exactly [`OUTPUT_BYTES`].
+/// ASCII, so every byte offset is a char boundary.
+pub fn command_output() -> String {
+    let tail = format!("{OUTPUT_LAST_LINE}\n");
+    let mut out = String::with_capacity(OUTPUT_BYTES);
+    for n in 0.. {
+        let line = format!("test case {n:06} ... ok\n");
+        if out.len() + line.len() + tail.len() > OUTPUT_BYTES {
+            break;
+        }
+        out.push_str(&line);
+    }
+    // The gap left is shorter than a line: dashes and a line break.
+    let gap = OUTPUT_BYTES - out.len() - tail.len();
+    if gap > 0 {
+        out.push_str(&"-".repeat(gap - 1));
+        out.push('\n');
+    }
+    out.push_str(&tail);
+    out
+}
+
+/// A `send` step of a `session/update` whose `update` is `update` (JSON).
+fn send_update(update: &str) -> String {
+    format!(r#"send {{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{update}}}}}"#)
+}
+
+/// The fake agent's script: ready at once, recording what it is sent in
+/// `record`; on the prompt it starts a command's tool call, its row open
+/// while it runs, and waits for `gate`; then it sends each of `pieces` as
+/// a `terminal_output_delta`, the command's exit, and ends the turn.
+pub fn output_script(record: &Path, gate: &Path, pieces: &[&str]) -> String {
+    let mut lines = vec![
+        format!("record {}", record.display()),
+        "expect initialize".to_string(),
+        r#"respond {"protocolVersion":1,"agentInfo":{"name":"Fake Agent","version":"1.0"}}"#.to_string(),
+        "expect session/new".to_string(),
+        r#"respond {"sessionId":"s1"}"#.to_string(),
+        "expect session/prompt".to_string(),
+        send_update(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Run tests","kind":"execute","status":"in_progress","content":[{"type":"terminal","terminalId":"t1"}],"_meta":{"terminal_info":{"terminal_id":"t1","cwd":"/w","command":"cargo test"}}}"#,
+        ),
+        format!("wait-file {}", gate.display()),
+    ];
+    lines.extend(pieces.iter().map(|piece| {
+        send_update(&format!(
+            r#"{{"sessionUpdate":"tool_call_update","toolCallId":"c1","_meta":{{"terminal_output_delta":{{"terminal_id":"t1","data":"{}"}}}}}}"#,
+            json_escape(piece)
+        ))
+    }));
+    lines.push(send_update(
+        r#"{"sessionUpdate":"tool_call_update","toolCallId":"c1","status":"completed","_meta":{"terminal_exit":{"terminal_id":"t1","exit_code":0,"signal":null}}}"#,
+    ));
+    lines.push(r#"respond {"stopReason":"end_turn"}"#.to_string());
+    lines.join("\n") + "\n"
+}
+
+pub fn tool_output(ctx: &Ctx) -> Result<Measured> {
+    let agent = fake_agent::find(&ctx.default_bin);
+    if let Err(why) = fake_agent::check(&agent, &ctx.default_bin) {
+        return Ok(Measured::Skip(why));
+    }
+    let text = command_output();
+    let deltas = chunks(&text, DELTA_BYTES);
+    let streamed_time =
+        run(ctx, &agent.path, "streamed", OUTPUT_LAST_LINE, &|record, gate| output_script(record, gate, &deltas))?;
+    let whole_time =
+        run(ctx, &agent.path, "whole", OUTPUT_LAST_LINE, &|record, gate| output_script(record, gate, &[text.as_str()]))?;
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    Ok(Measured::Stream(StreamResult {
+        bytes: text.len() as u64,
+        chunks: deltas.len() as u64,
+        streamed_ms: ms(streamed_time),
+        whole_ms: ms(whole_time),
+        difference_ms: ms(streamed_time) - ms(whole_time),
+        step_interval_ms: ms(STEP_INTERVAL),
+    }))
+}
+
+/// The output, its deltas and the script (`--self-test`).
+pub fn self_test_tool_output() -> Result {
+    let text = command_output();
+    ensure!(text.len() == OUTPUT_BYTES, "the output is {} bytes", text.len());
+    ensure!(text.is_ascii(), "the output isn't ASCII");
+    ensure!(text.ends_with(&format!("\n{OUTPUT_LAST_LINE}\n")), "the last line isn't a line of its own");
+    ensure!(text.matches(OUTPUT_LAST_LINE).count() == 1, "the last line shows more than once");
+    ensure!(text.starts_with("test case 000000 ... ok\n"), "the first line: {:?}", &text[..24]);
+
+    let deltas = chunks(&text, DELTA_BYTES);
+    ensure!(deltas.len() == OUTPUT_BYTES / DELTA_BYTES, "{} deltas", deltas.len());
+    ensure!(deltas.concat() == text, "the deltas don't make the output");
+    let before_last = &text[..text.len() - deltas[deltas.len() - 1].len()];
+    ensure!(!before_last.contains(OUTPUT_LAST_LINE), "the last line is whole before the last delta");
+
+    let (record, gate) = (Path::new("/case/r.jsonl"), PathBuf::from("/case/g"));
+    let lines: Vec<String> = output_script(record, &gate, &["a\"\n", "b\n"]).lines().map(String::from).collect();
+    ensure!(lines[0] == "record /case/r.jsonl", "{lines:?}");
+    let at = lines.iter().position(|l| l == "expect session/prompt").ok_or("no prompt step")?;
+    // The call starts before the gate, so the timed run streams into an
+    // open row.
+    ensure!(lines[at + 1].contains(r#""sessionUpdate":"tool_call""#), "no call before the gate: {lines:?}");
+    ensure!(lines[at + 2] == "wait-file /case/g", "the gate doesn't follow the call: {lines:?}");
+    let sends = &lines[at + 3..lines.len() - 1];
+    ensure!(sends.len() == 3, "{} sends after the gate", sends.len());
+    let value: serde_json::Value = serde_json::from_str(&sends[0][5..]).map_err(|e| e.to_string())?;
+    let delta = &value["params"]["update"]["_meta"]["terminal_output_delta"];
+    ensure!(delta["terminal_id"] == "t1" && delta["data"] == "a\"\n", "the first delta: {}", sends[0]);
+    ensure!(sends[2].contains(r#""terminal_exit""#) && sends[2].contains(r#""status":"completed""#), "no exit: {}", sends[2]);
+    ensure!(lines.last().is_some_and(|l| l == r#"respond {"stopReason":"end_turn"}"#), "no end of turn: {lines:?}");
     Ok(())
 }

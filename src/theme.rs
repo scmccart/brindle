@@ -360,6 +360,10 @@ impl Theme {
         tokens.destructive = destructive.hsla();
         tokens.destructive_foreground = destructive.on_color().hsla();
         tokens.destructive_tint = destructive_tint(raised, fg, destructive).hsla();
+        // A diff's added and removed lines: the code surface towards the
+        // theme's green and red, the text kept legible (decision 11).
+        tokens.diff_added = legible_tint(surface, fg, self.ansi[2], DIFF_TINT_MAX, 1.0).hsla();
+        tokens.diff_removed = legible_tint(surface, fg, self.ansi[1], DIFF_TINT_MAX, 1.0).hsla();
         tokens.border = border.hsla();
         tokens.input = border.hsla();
         tokens.ring = accent.hsla();
@@ -381,12 +385,23 @@ pub const DESTRUCTIVE_TINT_MAX: f32 = 0.12;
 /// [`DESTRUCTIVE_TINT_MAX`] of the way, in steps of 1%; the card itself
 /// when no step does.
 pub fn destructive_tint(card: Color, text: Color, destructive: Color) -> Color {
-    let steps = (DESTRUCTIVE_TINT_MAX * 100.0).round() as u32;
+    legible_tint(card, text, destructive, DESTRUCTIVE_TINT_MAX, 3.0)
+}
+
+/// How far a diff line's tint goes from `muted` towards the theme's green
+/// or red at most (OpenSpec change `agents-tool-content`, decision 11).
+pub const DIFF_TINT_MAX: f32 = 0.20;
+
+/// `base` mixed towards `colour` as far as keeps `text` at 4.5:1 and
+/// `colour` itself at `colour_min` on it (1.0: no check), at most `max` of
+/// the way, in steps of 1%; `base` itself when no step does.
+pub fn legible_tint(base: Color, text: Color, colour: Color, max: f32, colour_min: f32) -> Color {
+    let steps = (max * 100.0).round() as u32;
     (0..=steps)
         .rev()
-        .map(|step| card.mix(destructive, step as f32 / 100.0))
-        .find(|tint| text.contrast(*tint) >= 4.5 && destructive.contrast(*tint) >= 3.0)
-        .unwrap_or(card)
+        .map(|step| base.mix(colour, step as f32 / 100.0))
+        .find(|tint| text.contrast(*tint) >= 4.5 && colour.contrast(*tint) >= colour_min)
+        .unwrap_or(base)
 }
 
 const fn palette(colors: [u32; 16]) -> [Color; 16] {
@@ -959,10 +974,31 @@ mod tests {
                 // (agents-zone-attention).
                 ("card_foreground on destructive_tint", t.card_foreground, t.destructive_tint, 4.5),
                 ("destructive on destructive_tint", t.destructive, t.destructive_tint, 3.0),
+                // A diff's added and removed lines (agents-tool-content).
+                ("foreground on diff_added", t.foreground, t.diff_added, 4.5),
+                ("foreground on diff_removed", t.foreground, t.diff_removed, 4.5),
             ];
             for (label, fg, bg, min) in pairs {
                 let ratio = color_of(fg).contrast(color_of(bg));
                 assert!(ratio >= min, "{name} ({set} set): {label} contrast {ratio:.2} < {min}");
+            }
+        }
+    }
+
+    /// Decision 11: each set's diff colours are its muted surface towards
+    /// the theme's green and red, apart from it and from each other.
+    #[test]
+    fn diff_colours_are_muted_tinted_green_and_red_for_every_builtin() {
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            for (set, t) in [("window", theme.ui_tokens()), ("zone", theme.zone_tokens())] {
+                let (muted, added, removed) = (color_of(t.muted), color_of(t.diff_added), color_of(t.diff_removed));
+                assert!(added != muted && removed != muted && added != removed, "{name} ({set} set)");
+                let towards = |colour: Color, tint: Color| {
+                    (1..=20).any(|step| muted.mix(colour, step as f32 / 100.0) == tint)
+                };
+                assert!(towards(theme.ansi[2], added), "{name} ({set} set): {added:?} isn't muted towards green");
+                assert!(towards(theme.ansi[1], removed), "{name} ({set} set): {removed:?} isn't muted towards red");
             }
         }
     }

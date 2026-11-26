@@ -380,9 +380,24 @@ rule, not a convenience.
   - `Reasoning`: a trigger (lucide `brain`, the owner's label, a chevron
     turned over while open) over muted content; the owner holds `open` and
     flips it from `on_toggle`.
-  - `Tool`: one row, an icon, the title cut with an ellipsis and a status
-    badge (`ToolStatus`: pending, running, done, failed in the destructive
-    colour, `tool_status_colors`) that stays whole.
+  - `Tool`: one row, an icon, the title cut with an ellipsis, an optional
+    `.summary` (muted) and a status badge (`ToolStatus`: pending, running,
+    done, failed in the destructive colour, `tool_status_colors`), both
+    kept whole. With `.open(Some(open))` it ends in a chevron turned over
+    while open, and a primary press asks the owner to flip it
+    (`.on_toggle`, the row needing an `.id`); the owner draws the content.
+    `.open(None)`: no chevron, and a press does nothing.
+  - `Diff` (`components/diff.rs`): one file's change from plain lines the
+    owner gives (`DiffRowData`: `DiffSign`, old and new line numbers, text,
+    `hunk_start`): a header (`.header(op, path, from)`: the operation's
+    word, the path, `from → path` for a move or copy, and a pointer-only
+    ghost copy button, tooltip "Copy diff", `COPY_DIFF`, asking the owner
+    through `.on_copy`), then each line's two numbers, sign column (` `,
+    `+`, `−`) and text in the owner's family (`.font`), on `muted`,
+    `diff_added` or `diff_removed` (`diff_line_background`), a `border`
+    line above a hunk's first line. `.joined(above, below)` drops the frame's
+    edge where the owner continues it in another block. No focus, no
+    diffing.
   - `Confirmation`: a title and, while `ConfirmationState::Requested`, one
     small button per `ConfirmationAction` (keyed by `ItemKey`, a focus stop
     through the owner's handle), `on_action(key)`; once `Accepted`,
@@ -443,7 +458,9 @@ rule, not a convenience.
     ends it). The button is always shown, takes no focus and keeps focus
     where it was on a press; it gives the owner the whole text
     (`.on_copy`, or a response's `.on_copy_code`) and never writes the
-    clipboard.
+    clipboard. `.joined(above, below)` draws one run of a longer text the
+    owner lays out as several blocks: joined above, no header; a joined
+    edge has no border, rounding or padding.
 - **Actions** (`actions.rs`): `brindle_ui::TextInput*`, `TextArea*`,
   `PromptSubmit`/`PromptStop`, `Dismiss`, `FocusNext`/`FocusPrev` and
   `ListUp`/`ListDown`/`ListFirst`/`ListLast`/`ListConfirm`, bound by
@@ -938,8 +955,14 @@ code comes from there.
 - **Reasoning's trigger is pointer-only** (AI Elements' is a button): a
   conversation holds many, and Tab through each would bury the prompt. The
   owner holds `open`; no auto-close timer.
-- **Tool is one row** with no collapsible input and output, and takes no
-  focus; its badge says pending, running, done or failed.
+- **Tool is one row** with no collapsible of its own, and takes no
+  focus; its badge says pending, running, done or failed. The owner holds
+  whether its content is open and draws it below the row (an agent zone
+  lays a long detail out as separate list items), so the row is only the
+  trigger, pointer-only as Reasoning's.
+- **Diff** has no AI Elements counterpart; its line tints are tokens
+  (`diff_added`, `diff_removed`), not Tailwind's greens and reds, so a
+  theme scope's set draws them.
 - **Confirmation's outcome shows the chosen action's label**, and
   `Cancelled` shows "Cancelled"; the actions are keyed (`ItemKey`). An
   action can carry a description under its button (AI Elements' has

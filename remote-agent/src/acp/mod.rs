@@ -2,14 +2,23 @@
 //! OpenSpec change `agents-sessions`): the core's shell feeds an agent's
 //! stdout through these and writes what they return to its stdin, and never
 //! decodes ACP itself. Only this directory names `agent_client_protocol_schema`
-//! (`ports R3`, `only_the_acp_modules_name_the_schema_crate`).
+//! (`ports R3`, `only_the_acp_modules_name_the_schema_crate`), and within it
+//! only the version's own module names that version (`ports R14`,
+//! `acp_versions_stay_in_their_modules`).
 //!
-//! - [`wire`]: the JSON-RPC envelope ([`wire::Message`], decoded by hand) and
-//!   the ACP forms the reducer reads, decoded through the schema crate's types
-//!   into Brindle's own closed ones.
+//! - [`envelope`]: the JSON-RPC envelope ([`envelope::Message`], decoded by
+//!   hand), with no ACP version in it.
+//! - [`forms`]: what the reducer reads and asks to be written, in Brindle's
+//!   own closed types, whatever the version.
+//! - [`dialect`]: the version a session speaks ([`dialect::Dialect`]), and
+//!   the only `match` on it.
+//! - [`v1`]: ACP v1 decoded into the forms through the schema crate's types,
+//!   and the forms' requests encoded as v1 lines.
+//! - [`diff`]: a file change's hunks from its old and new text.
 //! - [`lines`]: stdout split into bounded lines ([`lines::Lines`]).
-//! - [`rpc`]: the request bookkeeping ([`rpc::Rpc`]) and every line the core
-//!   writes to the agent.
+//! - [`plain`]: a command's output as plain text.
+//! - [`rpc`]: the request bookkeeping ([`rpc::Rpc`]), which keeps the
+//!   session's dialect and takes each line from it.
 //! - [`reduce`]: the reducer ([`reduce::step`] over a [`reduce::AgentSession`]),
 //!   which turns the agent's stdout, the client's commands and the holder's
 //!   events into transcript events, stdin bytes, replies and checkpoints.
@@ -20,7 +29,12 @@
 //! Each is a whole pure module (`fcis` R2, R3; `PURE_MODULES`).
 
 pub mod checkpoint;
+pub mod dialect;
+pub mod diff;
+pub mod envelope;
+pub mod forms;
 pub mod lines;
+pub mod plain;
 pub mod reduce;
 pub mod rpc;
-pub mod wire;
+pub mod v1;

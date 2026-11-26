@@ -605,7 +605,9 @@ pub fn cancel(ctx: &Ctx) -> Result<Outcome> {
 /// prompt reaches its buttons, reject first though the agent listed allow
 /// first (`agents-zone-attention` decision 4), and enter on one answers
 /// it: the agent gets the option chosen, and the turn goes on to its end.
-/// The dump's entry line keeps the agent's order.
+/// The dump's entry line keeps the agent's order. The request names a call
+/// the agent never sent, so the server adds its tool entry first, entry 2
+/// (`agents-tool-content`), and the request is entry 3.
 pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let profile = Script::ready(&received)
@@ -621,12 +623,12 @@ pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
     let out = started("focus").key("tab").dump_at(5.0).run()?;
     waited(&out)?;
     ensure!(out.dump.agent_field("status") == Some("blocked"), "agent: {:?}", out.dump.agent);
-    ensure!(out.dump.focus_stop.as_deref() == Some("permission:2:reject-once"), "focus: {:?}", out.dump.focus_stop);
+    ensure!(out.dump.focus_stop.as_deref() == Some("permission:3:reject-once"), "focus: {:?}", out.dump.focus_stop);
 
     std::fs::remove_file(&received).ok();
     let out = started("reject").key("tab").key("enter").wait_for("agent \"done\"").dump_at(7.0).run()?;
     waited(&out)?;
-    agent_has(&out, "entry 2 permission call=\"call_1\" options=allow-once:\"Allow\"|reject-once:\"Reject\" outcome=selected:reject-once")?;
+    agent_has(&out, "entry 3 permission call=\"call_1\" options=allow-once:\"Allow\"|reject-once:\"Reject\" outcome=selected:reject-once")?;
     ensure!(out.dump.agent_field("turn") == Some("ended:end_turn"), "agent: {:?}", out.dump.agent);
     let sent = std::fs::read_to_string(&received).map_err(|e| e.to_string())?;
     ensure!(
@@ -1935,9 +1937,14 @@ pub fn quit_restore(ctx: &Ctx) -> Result<Outcome> {
         .dump_at(5.0)
         .run()?;
     waited(&out)?;
+    // The request's call, which the agent never sent, is the tool entry
+    // before it (`agents-tool-content`).
     let entries = out.dump.agent_entries();
     ensure!(
-        entries.len() == 2 && entries[0] == "user \"one\"" && entries[1].ends_with("outcome=pending \"Write a file\""),
+        entries.len() == 3
+            && entries[0] == "user \"one\""
+            && entries[1].starts_with("tool call=\"call_1\"")
+            && entries[2].ends_with("outcome=pending \"Write a file\""),
         "entries: {entries:?}"
     );
     ensure!(prompts_sent(&received)? == ["one"], "sent: {:?}", prompts_sent(&received)?);
@@ -3291,5 +3298,488 @@ pub fn login_terminal_env(ctx: &Ctx) -> Result<Outcome> {
     let text = std::fs::read_to_string(&env).map_err(|e| format!("reading {}: {e}", env.display()))?;
     ensure!(text.lines().any(|l| l == "LOGIN_MODE=device"), "LOGIN_MODE not applied: {text}");
     ensure!(text.lines().any(|l| l.starts_with("PATH=")) && !text.lines().any(|l| l == "PATH=/nowhere"), "PATH applied: {text}");
+    Ok(Outcome::Pass)
+}
+
+// --- Tool content (OpenSpec change `agents-tool-content`, section 8) -----
+
+/// The zone set's `diff_added` for the `e2e` theme, an added diff line's
+/// background: `ZONE_MUTED` mixed the most, 20%, towards the theme's green
+/// (`ANSI[2]`), since the foreground stays legible on it
+/// (`theme::legible_tint`, decision 11).
+const ZONE_DIFF_ADDED: crate::capture::Rgb = crate::capture::Rgb(0x25, 0x42, 0x2a);
+/// The same towards the theme's red (`ANSI[1]`): `diff_removed`.
+const ZONE_DIFF_REMOVED: crate::capture::Rgb = crate::capture::Rgb(0x45, 0x28, 0x2a);
+
+/// A diff item editing `/w/notes.txt` from apple to banana, as ACP's JSON.
+const NOTES_DIFF: &str = r#"{"type":"diff","path":"/w/notes.txt","oldText":"first\nan apple a day\nlast\n","newText":"first\nan banana a day\nlast\n"}"#;
+
+/// [`NOTES_DIFF`]'s `--- item` line, without `item entry=N `.
+const NOTES_ITEM: &str = "index=0 kind=diff op=modify path=\"/w/notes.txt\" added=1 removed=1 omitted=0";
+
+/// A tool line holding [`NOTES_DIFF`]'s count and summary.
+const NOTES_COUNTS: &str = "items=1 summary=\"+1 \u{2212}1\"";
+
+/// A `tool_call` for `call`, titled `title`, with `status` and `content`
+/// (a JSON array) and any `more` fields (`,"rawInput":…`).
+fn tool_call(call: &str, title: &str, status: &str, content: &str, more: &str) -> String {
+    update(&format!(
+        r#"{{"sessionUpdate":"tool_call","toolCallId":"{call}","title":"{title}","kind":"edit","status":"{status}","content":{content}{more}}}"#
+    ))
+}
+
+/// A `tool_call_update` setting `call`'s status to `completed`.
+fn tool_completed(call: &str) -> String {
+    update(&format!(r#"{{"sessionUpdate":"tool_call_update","toolCallId":"{call}","status":"completed"}}"#))
+}
+
+/// A `tool_call_update` for `call` carrying Codex's `_meta` (`meta`, an
+/// object's members) and any `more` fields.
+fn tool_meta(call: &str, meta: &str, more: &str) -> String {
+    update(&format!(r#"{{"sessionUpdate":"tool_call_update","toolCallId":"{call}"{more},"_meta":{{{meta}}}}}"#))
+}
+
+/// The line of tool entry `entry` holds `want`.
+fn tool_line(out: &crate::brindle::Output, entry: u64, want: &str) -> Result {
+    let line = out.dump.agent_entry(entry);
+    ensure!(line.is_some_and(|l| l.contains(want)), "entry {entry}: no `{want}` in {line:?}; agent {:?}", out.dump.agent);
+    Ok(())
+}
+
+/// A diff in a running call's open row: its item and hunk lines, the
+/// row's summary, its added and removed lines in the zone set's diff
+/// colours; once the call
+/// completes the row closes, and Toggle Tool Details opens it again, where
+/// it stays.
+pub fn tool_diff(ctx: &Ctx) -> Result<Outcome> {
+    let done = gate(ctx, "done");
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(tool_call("c1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), ""))
+        .step(format!("wait-file {}", done.display()))
+        .step(tool_completed("c1"))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "diff")?;
+    let started = |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi");
+
+    let out = started("open").wait_for("open=yes items=1").capture_at(5.0).dump_at(5.5).run()?;
+    waited(&out)?;
+    // The row's line carries its summary, lines added and removed.
+    tool_line(
+        &out,
+        2,
+        "tool call=\"c1\" kind=edit status=in_progress open=yes items=1 summary=\"+1 \u{2212}1\" \"Edit notes.txt\"",
+    )?;
+    let items = out.dump.agent_items(2);
+    ensure!(items == [NOTES_ITEM], "items {items:?}");
+    let hunks = out.dump.agent_hunks(2);
+    ensure!(
+        hunks.len() == 1 && hunks[0].contains("\\n-an apple a day\\n+an banana a day\\n"),
+        "hunks {hunks:?}"
+    );
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, crate::brindle::theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    // A line is the zone's width less its paddings, some 20 pixels high.
+    for (what, colour) in [("added", ZONE_DIFF_ADDED), ("removed", ZONE_DIFF_REMOVED)] {
+        let count = image.count_near(zone, colour, TOKEN_NEAR);
+        ensure!(
+            count as f32 >= 2_000.0 * scale * scale,
+            "the {what} line: {count} pixels of {} in {zone:?}; found {}",
+            colour.hex(),
+            image.summary(zone)
+        );
+    }
+
+    let ended = |label| {
+        touch_from_shell(started(label).wait_for("open=yes"), &done, true).wait_for("turn=ended:end_turn")
+    };
+    let out = ended("closed").dump_at(8.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, "status=completed open=no items=1")?;
+    // The gate again, closed, for the next run's turn to wait at.
+    std::fs::remove_file(&done).map_err(|e| format!("removing {}: {e}", done.display()))?;
+    let out = ended("toggled").action("toggle_agent_tool_details").wait_for("open=yes").dump_at(9.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, "status=completed open=yes items=1")?;
+    Ok(Outcome::Pass)
+}
+
+/// Command output streamed in Codex's `_meta` pieces into an open row: the
+/// text so far while it runs, the conversation kept at its end as it
+/// grows; then its whole text and exit once it ends.
+pub fn tool_output(ctx: &Ctx) -> Result<Outcome> {
+    let done = gate(ctx, "done");
+    let lines: String = (1..=200).map(|n| format!("line {n}\\n")).collect();
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(update(
+            r#"{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Run tests","kind":"execute","status":"in_progress","content":[{"type":"terminal","terminalId":"t1"}],"_meta":{"terminal_info":{"terminal_id":"t1","cwd":"/w","command":"cargo test"}}}"#,
+        ))
+        .step(tool_meta("c1", r#""terminal_output_delta":{"terminal_id":"t1","data":"first\n"}"#, ""))
+        .step(tool_meta("c1", &format!(r#""terminal_output_delta":{{"terminal_id":"t1","data":"{lines}"}}"#), ""))
+        .step(format!("wait-file {}", done.display()))
+        .step(tool_meta("c1", r#""terminal_output_delta":{"terminal_id":"t1","data":"last\n"}"#, ""))
+        .step(tool_meta("c1", r#""terminal_exit":{"terminal_id":"t1","exit_code":1,"signal":null}"#, r#","status":"failed""#))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "output")?;
+    let started = |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for("line 200");
+
+    let out = started("running").dump_at(5.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, "kind=execute status=in_progress open=yes items=1")?;
+    let items = out.dump.agent_items(2);
+    ensure!(
+        items.len() == 1
+            && items[0].starts_with("index=0 kind=output command=\"cargo test\" cwd=\"/w\" exit=none omitted=0 \"first\\nline 1\\n")
+            && items[0].ends_with("line 200\\n\""),
+        "items {items:?}"
+    );
+    ensure!(
+        out.dump.agent.iter().any(|l| l.starts_with("conversation ") && l.contains(" at=end")),
+        "the conversation left its end: {:?}",
+        out.dump.agent
+    );
+
+    let out = touch_from_shell(started("ended"), &done, true).wait_for("turn=ended:end_turn").dump_at(8.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, "status=failed open=no items=1 summary=\"exit 1\"")?;
+    let items = out.dump.agent_items(2);
+    ensure!(
+        items.len() == 1 && items[0].contains(" exit=1 omitted=0 ") && items[0].ends_with("line 200\\nlast\\n\""),
+        "items {items:?}"
+    );
+    Ok(Outcome::Pass)
+}
+
+/// A call with only a raw input shows it; a call with content doesn't.
+pub fn tool_raw(ctx: &Ctx) -> Result<Outcome> {
+    let text = r#"[{"type":"content","content":{"type":"text","text":"**patched**"}}]"#;
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(tool_call("c1", "Apply patch", "completed", "[]", r#","rawInput":"*** Begin Patch""#))
+        .step(tool_call("c2", "Apply another", "completed", text, r#","rawInput":"*** Begin Patch""#))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "raw")?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("turn=ended:end_turn")
+        .dump_at(4.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_raws(2) == ["which=input \"*** Begin Patch\""], "raw {:?}", out.dump.agent);
+    tool_line(&out, 2, "open=no items=0")?;
+    ensure!(out.dump.agent_raws(3).is_empty(), "a raw value beside content: {:?}", out.dump.agent);
+    ensure!(out.dump.agent_items(3) == ["index=0 kind=text cut=no \"**patched**\""], "items {:?}", out.dump.agent);
+    Ok(Outcome::Pass)
+}
+
+/// A permission request for `call` carrying `content` (a JSON array, or
+/// empty for none), with the JSON-RPC id `id`.
+fn ask_with(id: &str, call: &str, content: &str) -> String {
+    let content = if content.is_empty() { String::new() } else { format!(r#","content":{content}"#) };
+    format!(
+        r#"send {{"jsonrpc":"2.0","id":"{id}","method":"session/request_permission","params":{{"sessionId":"s1","toolCall":{{"toolCallId":"{call}","title":"Write a file"{content}}},"options":[{{"optionId":"allow-once","name":"Allow","kind":"allow_once"}},{{"optionId":"reject-once","name":"Reject","kind":"reject_once"}}]}}}}"#
+    )
+}
+
+/// A pending permission shows its call's diff while the call's row reads
+/// `open=permission`, with either `tool_details`; allowed, the detail is
+/// back in the running call's row. Content sent only in the request shows
+/// too.
+pub fn permission_detail(ctx: &Ctx) -> Result<Outcome> {
+    let never = gate(ctx, "never");
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(tool_call("call_1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), ""))
+        .step(ask_with("p1", "call_1", ""))
+        .step(r#"expect-response "p1""#)
+        .step(format!("wait-file {}", never.display()))
+        .profile(ctx, "detail")?;
+    for (label, settings) in [("open", ""), ("closed", "\n[agent]\ntool_details = \"closed\"\n")] {
+        let out = Run::new(ctx, label)
+            .config(&format!("{settings}{profile}"))
+            .agent("Fake")
+            .first_prompt("hi")
+            .wait_for("outcome=pending detail=1")
+            .dump_at(5.0)
+            .run()?;
+        waited(&out)?;
+        tool_line(&out, 2, "status=in_progress open=permission items=1")?;
+        tool_line(&out, 3, "outcome=pending detail=1 \"Write a file\"")?;
+        let items = out.dump.agent_items(2);
+        ensure!(items == [NOTES_ITEM], "{label}: items {items:?}");
+    }
+    let out = Run::new(ctx, "allowed")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("outcome=pending")
+        .key("tab")
+        .key("tab")
+        .key("enter")
+        .wait_for("outcome=selected:allow-once")
+        .dump_at(7.0)
+        .run()?;
+    waited(&out)?;
+    tool_line(&out, 3, "outcome=selected:allow-once \"Write a file\"")?;
+    tool_line(&out, 2, "status=in_progress open=yes items=1")?;
+
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(ask_with("p1", "call_2", &format!("[{NOTES_DIFF}]")))
+        .step(r#"expect-response "p1""#)
+        .profile(ctx, "request-only")?;
+    let out = Run::new(ctx, "request-only")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("outcome=pending detail=1")
+        .dump_at(5.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(
+        out.dump.agent_entries().iter().any(|l| l.starts_with("tool call=\"call_2\"") && l.contains("open=permission items=1")),
+        "no tool entry from the request: {:?}",
+        out.dump.agent
+    );
+    Ok(Outcome::Pass)
+}
+
+/// `[agent]`'s keys: `tool_details = "closed"` keeps a running call's row
+/// closed and `tool_details_when_done = "open"` a finished one open; the
+/// config rewritten while Brindle runs opens the finished row on its
+/// reload; a bad value shows on the config line.
+pub fn tool_settings(ctx: &Ctx) -> Result<Outcome> {
+    let never = gate(ctx, "never");
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(tool_call("c1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), ""))
+        .step(tool_completed("c1"))
+        .step(tool_call("c2", "Edit more.txt", "in_progress", &format!("[{NOTES_DIFF}]"), ""))
+        .step(format!("wait-file {}", never.display()))
+        .profile(ctx, "settings")?;
+    let agent = |keys: &str| format!("\n[agent]\n{keys}\n");
+    let both = agent("tool_details = \"closed\"\ntool_details_when_done = \"open\"");
+    let started = |label, extra: &str| {
+        Run::new(ctx, label).config(&format!("{extra}{profile}")).agent("Fake").first_prompt("hi").wait_for("call=\"c2\"")
+    };
+
+    let out = started("flipped", &both).dump_at(4.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, "status=completed open=yes")?;
+    tool_line(&out, 3, "status=in_progress open=no")?;
+
+    let rewritten = ctx.dir.join("done-open.toml");
+    let text = format!("{}{}{profile}", crate::brindle::config("e2e"), agent("tool_details_when_done = \"open\""));
+    std::fs::write(&rewritten, text).map_err(|e| format!("writing {}: {e}", rewritten.display()))?;
+    let copy = format!("cp '{}' '{}'", rewritten.display(), ctx.dir.join("config.toml").display());
+    let out = from_shell(started("reloaded", "").wait_for("status=completed open=no"), &copy, true)
+        .action("reload_config")
+        .wait_for("status=completed open=yes")
+        .dump_at(9.0)
+        .run()?;
+    waited(&out)?;
+    tool_line(&out, 2, "status=completed open=yes")?;
+    tool_line(&out, 3, "status=in_progress open=yes")?;
+
+    // A config that doesn't load is the defaults', so no `Fake` profile: a
+    // terminal tab (the implicit `Shell`) shows the line.
+    let out = Run::new(ctx, "bad").config(&agent("tool_details = \"maybe\"")).dump_at(3.0).run()?;
+    let line = out.dump.config.as_deref().unwrap_or_default();
+    ensure!(line.contains("agent.tool_details") && line.contains("`open` or `closed`"), "config line {:?}", out.dump.config);
+    Ok(Outcome::Pass)
+}
+
+/// `agent-tool-bounds`' output: lines of [`BOUNDS_LINE_BYTES`] bytes,
+/// some 200 KiB in all, sent [`BOUNDS_PER_DELTA`] lines a `_meta` delta.
+const BOUNDS_LINES: usize = 18_600;
+const BOUNDS_PER_DELTA: usize = 400;
+/// `out 000000\n`.
+const BOUNDS_LINE_BYTES: usize = 11;
+/// What an output item keeps (`brindle_transcript::ITEM_LIMIT`).
+const BOUNDS_ITEM_LIMIT: usize = 64 * 1024;
+
+/// A tool call's bounds (design decision 5): 200 KiB of output keeps its
+/// newest whole lines within 64 KiB and counts the bytes it dropped, and
+/// a call with 40 items keeps 32 and counts the rest.
+pub fn tool_bounds(ctx: &Ctx) -> Result<Outcome> {
+    let mut script = Script::ready(&ctx.dir.join("received.jsonl")).step("expect session/prompt").step(update(
+        r#"{"sessionUpdate":"tool_call","toolCallId":"c1","title":"Run tests","kind":"execute","status":"in_progress","content":[{"type":"terminal","terminalId":"t1"}],"_meta":{"terminal_info":{"terminal_id":"t1","cwd":"/w","command":"cargo test"}}}"#,
+    ));
+    for start in (0..BOUNDS_LINES).step_by(BOUNDS_PER_DELTA) {
+        let data: String = (start..(start + BOUNDS_PER_DELTA).min(BOUNDS_LINES)).map(|n| format!("out {n:06}\\n")).collect();
+        script = script.step(tool_meta("c1", &format!(r#""terminal_output_delta":{{"terminal_id":"t1","data":"{data}"}}"#), ""));
+    }
+    let items: Vec<String> =
+        (0..40).map(|n| format!(r#"{{"type":"content","content":{{"type":"text","text":"item {n}"}}}}"#)).collect();
+    let profile = script
+        .step(tool_meta("c1", r#""terminal_exit":{"terminal_id":"t1","exit_code":0,"signal":null}"#, r#","status":"completed""#))
+        .step(tool_call("c2", "Many items", "completed", &format!("[{}]", items.join(",")), ""))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "bounds")?;
+    let out = Run::new(ctx, "run").config(&profile).agent("Fake").first_prompt("hi").wait_for(ENDED).dump_at(6.0).run()?;
+    waited(&out)?;
+
+    tool_line(&out, 2, "status=completed open=no items=1 summary=\"exit 0\"")?;
+    let items = out.dump.agent_items(2);
+    let item = match items.as_slice() {
+        [item] => *item,
+        _ => return Err(format!("items {items:?}")),
+    };
+    let omitted: usize = item
+        .split(' ')
+        .find_map(|field| field.strip_prefix("omitted="))
+        .and_then(|n| n.parse().ok())
+        .ok_or_else(|| format!("no omitted= in {item:.200}"))?;
+    // The kept text is escaped onto the line: one `\n` per line kept.
+    let kept = item.matches("\\n").count() * BOUNDS_LINE_BYTES;
+    ensure!(
+        omitted > 0 && kept <= BOUNDS_ITEM_LIMIT && omitted + kept == BOUNDS_LINES * BOUNDS_LINE_BYTES,
+        "omitted={omitted} with {kept} bytes kept, of {}",
+        BOUNDS_LINES * BOUNDS_LINE_BYTES
+    );
+    ensure!(item.ends_with(&format!("out {:06}\\n\"", BOUNDS_LINES - 1)), "the output's end: …{}", &item[item.len().saturating_sub(80)..]);
+
+    tool_line(&out, 3, "status=completed open=no items=32 more=8 \"Many items\"")?;
+    let items = out.dump.agent_items(3);
+    ensure!(
+        items.len() == 32 && items[31] == "index=31 kind=text cut=no \"item 31\"",
+        "{} items, the last {:?}",
+        items.len(),
+        items.last()
+    );
+    Ok(Outcome::Pass)
+}
+
+/// A turn holding a running call with a diff and a pending permission
+/// about it: the agent's script, recording what it was sent, never ends it.
+fn diff_then_permission(ctx: &Ctx, name: &str, between: &[String]) -> Result<String> {
+    between
+        .iter()
+        .cloned()
+        .fold(
+            Script::ready(&ctx.dir.join(format!("{name}.jsonl")))
+                .step("expect session/prompt")
+                .step(tool_call("c1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), "")),
+            Script::step,
+        )
+        .step(ask_with("p1", "c1", ""))
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, name)
+}
+
+/// What a pending permission showing its call's diff reads as.
+const DIFF_PENDING: &str = "outcome=pending detail=1";
+
+/// Quitting mid-turn with a diff and a pending permission, the next
+/// launch restores the zone with both: the call's diff, shown with the
+/// permission while it waits.
+pub fn tool_restore(ctx: &Ctx) -> Result<Outcome> {
+    let profile = diff_then_permission(ctx, "restore", &[])?;
+    Run::new(ctx, "quit")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("hi")
+        .keep_detached()
+        .wait_for(DIFF_PENDING)
+        .action("quit")
+        .expect_exit()
+        .dump_at(8.0)
+        .run()?;
+    let out = Run::new(ctx, "restored").config(&profile).restore().wait_for(DIFF_PENDING).dump_at(5.0).run()?;
+    waited(&out)?;
+    tool_line(&out, 2, &format!("tool call=\"c1\" kind=edit status=in_progress open=permission {NOTES_COUNTS} \"Edit notes.txt\""))?;
+    let items = out.dump.agent_items(2);
+    ensure!(items == [NOTES_ITEM], "items {items:?}");
+    let hunks = out.dump.agent_hunks(2);
+    ensure!(hunks.len() == 1 && hunks[0].contains("\\n-an apple a day\\n+an banana a day\\n"), "hunks {hunks:?}");
+    tool_line(&out, 3, "permission call=\"c1\" options=")?;
+    tool_line(&out, 3, &format!("{DIFF_PENDING} \"Write a file\""))?;
+    Ok(Outcome::Pass)
+}
+
+/// The entries between `agent-tool-page`'s call and its permission: 80
+/// thoughts of 5 KiB and 80 short messages, some 400 KiB, more than a
+/// page (`PAGE_BYTES`, 256 KiB).
+const PAGE_BETWEEN: usize = 160;
+
+/// A session waiting on a permission whose tool call is more than a page
+/// back (design decision 15): attached again, the zone's first entry is
+/// that call, with the entry before it left to fetch, and the permission
+/// shows its diff.
+pub fn tool_page(ctx: &Ctx) -> Result<Outcome> {
+    let turn = long_turn(PAGE_BETWEEN, LONG_SIZE, None);
+    // `long_turn`'s entries, without its prompt and its end.
+    let profile = diff_then_permission(ctx, "page", &turn[1..turn.len() - 1])?;
+    let out = Run::new(ctx, "live")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("go")
+        .keep_detached()
+        .wait_for(DIFF_PENDING)
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(earlier(&out) == Some("none"), "a live zone holds the whole conversation: {:?}", out.dump.agent.last());
+
+    let out = Run::new(ctx, "attached").config(&profile).restore().wait_for(DIFF_PENDING).dump_at(6.0).run()?;
+    waited(&out)?;
+    let ids = entry_ids(&out);
+    let asked = 2 + PAGE_BETWEEN as u64 + 1;
+    ensure!(
+        ids.first() == Some(&2) && ids.last() == Some(&asked),
+        "entry ids {:?}…{:?}, not 2…{asked}",
+        ids.first(),
+        ids.last()
+    );
+    ensure!(earlier(&out) == Some("1"), "earlier={:?} with the call first", earlier(&out));
+    tool_line(&out, 2, &format!("status=in_progress open=permission {NOTES_COUNTS}"))?;
+    ensure!(out.dump.agent_items(2) == [NOTES_ITEM], "items {:?}", out.dump.agent_items(2));
+    tool_line(&out, asked, &format!("{DIFF_PENDING} \"Write a file\""))?;
+    Ok(Outcome::Pass)
+}
+
+/// A dark profile theme in a light window (ui-theme-tokens' "A profile
+/// theme unlike the window's"): an agent profile with the `e2e` theme in a
+/// `brindle-light` window draws a diff's added and removed lines in the
+/// `e2e` zone set's `diff_added` and `diff_removed`, as an `e2e` window's
+/// agent zone does.
+pub fn tool_theme(ctx: &Ctx) -> Result<Outcome> {
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(tool_call("c1", "Edit notes.txt", "in_progress", &format!("[{NOTES_DIFF}]"), ""))
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, "theme")?;
+    let out = Run::new(ctx, "run")
+        .initial_theme("brindle-light")
+        .config(&format!("{profile}theme = \"e2e\"\n"))
+        .agent("Fake")
+        .first_prompt("hi")
+        .wait_for("open=yes items=1")
+        .capture_at(5.0)
+        .dump_at(5.5)
+        .run()?;
+    waited(&out)?;
+    tool_line(&out, 2, &format!("status=in_progress open=yes {NOTES_COUNTS}"))?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    // The zone's card border is its profile theme's (`e2e`).
+    let scale = window_scale(image, crate::brindle::theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    for (what, colour) in [("added", ZONE_DIFF_ADDED), ("removed", ZONE_DIFF_REMOVED)] {
+        let count = image.count_near(zone, colour, TOKEN_NEAR);
+        ensure!(
+            count as f32 >= 2_000.0 * scale * scale,
+            "the {what} line: {count} pixels of {} in {zone:?}; found {}",
+            colour.hex(),
+            image.summary(zone)
+        );
+    }
     Ok(Outcome::Pass)
 }

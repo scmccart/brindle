@@ -21,9 +21,11 @@ use crate::agent::close::AgentBusy;
 use crate::agent::login::{self, AgentCommand, MethodOffer, TerminalLogin};
 use crate::agent::markdown::{self, Part};
 use crate::agent::shared::{Changes, Dirty};
+use crate::agent::tool::{self, DetailPart, RowState, Shown, ToolPolicy};
 use crate::agent::transcript::{
-    Activity, AgentState, Conversation, Entry, EntryId, HoldReason, NoticeLevel, PAGE_BYTES, PermissionKind,
-    PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript, TurnState, Window, status_of,
+    Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Exit, FileOp, HoldReason, NoticeLevel, PAGE_BYTES,
+    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind, ToolStatus, Transcript,
+    TurnState, Window, status_of,
 };
 use crate::terminal::links::Plan;
 use crate::terminal::status::State;
@@ -131,11 +133,50 @@ pub enum BlockBody {
     AgentPart { block: Arc<RichBlock> },
     /// A thought, whole: all its Markdown blocks.
     Thought { blocks: Arc<[Arc<RichBlock>]>, open: bool },
-    Tool { kind: ToolKind, title: SharedString, status: ToolStatus },
+    /// A tool call's line: its summary ([`tool::summary`]) and how its row
+    /// is drawn ([`tool::row_state`]). An open row's detail follows as
+    /// [`BlockBody::ToolDetail`] blocks of the same entry.
+    Tool { kind: ToolKind, title: SharedString, status: ToolStatus, summary: Option<SharedString>, state: RowState },
+    /// One part of an open tool call's detail.
+    ToolDetail(ShownPart),
     /// The buttons, reject kinds first, then allow kinds, each group in
-    /// the agent's order.
-    Permission { title: SharedString, options: Vec<PermissionButton>, outcome: Option<PermissionOutcome> },
+    /// the agent's order. While pending, `detail` holds the parts of the
+    /// tool entry `shows` (the one its call names), drawn inside the row
+    /// above the buttons (OpenSpec change `agents-tool-content` decision
+    /// 10, flag 25).
+    Permission {
+        title: SharedString,
+        options: Vec<PermissionButton>,
+        outcome: Option<PermissionOutcome>,
+        detail: Arc<[ShownPart]>,
+        shows: Option<EntryId>,
+    },
     Notice { level: NoticeLevel, text: SharedString },
+}
+
+/// Rendered Markdown, shared between the cache and the blocks.
+pub type Rich = Arc<[Arc<RichBlock>]>;
+
+/// A text item's Markdown source and its rendering.
+type RenderedText = (SharedString, Rich);
+
+/// A detail part as drawn: the part, and a text item's rendered Markdown
+/// (empty for the other parts).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownPart {
+    pub entry: EntryId,
+    pub part: DetailPart,
+    pub text: Rich,
+}
+
+/// What a tool entry's or a permission's blocks show beyond the entry
+/// itself: a tool row's state and, when open, its detail; a permission's
+/// tool entry and that entry's detail.
+#[derive(Debug, Clone, Default)]
+struct ToolDraw {
+    state: Option<RowState>,
+    detail: Vec<ShownPart>,
+    shows: Option<EntryId>,
 }
 
 /// One item of the conversation's list: an entry, or one part of a message
@@ -312,7 +353,7 @@ fn user_blocks(id: EntryId, text: &str, part: usize, from: usize) -> Vec<Block> 
 /// ([`parts`]) or per rendered part of an agent message (`rendered`), else
 /// one; a thought holds its `rendered` blocks and is drawn open when
 /// `thought_open`.
-fn blocks_of(id: EntryId, entry: &Entry, rendered: &[Part], thought_open: bool) -> Vec<Block> {
+fn blocks_of(id: EntryId, entry: &Entry, rendered: &[Part], thought_open: bool, draw: ToolDraw) -> Vec<Block> {
     let one = |body| vec![Block { entry: id, part: 0, start: 0, last: true, body }];
     match entry {
         Entry::User { text } => user_blocks(id, text, 0, 0),
@@ -332,12 +373,31 @@ fn blocks_of(id: EntryId, entry: &Entry, rendered: &[Part], thought_open: bool) 
             one(BlockBody::Thought { blocks, open: thought_open })
         }
         Entry::Tool { title, kind, status, .. } => {
-            one(BlockBody::Tool { kind: *kind, title: title.clone().into(), status: *status })
+            let state = draw.state.unwrap_or(RowState::Nothing);
+            let detail = match state {
+                RowState::Open => draw.detail,
+                RowState::Closed | RowState::WithPermission | RowState::Nothing => Vec::new(),
+            };
+            let row = BlockBody::Tool {
+                kind: *kind,
+                title: title.clone().into(),
+                status: *status,
+                summary: tool::summary(entry),
+                state,
+            };
+            let count = detail.len() + 1;
+            std::iter::once(row)
+                .chain(detail.into_iter().map(BlockBody::ToolDetail))
+                .enumerate()
+                .map(|(part, body)| Block { entry: id, part, start: 0, last: part + 1 == count, body })
+                .collect()
         }
         Entry::Permission { title, options, outcome, .. } => one(BlockBody::Permission {
             title: title.clone().into(),
             options: buttons(options),
             outcome: outcome.clone(),
+            detail: if outcome.is_none() { draw.detail.into() } else { Arc::from([]) },
+            shows: if outcome.is_none() { draw.shows } else { None },
         }),
         Entry::Notice { level, text } => one(BlockBody::Notice { level: *level, text: text.clone().into() }),
     }
@@ -358,6 +418,20 @@ fn render_entry(entry: &Entry) -> Option<(Vec<Part>, bool)> {
             (vec![Part { range: 0..text.len(), block: Arc::new(block) }], true)
         }
     })
+}
+
+/// A tool entry's text items, by index, with their Markdown sources; none
+/// for the other entries.
+fn text_items(entry: &Entry) -> Vec<(usize, SharedString)> {
+    let Entry::Tool { content, .. } = entry else { return Vec::new() };
+    content
+        .iter()
+        .enumerate()
+        .filter_map(|(item, content)| match content {
+            ToolItem::Text { text, .. } => Some((item, SharedString::from(text.clone()))),
+            ToolItem::Diff(_) | ToolItem::Output(_) => None,
+        })
+        .collect()
 }
 
 /// Whether a value may be resent from the queue row.
@@ -987,6 +1061,18 @@ pub struct ChatModel {
     /// `from` on.
     window: Option<Window>,
     earlier: Earlier,
+    /// How tool call rows open on their own (`[agent]`, decision 10).
+    policy: ToolPolicy,
+    /// Tool call rows the user opened or closed.
+    by_hand: BTreeMap<EntryId, Shown>,
+    /// The rendered Markdown of tool calls' text items, by entry and item,
+    /// with the source it was rendered from.
+    texts: BTreeMap<(EntryId, usize), RenderedText>,
+    /// The latest user message held: a tool call after it can be running.
+    last_user: Option<EntryId>,
+    /// Each pending permission's tool entry, when the zone holds it (the
+    /// newest with the call the permission names, before it).
+    permission_tools: BTreeMap<EntryId, EntryId>,
 }
 
 fn running(turn: &TurnState) -> bool {
@@ -1029,6 +1115,11 @@ impl ChatModel {
             first_shown: false,
             window: None,
             earlier: Earlier::None,
+            policy: ToolPolicy::default(),
+            by_hand: BTreeMap::new(),
+            texts: BTreeMap::new(),
+            last_user: None,
+            permission_tools: BTreeMap::new(),
         }
     }
 
@@ -1320,6 +1411,7 @@ impl ChatModel {
         }
         for (id, entry) in &fresh {
             self.keep_render(*id, render_entry(entry));
+            self.keep_texts(*id, text_items(entry));
         }
         let blocks: Vec<Block> =
             fresh.iter().flat_map(|(id, entry)| self.draw(*id, entry, self.thought_open(*id))).collect();
@@ -1339,10 +1431,16 @@ impl ChatModel {
             self.entries = transcript.entries().map(|(id, entry)| (id, entry.clone())).collect();
             self.auto_open = None;
             self.rendered.clear();
-            let renders: Vec<_> = self.entries.iter().map(|(id, entry)| (*id, render_entry(entry))).collect();
-            for (id, render) in renders {
+            self.texts.clear();
+            let renders: Vec<_> =
+                self.entries.iter().map(|(id, entry)| (*id, render_entry(entry), text_items(entry))).collect();
+            for (id, render, items) in renders {
                 self.keep_render(id, render);
+                self.keep_texts(id, items);
             }
+            // The turn decides which tool calls run, so it is read first.
+            self.turn = transcript.turn().clone();
+            self.refresh_facts();
             let old = self.blocks.len();
             self.blocks = self.entries.iter().flat_map(|(id, entry)| self.draw(*id, entry, false)).collect();
             splices.push(Splice { range: 0..old, count: self.blocks.len() });
@@ -1353,6 +1451,8 @@ impl ChatModel {
             if let Some(through) = changes.trimmed_through {
                 self.entries.retain(|(id, _)| *id > through);
                 self.rendered.retain(|id, _| *id > through);
+                self.texts.retain(|(id, _), _| *id > through);
+                self.by_hand.retain(|id, _| *id > through);
                 let gone = self.blocks.partition_point(|block| block.entry <= through);
                 self.blocks.drain(..gone);
                 if gone > 0 {
@@ -1369,7 +1469,11 @@ impl ChatModel {
                         continue;
                     }
                     self.entries.push((id, entry.clone()));
+                    if matches!(entry, Entry::User { .. }) {
+                        self.last_user = Some(id);
+                    }
                     self.keep_render(id, render_entry(entry));
+                    self.keep_texts(id, text_items(entry));
                     let fresh = self.draw(id, entry, false);
                     self.blocks.extend(fresh);
                 }
@@ -1400,15 +1504,16 @@ impl ChatModel {
             self.slot = transcript.slot().clone();
         }
         splices.extend(self.update_thoughts(changes.reset));
+        splices.extend(self.refresh_rows());
         self.follow_window(transcript.window(), changes.reset, changes.prepended.is_some());
         self.finish(before, splices, changes.from_replay)
     }
 
     /// Copies entry `id` again (its tail only when text was appended) and
     /// redraws its blocks from the first that changed.
-    fn update_entry(&mut self, transcript: &Transcript, id: EntryId, dirty: Dirty) -> Option<Splice> {
-        let source = transcript.entry(id)?;
-        let index = self.entries.binary_search_by_key(&id, |(own, _)| *own).ok()?;
+    fn update_entry(&mut self, transcript: &Transcript, id: EntryId, dirty: Dirty) -> Vec<Splice> {
+        let Some(source) = transcript.entry(id) else { return Vec::new() };
+        let Ok(index) = self.entries.binary_search_by_key(&id, |(own, _)| *own) else { return Vec::new() };
         let own = &mut self.entries[index].1;
         let appended = match (dirty, &mut *own, source) {
             (
@@ -1419,11 +1524,15 @@ impl ChatModel {
                 own.push_str(&text[from_byte..]);
                 true
             }
-            (Dirty::Appended { .. } | Dirty::Replaced, _, _) => false,
+            (Dirty::Appended { .. } | Dirty::ToolItems { .. } | Dirty::Output { .. } | Dirty::Replaced, _, _) => false,
         };
         if !appended {
             *own = source.clone();
         }
+        // A tool call's text items are rendered again only where their
+        // source changed (decision 10's cache by entry and item).
+        let items = text_items(&self.entries[index].1);
+        self.keep_texts(id, items);
         // An agent message or thought is rendered again whole; the parts
         // that didn't change keep their cached values.
         let render = render_entry(&self.entries[index].1).map(|(fresh, panicked)| {
@@ -1450,19 +1559,261 @@ impl ChatModel {
                 let fresh = self.draw(id, entry, open);
                 let same = self.blocks[range.clone()].iter().zip(&fresh).take_while(|(old, new)| old == new).count();
                 if same == range.len() && same == fresh.len() {
-                    return None;
+                    return Vec::new();
                 }
                 (range.start + same..range.end, fresh[same..].to_vec())
             }
-            Entry::User { .. }
-            | Entry::Thought { .. }
-            | Entry::Tool { .. }
-            | Entry::Permission { .. }
-            | Entry::Notice { .. } => (range, self.draw(id, entry, open)),
+            // A tool call's parts that changed, and the pending permission
+            // showing its detail; a permission's row.
+            Entry::Tool { .. } | Entry::Permission { .. } => {
+                let mut splices: Vec<Splice> = self.redraw(id).into_iter().collect();
+                let permission = self.permission_tools.iter().find(|(_, tool)| **tool == id).map(|(perm, _)| *perm);
+                splices.extend(permission.and_then(|permission| self.redraw(permission)));
+                return splices;
+            }
+            Entry::User { .. } | Entry::Thought { .. } | Entry::Notice { .. } => (range, self.draw(id, entry, open)),
         };
         let count = fresh.len();
         self.blocks.splice(range.clone(), fresh);
+        vec![Splice { range, count }]
+    }
+
+    /// Draws entry `id` again, splicing only the blocks that differ (a
+    /// common start and end kept): an open row's growing output changes
+    /// its last part alone.
+    fn redraw(&mut self, id: EntryId) -> Option<Splice> {
+        let index = self.entries.binary_search_by_key(&id, |(own, _)| *own).ok()?;
+        let entry = &self.entries[index].1;
+        let fresh = self.draw(id, entry, self.thought_open(id));
+        let range = self.entry_blocks(id);
+        let old = &self.blocks[range.clone()];
+        let head = old.iter().zip(&fresh).take_while(|(old, new)| old == new).count();
+        if head == old.len() && head == fresh.len() {
+            return None;
+        }
+        let room = old.len().min(fresh.len()) - head;
+        let tail = old.iter().rev().zip(fresh.iter().rev()).take(room).take_while(|(old, new)| old == new).count();
+        let range = range.start + head..range.end - tail;
+        let new: Vec<Block> = fresh[head..fresh.len() - tail].to_vec();
+        let count = new.len();
+        self.blocks.splice(range.clone(), new);
         Some(Splice { range, count })
+    }
+
+    /// Renders tool entry `id`'s text `items` (index and source) whose
+    /// source changed, and forgets its other items' renders. The renderer
+    /// runs under `catch_unwind` as for messages: a panic shows the source
+    /// plain.
+    fn keep_texts(&mut self, id: EntryId, items: Vec<(usize, SharedString)>) {
+        let held: Vec<(EntryId, usize)> = self.texts.range((id, 0)..=(id, usize::MAX)).map(|(key, _)| *key).collect();
+        for key in held {
+            if !items.iter().any(|(item, _)| *item == key.1) {
+                self.texts.remove(&key);
+            }
+        }
+        for (item, source) in items {
+            if self.texts.get(&(id, item)).is_some_and(|(held, _)| *held == source) {
+                continue;
+            }
+            let blocks: Arc<[Arc<RichBlock>]> = match std::panic::catch_unwind(|| markdown::render(&source)) {
+                Ok(parts) => parts.into_iter().map(|part| part.block).collect(),
+                Err(_) => {
+                    if !self.render_failed {
+                        self.render_failed = true;
+                        log::warn!("the Markdown renderer panicked on agent entry {id}; showing its text plain");
+                    }
+                    Arc::from([Arc::new(RichBlock::Paragraph(Inline::plain(source.to_string())))])
+                }
+            };
+            self.texts.insert((id, item), (source, blocks));
+        }
+    }
+
+    /// The latest user message, and each pending permission's tool entry,
+    /// read again from the held entries.
+    fn refresh_facts(&mut self) {
+        self.last_user =
+            self.entries.iter().rev().find(|(_, entry)| matches!(entry, Entry::User { .. })).map(|(id, _)| *id);
+        let mut newest: std::collections::HashMap<&str, EntryId> = std::collections::HashMap::new();
+        let mut tools = BTreeMap::new();
+        for (id, entry) in &self.entries {
+            match entry {
+                Entry::Tool { call, .. } => {
+                    newest.insert(call.as_str(), *id);
+                }
+                Entry::Permission { call: Some(call), outcome: None, .. } => {
+                    if let Some(tool) = newest.get(call.as_str()) {
+                        tools.insert(*id, *tool);
+                    }
+                }
+                Entry::Permission { .. }
+                | Entry::User { .. }
+                | Entry::Agent { .. }
+                | Entry::Thought { .. }
+                | Entry::Notice { .. } => {}
+            }
+        }
+        self.permission_tools = tools;
+    }
+
+    /// Whether tool call `id` runs (decision 10): its status is pending or
+    /// in progress, the turn runs, and it comes after the latest user
+    /// message held (or none is held: the turn's prompt is above the page).
+    fn tool_running(&self, id: EntryId, status: ToolStatus) -> bool {
+        tool::unfinished(status) && running(&self.turn) && self.last_user.is_none_or(|user| id > user)
+    }
+
+    /// How tool entry `id`'s row is drawn now.
+    fn tool_state(&self, id: EntryId, entry: &Entry) -> RowState {
+        let Entry::Tool { status, .. } = entry else { return RowState::Nothing };
+        let pending = self.permission_tools.values().any(|tool| *tool == id);
+        tool::row_state(entry, self.by_hand.get(&id).copied(), self.tool_running(id, *status), pending, self.policy)
+    }
+
+    /// Tool entry `id`'s detail parts as drawn, its text items rendered.
+    fn shown_parts(&self, id: EntryId, entry: &Entry) -> Vec<ShownPart> {
+        tool::detail(entry)
+            .into_iter()
+            .map(|part| {
+                let text = match &part {
+                    DetailPart::Text { item, .. } => {
+                        self.texts.get(&(id, *item)).map_or_else(|| Arc::from([]), |(_, blocks)| blocks.clone())
+                    }
+                    DetailPart::Diff { .. }
+                    | DetailPart::Output { .. }
+                    | DetailPart::Locations { .. }
+                    | DetailPart::Raw { .. }
+                    | DetailPart::Mark { .. } => Arc::from([]),
+                };
+                ShownPart { entry: id, part, text }
+            })
+            .collect()
+    }
+
+    /// What tool entry or permission `id` shows beyond itself.
+    fn tool_draw(&self, id: EntryId, entry: &Entry) -> ToolDraw {
+        match entry {
+            Entry::Tool { .. } => {
+                let state = self.tool_state(id, entry);
+                let detail = match state {
+                    RowState::Open => self.shown_parts(id, entry),
+                    RowState::Closed | RowState::WithPermission | RowState::Nothing => Vec::new(),
+                };
+                ToolDraw { state: Some(state), detail, shows: None }
+            }
+            Entry::Permission { .. } => {
+                let Some(tool) = self.permission_tools.get(&id).copied() else { return ToolDraw::default() };
+                let Some(tool_entry) = self.held(tool) else { return ToolDraw::default() };
+                ToolDraw { state: None, detail: self.shown_parts(tool, tool_entry), shows: Some(tool) }
+            }
+            Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. } | Entry::Notice { .. } => {
+                ToolDraw::default()
+            }
+        }
+    }
+
+    /// Held entry `id`.
+    fn held(&self, id: EntryId) -> Option<&Entry> {
+        let index = self.entries.binary_search_by_key(&id, |(own, _)| *own).ok()?;
+        Some(&self.entries[index].1)
+    }
+
+    /// Redraws every tool row whose state isn't the one drawn, and every
+    /// permission whose shown tool entry changed (a turn's end, a user
+    /// message, a permission answered or added, the policy, a toggle).
+    fn refresh_rows(&mut self) -> Vec<Splice> {
+        self.refresh_facts();
+        let stale: Vec<EntryId> = self
+            .entries
+            .iter()
+            .filter(|(id, entry)| {
+                let range = self.entry_blocks(*id);
+                match (entry, self.blocks.get(range.start).map(|block| &block.body)) {
+                    (Entry::Tool { .. }, Some(BlockBody::Tool { state, .. })) => *state != self.tool_state(*id, entry),
+                    (Entry::Permission { outcome: None, .. }, Some(BlockBody::Permission { shows, .. })) => {
+                        *shows != self.permission_tools.get(id).copied()
+                    }
+                    (
+                        Entry::Tool { .. }
+                        | Entry::Permission { .. }
+                        | Entry::User { .. }
+                        | Entry::Agent { .. }
+                        | Entry::Thought { .. }
+                        | Entry::Notice { .. },
+                        _,
+                    ) => false,
+                }
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        stale.into_iter().filter_map(|id| self.redraw(id)).collect()
+    }
+
+    /// The policy from the settings (`[agent]`): the rows it changes, and
+    /// only those, are redrawn.
+    pub fn set_policy(&mut self, policy: ToolPolicy) -> Vec<Splice> {
+        if self.policy == policy {
+            return Vec::new();
+        }
+        self.policy = policy;
+        self.refresh_rows()
+    }
+
+    /// A press on tool row `id`'s line: opens or closes it, as the user's
+    /// choice; nothing for a row with nothing to open, or whose detail a
+    /// pending permission shows.
+    pub fn toggle_tool(&mut self, id: EntryId) -> Vec<Splice> {
+        let Some(entry) = self.held(id) else { return Vec::new() };
+        let shown = match self.tool_state(id, entry) {
+            RowState::Open => Shown::Closed,
+            RowState::Closed => Shown::Open,
+            RowState::WithPermission | RowState::Nothing => return Vec::new(),
+        };
+        self.by_hand.insert(id, shown);
+        self.redraw(id).into_iter().collect()
+    }
+
+    /// `toggle_agent_tool_details`: opens every tool row with a detail when
+    /// any is closed, else closes them all, each as the user's choice.
+    pub fn toggle_tool_details(&mut self) -> Vec<Splice> {
+        let rows: Vec<(EntryId, RowState)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| tool::has_detail(entry))
+            .map(|(id, entry)| {
+                // As the row would be without a pending permission.
+                let state = match entry {
+                    Entry::Tool { status, .. } => tool::row_state(
+                        entry,
+                        self.by_hand.get(id).copied(),
+                        self.tool_running(*id, *status),
+                        false,
+                        self.policy,
+                    ),
+                    Entry::User { .. }
+                    | Entry::Agent { .. }
+                    | Entry::Thought { .. }
+                    | Entry::Permission { .. }
+                    | Entry::Notice { .. } => RowState::Nothing,
+                };
+                (*id, state)
+            })
+            .collect();
+        let open = rows.iter().any(|(_, state)| *state == RowState::Closed);
+        for (id, _) in &rows {
+            self.by_hand.insert(*id, if open { Shown::Open } else { Shown::Closed });
+        }
+        rows.into_iter().filter_map(|(id, _)| self.redraw(id)).collect()
+    }
+
+    /// What content item `item` of tool entry `entry` copies.
+    pub fn tool_copy_text(&self, entry: EntryId, item: usize) -> Option<String> {
+        match self.held(entry)? {
+            Entry::Tool { content, .. } => content.get(item).map(tool::copy_text),
+            Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. } | Entry::Permission { .. } | Entry::Notice { .. } => {
+                None
+            }
+        }
     }
 
     /// Keeps entry `id`'s rendered parts (`None`: it has none), logging the
@@ -1484,7 +1835,8 @@ impl ChatModel {
 
     /// The blocks entry `id` is drawn as, from its cached parts.
     fn draw(&self, id: EntryId, entry: &Entry, thought_open: bool) -> Vec<Block> {
-        blocks_of(id, entry, self.rendered.get(&id).map_or(&[][..], Vec::as_slice), thought_open)
+        let draw = self.tool_draw(id, entry);
+        blocks_of(id, entry, self.rendered.get(&id).map_or(&[][..], Vec::as_slice), thought_open, draw)
     }
 
     /// The blocks of entry `id`.
@@ -1628,7 +1980,9 @@ impl ChatModel {
     fn life_event(&mut self, change: impl FnOnce(&mut Self)) -> Absorbed {
         let before = self.before();
         change(self);
-        self.finish(before, Vec::new(), false)
+        // A respawn's idle turn finishes the tool calls that ran.
+        let splices = self.refresh_rows();
+        self.finish(before, splices, false)
     }
 
     fn finish(&mut self, before: Before, splices: Vec<Splice>, from_replay: bool) -> Absorbed {
@@ -2103,6 +2457,7 @@ impl ChatModel {
                 | BlockBody::AgentPart { .. }
                 | BlockBody::Thought { .. }
                 | BlockBody::Tool { .. }
+                | BlockBody::ToolDetail(_)
                 | BlockBody::Notice { .. } => None,
             })
             .collect()
@@ -2320,6 +2675,7 @@ impl ChatModel {
         for (id, entry) in &self.entries {
             out.push_str(&format!("--- entry {id} {}\n", self.entry_line(*id, entry)));
             out.push_str(&self.part_lines(*id, plan));
+            out.push_str(&tool_lines(*id, entry));
         }
         if let Some(row) = self.working_row() {
             out.push_str(&format!("--- working {:?}\n", row.text().as_ref()));
@@ -2402,8 +2758,19 @@ impl ChatModel {
             Entry::User { text } => format!("user {text:?}"),
             Entry::Agent { text } => format!("agent {text:?}"),
             Entry::Thought { text } => format!("thought open={} {text:?}", self.thought_open(id)),
-            Entry::Tool { call, title, kind, status } => {
-                format!("tool call={call:?} kind={} status={} {title:?}", tool_kind_word(*kind), tool_status_word(*status))
+            Entry::Tool { call, title, kind, status, content, more, .. } => {
+                // The items left out and the row's summary, each only when
+                // there is one (flags 31 and 33), after `items=` so the
+                // `open=… items=N` prefixes still match.
+                let more = if *more > 0 { format!(" more={more}") } else { String::new() };
+                let summary = tool::summary(entry).map(|s| format!(" summary={:?}", s.as_ref())).unwrap_or_default();
+                format!(
+                    "tool call={call:?} kind={} status={} open={} items={}{more}{summary} {title:?}",
+                    tool_kind_word(*kind),
+                    tool_status_word(*status),
+                    self.tool_state(id, entry).word(),
+                    content.len()
+                )
             }
             Entry::Permission { call, title, options, outcome } => {
                 let call = call.as_ref().map(|call| format!(" call={call:?}")).unwrap_or_default();
@@ -2415,7 +2782,13 @@ impl ChatModel {
                     Some(PermissionOutcome::Selected { option }) => format!("selected:{option}"),
                     Some(PermissionOutcome::Cancelled) => "cancelled".to_string(),
                 };
-                format!("permission{call} options={} outcome={outcome} {title:?}", options.join("|"))
+                // The parts of its tool call's detail shown with it, only
+                // when there are some (decision 12).
+                let shown = match self.blocks.get(self.entry_blocks(id).start).map(|block| &block.body) {
+                    Some(BlockBody::Permission { detail, .. }) if !detail.is_empty() => format!(" detail={}", detail.len()),
+                    Some(_) | None => String::new(),
+                };
+                format!("permission{call} options={} outcome={outcome}{shown} {title:?}", options.join("|"))
             }
             Entry::Notice { level, text } => {
                 let level = match level {
@@ -2427,6 +2800,88 @@ impl ChatModel {
             }
         }
     }
+}
+
+/// A tool entry's content in the dump (decision 12), open or not: a
+/// `--- item` line per content item, a `--- hunk` line per hunk after its
+/// diff's, a `--- location` line per location, and a `--- raw` line for
+/// each raw value its detail shows. Nothing for the other entries.
+fn tool_lines(id: EntryId, entry: &Entry) -> String {
+    let Entry::Tool { content, locations, input, result, .. } = entry else { return String::new() };
+    let mut out = String::new();
+    for (index, item) in content.iter().enumerate() {
+        out.push_str(&format!("--- item entry={id} index={index} kind="));
+        match item {
+            ToolItem::Text { text, cut } => {
+                out.push_str(&format!("text cut={} {text:?}\n", if *cut { "yes" } else { "no" }));
+            }
+            ToolItem::Diff(change) => {
+                let op = match &change.op {
+                    FileOp::Add => "add".to_string(),
+                    FileOp::Delete => "delete".to_string(),
+                    FileOp::Modify => "modify".to_string(),
+                    FileOp::Move { from } => format!("move from={from:?}"),
+                    FileOp::Copy { from } => format!("copy from={from:?}"),
+                    FileOp::Other { name } => format!("other:{name}"),
+                };
+                let lines = change.hunks.iter().flat_map(|hunk| &hunk.lines);
+                let added = lines.clone().filter(|line| matches!(line, DiffLine::Added(_))).count();
+                let removed = lines.filter(|line| matches!(line, DiffLine::Removed(_))).count();
+                out.push_str(&format!(
+                    "diff op={op} path={:?} added={added} removed={removed} omitted={}\n",
+                    change.path, change.omitted
+                ));
+                for hunk in &change.hunks {
+                    let text: Vec<String> = hunk
+                        .lines
+                        .iter()
+                        .map(|line| match line {
+                            DiffLine::Context(text) => format!(" {text}"),
+                            DiffLine::Added(text) => format!("+{text}"),
+                            DiffLine::Removed(text) => format!("-{text}"),
+                        })
+                        .collect();
+                    out.push_str(&format!(
+                        "--- hunk entry={id} index={index} old={} new={} {:?}\n",
+                        hunk.old_start,
+                        hunk.new_start,
+                        text.join("\n")
+                    ));
+                }
+            }
+            ToolItem::Output(output) => {
+                out.push_str("output");
+                if let Some(command) = &output.command {
+                    out.push_str(&format!(" command={command:?}"));
+                }
+                if let Some(cwd) = &output.cwd {
+                    out.push_str(&format!(" cwd={cwd:?}"));
+                }
+                let exit = match &output.exit {
+                    Some(Exit::Code { code }) => code.to_string(),
+                    Some(Exit::Signal { name }) => format!("signal:{name}"),
+                    None => "none".to_string(),
+                };
+                out.push_str(&format!(" exit={exit} omitted={} {:?}\n", output.omitted, output.text));
+            }
+        }
+    }
+    for location in locations {
+        out.push_str(&format!("--- location entry={id} path={:?}", location.path));
+        if let Some(line) = location.line {
+            out.push_str(&format!(" line={line}"));
+        }
+        out.push('\n');
+    }
+    // Raw values only where the detail shows them: with no content items.
+    if content.is_empty() {
+        for (which, value) in [(tool::Raw::Input, input), (tool::Raw::Result, result)] {
+            if let Some(text) = value {
+                out.push_str(&format!("--- raw entry={id} which={} {text:?}\n", which.word()));
+            }
+        }
+    }
+    out
 }
 
 fn state_word(phase: &AgentPhase) -> String {
@@ -2552,6 +3007,20 @@ mod tests {
         Event::Added { id: EntryId(id), entry }
     }
 
+    /// Tool call `id` completed, its other fields unchanged.
+    fn tool_completed(id: u64) -> Event {
+        Event::ToolChanged {
+            id: EntryId(id),
+            title: None,
+            kind: None,
+            status: Some(ToolStatus::Completed),
+            locations: None,
+            input: None,
+            result: None,
+            more: None,
+        }
+    }
+
     fn user(text: &str) -> Entry {
         Entry::User { text: text.into() }
     }
@@ -2599,6 +3068,7 @@ mod tests {
                     blocks.iter().map(|block| markdown::shown_text(block)).collect::<Vec<_>>().join("\n\n")
                 }
                 BlockBody::Tool { title, .. } | BlockBody::Permission { title, .. } => title.to_string(),
+                BlockBody::ToolDetail(shown) => format!("{:?}", shown.part),
             })
             .collect()
     }
@@ -2611,7 +3081,7 @@ mod tests {
     /// An entry's blocks, rendered as the model renders them.
     fn drawn(id: EntryId, entry: &Entry, open: bool) -> Vec<Block> {
         let rendered = render_entry(entry).map(|(parts, _)| parts).unwrap_or_default();
-        blocks_of(id, entry, &rendered, open)
+        blocks_of(id, entry, &rendered, open, ToolDraw::default())
     }
 
     const EVERY_HOLD: [HoldReason; 9] = [
@@ -2729,7 +3199,7 @@ mod tests {
         assert!(matches!(&message[1].body, BlockBody::UserText { text } if text.as_ref() == "b"));
         assert_eq!(drawn(EntryId(1), &user(""), false).len(), 1, "an empty message is one block");
         assert_eq!(drawn(EntryId(1), &agent(""), false).len(), 1, "an empty message is one block");
-        let tool = Entry::Tool { call: "c".into(), title: "Read".into(), kind: ToolKind::Read, status: ToolStatus::Pending };
+        let tool = Entry::tool("c".into(), "Read".into(), ToolKind::Read, ToolStatus::Pending);
         assert!(matches!(drawn(EntryId(3), &tool, false)[0].body, BlockBody::Tool { kind: ToolKind::Read, .. }));
         assert!(matches!(drawn(EntryId(4), &thought("t"), true)[0].body, BlockBody::Thought { open: true, .. }));
     }
@@ -3194,7 +3664,7 @@ mod tests {
     #[test]
     fn the_working_row_follows_the_turn() {
         let tool = |id: u64, call: &str, title: &str, status| {
-            added(id, Entry::Tool { call: call.into(), title: title.into(), kind: ToolKind::Read, status })
+            added(id, Entry::tool(call.into(), title.into(), ToolKind::Read, status))
         };
         let mut zone = Zone::ready();
         assert_eq!(zone.model.working_row(), None, "idle");
@@ -3204,7 +3674,7 @@ mod tests {
         let absorbed = zone.feed(&[tool(2, "c1", "Read main.rs", ToolStatus::InProgress)]);
         assert_eq!(absorbed.working, Some(Some(WorkingRow::Tool { title: "Read main.rs".into() })));
         assert_eq!(zone.model.working_row().unwrap().text(), "Read main.rs");
-        let absorbed = zone.feed(&[Event::ToolChanged { id: EntryId(2), title: None, kind: None, status: Some(ToolStatus::Completed) }]);
+        let absorbed = zone.feed(&[tool_completed(2)]);
         assert_eq!(absorbed.working, Some(Some(WorkingRow::Working)), "a completed call");
         // The newest of two in progress.
         zone.feed(&[tool(3, "c2", "First", ToolStatus::InProgress), tool(4, "c3", "Second", ToolStatus::InProgress)]);
@@ -3315,7 +3785,7 @@ mod tests {
     #[test]
     fn a_permission_notice_gives_the_context() {
         let tool = |call: &str, kind| {
-            added(2, Entry::Tool { call: call.into(), title: "cargo test".into(), kind, status: ToolStatus::Pending })
+            added(2, Entry::tool(call.into(), "cargo test".into(), kind, ToolStatus::Pending))
         };
         let asking = |id: u64, call: &str, title: &str| {
             added(
@@ -3412,8 +3882,8 @@ mod tests {
             turn(TurnState::Working),
             added(2, agent("Hello!")),
             added(3, thought("Considering")),
-            added(4, Entry::Tool { call: "call_1".into(), title: "Read main.rs".into(), kind: ToolKind::Read, status: ToolStatus::Pending }),
-            Event::ToolChanged { id: EntryId(4), title: None, kind: None, status: Some(ToolStatus::Completed) },
+            added(4, Entry::tool("call_1".into(), "Read main.rs".into(), ToolKind::Read, ToolStatus::Pending)),
+            tool_completed(4),
             added(5, permission("Run cargo test?")),
             added(6, Entry::Notice { level: NoticeLevel::Warning, text: "1 line was not an ACP message".into() }),
             queue(waiting()),
@@ -3425,7 +3895,7 @@ mod tests {
 --- block entry=2 part=0 kind=paragraph \"Hello!\"
 --- entry 3 thought open=false \"Considering\"
 --- block entry=3 part=0 kind=paragraph \"Considering\"
---- entry 4 tool call=\"call_1\" kind=read status=completed \"Read main.rs\"
+--- entry 4 tool call=\"call_1\" kind=read status=completed open=none items=0 \"Read main.rs\"
 --- entry 5 permission call=\"call_2\" options=reject-once:\"Reject\"|allow-once:\"Allow once\" outcome=pending \"Run cargo test?\"
 --- entry 6 notice level=warn \"1 line was not an ACP message\"
 --- working \"Working…\"
@@ -4520,7 +4990,7 @@ mod tests {
             ready(),
             added(1, user("go")),
             turn(TurnState::Working),
-            added(2, Entry::Tool { call: "c1".into(), title: "cargo build".into(), kind: ToolKind::Execute, status: ToolStatus::InProgress }),
+            added(2, Entry::tool("c1".into(), "cargo build".into(), ToolKind::Execute, ToolStatus::InProgress)),
         ];
         for n in 0..20 {
             events.push(added(n + 3, agent(&"y".repeat(20 * 1024))));
@@ -4540,5 +5010,384 @@ mod tests {
         }
         assert_eq!(working, Some(Some(WorkingRow::Tool { title: "cargo build".into() })));
         assert_eq!(zone.model.working_row(), Some(WorkingRow::Tool { title: "cargo build".into() }));
+    }
+
+    // agents-tool-content 5.3–5.7: tool call details.
+
+    use crate::agent::tool::DiffRow;
+    use crate::agent::transcript::{FileChange, Hunk, Location, Output};
+
+    fn diff_item(path: &str) -> ToolItem {
+        ToolItem::Diff(FileChange {
+            op: FileOp::Modify,
+            path: path.into(),
+            hunks: vec![Hunk {
+                old_start: 10,
+                new_start: 10,
+                lines: vec![
+                    DiffLine::Context("fn main() {".into()),
+                    DiffLine::Removed("    old();".into()),
+                    DiffLine::Added("    new();".into()),
+                    DiffLine::Context("}".into()),
+                ],
+            }],
+            omitted: 0,
+        })
+    }
+
+    fn output_item(command: Option<&str>, text: &str, exit: Option<Exit>) -> ToolItem {
+        ToolItem::Output(Output { command: command.map(str::to_string), text: text.into(), exit, ..Output::default() })
+    }
+
+    fn tool_entry(call: &str, status: ToolStatus, content: Vec<ToolItem>) -> Entry {
+        let Entry::Tool { call, title, kind, .. } = Entry::tool(call.into(), format!("Edit {call}"), ToolKind::Edit, status)
+        else {
+            unreachable!()
+        };
+        Entry::Tool { call, title, kind, status, content, more: 0, locations: Vec::new(), input: None, result: None }
+    }
+
+    fn items(id: u64, from: u32, items: Vec<ToolItem>) -> Event {
+        Event::ToolItems { id: EntryId(id), from, items }
+    }
+
+    fn out(id: u64, item: u32, text: &str, exit: Option<Exit>) -> Event {
+        Event::ToolOutput { id: EntryId(id), item, text: text.into(), exit }
+    }
+
+    fn named_permission(call: &str) -> Entry {
+        let Entry::Permission { title, options, outcome, .. } = permission("Write a file") else { unreachable!() };
+        Entry::Permission { call: Some(call.into()), title, options, outcome }
+    }
+
+    /// The drawn state of tool entry `id`'s row, and its count of blocks.
+    fn row(model: &ChatModel, id: u64) -> (RowState, usize) {
+        let range = model.entry_blocks(EntryId(id));
+        let BlockBody::Tool { state, .. } = &model.blocks()[range.start].body else { panic!("{:?}", model.blocks()) };
+        (*state, range.len())
+    }
+
+    /// The detail parts permission `id` shows.
+    fn shown_with(model: &ChatModel, id: u64) -> usize {
+        let range = model.entry_blocks(EntryId(id));
+        let BlockBody::Permission { detail, .. } = &model.blocks()[range.start].body else { panic!() };
+        detail.len()
+    }
+
+    fn in_progress(call: &str, content: Vec<ToolItem>) -> Entry {
+        tool_entry(call, ToolStatus::InProgress, content)
+    }
+
+    /// The zone's blocks are what drawing every entry afresh gives: the
+    /// splices kept the list right.
+    fn assert_drawn_afresh(model: &ChatModel) {
+        let fresh: Vec<Block> =
+            model.entries.iter().flat_map(|(id, entry)| model.draw(*id, entry, model.thought_open(*id))).collect();
+        assert_eq!(model.blocks(), fresh.as_slice());
+    }
+
+    /// Decision 10: a running call's row is open, a finished one closed,
+    /// and the detail is a block per part after the row's.
+    #[test]
+    fn a_tool_row_opens_while_its_call_runs_and_closes_when_it_finishes() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("go")), turn(TurnState::Working)]);
+        let absorbed = zone.feed(&[added(2, in_progress("c1", vec![diff_item("/p/main.rs")]))]);
+        assert_eq!(absorbed.splices, [Splice { range: 1..1, count: 2 }], "the row and its diff");
+        assert_eq!(row(&zone.model, 2), (RowState::Open, 2));
+        let BlockBody::Tool { summary, .. } = &zone.model.blocks()[1].body else { panic!() };
+        assert_eq!(*summary, Some("+1 \u{2212}1".into()));
+        let BlockBody::ToolDetail(ShownPart { part: DetailPart::Diff { rows, head: Some(head), .. }, .. }) =
+            &zone.model.blocks()[2].body
+        else {
+            panic!("{:?}", zone.model.blocks())
+        };
+        assert_eq!(head.path.as_ref(), "/p/main.rs");
+        assert_eq!(rows[1], DiffRow {
+            sign: tool::Sign::Removed,
+            old: Some(11),
+            new: None,
+            text: "    old();".into(),
+            hunk_start: false
+        });
+        assert!(zone.model.blocks()[2].last && !zone.model.blocks()[1].last);
+
+        let absorbed = zone.feed(&[tool_completed(2)]);
+        assert_eq!(absorbed.splices, [Splice { range: 1..3, count: 1 }]);
+        assert_eq!(row(&zone.model, 2), (RowState::Closed, 1));
+        assert_drawn_afresh(&zone.model);
+
+        // One that arrives finished is closed; one left running by a
+        // stopped turn closes with it.
+        zone.feed(&[added(3, tool_entry("c2", ToolStatus::Completed, vec![diff_item("/p/a.rs")]))]);
+        assert_eq!(row(&zone.model, 3), (RowState::Closed, 1));
+        zone.feed(&[added(4, in_progress("c3", vec![diff_item("/p/b.rs")]))]);
+        assert_eq!(row(&zone.model, 4), (RowState::Open, 2));
+        let absorbed = zone.feed(&[turn(TurnState::Ended { stop: StopReason::Cancelled })]);
+        assert_eq!(row(&zone.model, 4), (RowState::Closed, 1));
+        assert!(absorbed.splices.contains(&Splice { range: 3..5, count: 1 }), "{:?}", absorbed.splices);
+        assert_drawn_afresh(&zone.model);
+
+        // Nothing to open: none.
+        zone.feed(&[turn(TurnState::Working), added(5, in_progress("c4", Vec::new()))]);
+        assert_eq!(row(&zone.model, 5), (RowState::Nothing, 1));
+        // A call before the latest user message no longer runs.
+        zone.feed(&[added(6, in_progress("c5", vec![diff_item("/p/c.rs")]))]);
+        assert_eq!(row(&zone.model, 6), (RowState::Open, 2));
+        zone.feed(&[added(7, user("next"))]);
+        assert_eq!(row(&zone.model, 6), (RowState::Closed, 1));
+        assert_drawn_afresh(&zone.model);
+    }
+
+    /// A choice by hand outlives completion and a policy change; a policy
+    /// change splices only the rows it changes.
+    #[test]
+    fn a_choice_by_hand_outlives_completion_and_the_policy() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("go")), turn(TurnState::Working)]);
+        zone.feed(&[added(2, in_progress("c1", vec![diff_item("/p/a.rs")]))]);
+        zone.feed(&[added(3, in_progress("c2", vec![diff_item("/p/b.rs")]))]);
+        assert_eq!(zone.model.toggle_tool(EntryId(2)), [Splice { range: 1..3, count: 1 }], "closed by hand");
+        assert_eq!(zone.model.toggle_tool(EntryId(2)), [Splice { range: 1..2, count: 2 }], "opened again");
+        zone.feed(&[tool_completed(2), tool_completed(3)]);
+        assert_eq!(row(&zone.model, 2), (RowState::Open, 2), "still open: the user opened it");
+        assert_eq!(row(&zone.model, 3), (RowState::Closed, 1));
+
+        let all_open = ToolPolicy { running: Shown::Open, done: Shown::Open };
+        let splices = zone.model.set_policy(all_open);
+        assert_eq!(splices, [Splice { range: 3..4, count: 2 }], "only the row that changes");
+        assert_eq!(zone.model.set_policy(all_open), [], "no change, no splice");
+        let splices = zone.model.set_policy(ToolPolicy { running: Shown::Closed, done: Shown::Closed });
+        assert_eq!(splices, [Splice { range: 3..5, count: 1 }]);
+        assert_eq!(row(&zone.model, 2), (RowState::Open, 2), "a choice by hand outlives the policy");
+        assert_eq!(zone.model.toggle_tool(EntryId(9)), [], "no such entry");
+        assert_drawn_afresh(&zone.model);
+
+        // Toggle Tool Details: one closed, so all open; then all close.
+        let splices = zone.model.toggle_tool_details();
+        assert_eq!(splices.len(), 1);
+        assert_eq!((row(&zone.model, 2).0, row(&zone.model, 3).0), (RowState::Open, RowState::Open));
+        zone.model.toggle_tool_details();
+        assert_eq!((row(&zone.model, 2).0, row(&zone.model, 3).0), (RowState::Closed, RowState::Closed));
+        assert_drawn_afresh(&zone.model);
+    }
+
+    /// A call that runs with the zone holding no user message (its turn's
+    /// prompt above the page) is running (flag 7); every call of a replay's
+    /// earlier turns, and of a fetched page, is finished.
+    #[test]
+    fn replays_and_pages_draw_earlier_calls_closed_and_a_running_one_open() {
+        let mut server = Transcript::new();
+        let mut events = vec![ready(), added(1, user("first")), turn(TurnState::Working)];
+        events.push(added(2, tool_entry("c1", ToolStatus::InProgress, vec![diff_item("/p/a.rs")])));
+        events.push(turn(TurnState::Ended { stop: StopReason::EndTurn }));
+        events.push(added(3, user("second")));
+        events.push(turn(TurnState::Working));
+        events.push(added(4, in_progress("c2", vec![diff_item("/p/b.rs")])));
+        for n in 0..20 {
+            events.push(added(n + 5, agent(&"y".repeat(20 * 1024))));
+        }
+        events.push(added(25, in_progress("c3", vec![diff_item("/p/c.rs")])));
+        for event in &events {
+            server.apply(event).unwrap();
+        }
+        let mut whole = Zone::new(None);
+        whole.replay(&server.replay());
+        assert_eq!(row(&whole.model, 2).0, RowState::Closed, "left in progress by an ended turn");
+        assert_eq!(row(&whole.model, 4).0, RowState::Open, "the running turn's");
+        assert_eq!(row(&whole.model, 25).0, RowState::Open);
+
+        let mut zone = paged(&server);
+        assert!(zone.model.held(EntryId(3)).is_none(), "the prompt is above the page");
+        assert_eq!(row(&zone.model, 25).0, RowState::Open, "running with no user message held");
+        let mut request = 1;
+        while let Some(fetch) = zone.model.fetch_due(true, true) {
+            zone.model.fetching(request);
+            let absorbed = answer_fetch(&mut zone, &server, fetch, request);
+            assert_eq!(absorbed.notice, None);
+            request += 1;
+        }
+        assert_eq!(row(&zone.model, 2).0, RowState::Closed);
+        assert_eq!(row(&zone.model, 4).0, RowState::Open, "after the second prompt, its turn running");
+        assert_eq!(row(&zone.model, 25).0, RowState::Open);
+        assert_drawn_afresh(&zone.model);
+    }
+
+    /// An open row's growing output splices only its last part; a replaced
+    /// content list redraws from the first part that differs; a trim drops
+    /// an open entry's parts.
+    #[test]
+    fn an_open_rows_changes_splice_only_the_parts_that_change() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("go")), turn(TurnState::Working)]);
+        zone.feed(&[added(2, in_progress("c1", vec![diff_item("/p/a.rs"), output_item(Some("cargo test"), "", None)]))]);
+        assert_eq!(row(&zone.model, 2), (RowState::Open, 3));
+        let absorbed = zone.feed(&[out(2, 1, "line\n", None)]);
+        assert_eq!(absorbed.splices, [Splice { range: 3..4, count: 1 }], "the output's part alone");
+        let many: String = (0..60).map(|n| format!("{n}\n")).collect();
+        let absorbed = zone.feed(&[out(2, 1, &many, None)]);
+        assert_eq!(absorbed.splices, [Splice { range: 3..4, count: 2 }], "a part full, a new one after it");
+        let absorbed = zone.feed(&[out(2, 1, "more\n", None)]);
+        assert_eq!(absorbed.splices, [Splice { range: 4..5, count: 1 }], "only the last part");
+        let absorbed = zone.feed(&[out(2, 1, "", Some(Exit::Code { code: 1 }))]);
+        assert!(absorbed.splices.iter().all(|s| s.range.start >= 1), "{:?}", absorbed.splices);
+        let BlockBody::Tool { summary, .. } = &zone.model.blocks()[1].body else { panic!() };
+        assert_eq!(*summary, Some("+1 \u{2212}1 · exit 1".into()));
+        assert_drawn_afresh(&zone.model);
+
+        // The list replaced from item 1: the line's summary loses the exit,
+        // and the parts from the row's on are drawn again.
+        let absorbed = zone.feed(&[items(2, 1, vec![ToolItem::Text { text: "**done**".into(), cut: false }])]);
+        assert_eq!(absorbed.splices, [Splice { range: 1..5, count: 3 }]);
+        // Replaced again from item 1 with the summary unchanged: the row
+        // and the diff's part stay.
+        let absorbed = zone.feed(&[items(2, 1, vec![ToolItem::Text { text: "**more**".into(), cut: false }])]);
+        assert_eq!(absorbed.splices, [Splice { range: 3..4, count: 1 }]);
+        let BlockBody::ToolDetail(ShownPart { part: DetailPart::Text { .. }, text, .. }) = &zone.model.blocks()[3].body
+        else {
+            panic!()
+        };
+        assert_eq!(text.len(), 1, "rendered");
+        assert_drawn_afresh(&zone.model);
+
+        // A trim that drops the open entry drops its parts.
+        zone.feed(&[added(3, agent("after"))]);
+        let absorbed = zone.feed(&[Event::Trimmed { through: EntryId(2), dropped: 2 }]);
+        assert_eq!(absorbed.splices, [Splice { range: 0..4, count: 0 }]);
+        assert_eq!(zone.model.blocks().len(), 1);
+        assert!(zone.model.texts.is_empty() && zone.model.by_hand.is_empty());
+    }
+
+    /// Decision 10: a pending permission shows its call's detail, its row
+    /// shows the line alone; answered, the detail goes back to the row.
+    #[test]
+    fn a_pending_permission_shows_its_calls_detail() {
+        for policy in [ToolPolicy::default(), ToolPolicy { running: Shown::Closed, done: Shown::Closed }] {
+            let mut zone = Zone::ready();
+            zone.model.set_policy(policy);
+            zone.feed(&[added(1, user("go")), turn(TurnState::Working)]);
+            zone.feed(&[added(2, in_progress("c1", vec![diff_item("/p/main.rs")]))]);
+            zone.feed(&[turn(TurnState::Blocked), added(3, named_permission("c1"))]);
+            assert_eq!(row(&zone.model, 2), (RowState::WithPermission, 1), "{policy:?}");
+            assert_eq!(shown_with(&zone.model, 3), 1);
+            let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+            assert!(dump.contains("status=in_progress open=permission items=1 summary=\"+1 \u{2212}1\" \"Edit c1\""), "{dump}");
+            assert!(dump.contains("outcome=pending detail=1 \"Write a file\""), "{dump}");
+            assert_drawn_afresh(&zone.model);
+
+            // Content that arrives after the permission row shows with it.
+            zone.feed(&[items(2, 1, vec![diff_item("/p/lib.rs")])]);
+            assert_eq!(shown_with(&zone.model, 3), 2);
+            assert_drawn_afresh(&zone.model);
+
+            zone.feed(&[
+                Event::Answered { id: EntryId(3), outcome: PermissionOutcome::Selected { option: "allow-once".into() } },
+                turn(TurnState::Working),
+            ]);
+            assert_eq!(shown_with(&zone.model, 3), 0, "answered: no detail");
+            let want = if policy.running == Shown::Open { (RowState::Open, 3) } else { (RowState::Closed, 1) };
+            assert_eq!(row(&zone.model, 2), want);
+            let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+            assert!(dump.contains("outcome=selected:allow-once \"Write a file\""), "{dump}");
+            assert_drawn_afresh(&zone.model);
+        }
+
+        // Cancelled: no detail either.
+        let mut zone = Zone::ready();
+        zone.feed(&[turn(TurnState::Working), added(1, in_progress("c1", vec![diff_item("/p/a.rs")]))]);
+        zone.feed(&[added(2, named_permission("c1"))]);
+        zone.feed(&[Event::Answered { id: EntryId(2), outcome: PermissionOutcome::Cancelled }]);
+        assert_eq!(shown_with(&zone.model, 2), 0);
+        assert_eq!(row(&zone.model, 1).0, RowState::Open);
+
+        // No call, or a call the model doesn't hold: as before.
+        let mut zone = Zone::ready();
+        let mut no_call = named_permission("c1");
+        if let Entry::Permission { call, .. } = &mut no_call {
+            *call = None;
+        }
+        zone.feed(&[added(1, in_progress("c1", vec![diff_item("/p/a.rs")])), added(2, no_call)]);
+        zone.feed(&[added(3, named_permission("elsewhere"))]);
+        assert_eq!((shown_with(&zone.model, 2), shown_with(&zone.model, 3)), (0, 0));
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        assert!(dump.contains("outcome=pending \"Write a file\"\n"), "{dump}");
+    }
+
+    /// Decision 15: a restored page whose first entry is the permission's
+    /// tool call shows its detail in the permission.
+    #[test]
+    fn a_restored_page_starting_at_the_permissions_call_shows_its_detail() {
+        let mut server = Transcript::new();
+        let mut events = vec![ready(), added(1, user("go")), turn(TurnState::Working)];
+        events.push(added(2, in_progress("c1", vec![diff_item("/p/main.rs")])));
+        for n in 0..20 {
+            events.push(added(n + 3, agent(&"y".repeat(20 * 1024))));
+        }
+        events.push(turn(TurnState::Blocked));
+        events.push(added(23, named_permission("c1")));
+        for event in &events {
+            server.apply(event).unwrap();
+        }
+        let zone = paged(&server);
+        assert_eq!(zone.model.entries.first().map(|(id, _)| *id), Some(EntryId(2)));
+        assert_eq!(row(&zone.model, 2).0, RowState::WithPermission);
+        assert_eq!(shown_with(&zone.model, 23), 1);
+    }
+
+    /// Decision 12: the tool line's `open=`, `items=`, `more=` and
+    /// `summary=` (flags 31 and 33, each only with one), and its content's
+    /// lines, escaped onto one line each.
+    #[test]
+    fn the_dump_lists_a_tool_calls_content() {
+        let mut zone = Zone::ready();
+        let mut entry = tool_entry("c1", ToolStatus::Completed, vec![
+            diff_item("/p/main.rs"),
+            output_item(Some("cargo test"), "ok\n", Some(Exit::Code { code: 0 })),
+            output_item(None, "/p\n", Some(Exit::Signal { name: "SIGKILL".into() })),
+            ToolItem::Text { text: "a \"quote\"\nb".into(), cut: true },
+            ToolItem::Diff(FileChange { op: FileOp::Move { from: "/p/old".into() }, path: "/p/new".into(), hunks: vec![], omitted: 3 }),
+        ]);
+        if let Entry::Tool { locations, input, more, .. } = &mut entry {
+            locations.push(Location { path: "/p/main.rs".into(), line: Some(10) });
+            locations.push(Location { path: "/p/lib.rs".into(), line: None });
+            *input = Some("{\"x\":1}".into());
+            *more = 8;
+        }
+        zone.feed(&[added(1, entry)]);
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        let lines: Vec<&str> = dump.lines().filter(|line| line.contains("entry=1") || line.starts_with("--- entry 1")).collect();
+        assert_eq!(lines, [
+            "--- entry 1 tool call=\"c1\" kind=edit status=completed open=no items=5 more=8 summary=\"+1 \u{2212}1 · SIGKILL\" \"Edit c1\"",
+            "--- item entry=1 index=0 kind=diff op=modify path=\"/p/main.rs\" added=1 removed=1 omitted=0",
+            "--- hunk entry=1 index=0 old=10 new=10 \" fn main() {\\n-    old();\\n+    new();\\n }\"",
+            "--- item entry=1 index=1 kind=output command=\"cargo test\" exit=0 omitted=0 \"ok\\n\"",
+            "--- item entry=1 index=2 kind=output exit=signal:SIGKILL omitted=0 \"/p\\n\"",
+            "--- item entry=1 index=3 kind=text cut=yes \"a \\\"quote\\\"\\nb\"",
+            "--- item entry=1 index=4 kind=diff op=move from=\"/p/old\" path=\"/p/new\" added=0 removed=0 omitted=3",
+            "--- location entry=1 path=\"/p/main.rs\" line=10",
+            "--- location entry=1 path=\"/p/lib.rs\"",
+        ], "no raw line beside content");
+        assert!(zone.model.wait_text(&found(&zone.model), &linux).contains("kind=diff"));
+
+        // Raw values show with no content items; an empty call is `none`.
+        let mut zone = Zone::ready();
+        let mut raw = tool_entry("c2", ToolStatus::Pending, Vec::new());
+        if let Entry::Tool { input, result, .. } = &mut raw {
+            *input = Some("*** Begin Patch".into());
+            *result = Some("done".into());
+        }
+        zone.feed(&[added(1, raw), added(2, tool_entry("c3", ToolStatus::Pending, Vec::new()))]);
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        assert!(dump.contains("--- raw entry=1 which=input \"*** Begin Patch\"\n--- raw entry=1 which=result \"done\"\n"));
+        assert!(dump.contains("status=pending open=none items=0 \"Edit c3\""), "{dump}");
+    }
+
+    #[test]
+    fn copy_text_reads_the_held_entry() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, tool_entry("c1", ToolStatus::Completed, vec![output_item(None, "ok\n", None)]))]);
+        assert_eq!(zone.model.tool_copy_text(EntryId(1), 0).as_deref(), Some("ok\n"));
+        assert_eq!(zone.model.tool_copy_text(EntryId(1), 1), None);
+        assert_eq!(zone.model.tool_copy_text(EntryId(2), 0), None);
     }
 }

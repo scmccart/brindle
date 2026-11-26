@@ -29,7 +29,7 @@ A diff block SHALL draw the file change it is given: a header with the operation
 - **THEN** the owner is asked to copy, and the block changes nothing itself
 
 ### Requirement: Diff block lines
-Each line of a diff block SHALL show a sign column, the old and the new line number, and its text in the code family the owner names. Added lines SHALL be on the `diff_added` colour and removed lines on the `diff_removed` colour, and the sign column SHALL mark them too, so colour is never the only cue.
+Each line of a diff block SHALL show a sign column, the old and the new line number, and its text in the code family the owner names. Context lines SHALL be on the `muted` colour, as a code block's text is, added lines on the `diff_added` colour and removed lines on the `diff_removed` colour, and the sign column SHALL mark them too, so colour is never the only cue. The block SHALL take its colours from the active token set, so it follows a zone's theme scope.
 
 #### Scenario: Signs as well as colours
 - **WHEN** a diff block draws one added and one removed line

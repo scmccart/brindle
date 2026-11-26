@@ -19,8 +19,9 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
 use brindle_remote_protocol::serde_json::{self, Value, json};
 use brindle_transcript::{
-    AgentState, Entry, EntryId, HoldReason, LoginKind, LoginMethod, PermissionOutcome, Slot,
-    StopReason, ToolKind, ToolStatus, TurnState,
+    AgentState, DiffLine, Entry, EntryId, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, LoginKind,
+    LoginMethod, Output, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind, ToolStatus,
+    TurnState,
 };
 
 use support::fake_agent::{
@@ -648,6 +649,8 @@ fn shape(event: &Event) -> String {
         },
         Event::Appended { text, .. } => format!("appended {text}"),
         Event::ToolChanged { .. } => "tool changed".into(),
+        Event::ToolItems { from, items, .. } => format!("tool items {from} {}", items.len()),
+        Event::ToolOutput { text, .. } => format!("tool output {text}"),
         Event::Answered { outcome, .. } => format!("answered {outcome:?}"),
         Event::Queue { slot } => match slot {
             Slot::Empty => "queue empty".into(),
@@ -941,12 +944,12 @@ fn a_tool_call_is_one_entry_updated_by_its_id() {
     let tools: Vec<&Entry> = log.entries().map(|(_, entry)| entry).filter(|entry| matches!(entry, Entry::Tool { .. })).collect();
     assert_eq!(
         tools,
-        [&Entry::Tool {
-            call: "call_1".into(),
-            title: "Edit main.rs".into(),
-            kind: ToolKind::Edit,
-            status: ToolStatus::Completed,
-        }]
+        [&Entry::tool(
+            "call_1".into(),
+            "Edit main.rs".into(),
+            ToolKind::Edit,
+            ToolStatus::Completed,
+        )]
     );
 }
 
@@ -1954,6 +1957,8 @@ fn kind(event: &Event) -> &'static str {
         Event::Added { .. } => "added",
         Event::Appended { .. } => "appended",
         Event::ToolChanged { .. } => "tool_changed",
+        Event::ToolItems { .. } => "tool_items",
+        Event::ToolOutput { .. } => "tool_output",
         Event::Answered { .. } => "answered",
         Event::Queue { .. } => "queue",
         Event::Turn { .. } => "turn",
@@ -2933,7 +2938,11 @@ fn a_pending_permission_behind_2_mib_is_in_the_page_and_answerable() {
     let pending = permissions(&page);
     assert_eq!(pending.len(), 1, "the pending permission is in the page");
     let entry = pending[0].0;
-    assert_eq!(window.from, EntryId(entry), "the page starts at it");
+    // The request named a tool call the log didn't have, which was added
+    // right before it (`agents-tool-content` decision 7): the page starts
+    // at that tool entry.
+    assert!(matches!(page.entry(EntryId(entry - 1)), Some(Entry::Tool { .. })));
+    assert_eq!(window.from, EntryId(entry - 1), "the page starts at its tool entry");
     later.answer(id, entry, Some("allow-once")).unwrap();
     let log = later.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
     assert_eq!(says(&log).last().map(String::as_str), Some("agent: done"));
@@ -3135,4 +3144,271 @@ fn checkpoints_are_appended_to_the_holders_base_and_adopted_as_one_blob() {
     assert_eq!(said[0], "user: one");
     assert!(said[1..17].iter().all(|line| line.starts_with("agent: 0")), "{said:?}");
     assert_eq!(said[17..], ["user: two", "agent: short", "user: three", "agent: third"]);
+}
+
+// --- Tool content (OpenSpec change `agents-tool-content`, task 4.1) -------
+
+/// A `tool_call` for `call` editing `/w/notes.txt` from apple to banana.
+fn edit_call(call: &str) -> String {
+    update(json!({"sessionUpdate": "tool_call", "toolCallId": call, "title": "Edit notes.txt",
+        "kind": "edit", "status": "in_progress",
+        "content": [{"type": "diff", "path": "/w/notes.txt",
+            "oldText": "first\nan apple a day\nlast\n", "newText": "first\nan banana a day\nlast\n"}]}))
+}
+
+/// A `tool_call` for `call` running a command in terminal `t1`, as Codex
+/// sends one: a `[terminal]` item and `_meta.terminal_info`.
+fn run_call(call: &str) -> String {
+    update(json!({"sessionUpdate": "tool_call", "toolCallId": call, "title": "Run", "kind": "execute",
+        "status": "in_progress", "content": [{"type": "terminal", "terminalId": "t1"}],
+        "_meta": {"terminal_info": {"terminal_id": "t1", "cwd": "/w"}}}))
+}
+
+/// A piece of terminal `t1`'s output, in Codex's `_meta`.
+fn output_piece(call: &str, data: &str) -> String {
+    update(json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+        "_meta": {"terminal_output_delta": {"terminal_id": "t1", "data": data}}}))
+}
+
+/// Terminal `t1`'s exit with `code`, and its call completed.
+fn output_exit(call: &str, code: i32) -> String {
+    update(json!({"sessionUpdate": "tool_call_update", "toolCallId": call, "status": "completed",
+        "_meta": {"terminal_exit": {"terminal_id": "t1", "exit_code": code, "signal": null}}}))
+}
+
+/// The content of the log's first tool entry.
+fn tool_content(log: &Transcript) -> Vec<ToolItem> {
+    log.entries()
+        .find_map(|(_, entry)| match entry {
+            Entry::Tool { content, .. } => Some(content.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// The first tool entry's output: its text and exit.
+fn output_of(log: &Transcript) -> Option<(String, Option<Exit>)> {
+    tool_content(log).into_iter().find_map(|item| match item {
+        ToolItem::Output(output) => Some((output.text, output.exit)),
+        ToolItem::Text { .. } | ToolItem::Diff(_) => None,
+    })
+}
+
+const NOTES_EDIT: [&str; 4] = [" first", "-an apple a day", "+an banana a day", " last"];
+
+fn diff_lines(content: &[ToolItem]) -> Vec<String> {
+    content
+        .iter()
+        .flat_map(|item| match item {
+            ToolItem::Diff(change) => change.hunks.iter().flat_map(|hunk| &hunk.lines).collect(),
+            ToolItem::Text { .. } | ToolItem::Output(_) => Vec::new(),
+        })
+        .map(|line| match line {
+            DiffLine::Context(text) => format!(" {text}"),
+            DiffLine::Removed(text) => format!("-{text}"),
+            DiffLine::Added(text) => format!("+{text}"),
+        })
+        .collect()
+}
+
+#[test]
+fn a_diff_reaches_an_attached_client_as_tool_items_and_a_detached_ones_replay() {
+    let (mut dir, mut client) = agent_core("agent-tool-diff", &[]);
+    let (mut script, _) = started(&dir.path, "tool-diff");
+    script.step("expect session/prompt").step(edit_call("c1")).step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "edit").unwrap();
+    let live = client.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    assert!(client.events(id).iter().any(|event| matches!(event, Event::ToolItems { .. })));
+    let content = tool_content(&live);
+    assert!(
+        matches!(&content[..], [ToolItem::Diff(FileChange { op: FileOp::Modify, path, .. })] if path == "/w/notes.txt"),
+        "{content:?}"
+    );
+    assert_eq!(diff_lines(&content), NOTES_EDIT);
+    // Detached, the session replays the same content on attach.
+    client.detach(id);
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    assert_eq!(held_entries(&later.transcript(id)), held_entries(&live));
+}
+
+#[test]
+fn output_streamed_in_meta_pieces_arrives_piece_by_piece_and_ends_with_its_exit() {
+    let (mut dir, mut client) = agent_core("agent-tool-output", &[]);
+    let (mut script, _) = started(&dir.path, "tool-output");
+    script
+        .step("expect session/prompt")
+        .step(run_call("c1"))
+        .step(output_piece("c1", "one\n\u{1b}[3"));
+    let gate = script.gate();
+    script
+        .step(output_piece("c1", "1mtwo\u{1b}[0m\n"))
+        .step(output_exit("c1", 0))
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "run").unwrap();
+    let first = client.transcript_until(id, "has the first piece", |log| {
+        output_of(log).is_some_and(|(text, _)| text == "one\n")
+    });
+    assert_eq!(output_of(&first), Some(("one\n".into(), None)), "the escape is held back");
+    gate.open();
+    let log = client.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    assert_eq!(
+        tool_content(&log),
+        [ToolItem::Output(Output {
+            cwd: Some("/w".into()),
+            text: "one\ntwo\n".into(),
+            exit: Some(Exit::Code { code: 0 }),
+            ..Output::default()
+        })]
+    );
+    let outputs = client
+        .events(id)
+        .iter()
+        .filter(|event| matches!(event, Event::ToolOutput { .. }))
+        .count();
+    assert!(outputs >= 2, "{outputs}");
+}
+
+#[test]
+fn output_of_200_kib_leaves_the_clients_fold_and_the_servers_log_equal() {
+    let (mut dir, mut client) = agent_core("agent-tool-200k", &[]);
+    let (mut script, _) = started(&dir.path, "tool-200k");
+    script.step("expect session/prompt").step(run_call("c1"));
+    let line = format!("{}\n", "o".repeat(1023));
+    for _ in 0..200 {
+        script.step(output_piece("c1", &line));
+    }
+    script.step(output_exit("c1", 3)).step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "flood").unwrap();
+    let live = client.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    let Some(ToolItem::Output(output)) = tool_content(&live).pop() else {
+        panic!("no output");
+    };
+    assert_eq!(output.exit, Some(Exit::Code { code: 3 }));
+    assert!(output.text.len() <= ITEM_LIMIT, "{}", output.text.len());
+    assert!(output.omitted > 0, "the rest is counted");
+    client.detach(id);
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    assert_eq!(held_entries(&later.fetch_to_start(id)), held_entries(&live));
+}
+
+#[test]
+fn a_paged_attach_waiting_on_a_permission_holds_its_tool_call_from_pages_back() {
+    let (mut dir, mut client) = agent_core("agent-tool-page-permission", &[]);
+    let (mut script, _) = started(&dir.path, "tool-page-permission");
+    script.step("expect session/prompt").step(edit_call("call_1"));
+    long_reply(&mut script, 32, MESSAGE_BYTES);
+    script
+        .step(ask("perm-1"))
+        .step(r#"expect-response "perm-1""#)
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "has the reply, blocked", |log| said_all(32)(log) && blocked(log));
+    client.detach(id);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    let page = later.transcript(id);
+    let window = page.window().expect("2 MiB passes a page");
+    // The tool entry is the log's second, before the 2 MiB reply.
+    assert_eq!(window.from, EntryId(2), "the page starts at the tool entry");
+    assert_eq!(diff_lines(&tool_content(&page)), NOTES_EDIT);
+    let (entry, _) = permissions(&page)[0];
+    later.answer(id, entry, Some("allow-once")).unwrap();
+    later.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+}
+
+#[test]
+fn a_fetch_returns_a_tool_entry_with_output_appended_after_the_page_was_sent() {
+    let (mut dir, mut client) = agent_core("agent-tool-page-output", &[]);
+    let (mut script, _) = started(&dir.path, "tool-page-output");
+    script
+        .step("expect session/prompt")
+        .step(run_call("c1"))
+        .step(output_piece("c1", "before\n"));
+    long_reply(&mut script, 32, MESSAGE_BYTES);
+    let gate = script.gate();
+    script
+        .step(output_piece("c1", "after\n"))
+        .step(output_exit("c1", 0))
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "has the reply", said_all(32));
+    client.detach(id);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    assert_eq!(output_of(&later.transcript(id)), None, "the tool call is before the page");
+    gate.open();
+    later.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    let whole = later.fetch_to_start(id);
+    assert_eq!(output_of(&whole), Some(("before\nafter\n".into(), Some(Exit::Code { code: 0 }))));
+    assert_contiguous_from_1(&whole);
+}
+
+// --- Restarts (task 4.2) --------------------------------------------------
+
+#[test]
+fn output_streamed_across_a_core_kill_ends_as_an_uninterrupted_runs() {
+    let token = "token-agent-tool-kill";
+    let (mut dir, mut client) = agent_core("agent-tool-kill", &[]);
+    let (mut script, _) = started(&dir.path, "tool-kill");
+    script.step("expect session/prompt").step(run_call("call_1"));
+    let mut expected = String::new();
+    for n in 0..40 {
+        script.step(output_piece("call_1", &format!("line {n}\n")));
+        expected.push_str(&format!("line {n}\n"));
+    }
+    // The last piece before the kill ends inside an escape sequence and a
+    // line, which the checkpoint's filter state carries over.
+    script
+        .step(output_piece("call_1", "half \u{1b}[3"))
+        .step(ask("perm-1"))
+        .step(r#"expect-response "perm-1""#);
+    let answered = script.reached();
+    let gate = script.gate();
+    script.step(output_piece("call_1", "1mred\u{1b}[0m\n"));
+    expected.push_str("half red\n");
+    for n in 40..60 {
+        script.step(output_piece("call_1", &format!("line {n}\n")));
+        expected.push_str(&format!("line {n}\n"));
+    }
+    script.step(output_exit("call_1", 0)).step(stop("end_turn"));
+    let finished = script.reached();
+    let (id, pid) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    let log = client.transcript_until(id, "waits on the permission", blocked);
+    let (entry, _) = permissions(&log)[0];
+    // The core queues a checkpoint before the answer's bytes, so once the
+    // agent has the answer the holder has the output so far.
+    client.answer(id, entry, Some("allow-once")).unwrap();
+    reaches(&answered);
+    // The core is killed (in `stored_records`) with the output so far in
+    // a base and appended segments.
+    let records = stored_records(&dir, &mut client, id);
+    assert_eq!(records.first(), Some(&('B', 0)), "{records:?}");
+    assert!(records.len() >= 2, "no segment was appended: {records:?}");
+
+    // The agent finishes while no core runs; the next one adopts it.
+    gate.open();
+    reaches(&finished);
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, token);
+    dir.track(client.core_pid());
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (id, pid));
+    let log = client.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    assert_eq!(output_of(&log), Some((expected, Some(Exit::Code { code: 0 }))));
 }

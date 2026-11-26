@@ -55,14 +55,35 @@ use brindle_transcript::{
     NoticeLevel, PermissionOption, PermissionOutcome, Slot, StopReason, TEXT_CHUNK, Transcript,
     TurnState, chunks,
 };
-use brindle_transcript::{HoldReason, ToolKind, ToolStatus};
-
-use super::lines::{Lines, Piece};
-use super::rpc::{self, PROTOCOL_VERSION, Purpose, Refusal, Rpc};
-use super::wire::{
-    self, AUTH_REQUIRED, Content, ContentKind, Id, Malformed, Message, NotificationKind,
-    OptionKind, Patch, RequestKind, RpcError, ToolCall, ToolChange, UNSUPPORTED_VERSION, Update,
+use brindle_transcript::{
+    CALL_LIMIT, DiffLine, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, Location, MAX_ITEMS,
+    MAX_LOCATIONS, Output as ToolOutputItem, RAW_LIMIT, ToolItem, ToolKind, ToolStatus,
 };
+
+use super::{diff, plain};
+
+use super::dialect::{self, Dialect, Unsupported};
+use super::envelope::{self, Id, Malformed, Message, RpcError};
+use super::forms::{
+    self, AUTH_REQUIRED, Content, ContentKind, Continued, NotificationKind, OptionKind, OutputForm,
+    Patch, Refusal, Request, RequestKind, ToolCall, ToolChange, ToolDetail, ToolItemForm,
+    UNSUPPORTED_VERSION, Update,
+};
+use super::lines::{Lines, Piece};
+use super::rpc::{self, Purpose, Rpc};
+
+/// The most outputs a session still appends to (`agents-tool-content`
+/// decision 5): past it the oldest is closed, its text kept.
+pub const MAX_OPEN_OUTPUTS: usize = 64;
+
+/// An output still appended to: its tool entry, its item there, and the
+/// plain-text filter between pieces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenOutput {
+    pub entry: EntryId,
+    pub item: u32,
+    pub filter: plain::State,
+}
 
 /// The most the log keeps, encoded (decision 14): past it the oldest
 /// entries are dropped whole, with a `Trimmed` event, down to
@@ -304,6 +325,9 @@ pub struct AgentSession {
     pub(super) run: Option<Run>,
     /// The tool entries by the agent's call id; trimmed entries leave it.
     pub(super) tools: BTreeMap<String, EntryId>,
+    /// The outputs still appended to, by the agent's terminal id
+    /// (`agents-tool-content` decision 6); at most [`MAX_OPEN_OUTPUTS`].
+    pub(super) outputs: BTreeMap<String, OpenOutput>,
     pub(super) bad: Option<BadRun>,
     /// The login methods the agent's `initialize` advertised, in its order
     /// (`agents-login` decision 3), sent with every `LoginRequired`.
@@ -339,6 +363,7 @@ impl AgentSession {
             version,
             run: None,
             tools: BTreeMap::new(),
+            outputs: BTreeMap::new(),
             bad: None,
             methods: Vec::new(),
         }
@@ -1050,6 +1075,8 @@ impl Step<'_> {
         self.s.lines = Lines::new();
         self.s.run = None;
         self.s.tools.clear();
+        // The old agent's terminals are gone with it; their text stays.
+        self.s.outputs.clear();
         self.s.bad = None;
         self.s.phase = Phase::Spawning { start };
     }
@@ -1151,7 +1178,7 @@ impl Step<'_> {
     }
 
     fn line(&mut self, line: &[u8]) {
-        match wire::decode(line) {
+        match envelope::decode(line) {
             Ok(message) => self.message(message),
             // An empty line is no message and no fault.
             Err(Malformed::Blank) => {}
@@ -1159,7 +1186,10 @@ impl Step<'_> {
                 self.bad_line();
                 self.out
                     .stdin
-                    .extend(rpc::error(None, Refusal::InvalidRequest));
+                    .extend(self.s.rpc.dialect().encode(Request::Error {
+                        id: None,
+                        refusal: Refusal::InvalidRequest,
+                    }));
             }
             // A batch is skipped and counted, never answered.
             Err(
@@ -1176,34 +1206,44 @@ impl Step<'_> {
         match message {
             Message::Request { id, method, params } => {
                 self.flush_bad();
-                match wire::request_kind(&method) {
+                match self.s.rpc.dialect().request_kind(&method) {
                     RequestKind::Permission => self.permission(id, &params),
-                    RequestKind::Unoffered => self
-                        .out
-                        .stdin
-                        .extend(rpc::error(Some(&id), Refusal::MethodNotFound)),
+                    RequestKind::Unoffered => {
+                        self.out
+                            .stdin
+                            .extend(self.s.rpc.dialect().encode(Request::Error {
+                                id: Some(&id),
+                                refusal: Refusal::MethodNotFound,
+                            }))
+                    }
                 }
             }
-            Message::Notification { method, params } => match wire::notification_kind(&method) {
-                NotificationKind::SessionUpdate => match wire::session_update(&params) {
-                    Ok(update) => {
-                        self.flush_bad();
-                        self.update(update);
+            Message::Notification { method, params } => {
+                match self.s.rpc.dialect().notification_kind(&method) {
+                    NotificationKind::SessionUpdate => {
+                        match self.s.rpc.dialect().session_update(&params) {
+                            Ok(update) => {
+                                self.flush_bad();
+                                self.update(update);
+                            }
+                            // A muted replay counts even an update Brindle can't
+                            // read: it would show nothing either way.
+                            Err(_) if self.mute() => {}
+                            Err(_) => self.bad_line(),
+                        }
                     }
-                    // A muted replay counts even an update Brindle can't
-                    // read: it would show nothing either way.
-                    Err(_) if self.mute() => {}
-                    Err(_) => self.bad_line(),
-                },
-                NotificationKind::CancelRequest => match wire::cancel_request(&params) {
-                    Ok(id) => {
-                        self.flush_bad();
-                        self.withdraw(&id);
+                    NotificationKind::CancelRequest => {
+                        match self.s.rpc.dialect().cancel_request(&params) {
+                            Ok(id) => {
+                                self.flush_bad();
+                                self.withdraw(&id);
+                            }
+                            Err(_) => self.bad_line(),
+                        }
                     }
-                    Err(_) => self.bad_line(),
-                },
-                NotificationKind::Other => self.flush_bad(),
-            },
+                    NotificationKind::Other => self.flush_bad(),
+                }
+            }
             Message::Response { id, result } => {
                 self.flush_bad();
                 if let Some(purpose) = self.s.rpc.answered(&id) {
@@ -1250,7 +1290,7 @@ impl Step<'_> {
         }
     }
 
-    fn update(&mut self, update: wire::SessionUpdate) {
+    fn update(&mut self, update: forms::SessionUpdate) {
         // Only the conversation's own updates count once it is known.
         let own = match &self.s.phase {
             Phase::Ready { session: id }
@@ -1349,21 +1389,33 @@ impl Step<'_> {
     fn tool_call(&mut self, call: ToolCall) {
         let id = bound(clean(&call.call));
         let title = bound(clean(&call.title));
-        match self.tool(&id) {
+        let entry = match self.tool(&id) {
             // An agent may send `tool_call` again for a call it already
             // named: its fields change the entry.
             Some(entry) => {
                 self.change_tool(entry, Some(title), Some(call.kind), Some(call.status));
+                entry
             }
             None => self.add_tool(id, title, call.kind, call.status),
-        }
+        };
+        self.tool_detail(entry, call.detail);
     }
 
     fn tool_change(&mut self, change: ToolChange) {
         let id = bound(clean(&change.call));
-        let title = change.title.map(|title| bound(clean(&title)));
-        match self.tool(&id) {
-            Some(entry) => self.change_tool(entry, title, change.kind, change.status),
+        // A cleared field goes back to what a call with none has: its id
+        // for a title, `other`, `pending`.
+        let title = change
+            .title
+            .map(|title| bound(clean(&title)))
+            .or_reset(|| id.clone());
+        let kind = change.kind.or_reset(|| ToolKind::Other);
+        let status = change.status.or_reset(|| ToolStatus::Pending);
+        let entry = match self.tool(&id) {
+            Some(entry) => {
+                self.change_tool(entry, title, kind, status);
+                entry
+            }
             // An update for a call the log doesn't have adds it with the
             // fields it carries.
             None => {
@@ -1371,21 +1423,55 @@ impl Step<'_> {
                 self.add_tool(
                     id,
                     title,
-                    change.kind.unwrap_or(ToolKind::Other),
-                    change.status.unwrap_or(ToolStatus::Pending),
-                );
+                    kind.unwrap_or(ToolKind::Other),
+                    status.unwrap_or(ToolStatus::Pending),
+                )
             }
-        }
+        };
+        self.tool_detail(entry, change.detail);
     }
 
-    fn add_tool(&mut self, call: String, title: String, kind: ToolKind, status: ToolStatus) {
-        let entry = self.add(Entry::Tool {
-            call: call.clone(),
-            title,
-            kind,
-            status,
-        });
+    /// A permission request's `toolCall`: its content, locations and input
+    /// go to the tool entry it names, added from the request's fields when
+    /// the log has none. Its title, kind and status never change the
+    /// entry, since the request's title may differ (Copilot's does), and
+    /// its result and output are the update's to send.
+    fn permission_tool(&mut self, change: ToolChange) {
+        let id = bound(clean(&change.call));
+        let entry = match self.tool(&id) {
+            Some(entry) => entry,
+            None => {
+                let title = change
+                    .title
+                    .value()
+                    .map_or_else(|| id.clone(), |title| bound(clean(title)));
+                let kind = change.kind.value().copied().unwrap_or(ToolKind::Other);
+                let status = change
+                    .status
+                    .value()
+                    .copied()
+                    .unwrap_or(ToolStatus::Pending);
+                self.add_tool(id, title, kind, status)
+            }
+        };
+        let detail = ToolDetail {
+            result: Patch::Keep,
+            outputs: Vec::new(),
+            ..change.detail
+        };
+        self.tool_detail(entry, detail);
+    }
+
+    fn add_tool(
+        &mut self,
+        call: String,
+        title: String,
+        kind: ToolKind,
+        status: ToolStatus,
+    ) -> EntryId {
+        let entry = self.add(Entry::tool(call.clone(), title, kind, status));
         self.s.tools.insert(call, entry);
+        entry
     }
 
     /// Sends the fields that differ from the entry's, in whatever order
@@ -1397,10 +1483,25 @@ impl Step<'_> {
         kind: Option<ToolKind>,
         status: Option<ToolStatus>,
     ) {
+        self.change_tool_fields(entry, title, kind, status, ToolFields::default());
+    }
+
+    fn change_tool_fields(
+        &mut self,
+        entry: EntryId,
+        title: Option<String>,
+        kind: Option<ToolKind>,
+        status: Option<ToolStatus>,
+        fields: ToolFields,
+    ) {
         let Some(Entry::Tool {
             title: own_title,
             kind: own_kind,
             status: own_status,
+            locations: own_locations,
+            input: own_input,
+            result: own_result,
+            more: own_more,
             ..
         }) = self.s.transcript.entry(entry)
         else {
@@ -1409,7 +1510,18 @@ impl Step<'_> {
         let title = title.filter(|title| title != own_title);
         let kind = kind.filter(|kind| kind != own_kind);
         let status = status.filter(|status| status != own_status);
-        if title.is_none() && kind.is_none() && status.is_none() {
+        let locations = fields.locations.filter(|list| list != own_locations);
+        let input = fields.input.filter(|input| input != own_input);
+        let result = fields.result.filter(|result| result != own_result);
+        let more = fields.more.filter(|more| more != own_more);
+        if title.is_none()
+            && kind.is_none()
+            && status.is_none()
+            && locations.is_none()
+            && input.is_none()
+            && result.is_none()
+            && more.is_none()
+        {
             return;
         }
         self.emit(Event::ToolChanged {
@@ -1417,13 +1529,357 @@ impl Step<'_> {
             title,
             kind,
             status,
+            locations,
+            input,
+            result,
+            more,
         });
     }
 
+    /// What a tool call carries beyond its row (`agents-tool-content`
+    /// decisions 3 to 6), applied to `entry` with every bound before an
+    /// event is made: its content, which replaces the entry's only when it
+    /// differs; its locations and raw values; and its terminals' output.
+    fn tool_detail(&mut self, entry: EntryId, detail: ToolDetail) {
+        let opened: BTreeMap<String, (Option<String>, Option<String>)> = detail
+            .outputs
+            .iter()
+            .filter_map(|form| match form {
+                OutputForm::Opened {
+                    terminal,
+                    cwd,
+                    command,
+                } => Some((
+                    terminal.clone(),
+                    (
+                        cwd.as_ref().map(|cwd| bound(clean(cwd))),
+                        command.as_ref().map(|command| bound(clean(command))),
+                    ),
+                )),
+                OutputForm::Appended { .. } | OutputForm::Exited { .. } => None,
+            })
+            .collect();
+        let mut fields = ToolFields::default();
+        if let Patch::Set(items) = detail.content {
+            fields.more = self.tool_content(entry, items, &opened, detail.unreadable);
+        }
+        fields.locations = detail.locations.value().map(|list| {
+            list.iter()
+                .take(MAX_LOCATIONS)
+                .map(|location| Location {
+                    path: bound(clean(&location.path)),
+                    line: location.line,
+                })
+                .collect()
+        });
+        fields.input = detail.input.value().map(|text| Some(raw_text(text)));
+        fields.result = detail.result.value().map(|text| Some(raw_text(text)));
+        self.change_tool_fields(entry, None, None, None, fields);
+        for form in detail.outputs {
+            match form {
+                OutputForm::Opened {
+                    terminal,
+                    cwd,
+                    command,
+                } => {
+                    let command = command.map(|command| bound(clean(&command)));
+                    let cwd = cwd.map(|cwd| bound(clean(&cwd)));
+                    match self.s.outputs.get(&terminal) {
+                        None => {
+                            let output = ToolOutputItem {
+                                command,
+                                cwd,
+                                ..ToolOutputItem::default()
+                            };
+                            self.open_output(entry, terminal, output);
+                        }
+                        Some(open) => {
+                            let (entry, item) = (open.entry, open.item);
+                            self.describe_output(entry, item, cwd, command);
+                        }
+                    }
+                }
+                OutputForm::Appended { terminal, bytes } => {
+                    if let Some(open) = self.output(entry, &terminal) {
+                        let text = plain::feed(&mut open.filter, &bytes);
+                        let (id, item) = (open.entry, open.item);
+                        // In `TEXT_CHUNK` pieces, so every event fits a
+                        // frame however much one delta carries; they fold
+                        // as the whole text would.
+                        for piece in chunks(&text).filter(|piece| !piece.is_empty()) {
+                            self.emit(Event::ToolOutput {
+                                id,
+                                item,
+                                text: piece.to_owned(),
+                                exit: None,
+                            });
+                        }
+                    }
+                }
+                OutputForm::Exited { terminal, exit } => {
+                    if self.output(entry, &terminal).is_some()
+                        && let Some(mut open) = self.s.outputs.remove(&terminal)
+                    {
+                        let text = plain::finish(&mut open.filter);
+                        self.emit(Event::ToolOutput {
+                            id: open.entry,
+                            item: open.item,
+                            text,
+                            exit: exit.map(|exit| match exit {
+                                Exit::Code { code } => Exit::Code { code },
+                                Exit::Signal { name } => Exit::Signal {
+                                    name: bound(clean(&name)),
+                                },
+                            }),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// The open output for `terminal`; one opens at the end of `entry`'s
+    /// content when none is (Codex's file read sends output for a terminal
+    /// nothing opened, flag 16). `None` when the entry has no room.
+    fn output(&mut self, entry: EntryId, terminal: &str) -> Option<&mut OpenOutput> {
+        if !self.s.outputs.contains_key(terminal) {
+            self.open_output(entry, terminal.to_owned(), ToolOutputItem::default());
+        }
+        self.s.outputs.get_mut(terminal)
+    }
+
+    /// A terminal's description arriving after its output opened (a
+    /// `[terminal]` item named it first): the output, when it is the
+    /// entry's last item and has neither a command nor a directory, is
+    /// sent again with them, its text kept.
+    fn describe_output(
+        &mut self,
+        entry: EntryId,
+        item: u32,
+        cwd: Option<String>,
+        command: Option<String>,
+    ) {
+        if cwd.is_none() && command.is_none() {
+            return;
+        }
+        let Some(Entry::Tool { content, .. }) = self.s.transcript.entry(entry) else {
+            return;
+        };
+        let last = content.len().checked_sub(1) == Some(item as usize);
+        let Some(ToolItem::Output(output)) = content.get(item as usize) else {
+            return;
+        };
+        if !last || output.cwd.is_some() || output.command.is_some() {
+            return;
+        }
+        let output = ToolOutputItem {
+            cwd,
+            command,
+            ..output.clone()
+        };
+        self.emit(Event::ToolItems {
+            id: entry,
+            from: item,
+            items: vec![ToolItem::Output(output)],
+        });
+    }
+
+    /// Appends `output` to `entry`'s content and keeps it open for
+    /// `terminal`, unless the entry is at [`MAX_ITEMS`].
+    fn open_output(&mut self, entry: EntryId, terminal: String, output: ToolOutputItem) {
+        let Some(Entry::Tool { content, .. }) = self.s.transcript.entry(entry) else {
+            return;
+        };
+        let at = content.len();
+        if at >= MAX_ITEMS {
+            return;
+        }
+        let item = u32::try_from(at).unwrap_or(u32::MAX);
+        self.emit(Event::ToolItems {
+            id: entry,
+            from: item,
+            items: vec![ToolItem::Output(output)],
+        });
+        self.keep_open(
+            terminal,
+            OpenOutput {
+                entry,
+                item,
+                filter: plain::State::default(),
+            },
+        );
+    }
+
+    /// Keeps an output open, closing the oldest past [`MAX_OPEN_OUTPUTS`].
+    fn keep_open(&mut self, terminal: String, open: OpenOutput) {
+        while self.s.outputs.len() >= MAX_OPEN_OUTPUTS {
+            let oldest = self
+                .s
+                .outputs
+                .iter()
+                .min_by_key(|(_, open)| (open.entry, open.item))
+                .map(|(terminal, _)| terminal.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.s.outputs.remove(&oldest);
+        }
+        self.s.outputs.insert(terminal, open);
+    }
+
+    /// Replaces `entry`'s content with `items`, bounded, when they differ,
+    /// and returns how many items were left out past [`MAX_ITEMS`] and
+    /// [`CALL_LIMIT`]. A terminal still named keeps its output as it is.
+    fn tool_content(
+        &mut self,
+        entry: EntryId,
+        items: Vec<ToolItemForm>,
+        opened: &BTreeMap<String, (Option<String>, Option<String>)>,
+        unreadable: u32,
+    ) -> Option<u32> {
+        let Some(Entry::Tool { content, title, .. }) = self.s.transcript.entry(entry) else {
+            return None;
+        };
+        let (old, title) = (content.clone(), title.clone());
+        let mut kept: Vec<ToolItem> = Vec::new();
+        let mut terminals: Vec<(String, u32)> = Vec::new();
+        let mut more = 0u32;
+        let mut len = 0usize;
+        for form in items {
+            let item = match form {
+                ToolItemForm::Content(Content::Text(text)) => text_item(&text),
+                ToolItemForm::Content(Content::Other(kind)) => text_item(placeholder(kind)),
+                ToolItemForm::Unknown { kind } => {
+                    text_item(&format!("[content Brindle doesn't show: {kind}]"))
+                }
+                ToolItemForm::RawDiff { path, old, new } => {
+                    let diffed = diff::hunks(old.as_deref().unwrap_or_default(), &new);
+                    ToolItem::Diff(FileChange {
+                        op: match old {
+                            None => FileOp::Add,
+                            Some(_) => FileOp::Modify,
+                        },
+                        path: bound(clean(&path)),
+                        hunks: diffed
+                            .hunks
+                            .into_iter()
+                            .map(|mut hunk| {
+                                for line in &mut hunk.lines {
+                                    clean_line(line);
+                                }
+                                hunk
+                            })
+                            .collect(),
+                        omitted: diffed.omitted,
+                    })
+                }
+                ToolItemForm::Terminal { terminal } => {
+                    let open = self
+                        .s
+                        .outputs
+                        .get(&terminal)
+                        .filter(|open| open.entry == entry)
+                        .and_then(|open| old.get(open.item as usize));
+                    let output = match open {
+                        Some(item @ ToolItem::Output(_)) => item.clone(),
+                        Some(ToolItem::Text { .. } | ToolItem::Diff(_)) | None => {
+                            let (cwd, command) = opened.get(&terminal).cloned().unwrap_or_default();
+                            ToolItem::Output(ToolOutputItem {
+                                command,
+                                cwd,
+                                ..ToolOutputItem::default()
+                            })
+                        }
+                    };
+                    let at = u32::try_from(kept.len()).unwrap_or(u32::MAX);
+                    terminals.push((terminal, at));
+                    output
+                }
+            };
+            let item_len = item.text_len();
+            if kept.len() >= MAX_ITEMS || len.saturating_add(item_len) > CALL_LIMIT {
+                more = more.saturating_add(1);
+                if let Some((_, at)) = terminals.last()
+                    && *at as usize == kept.len()
+                {
+                    terminals.pop();
+                }
+                continue;
+            }
+            len += item_len;
+            kept.push(item);
+        }
+        // The outputs of this entry the new list no longer names close.
+        let named: Vec<&str> = terminals
+            .iter()
+            .map(|(terminal, _)| terminal.as_str())
+            .collect();
+        self.s
+            .outputs
+            .retain(|terminal, open| open.entry != entry || named.contains(&terminal.as_str()));
+        let from = old
+            .iter()
+            .zip(&kept)
+            .take_while(|(old, new)| old == new)
+            .count();
+        if from == kept.len() && from == old.len() {
+            return Some(more);
+        }
+        let mut at = from;
+        let mut pieces = vec![Vec::new()];
+        let mut piece_len = 0usize;
+        for item in kept.into_iter().skip(from) {
+            let item_len = item.text_len();
+            if piece_len > 0 && piece_len.saturating_add(item_len) > TEXT_CHUNK {
+                pieces.push(Vec::new());
+                piece_len = 0;
+            }
+            piece_len += item_len;
+            if let Some(piece) = pieces.last_mut() {
+                piece.push(item);
+            }
+        }
+        for items in pieces {
+            let count = items.len();
+            self.emit(Event::ToolItems {
+                id: entry,
+                from: u32::try_from(at).unwrap_or(u32::MAX),
+                items,
+            });
+            at += count;
+        }
+        for (terminal, item) in terminals {
+            match self.s.outputs.get_mut(&terminal) {
+                Some(open) if open.entry == entry => open.item = item,
+                Some(_) => {}
+                None => self.keep_open(
+                    terminal,
+                    OpenOutput {
+                        entry,
+                        item,
+                        filter: plain::State::default(),
+                    },
+                ),
+            }
+        }
+        if unreadable > 0 {
+            self.notice(
+                NoticeLevel::Warning,
+                format!("{unreadable} content items of tool call {title} couldn't be read"),
+            );
+        }
+        Some(more)
+    }
+
     fn permission(&mut self, id: Id, params: &Value) {
-        let Ok(request) = wire::permission_request(params) else {
+        let Ok(request) = self.s.rpc.dialect().permission_request(params) else {
             // Answered by its envelope id, never left waiting (decision 5).
-            self.out.stdin.extend(rpc::permission_answer(&id, None));
+            self.out
+                .stdin
+                .extend(self.s.rpc.dialect().encode(Request::PermissionAnswer {
+                    id: &id,
+                    option: None,
+                }));
             self.notice(
                 NoticeLevel::Warning,
                 "the agent asked for a permission Brindle couldn't read, which was answered cancelled"
@@ -1443,11 +1899,17 @@ impl Step<'_> {
                 OptionKind::Unknown { name } => unknown.push(clean(&name)),
             }
         }
+        // The request's tool call is applied first, so the entry its row
+        // points at holds what the agent sent in either place
+        // (`agents-tool-content` decision 7).
+        if let Some(call) = &request.call {
+            self.permission_tool(call.clone());
+        }
         let call = request.call.as_ref().map(|call| bound(clean(&call.call)));
         let title = request
             .call
             .as_ref()
-            .and_then(|call| call.title.as_deref())
+            .and_then(|call| call.title.value())
             .map(|title| bound(clean(title)))
             .or_else(|| {
                 let entry = self.tool(call.as_deref()?)?;
@@ -1504,7 +1966,12 @@ impl Step<'_> {
 
     /// Answers a permission request `cancelled` at once and records it.
     fn cancel_now(&mut self, entry: EntryId, id: &Id) {
-        self.out.stdin.extend(rpc::permission_answer(id, None));
+        self.out.stdin.extend(
+            self.s
+                .rpc
+                .dialect()
+                .encode(Request::PermissionAnswer { id, option: None }),
+        );
         self.emit(Event::Answered {
             id: entry,
             outcome: PermissionOutcome::Cancelled,
@@ -1554,35 +2021,23 @@ impl Step<'_> {
             return;
         };
         let start = start.clone();
+        // `initialize` asked for the newest version; the answer names the
+        // one the session speaks.
+        let newest = Dialect::newest().version();
         match result {
-            Ok(result) => match wire::initialize_result(result) {
-                Ok(initialized) if initialized.protocol_version == PROTOCOL_VERSION => {
-                    let (name, version) = initialized.agent.map_or((None, None), |agent| {
-                        (
-                            Some(agent_name(&agent)),
-                            Some(bound(clean(&agent.version))),
-                        )
-                    });
-                    let greeting = Greeting {
-                        name,
-                        version,
-                        continuation: initialized.continuation,
-                    };
-                    self.keep_methods(wire::auth_methods(result, true));
-                    self.start(start, greeting);
-                }
-                Ok(initialized) => self.refuse(format!(
-                    "the agent speaks ACP version {}; Brindle speaks {PROTOCOL_VERSION}",
-                    initialized.protocol_version
-                )),
-                Err(_) => self.refuse(
+            Ok(result) => match dialect::spoken(result).map(Dialect::from_version) {
+                None => self.refuse(
                     "the agent's answer to initialize isn't one Brindle can read".to_owned(),
                 ),
+                Some(Err(Unsupported { version })) => self.refuse(format!(
+                    "the agent speaks ACP version {version}; Brindle speaks {newest}"
+                )),
+                Some(Ok(dialect)) => self.speaking(dialect, start, result),
             },
             Err(error) => {
-                let message = match wire::supported_versions(error) {
+                let message = match Dialect::newest().supported_versions(error) {
                     Some(versions) => format!(
-                        "the agent supports ACP version{} {}; Brindle speaks {PROTOCOL_VERSION}",
+                        "the agent supports ACP version{} {}; Brindle speaks {newest}",
                         if versions.len() == 1 { "" } else { "s" },
                         versions
                             .iter()
@@ -1590,9 +2045,9 @@ impl Step<'_> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
-                    None if error.code == UNSUPPORTED_VERSION => format!(
-                        "the agent supports no ACP version Brindle speaks ({PROTOCOL_VERSION})"
-                    ),
+                    None if error.code == UNSUPPORTED_VERSION => {
+                        format!("the agent supports no ACP version Brindle speaks ({newest})")
+                    }
                     None => format!("the agent couldn't start: {}", clean(&error.message)),
                 };
                 self.refuse(message);
@@ -1600,11 +2055,32 @@ impl Step<'_> {
         }
     }
 
+    /// `initialize`'s answer, read in the version it names.
+    fn speaking(&mut self, dialect: Dialect, start: Start, result: &Value) {
+        self.s.rpc.speak(dialect);
+        match dialect.initialize_result(result) {
+            Ok(initialized) => {
+                let (name, version) = initialized.agent.map_or((None, None), |agent| {
+                    (Some(agent_name(&agent)), Some(bound(clean(&agent.version))))
+                });
+                let greeting = Greeting {
+                    name,
+                    version,
+                    continuation: initialized.continuation,
+                };
+                self.keep_methods(dialect.auth_methods(result, true));
+                self.start(start, greeting);
+            }
+            Err(_) => self
+                .refuse("the agent's answer to initialize isn't one Brindle can read".to_owned()),
+        }
+    }
+
     /// Keeps the login methods `initialize` advertised, their text cleaned,
     /// with one warning notice when any were left out or cut
     /// (`agents-login` decision 3). Brindle always advertises
     /// `auth.terminal`.
-    fn keep_methods(&mut self, read: wire::Methods) {
+    fn keep_methods(&mut self, read: forms::Methods) {
         self.s.methods = read
             .methods
             .into_iter()
@@ -1668,7 +2144,7 @@ impl Step<'_> {
         };
         let greeting = greeting.clone();
         match result {
-            Ok(result) => match wire::new_session_result(result) {
+            Ok(result) => match self.s.rpc.dialect().new_session_result(result) {
                 Ok(created) => self.ready(created.session_id, greeting, None),
                 Err(_) => self.refuse(
                     "the agent's answer to session/new isn't one Brindle can read".to_owned(),
@@ -1689,7 +2165,7 @@ impl Step<'_> {
     /// ACP session, with the notice its way calls for; `-32000` needs a
     /// login; any other error, or an answer Brindle can't read, fails it.
     fn continued(&mut self, result: Result<&Value, &RpcError>) {
-        let (greeting, conversation, log, notice, method) = match &self.s.phase {
+        let (greeting, conversation, log, notice, how) = match &self.s.phase {
             Phase::Resuming {
                 greeting,
                 conversation,
@@ -1699,7 +2175,7 @@ impl Step<'_> {
                     Log::Kept => None,
                     Log::Fresh => Some((NoticeLevel::Warning, NOT_REPLAYED.to_owned())),
                 };
-                (greeting, conversation, *log, notice, "session/resume")
+                (greeting, conversation, *log, notice, Continued::Resume)
             }
             Phase::Loading {
                 greeting,
@@ -1712,7 +2188,7 @@ impl Step<'_> {
                     }
                     Replay::Shown => (None, Log::Fresh),
                 };
-                (greeting, conversation, log, notice, "session/load")
+                (greeting, conversation, log, notice, Continued::Load)
             }
             Phase::Spawning { .. }
             | Phase::Initializing { .. }
@@ -1728,8 +2204,7 @@ impl Step<'_> {
         };
         let (greeting, conversation) = (greeting.clone(), conversation.clone());
         let readable = match result {
-            Ok(result) if method == "session/load" => wire::load_result(result).is_ok(),
-            Ok(result) => wire::resume_result(result).is_ok(),
+            Ok(result) => self.s.rpc.dialect().continued_result(how, result).is_ok(),
             // After a login the same continue is sent again (the session's
             // directory is the conversation's).
             Err(error) if error.code == AUTH_REQUIRED => {
@@ -1753,6 +2228,7 @@ impl Step<'_> {
             }
         };
         if !readable {
+            let method = self.s.rpc.dialect().continue_method(how);
             return self.refuse(format!(
                 "the agent couldn't continue the conversation: its answer to {method} isn't one Brindle can read"
             ));
@@ -1880,7 +2356,7 @@ impl Step<'_> {
 
     fn prompted(&mut self, result: Result<&Value, &RpcError>) {
         match result {
-            Ok(result) => match wire::prompt_result(result) {
+            Ok(result) => match self.s.rpc.dialect().prompt_result(result) {
                 Ok(stop) => self.end_turn(Ending::Stop(stop)),
                 Err(_) => self.end_turn(Ending::Failed(
                     "the agent's answer to the prompt isn't one Brindle can read".to_owned(),
@@ -2020,7 +2496,9 @@ impl Step<'_> {
     fn cancel_login(&mut self, login: Login) {
         if let Some(id) = self.s.rpc.awaited(Purpose::Authenticate) {
             self.s.rpc.forget_id(id);
-            self.out.stdin.extend(rpc::cancel_request(id));
+            self.out
+                .stdin
+                .extend(self.s.rpc.dialect().encode(Request::Withdraw { id }));
         }
         self.needs_login(login);
         self.mark(Moment::Login);
@@ -2101,7 +2579,12 @@ impl Step<'_> {
             | TurnState::Failed { .. } => return,
         }
         self.hold_waiting(HoldReason::Cancelled);
-        self.out.stdin.extend(rpc::cancel(&session));
+        self.out.stdin.extend(
+            self.s
+                .rpc
+                .dialect()
+                .encode(Request::Cancel { session: &session }),
+        );
         for (entry, answer) in self.s.rpc.cancel_permissions() {
             self.out.stdin.extend(answer);
             self.emit(Event::Answered {
@@ -2188,6 +2671,8 @@ impl Step<'_> {
             Event::Added { .. }
             | Event::Appended { .. }
             | Event::ToolChanged { .. }
+            | Event::ToolItems { .. }
+            | Event::ToolOutput { .. }
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
@@ -2197,6 +2682,7 @@ impl Step<'_> {
         };
         self.out.events.push(event);
         self.s.tools.retain(|_, entry| *entry > through);
+        self.s.outputs.retain(|_, open| open.entry > through);
         if self.s.run.is_some_and(|run| run.entry <= through) {
             self.s.run = None;
         }
@@ -2299,7 +2785,7 @@ pub fn clean(text: &str) -> String {
 /// `agentInfo.title` when it is given and not blank, else `agentInfo.name`
 /// (which the npm adapters fill with their package's name), cleaned and
 /// bounded.
-fn agent_name(agent: &wire::AgentInfo) -> String {
+fn agent_name(agent: &forms::AgentInfo) -> String {
     agent
         .title
         .as_deref()
@@ -2358,6 +2844,56 @@ fn bound(mut text: String) -> String {
         text.truncate(cut);
     }
     text
+}
+
+/// `text` cut to at most `limit` bytes at a character boundary, and
+/// whether it was cut.
+fn cut_at(mut text: String, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text, false);
+    }
+    let mut cut = limit;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    (text, true)
+}
+
+/// A text content item, cleaned, its end dropped past [`ITEM_LIMIT`].
+fn text_item(text: &str) -> ToolItem {
+    let (text, cut) = cut_at(clean(text), ITEM_LIMIT);
+    ToolItem::Text { text, cut }
+}
+
+/// A raw input or result, cleaned, its end dropped past [`RAW_LIMIT`] with
+/// `…`.
+fn raw_text(text: &str) -> String {
+    let ellipsis = "…";
+    match cut_at(clean(text), RAW_LIMIT) {
+        (text, false) => text,
+        (text, true) => {
+            let (mut text, _) = cut_at(text, RAW_LIMIT - ellipsis.len());
+            text.push_str(ellipsis);
+            text
+        }
+    }
+}
+
+/// A diff line's text, cleaned as every text is.
+fn clean_line(line: &mut DiffLine) {
+    let (DiffLine::Context(text) | DiffLine::Added(text) | DiffLine::Removed(text)) = line;
+    *text = clean(text);
+}
+
+/// A tool entry's fields beyond its row that an update changes; `None`
+/// leaves one as it is.
+#[derive(Default)]
+struct ToolFields {
+    locations: Option<Vec<Location>>,
+    input: Option<Option<String>>,
+    result: Option<Option<String>>,
+    more: Option<u32>,
 }
 
 #[cfg(test)]
@@ -2607,6 +3143,8 @@ mod tests {
                 Event::Added { entry, .. } => format!("added {}", entry_kind(entry)),
                 Event::Appended { .. } => "appended".into(),
                 Event::ToolChanged { .. } => "tool changed".into(),
+                Event::ToolItems { .. } => "tool items".into(),
+                Event::ToolOutput { .. } => "tool output".into(),
                 Event::Answered { .. } => "answered".into(),
                 Event::Queue { slot } => match slot {
                     Slot::Empty => "queue empty".into(),
@@ -2668,6 +3206,366 @@ mod tests {
             other => panic!("no fixture {other}"),
         };
         text.lines().nth(n).expect("a line").to_owned()
+    }
+
+    /// `agents-tool-content` decision 2: a version that can clear a tool
+    /// call's field (v1 can't) puts it back to what a call with none has.
+    #[test]
+    fn a_cleared_tool_field_goes_back_to_what_a_call_with_none_has() {
+        let mut agent = Agent::ready();
+        agent.feed(&tool_call("c1", "Edit notes.txt", "in_progress"));
+        let (entry, _) = agent.last_entry();
+        let change = |title, kind, status| ToolChange {
+            call: "c1".into(),
+            title,
+            kind,
+            status,
+            detail: forms::ToolDetail::default(),
+        };
+        let unknown = ToolChange {
+            call: "c2".into(),
+            ..change(Patch::Clear, Patch::Set(ToolKind::Read), Patch::Clear)
+        };
+        let mut step = Step {
+            s: &mut agent.s,
+            out: Output::default(),
+            fault: None,
+            now: agent.now,
+        };
+        step.tool_change(change(Patch::Keep, Patch::Keep, Patch::Keep));
+        step.tool_change(change(Patch::Clear, Patch::Clear, Patch::Clear));
+        // Cleared again, nothing differs.
+        step.tool_change(change(Patch::Clear, Patch::Clear, Patch::Clear));
+        // A call the log doesn't have, cleared, is added as one with none.
+        step.tool_change(unknown);
+        let events = step.out.events;
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(
+            events[0],
+            Event::ToolChanged {
+                id: entry,
+                title: Some("c1".into()),
+                kind: Some(ToolKind::Other),
+                status: Some(ToolStatus::Pending),
+                locations: None,
+                input: None,
+                result: None,
+                more: None,
+            }
+        );
+        assert!(
+            matches!(&events[1], Event::Added { entry: Entry::Tool { call, title, kind: ToolKind::Read, status: ToolStatus::Pending, .. }, .. } if call == "c2" && title == "c2"),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn v1_never_clears_a_tool_field() {
+        let update = |fields: Value| {
+            let mut update = json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1"});
+            if let (Some(update), Some(fields)) = (update.as_object_mut(), fields.as_object()) {
+                update.extend(fields.clone());
+            }
+            Dialect::newest().session_update(&json!({"sessionId": "s1", "update": update}))
+        };
+        for fields in [
+            json!({}),
+            json!({"title": null, "kind": null, "status": null}),
+            json!({"title": "T", "kind": "read", "status": "completed"}),
+        ] {
+            let Ok(forms::SessionUpdate {
+                update: Update::ToolChanged(change),
+                ..
+            }) = update(fields.clone())
+            else {
+                panic!("{fields}: didn't decode");
+            };
+            for cleared in [
+                change.title == Patch::Clear,
+                change.kind == Patch::Clear,
+                change.status == Patch::Clear,
+            ] {
+                assert!(!cleared, "{fields}: {change:?}");
+            }
+        }
+    }
+
+    // --- tool content (`agents-tool-content` decisions 3 to 7) ---------
+
+    fn tool_entry(agent: &Agent, call: &str) -> Entry {
+        let entry = *agent.s.tools.get(call).expect("a tool entry");
+        agent.s.transcript.entry(entry).cloned().expect("held")
+    }
+
+    fn content_of(entry: &Entry) -> Vec<ToolItem> {
+        match entry {
+            Entry::Tool { content, .. } => content.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn diff_item(path: &str, old: &str, new: &str) -> Value {
+        json!({"type": "diff", "path": path, "oldText": old, "newText": new})
+    }
+
+    #[test]
+    fn a_diff_becomes_a_file_change_and_a_resent_list_emits_nothing() {
+        let mut agent = Agent::ready();
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit", "in_progress"));
+        let content = json!([diff_item(
+            "/w/notes.txt",
+            "a\nan apple a day\nb\n",
+            "a\nan banana a day\nb\n"
+        )]);
+        let resend = || {
+            update(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "content": content}),
+            )
+        };
+        let out = agent.feed(&resend());
+        assert_eq!(shape(&out.events), ["tool items"]);
+        let out = agent.feed(&resend());
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        let Ok::<[ToolItem; 1], _>([ToolItem::Diff(change)]) =
+            content_of(&tool_entry(&agent, "c1")).try_into()
+        else {
+            panic!("not a diff");
+        };
+        assert_eq!(
+            (change.op, change.path.as_str()),
+            (FileOp::Modify, "/w/notes.txt")
+        );
+        assert_eq!(
+            change.hunks[0].lines,
+            [
+                DiffLine::Context("a".into()),
+                DiffLine::Removed("an apple a day".into()),
+                DiffLine::Added("an banana a day".into()),
+                DiffLine::Context("b".into()),
+            ]
+        );
+        // No old text is a new file.
+        agent.feed(&update(
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+            "content": [{"type": "diff", "path": "/w/new.txt", "newText": "x\n"}]}),
+        ));
+        assert!(matches!(
+            &content_of(&tool_entry(&agent, "c1"))[..],
+            [ToolItem::Diff(FileChange {
+                op: FileOp::Add,
+                ..
+            })]
+        ));
+    }
+
+    #[test]
+    fn a_permissions_tool_call_brings_its_content_but_never_its_title() {
+        let mut agent = Agent::ready();
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit notes.txt", "pending"));
+        let request = json!({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "options": [{"optionId": "a", "name": "Allow", "kind": "allow_once"}],
+                "toolCall": {"toolCallId": "c1", "title": "Another title", "status": "completed",
+                    "rawInput": {"path": "notes.txt"}, "rawOutput": "never",
+                    "content": [diff_item("notes.txt", "apple\n", "banana\n")]}}});
+        let out = agent.feed(&request.to_string());
+        assert_eq!(
+            shape(&out.events),
+            [
+                "tool items",
+                "tool changed",
+                "added permission",
+                "turn blocked"
+            ]
+        );
+        let Entry::Tool {
+            title,
+            status,
+            input,
+            result,
+            content,
+            ..
+        } = tool_entry(&agent, "c1")
+        else {
+            panic!("not a tool");
+        };
+        assert_eq!(
+            (title.as_str(), status),
+            ("Edit notes.txt", ToolStatus::Pending)
+        );
+        assert_eq!(
+            (input.as_deref(), result),
+            (Some("{\n  \"path\": \"notes.txt\"\n}"), None)
+        );
+        assert_eq!(content.len(), 1);
+        // The permission's row names the call's own title.
+        assert!(
+            matches!(agent.last_permission().1, Entry::Permission { title, .. } if title == "Another title")
+        );
+    }
+
+    fn meta(call: &str, meta: Value) -> String {
+        update(json!({"sessionUpdate": "tool_call_update", "toolCallId": call, "_meta": meta}))
+    }
+
+    #[test]
+    fn codexs_meta_output_ends_as_one_output_with_its_exit() {
+        let mut agent = Agent::ready();
+        agent.turn("pwd");
+        agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "pwd",
+            "kind": "execute", "status": "in_progress", "content": [{"type": "terminal", "terminalId": "t1"}],
+            "_meta": {"terminal_info": {"terminal_id": "t1", "cwd": "/home/user/scratch"}}})));
+        agent.feed(&meta(
+            "c1",
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": "/home/user/"}}),
+        ));
+        let out = agent.feed(&meta(
+            "c1",
+            json!({
+            "terminal_output_delta": {"terminal_id": "t1", "data": "\u{1b}[1mscratch\u{1b}[0m\n"},
+            "terminal_exit": {"terminal_id": "t1", "exit_code": 0, "signal": null}}),
+        ));
+        assert_eq!(shape(&out.events), ["tool output", "tool output"]);
+        assert_eq!(
+            content_of(&tool_entry(&agent, "c1")),
+            [ToolItem::Output(ToolOutputItem {
+                cwd: Some("/home/user/scratch".into()),
+                text: "/home/user/scratch\n".into(),
+                exit: Some(Exit::Code { code: 0 }),
+                ..ToolOutputItem::default()
+            })]
+        );
+        assert!(agent.s.outputs.is_empty(), "closed at its exit");
+        // Output for a terminal nothing opened opens one on its call (flag 16).
+        agent.feed(&tool_call("c2", "Read", "in_progress"));
+        agent.feed(&meta(
+            "c2",
+            json!({"terminal_output_delta": {"terminal_id": "t2", "data": "an apple a day\n"}}),
+        ));
+        assert!(matches!(&content_of(&tool_entry(&agent, "c2"))[..],
+            [ToolItem::Output(ToolOutputItem { text, command: None, .. })] if text == "an apple a day\n"));
+        // A resent `[terminal]` keeps the text.
+        agent.feed(&update(
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c2",
+            "content": [{"type": "terminal", "terminalId": "t2"}]}),
+        ));
+        assert!(matches!(&content_of(&tool_entry(&agent, "c2"))[..],
+            [ToolItem::Output(ToolOutputItem { text, .. })] if text == "an apple a day\n"));
+        // A restart closes the open outputs.
+        assert!(agent.s.outputs.contains_key("t2"));
+        let mut step = Step {
+            s: &mut agent.s,
+            out: Output::default(),
+            fault: None,
+            now: agent.now,
+        };
+        step.respawn(Start::New);
+        assert!(agent.s.outputs.is_empty());
+    }
+
+    #[test]
+    fn tool_content_is_bounded_before_any_event() {
+        let mut agent = Agent::ready();
+        agent.turn("big");
+        let items: Vec<Value> = (0..40)
+            .map(|n| json!({"type": "content", "content": {"type": "text", "text": format!("item {n}")}}))
+            .collect();
+        let big = "b".repeat(ITEM_LIMIT + 5);
+        let mut content =
+            vec![json!({"type": "content", "content": {"type": "text", "text": big}})];
+        content.extend(items);
+        content.push(json!({"type": "hologram"}));
+        content.push(json!({"type": "content"}));
+        let raw = "r".repeat(RAW_LIMIT * 2);
+        let locations: Vec<Value> = (0..40).map(|n| json!({"path": format!("/f{n}")})).collect();
+        let out = agent.feed(&update(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Big",
+            "content": content, "rawInput": raw, "locations": locations}),
+        ));
+        let Entry::Tool {
+            content,
+            more,
+            input,
+            locations,
+            ..
+        } = tool_entry(&agent, "c1")
+        else {
+            panic!("not a tool");
+        };
+        assert_eq!(content.len(), MAX_ITEMS);
+        assert!(
+            matches!(&content[0], ToolItem::Text { text, cut: true } if text.len() == ITEM_LIMIT)
+        );
+        // 41 readable items and the unknown one, 32 kept.
+        assert_eq!(more, 42 - 32);
+        let input = input.expect("an input");
+        assert!(input.len() <= RAW_LIMIT && input.ends_with('…'));
+        assert_eq!(locations.len(), MAX_LOCATIONS);
+        // The unreadable item is one notice.
+        assert_eq!(
+            agent.notices(),
+            ["1 content items of tool call Big couldn't be read"]
+        );
+        for event in &out.events {
+            assert!(event.to_value().to_string().len() < 1024 * 1024);
+        }
+    }
+
+    /// One delta carrying 1 MiB of output (a frame's size) goes out in
+    /// `TEXT_CHUNK` pieces, each event fitting a frame, and the output
+    /// keeps what the whole text would: its newest lines within
+    /// `ITEM_LIMIT`, the rest counted.
+    #[test]
+    fn a_delta_past_a_frame_is_sent_in_pieces() {
+        let mut agent = Agent::ready();
+        agent.turn("run");
+        agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run",
+            "kind": "execute", "status": "in_progress", "content": [{"type": "terminal", "terminalId": "t1"}]})));
+        let line = |n: usize| format!("test case {n:06} ... ok\n");
+        let text: String = (0..(1024 * 1024 / line(0).len())).map(line).collect();
+        let out = agent.feed(&meta(
+            "c1",
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": text}}),
+        ));
+        let outputs: Vec<&Event> = out
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolOutput { .. }))
+            .collect();
+        assert_eq!(outputs.len(), text.len().div_ceil(TEXT_CHUNK));
+        for event in &out.events {
+            assert!(event.to_value().to_string().len() < 128 * 1024);
+        }
+        let [ToolItem::Output(kept)] = &content_of(&tool_entry(&agent, "c1"))[..] else {
+            panic!("not one output");
+        };
+        assert!(kept.text.len() <= ITEM_LIMIT && kept.text.starts_with("test case "));
+        assert!(text.ends_with(&kept.text));
+        assert_eq!(kept.omitted as usize + kept.text.len(), text.len());
+    }
+
+    #[test]
+    fn a_trim_forgets_the_trimmed_entries_outputs() {
+        let mut agent = Agent::ready();
+        agent.turn("run");
+        agent.feed(&meta(
+            "c0",
+            json!({"terminal_output_delta": {"terminal_id": "t0", "data": "x"}}),
+        ));
+        assert!(agent.s.outputs.contains_key("t0"));
+        let mut step = Step {
+            s: &mut agent.s,
+            out: Output::default(),
+            fault: None,
+            now: agent.now,
+        };
+        let filler = "f".repeat(TEXT_CHUNK);
+        while step.s.transcript.encoded_len() <= LOG_LIMIT {
+            step.add_text(RunKind::Agent, &filler);
+        }
+        step.trim();
+        assert!(agent.s.outputs.is_empty());
     }
 
     // --- the start sequence (decision 4) --------------------------------
@@ -2832,6 +3730,8 @@ mod tests {
             Event::Added { .. }
             | Event::Appended { .. }
             | Event::ToolChanged { .. }
+            | Event::ToolItems { .. }
+            | Event::ToolOutput { .. }
             | Event::Answered { .. }
             | Event::Queue { .. }
             | Event::Turn { .. }
@@ -3456,7 +4356,12 @@ mod tests {
         let mut agent = Agent::ready();
         agent.turn("one");
         let out = agent.feed(&permission(json!(0), "call_1", &ALLOW_REJECT));
-        assert_eq!(shape(&out.events), ["added permission", "turn blocked"]);
+        assert_eq!(
+            shape(&out.events),
+            // The request names a call the log doesn't have: it is added first
+            // (`agents-tool-content` decision 7).
+            ["added tool", "added permission", "turn blocked"]
+        );
         assert_eq!(out.checkpoint, Some(Moment::Permission));
         assert!(out.stdin.is_empty(), "never answered on its own");
         assert_eq!(
@@ -3662,6 +4567,7 @@ mod tests {
         assert_eq!(
             shape(&out.events),
             [
+                "added tool",
                 "added permission",
                 "added notice",
                 "answered",
@@ -3693,7 +4599,10 @@ mod tests {
         agent.turn("one");
         agent.cmd(Command::Cancel);
         let out = agent.feed(&permission(json!(0), "call_1", &ALLOW_REJECT));
-        assert_eq!(shape(&out.events), ["added permission", "answered"]);
+        assert_eq!(
+            shape(&out.events),
+            ["added tool", "added permission", "answered"]
+        );
         assert_eq!(*agent.turn_state(), TurnState::Cancelling);
     }
 
@@ -3711,17 +4620,21 @@ mod tests {
                 id: EntryId(2),
                 title: None,
                 kind: None,
-                status: Some(ToolStatus::Completed)
+                status: Some(ToolStatus::Completed),
+                locations: None,
+                input: None,
+                result: None,
+                more: None,
             }]
         );
         assert_eq!(
             agent.last_entry().1,
-            Entry::Tool {
-                call: "call_1".into(),
-                title: "Write a file".into(),
-                kind: ToolKind::Edit,
-                status: ToolStatus::Completed
-            }
+            Entry::tool(
+                "call_1".into(),
+                "Write a file".into(),
+                ToolKind::Edit,
+                ToolStatus::Completed
+            )
         );
     }
 
@@ -3747,6 +4660,8 @@ mod tests {
                 Event::ToolChanged { status, .. } => *status,
                 Event::Added { .. }
                 | Event::Appended { .. }
+                | Event::ToolItems { .. }
+                | Event::ToolOutput { .. }
                 | Event::Answered { .. }
                 | Event::Queue { .. }
                 | Event::Turn { .. }
@@ -3802,12 +4717,12 @@ mod tests {
         agent.feed(&tool_update("call_9", "in_progress"));
         assert_eq!(
             agent.last_entry().1,
-            Entry::Tool {
-                call: "call_9".into(),
-                title: "call_9".into(),
-                kind: ToolKind::Other,
-                status: ToolStatus::InProgress
-            }
+            Entry::tool(
+                "call_9".into(),
+                "call_9".into(),
+                ToolKind::Other,
+                ToolStatus::InProgress
+            )
         );
     }
 
@@ -4596,7 +5511,7 @@ mod tests {
 
     // --- the captured sessions ------------------------------------------
 
-    const CAPTURES: [(&str, &[u8]); 8] = [
+    const CAPTURES: [(&str, &[u8]); 14] = [
         (
             "antigravity-1.5.16-reject",
             include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-reject.log"),
@@ -4628,6 +5543,35 @@ mod tests {
         (
             "copilot-1.0.115-reject",
             include_bytes!("../../tests/fixtures/acp/copilot-1.0.115-reject.log"),
+        ),
+        // `agents-tool-content` task 1.1: an allowed edit of an existing
+        // file and an allowed `seq 1 4`, with today's `initialize` and once
+        // more offering `clientCapabilities.terminal`.
+        (
+            "antigravity-1.5.16-edit-run",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run.log"),
+        ),
+        (
+            "antigravity-1.5.16-edit-run-terminal",
+            include_bytes!("../../tests/fixtures/acp/antigravity-1.5.16-edit-run-terminal.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-edit-run",
+            include_bytes!("../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run.log"),
+        ),
+        (
+            "claude-agent-acp-0.112.0-edit-run-terminal",
+            include_bytes!(
+                "../../tests/fixtures/acp/claude-agent-acp-0.112.0-edit-run-terminal.log"
+            ),
+        ),
+        (
+            "codex-acp-2.12.0-edit-run",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run.log"),
+        ),
+        (
+            "codex-acp-2.12.0-edit-run-terminal",
+            include_bytes!("../../tests/fixtures/acp/codex-acp-2.12.0-edit-run-terminal.log"),
         ),
     ];
 
@@ -4766,12 +5710,22 @@ mod tests {
     }
 
     /// What each captured agent is called and what it named its
-    /// conversation (`agents-session-title`): Codex never names one.
+    /// conversation (`agents-session-title`): Codex named one only in the
+    /// later captures, with its prompt.
     #[test]
     fn every_captured_session_names_its_agent_readably_and_keeps_its_title() {
         for (name, log) in CAPTURES {
             let agent = replay(log, |_| {});
+            let edit_run = name.contains("-edit-run");
             let (readable, title) = match name.split('-').next() {
+                Some("antigravity") if edit_run => {
+                    ("Antigravity ACP Server", Some("Edit Notes File And Run Seq"))
+                }
+                Some("claude") if edit_run => ("Claude Agent", Some("Notes.txt apple to banana edit")),
+                Some("codex") if edit_run => (
+                    "Codex",
+                    Some("In the current working directory there is a file named notes.txt."),
+                ),
                 Some("antigravity") => ("Antigravity ACP Server", Some("Create Hello.txt File")),
                 Some("claude") if name.starts_with("claude-agent") => {
                     ("Claude Agent", Some("Hello.txt file creation"))
@@ -4841,6 +5795,224 @@ mod tests {
                 .filter(|m| **m == "session/cancel")
                 .count(),
             0
+        );
+    }
+
+    /// What each captured agent's tool content becomes
+    /// (`agents-tool-content` task 3.7): every entry bounded, nothing
+    /// unreadable, and each agent's edit, new file, input and output.
+    #[test]
+    fn every_captured_tool_call_keeps_its_content_bounded() {
+        for (name, log) in CAPTURES {
+            let agent = replay(log, |_| {});
+            assert!(
+                !agent
+                    .notices()
+                    .iter()
+                    .any(|text| text.contains("couldn't be read")),
+                "{name}: {:?}",
+                agent.notices()
+            );
+            for entry in agent.entries() {
+                if let Entry::Tool {
+                    content,
+                    input,
+                    result,
+                    locations,
+                    more,
+                    ..
+                } = &entry
+                {
+                    let len: usize = content.iter().map(ToolItem::text_len).sum();
+                    assert!(content.len() <= MAX_ITEMS && len <= CALL_LIMIT, "{name}");
+                    assert_eq!(*more, 0, "{name}");
+                    assert!(locations.len() <= MAX_LOCATIONS, "{name}");
+                    for raw in [input, result].into_iter().flatten() {
+                        assert!(raw.len() <= RAW_LIMIT, "{name}");
+                    }
+                }
+            }
+        }
+    }
+
+    fn tools(agent: &Agent) -> Vec<Entry> {
+        agent
+            .entries()
+            .into_iter()
+            .filter(|entry| matches!(entry, Entry::Tool { .. }))
+            .collect()
+    }
+
+    /// The tool items events each tool entry was sent.
+    fn item_events(agent: &Agent, entry: EntryId) -> usize {
+        agent
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolItems { id, .. } if *id == entry))
+            .count()
+    }
+
+    fn capture_named(name: &str) -> &'static [u8] {
+        CAPTURES
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, log)| *log)
+            .unwrap_or_else(|| panic!("no capture {name}"))
+    }
+
+    const NOTES_EDIT: [&str; 6] = [
+        " first line",
+        " second line",
+        "-an apple a day",
+        "+an banana a day",
+        " fourth line",
+        " fifth line",
+    ];
+
+    fn diff_lines(item: &ToolItem) -> Vec<String> {
+        match item {
+            ToolItem::Diff(change) => change
+                .hunks
+                .iter()
+                .flat_map(|hunk| &hunk.lines)
+                .map(|line| match line {
+                    DiffLine::Context(text) => format!(" {text}"),
+                    DiffLine::Removed(text) => format!("-{text}"),
+                    DiffLine::Added(text) => format!("+{text}"),
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn claudes_and_antigravitys_captured_edits_are_one_file_change_each() {
+        for name in [
+            "claude-agent-acp-0.112.0-edit-run",
+            "claude-agent-acp-0.112.0-edit-run-terminal",
+            "antigravity-1.5.16-edit-run",
+            "antigravity-1.5.16-edit-run-terminal",
+        ] {
+            let agent = replay(capture_named(name), |_| {});
+            let edit = tools(&agent)
+                .into_iter()
+                .find(|entry| {
+                    matches!(
+                        entry,
+                        Entry::Tool {
+                            kind: ToolKind::Edit,
+                            ..
+                        }
+                    )
+                })
+                .unwrap_or_else(|| panic!("{name}: no edit"));
+            let [item] = &content_of(&edit)[..] else {
+                panic!("{name}: {edit:?}");
+            };
+            assert!(
+                matches!(item, ToolItem::Diff(FileChange { op: FileOp::Modify, path, .. }) if path == "/home/user/scratch/notes.txt"),
+                "{name}"
+            );
+            assert_eq!(diff_lines(item), NOTES_EDIT, "{name}");
+            let (id, _) = agent
+                .s
+                .transcript()
+                .entries()
+                .find(|(_, entry)| **entry == edit)
+                .expect("held");
+            // Each sends its fragment first (Claude in an update and again in
+            // the request, which sends nothing more, Antigravity in the
+            // request), then the whole file once the edit is made.
+            assert_eq!(item_events(&agent, id), 2, "{name}");
+        }
+    }
+
+    #[test]
+    fn new_files_rejections_raw_input_and_output_read_as_each_agent_sent_them() {
+        // Claude's `-auto` new file, and Antigravity's, whose content came
+        // only in the permission request.
+        for name in ["claude-agent-acp-0.112.0-auto", "antigravity-1.5.16-reject"] {
+            let agent = replay(capture_named(name), |_| {});
+            let [tool] = &tools(&agent)[..] else {
+                panic!("{name}");
+            };
+            let [item] = &content_of(tool)[..] else {
+                panic!("{name}: {tool:?}");
+            };
+            assert!(
+                matches!(
+                    item,
+                    ToolItem::Diff(FileChange {
+                        op: FileOp::Add,
+                        ..
+                    })
+                ),
+                "{name}"
+            );
+            assert_eq!(diff_lines(item), ["+hi"], "{name}");
+        }
+        // Copilot's patch is in its raw input, under its own title.
+        let agent = replay(capture_named("copilot-1.0.115-reject"), |_| {});
+        let [
+            Entry::Tool {
+                title,
+                input: Some(input),
+                result: Some(result),
+                ..
+            },
+        ] = &tools(&agent)[..]
+        else {
+            panic!("{:?}", tools(&agent));
+        };
+        assert_eq!(title, "apply_patch");
+        assert!(
+            input.contains("\"fileName\": \"/home/user/scratch/hello.txt\""),
+            "{input}"
+        );
+        assert!(result.contains("rejected"), "{result}");
+        // Codex's commands: `pwd`'s output and exit, the rejected command's
+        // output with none, and `seq 1 4`.
+        let agent = replay(capture_named("codex-acp-2.12.0-reject"), |_| {});
+        let outputs: Vec<Vec<ToolItem>> = tools(&agent).iter().map(content_of).collect();
+        assert_eq!(
+            outputs,
+            [
+                vec![ToolItem::Output(ToolOutputItem {
+                    cwd: Some("/home/user/scratch".into()),
+                    text: "/home/user/scratch\n".into(),
+                    exit: Some(Exit::Code { code: 0 }),
+                    ..ToolOutputItem::default()
+                })],
+                vec![ToolItem::Output(ToolOutputItem {
+                    cwd: Some("/home/user/scratch".into()),
+                    ..ToolOutputItem::default()
+                })],
+            ]
+        );
+        for name in [
+            "codex-acp-2.12.0-edit-run",
+            "codex-acp-2.12.0-edit-run-terminal",
+        ] {
+            let agent = replay(capture_named(name), |_| {});
+            let last = tools(&agent).pop().expect("a tool");
+            assert_eq!(
+                content_of(&last),
+                [ToolItem::Output(ToolOutputItem {
+                    cwd: Some("/home/user/scratch".into()),
+                    text: "1\n2\n3\n4\n".into(),
+                    exit: Some(Exit::Code { code: 0 }),
+                    ..ToolOutputItem::default()
+                })],
+                "{name}"
+            );
+        }
+        // Codex's file read sends output for a terminal nothing opened
+        // (flag 16): it is the read's own.
+        let agent = replay(capture_named("codex-acp-2.12.0-edit-run"), |_| {});
+        let read = tools(&agent).remove(0);
+        assert!(
+            matches!(&content_of(&read)[..], [ToolItem::Output(ToolOutputItem { text, .. })] if text == "an apple a day\n"),
+            "{read:?}"
         );
     }
 
@@ -5210,6 +6382,29 @@ mod tests {
         // A live chunk afterwards is a new entry, not the old run's.
         agent.feed(&said("Back."));
         assert!(matches!(agent.last_entry().1, Entry::Agent { text } if text == "Back."));
+    }
+
+    #[test]
+    fn a_muted_load_applies_no_tool_content() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        let kept = agent.entries();
+        agent.feed(&initialized(id, load_only()));
+        for line in [
+            update(
+                json!({"sessionUpdate": "tool_call", "toolCallId": "call_9", "title": "Edit",
+                "content": [{"type": "diff", "path": "/a", "oldText": "1\n", "newText": "2\n"}],
+                "rawInput": "x", "locations": [{"path": "/a"}]}),
+            ),
+            meta(
+                "call_9",
+                json!({"terminal_output_delta": {"terminal_id": "t9", "data": "out\n"}}),
+            ),
+        ] {
+            assert!(agent.feed(&line).events.is_empty(), "{line}");
+        }
+        assert_eq!(agent.entries(), kept);
+        assert!(agent.s.outputs.is_empty());
     }
 
     // The title across restarts (agents-session-title decision 3).
@@ -5818,7 +7013,7 @@ mod tests {
     fn methods_left_out_or_cut_add_one_warning() {
         let mut agent = Agent::new();
         agent.step(Input::Spawned);
-        let long = "d".repeat(wire::MAX_LOGIN_DESCRIPTION + 1);
+        let long = "d".repeat(forms::MAX_LOGIN_DESCRIPTION + 1);
         let out = agent.feed(&result(
             1,
             json!({"protocolVersion": 1, "authMethods": [

@@ -116,6 +116,9 @@ actions!(
         CopyLastCodeBlock,
         /// Opens every thought when one is closed, else closes them all.
         ToggleAgentThoughts,
+        /// Opens every tool call row with a detail when one is closed, else
+        /// closes them all.
+        ToggleAgentToolDetails,
         /// Scrolls the conversation to its end, which it then follows.
         AgentScrollToBottom,
     ]
@@ -202,6 +205,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
     ("copy_last_code_block", Some("Copy Last Code Block"), || Box::new(CopyLastCodeBlock)),
     ("toggle_agent_thoughts", Some("Toggle Agent Thoughts"), || Box::new(ToggleAgentThoughts)),
+    ("toggle_agent_tool_details", Some("Toggle Tool Details"), || Box::new(ToggleAgentToolDetails)),
     ("agent_scroll_to_bottom", Some("Scroll Agent to Bottom"), || Box::new(AgentScrollToBottom)),
     // The tab strip as a keyboard stop: unlabelled, for `--action` and user
     // bindings (its keys are the tab list's own).
@@ -899,6 +903,7 @@ mod tests {
             "Copy Last Agent Message",
             "Copy Last Code Block",
             "Toggle Agent Thoughts",
+            "Toggle Tool Details",
             "Scroll Agent to Bottom",
             "Split Zone Right",
             "Close Zone",

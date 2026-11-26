@@ -376,6 +376,10 @@ and one in an agent zone:
   to its restored agent tab showing the end of a conversation of about
   15 MiB, which it attaches again and pages, until Brindle quits on it. It
   needs the same test agent.
+- **Tool output streaming** (`agent-tool-output`): the time an agent zone
+  takes to show the end of a command's 1 MiB output in its tool call's open
+  row, streamed in 4 KiB pieces and again in one, and the difference. It
+  needs the same test agent.
 
 The suite reports numbers and never fails on them. Run it on an idle machine and
 compare runs made on the same machine. Each run is kept in
@@ -759,7 +763,16 @@ a launch beside a running Brindle is handed to it. From `brindle --help`:
 An agent zone shows the conversation, newest at the bottom, with the prompt
 input under it. Tool calls show as rows with their status, a permission
 request as buttons for its options, and the agent's thoughts as closed
-blocks that Toggle Agent Thoughts opens. The zone's status dot follows the agent: working, blocked
+blocks that Toggle Agent Thoughts opens. A tool call's row opens to show
+what the agent sent with it: the diffs of the files it edits (added lines
+green, removed red), a command's output as it runs and how it ended, its
+text, and the files it works on. A running call's row is open and a
+finished one's closed; a click on the row, or Toggle Tool Details for every
+row, opens or closes it, and a row you opened or closed stays as you left
+it. A permission request shows its call's diff above its buttons. Each diff
+and output has a copy button (a diff copies as a unified diff). A long item
+is cut (a diff keeps its start, an output its end), and the row says what
+was left out. The zone's status dot follows the agent: working, blocked
 (waiting on a permission), done or error, as a program's status does; a done
 or error dot goes once you type in the prompt input. An agent's tab title is
 the name it gives, else the profile's.
@@ -808,10 +821,11 @@ is stopped, fails or ends for a limit holds the waiting prompt instead (the
 row says why), which you can send again or discard. Commands in the palette
 while an agent zone has focus: Send Prompt, Stop Agent Turn, Remove Queued
 Prompt, Send Held Prompt Again, Copy Queued Prompt, Copy Last Agent Message,
-Copy Last Code Block, Toggle Agent Thoughts and Scroll Agent to Bottom (the
-actions `agent_submit`, `agent_cancel`, `agent_unqueue`, `agent_resend`,
-`copy_queued_prompt`, `copy_last_agent_message`, `copy_last_code_block`,
-`toggle_agent_thoughts`, `agent_scroll_to_bottom`),
+Copy Last Code Block, Toggle Agent Thoughts, Toggle Tool Details and Scroll
+Agent to Bottom (the actions `agent_submit`, `agent_cancel`, `agent_unqueue`,
+`agent_resend`, `copy_queued_prompt`, `copy_last_agent_message`,
+`copy_last_code_block`, `toggle_agent_thoughts`, `toggle_agent_tool_details`,
+`agent_scroll_to_bottom`),
 with the zone and tab commands; the terminal's commands aren't listed there.
 
 Splitting an agent zone opens another agent zone, with a session of its own,
@@ -1050,6 +1064,17 @@ titled with the agent's name and the tab's. The same focus rule and rate limits
 apply, and a conversation replayed when Brindle attaches to it again notifies
 nothing. `notifications.agent = false` keeps the tab's status dot and drops the
 notifications.
+
+Whether tool call rows open on their own is the `[agent]` table's:
+
+```toml
+[agent]
+tool_details = "open"              # a running call's row: "open" or "closed"
+tool_details_when_done = "closed"  # a finished call's row
+```
+
+A row opened or closed by hand stays as you left it, and a change applies
+to the open zones when the config is saved.
 
 #### kitty's notification protocol (OSC 99)
 
