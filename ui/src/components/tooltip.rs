@@ -154,7 +154,7 @@ impl Render for TooltipView {
 
 impl RenderOnce for Tooltip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let style = tooltip_style(cx.ui_theme());
+        let style = tooltip_style(&cx.ui_theme());
         let shortcut = self.shortcut;
         // gpui lays a tooltip out at its smallest size, so text that may
         // wrap would break at every word.

@@ -108,7 +108,7 @@ impl Styled for Kbd {
 
 impl RenderOnce for Kbd {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let style = kbd_style(cx.ui_theme());
+        let style = kbd_style(&cx.ui_theme());
         let (background, foreground) = self.colors.unwrap_or((style.background, style.foreground));
         let mut group = div().flex().flex_none().items_center().gap(style.stroke_gap);
         for stroke in keycaps(&self.keys) {

@@ -617,7 +617,7 @@ fn item_row(item: &MenuItem, highlighted: bool, style: &MenuStyle) -> Div {
 
 impl Render for Menu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let style = menu_style(cx.ui_theme());
+        let style = menu_style(&cx.ui_theme());
         let viewport = window.viewport_size();
         let max_width = (viewport.width - EDGE_MARGIN * 2.).max(px(0.));
         let min_width = MENU_MIN_WIDTH.to_pixels(window.rem_size()).min(max_width);

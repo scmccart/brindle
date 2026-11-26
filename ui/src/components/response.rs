@@ -705,7 +705,7 @@ fn pointer_guard(armed: bool, wanted: Modifiers) -> impl IntoElement {
 
 impl RenderOnce for Response {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let style = window.text_style();
         let mut draw = Draw {
             t: &t,

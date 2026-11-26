@@ -325,7 +325,7 @@ impl Styled for PopoverContent {
 
 impl RenderOnce for PopoverContent {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let style = popover_style(cx.ui_theme());
+        let style = popover_style(&cx.ui_theme());
         // w-72 rounded-md border p-4 shadow-md
         let mut panel = div()
             .w(POPOVER_WIDTH)

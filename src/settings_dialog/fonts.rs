@@ -650,7 +650,7 @@ impl SettingsDialog {
     // ---- rendering ----
 
     pub(super) fn render_fonts(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let muted = t.muted_foreground;
         let red = t.destructive;
         let fonts = &self.model.fonts;

@@ -237,7 +237,7 @@ pub struct DraggedTab {
 
 impl Render for DraggedTab {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let style = tab_drag_style(cx.ui_theme());
+        let style = tab_drag_style(&cx.ui_theme());
         div()
             .max_w(TAB_DRAG_MAX_WIDTH)
             .px(gpui::rems(0.75))
@@ -515,7 +515,7 @@ const TRIGGER_GROUP: &str = "brindle-ui-tab-trigger";
 
 impl RenderOnce for TabList {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let tokens = *cx.ui_theme();
+        let tokens = cx.ui_theme();
         let list_style = tab_list_style(&tokens);
         let count = self.triggers.len();
         let active = self.active.filter(|ix| *ix < count);
@@ -582,7 +582,7 @@ impl RenderOnce for TabList {
 
 /// One trigger, as the list draws it at `ix`.
 fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &mut Window, cx: &mut App) -> AnyElement {
-    let tokens = *cx.ui_theme();
+    let tokens = cx.ui_theme();
     let is_active = list.active == Some(ix);
     let style = tab_style(is_active, trigger.colors, &tokens);
     let disabled = trigger.disabled;

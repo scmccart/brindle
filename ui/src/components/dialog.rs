@@ -166,7 +166,7 @@ fn fit_to_window(style: &mut StyleRefinement, owner: &StyleRefinement, room: Siz
 
 impl RenderOnce for Dialog {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let style = dialog_style(t);
         let ring_color = focus_ring(t);
         let width = dialog_width(window.viewport_size().width, window.rem_size());

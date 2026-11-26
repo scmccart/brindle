@@ -1321,7 +1321,7 @@ impl SettingsDialog {
     }
 
     fn render_profile_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let fg = t.foreground;
         let muted = t.muted_foreground;
         let state = &self.model.profiles;
@@ -1451,7 +1451,7 @@ impl SettingsDialog {
     }
 
     fn render_profile_editor(&self, editor: &ProfileEditor, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let muted = t.muted_foreground;
         let red = t.destructive;
         let errors = match self.model.profiles.editor_result() {

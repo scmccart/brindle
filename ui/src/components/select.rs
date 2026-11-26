@@ -585,7 +585,7 @@ impl Select {
 
 impl Render for Select {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let style = select_style(t);
         let (ring, ring_color) = (t.ring, focus_ring(t));
         let disabled = self.disabled;
@@ -824,7 +824,7 @@ impl SelectMenu {
 
 impl Render for SelectMenu {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let style = select_style(cx.ui_theme());
+        let style = select_style(&cx.ui_theme());
         let highlight = self.nav.highlight;
         let selected = self.selected;
         // SelectItem: relative flex items-center gap-2 rounded-sm py-1.5

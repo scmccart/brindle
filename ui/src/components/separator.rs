@@ -52,7 +52,7 @@ impl Styled for Separator {
 
 impl RenderOnce for Separator {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl gpui::IntoElement {
-        let style = separator_style(cx.ui_theme());
+        let style = separator_style(&cx.ui_theme());
         let mut rule = div()
             .flex_none()
             .bg(style.color)

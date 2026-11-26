@@ -148,7 +148,7 @@ impl Styled for Button {
 
 impl RenderOnce for Button {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let style = button_style(self.variant, self.size, cx.ui_theme());
+        let style = button_style(self.variant, self.size, &cx.ui_theme());
         let (focus, on_click) = interaction(self.disabled, self.focus, self.on_click);
         let focused = focus.as_ref().is_some_and(|handle| handle.is_focused(window));
         let ring_shown = shows_ring(focused, modality(window, cx), false);

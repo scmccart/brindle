@@ -133,7 +133,7 @@ impl Styled for Toggle {
 
 impl RenderOnce for Toggle {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let style = toggle_style(self.variant, self.size, self.pressed, cx.ui_theme());
+        let style = toggle_style(self.variant, self.size, self.pressed, &cx.ui_theme());
         let (pressed, disabled) = (self.pressed, self.disabled);
         let (focus, on_click) = interaction(disabled, self.focus, self.on_click);
         let focused = focus.as_ref().is_some_and(|handle| handle.is_focused(window));

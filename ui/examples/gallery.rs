@@ -819,7 +819,7 @@ impl Gallery {
 
     /// The context menu, both dropdowns and what they chose.
     fn menus_section(&self, cx: &mut Context<Self>) -> Div {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let target = div()
             .id("context-target")
             .flex()
@@ -1019,7 +1019,7 @@ impl Gallery {
 
     /// The icon sizes, every icon, `Separator` and `Kbd`.
     fn chrome_section(&self, cx: &mut Context<Self>) -> Div {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let row = |name: &'static str| div().flex().items_center().gap_3().child(label(name, cx));
         let mut sizes = row("Icon sizes");
         for size in ICON_SIZES {
@@ -1436,7 +1436,7 @@ impl Gallery {
     /// plain one, the strip above content in the active tab's colours, and
     /// a crowded one whose triggers shrink to their minimum.
     fn tabs_section(&self, cx: &mut Context<Self>) -> Div {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let demo = self.tabs_demo("strip");
         let current = demo.tabs.get(demo.active);
         let (surface, text): (Hsla, Hsla) = current
@@ -1487,7 +1487,7 @@ impl Gallery {
     /// content paints a square background to its corners; and the same
     /// card without and with the ring.
     fn cards_section(&self, cx: &mut Context<Self>) -> Div {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let records = &self.records;
         let owner = owner_card_colors();
         let actions = |card: &'static str, muted: Hsla, header: CardHeader| {
@@ -1572,7 +1572,7 @@ impl Gallery {
     /// The AI elements: a conversation over a prompt input, and beside it a
     /// reasoning block, tool rows, a permission and two alerts.
     fn ai_section(&self, cx: &mut Context<Self>) -> Div {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let gallery = cx.weak_entity();
         let toggled = gallery.clone();
         let permission = Confirmation::new("demo-permission", "Run `cargo test --workspace`?", self.permission.clone())
@@ -1715,7 +1715,7 @@ impl Gallery {
     /// A response in an agent's bubble with every block kind, and a code
     /// block on its own.
     fn response_section(&self, cx: &mut Context<Self>) -> Div {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let log = |gallery: &gpui::WeakEntity<Gallery>| {
             let gallery = gallery.clone();
             move |entry: String, cx: &mut App| {
@@ -1951,7 +1951,7 @@ impl FocusStops for Gallery {
 
 impl Render for Gallery {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let content = div()
             .id("gallery-content")
             .flex()
@@ -2082,7 +2082,7 @@ impl DemoDialog {
 
 impl Render for DemoDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let field = |name: &'static str, control: gpui::AnyElement| {
             div()
                 .flex()
@@ -3345,7 +3345,7 @@ mod check {
     /// the modality alone passed.
     async fn ring_paints(c: &mut Checker) -> Check {
         let (background, ring) = c.with(|_, _, cx| {
-            let t = cx.ui_theme();
+            let t = &cx.ui_theme();
             (t.background, brindle_ui::focus_ring(t))
         })?;
         let (background, ring) = (over(background, background), over(ring, background));
@@ -3528,7 +3528,7 @@ mod check {
     /// The tooltip's background as the window shows it.
     fn tooltip_colour(c: &mut Checker) -> Result<[u8; 3], Failure> {
         c.with(|_, _, cx| {
-            let t = cx.ui_theme();
+            let t = &cx.ui_theme();
             over(brindle_ui::tooltip_style(t).background, t.background)
         })
     }
@@ -5109,7 +5109,7 @@ mod check {
         ensure!(c.focused_name("tabs-plain")?, "Tab didn't reach the plain list");
         let (background, ring) = c.with(|_, _, cx| {
             // The muted token is opaque.
-            let t = cx.ui_theme();
+            let t = &cx.ui_theme();
             (over(t.muted, t.background), over(brindle_ui::focus_ring(t), t.muted))
         })?;
         let (active, other) = (trigger(c, "plain", 1).await?, trigger(c, "plain", 0).await?);
@@ -5133,7 +5133,7 @@ mod check {
         pointer_away(c).await?;
         set_tab_active(c, "strip", 0).await?;
         let (raised, muted, primary) = c.with(|_, _, cx| {
-            let t = cx.ui_theme();
+            let t = &cx.ui_theme();
             let tab = brindle_ui::tab_style(true, Default::default(), t);
             let raised = tab.background.map_or(over(t.muted, t.background), |b| over(b, t.muted));
             (raised, over(t.muted, t.background), over(t.primary, t.background))
@@ -5440,7 +5440,7 @@ mod check {
     async fn card_default_colours(c: &mut Checker) -> Check {
         let card = c.reveal("card:default").await?;
         let header = c.recorded("card:default:header")?;
-        let s = c.with(|_, _, cx| card_style(cx.ui_theme()))?;
+        let s = c.with(|_, _, cx| card_style(&cx.ui_theme()))?;
         card_colours(c, card, header, s, "default").await
     }
 
@@ -5461,7 +5461,7 @@ mod check {
             c.tick().await;
             let card = c.reveal("card:owner").await?;
             let header = c.recorded("card:owner:header")?;
-            let s = c.with(move |_, _, cx| card_style(cx.ui_theme()).with_colors(owner))?;
+            let s = c.with(move |_, _, cx| card_style(&cx.ui_theme()).with_colors(owner))?;
             card_colours(c, card, header, s, if dark { "owner (dark set)" } else { "owner (light set)" }).await?;
             // The inactive card's title is muted, not in the text colour.
             let inactive = c.recorded("card:owner-inactive")?;
@@ -5521,7 +5521,7 @@ mod check {
             "the ringed card is laid out at {on:?}, the plain one at {off:?}: the ring took room"
         );
         let (background, ring) = c.with(|_, _, cx| {
-            let t = cx.ui_theme();
+            let t = &cx.ui_theme();
             (over(t.background, t.background), over(brindle_ui::focus_ring(t), t.background))
         })?;
         let above = |bounds: Bounds<Pixels>| point(bounds.center().x, bounds.top() - px(1.5));
@@ -5537,7 +5537,7 @@ mod check {
     async fn card_corners(c: &mut Checker) -> Check {
         let card = c.reveal("card:plain").await?;
         let (surround, border) = c.with(|_, _, cx| {
-            let s = card_style(cx.ui_theme());
+            let s = card_style(&cx.ui_theme());
             (over(s.surround, s.surround), over(s.border, s.surround))
         })?;
         let square = {

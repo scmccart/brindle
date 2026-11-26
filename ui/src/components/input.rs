@@ -49,7 +49,7 @@ impl Styled for Input {
 
 impl RenderOnce for Input {
     fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let handle = self.input.read(cx).focus_handle(cx);
         let ring_shown = shows_ring(handle.is_focused(window), modality(window, cx), true);
         let style = input_style(ring_shown, self.invalid, t);

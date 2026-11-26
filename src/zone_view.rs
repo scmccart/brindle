@@ -1704,7 +1704,7 @@ impl Render for ZoneTreeView {
         let tree = self.tree.clone();
         // Headers are recorded again as this frame lays them out.
         self.laid_out.borrow_mut().headers.clear();
-        let tokens = *cx.ui_theme();
+        let tokens = cx.ui_theme();
         let content = self.render_tree(&tree, &tokens, window, cx);
         let laid_out = self.laid_out.clone();
         div()

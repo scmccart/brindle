@@ -113,7 +113,7 @@ impl ParentElement for Bubble {
 
 impl RenderOnce for Bubble {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
-        let t = cx.ui_theme();
+        let t = &cx.ui_theme();
         let style = bubble_style(self.from, t);
         let edges = self.part.edges();
         let radius = t.radius_lg();

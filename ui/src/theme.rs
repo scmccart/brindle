@@ -9,6 +9,8 @@
 //! Hover and pressed states aren't tokens. Components fade a token instead, as
 //! shadcn does (`bg-primary/90` is `primary.opacity(0.9)`).
 
+use std::cell::Cell;
+
 use gpui::{App, Global, Hsla, Rems, SharedString, hsla, rems, rgb};
 
 /// One set of design tokens. Colours come in background/foreground pairs, as
@@ -148,32 +150,67 @@ impl Tokens {
     }
 }
 
-/// The active token set, a GPUI global. The app sets it before any component
-/// renders (reading it unset panics, as with any GPUI global).
-#[derive(Clone, Copy, Debug)]
+/// The window's token set, a GPUI global, and the set of the innermost
+/// [`ThemeScope`](crate::ThemeScope) being drawn. The app sets the window's
+/// set before any component renders (reading it unset panics, as with any
+/// GPUI global).
+///
+/// The scope's set is a `Cell` so that a scope can swap it through an
+/// immutable borrow of the global: `set_global` and `global_mut` both
+/// notify the global's observers, and a scope swaps the set around every
+/// phase of every frame. Only [`ThemeScope`](crate::ThemeScope) writes it.
+#[derive(Debug)]
 pub struct UiTheme {
+    /// The window's set.
     pub tokens: Tokens,
+    scope: Cell<Option<Tokens>>,
 }
 
 impl Global for UiTheme {}
 
 impl UiTheme {
-    /// Makes `tokens` the active set and redraws every window, which is all a
-    /// switch takes: components read the set on each render.
+    /// Makes `tokens` the window's set and redraws every window, which is all
+    /// a switch takes: components read the set on each render.
     pub fn set(tokens: Tokens, cx: &mut App) {
-        cx.set_global(UiTheme { tokens });
+        cx.set_global(UiTheme { tokens, scope: Cell::new(None) });
         cx.refresh_windows();
+    }
+
+    /// The innermost scope's set while one is being drawn.
+    pub(crate) fn scope(&self) -> Option<Tokens> {
+        self.scope.get()
     }
 }
 
 /// Access to the active token set: `cx.ui_theme().primary`.
 pub trait ActiveTheme {
-    fn ui_theme(&self) -> &Tokens;
+    /// The active set: the innermost theme scope's while one is being
+    /// drawn, else the window's. By value, since the scope's set lives in
+    /// a `Cell`.
+    fn ui_theme(&self) -> Tokens;
+
+    /// The window's set, ignoring any scope: for what an owner inside a
+    /// scope keeps in the window's colours (a zone's focus ring).
+    fn window_theme(&self) -> Tokens;
+
+    /// The innermost scope's set while one is being drawn, else `None`:
+    /// what a component stores for a tooltip it builds, which is drawn
+    /// after the scope has ended.
+    fn scoped_theme(&self) -> Option<Tokens>;
 }
 
 impl ActiveTheme for App {
-    fn ui_theme(&self) -> &Tokens {
-        &self.global::<UiTheme>().tokens
+    fn ui_theme(&self) -> Tokens {
+        let theme = self.global::<UiTheme>();
+        theme.scope().unwrap_or(theme.tokens)
+    }
+
+    fn window_theme(&self) -> Tokens {
+        self.global::<UiTheme>().tokens
+    }
+
+    fn scoped_theme(&self) -> Option<Tokens> {
+        self.global::<UiTheme>().scope()
     }
 }
 

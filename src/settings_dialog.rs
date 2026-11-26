@@ -1317,7 +1317,7 @@ impl SettingsDialog {
     /// does. The ring is on this frame, not on the scrolling list inside,
     /// which would clip it.
     fn list_frame(&self, list: impl IntoElement, window: &Window, cx: &App) -> gpui::Div {
-        let ring = brindle_ui::focus_ring(cx.ui_theme());
+        let ring = brindle_ui::focus_ring(&cx.ui_theme());
         let shown = brindle_ui::shows_ring(self.list_handle.is_focused(window), brindle_ui::modality(window, cx), false);
         let handle = self.list_handle.clone();
         div()
@@ -1363,7 +1363,7 @@ impl SettingsDialog {
     }
 
     fn render_list(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let fg = t.foreground;
         let muted = t.muted_foreground;
         let themes = &self.model.themes;
@@ -1511,7 +1511,7 @@ impl SettingsDialog {
     }
 
     fn render_editor(&self, editor: &Editor, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let muted = t.muted_foreground;
         let name_error = self.model.themes.name_error(editor);
 
@@ -1602,7 +1602,7 @@ impl Render for SettingsDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Focus moves by Tab, clicks and keys; scroll an editor after it.
         self.follow_focus(window, cx);
-        let t = *cx.ui_theme();
+        let t = cx.ui_theme();
         let content = match self.model.section() {
             Section::Profiles => self.render_profiles(window, cx),
             Section::Theme => match self.model.themes.editor().cloned() {

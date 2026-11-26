@@ -2762,7 +2762,7 @@ impl Workspace {
     /// and escape. A press on a tab activates it and leaves focus in its
     /// terminal.
     fn render_tab_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = *cx.ui_theme();
+        let tokens = cx.ui_theme();
         let decorations = window.window_decorations();
         // Windows always shows Brindle's own caption (see `window_control_area`
         // below); GPUI reports server decorations there.

@@ -614,20 +614,20 @@ mod tests {
             cx.set_global(Settings::from_platform(config, ConfigReport::default(), cx));
 
             Settings::apply_ui_theme(cx);
-            let before = *cx.ui_theme();
+            let before = cx.ui_theme();
             assert_eq!(before, config_theme.ui_tokens());
 
             let preview = builtin_theme("brindle-light").unwrap();
             assert_ne!(preview, config_theme);
             assert_eq!(*Settings::chrome_theme(cx), config_theme);
             Settings::set_ui_theme(&preview, cx);
-            assert_eq!(*cx.ui_theme(), preview.ui_tokens());
-            assert_ne!(*cx.ui_theme(), before);
+            assert_eq!(cx.ui_theme(), preview.ui_tokens());
+            assert_ne!(cx.ui_theme(), before);
             // Chrome's status colours follow the preview too.
             assert_eq!(*Settings::chrome_theme(cx), preview);
 
             Settings::apply_ui_theme(cx);
-            assert_eq!(*cx.ui_theme(), before);
+            assert_eq!(cx.ui_theme(), before);
             assert_eq!(*Settings::chrome_theme(cx), config_theme);
         });
     }
