@@ -24,10 +24,14 @@ The server SHALL keep the latest list of slash commands the agent offers: each c
 - **THEN** the replay holds the newest page of entries, and both lists whole
 
 ### Requirement: Only commands that can be typed are kept
-A command whose name is empty, or holds whitespace, a control character or `/`, SHALL be left out. At most 256 commands SHALL be kept, with texts bounded as tool call titles are; when the agent offers more, the log SHALL get one notice saying how many were offered and how many are kept.
+A command whose name is empty, or holds whitespace, a control character or `/`, or starts with `brindle:`, SHALL be left out. At most 256 commands SHALL be kept, with texts bounded as tool call titles are; when the agent offers more, the log SHALL get one notice saying how many were offered and how many are kept.
 
 #### Scenario: A name with a space
 - **WHEN** the agent offers commands `review` and `do thing`
+- **THEN** the session's commands are `review` alone
+
+#### Scenario: A name in Brindle's own space
+- **WHEN** the agent offers commands `review` and `brindle:model`
 - **THEN** the session's commands are `review` alone
 
 #### Scenario: Too many commands
