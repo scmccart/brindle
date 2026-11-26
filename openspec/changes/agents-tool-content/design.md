@@ -303,7 +303,7 @@ acp/
   - The static musl helper must still build, and its size is noted in the PR.
 - **No clock, so the same result twice.** No deadline or timeout is ever set: a time limit would make a restarted core compute different hunks from the same bytes (decision 14).
 - **What `diff.rs` adds around the crate.**
-  - `TextDiff::configure().algorithm(Algorithm::Myers).diff_lines(old, new)` and `grouped_ops(3)` give the groups.
+  - `similar::algorithms::myers::diff` over the two texts' lines (each with its `\n`), through a `Replace` hook into a `Capture`, and `group_diff_ops(ops, 3)` give the groups (flag 24).
   - `diff.rs` turns each group into a `Hunk`: 1-based starts, each line without its line break. A trailing `\r` stays part of the line and is cleaned later with the rest.
   - It keeps lines until their text passes `ITEM_LIMIT` (decision 5) and counts the rest in `omitted`.
   - As a guard on memory, texts with more than `MAX_DIFF_LINES` = 200,000 lines together aren't compared. The change becomes one hunk removing the old lines and adding the new, cut the same way.
@@ -629,6 +629,7 @@ Flags added while implementing (2026-11-26, sections 1–4):
 21. **`initialize`'s answer is read for its version first.** An answer naming a version Brindle doesn't speak now always fails with "the agent speaks ACP version N", even when the rest of it isn't v1's shape (before, such an answer failed as unreadable), and N may be past 65535. An answer with no whole-number `protocolVersion` is unreadable, as before. Recommend: accept; it is the order decision 2 asks for.
 22. **A terminal described after its output opened.** When a `[terminal]` item names a terminal before any `terminal_info` does, its `Output` opens with no command or directory. A later `terminal_info` for that open terminal sends the output again (`tool_items` from its index, its text kept) with them, when it is the entry's last item and has neither yet; otherwise it changes nothing. Codex sends both in one update, so its captures never take this path. Recommend: accept.
 23. **An output stays open until its exit, not its call's end.** Codex's file read streams output and never sends `terminal_exit`, so its output stays open (its text whole, its exit absent) after the call completes, until the entry is trimmed, a restart, or the 64-output bound closes it. Closing it at `completed` could drop an exit sent in a later update, which the captures don't rule out. Recommend: accept; revisit if a capture shows an agent sending exits before completion.
+24. **Myers is called directly, not through `TextDiff`.** `TextDiff` picks its algorithm at run time, so every algorithm `similar` has is built into the helper: the static musl helper grew from 3,822,464 to 4,760,448 bytes (+24.5%), about 760 KB of it `similar`'s. `diff.rs` now calls `algorithms::myers::diff` through a `Replace` hook (which orders a change's removed lines before its added ones, as `TextDiff` does) and `group_diff_ops`, with the same results under the same tests, and the helper is 4,023,168 bytes (+200,704 bytes, +5.3% over 3,822,464, `similar` about 38 KB of it). Recommend: accept.
 
 ## The user's decisions
 

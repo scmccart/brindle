@@ -22,11 +22,14 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, ReplayStart};
 use brindle_remote_protocol::holder as h1;
 use brindle_remote_protocol::serde_json::json;
-use brindle_transcript::{AgentState, Entry, HoldReason, Slot, StopReason, TurnState};
+use brindle_transcript::{
+    AgentState, DiffLine, Entry, Exit, FileChange, FileOp, HoldReason, Slot, StopReason, ToolItem,
+    TurnState,
+};
 
 use support::fake_agent::{
     LOAD_ONLY, NEITHER, TWO_LOGINS, ask, initialized, methods, offering_logins, prompts, recorded,
-    responses, said, started, stop, user_said,
+    responses, said, started, stop, update, user_said,
 };
 use support::programs::{self, ENTER, say};
 #[cfg(unix)]
@@ -577,6 +580,62 @@ fn a_held_prompt_survives_an_upgrade_and_is_sent_again() {
     });
     assert_eq!(*log.slot(), Slot::Empty);
     assert_eq!(prompts(&record), ["one", "two"]);
+}
+
+/// A tool call's file change and its open output (OpenSpec change
+/// `agents-tool-content`, task 4.2) come through an upgrade, and the
+/// output carries on in the next core.
+#[test]
+fn an_upgrade_keeps_a_tool_calls_file_change_and_its_open_output() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-tool");
+    let (mut script, _) = started(&dir.path, "tool");
+    script
+        .step("expect session/prompt")
+        .step(update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Edit",
+            "kind": "edit", "status": "completed",
+            "content": [{"type": "diff", "path": "/w/a.txt", "oldText": "one\n", "newText": "two\n"}]})))
+        .step(update(json!({"sessionUpdate": "tool_call", "toolCallId": "c2", "title": "Run",
+            "kind": "execute", "status": "in_progress",
+            "_meta": {"terminal_output_delta": {"terminal_id": "t1", "data": "before \u{1b}[3"}}})));
+    let gate = script.gate();
+    script
+        .step(update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "c2", "status": "completed",
+            "_meta": {"terminal_output_delta": {"terminal_id": "t1", "data": "1mafter\n"},
+                "terminal_exit": {"terminal_id": "t1", "exit_code": 0, "signal": null}}})))
+        .step(stop("end_turn"));
+    let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+    dir.track(pid);
+    client.transcript_until(id, "is ready", agent_ready);
+    client.prompt(id, "edit").unwrap();
+    let has_both = |log: &Transcript| log.entries().filter(|(_, entry)| matches!(entry, Entry::Tool { .. })).count() == 2;
+    let before = client.transcript_until(id, "has both tool calls", has_both);
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    assert_eq!(client.transcript(id), before);
+    gate.open();
+    let log = client.transcript_until(id, "has its turn's end", |log| {
+        matches!(log.turn(), TurnState::Ended { stop: StopReason::EndTurn })
+    });
+    let contents: Vec<Vec<ToolItem>> = log
+        .entries()
+        .filter_map(|(_, entry)| match entry {
+            Entry::Tool { content, .. } => Some(content.clone()),
+            Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
+        })
+        .collect();
+    let [edit, run] = &contents[..] else {
+        panic!("{contents:?}");
+    };
+    assert!(
+        matches!(&edit[..], [ToolItem::Diff(FileChange { op: FileOp::Modify, path, hunks, .. })]
+            if path == "/w/a.txt" && hunks[0].lines == [DiffLine::Removed("one".into()), DiffLine::Added("two".into())]),
+        "{edit:?}"
+    );
+    assert!(
+        matches!(&run[..], [ToolItem::Output(output)]
+            if output.text == "before after\n" && output.exit == Some(Exit::Code { code: 0 })),
+        "{run:?}"
+    );
 }
 
 #[test]

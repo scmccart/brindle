@@ -174,17 +174,17 @@ Before starting, check these:
 
 ## 4. Server roles
 
-- [ ] 4.1 **Add fake ACP agent scripts and real-role tests in `remote-agent/tests/agents.rs`**:
+- [x] 4.1 **Add fake ACP agent scripts and real-role tests in `remote-agent/tests/agents.rs`**:
   - a diff reaches an attached client as `tool_items`;
   - output streamed in `_meta` pieces arrives piece by piece and ends with its exit;
   - 200 KiB of output leaves the client's fold and the server's log equal;
   - a detached session replays its content on attach;
   - a paged attach waiting on a permission whose tool call is more than a page back holds that tool call;
   - a fetch returns a tool entry with output appended after the page was sent.
-- [ ] 4.2 **Add the restart and upgrade cases**, in `agents.rs` and `upgrade.rs`'s agent cases:
+- [x] 4.2 **Add the restart and upgrade cases**, in `agents.rs` and `upgrade.rs`'s agent cases:
   - a core killed (SIGKILL) in the middle of streamed output, with appended segments, adopts the session and ends with the same output text as an uninterrupted run;
   - an upgrade keeps a tool call's file change.
-- [ ] 4.3 **Check `brindle-remote list --json` and the helper's size.**
+- [x] 4.3 **Check `brindle-remote list --json` and the helper's size.**
   - The session's agent object is unchanged.
   - The static musl build links, with `similar` as the only new package in `Cargo.lock`: `cargo build -p brindle-remote-agent --release --target x86_64-unknown-linux-musl`, with the Docker command in README.md.
   - Note the helper's size before and after in the PR.

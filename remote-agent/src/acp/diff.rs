@@ -5,7 +5,8 @@
 //! The only file naming `similar` (`ports R3`).
 
 use brindle_transcript::{DiffLine, Hunk, ITEM_LIMIT};
-use similar::{Algorithm, ChangeTag, TextDiff};
+use similar::algorithms::{Capture, Replace, myers};
+use similar::{DiffTag, group_diff_ops};
 
 /// Lines of context around each change.
 const CONTEXT: usize = 3;
@@ -40,23 +41,40 @@ pub fn hunks(old: &str, new: &str) -> Diffed {
         }
         return kept.done();
     }
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_lines(old, new);
-    for group in diff.grouped_ops(CONTEXT) {
+    // Lines are compared with their `\n`, so a final line break counts.
+    let old: Vec<&str> = old.split_inclusive('\n').collect();
+    let new: Vec<&str> = new.split_inclusive('\n').collect();
+    // Myers alone, rather than `TextDiff`, whose choice of algorithm at
+    // run time builds every algorithm into the helper.
+    // `Replace` orders a change's removed lines before its added ones,
+    // as `TextDiff` does.
+    let mut capture = Replace::new(Capture::new());
+    match myers::diff(&mut capture, &old[..], 0..old.len(), &new[..], 0..new.len()) {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+    for group in group_diff_ops(capture.into_inner().into_ops(), CONTEXT) {
         let Some(first) = group.first() else {
             continue;
         };
         let hunk = kept.hunk(first.old_range().start + 1, first.new_range().start + 1);
         for op in &group {
-            for change in diff.iter_changes(op) {
-                let text = strip(change.value()).to_owned();
-                let line = match change.tag() {
-                    ChangeTag::Equal => DiffLine::Context(text),
-                    ChangeTag::Delete => DiffLine::Removed(text),
-                    ChangeTag::Insert => DiffLine::Added(text),
-                };
-                kept.push(hunk, line);
+            let (tag, old_range, new_range) = op.as_tag_tuple();
+            let line = |text: &str| strip(text).to_owned();
+            let (context, removed, added) = match tag {
+                DiffTag::Equal => (old_range, 0..0, 0..0),
+                DiffTag::Delete => (0..0, old_range, 0..0),
+                DiffTag::Insert => (0..0, 0..0, new_range),
+                DiffTag::Replace => (0..0, old_range, new_range),
+            };
+            for at in context {
+                kept.push(hunk, DiffLine::Context(line(old[at])));
+            }
+            for at in removed {
+                kept.push(hunk, DiffLine::Removed(line(old[at])));
+            }
+            for at in added {
+                kept.push(hunk, DiffLine::Added(line(new[at])));
             }
         }
     }
