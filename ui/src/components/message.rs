@@ -12,7 +12,9 @@
 //! the item that changed), each a [`BubblePart`]: the first rounds only its
 //! top corners and the last only its bottom ones, the middle ones neither,
 //! and only the outer edges are bordered and padded, so the parts read as
-//! one bubble.
+//! one bubble. The other side's bubble fills its row, so the parts' edges
+//! line up whatever each part's text; the person's fits its text (up to
+//! four fifths of the row), and is one part.
 //!
 //! Actions (a copy button, say) go under the bubble of a whole message or
 //! its last part, shown while the pointer is over the message (AI
@@ -144,8 +146,10 @@ impl RenderOnce for Bubble {
 /// The group a message's hover actions follow.
 const GROUP: &str = "brindle-ui-message";
 
-/// One message: a [`Bubble`] aligned to its side, at most four fifths of
-/// the row wide, and the actions under it while the pointer is over it.
+/// One message: a [`Bubble`] aligned to its side, and the actions under it
+/// while the pointer is over it. The person's bubble is as wide as its
+/// text, up to four fifths of the row; the other side's fills the row, so
+/// every part of a message drawn in parts has the same width.
 #[derive(IntoElement)]
 pub struct Message {
     id: ElementId,
@@ -200,7 +204,11 @@ impl RenderOnce for Message {
                 .children(self.actions)
         });
         // The row: is-user justify-end, is-assistant justify-start; py-2
-        // between messages, none between the parts of one.
+        // between messages, none between the parts of one. The person's
+        // column fits its text, up to four fifths of the row (AI Elements'
+        // `max-w-[80%]`); the other side's fills the row, a definite width,
+        // so the parts of one message line up into one bubble whatever
+        // each part's text.
         div()
             .id(self.id)
             .group(GROUP)
@@ -213,9 +221,8 @@ impl RenderOnce for Message {
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(relative(0.8))
                     .min_w_0()
-                    .when(user, |d| d.items_end())
+                    .map(|d| if user { d.max_w(relative(0.8)).items_end() } else { d.w_full() })
                     .child(Bubble::new(self.from).part(self.part).children(self.children))
                     .children(actions),
             )
@@ -277,6 +284,68 @@ mod tests {
         assert_eq!(agent.left(), px(1. + 16.));
         // Two lines (laid out to the half pixel).
         assert!((agent.size.height - user.size.height * 2.).abs() <= px(0.5), "{agent:?} {user:?}");
+    }
+
+    /// The row width the width rule's tests use, and what a bubble's text
+    /// gets of it: the agent's 1px border and px-4 padding on each side.
+    const ROW: f32 = 600.;
+    const INSIDE: f32 = ROW - 2. * (1. + 16.);
+
+    /// Messages in a `ROW`-wide column, each child's text under its
+    /// selector.
+    struct Rows(Vec<(&'static str, From, BubblePart, &'static str)>);
+
+    impl Render for Rows {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(ROW)).flex().flex_col().children(self.0.iter().enumerate().map(
+                |(ix, &(selector, from, part, text))| {
+                    Message::new(("m", ix), from)
+                        .part(part)
+                        .child(div().debug_selector(move || selector.into()).child(text))
+                },
+            ))
+        }
+    }
+
+    fn draw(rows: Vec<(&'static str, From, BubblePart, &'static str)>) -> &'static mut gpui::VisualTestContext {
+        let mut app: TestAppContext = test_support::app();
+        let (_, cx) = app.add_window_view(move |_, _| Rows(rows));
+        let cx: &'static mut gpui::VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.run_until_parked();
+        cx
+    }
+
+    /// The spec's "Parts of different lengths": both parts of an agent's
+    /// message are as wide as the row, whatever their text, so their edges
+    /// line up.
+    #[test]
+    fn an_agents_parts_line_up_at_the_rows_width() {
+        let long = "a paragraph much wider than the row it sits in, which has to wrap inside the bubble \
+                    rather than widen it, and goes on for a good while longer than that";
+        let cx = draw(vec![
+            ("short", From::Assistant, BubblePart::First, "short"),
+            ("long", From::Assistant, BubblePart::Last, long),
+        ]);
+        let short = cx.debug_bounds("short").expect("drawn");
+        let long = cx.debug_bounds("long").expect("drawn");
+        assert_eq!(short.size.width, px(INSIDE), "{short:?}");
+        assert_eq!((short.left(), short.right()), (long.left(), long.right()), "{short:?} {long:?}");
+        assert!(long.size.height > short.size.height, "the paragraph wraps: {long:?}");
+    }
+
+    /// The spec's "The other side fills the row" and "The person's bubble
+    /// fits its text".
+    #[test]
+    fn the_agent_fills_the_row_and_the_person_fits_the_text() {
+        let cx = draw(vec![
+            ("agent", From::Assistant, BubblePart::Whole, "ok"),
+            ("user", From::User, BubblePart::Whole, "ok"),
+        ]);
+        let agent = cx.debug_bounds("agent").expect("drawn");
+        let user = cx.debug_bounds("user").expect("drawn");
+        assert_eq!((agent.left(), agent.size.width), (px(17.), px(INSIDE)), "{agent:?}");
+        assert!(user.size.width < px(ROW / 2.), "{user:?}");
+        assert_eq!(user.right(), px(ROW - 16.), "{user:?}");
     }
 
     /// A message whose action records each time it is drawn.

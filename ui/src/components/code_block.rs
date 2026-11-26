@@ -3,7 +3,8 @@
 //!
 //! The frame is a rounded border. Its header sits on the surface around it
 //! (a bubble's card, say): the label, when there is one, in the muted
-//! foreground, and a ghost `copy` button at the end. Under the header the
+//! foreground on one line (cut with an ellipsis when it doesn't fit, never
+//! wrapped), and a ghost `copy` button at the end, which keeps its size. Under the header the
 //! code is drawn on the muted surface in the foreground colour and the
 //! owner's family, keeping its line breaks and spaces; long lines wrap.
 //! There is no highlighting.
@@ -21,7 +22,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder, rems,
 };
 
-use crate::components::Button;
+use crate::components::{Button, trigger_label};
 use crate::components::response::Code;
 use crate::components::tooltip::TooltipFor;
 use crate::icon::Icon;
@@ -95,6 +96,7 @@ impl RenderOnce for CodeBlock {
         // press would focus the nearest ancestor that tracks focus.
         let copy = div()
             .debug_selector(|| "code-block-copy".into())
+            .flex_none()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .child(copy);
         div()
@@ -116,12 +118,15 @@ impl RenderOnce for CodeBlock {
                     .pl_3()
                     .pr_1()
                     .py_1()
+                    // One line, cut with an ellipsis when it doesn't fit
+                    // beside the button: its width comes from the row, never
+                    // from its own measure, which gpui 0.2.2 can keep from a
+                    // narrower pass (the wrapping text pitfall).
                     .child(
-                        div()
-                            .min_w_0()
+                        trigger_label(label.unwrap_or_default())
+                            .debug_selector(|| "code-block-label".into())
                             .text_size(rems(0.75))
-                            .text_color(t.muted_foreground)
-                            .children(label),
+                            .text_color(t.muted_foreground),
                     )
                     .child(copy),
             )
@@ -142,7 +147,7 @@ impl RenderOnce for CodeBlock {
 mod tests {
     use std::cell::RefCell;
 
-    use gpui::{Context, FocusHandle, Modifiers, Render, px};
+    use gpui::{Bounds, Context, FocusHandle, Modifiers, Pixels, Render, px};
 
     use super::*;
     use crate::test_support;
@@ -203,5 +208,59 @@ mod tests {
         // The code sits under the header, inside the frame.
         let code = cx.debug_bounds("code-block-code").expect("drawn");
         assert!(code.top() >= button.bottom(), "{code:?} {button:?}");
+    }
+
+    /// A code block labelled `label` in an agent's message, in a 600px
+    /// column, as an agent zone draws one, and a line of the label's size
+    /// to measure one line by.
+    struct InMessage {
+        label: &'static str,
+    }
+
+    impl Render for InMessage {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let code = Code { label: Some(self.label.into()), text: "x".into() };
+            let response =
+                crate::components::Response::new("r", [std::sync::Arc::new(crate::components::RichBlock::Code(code))])
+                    .code_font("Mono");
+            div()
+                .w(px(600.))
+                .flex()
+                .flex_col()
+                .child(div().debug_selector(|| "one-line".into()).text_size(rems(0.75)).child("x"))
+                .child(div().px_3().w_full().child(
+                    crate::components::Message::new("m", crate::components::MessageFrom::Assistant).child(response),
+                ))
+        }
+    }
+
+    fn label_in_message(label: &'static str) -> (Bounds<Pixels>, Bounds<Pixels>, Bounds<Pixels>, Bounds<Pixels>) {
+        let mut app = test_support::app();
+        let (_, cx) = app.add_window_view(move |_, _| InMessage { label });
+        cx.run_until_parked();
+        let mut bounds = |selector: &'static str| cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} drawn"));
+        (bounds("one-line"), bounds("code-block-label"), bounds("code-block-copy"), bounds("code-block-code"))
+    }
+
+    /// The spec's "A short label inside a message": `rust` is one line, at
+    /// least as wide as its text (0.6em a character in gpui's test text
+    /// system).
+    #[test]
+    fn a_short_label_is_one_line_in_a_message() {
+        let (line, label, copy, code) = label_in_message("rust");
+        assert_eq!(label.size.height, line.size.height, "{label:?}");
+        assert!(label.size.width >= px(4. * 0.6 * 12. - 0.5), "{label:?}");
+        assert!(copy.left() >= label.right() && copy.right() <= code.right(), "{copy:?} beside {label:?} in {code:?}");
+    }
+
+    /// The spec's "A label too long for its row": one line, cut, and the
+    /// copy button whole (IconXs, 1.5rem) inside the block.
+    #[test]
+    fn a_label_too_long_is_one_line_and_the_copy_button_stays_whole() {
+        let long = "a-language-label-that-is-much-longer-than-the-row-it-sits-in-so-it-has-to-give-way-to-the-button";
+        let (line, label, copy, code) = label_in_message(long);
+        assert_eq!(label.size.height, line.size.height, "{label:?}");
+        assert_eq!(copy.size.width, px(24.), "{copy:?}");
+        assert!(copy.left() >= label.right() && copy.right() <= code.right(), "{copy:?} beside {label:?} in {code:?}");
     }
 }
