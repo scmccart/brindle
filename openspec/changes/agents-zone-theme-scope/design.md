@@ -65,6 +65,7 @@ pub trait ActiveTheme {
 - So an agent message's bubble is a faint raised surface on the background the zone actually shows, and a code block's `muted` surface is a step above it.
 - **FLAG F1 (the user didn't choose this).** Recommendation: zone tokens over the theme's own background. The alternative is the profile theme's `ui_tokens()` as it is. It is simpler, but its `background` is the darker chrome mix, so any component drawn on `background` (the prompt's textarea, outline buttons) would sit darker than the card around it.
 - **Contrast.** `ui_tokens_are_legible_for_every_builtin` (`src/theme.rs:802`) checks the same pairs over both derivations, one assertion message naming which set failed. A user's own theme gets the same pushes; nothing else checks it, as today.
+- **As built (2026-11-25).** Over its own background, solarized-dark's zone set missed two pairs (foreground on muted 4.27:1, muted foreground on card 2.86:1), since the theme's own background is lighter than the chrome mix and its foreground low in contrast. `tokens_over` now also pushes the foreground to 4.5:1 on the muted surface and the muted foreground to 3:1 on the card, after the pushes it already made; the surfaces are still mixed from the unpushed foreground. Every window set already met both, so `ui_tokens` and `brindle --export-ui-tokens` are byte for byte unchanged (checked by a diff of the export before and after, and `ui_tokens_keep_their_values` pins the brindle themes' surfaces).
 
 ### 3. Which zones, and what keeps the window's colours
 

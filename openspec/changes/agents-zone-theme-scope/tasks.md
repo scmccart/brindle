@@ -4,8 +4,8 @@ Before starting, check that `agents-profiles` and `agents-markdown` are archived
 
 ## 1. Pure code: zone tokens
 
-- [ ] 1.1 In `src/theme.rs`, move `ui_tokens`' derivation into a private `tokens_over(background)` and add `Theme::zone_tokens()` over the theme's own background (decision 2); verify with unit tests that `zone_tokens().background` is the theme's background and its primary and ring the accent, that `ui_tokens()` is unchanged for every built-in theme (compare against the values before the move), and that `brindle --export-ui-tokens`' output (`ui_tokens_css`) is byte for byte the same.
-- [ ] 1.2 Extend `ui_tokens_are_legible_for_every_builtin` to check the same pairs over `zone_tokens()`, naming the set in its message; verify with `cargo test -p brindle ui_tokens_are_legible_for_every_builtin`.
+- [x] 1.1 In `src/theme.rs`, move `ui_tokens`' derivation into a private `tokens_over(background)` and add `Theme::zone_tokens()` over the theme's own background (decision 2); verify with unit tests that `zone_tokens().background` is the theme's background and its primary and ring the accent, that `ui_tokens()` is unchanged for every built-in theme (compare against the values before the move), and that `brindle --export-ui-tokens`' output (`ui_tokens_css`) is byte for byte the same.
+- [x] 1.2 Extend `ui_tokens_are_legible_for_every_builtin` to check the same pairs over `zone_tokens()`, naming the set in its message; verify with `cargo test -p brindle ui_tokens_are_legible_for_every_builtin`.
 
 ## 2. brindle-ui: the scope and what carries it
 
