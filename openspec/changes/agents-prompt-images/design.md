@@ -56,7 +56,7 @@ A reference, like `Attachment::Text`: the log, the slot and the checkpoint hold 
 
 ### 3. The upload in pieces (`process R4`–`R6`, `R9`)
 
-Client protocol 4 is unreleased and amended (`agents-tool-content`, decision 8). These replace `agents-prompt-context`'s `AGENT_ATTACH`, so there is one way to send an attachment; a text of 1 KiB is a begin, one piece and an end. `AGENT_UPLOAD_BEGIN` takes `AGENT_ATTACH`'s number, 25, and `AGENT_UPLOAD_CHUNK` and `AGENT_UPLOAD_END` are 27 and 28, after `AGENT_READ_ATTACHMENT` (26); `ATTACHMENT` stays 44.
+Client protocol 4 is unreleased and amended (`agents-tool-content`, decision 8). These replace `agents-prompt-context`'s `AGENT_ATTACH`, so there is one way to send an attachment; a text of 1 KiB is a begin, one piece and an end. `AGENT_UPLOAD_BEGIN`, `AGENT_UPLOAD_CHUNK` and `AGENT_UPLOAD_END` are 27, 28 and 29, after `AGENT_READ_ATTACHMENT` (26). `AGENT_ATTACH`'s number, 25, is retired with it and not given to another message, so a number never has two meanings; `ATTACHMENT` stays 44.
 
 - **`AGENT_UPLOAD_BEGIN { req, session, upload, kind, name, bytes }`**, `kind` being `text` or one of the four image types and `bytes` the whole length. Checked before any data: `TooLong` (over `UPLOAD_LIMIT`), `StoreFull`, `DirectoryNotPrivate`, `UploadInProgress` (one at a time on a connection), `NotAnAgentSession`. Answered `OK` or `ERROR`.
 - **`AGENT_UPLOAD_CHUNK { session, upload, data }`**: the next bytes, at most what a frame holds, as raw bytes after the two numbers, with no answer. A piece that would pass the declared length, or that belongs to no upload, ends the upload with an `ERROR` and removes its file.
