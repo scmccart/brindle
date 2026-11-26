@@ -258,9 +258,15 @@ fn fake_agent_plays_the_section_its_arguments_name() {
     let text = std::fs::read_to_string(&env_file).expect("the recorded environment");
     let lines: Vec<&str> = text.lines().collect();
     assert!(lines.contains(&"LOGIN_MODE=device"), "{text}");
-    let mut sorted = lines.clone();
+    // Sorted by name, not by whole line: `=` sorts after `(`, so
+    // `ProgramFiles=…` comes before `ProgramFiles(x86)=…` on Windows.
+    let names: Vec<&str> = lines
+        .iter()
+        .map(|line| line.split_once('=').map_or(*line, |(name, _)| name))
+        .collect();
+    let mut sorted = names.clone();
     sorted.sort();
-    assert_eq!(lines, sorted);
+    assert_eq!(names, sorted);
 
     // With no arguments, the steps before the first section.
     assert_eq!(Agent::start(&path).status(), Some(5));
