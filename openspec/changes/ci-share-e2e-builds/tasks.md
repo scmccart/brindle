@@ -16,7 +16,7 @@
 
 ## 2. Linux jobs
 
-- [ ] 2.1 Add `e2e-build` to `ci.yml`:
+- [x] 2.1 Add `e2e-build` to `ci.yml`:
   - the shards' current packages, toolchain, musl target, `rust-cache` (`shared-key: dev`) and build commands;
   - the suite path from `--message-format=json` through `jq`;
   - `scripts/e2e-bundle pack`;
@@ -24,24 +24,24 @@
   - the `release-please--` condition and `timeout-minutes: 30`.
 
   Comment each choice with its README citation, as design.md gives it. Verify: `scripts/lint-workflows` passes.
-- [ ] 2.2 Change the `e2e` matrix and `e2e-archive` to need `e2e-build` (`e2e-archive`: `[release, e2e-build]`):
+- [x] 2.2 Change the `e2e` matrix and `e2e-archive` to need `e2e-build` (`e2e-archive`: `[release, e2e-build]`):
   - drop their Rust install, `rust-cache`, `musl-tools` and build steps;
   - add `download-artifact@v7` (`name: e2e-build-linux`, `path: ${{ runner.temp }}/e2e-build`) and `scripts/e2e-bundle unpack` after checkout;
   - run `scripts/with-xvfb target/debug/brindle-e2e-suite …` with the same arguments and `env:` as design.md's table.
 
   Keep the failure uploads unchanged. Verify: `scripts/lint-workflows` passes, and `git diff` shows every `env:` entry the jobs had.
-- [ ] 2.3 Update CLAUDE.md's CI paragraph and its re-run note, as design.md's "CLAUDE.md afterwards" lists for Linux. Also update README.md's CI paragraph and `docs/architecture/testing-architecture.md`'s CI line (the shards run one shared build). Verify: `rg -n 'cargo test --locked -p brindle --test e2e' .github CLAUDE.md` finds only the build jobs.
+- [x] 2.3 Update CLAUDE.md's CI paragraph and its re-run note, as design.md's "CLAUDE.md afterwards" lists for Linux. Also update README.md's CI paragraph and `docs/architecture/testing-architecture.md`'s CI line (the shards run one shared build). Verify: `rg -n 'cargo test --locked -p brindle --test e2e' .github CLAUDE.md` finds only the build jobs.
 
 ## 3. Windows jobs
 
-- [ ] 3.1 Add `windows-e2e-build`:
+- [x] 3.1 Add `windows-e2e-build`:
   - `windows-latest`;
   - Rust, `rust-cache` (`shared-key: windows`), `fetch-conpty.ps1`, `cargo build --locked -p brindle-remote-agent` and `cargo test --locked -p brindle --test e2e --no-run --message-format=json`, with the path through `ConvertFrom-Json` in `pwsh`;
   - `scripts/e2e-bundle pack` under `shell: bash`;
   - upload `e2e-build-windows` with the Linux job's settings.
 
   Verify: `scripts/lint-workflows` passes.
-- [ ] 3.2 Change `windows-e2e` (needs `windows-e2e-build`) and `windows-e2e-archive` (needs `[windows, windows-e2e-build]`):
+- [x] 3.2 Change `windows-e2e` (needs `windows-e2e-build`) and `windows-e2e-archive` (needs `[windows, windows-e2e-build]`):
   - drop Rust, `rust-cache`, `fetch-conpty.ps1` and the build steps;
   - download and `unpack` (`shell: bash`);
   - run `target/debug/brindle-e2e-suite.exe …` as design.md's table says;

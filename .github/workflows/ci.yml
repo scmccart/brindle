@@ -3,6 +3,8 @@
 # they go red on failure but aren't required checks. The release and Windows
 # builds are the reusable build-linux.yml and build-windows.yml, which
 # releases run too; the archive jobs run e2e cases against what they upload.
+# Every e2e job runs the suite from one build per platform (e2e-build,
+# windows-e2e-build), unpacked by scripts/e2e-bundle, with no toolchain.
 # rust-toolchain.toml pins Rust for every job.
 #
 # Pushes to main and pull requests run it. A pull request that changes only
@@ -158,12 +160,15 @@ jobs:
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     uses: ./.github/workflows/build-windows.yml
 
-  # The Windows cases of the end-to-end suite, on the runner's desktop.
-  # Advisory, like the Linux e2e jobs.
-  windows-e2e:
+  # The e2e build the Windows e2e jobs run, built once, as e2e-build does
+  # for Linux: the debug brindle.exe, brindle-remote.exe with the ConPTY
+  # files build.rs copies beside it, the fake ACP agent (the helper's package
+  # builds it, and the windows-agent-* cases find it beside the suite's
+  # build) and the suite. Nothing is stripped, and no .pdb is packed.
+  windows-e2e-build:
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - name: Install Rust
@@ -173,14 +178,57 @@ jobs:
           shared-key: windows
       - run: scripts/fetch-conpty.ps1
         shell: pwsh
-      # The helper's package builds the fake ACP agent beside it, which the
-      # windows-agent-* cases find beside the suite's build.
+      # The suite's path is the executable cargo reports for the e2e target.
+      # ConvertFrom-Json takes one message (one line) at a time.
       - name: Build
+        id: build
+        shell: pwsh
         run: |
           cargo build --locked -p brindle-remote-agent
-          cargo test --locked -p brindle --test e2e --no-run
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $messages = cargo test --locked -p brindle --test e2e --no-run --message-format=json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $suite = @($messages | ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'e2e' -and $_.executable } |
+            ForEach-Object { $_.executable })
+          if ($suite.Count -ne 1) { throw "expected one e2e test binary, found $($suite.Count)" }
+          "suite=$($suite[0])" >> $env:GITHUB_OUTPUT
+      # Git Bash: "the bash shell included with Git for Windows" (workflow
+      # syntax docs, defaults.run.shell).
+      - name: Pack the e2e build
+        shell: bash
+        env:
+          SUITE: ${{ steps.build.outputs.suite }}
+        run: scripts/e2e-bundle pack --suite "$SUITE" "$RUNNER_TEMP/e2e-build-windows.tar.gz"
+      # As e2e-build's upload.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-build-windows
+          path: ${{ runner.temp }}/e2e-build-windows.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+          overwrite: true
+
+  # The Windows cases of the end-to-end suite, on the runner's desktop, from
+  # windows-e2e-build's bundle, unpacked as e2e's shards unpack theirs.
+  # Advisory, like the Linux e2e jobs.
+  windows-e2e:
+    needs: windows-e2e-build
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          name: e2e-build-windows
+          path: ${{ runner.temp }}/e2e-build
+      - name: Unpack the e2e build
+        shell: bash
+        run: scripts/e2e-bundle unpack "$RUNNER_TEMP/e2e-build/e2e-build-windows.tar.gz"
       - name: End-to-end suite
-        run: cargo test --locked -p brindle --test e2e
+        run: ./target/debug/brindle-e2e-suite.exe
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
@@ -198,19 +246,24 @@ jobs:
   # brindle-remote.exe (and the ConPTY it embeds) beside it and no
   # BRINDLE_SERVER_HELPER, so what runs is what the zip carries. A job of
   # its own after the build, so windows-e2e doesn't wait for both builds.
-  # Advisory, like windows-e2e.
+  # The suite and the fake ACP agent the agent cases run (the zip carries
+  # none) come from windows-e2e-build's bundle: the agent's debug build
+  # speaks ACP from a script, as a release one would. Advisory, like
+  # windows-e2e.
   windows-e2e-archive:
-    needs: windows
+    needs: [windows, windows-e2e-build]
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-      - name: Install Rust
-        run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
         with:
-          shared-key: windows
+          name: e2e-build-windows
+          path: ${{ runner.temp }}/e2e-build
+      - name: Unpack the e2e build
+        shell: bash
+        run: scripts/e2e-bundle unpack "$RUNNER_TEMP/e2e-build/e2e-build-windows.tar.gz"
       - uses: actions/download-artifact@v7
         with:
           name: brindle-windows-x64
@@ -222,19 +275,13 @@ jobs:
           if ($zip.Count -ne 1) { throw "expected one zip, found $($zip.Count)" }
           Expand-Archive $zip[0].FullName "$env:RUNNER_TEMP/unpacked"
           Get-ChildItem "$env:RUNNER_TEMP/unpacked"
-      # The zip doesn't carry the fake ACP agent the agent cases run, so it
-      # is built here and named.
-      - name: Build the suite and the fake ACP agent
-        run: |
-          cargo test --locked -p brindle --test e2e --no-run
-          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent
       - name: ConPTY, PowerShell and agent cases from the zip
-        run: cargo test --locked -p brindle --test e2e -- windows-conpty windows-pwsh-integration windows-agent-
+        run: ./target/debug/brindle-e2e-suite.exe windows-conpty windows-pwsh-integration windows-agent-
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
           BRINDLE_E2E_BIN: ${{ runner.temp }}/unpacked/brindle.exe
-          BRINDLE_FAKE_ACP_AGENT: ${{ github.workspace }}/target/release/brindle-fake-acp-agent.exe
+          BRINDLE_FAKE_ACP_AGENT: ${{ github.workspace }}/target/debug/brindle-fake-acp-agent.exe
       - name: Upload the suite's output
         if: failure()
         uses: actions/upload-artifact@v7
@@ -251,9 +298,13 @@ jobs:
   # a missing or mismatched helper in the archive fails. Here rather than in
   # build-linux.yml, which every release runs on code CI has already passed:
   # the suite would add its whole run to each release. A release build has
-  # no fault switches, so the cases that need one skip. Advisory, like e2e.
+  # no fault switches, so the cases that need one skip. The suite and the
+  # static fake ACP agent (the archive carries none: the agent cases run it,
+  # named by BRINDLE_FAKE_ACP_AGENT, and remote-agent-ssh copies it into its
+  # container from where README.md's static build puts it) come from
+  # e2e-build's bundle. Advisory, like e2e.
   e2e-archive:
-    needs: release
+    needs: [release, e2e-build]
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 90
@@ -263,16 +314,14 @@ jobs:
         run: |
           sudo apt-get update
           # shellcheck disable=SC2086 # a list of packages
-          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES musl-tools \
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
             xvfb x11-utils openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less
-      # The musl target: the fake ACP agent is built static.
-      - name: Install Rust
-        run: |
-          rustup toolchain install
-          rustup target add x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
         with:
-          shared-key: dev
+          name: e2e-build-linux
+          path: ${{ runner.temp }}/e2e-build
+      - name: Unpack the e2e build
+        run: scripts/e2e-bundle unpack "$RUNNER_TEMP/e2e-build/e2e-build-linux.tar.gz"
       - uses: actions/download-artifact@v7
         with:
           name: brindle-linux-x64
@@ -289,17 +338,8 @@ jobs:
           PREFIX=$RUNNER_TEMP/prefix XDG_DATA_HOME=$RUNNER_TEMP/data BRINDLE_DOWNLOAD_BASE=file://$release \
             sh < "$release/install.sh"
           ls -l "$RUNNER_TEMP/prefix/bin"
-      # The archive doesn't carry the fake ACP agent the agent cases run, so
-      # it is built here, static: the agent cases run it here (named by
-      # BRINDLE_FAKE_ACP_AGENT) and remote-agent-ssh copies it into its
-      # container (from where README.md's static build puts it).
-      - name: Build the suite and the fake ACP agent
-        run: |
-          cargo test --locked -p brindle --test e2e --no-run
-          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent \
-            --target x86_64-unknown-linux-musl
       - name: Local-server, remote and agent cases from the installed archive
-        run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- local-server remote- agent-
+        run: scripts/with-xvfb target/debug/brindle-e2e-suite local-server remote- agent-
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
@@ -314,8 +354,68 @@ jobs:
           path: target/tmp/e2e/
           retention-days: 14
 
+  # Builds what the Linux e2e jobs run, once: the debug brindle, helper and
+  # fake ACP agent, the static fake ACP agent remote-agent-ssh copies into
+  # its container (the musl target), and the suite's test binary, whose
+  # path is the executable cargo reports for the e2e target.
+  # scripts/e2e-bundle packs them, debug info stripped (about 200 MB gzipped
+  # down to 20), with a stamp naming the commit and the workspace, into one
+  # tarball: an artifact's zip loses the executable bit, and both artifact
+  # actions' READMEs say to tar files to keep it ("Permission Loss"). The
+  # jobs that need this one check out the same commit, unpack the bundle
+  # where it was built (the suite's paths are compiled in) and run the
+  # suite's binary, with no toolchain.
+  e2e-build:
+    if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086 # a list of packages
+          sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES musl-tools
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: dev
+      - name: Build and pack the e2e build
+        run: |
+          cargo build --locked -p brindle-remote-agent
+          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent \
+            --target x86_64-unknown-linux-musl
+          suite=$(cargo test --locked -p brindle --test e2e --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and .target.name == "e2e" and .executable != null) | .executable')
+          scripts/e2e-bundle pack --suite "$suite" "$RUNNER_TEMP/e2e-build-linux.tar.gz"
+      # upload-artifact's README: compression-level 0 "is recommended for
+      # significantly faster uploads" of files that don't compress (the
+      # tarball is gzipped); retention-days is "Minimum 1 day", and only
+      # this run's jobs read it; overwrite deletes "an artifact with a
+      # matching name ... before a new one is uploaded", so a re-run of this
+      # job replaces it. download-artifact's README: "By default, the
+      # permissions are scoped so they can only download Artifacts within
+      # the current workflow run", so no token or permission is needed.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-build-linux
+          path: ${{ runner.temp }}/e2e-build-linux.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+          overwrite: true
+
+  # The suite in shards, from e2e-build's bundle. A job that needs another
+  # waits for it to "complete successfully", and "If a job fails or is
+  # skipped, all jobs that need it are skipped" (workflow syntax docs,
+  # jobs.<job_id>.needs): a failed build skips the shards, and on a release
+  # pull request they skip with it.
   e2e:
     name: e2e (${{ matrix.shard }}/3)
+    needs: e2e-build
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -334,25 +434,17 @@ jobs:
           # xclip: the clipboard cases' other application.
           # shellcheck disable=SC2086 # a list of packages
           sudo apt-get install -y --no-install-recommends $BUILD_PACKAGES \
-            xvfb x11-utils xclip openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish musl-tools
-      # The musl target: remote-agent-ssh copies a static fake ACP agent
-      # into its container.
-      - name: Install Rust
-        run: |
-          rustup toolchain install
-          rustup target add x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+            xvfb x11-utils xclip openbox mesa-vulkan-drivers libvulkan1 fonts-dejavu-core dbus less zsh fish
+      - uses: actions/download-artifact@v7
         with:
-          shared-key: dev
-      - name: Build
-        run: |
-          cargo build --locked -p brindle-remote-agent
-          cargo build --locked --release -p brindle-remote-agent --bin brindle-fake-acp-agent \
-            --target x86_64-unknown-linux-musl
-          cargo test --locked -p brindle --test e2e --no-run
+          name: e2e-build-linux
+          path: ${{ runner.temp }}/e2e-build
+      - name: Unpack the e2e build
+        run: scripts/e2e-bundle unpack "$RUNNER_TEMP/e2e-build/e2e-build-linux.tar.gz"
       - name: End-to-end suite
-        run: scripts/with-xvfb cargo test --locked -p brindle --test e2e -- --shard ${{ matrix.shard }}/3
+        run: scripts/with-xvfb target/debug/brindle-e2e-suite --shard "$SHARD/3"
         env:
+          SHARD: ${{ matrix.shard }}
           BRINDLE_E2E: "1"
           BRINDLE_E2E_CLIPBOARD_REQUIRED: "1"
           # lavapipe and shared runners are slower than a desktop.

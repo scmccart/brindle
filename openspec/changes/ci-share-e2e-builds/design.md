@@ -196,6 +196,14 @@ The repository is public, so standard runners cost nothing (Actions billing docs
 - **The Windows bullet:** "`windows-e2e` on CI builds the helper, and with it the fake ACP agent, first" becomes "`windows-e2e-build` on CI builds them".
 - **Re-runs:** a re-run of an e2e job after the artifact's 1-day retention needs "Re-run all jobs", which rebuilds.
 
+### As built (2026-11-25)
+
+- **The tarball goes through gzip on a pipe, not `tar -f`.** `pack` writes `tar -cf - … | gzip > OUT`, and `unpack` reads the stamp with `gzip -dc < FILE | tar -xOf - target/e2e-bundle.txt` and extracts with `gzip -dc < FILE | tar -xmf -`, instead of `tar -xzmf FILE`. GNU tar, which Git Bash runs, takes a path like `D:\a\_temp\…` as `host:file` on a remote host. `-m` still gives every file the extraction time.
+- **Messages use `printf`, not `echo`.** A Linux `sh` (dash) `echo` reads a Windows workspace's backslashes as escapes: a local run printed `D:\a\brindle\brindle` as `D:rindlerindle`.
+- **The shard number reaches its run step through `env:` (`SHARD`)**, as `.claude/rules/workflows.md` asks, where the old step had `${{ matrix.shard }}` inline.
+- **Both uploads set `if-no-files-found: error`**, so a missing tarball fails the build job, not its consumers' download.
+- **`windows-e2e-build` checks `$LASTEXITCODE` after each cargo in its `pwsh` step** and requires exactly one e2e executable. For `pwsh`, GitHub appends `if ((Test-Path -LiteralPath variable:\LASTEXITCODE)) { exit $LASTEXITCODE }` (workflow syntax docs, "Exit codes and error action preference"), which sees only the last native command's code.
+
 ## Risks / Trade-offs
 
 - [A consumer's runner checks out to another path, e.g. during a runner-image rollout] → `unpack` refuses with both paths named. "Re-run all jobs" rebuilds on matching runners.
