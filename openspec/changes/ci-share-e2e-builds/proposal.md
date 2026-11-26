@@ -18,6 +18,7 @@ Building once and reusing the output saves about 27 runner-minutes a run, net, r
 - **The shards, `e2e-archive`, `windows-e2e` and `windows-e2e-archive` no longer compile.** Each checks out the repository, downloads and unpacks its platform's artifact into `target/`, and runs the suite binary directly instead of through `cargo test`. They install no Rust toolchain and restore no cargo cache.
   - `windows-e2e-archive` runs the bundle's debug fake ACP agent instead of building a release one.
 - **A new script, `scripts/e2e-bundle`, packs and unpacks for both platforms** (`pack`, and `unpack` with the stamp check). Git Bash runs it on Windows.
+- **As built (2026-11-26): Linux only.** The Windows half (`windows-e2e-build` and the two Windows jobs' changes) was tried and reverted, and `scripts/e2e-bundle` handles Linux only. The Windows e2e jobs build their own suite, as on main. design.md's "As built (2026-11-26)" note says why.
 - **The harness doesn't change.** A local `BRINDLE_E2E=1 cargo test --test e2e` builds and runs exactly as now, and its helper and fake-agent freshness checks keep their rules.
 - CLAUDE.md's CI paragraph and the Windows note about what `windows-e2e` builds, README.md's CI paragraph and `docs/architecture/testing-architecture.md`'s CI line describe the build jobs and the artifacts.
 
@@ -33,7 +34,7 @@ None (`skip_specs: true`). The jobs still run every case they ran before, agains
 
 ## Impact
 
-- `.github/workflows/ci.yml`: two new jobs, four changed. `build-linux.yml`, `build-windows.yml` and `release.yml` don't change, so releases are unaffected.
+- `.github/workflows/ci.yml`: two new jobs, four changed (as built: one new job, `e2e-build`, and the three Linux e2e jobs changed). `build-linux.yml`, `build-windows.yml` and `release.yml` don't change, so releases are unaffected.
 - A new `scripts/e2e-bundle`, added to `scripts/lint-workflows`' shellcheck list.
 - CLAUDE.md, README.md, `docs/architecture/testing-architecture.md`.
 - Artifact storage: about 20 MB per run on Linux (measured locally, stripped and gzipped), plus the Windows bundle. Each is kept 1 day.

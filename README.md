@@ -335,8 +335,7 @@ suite and what it runs, and `scripts/e2e-bundle` packs that build as an
 artifact. The suite is split into 3 shards that run as separate jobs, each
 from that one build. A failed shard uploads its `target/tmp/e2e/` as an
 artifact, and `cargo test --test e2e -- --shard K/3` reruns it locally.
-The Windows cases get a build job of their own in the same way. A Windows
-job runs the
+A Windows job runs the
 release build, the unit tests and the harness self-tests on `windows-latest`.
 
 ### Performance

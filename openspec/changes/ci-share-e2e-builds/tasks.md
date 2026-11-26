@@ -34,14 +34,16 @@
 
 ## 3. Windows jobs
 
-- [x] 3.1 Add `windows-e2e-build`:
+Reverted (2026-11-26): 3.1 and 3.2 were built, then reverted after PR #138's run, because `windows-e2e` failed from the bundle. `windows-e2e` and `windows-e2e-archive` are main's jobs again, `windows-e2e-build` is removed, `scripts/e2e-bundle` is Linux only, and CLAUDE.md's Windows bullet describes the restored jobs again. design.md's "As built (2026-11-26)" note gives the failure and a plausible cause.
+
+- [x] 3.1 Add `windows-e2e-build` (reverted):
   - `windows-latest`;
   - Rust, `rust-cache` (`shared-key: windows`), `fetch-conpty.ps1`, `cargo build --locked -p brindle-remote-agent` and `cargo test --locked -p brindle --test e2e --no-run --message-format=json`, with the path through `ConvertFrom-Json` in `pwsh`;
   - `scripts/e2e-bundle pack` under `shell: bash`;
   - upload `e2e-build-windows` with the Linux job's settings.
 
   Verify: `scripts/lint-workflows` passes.
-- [x] 3.2 Change `windows-e2e` (needs `windows-e2e-build`) and `windows-e2e-archive` (needs `[windows, windows-e2e-build]`):
+- [x] 3.2 Change `windows-e2e` (needs `windows-e2e-build`) and `windows-e2e-archive` (needs `[windows, windows-e2e-build]`) (reverted):
   - drop Rust, `rust-cache`, `fetch-conpty.ps1` and the build steps;
   - download and `unpack` (`shell: bash`);
   - run `target/debug/brindle-e2e-suite.exe …` as design.md's table says;
@@ -59,7 +61,8 @@
 
   Record the jobs' durations against design.md's estimate: removed runner-minutes, the run's wall time, and the shards' and `windows-e2e`'s finish times.
 - [ ] 4.2 On a scratch branch, make one case fail. Verify: only its shard uploads `e2e-shard-<k>`, and "Re-run failed jobs" re-runs that shard alone, from the same artifact, with the stamp check passing. Delete the branch.
-- [ ] 4.3 If 4.1 shows the Windows half saving under a minute of runner time and no wall time, record that in the PR, and ask the user whether to keep it or revert group 3 before merging.
+- [x] 4.3 If 4.1 shows the Windows half saving under a minute of runner time and no wall time, record that in the PR, and ask the user whether to keep it or revert group 3 before merging.
+  - Decided: group 3 reverted (2026-11-26). `windows-e2e` failed from the bundle (every window case "Brindle didn't exit", then the 60-minute timeout), and the half was estimated to save about 1 runner-minute and no wall time. The user was away and left it to best judgement.
 
 ## Workflow follow-up
 
