@@ -1827,22 +1827,26 @@ fn run_debug_steps(window: gpui::WindowHandle<Workspace>, args: &Args, cx: &mut 
                 // update it themselves.
                 let keystroke = keystroke.clone();
                 cx.update_window(window.into(), move |_, window, cx| {
+                    draw_for_dispatch(window, cx);
                     window.dispatch_keystroke(keystroke, cx);
                 })
                 .ok();
+                continue;
+            }
+            if let Step::Action(name) = &step {
+                // Not inside the workspace's update either: the draw
+                // renders the workspace, which that update leases.
+                let action = actions::action_by_name(name).expect("checked when the arguments were parsed");
+                cx.update_window(window.into(), move |_, window, cx| dispatch_step_action(window, action, cx)).ok();
                 continue;
             }
             window
                 .update(cx, |ws, window, cx| match &step {
                     Step::Send(text) => ws.send_to_active(text.as_bytes(), window, cx),
                     Step::Find(text) => ws.find_in_active(text, window, cx),
-                    Step::Action(name) => {
-                        let action = actions::action_by_name(name).expect("checked when the arguments were parsed");
-                        window.dispatch_action(action, cx);
-                    }
                     Step::Pointer(step) => ws.debug_pointer(step, window, cx),
                     Step::Modality(modality) => brindle_ui::set_modality(window, *modality, cx),
-                    Step::WaitFor(_) | Step::Key(_) => {}
+                    Step::WaitFor(_) | Step::Key(_) | Step::Action(_) => {}
                 })
                 .ok();
         }
@@ -1873,6 +1877,24 @@ fn run_debug_steps(window: gpui::WindowHandle<Workspace>, args: &Args, cx: &mut 
         })
         .detach();
     }
+}
+
+/// An `--action` step: [`draw_for_dispatch`], then the action.
+fn dispatch_step_action(window: &mut gpui::Window, action: Box<dyn gpui::Action>, cx: &mut App) {
+    draw_for_dispatch(window, cx);
+    window.dispatch_action(action, cx);
+}
+
+/// GPUI routes an action or a key from the focused element through the
+/// dispatch tree of the frame it last drew. A window the platform has
+/// stopped drawing (X11 pauses it while the window is unmapped or fully
+/// obscured) keeps the frame from before the last change, so after a focus
+/// move (a new tab) a step would start at the tree's root, above the
+/// workspace's listeners, and be dropped without a word. Drawing first
+/// makes the tree match the state the step acts on; the platform presents
+/// the frame on its next refresh.
+fn draw_for_dispatch(window: &mut gpui::Window, cx: &mut App) {
+    window.draw(cx).clear();
 }
 
 /// `--wait-for`: polls the active terminal's screen until it shows `text`,
@@ -2850,5 +2872,46 @@ mod tests {
         assert_eq!((args.attach(), args.asked), (Some(7), Asked::Attach(7)));
         assert_eq!(parse(&[]).attach(), None);
         assert_eq!(parse(&["terminal"]).attach(), None);
+    }
+
+    gpui::actions!(dispatch_test, [Hit]);
+
+    /// As the workspace: the listener on the root view's div, and focusable
+    /// children (tabs) added over time.
+    struct Tabs {
+        tabs: Vec<gpui::FocusHandle>,
+        hits: usize,
+    }
+
+    impl gpui::Render for Tabs {
+        fn render(&mut self, _: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            use gpui::{InteractiveElement as _, ParentElement as _};
+            gpui::div()
+                .id("workspace")
+                .on_action(cx.listener(|this, _: &Hit, _, _| this.hits += 1))
+                .children(self.tabs.iter().enumerate().map(|(i, tab)| gpui::div().id(i).track_focus(tab)))
+        }
+    }
+
+    /// An action step right after focus moved to a tab no frame has drawn
+    /// yet (a window the platform stopped drawing, as on CI's Xvfb) still
+    /// reaches the workspace's listener: `agent-continue-load`'s dropped
+    /// `activate_tab_1`.
+    #[gpui::test]
+    fn an_action_step_reaches_a_tab_no_frame_has_drawn(cx: &mut gpui::TestAppContext) {
+        let (tabs, cx) = cx.add_window_view(|_, cx| Tabs { tabs: vec![cx.focus_handle()], hits: 0 });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let tab = tabs.update(cx, |tabs, cx| {
+                let tab = cx.focus_handle();
+                tabs.tabs.push(tab.clone());
+                cx.notify();
+                tab
+            });
+            window.focus(&tab);
+            dispatch_step_action(window, Box::new(Hit), cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(tabs.read_with(cx, |tabs, _| tabs.hits), 1);
     }
 }
