@@ -176,6 +176,13 @@ impl UiTheme {
         cx.refresh_windows();
     }
 
+    /// Makes `tokens` the innermost scope's set (`None`: no scope) and
+    /// returns the one it replaces, for the scope to restore after its
+    /// child's phase.
+    pub(crate) fn replace_scope(&self, tokens: Option<Tokens>) -> Option<Tokens> {
+        self.scope.replace(tokens)
+    }
+
     /// The innermost scope's set while one is being drawn.
     pub(crate) fn scope(&self) -> Option<Tokens> {
         self.scope.get()

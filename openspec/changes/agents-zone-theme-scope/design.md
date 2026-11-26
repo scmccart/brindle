@@ -111,6 +111,10 @@ pub trait ActiveTheme {
 - [`ui_theme()` by value touches 57 sites] → Mechanical, in one commit before anything else, with `cargo clippy` and the existing tests as the check.
 - [e2e constants shared with `agents-markdown-layout-fixes`' case] → Whichever lands second updates the other's: that case's `muted` colour becomes the zone set's (its border colour is `card_border` in both sets, so it stays).
 
+## As built: the `ui_theme()` audit (2026-11-25)
+
+Every `ui_theme()` call in `ui/src` and `src/` (50 sites, outside tests and the gallery) runs in a render: a `RenderOnce::render`, a view's `render`, or a helper a render calls (`render_row`, `queue_row`, `render_find_bar`, `render_feedback`, the settings dialog's `render_*`, `profile_menu_trigger`'s closure, `Badge::element`). None runs in an event handler, an entity's `update` or a stored colour. The reads that run outside a scope's phases, though called during a render, are two, both handled as decisions 4 and 5 planned: a tooltip's panel, rendered by gpui on hover outside the tree (`Tooltip::render`), and a non-modal overlay's panel lifted into a `deferred`. `TextArea` paints its caret and selection in the text colour its owner set at render (`input_style`'s foreground), so it follows a scope with no paint-time read of its own. The one stored colour remains `PromptInput::set_held_color`, the theme's ANSI yellow from the app.
+
 ## Migration Plan
 
 None: no config, state or wire change. A rollback is a revert.
