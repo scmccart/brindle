@@ -3,7 +3,7 @@
 //!
 //! The relay runs the login shell as an interactive login shell with no
 //! terminal ([`invocation`]). The shell `exec`s the hidden `login-env` role,
-//! which writes its environment to file descriptor 3 as `NAME=VALUE\0`
+//! which writes its environment to file descriptor 63 as `NAME=VALUE\0`
 //! records and one empty record as the terminator ([`encode_dump`]). The
 //! relay reads that pipe up to the terminator ([`parse_dump`]), never to its
 //! end, since a program a startup file left running may hold it open, and

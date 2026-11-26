@@ -10,7 +10,8 @@
 //!    user's login shell's environment on a thread of its own: the shell
 //!    ([`login_env::invocation`], `$SHELL -l -i -c`) runs in a session of its
 //!    own with stdin and stdout on `/dev/null`, stderr on a pipe whose last
-//!    4 KiB are kept for the reason, and file descriptor 3 on the dump pipe;
+//!    4 KiB are kept for the reason, and file descriptor 63 ([`DUMP_FD`]) on
+//!    the dump pipe;
 //!    it `exec`s this binary's hidden `login-env` role, which writes its
 //!    environment there ([`login_env::encode_dump`]). Nothing the startup
 //!    files print reaches stdout. The dump is read up to its terminator, for
@@ -68,7 +69,7 @@
 //!
 //! **`login-env`** ([`login_env_role`]), hidden from the usage text, is the
 //! role the login shell `exec`s: it writes its environment to file
-//! descriptor 3 and exits.
+//! descriptor 63 and exits.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -104,8 +105,13 @@ const IDLE_ENV: &str = "BRINDLE_TEST_RELAY_IDLE_MS";
 const LOGIN_ENV_ENV: &str = "BRINDLE_TEST_RELAY_LOGIN_ENV_MS";
 /// The argument that asks the relay for the login shell's environment.
 pub const LOGIN_ENVIRONMENT_ARG: &str = "--login-environment";
-/// The file descriptor the `login-env` role writes its dump to.
-const DUMP_FD: RawFd = 3;
+/// The file descriptor the `login-env` role writes its dump to. Not a low
+/// one: bash marks descriptors 3 to 19 close-on-exec in an interactive login
+/// shell, so the role, which it `exec`s, would find a low one closed. Every
+/// shell `invocation` runs keeps 63 (bash, dash, zsh, fish, ksh93, mksh,
+/// busybox), and each moves its own descriptors to free ones, never onto an
+/// open one.
+const DUMP_FD: RawFd = 63;
 /// How long a started core may take to say it is ready.
 const START_LIMIT: Duration = Duration::from_secs(5);
 /// How long the relay keeps trying a core it started: one that lost a start
@@ -176,8 +182,9 @@ fn passwd() -> Option<login_env::Passwd> {
 }
 
 /// `brindle-remote login-env`: writes this process's environment to file
-/// descriptor 3 ([`login_env::encode_dump`]) and exits. The login shell
-/// `exec`s it; it takes no arguments, and fails when fd 3 isn't open.
+/// descriptor [`DUMP_FD`] ([`login_env::encode_dump`]) and exits. The login
+/// shell `exec`s it; it takes no arguments, and fails when that descriptor
+/// isn't open.
 pub fn login_env_role(args: &[String]) -> Result<(), String> {
     use std::os::unix::ffi::OsStringExt as _;
 
@@ -193,7 +200,7 @@ pub fn login_env_role(args: &[String]) -> Result<(), String> {
         ));
     }
     // SAFETY: the descriptor is open (above), and this process owns it
-    // from here: nothing else in it uses fd 3.
+    // from here: nothing else in it uses that descriptor.
     let mut out = unsafe { File::from_raw_fd(DUMP_FD) };
     let dump = login_env::encode_dump(
         std::env::vars_os().map(|(name, value)| (name.into_vec(), value.into_vec())),
@@ -290,7 +297,7 @@ impl LoginShell {
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
-                // The dump pipe on fd 3, open across the exec (`dup2`
+                // The dump pipe on `DUMP_FD`, open across the exec (`dup2`
                 // leaves the copy without close-on-exec).
                 let kept = if dump_fd == DUMP_FD {
                     libc::fcntl(DUMP_FD, libc::F_SETFD, 0)

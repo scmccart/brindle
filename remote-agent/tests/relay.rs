@@ -507,6 +507,23 @@ fn a_relay_reports_the_login_shells_environment_without_its_noise() {
     say(&mut client, echo, "after the login shell");
 }
 
+/// bash as the login shell: an interactive login bash marks descriptors 3 to
+/// 19 close-on-exec, so the dump pipe must be above them for the role it
+/// `exec`s to find it. bash reads `.profile` when there is no
+/// `.bash_profile`.
+#[test]
+fn bash_as_the_login_shell_hands_its_environment_over() {
+    let mut dir = TempDir::new("relay-login-bash");
+    let home = login_home(&dir, "export RELAY_LOGIN_VAR=bash\n");
+    let mut relay = login_relay(&dir, &home, "/bin/bash", &[]);
+    let host = relay.host();
+    dir.track(host.core_pid);
+    let Some(LoginEnv::Captured(login)) = &host.login else {
+        panic!("expected a captured login environment, got {:?}", host.login);
+    };
+    assert_eq!(login.get("RELAY_LOGIN_VAR").map(String::as_str), Some("bash"));
+}
+
 /// `remote-login-environment` 4.4: a `.profile` that never finishes. The relay
 /// reports it took too long, the shell's process group is gone, `core.log`
 /// says why, and the relay relays.
@@ -618,14 +635,15 @@ fn a_relays_environment_gets_the_passwd_basics() {
     assert_eq!(host.shell, shell);
 }
 
-/// `remote-login-environment` 4.2: the hidden role writes its environment to fd 3
+/// `remote-login-environment` 4.2: the hidden role writes its environment to fd 63
 /// as `NAME=VALUE` records and an empty one, and refuses to run without fd
-/// 3 or with arguments.
+/// 63 or with arguments. bash runs the scripts, since dash's redirections
+/// take one digit.
 #[test]
-fn the_login_env_role_writes_its_environment_to_fd_3() {
-    // `3>&1`: fd 3 is the shell's stdout, which the test reads.
-    let output = std::process::Command::new("/bin/sh")
-        .args(["-c", "exec \"$0\" login-env 3>&1 1>/dev/null", BIN])
+fn the_login_env_role_writes_its_environment_to_fd_63() {
+    // `63>&1`: fd 63 is the shell's stdout, which the test reads.
+    let output = std::process::Command::new("/bin/bash")
+        .args(["-c", "exec \"$0\" login-env 63>&1 1>/dev/null", BIN])
         .env_clear()
         .env("ROLE_TEST", "a b=c")
         .env("EMPTY", "")
@@ -646,8 +664,8 @@ fn the_login_env_role_writes_its_environment_to_fd_3() {
     // Nothing after the terminator but the end of the last record.
     assert_eq!(&output.stdout[output.stdout.len() - 2..], b"\0\0");
 
-    for script in ["exec \"$0\" login-env 3>&-", "exec \"$0\" login-env extra 3>/dev/null"] {
-        let status = std::process::Command::new("/bin/sh")
+    for script in ["exec \"$0\" login-env 63>&-", "exec \"$0\" login-env extra 63>/dev/null"] {
+        let status = std::process::Command::new("/bin/bash")
             .args(["-c", script, BIN])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
