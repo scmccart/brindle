@@ -180,9 +180,10 @@ Settled on 2026-11-26, one at a time:
 - A tab may hold panes on different hosts, which the user chose over the recommended one host per tab (decisions 3, 8, 9).
 - Split Agent Right and Down are ctrl-shift-alt-e and ctrl-shift-alt-o, chosen over the recommended ctrl-shift-g and ctrl-shift-b.
 
+- A split to a kind with several profiles runs the default profile when it is of that kind, and asks only otherwise, chosen over always asking (decision 2).
+- Split Right With Profile… and Split Down With Profile… are kept as two commands, chosen over one command that asks twice and over leaving them out (decision 4). With any host allowed in a tab, they are how a profile the kind rules wouldn't choose is added, such as an SSH shell beside a local one.
+
 Choices made here, for review:
-- A split tries the default profile before "the only profile of the kind" (decision 2). The user approved "the pane's own, else the only one, else ask"; with several terminal profiles that would ask on every terminal split from an agent pane.
-- Split Right/Down With Profile… are added (decision 4). With any host allowed in a tab, there must be a way to pick a profile that the kind rules wouldn't choose, such as an SSH shell beside a local one.
 - A split starts in the split pane's directory whenever both run on one host, even when the new profile sets its own (decision 3).
 - A swept tab that spanned hosts comes back as one tab per host (decision 9).
 - The tab's face follows the active zone's theme (decision 5).
