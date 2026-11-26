@@ -50,6 +50,7 @@ pub mod dropdown_menu;
 pub mod edge_bar;
 pub mod input;
 pub mod kbd;
+pub mod loader;
 pub mod menu;
 pub mod message;
 pub mod message_scroller;
@@ -59,6 +60,7 @@ pub mod reasoning;
 pub mod response;
 pub mod select;
 pub mod separator;
+pub mod shimmer;
 pub mod switch;
 pub mod tabs;
 pub mod textarea;
@@ -78,7 +80,11 @@ use crate::style::ring_geometry;
 
 pub use alert::{Alert, AlertStyle, AlertVariant, alert_style};
 pub use badge::{Badge, BadgeContent, TITLE_KEEPS, kept_title};
-pub use confirmation::{Confirmation, ConfirmationAction, ConfirmationState};
+pub use confirmation::{
+    Confirmation, ConfirmationAction, ConfirmationFrame, ConfirmationState, ConfirmationTone, confirmation_frame,
+};
+pub use loader::{LOADER_STEPS, Loader};
+pub use shimmer::Shimmer;
 pub use reasoning::Reasoning;
 pub use response::{
     Code, ColumnAlign, HeadingLevel, Inline, InlineError, InlineLink, ListItem, ListKind, Response, RichBlock, RunBase,

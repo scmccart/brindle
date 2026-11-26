@@ -15,6 +15,7 @@ use gpui::{
 };
 
 mod launch;
+pub mod mark;
 mod notices;
 mod overlays;
 mod previews;
@@ -40,8 +41,9 @@ use crate::picker::{
     KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRef, SessionRow, SessionsModel, SubmitFn,
 };
 use crate::settings::Zoom;
+use crate::motion::Motion;
 use brindle_ui::{
-    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, MenuEntry, MenuEvent, MenuItem,
+    ActiveFont as _, ActiveTheme as _, Button, ButtonSize, ButtonVariant, ContextMenu, DropdownMenu, EdgeBar, Icon, ItemKey, Loader, MenuEntry, MenuEvent, MenuItem,
     LEGIBLE_ICON_STROKE, Modality, Overlay as UiOverlay, TabActivate, TabContextMenu, TabList, TabMove, TabTrigger,
     TabWidth, TextInput, Tokens, Tooltip, TooltipFor as _, button_style, entry_keyed,
 };
@@ -106,6 +108,10 @@ pub struct Tab {
     /// The most pressing program status (OSC 7501) across the tab's
     /// terminals; see [`Workspace::refresh_status`].
     pub status: Option<State>,
+    /// One of the tab's working zones is an agent zone, so a `working`
+    /// status is drawn as a spinner ([`mark::mark`]); refreshed with
+    /// `status`.
+    pub agent_working: bool,
     /// The most pressing progress (OSC 9;4) across the tab's terminals,
     /// drawn as the bar on its face; refreshed with `status`.
     pub progress: Option<Progress>,
@@ -139,6 +145,7 @@ impl Tab {
             origin,
             bell: false,
             status: None,
+            agent_working: false,
             progress: None,
             badge: None,
             manual_title: None,
@@ -665,6 +672,9 @@ impl Workspace {
                 let MenuEvent::Selected(key) = event;
                 this.context_menu_selected(key, window, cx);
             });
+        // A closed window can't keep the motion clock running.
+        let motion_id = cx.entity_id();
+        cx.on_release(move |_, cx| Motion::want(motion_id, false, cx)).detach();
         let mut this = Self {
             tabs: Vec::new(),
             strip: Tabs::default(),
@@ -1549,7 +1559,7 @@ impl Workspace {
         let Some(handle) = window.window_handle().downcast::<Workspace>() else { return };
         let tab = &self.tabs[ix];
         let tab_title = notify::policy::TabTitle::of(tab.manual_title.as_deref(), &tab.title);
-        let (summary, body) = notify::policy::layout(source, title, body, tab_title);
+        let (summary, body) = notify::policy::layout(source, title, body, tab_title, &tab.profile.name);
         let request = notify::Request { source, summary, body, window: handle, tab: tab.id.0, program };
         Notifier::send(request, cx);
     }
@@ -1559,13 +1569,27 @@ impl Workspace {
     /// records do (a new report, a new prompt, the user typing).
     fn refresh_status(&mut self, ix: usize, cx: &mut Context<Self>) {
         let status = self.tabs[ix].status_summary(cx);
+        let agent_working = self.tabs[ix].zones.read(cx).agent_working();
         let progress = self.tabs[ix].zones.read(cx).progress_summary();
         let badge = self.refresh_badge(ix, cx);
         let tab = &mut self.tabs[ix];
-        if (tab.status, tab.progress) != (status, progress) || badge {
-            (tab.status, tab.progress) = (status, progress);
+        if (tab.status, tab.agent_working, tab.progress) != (status, agent_working, progress) || badge {
+            (tab.status, tab.agent_working, tab.progress) = (status, agent_working, progress);
             cx.notify();
         }
+        self.refresh_motion(cx);
+    }
+
+    /// Each tab's face mark ([`mark::mark`]), in the strip's order.
+    fn face_marks(&self) -> impl Iterator<Item = mark::Mark> + '_ {
+        self.tabs.iter().map(|tab| mark::mark(tab.status, tab.agent_working))
+    }
+
+    /// Wants the motion clock while a tab's face shows a spinner (OpenSpec
+    /// change `agents-zone-attention`, decision 1).
+    fn refresh_motion(&self, cx: &mut Context<Self>) {
+        let spins = self.face_marks().any(mark::Mark::is_spinner);
+        Motion::want(cx.entity_id(), spins, cx);
     }
 
     /// Activates the tab with this id, if it is still open (a notification
@@ -1655,6 +1679,7 @@ impl Workspace {
         let tab = self.tabs.remove(ix);
         let removed = self.strip.removed(&order, id);
         tab.zones.update(cx, |v, cx| v.shutdown_all(cx));
+        self.refresh_motion(cx);
         #[cfg(any(target_os = "linux", windows))]
         {
             let after: Vec<Host> = self.tabs.iter().map(|tab| tab.host.clone()).collect();
@@ -2659,6 +2684,10 @@ impl Workspace {
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_badges());
             }
+            out.push_str(&describe_tab_spinners(self.face_marks()));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_spinners());
+            }
             if let Some(view) = view.as_ref() {
                 out.push_str(&view.read(cx).describe_feedback(std::time::Instant::now()));
             }
@@ -2677,6 +2706,10 @@ impl Workspace {
             out.push_str(&describe_tab_badges(self.tabs.iter().map(|tab| tab.badge.as_ref())));
             if let Some(tab) = self.active_tab() {
                 out.push_str(&tab.zones.read(cx).describe_badges());
+            }
+            out.push_str(&describe_tab_spinners(self.face_marks()));
+            if let Some(tab) = self.active_tab() {
+                out.push_str(&tab.zones.read(cx).describe_spinners());
                 out.push_str(&tab.zones.read(cx).describe_zones());
             }
             out.push_str(&agent);
@@ -2709,6 +2742,7 @@ impl Workspace {
         if let Some(input) = self.focused_input(window, cx) {
             out.push_str(&format!("--- input {}\n", input.describe(cx)));
         }
+        out.push_str(&describe_motion(Motion::running(cx)));
         out.push_str(&format!("--- focus {}\n", self.describe_focus(window, cx)));
         out
     }
@@ -2822,9 +2856,16 @@ impl Workspace {
                     .close_tooltip(close_tip.clone())
                     .surface(surface)
                     .text_color(text);
-                // The status and bell dots lead the face, before its title.
-                if let Some(state) = tab.status {
-                    trigger = trigger.leading(dot(status_color(state)));
+                // The status and bell dots lead the face, before its title;
+                // an agent's `working` is a spinner at the motion clock's
+                // step, in the working dot's colour.
+                match mark::mark(tab.status, tab.agent_working) {
+                    mark::Mark::None => {}
+                    mark::Mark::Dot(state) => trigger = trigger.leading(dot(status_color(state))),
+                    mark::Mark::Spinner => {
+                        let step = crate::motion::loader_step(Motion::step(cx));
+                        trigger = trigger.leading(Loader::new().step(step).color(status_color(State::Working)));
+                    }
                 }
                 if tab.bell {
                     trigger = trigger.leading(dot(tokens.primary));
@@ -3408,6 +3449,23 @@ fn describe_tab_badges<'a>(tabs: impl IntoIterator<Item = Option<&'a Badge>>) ->
         .enumerate()
         .filter_map(|(ix, badge)| Some(format!("--- badge tab={} {}\n", ix + 1, describe_badge(badge?))))
         .collect()
+}
+
+/// The tabs' spinners, for `--dump-screen-after`: `--- spinner tab=N` for
+/// each tab whose face shows one, numbered from 1 as the `--- tab` lines
+/// are (OpenSpec change `agents-zone-attention`, decision 7).
+fn describe_tab_spinners(marks: impl IntoIterator<Item = mark::Mark>) -> String {
+    marks
+        .into_iter()
+        .enumerate()
+        .filter(|(_, mark)| mark.is_spinner())
+        .map(|(ix, _)| format!("--- spinner tab={}\n", ix + 1))
+        .collect()
+}
+
+/// Whether the window's motion clock runs, for `--dump-screen-after`.
+fn describe_motion(running: bool) -> String {
+    format!("--- motion {}\n", if running { "running" } else { "stopped" })
 }
 
 /// An open menu, for `--dump-screen-after`: `--- menu items=A|[B]|-|C
@@ -4240,6 +4298,16 @@ mod tests {
             "--- menu items=Shell|[Off]|-|htop highlighted=none\nShell  bash  [ctrl-alt-1]\nOff\nhtop\n"
         );
         assert!(describe_menu(&entries, Some(3)).starts_with("--- menu items=Shell|[Off]|-|htop highlighted=3\n"));
+    }
+
+    #[test]
+    fn tab_spinner_and_motion_lines() {
+        use mark::Mark;
+        let marks = [Mark::Dot(State::Working), Mark::Spinner, Mark::None, Mark::Spinner];
+        assert_eq!(describe_tab_spinners(marks), "--- spinner tab=2\n--- spinner tab=4\n");
+        assert_eq!(describe_tab_spinners([Mark::Dot(State::Done)]), "");
+        assert_eq!(describe_motion(true), "--- motion running\n");
+        assert_eq!(describe_motion(false), "--- motion stopped\n");
     }
 
     #[test]

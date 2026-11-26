@@ -49,9 +49,10 @@ fn events_through_the_sink_reach_the_model_and_the_first_prompt_goes_once() {
     settle(&cx);
     let splices = drained(&mut updates);
     assert!(
-        splices.iter().all(|update| matches!(update, AgentUpdate::Splices(_))),
+        splices.iter().all(|update| matches!(update, AgentUpdate::Splices(_) | AgentUpdate::Working(_))),
         "only the list changes: {splices:?}"
     );
+    assert_eq!(splices.last(), Some(&AgentUpdate::Working(Some(model::WorkingRow::Working))), "the working row, last");
     assert_eq!(drained(&mut terminal_events), [TerminalEvent::Status(None)], "working");
     zone.feed(&[Event::Turn { state: TurnState::Ended { stop: crate::agent::transcript::StopReason::EndTurn } }]);
     settle(&cx);

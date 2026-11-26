@@ -35,8 +35,9 @@ use brindle_ui::{
     ThemeScope, ToggleVariant, Tokens, Tooltip, TooltipFor, UiTheme,
 };
 use brindle_ui::{
-    Alert, AlertVariant, BubblePart, Confirmation, ConfirmationAction, ConfirmationState, Message, MessageFrom,
-    MessageScroller, PromptInput, PromptInputEvent, PromptStatus, Reasoning, Tool, ToolStatus,
+    Alert, AlertVariant, BubblePart, Confirmation, ConfirmationAction, ConfirmationState, ConfirmationTone,
+    LOADER_STEPS, Loader, Message, MessageFrom, MessageScroller, PromptInput, PromptInputEvent, PromptStatus, Reasoning,
+    Shimmer, Tool, ToolStatus,
 };
 use brindle_ui::{
     Code, CodeBlock, ColumnAlign, HeadingLevel, Inline, InlineLink, ListItem, ListKind, Response, RichBlock, RunStyle,
@@ -257,6 +258,22 @@ fn main() {
         cx.activate(true);
         if check {
             cx.spawn(async move |cx| check::run(window, title, cx.clone()).await).detach();
+        } else {
+            // The loader and the shimmer move at 10 steps a second, as in
+            // Brindle; the checks keep them still.
+            cx.spawn(async move |cx| {
+                loop {
+                    cx.background_executor().timer(std::time::Duration::from_millis(100)).await;
+                    let stepped = window.update(cx, |gallery, _, cx| {
+                        gallery.motion_step = gallery.motion_step.wrapping_add(1);
+                        cx.notify();
+                    });
+                    if stepped.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
         }
     });
 }
@@ -545,6 +562,10 @@ pub struct Gallery {
     permission: ConfirmationState,
     /// The permission's actions pressed, by label, in order.
     permission_log: Vec<String>,
+    /// The loader's and the shimmer's step: moved 10 times a second by a
+    /// gallery-local timer (as Brindle's motion clock does), never under
+    /// `--check`, so the checks draw a still frame.
+    motion_step: u32,
     /// The demo response's blocks, built once.
     response: Vec<Arc<RichBlock>>,
     /// What the responses and the code block told the gallery, in order:
@@ -891,6 +912,7 @@ impl Gallery {
             thought_open: false,
             permission: ConfirmationState::Requested,
             permission_log: Vec::new(),
+            motion_step: 0,
             response: demo_response(),
             response_log: Vec::new(),
             scroll: ScrollHandle::new(),
@@ -1772,11 +1794,14 @@ impl Gallery {
         let t = cx.ui_theme();
         let gallery = cx.weak_entity();
         let toggled = gallery.clone();
+        // A pending request is a risk (Brindle's permission rows): the
+        // destructive tone while requested, the default tone once answered.
         let permission = Confirmation::new("demo-permission", "Run `cargo test --workspace`?", self.permission.clone())
+            .tone(ConfirmationTone::Destructive)
             .action(
                 ConfirmationAction::new("Allow once")
                     .key("allow-once")
-                    .variant(ButtonVariant::Default)
+                    .variant(ButtonVariant::Destructive)
                     .focus(&self.handle("confirm-allow")),
             )
             .action(ConfirmationAction::new("Reject").key("reject").focus(&self.handle("confirm-reject")))
@@ -1830,6 +1855,27 @@ impl Gallery {
                     .ok();
             })
             .child("The workflow names fxc.exe; the SDK path moved with 10.0.26100.0.");
+        // An answered destructive request draws as a plain one.
+        let answered = Confirmation::new(
+            "demo-permission-answered",
+            "Write `.github/workflows/build-windows.yml`?",
+            ConfirmationState::Accepted { label: "Allow once".into() },
+        )
+        .tone(ConfirmationTone::Destructive);
+        // A working agent's spinner and its working row, at the motion step.
+        let working = "Read .github/workflows/build-windows.yml";
+        let sweep = (self.motion_step % 20) as f32 / 19.;
+        let position = -3. + sweep * (working.chars().count() as f32 + 6.);
+        let motion = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(recorded(
+                Loader::new().step(self.motion_step % LOADER_STEPS).color(t.primary),
+                "loader",
+                &self.records,
+            ))
+            .child(recorded(div().flex_1().min_w_0().child(Shimmer::new(working).position(position)), "shimmer", &self.records));
         div()
             .flex()
             .flex_col()
@@ -1869,7 +1915,9 @@ impl Gallery {
                             .child(Tool::new(Icon::Search, "Search for fxc.exe", ToolStatus::Pending))
                             .child(Tool::new(Icon::Globe, "Fetch the Windows SDK release notes", ToolStatus::Running))
                             .child(Tool::new(Icon::Pencil, "Edit .github/workflows/build-windows.yml", ToolStatus::Failed))
+                            .child(motion)
                             .child(permission)
+                            .child(recorded(answered, "permission-answered", &self.records))
                             .child(login)
                             .child(Alert::new("Heads up").description("The agent edits files in this directory."))
                             .child(
@@ -3356,6 +3404,8 @@ mod check {
         c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
         let check = confirmation_described_actions(&mut c).await;
         c.run_check("confirmation-described-actions-stack-and-a-disabled-one-is-no-stop", check).await;
+        let check = confirmation_destructive_answered(&mut c).await;
+        c.run_check("confirmation-destructive-answered-draws-in-the-default-tone", check).await;
         let check = scroller_keeps_the_view_while_away(&mut c).await;
         c.run_check("message-scroller-item-added-while-away-keeps-the-view", check).await;
         let check = response_paints(&mut c).await;
@@ -5990,6 +6040,37 @@ mod check {
         })?;
         ensure!(!listed, "an answered permission's button is still a stop");
         Ok(())
+    }
+
+    /// The spec's "Destructive tone": requested, the frame is the tint with
+    /// the destructive border and the warning icon; answered, it is the
+    /// default tone's, and the answered demo row reads the card colour
+    /// inside its border (a pixel read, on Windows).
+    async fn confirmation_destructive_answered(c: &mut Checker) -> Check {
+        use brindle_ui::{ConfirmationState, ConfirmationTone, confirmation_frame};
+        let tokens = c.with(|_, _, cx| cx.window_theme())?;
+        let requested = confirmation_frame(ConfirmationTone::Destructive, &ConfirmationState::Requested, &tokens);
+        ensure!(
+            requested.warning && requested.background == tokens.destructive_tint && requested.border == tokens.destructive,
+            "a requested destructive confirmation draws {requested:?}"
+        );
+        let answered = ConfirmationState::Accepted { label: "Allow once".into() };
+        let frame = confirmation_frame(ConfirmationTone::Destructive, &answered, &tokens);
+        let plain = confirmation_frame(ConfirmationTone::Default, &answered, &tokens);
+        ensure!(frame == plain, "an answered destructive confirmation draws {frame:?}, not the default {plain:?}");
+        let bounds = c.reveal("permission-answered").await?;
+        // Inside the border, in the padding left of the title.
+        let sample = point(bounds.left() + px(4.), bounds.top() + bounds.size.height / 2.);
+        match c.pixel(sample).await {
+            Ok(shown) => {
+                let expected = over(tokens.card, tokens.background);
+                ensure!(near(shown, expected), "the answered row at {sample:?} is {shown:?}, not the card {expected:?}");
+                Ok(())
+            }
+            // No pixel reads on Linux: the frame's decision is checked.
+            Err(Failure::Skip(_)) => Ok(()),
+            Err(failure) => Err(failure),
+        }
     }
 
     /// The spec's "Action descriptions": the login choice's actions stack

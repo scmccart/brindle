@@ -268,6 +268,8 @@ fn unix() -> Vec<Case> {
         display("agent-multiline", agent::multiline).needs_fake_agent(),
         display("agent-cancel", agent::cancel).needs_fake_agent(),
         display("agent-permission-keys", agent::permission_keys).needs_fake_agent(),
+        display("agent-permission-style", agent::permission_style).needs_fake_agent(),
+        display("agent-working", agent::working).needs_fake_agent(),
         display("agent-thoughts", agent::thoughts).needs_fake_agent(),
         display("agent-scroll", agent::scroll).needs_fake_agent(),
         display("agent-copy", agent::copy).needs_fake_agent(),

@@ -602,8 +602,10 @@ pub fn cancel(ctx: &Ctx) -> Result<Outcome> {
 }
 
 /// A permission request blocks the turn (`status=blocked`); tab from the
-/// prompt reaches its buttons, allow first, and enter on one answers it:
-/// the agent gets the option chosen, and the turn goes on to its end.
+/// prompt reaches its buttons, reject first though the agent listed allow
+/// first (`agents-zone-attention` decision 4), and enter on one answers
+/// it: the agent gets the option chosen, and the turn goes on to its end.
+/// The dump's entry line keeps the agent's order.
 pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let profile = Script::ready(&received)
@@ -619,10 +621,10 @@ pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
     let out = started("focus").key("tab").dump_at(5.0).run()?;
     waited(&out)?;
     ensure!(out.dump.agent_field("status") == Some("blocked"), "agent: {:?}", out.dump.agent);
-    ensure!(out.dump.focus_stop.as_deref() == Some("permission:2:allow-once"), "focus: {:?}", out.dump.focus_stop);
+    ensure!(out.dump.focus_stop.as_deref() == Some("permission:2:reject-once"), "focus: {:?}", out.dump.focus_stop);
 
     std::fs::remove_file(&received).ok();
-    let out = started("reject").key("tab").key("tab").key("enter").wait_for("agent \"done\"").dump_at(7.0).run()?;
+    let out = started("reject").key("tab").key("enter").wait_for("agent \"done\"").dump_at(7.0).run()?;
     waited(&out)?;
     agent_has(&out, "entry 2 permission call=\"call_1\" options=allow-once:\"Allow\"|reject-once:\"Reject\" outcome=selected:reject-once")?;
     ensure!(out.dump.agent_field("turn") == Some("ended:end_turn"), "agent: {:?}", out.dump.agent);
@@ -631,6 +633,136 @@ pub fn permission_keys(ctx: &Ctx) -> Result<Outcome> {
         sent.lines().any(|l| l.contains("\"id\":\"p1\"") && l.contains("\"optionId\":\"reject-once\"")),
         "the agent wasn't answered reject-once: {sent}"
     );
+    Ok(Outcome::Pass)
+}
+
+/// The zone set's `card` token for the `e2e` theme, an agent zone's agent
+/// bubble and an answered permission: `BACKGROUND` (the theme's own,
+/// `Theme::zone_tokens`) mixed 4% towards the foreground.
+const ZONE_CARD: crate::capture::Rgb = crate::capture::Rgb(0x17, 0x1b, 0x1f);
+
+/// The zone set's `destructive_tint` for the `e2e` theme, a pending
+/// permission's background: [`ZONE_CARD`] mixed the most, 12%, towards the
+/// red (`RED`, 4.1:1 on the card, so `destructive` as it is), since the
+/// foreground keeps 8.6:1 and the red 3.7:1 on it (`theme::destructive_tint`).
+const ZONE_DESTRUCTIVE_TINT: crate::capture::Rgb = crate::capture::Rgb(0x2f, 0x1f, 0x23);
+
+/// The working row and the spinners (OpenSpec change
+/// `agents-zone-attention`, decisions 1 to 3): while a tool call is in
+/// progress the zone's last line is `--- working "Read main.rs"`, the tab's
+/// face spins and the motion clock runs; split, the working zone's header
+/// spins too. Once the turn ends (the case opens the gate from a Shell
+/// tab) there is no working line and no spinner, and the clock is stopped.
+pub fn working(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let done = gate(ctx, "done");
+    let tool = |status: &str| {
+        update(&format!(
+            r#"{{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"Read main.rs","kind":"read","status":"{status}"}}"#
+        ))
+    };
+    let profile = Script::ready(&received)
+        .step("expect session/prompt")
+        .step(tool("in_progress"))
+        .step(format!("wait-file {}", done.display()))
+        .step(update(r#"{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed"}"#))
+        .step(says("done"))
+        .step(stop("end_turn"))
+        .profile(ctx, "working")?;
+    let in_progress = "working \"Read main.rs\"";
+    let started = |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for(in_progress);
+
+    let out = started("working").dump_at(5.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_working().as_deref() == Some("Read main.rs"), "working row: {:?}", out.dump.agent);
+    ensure!(out.dump.agent.last().is_some_and(|l| l.starts_with("prompt ")), "agent lines {:?}", out.dump.agent);
+    ensure!(out.dump.spinners == ["tab=1"], "spinners {:?}", out.dump.spinners);
+    ensure!(out.dump.motion.as_deref() == Some("running"), "motion {:?}", out.dump.motion);
+
+    // Split: the new zone is active and idle, the working one's header
+    // spins.
+    let out = started("split").action("split_zone_right").wait_for("conversation entries=0").dump_at(6.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.zones.as_deref() == Some("count=2 active=2"), "zones {:?}", out.dump.zones);
+    ensure!(out.dump.spinners == ["tab=1", "zone=1"], "spinners {:?}", out.dump.spinners);
+    ensure!(out.dump.motion.as_deref() == Some("running"), "motion {:?}", out.dump.motion);
+
+    let out = started("ended")
+        .action("new_tab")
+        .send(&format!("touch '{}'\r", done.display()))
+        .action("activate_tab_1")
+        .wait_for("turn=ended:end_turn")
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.agent_working().is_none(), "a working row at the end: {:?}", out.dump.agent);
+    ensure!(out.dump.spinners.is_empty(), "spinners at the end {:?}", out.dump.spinners);
+    ensure!(out.dump.motion.as_deref() == Some("stopped"), "motion {:?}", out.dump.motion);
+    Ok(Outcome::Pass)
+}
+
+/// A pending permission is drawn as a risk (OpenSpec change
+/// `agents-zone-attention`, decision 4), in pixels: its row has the zone
+/// set's destructive tint behind its title and the allow button's
+/// destructive fill (the `e2e` theme's red); once allowed (tab, tab,
+/// enter: reject comes first) the row is back on the card's colour.
+pub fn permission_style(ctx: &Ctx) -> Result<Outcome> {
+    use crate::brindle::theme;
+    let profile = Script::ready(&ctx.dir.join("received.jsonl"))
+        .step("expect session/prompt")
+        .step(ask("p1"))
+        .step(r#"expect-response "p1""#)
+        .step(format!("wait-file {}", gate(ctx, "never").display()))
+        .profile(ctx, "style")?;
+    let started =
+        |label| Run::new(ctx, label).config(&profile).agent("Fake").first_prompt("hi").wait_for("outcome=pending");
+
+    let out = started("pending").capture_at(5.0).dump_at(5.5).run()?;
+    waited(&out)?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    let area = scale * scale;
+    // The title row is the zone's width less its paddings by some 30
+    // logical pixels; the allow button about 60 by 28.
+    let tint = image.count_near(zone, ZONE_DESTRUCTIVE_TINT, TOKEN_NEAR);
+    ensure!(
+        tint as f32 >= 2_000.0 * area,
+        "the tint: {tint} pixels of {} in {zone:?}; found {}",
+        ZONE_DESTRUCTIVE_TINT.hex(),
+        image.summary(zone)
+    );
+    let fill = image.count_near(zone, theme::RED, TOKEN_NEAR);
+    ensure!(
+        fill as f32 >= 500.0 * area,
+        "the allow button's fill: {fill} pixels of {} in {zone:?}; found {}",
+        theme::RED.hex(),
+        image.summary(zone)
+    );
+
+    let out = started("answered")
+        .key("tab")
+        .key("tab")
+        .key("enter")
+        .wait_for("outcome=selected:allow-once")
+        .capture_at(7.0)
+        .dump_at(7.5)
+        .run()?;
+    waited(&out)?;
+    let image = out.image.as_ref().ok_or("no capture")?;
+    let scale = window_scale(image, theme::CHROME_BORDER)?;
+    let zone = zone_inner(image, scale, [0.0, 0.0, 1.0, 1.0]);
+    // Antialiased red edges pass through the tint's colour; a row of it
+    // doesn't.
+    let tint = image.count_near(zone, ZONE_DESTRUCTIVE_TINT, TOKEN_NEAR);
+    ensure!(
+        (tint as f32) < 100.0 * scale * scale,
+        "answered, {tint} pixels of the tint {} remain in {zone:?}; found {}",
+        ZONE_DESTRUCTIVE_TINT.hex(),
+        image.summary(zone)
+    );
+    let card = image.count_near(zone, ZONE_CARD, TOKEN_NEAR);
+    ensure!(card as f32 >= 2_000.0 * scale * scale, "the card: {card} pixels of {}; found {}", ZONE_CARD.hex(), image.summary(zone));
     Ok(Outcome::Pass)
 }
 
@@ -1733,15 +1865,33 @@ fn agent_listed(ctx: &Ctx) -> Result<bool> {
     Ok(String::from_utf8_lossy(&out.stdout).contains("brindle-fake-acp-agent"))
 }
 
-/// The permission an agent asks for in `agent-notify`.
-const ASKED: &str = "Run cargo test?";
+/// The command an agent asks to run in `agent-notify`.
+const ASKED: &str = "cargo test";
+
+/// A permission notice's body in the log, its two lines joined by a space
+/// (`agents-zone-attention` decision 6): the call's kind and title, then
+/// the options, reject first.
+const ASKED_BODY: &str = "Command: cargo test Reject · Allow";
+
+/// A permission notice's title: the profile's name and what it asks.
+const ASKED_TITLE: &str = "Fake needs permission";
+
+/// `script` starting a tool call `call_1` that runs [`ASKED`], then asking
+/// permission for it with the JSON-RPC id `id`.
+fn asks_to_run(script: Script, id: &str) -> Script {
+    script
+        .step(update(&format!(
+            r#"{{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"{ASKED}","kind":"execute","status":"pending"}}"#
+        )))
+        .step(ask_about(id, ASKED))
+}
 
 /// The notification log's lines for an agent's notice (`source<TAB>title
-/// <TAB>body`): the zone's title, the profile's name until the agent
-/// names the conversation; the tab's automatic title isn't repeated
-/// (`agents-session-title` decision 6).
-fn agent_notice(body: &str) -> String {
-    format!("agent\tFake\t{body}")
+/// <TAB>body`): the profile's name, what it asks, and the conversation's
+/// title once the agent names it; the tab's automatic title isn't
+/// repeated (`agents-zone-attention` decision 6).
+fn agent_notice(title: &str, body: &str) -> String {
+    format!("agent\t{title}\t{body}")
 }
 
 /// The lines of a run's notification log; none when it wasn't written.
@@ -1759,9 +1909,10 @@ fn until_logged(log: &Path, text: &str, label: &str) -> String {
 
 /// An agent's notifications (`BRINDLE_NOTIFY_LOG`, source `agent`):
 /// - in a background tab, with the default `when`, a permission request
-///   notifies with its title and a turn that ends normally with `Done`,
-///   each titled `Fake`, the profile's name; answering the permission in
-///   front raises nothing;
+///   notifies titled `Fake needs permission`, its body the command and
+///   the options, and a turn that ends normally notifies `Done` titled
+///   `Fake`, the profile's name; answering the permission in front raises
+///   nothing;
 /// - with `when = "always"` the same turn in the active tab notifies both,
 ///   and with `notifications.agent = false` it notifies nothing;
 /// - a replay after a quit and relaunch notifies nothing, though it shows
@@ -1769,11 +1920,11 @@ fn until_logged(log: &Path, text: &str, label: &str) -> String {
 pub fn notify(ctx: &Ctx) -> Result<Outcome> {
     let received = ctx.dir.join("received.jsonl");
     let (asked, answered) = (gate(ctx, "asked"), gate(ctx, "answered"));
-    let background = Script::ready(&received)
-        .step("expect session/prompt")
-        .step(format!("wait-file {}", asked.display()))
-        .step(ask_about("p1", ASKED))
-        .step(r#"expect-response "p1""#)
+    let background = asks_to_run(
+        Script::ready(&received).step("expect session/prompt").step(format!("wait-file {}", asked.display())),
+        "p1",
+    )
+    .step(r#"expect-response "p1""#)
         .step(format!("wait-file {}", answered.display()))
         .step(says("done"))
         .step(stop("end_turn"))
@@ -1791,21 +1942,20 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
         .action("activate_tab_1")
         .wait_for("outcome=pending")
         .key("tab")
+        .key("tab")
         .key("enter")
         .wait_for("outcome=selected:allow-once")
         .action("activate_tab_2")
         .send(&format!("touch '{}'; {}", answered.display(), until_logged(&log, "Done", "notice-2")))
         .wait_for("notice-2")
-        .dump_at(12.0)
+        .dump_at(14.0)
         .run()?;
     waited(&out)?;
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "the Shell tab in front: {:?}", out.dump.tabs);
-    let want = [agent_notice(ASKED), agent_notice("Done")];
+    let want = [agent_notice(ASKED_TITLE, ASKED_BODY), agent_notice("Fake", "Done")];
     ensure!(notices(&log) == want, "background: notices {:?}, expected {want:?}", notices(&log));
 
-    let in_front = Script::ready(&received)
-        .step("expect session/prompt")
-        .step(ask_about("p1", ASKED))
+    let in_front = asks_to_run(Script::ready(&received).step("expect session/prompt"), "p1")
         .step(r#"expect-response "p1""#)
         .step(says("done"))
         .step(stop("end_turn"))
@@ -1820,18 +1970,17 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
             .first_prompt("hi")
             .wait_for("outcome=pending")
             .key("tab")
+            .key("tab")
             .key("enter")
             .wait_for("agent \"done\"")
             .wait_for("status=done")
-            .dump_at(7.0)
+            .dump_at(8.0)
             .run()?;
         waited(&out)?;
         ensure!(notices(&log) == want, "{label}: notices {:?}, expected {want:?}", notices(&log));
     }
 
-    let pending = Script::ready(&received)
-        .step("expect session/prompt")
-        .step(ask_about("p1", ASKED))
+    let pending = asks_to_run(Script::ready(&received).step("expect session/prompt"), "p1")
         .step(format!("wait-file {}", gate(ctx, "never").display()))
         .profile(ctx, "replay")?;
     let notifications = "\n[notifications]\nwhen = \"always\"\n";
@@ -1848,7 +1997,7 @@ pub fn notify(ctx: &Ctx) -> Result<Outcome> {
         .expect_exit()
         .dump_at(12.0)
         .run()?;
-    ensure!(notices(&live) == [agent_notice(ASKED)], "live: notices {:?}", notices(&live));
+    ensure!(notices(&live) == [agent_notice(ASKED_TITLE, ASKED_BODY)], "live: notices {:?}", notices(&live));
     let out = Run::new(ctx, "replayed")
         .config(&pending)
         .config(notifications)
@@ -1882,7 +2031,7 @@ fn titles(title: Option<&str>) -> String {
 ///   the agent by its readable title;
 /// - after the agent titles its conversation (on the first prompt) the
 ///   tab reads the title, and the turn's `Done` notification is titled
-///   with it alone;
+///   with the profile's name and it (`agents-zone-attention` decision 6);
 /// - after the agent clears it (on the second prompt) the tab and the
 ///   notification read `Fake` again;
 /// - a tab renamed `Build` through the rename prompt keeps its name after
@@ -1935,7 +2084,7 @@ pub fn session_title(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     waited(&out)?;
     ensure!(tab(&out) == NAMED, "the conversation's title, on one line: {:?}", out.dump.tabs);
-    ensure!(notices(&log) == [format!("agent\t{NAMED}\tDone")], "titled: notices {:?}", notices(&log));
+    ensure!(notices(&log) == [format!("agent\tFake — {NAMED}\tDone")], "titled: notices {:?}", notices(&log));
 
     let log = ctx.dir.join("cleared.notify");
     let out = Run::new(ctx, "cleared")
@@ -1961,7 +2110,7 @@ pub fn session_title(ctx: &Ctx) -> Result<Outcome> {
     waited(&out)?;
     ensure!(out.dump.tabs.len() == 2 && out.dump.tabs[1].1, "the Shell tab in front: {:?}", out.dump.tabs);
     ensure!(tab(&out) == "Fake", "the profile's name again: {:?}", out.dump.tabs);
-    let want = [format!("agent\t{NAMED}\tDone"), "agent\tFake\tDone".to_string()];
+    let want = [format!("agent\tFake — {NAMED}\tDone"), "agent\tFake\tDone".to_string()];
     ensure!(notices(&log) == want, "cleared: notices {:?}, expected {want:?}", notices(&log));
 
     let log = ctx.dir.join("renamed.notify");
@@ -1982,7 +2131,7 @@ pub fn session_title(ctx: &Ctx) -> Result<Outcome> {
         .run()?;
     waited(&out)?;
     ensure!(tab(&out) == "Build", "the manual title wins: {:?}", out.dump.tabs);
-    let want = [format!("agent\t{NAMED} — Build\tDone")];
+    let want = [format!("agent\tFake — {NAMED} — Build\tDone")];
     ensure!(notices(&log) == want, "renamed: notices {:?}, expected {want:?}", notices(&log));
     Ok(Outcome::Pass)
 }

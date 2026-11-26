@@ -21,14 +21,50 @@
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, ElementId, FocusHandle, InteractiveElement, IntoElement, ParentElement, RenderOnce, SharedString,
-    Styled, Window, div, prelude::FluentBuilder as _, rems,
+    AnyElement, App, ElementId, FocusHandle, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, Styled, Window, div, prelude::FluentBuilder as _, rems,
 };
 
 use crate::components::{Button, ItemKey};
 use crate::icon::Icon;
 use crate::style::{ButtonSize, ButtonVariant};
-use crate::theme::ActiveTheme;
+use crate::theme::{ActiveTheme, Tokens};
+
+/// How a requested confirmation reads: plain, or as a risk.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfirmationTone {
+    /// An alert's frame on the card.
+    #[default]
+    Default,
+    /// shadcn's destructive alert while requested: a warning icon in
+    /// `destructive` before the title, the frame tinted
+    /// (`destructive_tint`) with a `destructive` border. Answered, it reads
+    /// as the default tone, so a conversation's history doesn't keep
+    /// warning.
+    Destructive,
+}
+
+/// What a confirmation's frame draws: the warning icon, its background
+/// and its border.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ConfirmationFrame {
+    pub warning: bool,
+    pub background: Hsla,
+    pub border: Hsla,
+}
+
+/// The frame of a confirmation of `tone` in `state`, from `t`: the
+/// destructive look only while requested.
+pub fn confirmation_frame(tone: ConfirmationTone, state: &ConfirmationState, t: &Tokens) -> ConfirmationFrame {
+    match (tone, state.outcome()) {
+        (ConfirmationTone::Destructive, None) => {
+            ConfirmationFrame { warning: true, background: t.destructive_tint, border: t.destructive }
+        }
+        (ConfirmationTone::Default, _) | (ConfirmationTone::Destructive, Some(_)) => {
+            ConfirmationFrame { warning: false, background: t.card, border: t.border }
+        }
+    }
+}
 
 /// Where a confirmation is.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,6 +159,7 @@ pub struct Confirmation {
     id: ElementId,
     title: SharedString,
     state: ConfirmationState,
+    tone: ConfirmationTone,
     actions: Vec<ConfirmationAction>,
     on_action: Option<OnAction>,
     children: Vec<AnyElement>,
@@ -131,7 +168,22 @@ pub struct Confirmation {
 impl Confirmation {
     /// `id` is unique among the confirmations of one list.
     pub fn new(id: impl Into<ElementId>, title: impl Into<SharedString>, state: ConfirmationState) -> Self {
-        Self { id: id.into(), title: title.into(), state, actions: Vec::new(), on_action: None, children: Vec::new() }
+        Self {
+            id: id.into(),
+            title: title.into(),
+            state,
+            tone: ConfirmationTone::Default,
+            actions: Vec::new(),
+            on_action: None,
+            children: Vec::new(),
+        }
+    }
+
+    /// How it reads while requested ([`ConfirmationTone`]); its actions
+    /// keep the variants the owner gives them.
+    pub fn tone(mut self, tone: ConfirmationTone) -> Self {
+        self.tone = tone;
+        self
     }
 
     pub fn action(mut self, action: ConfirmationAction) -> Self {
@@ -156,6 +208,7 @@ impl ParentElement for Confirmation {
 impl RenderOnce for Confirmation {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let t = cx.ui_theme();
+        let frame = confirmation_frame(self.tone, &self.state, &t);
         let stacked = actions_stack(&self.actions);
         let muted = t.muted_foreground;
         let footer: AnyElement = match self.state.outcome() {
@@ -214,10 +267,26 @@ impl RenderOnce for Confirmation {
                 .child(label)
                 .into_any_element(),
         };
-        // An alert's frame: rounded-lg border bg-card px-4 py-3 text-sm.
-        // Its id scopes the buttons'.
+        // An alert's frame: rounded-lg border bg-card px-4 py-3 text-sm;
+        // the destructive tone tints it and puts a warning icon before the
+        // title. Its id scopes the buttons'.
+        let title = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .when(frame.warning, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "confirmation-warning".into())
+                        .flex_none()
+                        .child(Icon::TriangleAlert.size(rems(1.)).color(t.destructive)),
+                )
+            })
+            .child(div().flex_1().min_w_0().font_weight(gpui::FontWeight::MEDIUM).child(self.title));
         div()
             .id(self.id)
+            .when(frame.warning, |d| d.debug_selector(|| "confirmation-destructive".into()))
             .flex()
             .flex_col()
             .gap_2()
@@ -227,11 +296,11 @@ impl RenderOnce for Confirmation {
             .py_3()
             .rounded(t.radius_lg())
             .border_1()
-            .border_color(t.border)
-            .bg(t.card)
+            .border_color(frame.border)
+            .bg(frame.background)
             .text_color(t.card_foreground)
             .text_size(rems(0.875))
-            .child(div().font_weight(gpui::FontWeight::MEDIUM).child(self.title))
+            .child(title)
             .children(self.children)
             .child(footer)
     }
@@ -255,6 +324,62 @@ mod tests {
         );
         assert_eq!(ConfirmationState::Rejected { label: "Reject".into() }.outcome(), Some((Icon::X, "Reject".into())));
         assert_eq!(ConfirmationState::Cancelled.outcome(), Some((Icon::X, "Cancelled".into())));
+    }
+
+    #[test]
+    fn the_destructive_tone_draws_only_while_requested() {
+        let t = Tokens::neutral_light();
+        let requested = ConfirmationState::Requested;
+        let rejected = ConfirmationState::Rejected { label: "Reject".into() };
+        let plain = ConfirmationFrame { warning: false, background: t.card, border: t.border };
+        assert_eq!(confirmation_frame(ConfirmationTone::Default, &requested, &t), plain);
+        assert_eq!(
+            confirmation_frame(ConfirmationTone::Destructive, &requested, &t),
+            ConfirmationFrame { warning: true, background: t.destructive_tint, border: t.destructive }
+        );
+        for answered in [rejected, ConfirmationState::Accepted { label: "Allow".into() }, ConfirmationState::Cancelled] {
+            assert_eq!(confirmation_frame(ConfirmationTone::Destructive, &answered, &t), plain, "{answered:?}");
+            assert_eq!(confirmation_frame(ConfirmationTone::Default, &answered, &t), plain, "{answered:?}");
+        }
+    }
+
+    struct Toned {
+        state: ConfirmationState,
+    }
+
+    impl Render for Toned {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(400.)).child(
+                Confirmation::new("permission", "Run cargo test?", self.state.clone())
+                    .tone(ConfirmationTone::Destructive)
+                    .action(ConfirmationAction::new("Reject").key("reject"))
+                    .action(ConfirmationAction::new("Allow once").key("allow").variant(ButtonVariant::Destructive)),
+            )
+        }
+    }
+
+    /// The spec's "Destructive tone" and "Destructive tone once answered":
+    /// requested, the warning icon sits before the title inside the tinted
+    /// frame; rejected, neither is drawn.
+    #[test]
+    fn a_destructive_confirmation_warns_until_answered() {
+        let mut app = test_support::app();
+        let (host, cx) = app.add_window_view(|_, _| Toned { state: ConfirmationState::Requested });
+        cx.run_until_parked();
+        let frame = cx.debug_bounds("confirmation-destructive").expect("the tinted frame");
+        let icon = cx.debug_bounds("confirmation-warning").expect("the warning icon");
+        let actions = cx.debug_bounds("confirmation-actions").expect("the buttons");
+        assert!(icon.left() > frame.left() && icon.bottom() <= actions.top(), "{icon:?} in {frame:?}, above {actions:?}");
+        cx.update(|_, cx| {
+            host.update(cx, |host, cx| {
+                host.state = ConfirmationState::Rejected { label: "Reject".into() };
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("confirmation-outcome").is_some(), "the outcome shows");
+        assert_eq!(cx.debug_bounds("confirmation-warning"), None, "no icon once answered");
+        assert_eq!(cx.debug_bounds("confirmation-destructive"), None, "no tint once answered");
     }
 
     #[test]

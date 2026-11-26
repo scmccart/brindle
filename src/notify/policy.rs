@@ -62,14 +62,19 @@ impl<'a> TabTitle<'a> {
 
 /// The notification's title and body: a program's own title comes first,
 /// then the tab's, so the part that matters survives truncation. An
-/// agent's title is its zone's, which an automatic tab title only repeats,
-/// so the tab's follows only when the user named the tab something else.
-pub fn layout(source: Source, title: &str, body: &str, tab: TabTitle<'_>) -> (String, String) {
+/// agent's title already names its profile and zone (`ChatModel::notice`),
+/// which an automatic tab title only repeats, so the tab's follows only
+/// when the user named the tab something that is none of the title's
+/// ` — `-separated parts nor the tab's `profile` name (OpenSpec change
+/// `agents-zone-attention`, decision 6).
+pub fn layout(source: Source, title: &str, body: &str, tab: TabTitle<'_>, profile: &str) -> (String, String) {
     let tab_title = tab.text().trim();
     let tab_title = if tab_title.is_empty() { "Brindle" } else { tab_title };
     let named = match source {
         Source::Agent => match tab {
-            TabTitle::Manual(_) => tab_title != title.trim(),
+            TabTitle::Manual(_) => {
+                tab_title != profile.trim() && title.split(" — ").all(|part| part.trim() != tab_title)
+            }
             TabTitle::Automatic(_) => false,
         },
         Source::Bell | Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 => true,
@@ -331,11 +336,11 @@ mod tests {
     #[test]
     fn titles_name_the_tab() {
         for tab in [TabTitle::Automatic, TabTitle::Manual] {
-            assert_eq!(layout(Source::Osc9, "", "done", tab("make")), ("make".into(), "done".into()));
-            assert_eq!(layout(Source::Osc777, "Build", "ok", tab("bash")), ("Build — bash".into(), "ok".into()));
-            assert_eq!(layout(Source::Osc99, "Build", "ok", tab("Build")), ("Build — Build".into(), "ok".into()));
-            assert_eq!(layout(Source::Bell, "", "", tab("vim")), ("vim".into(), "Bell".into()));
-            assert_eq!(layout(Source::Osc9, "", "x", tab(" ")), ("Brindle".into(), "x".into()));
+            assert_eq!(layout(Source::Osc9, "", "done", tab("make"), "Shell"), ("make".into(), "done".into()));
+            assert_eq!(layout(Source::Osc777, "Build", "ok", tab("bash"), "Shell"), ("Build — bash".into(), "ok".into()));
+            assert_eq!(layout(Source::Osc99, "Build", "ok", tab("Build"), "Build"), ("Build — Build".into(), "ok".into()));
+            assert_eq!(layout(Source::Bell, "", "", tab("vim"), "Shell"), ("vim".into(), "Bell".into()));
+            assert_eq!(layout(Source::Osc9, "", "x", tab(" "), "Shell"), ("Brindle".into(), "x".into()));
         }
     }
 
@@ -345,24 +350,39 @@ mod tests {
         assert_eq!(TabTitle::of(None, "Fake"), TabTitle::Automatic("Fake"));
     }
 
-    /// An agent's notice (`ChatModel::notice`, `agents-session-title`
-    /// decision 6): the zone's title, then the tab's only when the user
-    /// named the tab something else; the body as the model worded it.
+    /// An agent's notice (`ChatModel::notice`, `agents-zone-attention`
+    /// decision 6): its title as the model worded it, then the tab's only
+    /// when the user named the tab something that is none of the title's
+    /// parts nor the profile's name; the body as the model worded it.
     #[test]
-    fn agent_notices_name_the_zone_then_a_tab_the_user_renamed() {
-        let permission = layout(Source::Agent, "Fake", "Run cargo test?", TabTitle::Automatic("Fake"));
-        assert_eq!(permission, ("Fake".into(), "Run cargo test?".into()));
-        let named = layout(Source::Agent, "Hello.txt file creation", "Done", TabTitle::Automatic("Hello.txt file creation"));
-        assert_eq!(named, ("Hello.txt file creation".into(), "Done".into()));
-        assert_eq!(layout(Source::Agent, "Fake", "Done", TabTitle::Manual("Build")), ("Fake — Build".into(), "Done".into()));
+    fn agent_notices_add_only_a_tab_title_the_user_gave_that_says_more() {
+        let body = "Command: cargo test\nReject · Allow once";
+        let permission = layout(Source::Agent, "Fake needs permission", body, TabTitle::Automatic("Fake"), "Fake");
+        assert_eq!(permission, ("Fake needs permission".into(), body.into()));
+        let title = "Fake — Hello.txt file creation";
+        let named = layout(Source::Agent, title, "Done", TabTitle::Automatic("Hello.txt file creation"), "Fake");
+        assert_eq!(named, (title.into(), "Done".into()));
         assert_eq!(
-            layout(Source::Agent, "Fake", "Done", TabTitle::Manual("Fake")),
-            ("Fake".into(), "Done".into()),
+            layout(Source::Agent, "Fake", "Done", TabTitle::Manual("Build"), "Fake"),
+            ("Fake — Build".into(), "Done".into())
+        );
+        assert_eq!(
+            layout(Source::Agent, title, "Done", TabTitle::Manual("Hello.txt file creation"), "Fake"),
+            (title.into(), "Done".into()),
             "a manual title equal to the zone's isn't repeated"
         );
-        assert_eq!(layout(Source::Agent, "", "bad", TabTitle::Automatic("")), ("Brindle".into(), "bad".into()));
+        assert_eq!(
+            layout(Source::Agent, "Fake needs permission", body, TabTitle::Manual("Fake"), "Fake"),
+            ("Fake needs permission".into(), body.into()),
+            "a manual title equal to the profile's name isn't repeated"
+        );
+        assert_eq!(
+            layout(Source::Agent, title, "Done", TabTitle::Manual("Build"), "Fake"),
+            (format!("{title} — Build"), "Done".into())
+        );
+        assert_eq!(layout(Source::Agent, "", "bad", TabTitle::Automatic(""), "Fake"), ("Brindle".into(), "bad".into()));
         let long = "a".repeat(MAX_TITLE_CHARS * 2);
-        let (summary, _) = layout(Source::Agent, &long, "Done", TabTitle::Manual("tab"));
+        let (summary, _) = layout(Source::Agent, &long, "Done", TabTitle::Manual("tab"), "Fake");
         assert!(summary.chars().count() <= MAX_TITLE_CHARS, "{summary}");
     }
 

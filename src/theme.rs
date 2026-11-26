@@ -331,7 +331,10 @@ impl Theme {
         // from the unpushed colour, so pushing it doesn't move them.
         let fg = base.legible_on(surface, 4.5);
         let accent = self.accent();
-        let destructive = self.ansi[1];
+        // The red as a warning icon and border on the card (a pending
+        // permission, `agents-zone-attention`): pushed only when it is
+        // short of 3:1 there (gruvbox-dark's on the darker chrome).
+        let destructive = self.ansi[1].legible_on(raised, 3.0);
         let border = self.card_border();
         let mut tokens = if self.is_dark() {
             brindle_ui::Tokens::neutral_dark()
@@ -356,6 +359,7 @@ impl Theme {
         tokens.accent_foreground = fg.legible_on(bg.mix(fg, 0.12), 4.5).hsla();
         tokens.destructive = destructive.hsla();
         tokens.destructive_foreground = destructive.on_color().hsla();
+        tokens.destructive_tint = destructive_tint(raised, fg, destructive).hsla();
         tokens.border = border.hsla();
         tokens.input = border.hsla();
         tokens.ring = accent.hsla();
@@ -365,6 +369,24 @@ impl Theme {
         tokens.dark = self.is_dark();
         tokens
     }
+}
+
+/// How far a destructive tint goes from the card towards the destructive
+/// colour at most (OpenSpec change `agents-zone-attention`, decision 4).
+pub const DESTRUCTIVE_TINT_MAX: f32 = 0.12;
+
+/// The background of a pending permission: `card` mixed towards
+/// `destructive` as far as keeps `text` at 4.5:1 and `destructive` itself
+/// (the warning icon and border) at 3:1 on it, at most
+/// [`DESTRUCTIVE_TINT_MAX`] of the way, in steps of 1%; the card itself
+/// when no step does.
+pub fn destructive_tint(card: Color, text: Color, destructive: Color) -> Color {
+    let steps = (DESTRUCTIVE_TINT_MAX * 100.0).round() as u32;
+    (0..=steps)
+        .rev()
+        .map(|step| card.mix(destructive, step as f32 / 100.0))
+        .find(|tint| text.contrast(*tint) >= 4.5 && destructive.contrast(*tint) >= 3.0)
+        .unwrap_or(card)
 }
 
 const fn palette(colors: [u32; 16]) -> [Color; 16] {
@@ -864,7 +886,8 @@ mod tests {
             assert_eq!(zone.input, zone.border, "{name}");
             assert_eq!(color_of(zone.primary), theme.accent(), "{name}");
             assert_eq!(color_of(zone.ring), theme.accent(), "{name}");
-            assert_eq!(color_of(zone.destructive), theme.ansi[1], "{name}");
+            let card = theme.background.mix(fg, 0.04);
+            assert_eq!(color_of(zone.destructive), theme.ansi[1].legible_on(card, 3.0), "{name}");
             assert_eq!(zone.dark, window.dark, "{name}");
             assert_ne!(zone.background, window.background, "{name}: the zone set is on the chrome background");
         }
@@ -888,6 +911,31 @@ mod tests {
         assert_eq!(css_color(zone.ring), "#7aa2f7");
     }
 
+    /// The tint goes the whole 12% when that stays legible, stops short
+    /// when it wouldn't, and is the card when no step is.
+    #[test]
+    fn the_destructive_tint_stops_where_it_stays_legible() {
+        let (white, black, red) = (Color::hex(0xffffff), Color::hex(0x0a0a0a), Color::hex(0xe7000b));
+        assert_eq!(destructive_tint(white, black, red), white.mix(red, 0.12));
+        // Mid-grey text on a mid-grey card is never legible: the card.
+        let grey = Color::hex(0x777777);
+        assert_eq!(destructive_tint(grey, Color::hex(0x888888), red), grey);
+        // Text just legible on the card loses it a little way in.
+        let card = Color::hex(0xffffff);
+        let text = Color::hex(0x737373);
+        let tint = destructive_tint(card, text, red);
+        assert!(tint != card.mix(red, 0.12) && text.contrast(tint) >= 4.5, "{tint:?}");
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            for t in [theme.ui_tokens(), theme.zone_tokens()] {
+                let (card, tint) = (color_of(t.card), color_of(t.destructive_tint));
+                let red = color_of(t.destructive);
+                let step = (0..=12).find(|step| card.mix(red, *step as f32 / 100.0) == tint);
+                assert!(step.is_some(), "{name}: {tint:?} isn't the card towards the red");
+            }
+        }
+    }
+
     #[test]
     fn ui_tokens_are_legible_for_every_builtin() {
         for (name, set, t) in BUILTIN_THEMES.iter().flat_map(|name| {
@@ -907,6 +955,10 @@ mod tests {
                 ("link on background", t.link, t.background, 4.5),
                 ("foreground on muted", t.foreground, t.muted, 4.5),
                 ("muted_foreground on card", t.muted_foreground, t.card, 3.0),
+                // A pending permission's title, icon and border
+                // (agents-zone-attention).
+                ("card_foreground on destructive_tint", t.card_foreground, t.destructive_tint, 4.5),
+                ("destructive on destructive_tint", t.destructive, t.destructive_tint, 3.0),
             ];
             for (label, fg, bg, min) in pairs {
                 let ratio = color_of(fg).contrast(color_of(bg));
