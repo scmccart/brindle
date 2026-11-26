@@ -176,3 +176,11 @@ When an agent session ends, the text kept for it SHALL stay for the number of da
 #### Scenario: After a reboot
 - **WHEN** the machine is restarted a day after a session kept an attachment
 - **THEN** the attachment's file is still at the path the agent was given
+
+#### Scenario: A stopped agent isn't the session's end
+- **WHEN** a session started with a keep time of 0 days has a kept attachment, and its agent exits while its zone stays open
+- **THEN** the attachment's file is still there, and a client can still read it
+
+#### Scenario: Continued with a held prompt
+- **WHEN** a session holds a prompt with a kept attachment, its agent exits, the conversation is continued, and a client sends the prompt again
+- **THEN** the continued agent receives the prompt with the attachment

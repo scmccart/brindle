@@ -4,11 +4,12 @@ Before starting, check that `agents-prompt-context` is implemented and archived 
 - From it: `Attachment::{Link, Text}`, the store and `store::plan`, `AGENT_ATTACH`, `AGENT_READ_ATTACHMENT`, `ATTACHMENT`, `PromptSupport`, `PromptPart`, the draft, `send_plan`, `drop_plan`, the attachment rows and `TextState`, `PromptInput::set_attachments`, `BRINDLE_CACHE_DIR` in the harnesses.
 - Its spec deltas modify requirements that `agents-prompt-context` adds, so `openspec validate` notes that an archive would refuse them until that change's specs are synced. That is the order of the stack, not a fault.
 - Client protocol 4 and holder protocol H1 3 are still unreleased. If either has shipped, stop and raise design decisions 3 and 4.
+- Refreshed on 2026-11-26 for the built stack: design decision 11 holds what `agents-session-recovery`, `agents-login`, `agents-zone-attention`, `agents-zone-theme-scope` and `agents-log-paging` change. The function and file names in the tasks are from before those changes; check each against the code.
 
 ## 1. Shared contracts
 
 - [ ] 1.1 Add `Attachment::Image` and `ImageType` to `brindle-transcript`, and the pure `image_type(head)`; verify with unit tests that the forms round-trip, each type's signature is recognised, a truncated head and lookalikes (`RIFF` that isn't WebP, `GIF8` alone, an SVG, a BMP, a TIFF) aren't, new `tests/fixtures/v4/` files are written once, and no existing fixture changed.
-- [ ] 1.2 In `brindle-remote-protocol`, replace `AGENT_ATTACH` with `AGENT_UPLOAD_BEGIN`, `AGENT_UPLOAD_CHUNK` and `AGENT_UPLOAD_END`, and give `AGENT_READ_ATTACHMENT` its `offset` and `ATTACHMENT` its `offset`, `total` and raw bytes; verify with fixtures for each message and refusal, a piece of the largest size fitting one frame, decoding errors, and fuzzing that includes pieces out of order, past the stated length and for unknown uploads.
+- [ ] 1.2 In `brindle-remote-protocol`, replace `AGENT_ATTACH` with `AGENT_UPLOAD_BEGIN` (taking its number, 25), `AGENT_UPLOAD_CHUNK` (27) and `AGENT_UPLOAD_END` (28), and give `AGENT_READ_ATTACHMENT` its `offset` and `ATTACHMENT` its `offset`, `total` and raw bytes; verify with fixtures for each message and refusal, a piece of the largest size fitting one frame, decoding errors, and fuzzing that includes pieces out of order, past the stated length and for unknown uploads.
 - [ ] 1.3 Add `PromptPart::Image` to `acp/forms.rs` and to `Dialect::encode`; verify `cargo test -p brindle --test architecture` passes.
 - [ ] 1.4 Add the store's platform items for appending to an upload's file, sealing it read-only, and reading a range of a kept file, under the same names on every platform; verify with tests on each for a sealed file refusing writes and a range read at the start, the middle and past the end.
 
@@ -42,7 +43,7 @@ Before starting, check that `agents-prompt-context` is implemented and archived 
 
 - [ ] 6.1 Wire paste in `src/agent/view.rs` through `paste_plan`, and add `agent_paste_image` ("Paste Image") to `ACTIONS`, handled only by `AgentView`; verify with a unit test for the palette's listing.
 - [ ] 6.2 Read dropped and pasted images on a background task (at most `UPLOAD_LIMIT` + 1 bytes for a file), attach or refuse by the plans, and show the preview. Nothing is read or decoded on the UI thread beyond GPUI's own image element (`process R13`, `R14`).
-- [ ] 6.3 Run the send on the reader thread with progress in the prompt input; escape and the stop button stop it.
+- [ ] 6.3 Run the send on the reader thread with progress in the prompt input; escape and the stop button stop it. The progress is drawn when it changes and runs no motion clock, and a send shows no working row or tab spinner (design decision 11); verify in the e2e case for a send that the dump has `--- motion stopped` and no `--- working` line while `status=sending`.
 - [ ] 6.4 Draw the conversation's image rows and the long-text line.
 - [ ] 6.5 Add the hidden `--attach-file PATH` debug step (a usage error for an unreadable path; a note in the dump in a terminal zone); verify with unit tests for the parser and the usage error.
 
