@@ -16,6 +16,10 @@ pub mod transcript;
 // What an agent session's start asks for.
 pub mod spawn;
 
+// An agent's earlier conversations: the list, the plans and the palette's
+// model (OpenSpec change `agents-session-list`).
+pub mod conversations;
+
 // Whether a close asks first, and what the confirmation says.
 pub mod close;
 
@@ -51,9 +55,10 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, Link, LoginChoice, LoginZoneEnd, Offer, ProfileFound,
-    Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, LaunchChoice, Link, ListDone, ListFor, LoginChoice,
+    LoginZoneEnd, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
 };
+use crate::agent::spawn::AgentSpawnRequest;
 use crate::agent::shared::AgentShared;
 use crate::agent::tool::ToolPolicy;
 use crate::agent::sink::{AgentEvent, Feed, Sink, Taker};
@@ -90,6 +95,13 @@ pub trait Requests {
     /// Asks for the entries before `before`, within `max_bytes`
     /// (`AGENT_FETCH`): the page comes as a change before the reply.
     fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId>;
+    /// Asks for a page of the agent's conversations after `cursor`
+    /// (`AGENT_LIST`): the page comes as [`AgentEvent::Conversations`] in
+    /// place of a reply (OpenSpec change `agents-session-list`).
+    fn list(&self, cursor: Option<String>) -> Option<RequestId>;
+    /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues
+    /// `conversation`, or starts a new one with `None`.
+    fn choose(&self, conversation: Option<String>) -> Option<RequestId>;
 }
 
 /// Opens an agent zone's session on a host (`remote::agent_link`), or a
@@ -152,6 +164,14 @@ impl Requests for crate::remote::AgentLink {
     fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
         crate::remote::AgentLink::fetch(self, before, max_bytes)
     }
+
+    fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+        crate::remote::AgentLink::list(self, cursor)
+    }
+
+    fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+        crate::remote::AgentLink::choose(self, conversation)
+    }
 }
 
 /// What an [`Agent`] asks of its view, beside the status and title events
@@ -186,6 +206,19 @@ pub enum LoginZone {
     /// Close the login zone (Cancel login).
     Close,
 }
+
+/// What an agent zone asks of its window about its conversations (OpenSpec
+/// change `agents-session-list`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAsk {
+    /// Open the conversations palette on the zone (Conversations…, or a
+    /// `-r` launch's agent now choosing).
+    Conversations,
+}
+
+/// A list the palette asked for was answered: the page, or why not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentListed(pub Result<conversations::Page, String>);
 
 /// `profile`'s command on `host`, which a terminal login runs again: its
 /// variable names ignore case where this machine's do, on this machine.
@@ -231,6 +264,8 @@ pub struct Agent {
 impl EventEmitter<TerminalEvent> for Agent {}
 impl EventEmitter<AgentUpdate> for Agent {}
 impl EventEmitter<LoginZone> for Agent {}
+impl EventEmitter<AgentAsk> for Agent {}
+impl EventEmitter<AgentListed> for Agent {}
 
 impl Agent {
     /// Starts an agent of `profile` in a new session of `host`'s terminal
@@ -245,6 +280,65 @@ impl Agent {
         first: Option<FirstPrompt>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let model = ChatModel::new(profile.name.clone(), first);
+        Self::spawned(model, profile, host, cwd, opened, |request| request, cx)
+    }
+
+    /// Starts an agent of `profile` that chooses (OpenSpec change
+    /// `agents-session-list` decision 1): initialized, it waits for a
+    /// conversation to be chosen, then does what a launch's `launch` asked
+    /// (`-c`, `-r`) and sends its `first` prompt once ready. In `cwd` as
+    /// [`Self::spawn`] says.
+    pub fn spawn_choosing(
+        profile: &Profile,
+        host: &Host,
+        cwd: Option<PathBuf>,
+        opened: OpenedBy,
+        first: Option<FirstPrompt>,
+        launch: Option<LaunchChoice>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let home = dirs::home_dir();
+        let directory = spawn::directory(profile, host, cwd.clone(), &opened, home.as_deref());
+        let model = ChatModel::choosing(profile.name.clone(), first, launch, Self::dir_shown(host, directory.as_deref()));
+        Self::spawned(model, profile, host, cwd, opened, AgentSpawnRequest::choosing, cx)
+    }
+
+    /// Starts an agent of `profile` on `host` in `cwd` continuing the listed
+    /// conversation `id` there (a conversation chosen from a list another
+    /// zone's agent gave, decision 5): `SPAWN_AGENT` with the conversation,
+    /// as a continue in a new session.
+    pub fn spawn_continuing(profile: &Profile, host: &Host, cwd: Option<PathBuf>, id: &str, cx: &mut Context<Self>) -> Self {
+        let home = dirs::home_dir();
+        let directory = spawn::directory(profile, host, cwd.clone(), &OpenedBy::Window, home.as_deref());
+        let model = ChatModel::new(profile.name.clone(), None);
+        let (id, dir) = (id.to_string(), directory.map(|dir| dir.to_string_lossy().into_owned()));
+        let shape = move |request: AgentSpawnRequest| {
+            // The spawn's own directory when this machine can't say it (the
+            // home directory on another host).
+            let dir = dir.or_else(|| request.cwd.clone()).unwrap_or_default();
+            request.continuing_listed(&id, &dir)
+        };
+        Self::spawned(model, profile, host, cwd, OpenedBy::Window, shape, cx)
+    }
+
+    /// `directory` as a reason or a title shows it ([`conversations::shown_dir`]):
+    /// under this machine's home with `~` only on this machine.
+    pub fn dir_shown(host: &Host, directory: Option<&std::path::Path>) -> String {
+        let home = dirs::home_dir().filter(|_| host.is_local());
+        conversations::shown_dir(directory, home.as_deref())
+    }
+
+    #[allow(clippy::too_many_arguments, reason = "a start's model, profile, host and directory, and how its request is made")]
+    fn spawned(
+        model: ChatModel,
+        profile: &Profile,
+        host: &Host,
+        cwd: Option<PathBuf>,
+        opened: OpenedBy,
+        shape: impl FnOnce(AgentSpawnRequest) -> AgentSpawnRequest + Send + 'static,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let home = dirs::home_dir();
         let directory = spawn::directory(profile, host, cwd.clone(), &opened, home.as_deref());
         let (sink, feed) = Sink::new();
@@ -254,7 +348,7 @@ impl Agent {
             // is: it reads Brindle's environment.
             Box::new(move || {
                 let home = dirs::home_dir();
-                agent_spawn_request(
+                shape(agent_spawn_request(
                     &profile,
                     &host,
                     cwd,
@@ -262,12 +356,11 @@ impl Agent {
                     std::env::vars_os(),
                     home.as_deref(),
                     crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
-                )
+                ))
             })
         };
         let connect = server_connect();
         let link = connect(host.clone(), AgentStart::Spawn(request), sink);
-        let model = ChatModel::new(profile.name.clone(), first);
         Self::linked(model, feed, link, profile, host, directory, connect, cx)
     }
 
@@ -435,29 +528,51 @@ impl Agent {
     /// until the new session's first events replace it, as an attach's
     /// replay does.
     fn respawn(&mut self, profile: &Profile, conversation: &Conversation, cx: &mut Context<Self>) {
+        let conversation = conversation.clone();
+        let directory = PathBuf::from(&conversation.cwd);
+        // The server no longer has the zone's session: nothing to close.
+        self.renew(profile, directory, Box::new(move |request| request.continuing(&conversation)), false, cx);
+    }
+
+    /// A new session of `profile`'s agent in `directory`, its request
+    /// shaped by `shape`, in place of the zone's: what a continue in a new
+    /// session, a stopped zone's New conversation and a conversation chosen
+    /// into a stopped zone do. With `close_old` the zone's old session,
+    /// which the server keeps for a stopped agent, is closed first.
+    fn renew(
+        &mut self,
+        profile: &Profile,
+        directory: PathBuf,
+        shape: Box<dyn FnOnce(AgentSpawnRequest) -> AgentSpawnRequest + Send>,
+        close_old: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let (Held::Holding, Some(requests), true) = (self.held, &self.requests, close_old) {
+            requests.close();
+        }
+        self.held = Held::Holding;
         let (sink, feed) = Sink::new();
         feed.shared.lock().start_over();
         let request = {
-            let (profile, host, conversation) = (profile.clone(), self.host.clone(), conversation.clone());
+            let (profile, host, cwd) = (profile.clone(), self.host.clone(), directory.clone());
             // On the session's thread, as a new zone's start.
             Box::new(move || {
                 let home = dirs::home_dir();
-                agent_spawn_request(
+                shape(agent_spawn_request(
                     &profile,
                     &host,
-                    None,
+                    Some(cwd),
                     &OpenedBy::Window,
                     std::env::vars_os(),
                     home.as_deref(),
                     crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
-                )
-                .continuing(&conversation)
+                ))
             })
         };
         let link = (self.connect)(self.host.clone(), AgentStart::Spawn(request), sink);
         self.command = profile.command.clone().unwrap_or_default();
         self.model.set_command(agent_command(profile, &self.host));
-        self.directory = Some(PathBuf::from(&conversation.cwd));
+        self.directory = Some(directory);
         let (shared, taker, events) = feed.split();
         self.shared = shared;
         self._events = Self::drain(events, taker, cx);
@@ -471,6 +586,79 @@ impl Agent {
                 None
             }
         };
+        cx.notify();
+    }
+
+    /// Asks for a page of the agent's conversations after `cursor`, for
+    /// `purpose` (OpenSpec change `agents-session-list`): the palette's
+    /// answer comes as an [`AgentListed`] event, a launch's is acted on
+    /// here. One that can't go is refused as the model says.
+    pub fn list(&mut self, cursor: Option<String>, purpose: ListFor, cx: &mut Context<Self>) {
+        self.send(Sent::List(purpose), |requests| requests.list(cursor), cx);
+    }
+
+    /// Ends a choosing agent's wait: continues `conversation`, or starts a
+    /// new one with `None` (`AGENT_CHOOSE`). Nothing unless it is choosing.
+    pub fn choose(&mut self, conversation: Option<String>, cx: &mut Context<Self>) {
+        if !self.model.can_choose() {
+            return;
+        }
+        match self.requests.as_ref().and_then(|requests| requests.choose(conversation)) {
+            Some(request) => self.model.chose(request),
+            None => self.model.server_note(model::UNSENT),
+        }
+        cx.notify();
+    }
+
+    /// New conversation: a choosing agent starts one (`AGENT_CHOOSE` with
+    /// none); a stopped zone's session is replaced by a new one in its
+    /// directory, the old one closed. Nothing once the profile is gone.
+    pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
+        if self.model.is_choosing() {
+            self.choose(None, cx);
+            return;
+        }
+        if self.held == Held::Left {
+            return;
+        }
+        let (_, Some(profile)) = self.profile_found(&Settings::get(cx).config) else { return };
+        let Some(directory) = self.zone_dir() else { return };
+        self.renew(&profile, directory, Box::new(|request| request), true, cx);
+        self.model.forget_conversation();
+    }
+
+    /// The zone's directory: where its session was started, else its
+    /// conversation's.
+    fn zone_dir(&self) -> Option<PathBuf> {
+        self.directory.clone().or_else(|| self.model.conversation().map(|conversation| PathBuf::from(&conversation.cwd)))
+    }
+
+    /// A stopped zone takes the listed conversation `id` of its directory
+    /// (a choice from a list another zone's agent gave): a new session
+    /// continuing it replaces the zone's, the old one closed.
+    pub fn continue_listed(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.held == Held::Left {
+            return;
+        }
+        let (_, Some(profile)) = self.profile_found(&Settings::get(cx).config) else { return };
+        let Some(directory) = self.zone_dir() else { return };
+        let (id, cwd) = (id.to_string(), directory.to_string_lossy().into_owned());
+        self.renew(&profile, directory, Box::new(move |request| request.continuing_listed(&id, &cwd)), true, cx);
+        self.model.forget_conversation();
+    }
+
+    /// Conversations…: the window opens the conversations palette on the
+    /// zone.
+    pub fn ask_conversations(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AgentAsk::Conversations);
+    }
+
+    fn apply_listed(&mut self, done: ListDone, cx: &mut Context<Self>) {
+        match done {
+            ListDone::Palette(outcome) => cx.emit(AgentListed(outcome)),
+            ListDone::Choose(id) => self.choose(Some(id), cx),
+            ListDone::Nothing => {}
+        }
         cx.notify();
     }
 
@@ -536,6 +724,11 @@ impl Agent {
                 self.apply_replied(replied, cx);
                 return;
             }
+            AgentEvent::Conversations { request, page } => {
+                let done = self.model.listed(request, page);
+                self.apply_listed(done, cx);
+                return;
+            }
             AgentEvent::Note(text) => {
                 self.model.server_note(text);
                 return;
@@ -552,7 +745,12 @@ impl Agent {
     /// Hands what the model decided on: the view's splices, the status and
     /// title events, the first prompt's send.
     fn apply_absorbed(&mut self, absorbed: Absorbed, cx: &mut Context<Self>) {
-        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working } = absorbed;
+        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working, choosing } = absorbed;
+        match choosing {
+            Some(OnChoosing::ListLatest) => self.list(None, ListFor::Latest, cx),
+            Some(OnChoosing::OpenList) => cx.emit(AgentAsk::Conversations),
+            None => {}
+        }
         if !splices.is_empty() {
             cx.emit(AgentUpdate::Splices(splices));
         }
@@ -637,6 +835,7 @@ impl Agent {
         match replied {
             Replied::ClearDraft => cx.emit(AgentUpdate::ClearDraft),
             Replied::SetDraft(text) => cx.emit(AgentUpdate::SetDraft(text)),
+            Replied::Listed(done) => self.apply_listed(done, cx),
             Replied::Nothing => {}
         }
     }
@@ -829,9 +1028,27 @@ impl Agent {
     /// `-e`). Done explicitly, never in a drop (`process R16`).
     pub fn quit_with(&mut self, layout: Option<serde_json::Value>) {
         if let (Held::Holding, Some(requests)) = (self.held, &self.requests) {
-            requests.detach_with(layout);
+            // A session still choosing has nothing to bring back: it ends
+            // (OpenSpec change `agents-session-list` decision 12).
+            if self.model.started_choosing() || self.model.is_choosing() {
+                requests.close();
+            } else {
+                requests.detach_with(layout);
+            }
         }
         self.held = Held::Left;
+    }
+
+    /// Where the agent a conversations palette lists through is
+    /// ([`ChatModel::lister_state`]).
+    pub fn lister_state(&self) -> model::ListerState {
+        self.model.lister_state(&self.command, &self.host.name())
+    }
+
+    /// What the conversations plans know of the zone's agent: what it runs
+    /// and the conversation it has.
+    pub fn run_facts(&self) -> (conversations::ZoneRun, Option<String>) {
+        (self.model.zone_run(), self.model.conversation().map(|conversation| conversation.id.clone()))
     }
 
     /// Keeps the core's copy of the tab's layout current while the session

@@ -22,7 +22,8 @@ use crate::actions::*;
 use crate::agent::close::{BusyAgent, ClosePlan, Closing, close_plan};
 use crate::agent::login::{self, TerminalLogin};
 use crate::agent::model::LoginZoneEnd;
-use crate::agent::{Agent, LoginZone};
+use crate::agent::conversations::{ZoneAt, ZoneFacts, ZoneRun};
+use crate::agent::{Agent, AgentAsk, LoginZone};
 use crate::agent::spawn::OpenedBy;
 use crate::agent::view::{AgentView, ConfirmLink};
 use brindle_ui::FocusStops as _;
@@ -386,6 +387,17 @@ pub fn split_host(split: &Profile, split_host: &Host, profile: &Profile) -> Host
 /// endpoints.
 pub fn split_cwd(split_dir: Option<PathBuf>, same_host: bool) -> Option<PathBuf> {
     split_dir.filter(|_| same_host)
+}
+
+/// Where a new zone of `profile` split from a zone of `split` on
+/// `split_host` in `split_dir` runs ([`split_host`]) and the directory it
+/// asks to start in ([`split_cwd`]): the split's rule, which the
+/// conversations palette's directory follows too
+/// (`crate::agent::conversations::list_dir`).
+pub fn split_target(split: &Profile, split_host_now: &Host, split_dir: Option<PathBuf>, profile: &Profile) -> (Host, Option<PathBuf>) {
+    let host = split_host(split, split_host_now, profile);
+    let same_host = *split_host_now == host;
+    (host, split_cwd(split_dir, same_host))
 }
 
 /// What a zone header's menu enables its split items by: whether the zone
@@ -904,6 +916,14 @@ pub struct SplitAsk {
 #[derive(Clone, Copy, Debug)]
 pub struct SplitRefused(pub SplitRefusal);
 
+/// Agent zone `zone` asks for the conversations palette on it (OpenSpec
+/// change `agents-session-list`: its Conversations… button,
+/// `agent_conversations`, or a `-r` launch now choosing).
+#[derive(Clone, Copy, Debug)]
+pub struct ConversationsAsk {
+    pub zone: ZoneId,
+}
+
 pub struct ZoneTreeView {
     tree: ZoneTree,
     zones: HashMap<ZoneId, Zone>,
@@ -933,6 +953,7 @@ impl EventEmitter<ZoneMenuRequest> for ZoneTreeView {}
 impl EventEmitter<CloseZoneAsk> for ZoneTreeView {}
 impl EventEmitter<SplitAsk> for ZoneTreeView {}
 impl EventEmitter<SplitRefused> for ZoneTreeView {}
+impl EventEmitter<ConversationsAsk> for ZoneTreeView {}
 /// A zone's link wasn't opened, passed on to the window (whichever tab the
 /// zone is in: an opener can fail after its tab went to the background).
 impl EventEmitter<LinkFailed> for ZoneTreeView {}
@@ -1030,8 +1051,12 @@ impl ZoneTreeView {
                 let login = cx.subscribe_in(&agent, window, move |this, _, event: &LoginZone, window, cx| {
                     this.on_login_zone(id, event, window, cx);
                 });
+                // Its conversations palette, which the window opens.
+                let ask = cx.subscribe(&agent, move |_, _, AgentAsk::Conversations: &AgentAsk, cx| {
+                    cx.emit(ConversationsAsk { zone: id });
+                });
                 let title: SharedString = agent.read(cx).title().into();
-                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link, login])
+                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link, login, ask])
             }
         };
         let focus = content.focus_handle(cx);
@@ -1679,18 +1704,10 @@ impl ZoneTreeView {
         // A profile chosen in a palette may have gone since it opened.
         let Some(profile) = config.find_profile(&key).map(|ix| config.profiles[ix].clone()) else { return };
         let Some(split) = self.zones.get(&target) else { return };
-        let host = split_host(&split.profile, &split.host, &profile);
         // The target zone's working directory (an agent zone's: the one its
         // session started in) when the new zone runs on its endpoint; else
         // the spawn takes the profile's directory, or home there.
-        let same_host = split.host == host;
-        let cwd = split_cwd(self.zone_working_directory(target, cx), same_host);
-
-        let new_id = ZoneId(self.next_id);
-        self.next_id += 1;
-        if !self.tree.split(target, axis, new_id) {
-            return;
-        }
+        let (host, cwd) = split_target(&split.profile, &split.host, self.zone_working_directory(target, cx), &profile);
         let start = match profile.kind() {
             ProfileKind::Terminal => {
                 ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&profile, &host, None, cwd, &config, cx)))
@@ -1699,7 +1716,51 @@ impl ZoneTreeView {
                 ZoneStart::Agent(cx.new(|cx| Agent::spawn(&profile, &host, cwd, OpenedBy::Window, None, cx)))
             }
         };
-        let spec = ZoneSpec::of(profile, host, &config);
+        self.insert_split(target, axis, ZoneSpec::of(profile, host, &config), start, window, cx);
+    }
+
+    /// Whether zone `id` can be split along `axis` now: it is there, isn't a
+    /// terminal login's zone, and is big enough.
+    pub fn can_split(&self, id: ZoneId, axis: SplitAxis, window: &Window, cx: &App) -> bool {
+        self.splittable(id) && self.fits(id, axis, window, cx)
+    }
+
+    /// Splits zone `target` along `axis` with a zone of `profile` on `host`
+    /// showing `start`, which the window started (a conversation chosen
+    /// from the conversations palette, OpenSpec change
+    /// `agents-session-list` decision 5). False, `start` unused, when the
+    /// zone can't be split.
+    pub fn split_zone_with(
+        &mut self,
+        target: ZoneId,
+        axis: SplitAxis,
+        spec: ZoneSpec,
+        start: ZoneStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.can_split(target, axis, window, cx) {
+            return false;
+        }
+        self.insert_split(target, axis, spec, start, window, cx)
+    }
+
+    /// Splits zone `target` along `axis` with a new zone of `spec` showing
+    /// `start`, which takes focus.
+    fn insert_split(
+        &mut self,
+        target: ZoneId,
+        axis: SplitAxis,
+        spec: ZoneSpec,
+        start: ZoneStart,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let new_id = ZoneId(self.next_id);
+        self.next_id += 1;
+        if !self.tree.split(target, axis, new_id) {
+            return false;
+        }
 
         // Refresh the existing zone's title so its header bar has an up-to-date label.
         self.refresh_zone_title(target, cx);
@@ -1710,6 +1771,68 @@ impl ZoneTreeView {
         window.focus(&focus);
         cx.emit(TerminalEvent::TitleChanged);
         cx.notify();
+        true
+    }
+
+    /// Agent zone `id` shows `agent` in place of its own, whose session is
+    /// closed (a stopped zone taking a conversation listed through an agent
+    /// started for the list, OpenSpec change `agents-session-list` decision
+    /// 5). The zone keeps its place, profile, host and look, and focus when
+    /// it had it. False, `agent` unused, when it isn't an agent zone.
+    pub fn replace_agent(&mut self, id: ZoneId, agent: Entity<Agent>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(zone) = self.zones.get(&id) else { return false };
+        match zone.content {
+            ZoneContent::Agent(_) => {}
+            ZoneContent::Terminal(_) => return false,
+        }
+        let had_focus = zone.content.contains_focused(window, cx);
+        let Some(old) = self.zones.remove(&id) else { return false };
+        old.content.close(cx);
+        let spec = ZoneSpec { profile: old.profile, host: old.host, theme: old.theme, font_size: old.font_size };
+        self.insert_zone(id, spec, ZoneStart::Agent(agent), window, cx);
+        self.refresh_zone_title(id, cx);
+        if had_focus || self.active == id {
+            self.focus_zone(id, window, cx);
+        }
+        cx.emit(TerminalEvent::TitleChanged);
+        cx.notify();
+        true
+    }
+
+    /// Zone `id`, while it is there.
+    pub fn zone(&self, id: ZoneId) -> Option<&Zone> {
+        self.zones.get(&id)
+    }
+
+    /// The agent zone `id`'s agent; `None` for a terminal zone.
+    pub fn agent_of(&self, id: ZoneId, cx: &App) -> Option<Entity<Agent>> {
+        Some(self.zones.get(&id)?.content.agent_view()?.read(cx).agent().clone())
+    }
+
+    /// What the conversations plans know of each zone of the tab `tab`
+    /// (OpenSpec change `agents-session-list`): its profile, host,
+    /// directory, what runs in it and its agent's conversation, and how
+    /// recently it had focus, `base` added (larger for the active tab).
+    pub fn zone_facts(&self, tab: crate::workspace::TabId, base: u64, cx: &App) -> Vec<ZoneFacts> {
+        self.zones
+            .iter()
+            .filter(|(_, zone)| zone.login_for.is_none())
+            .map(|(id, zone)| {
+                let (run, conversation) = match &zone.content {
+                    ZoneContent::Terminal(_) => (ZoneRun::Terminal, None),
+                    ZoneContent::Agent(view) => view.read(cx).agent().read(cx).run_facts(),
+                };
+                ZoneFacts {
+                    at: ZoneAt { tab, zone: *id },
+                    profile: zone.profile.name.clone(),
+                    host: zone.host.clone(),
+                    dir: self.zone_working_directory(*id, cx),
+                    run,
+                    conversation,
+                    recency: base + zone.last_focused,
+                }
+            })
+            .collect()
     }
 
     /// Closes zone `target`, ending its terminal's program or its agent

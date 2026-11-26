@@ -545,6 +545,12 @@ pub enum SpawnStart {
     Choose,
 }
 
+/// The `ERROR` text answering an `AGENT_LIST` whose agent doesn't offer a
+/// list of conversations. A client tells this refusal apart by it (the
+/// choosing screen then offers New conversation alone), so the core writes
+/// exactly this.
+pub const LIST_NOT_OFFERED: &str = "the agent can't list conversations";
+
 /// `AGENT_LIST` (protocol 4): a page of the agent's earlier conversations
 /// in the session's directory, after `cursor` (an earlier reply's `next`),
 /// answered by `AGENT_CONVERSATIONS`.

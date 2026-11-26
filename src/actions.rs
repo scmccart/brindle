@@ -121,6 +121,13 @@ actions!(
         /// Continues the conversation of an agent that exited or was lost,
         /// as the Continue conversation button does.
         AgentContinue,
+        /// Lists the earlier conversations of the agent zone's profile in
+        /// its directory, as its Conversations… button does (OpenSpec
+        /// change `agents-session-list`).
+        AgentConversations,
+        /// Lists an agent profile's earlier conversations in the pane's
+        /// directory, asking which profile when the config has several.
+        AgentContinueConversation,
         /// Copies the queued prompt's text, waiting or held.
         CopyQueuedPrompt,
         /// Copies the agent's latest message.
@@ -212,13 +219,16 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("focus_zone_up", Some("Focus Zone Up"), || Box::new(FocusZoneUp)),
     ("focus_zone_down", Some("Focus Zone Down"), || Box::new(FocusZoneDown)),
     ("attach_session", Some("Attach Session…"), || Box::new(AttachSession)),
+    // The workspace's: any pane, while the config has an agent profile.
+    ("agent_continue_conversation", Some("Continue Agent Conversation…"), || Box::new(AgentContinueConversation)),
     ("quit", Some("Quit"), || Box::new(Quit)),
     // An agent zone's: the palette lists them only while one has focus.
     ("agent_submit", Some("Send Prompt"), || Box::new(AgentSubmit)),
     ("agent_cancel", Some("Stop Agent Turn"), || Box::new(AgentCancel)),
     ("agent_unqueue", Some("Remove Queued Prompt"), || Box::new(AgentUnqueue)),
     ("agent_resend", Some("Send Held Prompt Again"), || Box::new(AgentResend)),
-    ("agent_continue", Some("Continue Agent Conversation"), || Box::new(AgentContinue)),
+    ("agent_continue", Some("Continue This Conversation"), || Box::new(AgentContinue)),
+    ("agent_conversations", Some("Agent Conversations…"), || Box::new(AgentConversations)),
     ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
     ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
     ("copy_last_code_block", Some("Copy Last Code Block"), || Box::new(CopyLastCodeBlock)),
@@ -419,6 +429,11 @@ pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
     let kind_listed = match split_kind(action) {
         Some(crate::config::ProfileKind::Terminal) => facts.terminal_profiles,
         Some(crate::config::ProfileKind::Agent) => facts.agent_profiles,
+        // The conversations commands list an agent profile's (OpenSpec
+        // change `agents-session-list`).
+        None if action.partial_eq(&AgentContinueConversation) || action.partial_eq(&AgentConversations) => {
+            facts.agent_profiles
+        }
         None => true,
     };
     kind_listed
@@ -1042,7 +1057,9 @@ mod tests {
             "Stop Agent Turn",
             "Remove Queued Prompt",
             "Send Held Prompt Again",
-            "Continue Agent Conversation",
+            "Continue This Conversation",
+            "Agent Conversations…",
+            "Continue Agent Conversation…",
             "Copy Queued Prompt",
             "Copy Last Agent Message",
             "Copy Last Code Block",
@@ -1061,6 +1078,38 @@ mod tests {
         }
         for label in ["Clear Scrollback", "Find", "Copy", "Paste", "Scroll to Bottom", "Scroll Page Up", "Jump to Next Prompt"] {
             assert!(!listed.contains(&label), "{label} isn't listed");
+        }
+    }
+
+    /// The conversations commands (`agents-session-list` 5.1): in a shell
+    /// Continue Agent Conversation… alone (Agent Conversations… is the agent
+    /// zone's, so not available there); in an agent zone both, beside
+    /// Continue This Conversation; neither without an agent profile; no
+    /// default keys.
+    #[test]
+    fn the_conversations_commands_are_listed_where_they_act() {
+        use std::any::TypeId;
+        let listed = |facts: PaletteFacts, available: &[TypeId]| -> Vec<&'static str> {
+            palette_commands()
+                .into_iter()
+                .filter(|(_, a)| palette_lists(&**a, facts))
+                .filter(|(_, a)| available.contains(&a.as_any().type_id()))
+                .map(|(l, _)| l)
+                .collect()
+        };
+        let workspace = [TypeId::of::<AgentContinueConversation>()];
+        let agent_zone =
+            [TypeId::of::<AgentContinueConversation>(), TypeId::of::<AgentConversations>(), TypeId::of::<AgentContinue>()];
+        assert_eq!(listed(both_kinds(PaletteZone::Terminal), &workspace), ["Continue Agent Conversation…"]);
+        assert_eq!(
+            listed(both_kinds(PaletteZone::Agent), &agent_zone),
+            ["Continue Agent Conversation…", "Continue This Conversation", "Agent Conversations…"]
+        );
+        let no_agent = PaletteFacts { agent_profiles: false, ..both_kinds(PaletteZone::Terminal) };
+        assert!(listed(no_agent, &agent_zone).iter().all(|l| !l.contains("Agent Conversation")), "neither");
+        let bindings = default_bindings();
+        for action in [&AgentConversations as &dyn Action, &AgentContinueConversation] {
+            assert!(bindings.iter().all(|b| !b.action().partial_eq(action)), "{} has no default key", action.name());
         }
     }
 

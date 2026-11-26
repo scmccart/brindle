@@ -1476,7 +1476,7 @@ impl Connection {
         abandon: Option<&Abandon>,
     ) -> Result<Running> {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let AgentSpawnRequest { command, args, cwd, env, profile, conversation } = request;
+        let AgentSpawnRequest { command, args, cwd, env, profile, conversation, start } = request;
         let started = self.ask("start the agent session", abandon, None, |req, reply| {
             let spawn = SpawnAgent {
                 req,
@@ -1487,7 +1487,7 @@ impl Connection {
                 policy: Policy::Detach,
                 profile: Some(profile),
                 conversation,
-                start: None,
+                start,
             };
             (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;
@@ -3109,6 +3109,25 @@ impl Running {
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentPermission(AgentPermission { req, session, entry, option }))
+    }
+
+    /// Asks the agent for a page of its conversations in the session's
+    /// directory after `cursor` (`AGENT_LIST`, OpenSpec change
+    /// `agents-session-list`): the page comes to the session's sink
+    /// ([`SessionSink::conversations`]) in place of an `OK`; a refusal, or
+    /// the link's failure, as its reply.
+    pub fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentList(client::AgentList { req, session, cursor }))
+    }
+
+    /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues the
+    /// conversation `conversation`, or starts a new one with `None`. `OK`
+    /// once the agent was asked, then the start's states as transcript
+    /// events.
+    pub fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentChoose(client::AgentChoose { req, session, conversation }))
     }
 
     /// Cancels the running turn (`AGENT_CANCEL`, which has no answer; a

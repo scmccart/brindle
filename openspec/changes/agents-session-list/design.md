@@ -232,6 +232,19 @@ The user asked for open questions to be decided and flagged. Each is decided as 
 13. **A chosen conversation continues as a fresh log's continue does**, so an agent offering both loads it with its replay shown (decision 2 of `agents-session-recovery`), and a resume-only agent resumes it with the notice that its earlier turns aren't shown.
 14. **A list's id is checkpointed, the list isn't** (flag 4, found by task 3.2's restart case): a list marks `BeforeRequest`, so the checkpoint the holder has before the agent's `session/list` already counts the id. Without it a restored session would send its next request under the same id, and the agent's late answer to the old list would answer it.
 
+Flags from the client's build (sections 4 to 6), for the design's author:
+
+15. **The client tells `NotOffered` by its text.** `brindle-remote-protocol` gains `client::LIST_NOT_OFFERED` ("the agent can't list conversations"), which the server's refusal writes and the client compares; no wire change (flag 3 stands). Alternative: an error code on `ERROR`, which nothing else has.
+16. **`lister_plan` takes the pane itself when it is choosing** in the directory wanted, not only when it is ready: its agent is that profile's, waiting there, so `-r` and a choosing zone's Conversations… list through their own session and start nothing.
+17. **The buttons follow the offer alone** (`ChatModel::zone_choices`): a stopped zone that never started a conversation still offers Conversations… and New conversation; a never-started agent (`NotStarted`) offers none and keeps its own reason; a gone profile offers none. The "open" mark and `Show` count only zones whose agent may run (ready or busy); a stopped zone showing the conversation is `Here` instead, which continues it in that zone.
+18. **"Most recently focused" is a recency the workspace computes**: the zone's focus serial in its tab, the active tab's raised above the others'. Zones of two background tabs compare by their own serials, which aren't one clock.
+19. **`ago` uses UTC calendar days** for "yesterday", and dates show as `YYYY-MM-DD`: there is no local time zone in the pure code (`fcis R2`), and the e2e cases give no `updatedAt`.
+20. **`brindle-ui`'s `PromptInput` takes several keyed actions** (`set_actions`, `PromptAction { key, label }`, `PromptInputEvent::Action(key)`, `PromptFocus::Action(key)`), the key being the stop's name (`continue`, `conversations`, `new`); `set_action` keeps the one-button form. The dump's prompt line gains ` reason="…"` while choosing and ` actions=continue,conversations,new` while buttons show.
+21. **A choosing zone's session is closed on quit** (`CLOSE`, not `DETACH`), as is one started to choose that hasn't chosen yet (still connecting or starting): neither is recorded, so a detached one would only wait for the owner-gone rules.
+22. **The question has one `splits` bit**: Split Right and Split Down are both enabled when the pane fits either way, and a split that then doesn't fit says so on the config line ("the zone can't be split now; the conversation wasn't opened"), closing the chooser. Alternative: a bit per axis in `Stage::Ask`.
+23. **A conversation chosen through a running zone's agent starts with `SPAWN_AGENT` and the conversation** in the listed directory, or, when this machine can't say it (another host's home), in the spawn's own directory.
+24. **The profile question's title is "Continue a conversation of…"**, and with no agent profile `agent_continue_conversation` does nothing (it isn't listed then).
+
 ## The user's decisions
 
 Settled on 2026-11-26, one at a time:

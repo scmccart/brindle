@@ -655,7 +655,7 @@ impl fmt::Display for Refused {
             ),
             Self::LoggingIn => f.write_str("the agent is logging in"),
             Self::NotChoosing => f.write_str("the agent isn't choosing"),
-            Self::NotOffered => f.write_str("the agent can't list conversations"),
+            Self::NotOffered => f.write_str(brindle_remote_protocol::client::LIST_NOT_OFFERED),
             Self::ListBusy => f.write_str("a list of conversations is already being answered"),
             Self::TooLongToList { what, len } => write!(f, "the {what} is {len} bytes, over the limit"),
         }

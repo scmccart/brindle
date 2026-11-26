@@ -15,6 +15,9 @@ pub enum PaletteRole {
     /// The profiles a split asks which of (OpenSpec change
     /// `zones-mixed-tabs`, decision 5), to split a zone with one.
     SplitProfile,
+    /// An agent profile's earlier conversations (OpenSpec change
+    /// `agents-session-list`), or which agent profile's to list.
+    Conversations,
 }
 
 /// An overlay the window shows.
@@ -70,12 +73,13 @@ pub fn toggle(open: Option<OverlayKind>, wanted: OverlayKind, how: Opens) -> Tog
 mod tests {
     use super::*;
 
-    const KINDS: [OverlayKind; 10] = [
+    const KINDS: [OverlayKind; 11] = [
         OverlayKind::Palette(PaletteRole::NewTab),
         OverlayKind::Palette(PaletteRole::Commands),
         OverlayKind::Palette(PaletteRole::Prompt),
         OverlayKind::Palette(PaletteRole::Sessions),
         OverlayKind::Palette(PaletteRole::SplitProfile),
+        OverlayKind::Palette(PaletteRole::Conversations),
         OverlayKind::Settings,
         OverlayKind::ProfileMenu,
         OverlayKind::ContextMenu,

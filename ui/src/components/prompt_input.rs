@@ -64,7 +64,7 @@ pub enum PromptStatus {
 
 /// A [`PromptInput`] stop that can have keyboard focus
 /// ([`PromptInput::focused`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptFocus {
     /// The text area.
     Text,
@@ -76,8 +76,15 @@ pub enum PromptFocus {
     Discard,
     /// The stop button.
     Stop,
-    /// The reason line's action.
-    Action,
+    /// The reason line's action with this key.
+    Action(SharedString),
+}
+
+/// A button on the reason line: its owner's key for it, and its label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptAction {
+    pub key: SharedString,
+    pub label: SharedString,
 }
 
 /// Whether a held text can be sent again.
@@ -124,8 +131,8 @@ pub enum PromptInputEvent {
     RemoveQueued,
     /// Send the held text again.
     ResendQueued,
-    /// Do what the reason line's action says.
-    Action,
+    /// Do what the reason line's action with this key says.
+    Action(SharedString),
 }
 
 /// What the submit button asks for.
@@ -179,11 +186,13 @@ pub struct PromptInput {
     status: PromptStatus,
     queued: Option<Queued>,
     reason: Option<SharedString>,
-    /// The reason line's action button's label.
-    action: Option<SharedString>,
+    /// The reason line's action buttons, in order.
+    actions: Vec<PromptAction>,
     held_color: Option<Hsla>,
     stop_handle: FocusHandle,
-    action_handle: FocusHandle,
+    /// The action buttons' handles by key (`types R3`): a button keeps its
+    /// handle, and its focus, while the others change.
+    action_handles: Vec<(SharedString, FocusHandle)>,
     remove_handle: FocusHandle,
     resend_handle: FocusHandle,
     discard_handle: FocusHandle,
@@ -209,10 +218,10 @@ impl PromptInput {
             status: PromptStatus::Ready,
             queued: None,
             reason: None,
-            action: None,
+            actions: Vec::new(),
             held_color: None,
             stop_handle: cx.focus_handle(),
-            action_handle: cx.focus_handle(),
+            action_handles: Vec::new(),
             remove_handle: cx.focus_handle(),
             resend_handle: cx.focus_handle(),
             discard_handle: cx.focus_handle(),
@@ -280,23 +289,52 @@ impl PromptInput {
         self.reason.as_ref()
     }
 
-    /// A button labelled `label` after the reason, which asks the owner
-    /// ([`PromptInputEvent::Action`]); `None` takes it away, and its focus
-    /// with it (the owner moves focus back to the text area).
+    /// One button labelled `label` after the reason, keyed by its label,
+    /// which asks the owner ([`PromptInputEvent::Action`]); `None` takes it
+    /// away, and its focus with it (the owner moves focus back to the text
+    /// area).
     pub fn set_action(&mut self, label: Option<SharedString>, cx: &mut Context<Self>) {
-        if self.action != label {
-            self.action = label;
+        let actions = label.map(|label| PromptAction { key: label.clone(), label }).into_iter().collect();
+        self.set_actions(actions, cx);
+    }
+
+    /// Buttons for `actions` after the reason, in order, each asking the
+    /// owner with its key ([`PromptInputEvent::Action`]); none takes them
+    /// away.
+    pub fn set_actions(&mut self, actions: Vec<PromptAction>, cx: &mut Context<Self>) {
+        for action in &actions {
+            if !self.action_handles.iter().any(|(key, _)| *key == action.key) {
+                self.action_handles.push((action.key.clone(), cx.focus_handle()));
+            }
+        }
+        if self.actions != actions {
+            self.actions = actions;
             cx.notify();
         }
     }
 
+    /// The first action's label.
     pub fn action(&self) -> Option<&SharedString> {
-        self.action.as_ref()
+        self.actions.first().map(|action| &action.label)
     }
 
-    /// The reason line's action button's handle while it shows.
+    /// The actions, in order.
+    pub fn actions(&self) -> &[PromptAction] {
+        &self.actions
+    }
+
+    fn action_handle(&self, key: &SharedString) -> Option<&FocusHandle> {
+        self.action_handles.iter().find(|(k, _)| k == key).map(|(_, handle)| handle)
+    }
+
+    /// The first action button's handle while it shows.
     pub fn action_stop(&self) -> Option<FocusHandle> {
-        self.action.as_ref().map(|_| self.action_handle.clone())
+        self.action_stops().into_iter().next()
+    }
+
+    /// The action buttons' handles while they show, in order.
+    pub fn action_stops(&self) -> Vec<FocusHandle> {
+        self.actions.iter().filter_map(|action| self.action_handle(&action.key).cloned()).collect()
     }
 
     /// The colour of a held text's `not sent` label (the app's warning
@@ -333,9 +371,9 @@ impl PromptInput {
             (self.resend_handle.clone(), PromptFocus::SendAgain),
             (self.discard_handle.clone(), PromptFocus::Discard),
             (self.stop_handle.clone(), PromptFocus::Stop),
-            (self.action_handle.clone(), PromptFocus::Action),
         ];
-        stops.into_iter().find(|(handle, _)| handle.is_focused(window)).map(|(_, stop)| stop)
+        let actions = self.action_handles.iter().map(|(key, handle)| (handle.clone(), PromptFocus::Action(key.clone())));
+        stops.into_iter().chain(actions).find(|(handle, _)| handle.is_focused(window)).map(|(_, stop)| stop)
     }
 
     fn blank(&self, cx: &App) -> bool {
@@ -491,15 +529,32 @@ impl Render for PromptInput {
         let button = self.submit_button(cx);
         let muted = cx.ui_theme().muted_foreground;
         // An outline button after the reason, at the toolbar's height.
-        let action = self.action.clone().map(|label| {
-            div().debug_selector(|| "prompt-action".into()).flex_none().child(
-                Button::new("prompt-action", label)
-                    .variant(ButtonVariant::Outline)
-                    .size(ButtonSize::Sm)
-                    .focus(&self.action_handle)
-                    .on_click(cx.listener(|_, _, _, cx| cx.emit(PromptInputEvent::Action))),
-            )
-        });
+        // The first is `prompt-action`, as with one; the others add their
+        // place (`prompt-action-1`, …).
+        let action: Vec<_> = self
+            .actions
+            .iter()
+            .enumerate()
+            .filter_map(|(ix, action)| {
+                let handle = self.action_handle(&action.key)?.clone();
+                let id: SharedString = if ix == 0 { "prompt-action".into() } else { format!("prompt-action-{ix}").into() };
+                let key = action.key.clone();
+                Some(
+                    div().debug_selector({
+                        let id = id.clone();
+                        move || id.to_string()
+                    })
+                    .flex_none()
+                    .child(
+                        Button::new(id, action.label.clone())
+                            .variant(ButtonVariant::Outline)
+                            .size(ButtonSize::Sm)
+                            .focus(&handle)
+                            .on_click(cx.listener(move |_, _, _, cx| cx.emit(PromptInputEvent::Action(key.clone())))),
+                    ),
+                )
+            })
+            .collect();
         div()
             .flex()
             .flex_col()
@@ -801,17 +856,48 @@ mod tests {
         let area = bounds("prompt-area", cx).expect("drawn");
         assert!(reason.top() >= area.bottom(), "{reason:?} under {area:?}");
         click("prompt-action", cx);
-        assert_eq!(take(&events), [PromptInputEvent::Action]);
+        let continuing = || PromptInputEvent::Action("Continue conversation".into());
+        assert_eq!(take(&events), [continuing()]);
         let stop = input.read_with(cx, |input, _| input.action_stop()).expect("a stop");
         cx.update(|window, _| stop.focus(window));
         cx.run_until_parked();
-        assert_eq!(cx.update(|window, cx| input.read(cx).focused(window, cx)), Some(PromptFocus::Action));
+        assert_eq!(
+            cx.update(|window, cx| input.read(cx).focused(window, cx)),
+            Some(PromptFocus::Action("Continue conversation".into()))
+        );
         cx.simulate_keystrokes("enter");
         cx.simulate_keystrokes("space");
-        assert_eq!(take(&events), [PromptInputEvent::Action, PromptInputEvent::Action]);
+        assert_eq!(take(&events), [continuing(), continuing()]);
         assert_eq!(input.read_with(cx, |input, cx| input.text(cx).to_string()), "draft");
         update(&input, cx, |input, cx| input.set_action(None, cx));
         assert!(input.read_with(cx, |input, _| input.action_stop()).is_none());
+    }
+
+    /// Several actions show in order, each a stop that asks with its key;
+    /// one kept while the others change keeps its handle, and its focus.
+    #[test]
+    fn several_actions_ask_by_key_and_keep_their_stops() {
+        let (_, input, events, cx) = host();
+        let action = |key: &'static str, label: &'static str| PromptAction { key: key.into(), label: label.into() };
+        update(&input, cx, |input, cx| {
+            input.set_status(PromptStatus::Disabled, cx);
+            input.set_actions(vec![action("continue", "Continue"), action("list", "List…"), action("new", "New")], cx);
+        });
+        let first = bounds("prompt-action", cx).expect("the first shows");
+        let second = bounds("prompt-action-1", cx).expect("the second shows");
+        let third = bounds("prompt-action-2", cx).expect("the third shows");
+        assert!(first.right() <= second.left() && second.right() <= third.left(), "in order");
+        click("prompt-action-2", cx);
+        assert_eq!(take(&events), [PromptInputEvent::Action("new".into())]);
+        let stops = input.read_with(cx, |input, _| input.action_stops());
+        assert_eq!(stops.len(), 3);
+        cx.update(|window, _| stops[1].focus(window));
+        cx.run_until_parked();
+        update(&input, cx, |input, cx| input.set_actions(vec![action("list", "List…"), action("new", "New")], cx));
+        assert_eq!(input.read_with(cx, |input, _| input.action_stops()), stops[1..].to_vec());
+        assert_eq!(cx.update(|window, cx| input.read(cx).focused(window, cx)), Some(PromptFocus::Action("list".into())));
+        cx.simulate_keystrokes("enter");
+        assert_eq!(take(&events), [PromptInputEvent::Action("list".into())]);
     }
 
     /// A disabled prompt input showing `CONNECTING` in a host of a given

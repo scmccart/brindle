@@ -27,20 +27,20 @@ use gpui::{
 use brindle_ui::{
     ActiveTheme as _, Alert as UiAlert, AlertVariant, BubblePart, Button, ButtonSize, ButtonVariant, Confirmation, ConfirmationAction,
     ConfirmationState, ConfirmationTone, FocusScope, FocusStops, Icon, ItemKey, Loader, Message, MessageFrom, MessageScroller,
-    PageDirection, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
+    PageDirection, PromptAction, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
     Resend as UiResend, Response, RichBlock, Shimmer, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
 use brindle_ui::{Code, CodeBlock, Diff};
 
 use crate::actions::{
-    AgentCancel, AgentContinue, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
+    AgentCancel, AgentContinue, AgentConversations, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
     CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts, ToggleAgentToolDetails,
 };
 use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
     AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow,
-    Resend, ShownPart, Splice, WorkingRow,
+    Resend, ShownPart, Splice, WorkingRow, ZoneChoice,
 };
 use crate::agent::tool::{self, DetailPart};
 use crate::motion::{self, Motion};
@@ -106,6 +106,7 @@ pub fn item_padding(block: &Block) -> (bool, bool) {
 }
 
 /// The Continue conversation button's label.
+#[cfg(test)]
 pub const CONTINUE: &str = "Continue conversation";
 
 /// The login row's Cancel login button's label.
@@ -134,13 +135,27 @@ pub fn method_description(choice: &MethodChoice) -> Option<SharedString> {
 }
 
 /// What the prompt input shows: its status and queue row, and its reason
-/// line, `reason` then the `action` button's label.
+/// line, `reason` then the `actions`' buttons (OpenSpec change
+/// `agents-session-list` decision 6).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptState {
     pub status: UiStatus,
     pub queued: Option<Queued>,
     pub reason: Option<SharedString>,
-    pub action: Option<SharedString>,
+    pub actions: Vec<ZoneChoice>,
+}
+
+impl PromptState {
+    /// The first button's label: Continue conversation when it shows.
+    #[cfg(test)]
+    pub fn action(&self) -> Option<SharedString> {
+        self.actions.first().map(|choice| choice.label().into())
+    }
+}
+
+/// The reason line's buttons for `choices`, each keyed by its stop's name.
+pub fn prompt_actions(choices: &[ZoneChoice]) -> Vec<PromptAction> {
+    choices.iter().map(|choice| PromptAction { key: choice.word().into(), label: choice.label().into() }).collect()
 }
 
 /// What the prompt input shows for the model and its continue `offer`
@@ -157,17 +172,19 @@ pub fn prompt_state(model: &ChatModel, offer: &Offer) -> PromptState {
         PromptStatus::Disabled(why) => (UiStatus::Disabled, Some(SharedString::from(why.text()))),
     };
     let refusal = model.refusal().map(|refusal| SharedString::from(refusal.to_string()));
-    let (reason, action) = match offer {
-        Offer::Restart | Offer::Respawn { .. } => (refusal.or(reason), Some(SharedString::from(CONTINUE))),
-        Offer::None(NoOffer::NotEnded) => (reason.or(refusal), None),
-        Offer::None(NoOffer::NoConversation) if matches!(model.phase(), AgentPhase::NotStarted(_)) => {
-            (reason.or(refusal), None)
+    let reason = match offer {
+        Offer::Restart | Offer::Respawn { .. } => refusal.or(reason),
+        // A choosing agent's reason is the screen's (decision 6).
+        Offer::None(NoOffer::NotEnded) if model.is_choosing() => {
+            refusal.or_else(|| Some(SharedString::from(model.choosing_reason())))
         }
+        Offer::None(NoOffer::NotEnded) => reason.or(refusal),
+        Offer::None(NoOffer::NoConversation) if matches!(model.phase(), AgentPhase::NotStarted(_)) => reason.or(refusal),
         Offer::None(why @ (NoOffer::NoConversation | NoOffer::NotOffered | NoOffer::ProfileGone { .. })) => {
-            (Some(SharedString::from(why.text())), None)
+            Some(SharedString::from(why.text()))
         }
     };
-    PromptState { status, queued: queued_of(model.queue()), reason, action }
+    PromptState { status, queued: queued_of(model.queue()), reason, actions: model.zone_choices(offer) }
 }
 
 /// The prompt input's queue row for the model's [`QueueRow`].
@@ -293,7 +310,7 @@ impl FocusStops for AgentView {
     fn stops(&self, cx: &App) -> Vec<FocusHandle> {
         let prompt = self.prompt.read(cx);
         let mut stops = vec![prompt.focus_handle(cx)];
-        stops.extend(prompt.action_stop());
+        stops.extend(prompt.action_stops());
         stops.extend(prompt.row_stops());
         stops.extend(self.login_stops());
         stops.extend(self.permissions.iter().map(|(_, handle)| handle.clone()));
@@ -410,17 +427,16 @@ impl AgentView {
     /// or `stop`.
     pub fn focused_stop(&self, window: &Window, cx: &App) -> Option<String> {
         if let Some(stop) = self.prompt.read(cx).focused(window, cx) {
-            return Some(
-                match stop {
-                    PromptFocus::Text => "prompt",
-                    PromptFocus::Remove => "queued:remove",
-                    PromptFocus::SendAgain => "queued:send-again",
-                    PromptFocus::Discard => "queued:discard",
-                    PromptFocus::Stop => "stop",
-                    PromptFocus::Action => "continue",
-                }
-                .to_string(),
-            );
+            return Some(match stop {
+                PromptFocus::Text => "prompt".into(),
+                PromptFocus::Remove => "queued:remove".into(),
+                PromptFocus::SendAgain => "queued:send-again".into(),
+                PromptFocus::Discard => "queued:discard".into(),
+                PromptFocus::Stop => "stop".into(),
+                // Keyed by the choice's word: `continue`, `conversations`,
+                // `new`.
+                PromptFocus::Action(key) => key.to_string(),
+            });
         }
         if let Some((id, _)) = self.logins.iter().find(|(_, handle)| handle.is_focused(window)) {
             return Some(format!("login:{id}"));
@@ -524,7 +540,17 @@ impl AgentView {
             PromptInputEvent::Stop => self.agent.update(cx, |agent, cx| agent.cancel(cx)),
             PromptInputEvent::RemoveQueued => self.agent.update(cx, |agent, cx| agent.unqueue(cx)),
             PromptInputEvent::ResendQueued => self.agent.update(cx, |agent, cx| agent.resend(cx)),
-            PromptInputEvent::Action => self.agent.update(cx, |agent, cx| agent.continue_conversation(cx)),
+            PromptInputEvent::Action(key) => {
+                let choice = [ZoneChoice::Continue, ZoneChoice::Conversations, ZoneChoice::New]
+                    .into_iter()
+                    .find(|choice| choice.word() == key.as_ref());
+                self.agent.update(cx, |agent, cx| match choice {
+                    Some(ZoneChoice::Continue) => agent.continue_conversation(cx),
+                    Some(ZoneChoice::Conversations) => agent.ask_conversations(cx),
+                    Some(ZoneChoice::New) => agent.new_conversation(cx),
+                    None => {}
+                });
+            }
         }
     }
 
@@ -564,7 +590,7 @@ impl AgentView {
             prompt.set_status(state.status, cx);
             prompt.set_queued(state.queued, cx);
             prompt.set_reason(state.reason, cx);
-            prompt.set_action(state.action, cx);
+            prompt.set_actions(prompt_actions(&state.actions), cx);
         });
         let mut kept = std::mem::take(&mut self.permissions);
         for (entry, options) in pending {
@@ -608,6 +634,12 @@ impl AgentView {
     /// it isn't offered.
     fn continue_conversation(&mut self, _: &AgentContinue, _: &mut Window, cx: &mut Context<Self>) {
         self.agent.update(cx, |agent, cx| agent.continue_conversation(cx));
+    }
+
+    /// `agent_conversations`: as the Conversations… button, for the zone's
+    /// profile and directory.
+    fn conversations(&mut self, _: &AgentConversations, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.ask_conversations(cx));
     }
 
     fn copy_queued(&mut self, _: &CopyQueuedPrompt, _: &mut Window, cx: &mut Context<Self>) {
@@ -1134,6 +1166,7 @@ impl Render for AgentView {
             .on_action(cx.listener(Self::unqueue))
             .on_action(cx.listener(Self::resend))
             .on_action(cx.listener(Self::continue_conversation))
+            .on_action(cx.listener(Self::conversations))
             .on_action(cx.listener(Self::copy_queued))
             .on_action(cx.listener(Self::copy_last))
             .on_action(cx.listener(Self::copy_last_code))

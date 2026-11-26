@@ -29,14 +29,14 @@ Before starting:
 
 ## 4. Brindle's model
 
-- [ ] 4.1 Extend `src/agent/shared.rs` and `transcript.rs` for `AgentState::Choosing`; add `list`, `choose` and the choosing start to `Requests` and `remote::AgentLink`, with the protocol gate naming the endpoint, and the reply `AGENT_CONVERSATIONS` through the sink; verify with unit tests.
-- [ ] 4.2 Add the pure plans in `src/agent/conversations.rs`: `lister_plan`, `list_dir` (shared with `zones-mixed-tabs`' split rule), `open_plan`, `latest_plan` and `ago(now, text)`; verify with unit tests for: a ready zone of the profile in the directory chosen as lister and one in another directory not; each of `list_dir`'s cases; `open_plan` for a conversation already open, a stopped zone, a choosing zone, a running agent and a shell; `latest_plan` for an empty list, for Antigravity's order (the newest `updated`, not the first) and for times that don't parse (the first); `ago` for minutes, hours, yesterday, a date, and text that doesn't parse.
-- [ ] 4.3 Add the choosing screen's parts to `src/agent/model.rs` (design decision 6's table: the reason and the buttons for each state, the profile gone offering none), with no working row and no attention while choosing; `state=choosing` in `describe`; verify with unit tests for each row of the table.
-- [ ] 4.4 Add the conversations palette's model (states, rows, "More…", the 1,024 bound, the "open" mark, the question's rows and their disabling) and the dump lines; verify with unit tests for each state and row form and escaping.
+- [x] 4.1 Extend `src/agent/shared.rs` and `transcript.rs` for `AgentState::Choosing`; add `list`, `choose` and the choosing start to `Requests` and `remote::AgentLink`, with the protocol gate naming the endpoint, and the reply `AGENT_CONVERSATIONS` through the sink; verify with unit tests.
+- [x] 4.2 Add the pure plans in `src/agent/conversations.rs`: `lister_plan`, `list_dir` (shared with `zones-mixed-tabs`' split rule), `open_plan`, `latest_plan` and `ago(now, text)`; verify with unit tests for: a ready zone of the profile in the directory chosen as lister and one in another directory not; each of `list_dir`'s cases; `open_plan` for a conversation already open, a stopped zone, a choosing zone, a running agent and a shell; `latest_plan` for an empty list, for Antigravity's order (the newest `updated`, not the first) and for times that don't parse (the first); `ago` for minutes, hours, yesterday, a date, and text that doesn't parse.
+- [x] 4.3 Add the choosing screen's parts to `src/agent/model.rs` (design decision 6's table: the reason and the buttons for each state, the profile gone offering none), with no working row and no attention while choosing; `state=choosing` in `describe`; verify with unit tests for each row of the table.
+- [x] 4.4 Add the conversations palette's model (states, rows, "More…", the 1,024 bound, the "open" mark, the question's rows and their disabling) and the dump lines; verify with unit tests for each state and row form and escaping.
 
 ## 5. The zone and the workspace
 
-- [ ] 5.1 Add `agent_conversations` and `agent_continue_conversation` to `ACTIONS` in `src/actions.rs` (no default keys), listed as design decision 7 says, and rename `agent_continue`'s palette name to "Continue This Conversation"; verify with unit tests of the palette's listing in a shell, in an agent zone, with no agent profile and in a stopped zone.
+- [x] 5.1 Add `agent_conversations` and `agent_continue_conversation` to `ACTIONS` in `src/actions.rs` (no default keys), listed as design decision 7 says, and rename `agent_continue`'s palette name to "Continue This Conversation"; verify with unit tests of the palette's listing in a shell, in an agent zone, with no agent profile and in a stopped zone.
 - [ ] 5.2 Build the palette in `src/workspace.rs` (a `PaletteKind` of its own beside `SplitProfile`): the profile question when several, the chooser's start and the list request off the UI thread (`process R13`), "More…", escape closing a chooser that was started for it, and closing it with the window and on quit.
 - [ ] 5.3 Carry out a choice by `open_plan`: show the zone that has it; take it in the zone (`AGENT_CHOOSE`, or a stopped zone reset onto the new session with the old one closed); or ask, then split with the profile through `SplitWith::Profile` or open a tab, the new zone attaching the chooser or starting a continuing session.
 - [ ] 5.4 Draw the choosing screen and a stopped zone's buttons in `src/agent/view.rs`, as keyboard stops after the existing one, wired to the palette and to New conversation.
@@ -44,7 +44,7 @@ Before starting:
 
 ## 6. The command line
 
-- [ ] 6.1 Parse `-c/--continue` and `-r/--resume` under `agent` in `src/main.rs` (`AgentLaunch::choose`), with their usage errors; carry the choice in `instance::AgentRequest::choose` under the kind `agent-choose`, and turn an older Brindle's refusal of that kind into the message and status 1; verify with unit tests of the parser, of the hand-off's encoding and of `Request::asked` for both kinds.
+- [x] 6.1 Parse `-c/--continue` and `-r/--resume` under `agent` in `src/main.rs` (`AgentLaunch::choose`), with their usage errors; carry the choice in `instance::AgentRequest::choose` under the kind `agent-choose`, and turn an older Brindle's refusal of that kind into the message and status 1; verify with unit tests of the parser, of the hand-off's encoding and of `Request::asked` for both kinds.
 - [ ] 6.2 Start the tab's zone as a chooser; for `-c` ask for the first page and apply `latest_plan`; for `-r` open the palette on the zone once it is choosing; `-p` sent on the first `Ready`.
 
 ## 7. End-to-end cases (fake ACP agent)

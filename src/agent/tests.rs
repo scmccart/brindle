@@ -304,6 +304,50 @@ fn a_respawn_starts_a_new_session_continuing_the_conversation() {
     assert_eq!(zone.take_calls(), [Call::Prompt("next".into())]);
 }
 
+/// `agents-session-list` 5.4: a stopped zone's New conversation closes its
+/// session and starts a new one in its directory with no conversation;
+/// a listed conversation chosen into it starts one continuing that; a
+/// choosing zone's New conversation is `AGENT_CHOOSE` with none, and
+/// Conversations… asks the window.
+#[test]
+fn a_stopped_zone_starts_anew_or_takes_a_listed_conversation() {
+    let mut cx = app();
+    let zone = ended_zone(Continuation::Resume, &mut cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.new_conversation(cx));
+    assert_eq!(zone.take_calls(), [Call::Close]);
+    let starts = zone.take_starts();
+    let [Start::Spawn(request)] = starts.as_slice() else { panic!("one spawn: {starts:?}") };
+    assert_eq!((request.conversation.as_ref(), request.start), (None, None));
+    assert_eq!(request.cwd.as_deref(), Some("/home/u/src"), "the conversation's directory");
+    zone.agent.read_with(&cx, |agent, _| {
+        assert_eq!(agent.model().phase(), &AgentPhase::Connecting);
+        assert_eq!(agent.model().conversation(), None, "the old conversation is forgotten");
+    });
+
+    let listed = ended_zone(Continuation::Resume, &mut cx);
+    listed.agent.update(&mut cx, |agent, cx| agent.continue_listed("other", cx));
+    assert_eq!(listed.take_calls(), [Call::Close]);
+    let starts = listed.take_starts();
+    let [Start::Spawn(request)] = starts.as_slice() else { panic!("one spawn: {starts:?}") };
+    let conversation = request.conversation.as_ref().map(|c| (c.id.as_str(), c.cwd.as_str()));
+    assert_eq!(conversation, Some(("other", "/home/u/src")));
+
+    let mut choosing = Zone::new(None, &mut cx);
+    choosing.feed(&[Event::Agent { state: AgentState::Choosing { message: None } }]);
+    settle(&cx);
+    let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let _subscription = cx.update(|cx| {
+        let asked = asked.clone();
+        cx.subscribe(&choosing.agent, move |_, event: &AgentAsk, _| asked.borrow_mut().push(*event))
+    });
+    choosing.agent.update(&mut cx, |agent, cx| agent.ask_conversations(cx));
+    settle(&cx);
+    assert_eq!(asked.borrow().as_slice(), [AgentAsk::Conversations]);
+    choosing.agent.update(&mut cx, |agent, cx| agent.new_conversation(cx));
+    assert_eq!(choosing.take_calls(), [Call::Choose(None)]);
+    assert!(choosing.take_starts().is_empty(), "the same session");
+}
+
 /// No offer, nothing sent: an agent that can't continue, a profile that
 /// is gone, a session started with another profile than the zone's.
 #[test]

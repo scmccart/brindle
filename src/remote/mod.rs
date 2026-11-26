@@ -102,6 +102,20 @@ impl AgentLink {
         self.0.fetch(before, max_bytes)
     }
 
+    /// Asks for a page of the agent's conversations after `cursor`
+    /// (`AGENT_LIST`, OpenSpec change `agents-session-list`), as
+    /// [`AgentLink::prompt`]: the page comes as `AgentEvent::Conversations`,
+    /// a refusal as the reply.
+    pub fn list(&self, cursor: Option<String>) -> Option<protocol::RequestId> {
+        self.0.list(cursor)
+    }
+
+    /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues
+    /// `conversation`, or starts a new one; as [`AgentLink::prompt`].
+    pub fn choose(&self, conversation: Option<String>) -> Option<protocol::RequestId> {
+        self.0.choose(conversation)
+    }
+
     /// Cancels the running turn, or the agent's login; true when it was
     /// sent.
     pub fn cancel(&self) -> bool {
@@ -157,6 +171,14 @@ impl AgentLink {
     }
 
     pub fn fetch(&self, _before: u64, _max_bytes: u32) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn list(&self, _cursor: Option<String>) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn choose(&self, _conversation: Option<String>) -> Option<protocol::RequestId> {
         match *self {}
     }
 
