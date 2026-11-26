@@ -23,6 +23,29 @@ The server SHALL keep the plans the agent reports: each a checklist of items, ev
 - **WHEN** a session has a plan, the core restarts, and a client attaches the session
 - **THEN** the replay holds the same plan
 
+#### Scenario: A conversation longer than a page
+- **WHEN** a client attaches a session whose conversation is longer than the page an attach sends, and whose agent reported a plan
+- **THEN** the replay holds the newest page of entries, and the plan whole
+
+### Requirement: Plans belong to the conversation
+A session's plans, and what was dismissed, SHALL stay when its agent stops and when the same conversation is continued by a new agent. When the session starts a new conversation with its agent, the server SHALL remove them and tell attached clients. Plans an agent reports while replaying a conversation it was asked to load SHALL be kept as at any other time, whether or not the replay is shown, and SHALL NOT be counted among the updates a hidden replay left out.
+
+#### Scenario: The agent exits
+- **WHEN** a session has a plan and its agent exits
+- **THEN** the session still holds the plan, and a client can dismiss it
+
+#### Scenario: Continued
+- **WHEN** that conversation is continued by a new agent that takes up the same ACP session
+- **THEN** the session holds the plan as before, until the agent next reports it
+
+#### Scenario: A new conversation
+- **WHEN** a session with a plan can't continue its conversation and starts a new one
+- **THEN** attached clients are told the plan is gone
+
+#### Scenario: A dismissed plan replayed
+- **WHEN** a client dismissed a plan, the agent exits, and the continued agent replays the conversation with that plan unchanged
+- **THEN** the session still holds no plan
+
 ### Requirement: Both forms of a plan are read
 The server SHALL read a plan the agent sends without an id as the session's one unnamed plan, and SHALL read plans the agent sends with ids, as checklists or as Markdown, each as a plan of its own, telling the agent at the start of the session that it accepts them. A plan sent again with its id as the other type SHALL replace the first. The agent removing a plan by its id, or sending the unnamed plan with no items, SHALL remove it; removing a plan the session doesn't hold SHALL change nothing.
 

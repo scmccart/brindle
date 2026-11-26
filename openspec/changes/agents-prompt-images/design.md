@@ -56,7 +56,7 @@ A reference, like `Attachment::Text`: the log, the slot and the checkpoint hold 
 
 ### 3. The upload in pieces (`process R4`–`R6`, `R9`)
 
-Client protocol 4 is unreleased and amended (`agents-tool-content`, decision 8). These replace `agents-prompt-context`'s `AGENT_ATTACH`, so there is one way to send an attachment; a text of 1 KiB is a begin, one piece and an end.
+Client protocol 4 is unreleased and amended (`agents-tool-content`, decision 8). These replace `agents-prompt-context`'s `AGENT_ATTACH`, so there is one way to send an attachment; a text of 1 KiB is a begin, one piece and an end. `AGENT_UPLOAD_BEGIN`, `AGENT_UPLOAD_CHUNK` and `AGENT_UPLOAD_END` are 27, 28 and 29, after `AGENT_READ_ATTACHMENT` (26). `AGENT_ATTACH`'s number, 25, is retired with it and not given to another message, so a number never has two meanings; `ATTACHMENT` stays 44.
 
 - **`AGENT_UPLOAD_BEGIN { req, session, upload, kind, name, bytes }`**, `kind` being `text` or one of the four image types and `bytes` the whole length. Checked before any data: `TooLong` (over `UPLOAD_LIMIT`), `StoreFull`, `DirectoryNotPrivate`, `UploadInProgress` (one at a time on a connection), `NotAnAgentSession`. Answered `OK` or `ERROR`.
 - **`AGENT_UPLOAD_CHUNK { session, upload, data }`**: the next bytes, at most what a frame holds, as raw bytes after the two numbers, with no answer. A piece that would pass the declared length, or that belongs to no upload, ends the upload with an `ERROR` and removes its file.
@@ -128,7 +128,18 @@ An image's lines have its type and size and never its bytes; its row state is `c
 
 As for text: kept images are files and their references are in the checkpoint, so a waiting or held prompt keeps them across a core restart and an upgrade. An upload in flight at a core restart is lost: its partial file is removed on adoption, and Brindle's send fails with the connection's error. A Brindle crash loses the draft and leaves no upload behind. The holder gains nothing but a larger bound.
 
-### 11. Tests
+### 11. The built agent stack (refresh, 2026-11-26)
+
+`agents-session-recovery`, `agents-login`, `agents-zone-attention`, `agents-zone-theme-scope` and `agents-log-paging` are built since this was written. `agents-prompt-context`'s decisions 4 and 13 say what they change for attachments of every kind; for images:
+
+- **A continued agent** gives its own `PromptSupport`: a held prompt's image goes as an image to an agent that takes images and as a link to one that doesn't, whichever agent first had it. A session whose agent stopped keeps its images, which can still be opened.
+- **Progress doesn't move on a clock.** The send's progress and an opening image's (`Loading { got, total }`) are the share done, drawn when a piece is taken or arrives. Nothing spins or shimmers, so `agents-zone-attention`'s motion clock isn't run and "Motion only while an agent works" is untouched.
+- **A send is not a turn.** While pieces are sent the prompt's status is `sending` and the turn is still idle: the working row, the tab's spinner and the attention state don't show, and escape and the stop button stop the send (decision 6), not the agent.
+- **The checkpoint** is format 2; nothing of an image or an upload is in it but the references, as for text.
+- **The holder's bound** is still one constant for every session (`INPUT_QUEUE_LIMIT`, 4 MiB, checked at `remote-agent/src/server/holder.rs`); H1 3 gained `CHECKPOINT_APPEND` and is still unreleased, so decision 4's larger bound for pipe sessions stands.
+- **Drawing.** The preview, the image row and the opened image are parts of the zone, in the zone's token set.
+
+### 12. Tests
 
 - **Unit:** `image_type` over each type's signature, truncated heads and lookalikes; `base64::encode` against known vectors and every length modulo 3; `store::plan` for begin, pieces, end, each refusal, abandon and adoption with a partial file; the reducer's image or link by support, the order of parts and the line's size at the bounds; `paste_plan`, `drop_plan`, `attach` at `PROMPT_IMAGES`, `send_plan` with progress and a stop, `ImageState`'s transitions; the dump lines.
 - **Protocol:** fixtures and fuzzing (decision 3).
