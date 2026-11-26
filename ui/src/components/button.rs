@@ -202,7 +202,7 @@ impl RenderOnce for Button {
                 }
             }))
             .children(self.label);
-        button = attach(button, self.tooltip.filter(|_| !self.disabled));
+        button = attach(button, self.tooltip.filter(|_| !self.disabled), cx.scoped_theme());
         // The owner's layout refinements win over the component's. The ring
         // follows the corners they leave.
         button.style().refine(&self.style);

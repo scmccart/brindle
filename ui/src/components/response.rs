@@ -496,6 +496,9 @@ impl Response {
 /// The walk over a response's blocks, with what every block needs.
 struct Draw<'a> {
     t: &'a Tokens,
+    /// The theme scope's set the response is drawn in, if any, which its
+    /// link tooltips are drawn in too.
+    scope: Option<Tokens>,
     base: Font,
     /// The text colour of the block being drawn (muted inside a quote).
     color: Hsla,
@@ -664,8 +667,9 @@ impl Draw<'_> {
             text = text.on_click(ranges, listener);
         }
         if has_tooltip {
+            let scope = self.scope;
             text = text.tooltip(move |ix, window, cx| {
-                tooltip_at(&links, ix).map(|tooltip| Tooltip::new(tooltip.clone()).build(window, cx))
+                tooltip_at(&links, ix).map(|tooltip| Tooltip::new(tooltip.clone()).in_scope(scope).build(window, cx))
             });
         }
         wrapper
@@ -709,6 +713,7 @@ impl RenderOnce for Response {
         let style = window.text_style();
         let mut draw = Draw {
             t: &t,
+            scope: cx.scoped_theme(),
             base: style.font(),
             color: style.color,
             code_family: self.code_font,
@@ -1011,25 +1016,35 @@ mod tests {
     struct Host {
         blocks: Vec<Arc<RichBlock>>,
         log: Log,
+        /// A theme scope the response is drawn in.
+        scope: Option<Tokens>,
     }
 
     impl Render for Host {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             let log = self.log.clone();
-            div().w(px(400.)).child(
+            let response = div().w(px(400.)).child(
                 Response::new("response", self.blocks.iter().cloned())
                     .code_font("Mono")
                     .link_modifiers(Modifiers::control())
                     .on_link(move |link, modifiers, _, _| log.borrow_mut().push((link.target.clone(), modifiers))),
-            )
+            );
+            match self.scope {
+                Some(tokens) => crate::ThemeScope::new(tokens, response).into_any_element(),
+                None => response.into_any_element(),
+            }
         }
     }
 
     fn open(blocks: Vec<Arc<RichBlock>>) -> (Log, &'static mut VisualTestContext) {
+        open_in(blocks, None)
+    }
+
+    fn open_in(blocks: Vec<Arc<RichBlock>>, scope: Option<Tokens>) -> (Log, &'static mut VisualTestContext) {
         let app: &'static mut TestAppContext = Box::leak(Box::new(test_support::app()));
         let log: Log = Rc::default();
         let held = log.clone();
-        let (_, cx) = app.add_window_view(move |_, _| Host { blocks, log: held });
+        let (_, cx) = app.add_window_view(move |_, _| Host { blocks, log: held, scope });
         cx.run_until_parked();
         (log, cx)
     }
@@ -1154,6 +1169,19 @@ mod tests {
         let docs = over(cx, "response-text 0", LINKED, 7);
         assert!(!tooltip_shown_at(cx, home), "a link without a tooltip showed one");
         assert!(tooltip_shown_at(cx, docs), "the link's tooltip didn't show");
+        let window = cx.update(|_, cx| cx.window_theme());
+        assert!(cx.debug_bounds(test_support::tooltip_in(&window)).is_none(), "outside a scope, the window's set");
+    }
+
+    /// The spec's "Tooltip inside a scope", for a link: a response drawn
+    /// in a theme scope shows its link's tooltip in the scope's set.
+    #[test]
+    fn a_link_tooltip_inside_a_scope_takes_its_set() {
+        let dark = Tokens { background: gpui::red(), ..Tokens::neutral_dark() };
+        let (_, cx) = open_in(vec![linked()], Some(dark));
+        let docs = over(cx, "response-text 0", LINKED, 7);
+        assert!(tooltip_shown_at(cx, docs), "the link's tooltip didn't show");
+        assert!(cx.debug_bounds(test_support::tooltip_in(&dark)).is_some(), "the tooltip isn't drawn in the scope's set");
     }
 
     /// The spec's "Short row": a three-column table whose row has two cells

@@ -185,7 +185,7 @@ impl RenderOnce for Toggle {
             })
             .children(self.icon.map(|icon| icon.size(style.icon_size)))
             .children(self.label);
-        toggle = attach(toggle, tooltip);
+        toggle = attach(toggle, tooltip, cx.scoped_theme());
         // The owner's layout refinements win over the component's. The ring
         // follows the corners they leave.
         toggle.style().refine(&self.style);

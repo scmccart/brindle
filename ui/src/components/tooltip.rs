@@ -34,21 +34,46 @@ use gpui::{
 };
 
 use crate::components::Kbd;
+use crate::primitives::ThemeScope;
 use crate::style::tooltip_style;
-use crate::theme::{ActiveFont, ActiveTheme};
+use crate::theme::{ActiveFont, ActiveTheme, Tokens};
 
 /// What a tooltip shows: a label, and optionally a shortcut as keycaps.
 /// It also renders as an element, the tooltip's panel drawn in place (the
 /// gallery shows it so), which is how the shown view draws it.
-#[derive(Clone, Debug, PartialEq, Eq, IntoElement)]
+#[derive(Clone, Debug, PartialEq, IntoElement)]
 pub struct Tooltip {
     label: SharedString,
     shortcut: Option<SharedString>,
+    /// The token set it is drawn in, inside a [`ThemeScope`]: the one in
+    /// effect where its control was drawn, since gpui draws the tooltip
+    /// outside the window's tree, after any scope has ended. `None`: the
+    /// window's set, followed live.
+    tokens: Option<Tokens>,
 }
 
 impl Tooltip {
     pub fn new(label: impl Into<SharedString>) -> Self {
-        Self { label: label.into(), shortcut: None }
+        Self { label: label.into(), shortcut: None, tokens: None }
+    }
+
+    /// Draws the tooltip in `tokens` rather than the window's set.
+    pub fn tokens(mut self, tokens: Tokens) -> Self {
+        self.tokens = Some(tokens);
+        self
+    }
+
+    /// The set it is drawn in, when not the window's.
+    pub fn token_set(&self) -> Option<&Tokens> {
+        self.tokens.as_ref()
+    }
+
+    /// Draws the tooltip in `scope`'s set when its control was drawn inside
+    /// a theme scope (what [`ActiveTheme::scoped_theme`] read at the
+    /// control's render), keeping a set it was given.
+    pub(crate) fn in_scope(mut self, scope: Option<Tokens>) -> Self {
+        self.tokens = self.tokens.or(scope);
+        self
     }
 
     /// The shortcut, as a keymap string (`ctrl-shift-t`), drawn after the
@@ -102,15 +127,28 @@ impl Tooltip {
 pub(crate) type TooltipHandler = Box<dyn Fn(&mut Window, &mut App) -> Tooltip + 'static>;
 
 /// Puts the tooltip `build` describes on `element` (a control's own
-/// stateful root), when there is one.
-pub(crate) fn attach<E: StatefulInteractiveElement>(element: E, build: Option<TooltipHandler>) -> E {
+/// stateful root), when there is one. `scope` is the theme scope's set the
+/// control is drawn in ([`ActiveTheme::scoped_theme`] at its render), which
+/// the tooltip is drawn in too.
+pub(crate) fn attach<E: StatefulInteractiveElement>(
+    element: E,
+    build: Option<TooltipHandler>,
+    scope: Option<Tokens>,
+) -> E {
     match build {
-        Some(build) => element.tooltip(move |window, cx| build(window, cx).build(window, cx)),
+        Some(build) => element.tooltip(move |window, cx| build(window, cx).in_scope(scope).build(window, cx)),
         None => element,
     }
 }
 
 /// A tooltip on an element. Call it once per element: gpui allows one.
+///
+/// It has no `cx` where it is called, so its tooltip is drawn in the
+/// window's set even inside a [`ThemeScope`]: inside one, use a
+/// component's tooltip ([`Button`]'s, [`Badge`]'s), which carries the
+/// scope's set, or give the tooltip its set with [`Tooltip::tokens`].
+///
+/// [`Badge`]: crate::components::Badge
 pub trait TooltipFor: Sized {
     /// A tooltip whose content `build` works out when it is shown.
     fn tooltip_with(self, build: impl Fn(&mut Window, &mut App) -> Tooltip + 'static) -> Self;
@@ -154,6 +192,15 @@ impl Render for TooltipView {
 
 impl RenderOnce for Tooltip {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        if let Some(tokens) = self.tokens {
+            // The panel again, inside the scope. The wrapper's selector
+            // names the set, for the tests (a no-op in release builds).
+            let panel = Tooltip { tokens: None, ..self };
+            return div()
+                .debug_selector(move || format!("tooltip-in {:?}", tokens.background))
+                .child(ThemeScope::new(tokens, panel))
+                .into_any_element();
+        }
         let style = tooltip_style(&cx.ui_theme());
         let shortcut = self.shortcut;
         // gpui lays a tooltip out at its smallest size, so text that may
@@ -177,12 +224,81 @@ impl RenderOnce for Tooltip {
             .whitespace_nowrap()
             .child(self.label)
             .children(shortcut.map(|keys| Kbd::new(keys).colors(style.kbd_background, style.kbd_foreground)))
+            .into_any_element()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use gpui::{Modifiers, TestAppContext, VisualTestContext, point, px};
+
     use super::*;
+    use crate::components::Button;
+    use crate::test_support;
+
+    /// A button with a tooltip outside any scope, and one inside a scope
+    /// of `scope`, at the left and the right.
+    struct Host {
+        scope: Tokens,
+    }
+
+    impl Render for Host {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .items_start()
+                .justify_between()
+                .child(div().debug_selector(|| "outside".into()).child(Button::new("out", "Out").tooltip_for("Out", None)))
+                .child(ThemeScope::new(
+                    self.scope,
+                    div().debug_selector(|| "inside".into()).child(Button::new("in", "In").tooltip_for("In", None)),
+                ))
+        }
+    }
+
+    /// Rests the pointer on the middle of `selector` until its tooltip
+    /// shows.
+    fn rest_on(cx: &mut VisualTestContext, selector: &'static str) {
+        let at = cx.debug_bounds(selector).expect("drawn").center();
+        cx.simulate_mouse_move(point(px(1.), px(300.)), None, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(at, None, Modifiers::none());
+        cx.executor().advance_clock(Duration::from_millis(800));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    /// The spec's "Tooltip inside a scope": a button drawn inside a scope
+    /// shows its tooltip in the scope's set; one outside in the window's.
+    #[test]
+    fn a_buttons_tooltip_takes_the_scope_it_was_drawn_in() {
+        let mut app: TestAppContext = test_support::app();
+        let dark = Tokens { background: gpui::red(), ..Tokens::neutral_dark() };
+        let (_, cx) = app.add_window_view(move |_, _| Host { scope: dark });
+        cx.run_until_parked();
+        let window = cx.update(|_, cx| cx.window_theme());
+
+        rest_on(cx, "outside");
+        assert!(cx.debug_bounds("tooltip").is_some(), "the outside button's tooltip didn't show");
+        assert!(cx.debug_bounds(test_support::tooltip_in(&dark)).is_none());
+        assert!(cx.debug_bounds(test_support::tooltip_in(&window)).is_none(), "it holds no set of its own");
+
+        rest_on(cx, "inside");
+        assert!(cx.debug_bounds("tooltip").is_some(), "the inside button's tooltip didn't show");
+        assert!(cx.debug_bounds(test_support::tooltip_in(&dark)).is_some(), "not drawn in the scope's set");
+    }
+
+    #[test]
+    fn a_scope_fills_only_a_tooltip_without_a_set() {
+        let (a, b) = (Tokens::neutral_dark(), Tokens::neutral_light());
+        assert_eq!(Tooltip::new("x").in_scope(Some(a)).token_set(), Some(&a));
+        assert_eq!(Tooltip::new("x").in_scope(None).token_set(), None);
+        assert_eq!(Tooltip::new("x").tokens(b).in_scope(Some(a)).token_set(), Some(&b));
+    }
 
     #[test]
     fn a_tooltip_keeps_its_label_and_shortcut() {

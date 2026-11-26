@@ -724,7 +724,7 @@ fn render_trigger(trigger: TabTrigger, ix: usize, list: &ListContext, window: &m
                 on_move(&TabMove { from: dragged.trigger.clone(), to: ix }, window, cx);
             });
     }
-    let element = attach(element, trigger.tooltip.filter(|_| !disabled));
+    let element = attach(element, trigger.tooltip.filter(|_| !disabled), cx.scoped_theme());
     element.focus_ring(ring_shown, style.ring, window).into_any_element()
 }
 

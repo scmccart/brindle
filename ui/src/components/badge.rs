@@ -113,9 +113,14 @@ impl Badge {
                 .items_center()
                 .child(icon.size(BADGE_ICON_SIZE).color(color).min_stroke(LEGIBLE_ICON_STROKE)),
         };
+        // Drawn in the theme scope the badge is drawn in, if any.
+        let scope = cx.scoped_theme();
         match tooltip {
             // The id is the badge's own, under its trigger's or header's.
-            Some(text) => element.id("badge").tooltip_with(move |_, _| Tooltip::new(text.clone())).into_any_element(),
+            Some(text) => element
+                .id("badge")
+                .tooltip_with(move |_, _| Tooltip::new(text.clone()).in_scope(scope))
+                .into_any_element(),
             None => element.into_any_element(),
         }
     }
