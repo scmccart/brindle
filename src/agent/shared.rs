@@ -20,9 +20,33 @@ pub enum Dirty {
     /// Text was appended from this byte of the entry's text on: the zone
     /// copies only the new tail.
     Appended { from_byte: usize },
+    /// A tool call's content items from index `from` on were replaced
+    /// (`ToolItems`, OpenSpec change `agents-tool-content` decision 10):
+    /// the zone draws those items' parts again.
+    ToolItems { from: usize },
+    /// Output was appended to a tool call's item `item` (`ToolOutput`):
+    /// the zone draws that output's last part again.
+    Output { item: usize },
     /// Something else changed (a tool call's fields, a permission's
     /// outcome): the zone copies the entry again.
     Replaced,
+}
+
+impl Dirty {
+    /// Two changes to one tool entry as one: the items from the first
+    /// that either touched, or a replacement when either replaced it.
+    fn and(self, later: Self) -> Self {
+        match (self, later) {
+            (Self::Output { item: a }, Self::Output { item: b }) if a == b => Self::Output { item: a },
+            (
+                Self::ToolItems { from: a } | Self::Output { item: a },
+                Self::ToolItems { from: b } | Self::Output { item: b },
+            ) => Self::ToolItems { from: a.min(b) },
+            (Self::Replaced | Self::Appended { .. } | Self::ToolItems { .. } | Self::Output { .. }, _) => {
+                Self::Replaced
+            }
+        }
+    }
 }
 
 /// What changed in the transcript since [`AgentShared::take_changes`].
@@ -76,6 +100,16 @@ impl Changes {
         if !self.is_new(id) {
             self.changed.insert(id, Dirty::Replaced);
         }
+    }
+
+    /// A tool entry's items changed (`ToolItems` or `ToolOutput`), merged
+    /// with what changed in it before.
+    fn tool_content(&mut self, id: EntryId, dirty: Dirty) {
+        if self.is_new(id) {
+            return;
+        }
+        let merged = self.changed.get(&id).map_or(dirty, |before| before.and(dirty));
+        self.changed.insert(id, merged);
     }
 
     fn trimmed(&mut self, through: EntryId) {
@@ -169,15 +203,21 @@ impl AgentShared {
             .map_err(|why| Broken(format!("an event from the terminal server couldn't be applied: {why}")))?;
         let changes = &mut self.changes;
         changes.from_replay |= self.replaying;
+        // A paged copy ignores a change to an entry below its window: there
+        // is nothing the zone shows to redraw.
+        let held = |id: &EntryId| self.transcript.entry(*id).is_some();
         match event {
-            Event::Added { id, .. } => changes.added(*id),
-            Event::Appended { id, .. } => changes.appended(*id, before.unwrap_or(0)),
-            // Tool content redraws its row whole until the detail has its
-            // own blocks (`agents-tool-content` task 5.2).
-            Event::ToolChanged { id, .. }
+            Event::Appended { id, .. }
+            | Event::ToolChanged { id, .. }
             | Event::ToolItems { id, .. }
             | Event::ToolOutput { id, .. }
-            | Event::Answered { id, .. } => changes.replaced(*id),
+            | Event::Answered { id, .. }
+                if !held(id) => {}
+            Event::Added { id, .. } => changes.added(*id),
+            Event::Appended { id, .. } => changes.appended(*id, before.unwrap_or(0)),
+            Event::ToolItems { id, from, .. } => changes.tool_content(*id, Dirty::ToolItems { from: *from as usize }),
+            Event::ToolOutput { id, item, .. } => changes.tool_content(*id, Dirty::Output { item: *item as usize }),
+            Event::ToolChanged { id, .. } | Event::Answered { id, .. } => changes.replaced(*id),
             Event::Queue { .. } => changes.slot_changed = true,
             // The conversation decides whether a continue is offered.
             Event::Turn { .. } | Event::Agent { .. } | Event::Conversation { .. } => changes.turn_or_agent = true,
@@ -229,8 +269,8 @@ fn text_len(entry: &Entry) -> usize {
 mod tests {
     use super::*;
     use crate::agent::transcript::{
-        AgentState, HoldReason, NoticeLevel, PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason,
-        ToolKind, ToolStatus, TurnState,
+        AgentState, HoldReason, NoticeLevel, Output, PermissionKind, PermissionOption, PermissionOutcome, Slot,
+        StopReason, ToolItem, ToolKind, ToolStatus, TurnState,
     };
 
     fn values(events: &[Event]) -> Vec<Value> {
@@ -382,6 +422,129 @@ mod tests {
         let Broken(why) = shared.apply(&values(&[Event::Appended { id: EntryId(9), text: "x".into() }])).unwrap_err();
         assert!(why.ends_with("there is no entry 9"), "{why}");
         assert_eq!(Broken("x".into()).to_string(), "x");
+    }
+
+    // agents-tool-content 5.2: tool content's changes.
+
+    fn output(text: &str) -> ToolItem {
+        ToolItem::Output(Output { text: text.into(), ..Output::default() })
+    }
+
+    fn items(id: u64, from: u32, items: Vec<ToolItem>) -> Event {
+        Event::ToolItems { id: EntryId(id), from, items }
+    }
+
+    fn out(id: u64, item: u32, text: &str) -> Event {
+        Event::ToolOutput { id: EntryId(id), item, text: text.into(), exit: None }
+    }
+
+    /// Each tool content event folds and is recorded as what it changed;
+    /// changes to one entry merge, and a new entry's aren't listed.
+    #[test]
+    fn tool_content_events_record_the_items_they_change() {
+        let mut shared = AgentShared::new();
+        shared.apply(&values(&[added(1, tool()), added(2, tool())])).unwrap();
+        shared.apply(&values(&[items(1, 0, vec![output("a\n"), output("b\n")])])).unwrap();
+        shared.take_changes();
+
+        let table: Vec<(Vec<Event>, Dirty)> = vec![
+            (vec![out(1, 1, "more\n")], Dirty::Output { item: 1 }),
+            (vec![out(1, 1, "x"), out(1, 1, "y\n")], Dirty::Output { item: 1 }),
+            (vec![out(1, 1, "x"), out(1, 0, "y\n")], Dirty::ToolItems { from: 0 }),
+            (vec![items(1, 1, vec![output("c\n")])], Dirty::ToolItems { from: 1 }),
+            (vec![out(1, 1, "x"), items(1, 2, vec![output("d\n")])], Dirty::ToolItems { from: 1 }),
+            (vec![items(1, 3, vec![]), out(1, 0, "z\n")], Dirty::ToolItems { from: 0 }),
+            (
+                vec![
+                    out(1, 0, "z\n"),
+                    Event::ToolChanged {
+                        id: EntryId(1),
+                        title: Some("Run".into()),
+                        kind: None,
+                        status: None,
+                        locations: None,
+                        input: None,
+                        result: None,
+                        more: None,
+                    },
+                    out(1, 0, "w\n"),
+                ],
+                Dirty::Replaced,
+            ),
+        ];
+        for (events, dirty) in table {
+            shared.apply(&values(&events)).unwrap();
+            let changes = shared.take_changes();
+            assert_eq!(changes.changed, BTreeMap::from([(EntryId(1), dirty)]), "{events:?}");
+        }
+        let Some(Entry::Tool { content, .. }) = shared.transcript().entry(EntryId(1)) else { panic!("a tool") };
+        assert!(!content.is_empty());
+
+        // Content for a tool entry added in the same changes isn't listed.
+        shared.apply(&values(&[added(3, tool()), items(3, 0, vec![output("new\n")]), out(3, 0, "more\n")])).unwrap();
+        let changes = shared.take_changes();
+        assert_eq!(changes.added_from, Some(EntryId(3)));
+        assert!(changes.changed.is_empty(), "{:?}", changes.changed);
+        // A trim drops the trimmed entries' changes.
+        shared.apply(&values(&[items(2, 0, vec![output("x\n")]), out(1, 0, "a\n")])).unwrap();
+        shared.apply(&values(&[Event::Trimmed { through: EntryId(1), dropped: 1 }])).unwrap();
+        let changes = shared.take_changes();
+        assert_eq!(changes.changed, BTreeMap::from([(EntryId(2), Dirty::ToolItems { from: 0 })]));
+    }
+
+    /// A replay and a prepended page carry tool content whole: the copy is
+    /// the server's log, and nothing is listed as changed.
+    #[test]
+    fn a_replay_and_a_page_carry_tool_content() {
+        let mut source = Transcript::new();
+        for event in [
+            added(1, Entry::User { text: "go".into() }),
+            added(2, tool()),
+            items(2, 0, vec![ToolItem::Text { text: "**done**".into(), cut: false }, output("one\n")]),
+            out(2, 1, "two\n"),
+            added(3, agent("ok")),
+        ] {
+            source.apply(&event).unwrap();
+        }
+        let mut shared = AgentShared::new();
+        shared.replay_start();
+        shared.apply(&values(&source.replay())).unwrap();
+        shared.replay_end();
+        let changes = shared.take_changes();
+        assert!(changes.reset && changes.changed.is_empty());
+        assert_eq!(shared.transcript(), &source);
+
+        // A paged copy of the last entry, then the rest fetched in front.
+        let mut shared = AgentShared::new();
+        shared.replay_start();
+        shared.apply(&values(&source.page(1))).unwrap();
+        shared.replay_end();
+        shared.take_changes();
+        let fetched = source.fetch(EntryId(3), usize::MAX);
+        shared.prepend(&values(&fetched.events), fetched.more).unwrap();
+        let changes = shared.take_changes();
+        assert_eq!(changes.prepended, Some(2));
+        assert!(changes.changed.is_empty() && changes.from_replay);
+        assert_eq!(shared.transcript().entry(EntryId(2)), source.entry(EntryId(2)));
+    }
+
+    /// Tool content for an entry below the window changes nothing the zone
+    /// holds, and records nothing.
+    #[test]
+    fn tool_content_below_the_window_records_nothing() {
+        let mut source = Transcript::new();
+        for event in [added(1, tool()), items(1, 0, vec![output("a\n")]), added(2, agent("later"))] {
+            source.apply(&event).unwrap();
+        }
+        let mut shared = AgentShared::new();
+        shared.replay_start();
+        shared.apply(&values(&source.page(1))).unwrap();
+        shared.replay_end();
+        shared.take_changes();
+        assert!(shared.transcript().entry(EntryId(1)).is_none(), "below the window");
+        shared.apply(&values(&[out(1, 0, "b\n"), items(1, 1, vec![output("c\n")])])).unwrap();
+        let changes = shared.take_changes();
+        assert!(changes.is_empty(), "{changes:?}");
     }
 
     // agents-log-paging 4.2: a fetched page folded in front.

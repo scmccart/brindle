@@ -191,19 +191,19 @@ Before starting, check these:
 
 ## 5. Brindle's model
 
-- [ ] 5.1 **Add the `[agent]` table to `src/config.rs`**: `tool_details` and `tool_details_when_done`, each `"open"` or `"closed"`, decoded into `Shown` (defaults `open` and `closed`). Another value is reported on the config line, naming the key and its two values. Document both in `assets/default-config.toml`.
+- [x] 5.1 **Add the `[agent]` table to `src/config.rs`**: `tool_details` and `tool_details_when_done`, each `"open"` or `"closed"`, decoded into `Shown` (defaults `open` and `closed`). Another value is reported on the config line, naming the key and its two values. Document both in `assets/default-config.toml`.
   - Verify with unit tests:
     - the defaults;
     - each value;
     - a bad value's message;
     - an unknown key under `[agent]`;
     - the shipped default config parsing.
-- [ ] 5.2 **Extend `src/agent/shared.rs`** for the new events: `Dirty::ToolItems { from }` and `Dirty::Output { item }`, recorded in `Changes`. Check that `sink.rs` passes them through unchanged.
+- [x] 5.2 **Extend `src/agent/shared.rs`** for the new events: `Dirty::ToolItems { from }` and `Dirty::Output { item }`, recorded in `Changes`. Check that `sink.rs` passes them through unchanged.
   - Verify with unit tests:
     - folding each event;
     - a replay and a prepended page holding tool content;
     - events below the window recording nothing.
-- [ ] 5.3 **Add the pure functions to `src/agent/model.rs`**:
+- [x] 5.3 **Add the pure functions to `src/agent/model.rs`**:
   - `detail(entry) -> Vec<DetailPart>`: items, locations, then raw input and result only with no items; the marks for what was left out;
   - `summary(entry)`;
   - `copy_text(part)`: unified diff text, output text, a text item's source.
@@ -212,7 +212,7 @@ Before starting, check these:
     - a move with no hunks;
     - a cut diff's mark;
     - the copy text of a two-hunk diff.
-- [ ] 5.4 **Add the detail's blocks** (`BlockBody::ToolDetail`, `BlockBody::Tool`'s `summary` and `open`) in `blocks_of` and `absorb`.
+- [x] 5.4 **Add the detail's blocks** (`BlockBody::ToolDetail`, `BlockBody::Tool`'s `summary` and `open`) in `blocks_of` and `absorb`.
   - One per text item, through `markdown::render` under `catch_unwind`, cached by entry and item.
   - One per `DETAIL_LINES` lines of a diff or output.
   - Locations, and raw values.
@@ -223,7 +223,7 @@ Before starting, check these:
     - a replaced content list on an open row;
     - a `Trimmed` that drops an open tool entry;
     - a prepended page holding tool entries.
-- [ ] 5.5 **Add the open state** (design decision 10): `Shown`, `ToolPolicy`, `RowState` and the pure `row_state`, plus `by_hand`, `toggle_tool(id)`, `toggle_tool_details()` and `set_policy(policy)`, each returning `Splice`s.
+- [x] 5.5 **Add the open state** (design decision 10): `Shown`, `ToolPolicy`, `RowState` and the pure `row_state`, plus `by_hand`, `toggle_tool(id)`, `toggle_tool_details()` and `set_policy(policy)`, each returning `Splice`s.
   - Verify with unit tests over every combination of detail or none, by-hand choice, running or finished, pending permission and policy.
   - Also verify these cases:
     - a call that arrives completed;
@@ -232,14 +232,14 @@ Before starting, check these:
     - a running call whose turn's user message is above the page (flag 7);
     - a by-hand choice outliving completion and a policy change;
     - a policy change splicing only the rows that change.
-- [ ] 5.6 **Show a pending permission's detail.** The parts of the tool entry its `call` names become blocks of the permission entry, before its confirmation. Meanwhile that tool row shows its line alone, and the parts go once the request is answered.
+- [x] 5.6 **Show a pending permission's detail.** The parts of the tool entry its `call` names become blocks of the permission entry, before its confirmation. Meanwhile that tool row shows its line alone, and the parts go once the request is answered.
   - Verify with unit tests for:
     - pending, answered and cancelled;
     - no `call`;
     - a `call` the model doesn't hold;
     - content that arrives after the permission row;
     - a restored page whose permission's tool entry is its first entry.
-- [ ] 5.7 **Extend the dump** (`describe`, `wait_text`, `entry_line`; design decision 12).
+- [x] 5.7 **Extend the dump** (`describe`, `wait_text`, `entry_line`; design decision 12).
   - The tool line's ` open=… items=N` after `status=`.
   - The `--- item`, `--- hunk`, `--- location` and `--- raw` lines.
   - The permission line's ` detail=N` after `outcome=`, only when N > 0.
@@ -289,7 +289,7 @@ Before starting, check these:
   - The row's press calls `toggle_tool`, and the copy buttons write `copy_text` to the clipboard.
   - Nothing is computed in `render` beyond reading the model's blocks (`process R14`).
   - Verify in the e2e cases of 8.1, 8.5 and 8.9.
-- [ ] 7.2 **Add `toggle_agent_tool_details` to `ACTIONS`** ("Toggle Tool Details", no default key). Only `AgentView` handles it (`src/agent/mod.rs`).
+- [x] 7.2 **Add `toggle_agent_tool_details` to `ACTIONS`** ("Toggle Tool Details", no default key). Only `AgentView` handles it (`src/agent/mod.rs`).
   - Verify with a unit test beside `an_agent_zone_lists_no_terminal_commands` that the palette lists it in an agent zone and not in a terminal zone.
 - [ ] 7.3 **Keep the end in view while an open row's output grows**, through the scroller's existing follow rule, with the working row still the last item.
   - Verify in the e2e case of 8.2.

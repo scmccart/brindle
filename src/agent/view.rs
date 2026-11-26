@@ -30,17 +30,19 @@ use brindle_ui::{
     PageDirection, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
     Resend as UiResend, Response, RichBlock, Shimmer, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
+use brindle_ui::{Code, CodeBlock, Diff};
 
 use crate::actions::{
     AgentCancel, AgentContinue, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
-    CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts,
+    CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts, ToggleAgentToolDetails,
 };
 use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
     AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow,
-    Resend, Splice, WorkingRow,
+    Resend, ShownPart, Splice, WorkingRow,
 };
+use crate::agent::tool::{self, DetailPart};
 use crate::motion::{self, Motion};
 use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
 use crate::agent::{Agent, AgentUpdate};
@@ -96,9 +98,10 @@ pub fn item_padding(block: &Block) -> (bool, bool) {
             let edges = bubble_part(block.part, block.last).edges();
             (edges.top, edges.bottom)
         }
-        BlockBody::Thought { .. } | BlockBody::Tool { .. } | BlockBody::Permission { .. } | BlockBody::Notice { .. } => {
-            (true, true)
-        }
+        // A tool row and its open detail read as one: padded above its
+        // line and below its last part.
+        BlockBody::Tool { .. } | BlockBody::ToolDetail(_) => (block.part == 0, block.last),
+        BlockBody::Thought { .. } | BlockBody::Permission { .. } | BlockBody::Notice { .. } => (true, true),
     }
 }
 
@@ -657,6 +660,10 @@ impl AgentView {
         self.agent.update(cx, |agent, cx| agent.toggle_thoughts(cx));
     }
 
+    fn toggle_tool_details(&mut self, _: &ToggleAgentToolDetails, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.toggle_tool_details(cx));
+    }
+
     fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.scroller.update(cx, |scroller, cx| scroller.scroll_to_end(cx));
     }
@@ -760,7 +767,17 @@ fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::
         .collect();
     let colors = (this.theme.ansi[1].hsla(), this.theme.ansi[3].hsla());
     let code_font = Settings::get(cx).font().family;
-    let body = block_element(view.clone(), &block, &handles, colors, code_font);
+    // A long diff's or output's runs read as one frame.
+    let below = if let BlockBody::ToolDetail(part) = &block.body
+        && let Some(Block { body: BlockBody::ToolDetail(next), .. }) = this.agent.read(cx).model().blocks().get(ix + 1)
+        && next.entry == part.entry
+    {
+        tool::continues_into(&part.part, Some(&next.part))
+    } else {
+        false
+    };
+    let muted = cx.ui_theme().muted_foreground;
+    let body = block_element(view.clone(), &block, &handles, colors, code_font, (below, muted));
     let (top, bottom) = item_padding(&block);
     div().px_3().when(top, |d| d.pt_1()).when(bottom, |d| d.pb_1()).w_full().child(body).into_any_element()
 }
@@ -843,12 +860,82 @@ fn response(
         .on_copy_code(|text, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string())))
 }
 
+/// Writes the copy text of item `item` of tool call `entry` (a unified
+/// diff, an output's text) to the clipboard.
+fn copy_tool_item(view: &WeakEntity<AgentView>, entry: EntryId, item: usize, cx: &mut App) {
+    let Some(view) = view.upgrade() else { return };
+    let text = view.read(cx).agent.read(cx).model().tool_copy_text(entry, item);
+    if let Some(text) = text {
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+    }
+}
+
+/// One part of a tool call's detail (`agents-tool-content` decision 10):
+/// a text item as a response, a run of a diff's lines as a [`Diff`], a run
+/// of an output's or a raw value as a [`CodeBlock`], the locations as a
+/// muted list, a mark in muted words. `below`: the part's frame goes on
+/// into the next block.
+fn detail_element(
+    view: &WeakEntity<AgentView>,
+    id: ElementId,
+    shown: &ShownPart,
+    below: bool,
+    code_font: &SharedString,
+    muted: gpui::Hsla,
+) -> gpui::AnyElement {
+    let entry = shown.entry;
+    match &shown.part {
+        DetailPart::Text { .. } => {
+            response(view.clone(), id, shown.text.iter().cloned(), code_font.clone()).into_any_element()
+        }
+        DetailPart::Diff { item, head, rows } => {
+            let (view, item) = (view.clone(), *item);
+            let diff = Diff::new(id, rows.iter().cloned()).font(code_font.clone()).joined(head.is_none(), below);
+            match head {
+                Some(head) => diff
+                    .header(head.op.clone(), head.path.clone(), head.from.clone())
+                    .on_copy(move |_, cx| copy_tool_item(&view, entry, item, cx))
+                    .into_any_element(),
+                None => diff.into_any_element(),
+            }
+        }
+        DetailPart::Output { item, head, text } => {
+            let (view, item) = (view.clone(), *item);
+            let code = Code { label: head.as_ref().map(|head| head.label.clone()), text: text.clone() };
+            CodeBlock::new(id, code)
+                .font(code_font.clone())
+                .joined(head.is_none(), below)
+                .on_copy(move |_, _, cx| copy_tool_item(&view, entry, item, cx))
+                .into_any_element()
+        }
+        DetailPart::Raw { which, text } => {
+            CodeBlock::new(id, Code { label: Some(which.word().into()), text: text.clone() })
+                .font(code_font.clone())
+                .on_copy(|text, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string())))
+                .into_any_element()
+        }
+        DetailPart::Locations { lines } => div()
+            .debug_selector(|| "agent-tool-locations".into())
+            .flex()
+            .flex_col()
+            .text_size(gpui::rems(0.75))
+            .text_color(muted)
+            .font_family(code_font.clone())
+            .children(lines.iter().cloned())
+            .into_any_element(),
+        DetailPart::Mark { text } => {
+            div().text_size(gpui::rems(0.75)).text_color(muted).child(text.clone()).into_any_element()
+        }
+    }
+}
+
 fn block_element(
     view: WeakEntity<AgentView>,
     block: &Block,
     handles: &[(SharedString, FocusHandle)],
     (error, warning): (gpui::Hsla, gpui::Hsla),
     code_font: SharedString,
+    (below, muted): (bool, gpui::Hsla),
 ) -> gpui::AnyElement {
     let entry = block.entry;
     let id = |what: &str| ElementId::Name(format!("agent-{what}-{}-{}", entry.0, block.part).into());
@@ -888,10 +975,20 @@ fn block_element(
                 .child(content)
                 .into_any_element()
         }
-        BlockBody::Tool { kind, title, status } => {
-            Tool::new(tool_icon(*kind), title.clone(), tool_status(*status)).into_any_element()
+        BlockBody::Tool { kind, title, status, summary, state } => {
+            Tool::new(tool_icon(*kind), title.clone(), tool_status(*status))
+                .id(id("tool"))
+                .when_some(summary.clone(), |tool, summary| tool.summary(summary))
+                .open(state.open())
+                .on_toggle(move |_, _, cx| {
+                    view.update(cx, |view, cx| view.agent.update(cx, |agent, cx| agent.toggle_tool(entry, cx))).ok();
+                })
+                .into_any_element()
         }
-        BlockBody::Permission { title, options, outcome } => {
+        BlockBody::ToolDetail(shown) => {
+            div().pt_1().child(detail_element(&view, id("detail"), shown, below, &code_font, muted)).into_any_element()
+        }
+        BlockBody::Permission { title, options, outcome, detail, .. } => {
             let state = match outcome {
                 None => ConfirmationState::Requested,
                 Some(PermissionOutcome::Selected { option }) => match options.iter().find(|o| o.id.as_ref() == option) {
@@ -914,7 +1011,18 @@ fn block_element(
                 }
                 confirmation = confirmation.action(action);
             }
+            // A pending request shows its call's detail inside its alert,
+            // between the title and the buttons.
+            let parts = detail.iter().enumerate().map(|(k, shown)| {
+                let below = tool::continues_into(&shown.part, detail.get(k + 1).map(|next| &next.part));
+                let id = ElementId::Name(format!("agent-permission-detail-{}-{k}", entry.0).into());
+                detail_element(&view, id, shown, below, &code_font, muted)
+            });
+            let parts: Vec<gpui::AnyElement> = parts.collect();
             confirmation
+                .when(!parts.is_empty(), |c| {
+                    c.child(div().debug_selector(|| "agent-permission-detail".into()).flex().flex_col().children(parts))
+                })
                 .on_action(move |key: &ItemKey, _, cx| {
                     let option = key.as_str().to_string();
                     view.update(cx, |view, cx| view.agent.update(cx, |agent, cx| agent.answer(entry, &option, cx)))
@@ -1030,6 +1138,7 @@ impl Render for AgentView {
             .on_action(cx.listener(Self::copy_last))
             .on_action(cx.listener(Self::copy_last_code))
             .on_action(cx.listener(Self::toggle_thoughts))
+            .on_action(cx.listener(Self::toggle_tool_details))
             // A link shows the pointing hand only while ctrl is held: a
             // modifiers change with the pointer still reaches only the
             // focused path (the prompt input, inside this), so the frame is

@@ -25,6 +25,9 @@ pub mod shared;
 // Markdown in agent messages and thoughts: the app's one door to the parser.
 pub mod markdown;
 
+// A tool call's detail, summary, copy text and open state.
+pub mod tool;
+
 // The chat model and the protocol gate.
 pub mod model;
 
@@ -42,7 +45,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt as _;
-use gpui::{App, Context, EventEmitter, Task};
+use gpui::{App, Context, EventEmitter, Subscription, Task};
 use parking_lot::Mutex;
 
 use crate::FirstPrompt;
@@ -52,6 +55,7 @@ use crate::agent::model::{
     Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
 };
 use crate::agent::shared::AgentShared;
+use crate::agent::tool::ToolPolicy;
 use crate::agent::sink::{AgentEvent, Feed, Sink, Taker};
 use crate::agent::spawn::{AgentRestartRequest, OpenedBy, agent_spawn_request, continuing_profile};
 use crate::agent::transcript::{Conversation, EntryId};
@@ -220,6 +224,8 @@ pub struct Agent {
     session_profile: Option<String>,
     connect: Connect,
     _events: Task<()>,
+    /// Hands the model `[agent]`'s tool policy on every config reload.
+    _settings: Subscription,
 }
 
 impl EventEmitter<TerminalEvent> for Agent {}
@@ -330,7 +336,18 @@ impl Agent {
         cx: &mut Context<Self>,
     ) -> Self {
         let (shared, taker, events) = feed.split();
+        let mut model = model;
+        if let Some(settings) = cx.try_global::<Settings>() {
+            model.set_policy(ToolPolicy::of(&settings.config.agent));
+        }
+        // A reload applies to the rows on screen at once (decision 10).
+        let settings = cx.observe_global::<Settings>(|this: &mut Self, cx| {
+            let policy = ToolPolicy::of(&Settings::get(cx).config.agent);
+            let splices = this.model.set_policy(policy);
+            this.splices(splices, cx);
+        });
         Self {
+            _settings: settings,
             model,
             shared,
             requests,
@@ -728,6 +745,18 @@ impl Agent {
     /// `toggle_agent_thoughts`.
     pub fn toggle_thoughts(&mut self, cx: &mut Context<Self>) {
         let splices = self.model.toggle_thoughts();
+        self.splices(splices, cx);
+    }
+
+    /// A press on tool call `entry`'s row: open or close its detail.
+    pub fn toggle_tool(&mut self, entry: EntryId, cx: &mut Context<Self>) {
+        let splices = self.model.toggle_tool(entry);
+        self.splices(splices, cx);
+    }
+
+    /// `toggle_agent_tool_details`.
+    pub fn toggle_tool_details(&mut self, cx: &mut Context<Self>) {
+        let splices = self.model.toggle_tool_details();
         self.splices(splices, cx);
     }
 

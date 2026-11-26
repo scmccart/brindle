@@ -56,6 +56,14 @@ osc99 = true
 # or any tab while its window isn't focused). "always": every time.
 when = "unfocused"
 
+# Agent zones. A tool call row opens to show the call's diffs, command output
+# and other content: "open" or "closed" while the call runs (tool_details),
+# and once it has finished (tool_details_when_done). A row you open or close
+# by hand stays as you left it.
+[agent]
+tool_details = "open"
+tool_details_when_done = "closed"
+
 # ---------------------------------------------------------------------------
 # Profiles. Open the new-tab palette with ctrl-shift-space, or open profile N
 # directly with ctrl-alt-N. Profiles can also be edited in the settings dialog

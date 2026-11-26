@@ -7,10 +7,14 @@
 //! Pure: values in, values out.
 
 pub use brindle_transcript::{
-    Activity, AgentState, Conversation, Entry, EntryId, Event, HoldReason, LoginKind, LoginMethod, NoticeLevel,
-    PAGE_BYTES, PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolKind, ToolStatus, Transcript,
-    TurnState, Window,
+    Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange, FileOp, HoldReason,
+    LoginKind, LoginMethod, NoticeLevel, Output, PAGE_BYTES, PermissionKind, PermissionOption, PermissionOutcome, Slot,
+    StopReason, ToolItem, ToolKind, ToolStatus, Transcript, TurnState, Window,
 };
+
+/// What the zone's tests build tool content with.
+#[cfg(test)]
+pub use brindle_transcript::{Hunk, Location};
 
 /// What the zone's tests build conversations with; the zone itself reads
 /// only whether one is continuable.
