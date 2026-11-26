@@ -1603,11 +1603,14 @@ impl Step<'_> {
                     if let Some(open) = self.output(entry, &terminal) {
                         let text = plain::feed(&mut open.filter, &bytes);
                         let (id, item) = (open.entry, open.item);
-                        if !text.is_empty() {
+                        // In `TEXT_CHUNK` pieces, so every event fits a
+                        // frame however much one delta carries; they fold
+                        // as the whole text would.
+                        for piece in chunks(&text).filter(|piece| !piece.is_empty()) {
                             self.emit(Event::ToolOutput {
                                 id,
                                 item,
-                                text,
+                                text: piece.to_owned(),
                                 exit: None,
                             });
                         }
@@ -3507,6 +3510,39 @@ mod tests {
         for event in &out.events {
             assert!(event.to_value().to_string().len() < 1024 * 1024);
         }
+    }
+
+    /// One delta carrying 1 MiB of output (a frame's size) goes out in
+    /// `TEXT_CHUNK` pieces, each event fitting a frame, and the output
+    /// keeps what the whole text would: its newest lines within
+    /// `ITEM_LIMIT`, the rest counted.
+    #[test]
+    fn a_delta_past_a_frame_is_sent_in_pieces() {
+        let mut agent = Agent::ready();
+        agent.turn("run");
+        agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run",
+            "kind": "execute", "status": "in_progress", "content": [{"type": "terminal", "terminalId": "t1"}]})));
+        let line = |n: usize| format!("test case {n:06} ... ok\n");
+        let text: String = (0..(1024 * 1024 / line(0).len())).map(line).collect();
+        let out = agent.feed(&meta(
+            "c1",
+            json!({"terminal_output_delta": {"terminal_id": "t1", "data": text}}),
+        ));
+        let outputs: Vec<&Event> = out
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::ToolOutput { .. }))
+            .collect();
+        assert_eq!(outputs.len(), text.len().div_ceil(TEXT_CHUNK));
+        for event in &out.events {
+            assert!(event.to_value().to_string().len() < 128 * 1024);
+        }
+        let [ToolItem::Output(kept)] = &content_of(&tool_entry(&agent, "c1"))[..] else {
+            panic!("not one output");
+        };
+        assert!(kept.text.len() <= ITEM_LIMIT && kept.text.starts_with("test case "));
+        assert!(text.ends_with(&kept.text));
+        assert_eq!(kept.omitted as usize + kept.text.len(), text.len());
     }
 
     #[test]
