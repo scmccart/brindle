@@ -28,7 +28,7 @@ Each test in groups 1–3 is written first and run against today's code; note in
 ## 4. Docs and integration
 
 - [x] 4.1 Update `docs/code-map.md`'s `brindle-ui` entry with the wrapping-text pitfall beside the ellipsis pitfall, and its `agent/` Markdown bullet with the width rule; verify the entry names `trigger_label` and the `flex_1().min_w_0()` form.
-- [ ] 4.2 Run the integration chore: `cargo test --workspace --locked`, the clippy command above, the gallery's `--check` and `BRINDLE_E2E=1 cargo test --test e2e -- agent` under `scripts/with-xvfb` (through `systemd-run --user --scope` when run from inside Brindle); verify all pass and report the gallery and e2e lines for the new checks.
+- [x] 4.2 Run the integration chore: `cargo test --workspace --locked`, the clippy command above, the gallery's `--check` and `BRINDLE_E2E=1 cargo test --test e2e -- agent` under `scripts/with-xvfb` (through `systemd-run --user --scope` when run from inside Brindle); verify all pass and report the gallery and e2e lines for the new checks.
 
 ## Workflow follow-up
 
