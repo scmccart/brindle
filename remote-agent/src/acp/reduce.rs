@@ -2340,6 +2340,10 @@ impl Step<'_> {
         }
         let line = self.s.rpc.list(req, &self.s.cwd, cursor.as_deref());
         self.out.stdin.extend(line);
+        // The list itself isn't kept (flag 4), but the id it took is: a
+        // restored session never sends another request under it, so the
+        // agent's late answer is to no request.
+        self.mark(Moment::BeforeRequest);
         Ok(())
     }
 
@@ -7944,7 +7948,10 @@ mod tests {
     #[test]
     fn a_list_asks_for_the_sessions_directory_and_answers_with_its_conversations_only() {
         let mut agent = Agent::choosing_offering(listing_offered());
-        assert_eq!(agent.list(9, Some("p1")).reply, Some(Ok(())));
+        let out = agent.list(9, Some("p1"));
+        assert_eq!(out.reply, Some(Ok(())));
+        // Its id is kept before it goes, though the list isn't (flag 4).
+        assert_eq!(out.checkpoint, Some(Moment::BeforeRequest));
         let list = agent.last("session/list").clone();
         assert_eq!(list["params"], json!({"cwd": "/home/u/src", "cursor": "p1"}));
         let out = agent.feed(&result(

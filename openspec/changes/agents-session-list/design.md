@@ -230,6 +230,7 @@ The user asked for open questions to be decided and flagged. Each is decided as 
 11. **A list out when the agent stops being read is answered** with why (`the agent has exited`, `the agent was lost with its holder`, the start's failure, `the terminal server's ACP handling failed`), so a palette waiting on it never hangs.
 12. **A `SPAWN_AGENT` naming both a `conversation` and `start: "choose"` is refused** ("SPAWN_AGENT can't both continue a conversation and choose one").
 13. **A chosen conversation continues as a fresh log's continue does**, so an agent offering both loads it with its replay shown (decision 2 of `agents-session-recovery`), and a resume-only agent resumes it with the notice that its earlier turns aren't shown.
+14. **A list's id is checkpointed, the list isn't** (flag 4, found by task 3.2's restart case): a list marks `BeforeRequest`, so the checkpoint the holder has before the agent's `session/list` already counts the id. Without it a restored session would send its next request under the same id, and the agent's late answer to the old list would answer it.
 
 ## The user's decisions
 

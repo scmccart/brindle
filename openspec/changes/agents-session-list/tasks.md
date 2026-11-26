@@ -23,9 +23,9 @@ Before starting:
 
 ## 3. Server roles
 
-- [ ] 3.1 Handle `SpawnAgent::start`, `AGENT_LIST` and `AGENT_CHOOSE` in the core (`server/core/{clients,agents,policy}.rs`, `AgentRequest::{List, Choose}`): gather, step, write the agent's line, answer `OK`, `AGENT_CONVERSATIONS` or `ERROR`; verify with real-role tests in `remote-agent/tests/agents.rs` through the fake ACP agent: a chooser lists and then continues a conversation in the same process (one spawn); a list through a ready agent; a choice of none; each refusal's text; paging with a cursor; a chooser closed without a choice leaving no session; a login during a list.
-- [ ] 3.2 Add the restart cases (`remote-agent/tests/upgrade.rs` or `agents.rs`): a choosing session keeps choosing across a core restart and an upgrade, and a choice is then carried out.
-- [ ] 3.3 Give the fake ACP agent what the cases need (offering `list`, answering `session/list` with pages and with an error) through its existing script steps, adding a step only if a case can't be written without one.
+- [x] 3.1 Handle `SpawnAgent::start`, `AGENT_LIST` and `AGENT_CHOOSE` in the core (`server/core/{clients,agents,policy}.rs`, `AgentRequest::{List, Choose}`): gather, step, write the agent's line, answer `OK`, `AGENT_CONVERSATIONS` or `ERROR`; verify with real-role tests in `remote-agent/tests/agents.rs` through the fake ACP agent: a chooser lists and then continues a conversation in the same process (one spawn); a list through a ready agent; a choice of none; each refusal's text; paging with a cursor; a chooser closed without a choice leaving no session; a login during a list.
+- [x] 3.2 Add the restart cases (`remote-agent/tests/upgrade.rs` or `agents.rs`): a choosing session keeps choosing across a core restart and an upgrade, and a choice is then carried out.
+- [x] 3.3 Give the fake ACP agent what the cases need (offering `list`, answering `session/list` with pages and with an error) through its existing script steps, adding a step only if a case can't be written without one.
 
 ## 4. Brindle's model
 

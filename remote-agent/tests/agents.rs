@@ -25,7 +25,7 @@ use brindle_transcript::{
 };
 
 use support::fake_agent::{
-    AgentScript, Gate, LOAD_ONLY, NEITHER, RESUME_AND_LOAD, RESUME_ONLY, TERMINAL_LOGIN, TWO_LOGINS,
+    AgentScript, Gate, LISTS, LOAD_ONLY, NEITHER, RESUME_AND_LOAD, RESUME_ONLY, TERMINAL_LOGIN, TWO_LOGINS,
     ask, continuable, initialized, methods, offering_logins, prompts, recorded, responses, said,
     started, stop, title, update, user_said,
 };
@@ -3411,4 +3411,212 @@ fn output_streamed_across_a_core_kill_ends_as_an_uninterrupted_runs() {
     assert_eq!((start.session, start.pid), (id, pid));
     let log = client.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
     assert_eq!(output_of(&log), Some((expected, Some(Exit::Code { code: 0 }))));
+}
+
+// --- choosing and listing (OpenSpec change `agents-session-list`, 3.1) ---
+
+fn choosing(log: &Transcript) -> bool {
+    matches!(log.agent(), AgentState::Choosing { .. })
+}
+
+/// A `SPAWN_AGENT` of `script` that chooses, working in `cwd`.
+fn chooser(script: &Path, cwd: &str) -> client::SpawnAgent {
+    client::SpawnAgent {
+        cwd: Some(cwd.to_owned()),
+        start: Some(client::SpawnStart::Choose),
+        ..client_agent(script)
+    }
+}
+
+/// A `respond` step answering `session/list` with `sessions` and `next`.
+fn list_answer(sessions: Value, next: Option<&str>) -> String {
+    let mut result = json!({ "sessions": sessions });
+    if let Some(next) = next {
+        result["nextCursor"] = json!(next);
+    }
+    format!("respond {result}")
+}
+
+fn conversation_ids(listed: &client::AgentConversations) -> Vec<&str> {
+    listed.conversations.iter().map(|conversation| conversation.id.as_str()).collect()
+}
+
+#[test]
+fn a_chooser_lists_pages_and_continues_a_conversation_in_the_same_agent() {
+    let (mut dir, mut client) = agent_core("agent-choose-list", &[]);
+    let cwd = dir.path.display().to_string();
+    let (mut script, record) = initialized(&dir.path, "chooser", LISTS);
+    script
+        .step("expect session/list")
+        .step(list_answer(
+            json!([
+                {"sessionId": "c1", "cwd": cwd, "title": "First", "updatedAt": "2026-11-26T18:05:00Z"},
+                {"sessionId": "elsewhere", "cwd": "/not/here"}
+            ]),
+            Some("p2"),
+        ))
+        .step("expect session/list")
+        .step(list_answer(json!([{"sessionId": "c2", "cwd": cwd}]), None))
+        .step("expect session/load")
+        .step(said("welcome back"))
+        .step("respond {}");
+    let (id, pid) = spawned(&mut client, &mut dir, chooser(&script.write(), &cwd));
+    let log = client.transcript_until(id, "is choosing", choosing);
+    assert_eq!(*log.agent(), AgentState::Choosing { message: None });
+    assert!(log.conversation().is_none());
+
+    let first = client.list_conversations(id, None).unwrap();
+    assert_eq!(conversation_ids(&first), ["c1"]);
+    assert_eq!(first.conversations[0].title.as_deref(), Some("First"));
+    assert_eq!(first.conversations[0].updated.as_deref(), Some("2026-11-26T18:05:00Z"));
+    assert_eq!(first.next.as_deref(), Some("p2"));
+    let second = client.list_conversations(id, first.next.as_deref()).unwrap();
+    assert_eq!(conversation_ids(&second), ["c2"]);
+    assert_eq!(second.next, None);
+
+    client.choose(id, Some("c1")).unwrap();
+    let log = client.transcript_until(id, "is ready", ready);
+    assert_eq!(log.conversation().map(|conversation| conversation.id.as_str()), Some("c1"));
+    let sent = recorded(&record);
+    assert_eq!(methods(&record), ["initialize", "session/list", "session/list", "session/load"]);
+    assert_eq!(sent[1]["params"], json!({"cwd": cwd}));
+    assert_eq!(sent[2]["params"], json!({"cwd": cwd, "cursor": "p2"}));
+    assert_eq!(sent[3]["params"], json!({"sessionId": "c1", "cwd": cwd, "mcpServers": []}));
+    // One agent, listed as the session's, all along.
+    assert_eq!(listed(&mut client, id).map(|info| info.pid), Some(pid));
+}
+
+#[test]
+fn a_choice_of_none_starts_a_new_conversation_and_a_ready_agent_lists_too() {
+    let (mut dir, mut client) = agent_core("agent-choose-new", &[]);
+    let cwd = dir.path.display().to_string();
+    let (mut script, record) = initialized(&dir.path, "new", LISTS);
+    script
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/list")
+        .step(list_answer(json!([{"sessionId": "s1", "cwd": cwd}]), None));
+    let (id, _) = spawned(&mut client, &mut dir, chooser(&script.write(), &cwd));
+    client.transcript_until(id, "is choosing", choosing);
+    client.choose(id, None).unwrap();
+    client.transcript_until(id, "is ready", ready);
+    let listed = client.list_conversations(id, None).unwrap();
+    assert_eq!(conversation_ids(&listed), ["s1"]);
+    assert_eq!(methods(&record), ["initialize", "session/new", "session/list"]);
+    let refusal = client.choose(id, Some("s1")).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent isn't choosing"));
+}
+
+#[test]
+fn a_list_is_refused_with_its_reason() {
+    let (mut dir, mut client) = agent_core("agent-list-refused", &[]);
+    let cwd = dir.path.display().to_string();
+    // An agent that offers no list.
+    let (script, _) = initialized(&dir.path, "unlisted", RESUME_AND_LOAD);
+    let (id, _) = spawned(&mut client, &mut dir, chooser(&script.write(), &cwd));
+    client.transcript_until(id, "is choosing", choosing);
+    let refusal = client.list_conversations(id, None).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent can't list conversations"));
+
+    // A second list while one is out, then the agent's own error.
+    let (mut script, _) = initialized(&dir.path, "busy", LISTS);
+    script.step("expect session/list");
+    let gate = script.gate();
+    script.step(r#"respond-error -32603 "index unavailable""#);
+    let (busy, _) = spawned(&mut client, &mut dir, chooser(&script.write(), &cwd));
+    client.transcript_until(busy, "is choosing", choosing);
+    let req = 9_000;
+    client.send(client::ToCore::AgentList(client::AgentList { req, session: busy, cursor: None }));
+    let refusal = client.list_conversations(busy, None).unwrap_err();
+    assert_eq!(refusal.message, format!("session {busy}: a list of conversations is already being answered"));
+    gate.open();
+    match client.reply(req) {
+        ToClient::Error(error) => assert_eq!(
+            error.message,
+            format!("session {busy}: the agent couldn't list its conversations: index unavailable")
+        ),
+        other => panic!("expected the list's ERROR, got {other:?}"),
+    }
+    // A choosing agent is still choosing.
+    assert!(choosing(&client.transcript_until(busy, "is choosing", choosing)));
+}
+
+#[test]
+fn a_chooser_closed_without_a_choice_leaves_no_session() {
+    let (mut dir, mut client) = agent_core("agent-choose-close", &[]);
+    let cwd = dir.path.display().to_string();
+    let (script, record) = initialized(&dir.path, "closed", LISTS);
+    let (id, pid) = spawned(&mut client, &mut dir, chooser(&script.write(), &cwd));
+    client.transcript_until(id, "is choosing", choosing);
+    client.send(client::ToCore::Close(client::SessionRef { session: id }));
+    exit_of(&mut client, id);
+    assert!(eventually(Duration::from_secs(10), || !alive(pid)), "the agent outlived its close");
+    assert!(listed(&mut client, id).is_none());
+    assert_eq!(methods(&record), ["initialize"]);
+}
+
+/// Task 3.2: the core is killed while a chooser's list is out; the next
+/// core adopts it still choosing, ignores the agent's late answer (the
+/// list isn't checkpointed, flag 4), lists again and carries out a choice.
+#[test]
+fn a_choosing_session_keeps_choosing_across_a_core_restart_and_then_chooses() {
+    let tag = "agent-choose-killed";
+    let (mut dir, mut client) = agent_core(tag, &[]);
+    let cwd = dir.path.display().to_string();
+    let (mut script, record) = initialized(&dir.path, "killed", LISTS);
+    script.step("expect session/list");
+    let gate = script.gate();
+    script
+        .step(list_answer(json!([{"sessionId": "late", "cwd": cwd}]), None))
+        .step("expect session/list")
+        .step(list_answer(json!([{"sessionId": "c1", "cwd": cwd}]), None))
+        .step("expect session/load")
+        .step("respond {}");
+    let spawn = client::SpawnAgent { policy: client::Policy::Detach, ..chooser(&script.write(), &cwd) };
+    let (id, pid) = spawned(&mut client, &mut dir, spawn);
+    client.transcript_until(id, "is choosing", choosing);
+    client.send(client::ToCore::AgentList(client::AgentList { req: 9_000, session: id, cursor: None }));
+    // The agent has the list, so the holder has the checkpoint before it.
+    until("the agent gets session/list", TIMEOUT, || methods(&record).contains(&"session/list".to_owned()).then_some(()));
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, &format!("token-{tag}"), || {});
+    let (start, _) = client.reconnect_replay();
+    assert_eq!((start.session, start.pid), (id, pid));
+    assert_eq!(*client.transcript(id).agent(), AgentState::Choosing { message: None });
+    gate.open();
+    let listed = client.list_conversations(id, None).unwrap();
+    assert_eq!(conversation_ids(&listed), ["c1"], "the late answer answered nothing");
+    let sent = recorded(&record);
+    assert_ne!(sent[1]["id"], sent[2]["id"], "the restored session took a new id");
+    client.choose(id, Some("c1")).unwrap();
+    let log = client.transcript_until(id, "is ready", ready);
+    assert_eq!(log.conversation().map(|conversation| conversation.id.as_str()), Some("c1"));
+    assert_eq!(methods(&record), ["initialize", "session/list", "session/list", "session/load"]);
+}
+
+#[test]
+fn a_login_a_list_needs_returns_the_agent_to_choosing() {
+    let (mut dir, mut client) = agent_core("agent-list-login", &[]);
+    let cwd = dir.path.display().to_string();
+    let (mut script, record) = offering_logins(&dir.path, "login", LISTS, TWO_LOGINS);
+    script
+        .step("expect session/list")
+        .step(r#"respond-error -32000 "log in first""#)
+        .step("expect authenticate")
+        .step("respond {}")
+        .step("expect session/list")
+        .step(list_answer(json!([]), None));
+    let (id, _) = spawned(&mut client, &mut dir, chooser(&script.write(), &cwd));
+    client.transcript_until(id, "is choosing", choosing);
+    let refusal = client.list_conversations(id, None).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent needs a login"));
+    let log = client.transcript_until(id, "needs a login", |log| {
+        matches!(log.agent(), AgentState::LoginRequired { .. })
+    });
+    assert!(matches!(log.agent(), AgentState::LoginRequired { message, .. } if message == "log in first"));
+    client.login(id, "oauth-personal").unwrap();
+    client.transcript_until(id, "is choosing again", choosing);
+    let listed = client.list_conversations(id, None).unwrap();
+    assert!(listed.conversations.is_empty());
+    assert_eq!(methods(&record), ["initialize", "session/list", "authenticate", "session/list"]);
 }

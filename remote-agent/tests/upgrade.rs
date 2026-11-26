@@ -28,7 +28,7 @@ use brindle_transcript::{
 };
 
 use support::fake_agent::{
-    LOAD_ONLY, NEITHER, TWO_LOGINS, ask, initialized, methods, offering_logins, prompts, recorded,
+    LISTS, LOAD_ONLY, NEITHER, TWO_LOGINS, ask, initialized, methods, offering_logins, prompts, recorded,
     responses, said, started, stop, update, user_said,
 };
 use support::programs::{self, ENTER, say};
@@ -547,6 +547,44 @@ fn upgraded(dir: &mut TempDir, client: &mut TestClient, session: SessionId, pid:
     let (start, _) = client.reconnect_replay();
     assert_eq!((start.session, start.pid), (session, pid));
     client
+}
+
+/// OpenSpec change `agents-session-list`, task 3.2: a choosing session
+/// comes through an upgrade still choosing, its agent still listing, and
+/// the next core carries out a choice.
+#[test]
+fn a_choosing_session_survives_an_upgrade_and_then_chooses() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-choosing");
+    let cwd = dir.path.display().to_string();
+    let (mut script, record) = initialized(&dir.path, "choosing", LISTS);
+    // `s1`, the conversation `said` speaks in.
+    let answer = json!({"sessions": [{"sessionId": "s1", "cwd": cwd, "title": "Earlier"}]});
+    script
+        .step("expect session/list")
+        .step(format!("respond {answer}"))
+        .step("expect session/load")
+        .step(said("loaded"))
+        .step("respond {}");
+    let spawn = client::SpawnAgent {
+        cwd: Some(cwd.clone()),
+        start: Some(client::SpawnStart::Choose),
+        policy: client::Policy::Detach,
+        ..client_agent(&script.write())
+    };
+    let (id, pid) = client.spawn_agent(spawn);
+    dir.track(pid);
+    let choosing = |log: &Transcript| matches!(log.agent(), AgentState::Choosing { .. });
+    let before = client.transcript_until(id, "is choosing", choosing);
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    assert_eq!(client.transcript(id), before);
+    let listed = client.list_conversations(id, None).unwrap();
+    assert_eq!(listed.conversations.len(), 1);
+    assert_eq!(listed.conversations[0].title.as_deref(), Some("Earlier"));
+    client.choose(id, Some("s1")).unwrap();
+    let log = client.transcript_until(id, "is ready", agent_ready);
+    assert_eq!(says(&log), ["agent: loaded"]);
+    assert_eq!(methods(&record), ["initialize", "session/list", "session/load"]);
 }
 
 #[test]

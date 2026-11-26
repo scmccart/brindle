@@ -1332,6 +1332,48 @@ impl TestClient {
         self.agent_reply(req)
     }
 
+    /// `AGENT_LIST` (OpenSpec change `agents-session-list`): a page of the
+    /// agent's conversations after `cursor`, as `AGENT_CONVERSATIONS`
+    /// answers it, or the refusal. Other messages are kept for later.
+    pub fn list_conversations(
+        &mut self,
+        session: SessionId,
+        cursor: Option<&str>,
+    ) -> Result<client::AgentConversations, client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentList(client::AgentList {
+            req,
+            session,
+            cursor: cursor.map(str::to_owned),
+        }));
+        let mut kept = Vec::new();
+        let result = loop {
+            match self.recv() {
+                ToClient::AgentConversations(listed) if listed.req == req => {
+                    assert_eq!(listed.session, session);
+                    break Ok(listed);
+                }
+                ToClient::Error(error) if error.req == Some(req) => break Err(error),
+                other => kept.push(other),
+            }
+        };
+        kept.extend(self.backlog.drain(..));
+        self.backlog = kept.into();
+        result
+    }
+
+    /// `AGENT_CHOOSE` (`agents-session-list`): continue `conversation`, or
+    /// start a new one with `None`.
+    pub fn choose(&mut self, session: SessionId, conversation: Option<&str>) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentChoose(client::AgentChoose {
+            req,
+            session,
+            conversation: conversation.map(str::to_owned),
+        }));
+        self.agent_reply(req)
+    }
+
     /// `AGENT_CANCEL`, which has no reply (an `ERROR` without a `req` if
     /// it is refused).
     pub fn cancel(&mut self, session: SessionId) {
