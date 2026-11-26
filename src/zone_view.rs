@@ -2041,7 +2041,8 @@ mod tests {
             assert!(view.terminals(cx).is_empty());
             let content = view.active_content().expect("the agent zone");
             assert!(content.terminal_view().is_none());
-            assert_eq!(content.title("Shell", cx).as_ref(), "Fake Agent");
+            // The agent's profile's name, not the agent's own.
+            assert_eq!(content.title("Shell", cx).as_ref(), "Fake");
             assert_eq!(content.working_directory(cx), None);
             assert!(!content.unrecorded(cx), "an open session is recorded");
             assert_eq!(view.zone_records(cx).len(), 1);
@@ -2308,7 +2309,7 @@ mod tests {
         zone.feed(&[ready(), Event::Turn { state: TurnState::Blocked }]);
         settle(tab.cx);
         let closing = tab.view.read_with(tab.cx, |view, cx| view.closing(cx));
-        assert!(matches!(&closing[..], [Closing::Agent { name, .. }] if name == "Fake Agent"));
+        assert!(matches!(&closing[..], [Closing::Agent { name, .. }] if name == "Fake"));
         assert!(matches!(close_plan(&closing), ClosePlan::Ask(busy) if describe_busy(&busy) == "1:blocked"));
 
         let shell = Tab::new(&mut app, Profile::default_shell(), |cx| {

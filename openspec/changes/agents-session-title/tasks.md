@@ -18,9 +18,9 @@ Run `cargo test --workspace` and `cargo clippy --locked --workspace --all-target
 
 ## 3. Brindle (decisions 5 and 6)
 
-- [ ] 3.1 Make `ChatModel::title()` the conversation's title else the profile's, add `agent_label()` for `failure_text`'s `{agent}`, and update the model's title tests: the agent's own name doesn't title the zone, a title and a cleared title emit `title_changed`, a profile rename still retitles an untitled zone, a respawn falls back to the profile's name; verify with `cargo test -p brindle agent::model`.
-- [ ] 3.2 Add `TabTitle::{Automatic, Manual}` to `policy::layout`, with the agent arm appending a manual title only when it differs from the notice's title; build it in `Workspace::on_attention` from the tab's `manual_title`; unit tests for an automatic tab, a manual one, a manual one equal to the zone's title, and the programs' arms unchanged; verify with `cargo test -p brindle notify::policy`.
-- [ ] 3.3 Update the agent entity and view tests that expected the tab or zone to read `Fake Agent` (`src/agent/tests.rs`, `src/agent/view/tests.rs`) to the profile's name.
+- [x] 3.1 Make `ChatModel::title()` the conversation's title else the profile's, add `agent_label()` for `failure_text`'s `{agent}`, and update the model's title tests: the agent's own name doesn't title the zone, a title and a cleared title emit `title_changed`, a profile rename still retitles an untitled zone, a respawn falls back to the profile's name; verify with `cargo test -p brindle agent::model`.
+- [x] 3.2 Add `TabTitle::{Automatic, Manual}` to `policy::layout`, with the agent arm appending a manual title only when it differs from the notice's title; build it in `Workspace::on_attention` from the tab's `manual_title`; unit tests for an automatic tab, a manual one, a manual one equal to the zone's title, and the programs' arms unchanged; verify with `cargo test -p brindle notify::policy`.
+- [x] 3.3 Update the agent entity and view tests that expected the tab or zone to read `Fake Agent` (`src/agent/tests.rs`, `src/agent/view/tests.rs`) to the profile's name.
 
 ## 4. End to end and docs
 
