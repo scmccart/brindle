@@ -20,11 +20,19 @@ A tool call SHALL be shown as a row whose line holds an icon for its kind, its t
 - **THEN** its row is one line with no sign that it opens
 
 ### Requirement: Permission rows
-A permission request SHALL be shown as a row with its title and one button per option the agent offers, labelled with the option's name, allow options before reject options. While the request is pending, the detail of the tool call it names SHALL be shown with it, above its buttons, whatever the settings, and SHALL NOT be shown a second time in that tool call's own row. Choosing an option SHALL send it as the answer. Once answered, the row SHALL show the chosen option, or that the request was cancelled, and offer no buttons and no detail.
+A permission request SHALL be shown as a row with its title and one button per option the agent offers, labelled with the option's name, reject options before allow options, each group in the agent's order. While the request is pending, the detail of the tool call it names SHALL be shown with it, above its buttons, whatever the settings, and SHALL NOT be shown a second time in that tool call's own row. Choosing an option SHALL send it as the answer. Once answered, the row SHALL show the chosen option, or that the request was cancelled, and offer no buttons and no detail.
+
+#### Scenario: Reject from the keyboard
+- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab and then enter
+- **THEN** the agent receives `Reject`, and the row says `Reject` was chosen
 
 #### Scenario: Allow from the keyboard
-- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab and then enter
+- **WHEN** the agent asks `Run cargo test?` with options `Allow once` and `Reject`, the prompt input has focus, nothing is queued, and the user presses tab twice and then enter
 - **THEN** the agent receives `Allow once`, and the row says `Allow once` was chosen
+
+#### Scenario: Rejects come first
+- **WHEN** the agent asks permission with options `Always allow`, `Allow once` and `Reject`, in that order
+- **THEN** the row's buttons read `Reject`, `Always allow`, `Allow once`, in that order
 
 #### Scenario: Reject with the pointer
 - **WHEN** a permission row is pending and the user clicks `Reject`
@@ -49,6 +57,21 @@ A permission request SHALL be shown as a row with its title and one button per o
 #### Scenario: A request naming no tool call
 - **WHEN** the agent asks permission without naming a tool call
 - **THEN** the row shows its title and buttons alone
+
+#### Scenario: Inside the dangerous row
+- **WHEN** the agent asks permission for a tool call that holds a file change, in any built-in theme
+- **THEN** the file change shows inside the row's destructive border, its added and removed lines on their own colours
+
+#### Scenario: A long turn before the request
+- **WHEN** Brindle restores an agent zone whose session waits on a permission request for a tool call with a file change, and more than a page of entries came between the tool call and the request
+- **THEN** the permission row shows the file change above its buttons, without the user scrolling up
+
+### Requirement: Agent commands in the palette
+While an agent zone has focus, the command palette SHALL list Stop Agent Turn, Remove Queued Prompt, Send Held Prompt Again, Copy Queued Prompt, Copy Last Agent Message, Copy Last Code Block, Toggle Agent Thoughts, Toggle Tool Details and Scroll Agent to Bottom, with the zone and tab commands, and SHALL NOT list commands that act on a terminal, such as Clear Scrollback or Find.
+
+#### Scenario: Palette in an agent zone
+- **WHEN** an agent zone has focus and the user opens the command palette
+- **THEN** it lists "Stop Agent Turn", "Copy Last Code Block", "Toggle Tool Details" and "Split Zone Right", and not "Clear Scrollback"
 
 ## ADDED Requirements
 
@@ -89,6 +112,10 @@ A tool call row that has a detail SHALL be open while its tool call is running a
 #### Scenario: A restored conversation
 - **WHEN** Brindle is launched and restores an agent zone whose earlier turns hold finished tool calls
 - **THEN** those rows are closed
+
+#### Scenario: Earlier messages fetched
+- **WHEN** the user scrolls an agent zone up and earlier entries holding finished tool calls with file changes are fetched
+- **THEN** those rows are closed, and no notification appears
 
 ### Requirement: Opening a tool call row
 A pointer press on the line of a tool call row that has a detail SHALL open or close it. A row SHALL stay as the user left it while its tool call changes. A detail SHALL add no keyboard stop.

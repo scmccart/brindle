@@ -1,81 +1,359 @@
 # Tasks
 
-Before starting, check that the changes this one builds on are implemented and archived (the user's decisions are settled; design.md lists them):
-- `agents-profiles` (and through it `agents-sessions`): `remote-agent/src/acp/{wire, rpc, reduce, checkpoint, lines}.rs`, `brindle-transcript` with `Entry::Tool`, `Event::ToolChanged` and `tests/fixtures/v4/`, `src/agent/model.rs` with `Block`/`BlockBody` and `Splice`s, `brindle-ui`'s `Tool` and `Confirmation`, the `--- entry` dump lines, the fake ACP agent.
-- `agents-markdown`: `src/agent/markdown.rs` (`render`), `brindle-ui`'s `Response` and `CodeBlock`, a message's parts as list items.
-- When stacked on `agents-session-recovery`, `agents-login` and `agents-log-paging`: their v1 requests and decoders are in `wire.rs` and `rpc.rs` and move with the rest in group 2; paging's fold ignores events below the floor.
-- Client protocol 4 and holder protocol H1 3 are still unreleased. If a release has shipped protocol 4, stop and raise design decision 8.
+Before starting, check these:
+- **The stack.** `agents-log-paging` is merged (PR #144) or this branch is rebased on it. Its archive is in `openspec/changes/archive/2026-11-26-agents-log-paging/`, and `openspec/specs/` holds its requirements: agent-sessions "Older entries are fetched on demand", agent-zones "Earlier messages". The other changes design.md's Context lists are archived on `main`.
+- **No release.** Client protocol 4, H1 3 and checkpoint format 2 are unreleased (`git tag --list 'v*'` ends at v0.3.0, and no release PR has merged since). If a release has shipped them, stop and raise design decision 8.
+- **The code.** It is as design.md's Context says:
+  - `acp/{wire,rpc,lines,reduce,checkpoint}.rs`, with `wire.rs` the only file naming `agent_client_protocol_schema::v1`;
+  - `Entry::Tool { call, title, kind, status }`;
+  - `Transcript::{page, fetch, prepend}` and `entry_change`;
+  - `ChatModel`'s `blocks_of` and `entry_line`;
+  - `brindle-ui`'s `Tool`;
+  - `tokens_over` and `destructive_tint`;
+  - no `[agent]` table in `src/config.rs`.
+  If a change merged since moved any of them, adjust the task naming it before starting.
+- **The flags.** The user's answers on design decision 17's flags. A flag overturned changes the tasks it names.
 
 ## 1. Captures and shared contracts
 
-- [ ] 1.1 Capture real ACP v1 agents (the ones `remote-agent/tests/fixtures/acp/` already has, as far as each can be run) doing an allowed edit of an existing file and an allowed shell command with several lines of output, once with today's `clientCapabilities: {}` and, for the agents that send `_meta.terminal_info`, once more with the `_meta` terminal-output flag they look for; and, for `agents-client-terminals`, once with `clientCapabilities.terminal: true`, answering any `terminal/create` with an error, to record which agents call it. Add the logs to `remote-agent/tests/fixtures/acp/` with identifying values replaced as the existing ones are; write down in design.md's "As built" what each agent sends for the diff and for the output and which called `terminal/create`; then apply design decision 6's rule: read the `_meta` convention only if a capture shows an agent's output arrives no other way, and move the command-output parts to `agents-acp-v2` if no v1 agent fills an `Output`.
-- [ ] 1.2 Add to `brindle-transcript`: `ToolItem`, `FileChange`, `FileOp`, `Hunk`, `DiffLine` (one string per line, the sign first), `Output`, `Exit`, `Location`; `Entry::Tool`'s `content`, `more`, `locations`, `input` and `result` (defaulted, omitted when empty); `Event::ToolChanged`'s `locations`, `input`, `result` and `more`; `Event::ToolItems` and `Event::ToolOutput`; `ITEM_LIMIT`, `MAX_ITEMS`, `CALL_LIMIT`, `RAW_LIMIT`, `MAX_LOCATIONS`; verify with unit tests that each form round-trips, that a `DiffLine` with another first character or no character is a `DecodeError`, and that every existing `tests/fixtures/v4/` file still passes unedited.
-- [ ] 1.3 Write the new forms' encodings as new files in `transcript/tests/fixtures/v4/` (a tool entry with each item kind, `tool_items` replacing, appending and clearing, `tool_output` with and without an exit, `tool_changed` with each new field); verify the fixture tests write them once and read them back, and that no existing fixture changed (`git diff --stat` shows additions only there).
-- [ ] 1.4 Add the fold for the new events: `ToolItems` (truncate to `from`, extend; `ItemsOutOfRange`), `ToolOutput` (append, then drop whole lines from the start past `ITEM_LIMIT` into `omitted`, a single over-long line cut at a character boundary; `NotAnOutput`), the new `ToolChanged` fields, the entry's kept size recomputed; extend `replay` (the entry with no content, then one `ToolItems` per item); verify with unit tests for each rule and error, the log unchanged on an error, the property `fold(replay(t)) == t` with tool content, the `LOG_LIMIT` trim over large tool entries, and the new forms in `fuzz.rs`.
+- [ ] 1.1 **Capture real ACP v1 agents.**
+  - Capture the agents already in `remote-agent/tests/fixtures/acp/` that can be run (Claude adapter, Antigravity, Copilot, Codex), with today's `initialize`, which offers `{"auth":{"terminal":true}}`. Each does two things:
+    - an allowed edit of an existing file;
+    - an allowed shell command printing several lines.
+  - For `agents-client-terminals`, capture each once more with `clientCapabilities.terminal: true`, answering any `terminal/create` with an error, to record which agents call it.
+  - Add the logs with identifying values replaced, as the existing ones are.
+  - Record in design.md, under a new "As built" note in decision 6, what each agent sends for the diff and the output, and which called `terminal/create`.
+  - Codex's `_meta` delivery is already captured (`codex-acp-2.12.0-reject.log`, flag 1). If an agent turns out to deliver output a third way, raise it before writing its mapping.
+  - Verify: the new logs replay through the existing capture replay test in `reduce.rs` with no panic.
+- [ ] 1.2 **Add the forms to `brindle-transcript`** (`transcript/src/lib.rs`).
+  - The types: `ToolItem`, `FileChange`, `FileOp`, `Hunk`, `DiffLine` (one string per line, the sign first), `Output`, `Exit` and `Location`.
+  - `Entry::Tool` gains `content`, `more`, `locations`, `input` and `result`, each `#[serde(default, skip_serializing_if = …)]`. Drop its "Its content isn't kept" doc line.
+  - `Event::ToolChanged` gains `locations`, `input`, `result` and `more`.
+  - Add `Event::ToolItems` and `Event::ToolOutput`.
+  - Add the constants `ITEM_LIMIT`, `MAX_ITEMS`, `CALL_LIMIT`, `RAW_LIMIT` and `MAX_LOCATIONS`.
+  - Re-export what the app uses from `src/agent/transcript.rs`.
+  - Verify with unit tests:
+    - each form round-trips;
+    - a `DiffLine` with another first character, or none, is a `DecodeError`;
+    - `decoding_refuses_what_isnt_an_event_and_ignores_unknown_fields` covers the new kinds;
+    - every existing `tests/fixtures/v4/` file, `added-tool.json` and `tool-changed-*.json` among them, still passes unedited.
+- [ ] 1.3 **Write the new forms' fixtures** as new files in `transcript/tests/fixtures/v4/`:
+  - a tool entry with each item kind;
+  - `tool-items-replaced`, `-appended` and `-cleared`;
+  - `tool-output` and `tool-output-exit`;
+  - `tool-changed-locations`, `-input`, `-result` and `-more`.
+  - Verify: the fixture tests write them once and read them back, and `git diff --stat` shows additions only in that directory.
+- [ ] 1.4 **Add the fold for the new events** in `Transcript::apply`.
+  - `ToolItems`: truncate to `from`, then extend. Past the end is `FoldError::ItemsOutOfRange`.
+  - `ToolOutput`: append, then keep the longest suffix within `ITEM_LIMIT` (whole lines dropped from the start, a single over-long line keeping its last bytes at a character boundary), adding the dropped bytes to `omitted`. A missing or other item is `FoldError::NotAnOutput`. The kept size grows by `escaped_len` and shrinks by the dropped text's.
+  - The new `ToolChanged` fields, through `resize_entry`.
+  - `entry_change` names both new kinds.
+  - `replay_entry` emits a tool entry as `Added` with no content, then one `ToolItems` per item.
+  - Verify with unit tests:
+    - each rule and error, with the log unchanged on an error;
+    - folding `ToolOutput(a)` then `ToolOutput(b)` equals folding `ToolOutput(a + b)`, as a property test over random texts and split points;
+    - `fold(replay(t)) == t` with tool content;
+    - the `LOG_LIMIT` trim over large tool entries;
+    - `fuzz::random_transcript` generating tool content, so the paging laws in `fuzz.rs` (page, fetch, prepend, live events below the window) run over it;
+    - a paged copy ignoring `ToolItems` and `ToolOutput` below its window.
+- [ ] 1.5 **Make `Transcript::page` reach waiting permissions' tool calls** (design decision 15). It lowers the start to the newest `Entry::Tool` with the `call` that each permission with no outcome names, before that permission.
+  - Verify with unit tests:
+    - a waiting permission whose tool entry is 2 MiB of entries before it starts the page at the tool entry;
+    - an answered permission's tool entry doesn't widen the page;
+    - a permission naming a call the log no longer holds pages as before.
+  - Verify also that the page property test's "holds every pending permission" now includes "and the tool entry each names".
 
 ## 2. One module per ACP version (no behaviour change)
 
-- [ ] 2.1 Split `remote-agent/src/acp/wire.rs` and `rpc.rs` into `envelope.rs` (`Id`, `Message`, `Malformed`, `decode`, `RpcError`), `forms.rs` (every type the reducer reads, and `Request`, the lines it asks to be written) and `v1/{decode, encode}.rs` (everything that names `agent_client_protocol_schema::v1`, an ACP method name or an ACP field name), moving the tests with their code; `rpc.rs` keeps ids, pending requests and held permissions and takes its lines from the dialect; verify every existing unit test, the capture replay test and `cargo test -p brindle-remote-agent` pass with changes to paths only.
-- [ ] 2.2 Add `acp/dialect.rs`: `Dialect { V1 }`, `newest()`, `from_version(n) -> Result<Dialect, Unsupported>`, and one method per decoder and for `encode(Request)`, each a single exhaustive `match self`; make the reducer hold the session's `Dialect` (set from `initialize`'s answer, restored from the checkpoint's version) and call it; verify with unit tests for `from_version` (1, 0, 2, 65535), that the "agent speaks ACP version N" failures read as before, and that a checkpoint from before the change restores its dialect.
-- [ ] 2.3 Add `Patch<T> { Keep, Clear, Set(T) }` to `forms.rs` and use it for `ToolChange`'s fields, with the reducer applying all three; verify with unit tests that `Clear` resets a title to the call id, a kind to `other` and a status to `pending`, and that v1's decoder never produces `Clear`.
-- [ ] 2.4 Add the rule to `docs/architecture/ports-and-adapters.md` (one module per ACP protocol version; `Dialect` matched only in `acp/dialect.rs`; a protocol version an outside program chooses is a seam like a platform, in `ports R6`'s text) and its row to `docs/architecture/README.md`; add `acp_versions_stay_in_their_modules` to `tests/architecture.rs` and the new whole pure modules to `PURE_MODULES` and `fcis`'s table; update `.claude/rules/remote-agent.md`; verify `cargo test -p brindle --test architecture` passes, and fails when a `v1::` path is added to `reduce.rs` (try it, then revert).
-- [ ] 2.5 Commit groups 2.1–2.4 on their own, before any tool content, so the move can be reviewed as a move.
+- [ ] 2.1 **Split `remote-agent/src/acp/wire.rs` and `rpc.rs`**:
+  - into `envelope.rs`: `Id`, `Message`, `Malformed`, `decode`, `RpcError`, `BadParams`;
+  - into `forms.rs`: every type the reducer reads (`Initialized`, `AgentInfo`, `Methods`, `NewSession`, `SessionUpdate`, `Update`, `Patch`, `Content`, `ContentKind`, `ToolCall`, `ToolChange`, `PermissionRequest`, `RequestedOption`, `OptionKind`, `RequestKind`, `NotificationKind`), and `Request`, the lines the reducer asks to be written;
+  - into `v1/decode.rs` and `v1/encode.rs`: everything that names `agent_client_protocol_schema::v1`, an ACP method name or an ACP field name. That covers `initialize_result`, `auth_methods`, `supported_versions`, `new_session_result`, `resume_result`, `load_result`, `prompt_result`, `session_update`, `permission_request`, `cancel_request`, `request_kind`, `notification_kind`, and the encoders behind `Rpc::{initialize, authenticate, new_session, resume, load, prompt}`, `cancel`, `cancel_request`, `permission_answer` and `error`.
+  - Move the tests with their code.
+  - `rpc.rs` keeps `Rpc`'s ids, outgoing purposes and held permissions, and takes its lines from the dialect.
+  - Update `acp/mod.rs`'s module docs.
+  - Verify: every existing unit test, the capture replay test and `cargo test -p brindle-remote-agent` pass with changes to paths only.
+- [ ] 2.2 **Add `acp/dialect.rs`.**
+  - `Dialect { V1 }`, `newest()`, and `from_version(n) -> Result<Dialect, Unsupported>`.
+  - One method per decoder, for `continued_result` (which takes `continued`'s `method == "session/load"` check out of `reduce.rs`, flag 15) and for `encode(Request)`. Each is a single exhaustive `match self`.
+  - The reducer holds the session's `Dialect`: set from `initialize`'s answer (in place of `initialized`'s `protocol_version == PROTOCOL_VERSION`), and restored by `checkpoint::decode` from `acp`.
+  - Verify with unit tests:
+    - `from_version` for 1, 0, 2 and 65535;
+    - the "the agent speaks ACP version N" and `supported_versions` failure texts read as before;
+    - a format 1 and a format 2 checkpoint from before the change restore their dialect.
+- [ ] 2.3 **Use `Patch<T>` (moved to `forms.rs`) for `ToolChange`'s fields**, with the reducer applying all three cases.
+  - Verify with unit tests:
+    - `Clear` resets a title to the call id, a kind to `other` and a status to `pending`;
+    - v1's decoder never produces `Clear` for a tool field;
+    - `session_info_update`'s title still keeps, clears and sets as before.
+- [ ] 2.4 **Add the rule** (`ports R14`).
+  - In `docs/architecture/ports-and-adapters.md`: one module per ACP protocol version; `Dialect` matched only in `acp/dialect.rs`; and, in `ports R6`'s text, a protocol version an outside program chooses is a seam like a platform. Add its "Enforced by" line.
+  - Add its row to `docs/architecture/README.md`.
+  - Add `acp_versions_stay_in_their_modules` to `tests/architecture.rs`.
+  - Add `acp/{envelope,forms,dialect}.rs` and `acp/v1/{decode,encode}.rs` to `PURE_MODULES` and `fcis`'s table, in place of `acp/wire.rs`.
+  - Update `.claude/rules/remote-agent.md`.
+  - Verify: `cargo test -p brindle --test architecture` passes, and fails when a `v1::` path is added to `reduce.rs` (try it, then revert).
+- [ ] 2.5 **Commit 2.1–2.4 on their own**, before any tool content, as `refactor(remote): …`, so the move can be reviewed as a move.
+  - Verify: `cargo test --workspace` and the clippy command pass at that commit.
 
 ## 3. Pure code in the server
 
-- [ ] 3.1 Add the `similar` dependency to `brindle-remote-agent` as design decision 4 says (`cargo add similar@3.2.1 --no-default-features -F text -p brindle-remote-agent`; default features only if `text` doesn't build without `std`); check that `git diff Cargo.lock` shows exactly one added package and one added dependency name, and revert and pin if anything else moved; add `similar` to the crate's closed list in `tests/architecture.rs`, `ports R3`'s text and `.claude/rules/remote-agent.md`, and add `only_the_diff_module_names_similar`; verify `cargo test -p brindle --test architecture` passes.
-- [ ] 3.1a Add `acp/diff.rs`: `hunks(old, new) -> Diffed` over `similar`'s `Algorithm::Myers` with no deadline or timeout (line diff, groups with three lines of context turned into `Hunk`s with 1-based starts and lines without their line breaks, lines kept up to `ITEM_LIMIT` with the rest counted, the `MAX_DIFF_LINES` guard as one replacing hunk); verify with unit tests that applying the hunks to `old` gives `new` for a table of edits and 10,000 deterministic pseudo-random pairs, an absent `old`, texts with and without a final line break, 1-based line numbers, 50,000 lines against 50,000 unrelated lines finishing and cut at `ITEM_LIMIT`, the guard, and the same inputs giving the same hunks twice.
-- [ ] 3.2 Add `acp/plain.rs`: `feed(state, bytes) -> String` removing CSI, OSC, DCS and the other string forms and single-character escapes, keeping `\n` and `\t`, and keeping only what follows a line's last carriage return, with its state encodable for the checkpoint; verify with unit tests for each form, every split point of a sequence across two calls, a progress line, an unterminated string form bounded in what it holds back, and invalid UTF-8.
-- [ ] 3.3 Add the tool content mapping to `acp/v1/decode.rs` per design decision 3 and the outcome of 1.1: items decoded one by one from the raw JSON with a count of those unreadable, `RawDiff`, `locations`, `rawInput` and `rawOutput` as text, and the same for a permission request's `toolCall`; verify with unit tests over every captured `tool_call`, `tool_call_update` and permission request line, an item of the wrong shape, a diff with no `newText`, an unknown `type`, a non-text block, and raw values that are a string, an object and a 9 MiB string.
-- [ ] 3.4 Extend the reducer's tool handling: the upsert over `Patch` fields; `RawDiff` to `FileChange` through `diff::hunks`; every bound of design decision 5 applied before an event is made; equal content emitting nothing; the output forms through `plain::feed`; the one notice for unreadable items; the permission request's `toolCall` applied to its tool entry first (adding it when missing; never title, kind or status); verify with unit tests for each, including the Claude capture's resent content emitting one `ToolItems`, Antigravity's content arriving only in the request, and Copilot's differing title.
-- [ ] 3.5 Extend `acp/checkpoint.rs` for the new entry fields and the output filter's state, format 1 amended; verify with unit tests that a session with a diff and a half-received escape sequence round-trips, and that a checkpoint written before this change still decodes.
-- [ ] 3.6 Extend the capture replay test in `reduce.rs` to assert what each agent's tool content becomes (Claude's and Antigravity's file changes, Copilot's raw input, and the captures of 1.1), with no panic and no unbounded entry.
+- [ ] 3.1 **Add the `similar` dependency** to `brindle-remote-agent` as design decision 4 says: `cargo add similar@3.2.1 --no-default-features -F text -p brindle-remote-agent`, or the default features only if `text` doesn't build without `std`.
+  - Check that `git diff Cargo.lock` shows exactly one added package and one added dependency name. If anything else moved, revert and pin.
+  - Add `similar` to the crate's `ALLOWED` list in `tests/architecture.rs`, `ports R3`'s text and `.claude/rules/remote-agent.md`.
+  - Add `only_the_diff_module_names_similar`, which also refuses `deadline` and `timeout` in `diff.rs`.
+  - Verify: `cargo test -p brindle --test architecture` passes.
+- [ ] 3.2 **Add `acp/diff.rs`.** `hunks(old, new) -> Diffed`, over `similar`'s `Algorithm::Myers` with no deadline or timeout:
+  - a line diff;
+  - groups with three lines of context, turned into `Hunk`s with 1-based starts and lines without their line breaks;
+  - lines kept up to `ITEM_LIMIT`, the rest counted;
+  - the `MAX_DIFF_LINES` guard as one replacing hunk.
+  - Add it to `PURE_MODULES`.
+  - Verify with unit tests:
+    - applying the hunks to `old` gives `new`, for a table of edits and for 10,000 deterministic pseudo-random pairs;
+    - an absent `old`;
+    - texts with and without a final line break;
+    - 1-based line numbers;
+    - 50,000 lines against 50,000 unrelated lines finishing and cut at `ITEM_LIMIT`;
+    - the guard;
+    - the same inputs giving the same hunks twice.
+- [ ] 3.3 **Add `acp/plain.rs`.** `feed(state, bytes) -> String`:
+  - removes CSI, OSC, DCS and the other string forms, and single-character escapes;
+  - keeps `\n` and `\t`;
+  - keeps only what follows a line's last carriage return;
+  - has its state encodable for the checkpoint.
+  - Add it to `PURE_MODULES`.
+  - Verify with unit tests:
+    - each form;
+    - every split point of a sequence across two calls;
+    - a progress line;
+    - an unterminated string form bounded in what it holds back;
+    - invalid UTF-8.
+- [ ] 3.4 **Add the tool content mapping to `acp/v1/decode.rs`** (design decisions 3 and 6, flag 14).
+  - The crate decodes the update with `content`, `locations`, `rawInput`, `rawOutput` and `_meta` taken out.
+  - Items are decoded one at a time, with a count of those unreadable.
+  - `RawDiff`, `Terminal { terminal }`, `locations`, and `rawInput` and `rawOutput` as text.
+  - `_meta.terminal_info`, `terminal_output_delta` and `terminal_exit` become `OutputForm`s.
+  - A permission request's `toolCall` decodes the same way.
+  - Verify with unit tests:
+    - every captured `tool_call`, `tool_call_update` and permission request line, including Codex's three `_meta` updates and the rejected command's null exit;
+    - an item of the wrong shape, which keeps the update's status;
+    - a diff with no `newText`;
+    - an unknown `type`;
+    - a non-text block;
+    - raw values that are a string, an object and a 9 MiB string.
+- [ ] 3.5 **Extend the reducer's tool handling** (`Step::tool_call`, `tool_change`, `add_tool`, `change_tool` and `permission`).
+  - The upsert over `Patch` fields.
+  - `RawDiff` becomes a `FileChange` through `diff::hunks`.
+  - Every bound of design decision 5 is applied before an event is made.
+  - Equal content emits nothing.
+  - The open outputs (`AgentSession.outputs`, `MAX_OPEN_OUTPUTS`), with `OutputForm`s through `plain::feed`. A replaced list keeps the output of a terminal it still names.
+  - The one notice for unreadable items.
+  - The permission request's `toolCall` is applied to its tool entry first. It adds the entry when missing, and never changes title, kind or status.
+  - `Step::trim` matches the new kinds and forgets the trimmed entries' outputs.
+  - A restart (`Step::restart`, `restart_for_login`) closes open outputs.
+  - Verify with unit tests for each, including:
+    - the Claude capture's resent content emitting one `ToolItems`;
+    - Antigravity's content arriving only in the request;
+    - Copilot's differing title;
+    - Codex's `pwd` ending as one `Output` with text `/home/user/scratch\n` and exit 0;
+    - a muted load applying no content.
+- [ ] 3.6 **Extend `acp/checkpoint.rs`** (format 2, amended).
+  - The new entry fields.
+  - `outputs` in the base's and every segment's state; absent is none.
+  - `merged` merges consecutive `ToolOutput`s of one item up to `ITEM_LIMIT`, keeping the later exit.
+  - `decode` checks that each open output names a held tool entry's `Output` item.
+  - Update the module's format docs.
+  - Verify with unit tests:
+    - a session with a diff and a half-received escape sequence round-trips, whole and as base plus segments;
+    - the merged `ToolOutput`s fold to the same log;
+    - a format 2 and a format 1 checkpoint written before this change still decode;
+    - an output naming no entry is `Unreadable`.
+- [ ] 3.7 **Extend the capture replay test in `reduce.rs`** to assert what each agent's tool content becomes: Claude's and Antigravity's file changes, Claude's `-auto` new file, Copilot's raw input, Codex's output, and the captures of 1.1. Also assert no panic and no unbounded entry.
 
 ## 4. Server roles
 
-- [ ] 4.1 Add fake ACP agent scripts and real-role tests in `remote-agent/tests/agents.rs`: a diff reaches an attached client as `tool_items`; output streamed in pieces arrives piece by piece and ends with its exit; 200 KiB of output leaves the client's fold and the server's log equal; a detached session replays its content on attach.
-- [ ] 4.2 Add the restart and upgrade cases (in `agents.rs` and `upgrade.rs`'s agent cases): a core killed in the middle of streamed output adopts the session and ends with the same output text as an uninterrupted run; an upgrade keeps a tool call's file change.
-- [ ] 4.3 Check `brindle-remote list --json` and the helper's size: the session's agent object is unchanged, and the static musl build links (`cargo build -p brindle-remote-agent --release --target x86_64-unknown-linux-musl`, with the Docker command in README.md) with `similar` as the only new package in `Cargo.lock`; note the helper's size before and after in the PR.
+- [ ] 4.1 **Add fake ACP agent scripts and real-role tests in `remote-agent/tests/agents.rs`**:
+  - a diff reaches an attached client as `tool_items`;
+  - output streamed in `_meta` pieces arrives piece by piece and ends with its exit;
+  - 200 KiB of output leaves the client's fold and the server's log equal;
+  - a detached session replays its content on attach;
+  - a paged attach waiting on a permission whose tool call is more than a page back holds that tool call;
+  - a fetch returns a tool entry with output appended after the page was sent.
+- [ ] 4.2 **Add the restart and upgrade cases**, in `agents.rs` and `upgrade.rs`'s agent cases:
+  - a core killed (SIGKILL) in the middle of streamed output, with appended segments, adopts the session and ends with the same output text as an uninterrupted run;
+  - an upgrade keeps a tool call's file change.
+- [ ] 4.3 **Check `brindle-remote list --json` and the helper's size.**
+  - The session's agent object is unchanged.
+  - The static musl build links, with `similar` as the only new package in `Cargo.lock`: `cargo build -p brindle-remote-agent --release --target x86_64-unknown-linux-musl`, with the Docker command in README.md.
+  - Note the helper's size before and after in the PR.
 
 ## 5. Brindle's model
 
-- [ ] 5.0 Add the `[agent]` table to `src/config.rs` with `tool_details` and `tool_details_when_done`, each `"open"` or `"closed"` decoded into `Shown` (defaults `open` and `closed`), another value reported as an invalid config naming the key and its two values; document both in `assets/default-config.toml`; verify with unit tests for the defaults, each value, a bad value's message, an unknown key under `[agent]`, and that the shipped default config parses.
-
-- [ ] 5.1 Extend `src/agent/shared.rs` and `transcript.rs` for the new events (`Dirty` marks for replaced items and appended output); verify with unit tests folding each event and a replay holding tool content.
-- [ ] 5.2 Add to `src/agent/model.rs` the pure `detail(entry) -> Vec<DetailPart>` (items, locations, then raw input and result only with no items; the marks for what was left out), `summary(entry)`, and `copy_text(part)` (unified diff text, output text, a text item's source); verify with unit tests for each rule, a move with no hunks, a cut diff's mark and the copy text of a two-hunk diff.
-- [ ] 5.3 Add the detail's list items: one per text item (through `markdown::render` under `catch_unwind`), one per `DETAIL_LINES` lines of a diff or output, locations, raw values; an open row absorbing appended output by splicing only its last part; verify with unit tests for the splices of opening, closing, a growing output, a replaced content list on an open row, and a `Trimmed` that drops an open tool entry.
-- [ ] 5.3a Add `Shown`, `ToolPolicy`, `RowState` and the pure `row_state` (design decision 10), `by_hand`, `toggle_tool(id)`, `toggle_tool_details()` and `set_policy(policy)`, each returning `Splice`s; verify with unit tests over every combination of detail or none, by-hand choice, running or finished, pending permission and policy, and for: a call that arrives completed, a call left in progress when its turn stops, calls of earlier turns after a replay, a by-hand choice outliving completion and a policy change, and a policy change splicing only the rows that change.
-- [ ] 5.4 Show a pending permission's detail: the parts of the tool entry its `call` names, as items of the permission entry before its confirmation, with that tool row showing its line alone meanwhile, and gone once answered; verify with unit tests for pending, answered, cancelled, no `call`, a `call` the model doesn't hold, and content that arrives after the permission row.
-- [ ] 5.5 Extend the dump (`describe`, `wait_text`): the tool line's `open=` and `items=`, the `--- item`, `--- hunk`, `--- location` and `--- raw` lines, the permission line's `detail=`; update the unit tests and e2e expectations that quote a tool or permission entry line; verify with unit tests for each line form and escaping.
-- [ ] 5.6 When stacked on `agents-log-paging`: make a page reach the tool entry that a pending permission names, and check that a fetch returns a tool entry with its content; verify with a unit test in the paging model and a real-role test.
+- [ ] 5.1 **Add the `[agent]` table to `src/config.rs`**: `tool_details` and `tool_details_when_done`, each `"open"` or `"closed"`, decoded into `Shown` (defaults `open` and `closed`). Another value is reported on the config line, naming the key and its two values. Document both in `assets/default-config.toml`.
+  - Verify with unit tests:
+    - the defaults;
+    - each value;
+    - a bad value's message;
+    - an unknown key under `[agent]`;
+    - the shipped default config parsing.
+- [ ] 5.2 **Extend `src/agent/shared.rs`** for the new events: `Dirty::ToolItems { from }` and `Dirty::Output { item }`, recorded in `Changes`. Check that `sink.rs` passes them through unchanged.
+  - Verify with unit tests:
+    - folding each event;
+    - a replay and a prepended page holding tool content;
+    - events below the window recording nothing.
+- [ ] 5.3 **Add the pure functions to `src/agent/model.rs`**:
+  - `detail(entry) -> Vec<DetailPart>`: items, locations, then raw input and result only with no items; the marks for what was left out;
+  - `summary(entry)`;
+  - `copy_text(part)`: unified diff text, output text, a text item's source.
+  - Verify with unit tests:
+    - each rule;
+    - a move with no hunks;
+    - a cut diff's mark;
+    - the copy text of a two-hunk diff.
+- [ ] 5.4 **Add the detail's blocks** (`BlockBody::ToolDetail`, `BlockBody::Tool`'s `summary` and `open`) in `blocks_of` and `absorb`.
+  - One per text item, through `markdown::render` under `catch_unwind`, cached by entry and item.
+  - One per `DETAIL_LINES` lines of a diff or output.
+  - Locations, and raw values.
+  - An open row absorbing appended output by splicing only its last part.
+  - Verify with unit tests for the splices of:
+    - opening and closing;
+    - a growing output;
+    - a replaced content list on an open row;
+    - a `Trimmed` that drops an open tool entry;
+    - a prepended page holding tool entries.
+- [ ] 5.5 **Add the open state** (design decision 10): `Shown`, `ToolPolicy`, `RowState` and the pure `row_state`, plus `by_hand`, `toggle_tool(id)`, `toggle_tool_details()` and `set_policy(policy)`, each returning `Splice`s.
+  - Verify with unit tests over every combination of detail or none, by-hand choice, running or finished, pending permission and policy.
+  - Also verify these cases:
+    - a call that arrives completed;
+    - a call left in progress when its turn stops;
+    - calls of earlier turns after a replay, and in a fetched page;
+    - a running call whose turn's user message is above the page (flag 7);
+    - a by-hand choice outliving completion and a policy change;
+    - a policy change splicing only the rows that change.
+- [ ] 5.6 **Show a pending permission's detail.** The parts of the tool entry its `call` names become blocks of the permission entry, before its confirmation. Meanwhile that tool row shows its line alone, and the parts go once the request is answered.
+  - Verify with unit tests for:
+    - pending, answered and cancelled;
+    - no `call`;
+    - a `call` the model doesn't hold;
+    - content that arrives after the permission row;
+    - a restored page whose permission's tool entry is its first entry.
+- [ ] 5.7 **Extend the dump** (`describe`, `wait_text`, `entry_line`; design decision 12).
+  - The tool line's ` open=… items=N` after `status=`.
+  - The `--- item`, `--- hunk`, `--- location` and `--- raw` lines.
+  - The permission line's ` detail=N` after `outcome=`, only when N > 0.
+  - Verify with unit tests:
+    - each line form and its escaping;
+    - an output with no command;
+    - a permission line with no detail unchanged byte for byte.
+  - Verify also that `agent.rs`'s existing expectations (`ends_with("outcome=pending \"Write a file\"")`, the `agent_has` prefixes) still hold.
 
 ## 6. brindle-ui and tokens
 
-- [ ] 6.1 Add `diff_added` and `diff_removed` to `brindle-ui`'s `Tokens` (the neutral sets with fixed tints) and derive them in `src/theme.rs` `ui_tokens` from the theme's green and red mixed into `card`, as far as keeps `foreground` at 4.5:1; extend the legibility test over every built-in theme with both pairs and that the two differ from `card`.
-- [ ] 6.2 Extend `Tool` with `.summary`, `.open(Option<bool>)` and `.on_toggle`; verify with component tests for the chevron, the press asking the owner, no press handler without an open state, and the summary and badge staying whole beside a long title; add it to the gallery.
-- [ ] 6.3 Add `Diff` (`ui/src/components/diff.rs`): the header with the operation, path, earlier path and copy button; lines with sign column, both line numbers and text in the given code family on their colours; a border line between hunks; no focus; verify with component tests for signs, line numbers, the separator and the copy request; add it to the gallery.
+- [ ] 6.1 **Add the diff tokens.**
+  - Add `diff_added` and `diff_removed` to `brindle-ui`'s `Tokens`, with fixed tints in `Tokens::neutral_light` and `neutral_dark`.
+  - Generalise `destructive_tint` into `legible_tint(base, text, colour, max)`, keeping `destructive_tint`'s results byte for byte.
+  - Derive the two tokens in `tokens_over` from `muted` and the theme's green (`ansi[2]`) and red (`ansi[1]`), up to `DIFF_TINT_MAX`.
+  - Verify:
+    - `ui_tokens_are_legible_for_every_builtin` checks `foreground` on both, over the window and zone sets;
+    - a test that both differ from `muted` for every built-in;
+    - `the_destructive_tint_stops_where_it_stays_legible` and `ui_tokens_keep_their_values` unchanged;
+    - `ui_tokens_css_covers_every_builtin_with_shadcn_names` unchanged, since the export doesn't list them.
+- [ ] 6.2 **Extend `Tool`** (`ui/src/components/tool.rs`) with `.summary`, `.open(Option<bool>)` and `.on_toggle`, and update its module docs. Add it to the gallery.
+  - Verify with component tests:
+    - the chevron;
+    - the press asking the owner;
+    - no press handler without an open state;
+    - the summary and badge staying whole beside a long title.
+- [ ] 6.3 **Add `Diff`** (`ui/src/components/diff.rs`, exported from `components/mod.rs`).
+  - The header with the operation, path, earlier path and copy button.
+  - Lines on `muted`, `diff_added` and `diff_removed`, with sign column, both line numbers and text in the given code family.
+  - A border line between hunks, and no focus.
+  - Add it to the gallery.
+  - Verify with component tests:
+    - signs and line numbers;
+    - the separator;
+    - the copy request;
+    - the colours read from a theme scope's set.
 
 ## 7. The zone
 
-- [ ] 7.1 Draw the detail parts in `src/agent/view.rs`: text items through `Response`, diffs through `Diff`, output and raw values through `CodeBlock` with the command and exit in its header, locations as a muted list, the marks for what was left out; the row's press calling `toggle_tool`; the copy buttons writing `copy_text` to the clipboard. Nothing is computed in `render` beyond reading the model's parts (`process R14`).
-- [ ] 7.2 Add `toggle_agent_tool_details` to `ACTIONS` ("Toggle Tool Details", no default key), handled only by `AgentView`; verify with a unit test that the palette lists it in an agent zone and not in a terminal zone.
-- [ ] 7.3 Keep the end in view while an open row's output grows, through the scroller's existing follow rule; verify in the e2e case of 8.2.
-- [ ] 7.4 Hand the model its `ToolPolicy` from the settings when the zone is built and on every config reload, applying the returned `Splice`s; verify in the e2e case of 8.8.
+- [ ] 7.1 **Draw the detail parts** in `src/agent/view.rs`:
+  - text items through `Response`;
+  - diffs through `Diff`;
+  - output and raw values through `CodeBlock`, with the command and exit in its header;
+  - locations as a muted list;
+  - the marks for what was left out.
+  - Inside a pending permission, the parts sit inside the dangerous row's alert.
+  - The row's press calls `toggle_tool`, and the copy buttons write `copy_text` to the clipboard.
+  - Nothing is computed in `render` beyond reading the model's blocks (`process R14`).
+  - Verify in the e2e cases of 8.1, 8.5 and 8.9.
+- [ ] 7.2 **Add `toggle_agent_tool_details` to `ACTIONS`** ("Toggle Tool Details", no default key). Only `AgentView` handles it (`src/agent/mod.rs`).
+  - Verify with a unit test beside `an_agent_zone_lists_no_terminal_commands` that the palette lists it in an agent zone and not in a terminal zone.
+- [ ] 7.3 **Keep the end in view while an open row's output grows**, through the scroller's existing follow rule, with the working row still the last item.
+  - Verify in the e2e case of 8.2.
+- [ ] 7.4 **Hand the model its `ToolPolicy`** from the settings when the zone is built and on every config reload, applying the returned `Splice`s.
+  - Verify in the e2e case of 8.8.
 
-## 8. End-to-end cases (fake ACP agent)
+## 8. End-to-end and perf cases (fake ACP agent)
 
-- [ ] 8.1 `agent-tool-diff`: a diff's item and hunk lines, the row's summary, the row open while the call is in progress (behind a `Gate`) and closed once it completes, `toggle_agent_tool_details` opening it again and it staying open, and a pixel check of the added and removed colours against the `e2e` theme.
-- [ ] 8.2 `agent-tool-output`: output streamed in pieces behind a `Gate`, its text, exit and the conversation staying at its end.
-- [ ] 8.3 `agent-tool-raw`: a call with only a raw input shows it; a call with content doesn't.
-- [ ] 8.4 `agent-tool-bounds`: 200 KiB of output and a 40-item call show their counts.
-- [ ] 8.5 `agent-permission-detail`: a pending request shows its call's diff while the call's own line reads `open=permission`, also with `tool_details = "closed"`; after `Allow once` the detail is gone from the permission and back in the running call's row; content sent only in the request shows too.
-- [ ] 8.6 `agent-tool-restore`: quit mid-turn with a diff and a pending permission, relaunch, and the restored zone shows both.
-- [ ] 8.8 `agent-tool-settings`: `tool_details = "closed"` keeps a running call's row closed; `tool_details_when_done = "open"` keeps a finished one open; rewriting the config while Brindle runs opens the finished rows without a restart; a bad value shows the config line.
-- [ ] 8.7 Run the agent cases on Windows (`windows-agent-*` gains one case with a diff) and in the archive jobs.
+- [ ] 8.1 **`agent-tool-diff`**:
+  - a diff's item and hunk lines;
+  - the row's summary;
+  - the row open while the call is in progress (behind a `Gate`) and closed once it completes;
+  - `toggle_agent_tool_details` opening it again, and it staying open;
+  - a pixel check of the added and removed colours against the `e2e` theme.
+- [ ] 8.2 **`agent-tool-output`**: output streamed in Codex's `_meta` pieces behind a `Gate`; its text and exit; the conversation staying at its end (`at=end`).
+- [ ] 8.3 **`agent-tool-raw`**: a call with only a raw input shows it; a call with content doesn't.
+- [ ] 8.4 **`agent-tool-bounds`**: 200 KiB of output and a 40-item call show their counts.
+- [ ] 8.5 **`agent-permission-detail`**:
+  - a pending request shows its call's diff while the call's own line reads `open=permission`, also with `tool_details = "closed"`;
+  - after `Allow once`, the detail is gone from the permission and back in the running call's row;
+  - content sent only in the request shows too.
+- [ ] 8.6 **`agent-tool-restore`**: quit mid-turn with a diff and a pending permission, relaunch, and the restored zone shows both.
+- [ ] 8.7 **`agent-tool-page`**: a session waits on a permission for a tool call with more than a page of entries after it; the restored zone's first entry is that tool call, and the permission shows its diff (`earlier=` present).
+- [ ] 8.8 **`agent-tool-settings`**:
+  - `tool_details = "closed"` keeps a running call's row closed;
+  - `tool_details_when_done = "open"` keeps a finished one open;
+  - rewriting the config while Brindle runs opens the finished rows without a restart;
+  - a bad value shows the config line.
+- [ ] 8.9 **`agent-tool-theme`**: an agent profile with a dark theme in a light window; a pixel check that a diff's added line is the dark zone set's `diff_added`.
+- [ ] 8.10 **`windows-agent-tool-diff`** in `tests/e2e/cases/win.rs`: a diff and its permission detail through ConPTY.
+  - Verify: it is listed on Windows, and the archive jobs (`e2e-archive`, `windows-e2e-archive`) pick up the new `agent-*` and `windows-agent-*` cases by their filters.
+- [ ] 8.11 **The perf case `agent-tool-output`** in `tests/perf/agent.rs` (flag 13): 1 MiB of output in 4 KiB `_meta` deltas into an open row, timed from the gate to the last line shown. Its case name goes in `tests/perf/main.rs`'s list.
+  - Verify: `BRINDLE_PERF=1 cargo test --test perf -- --list` lists it, and a run under `scripts/with-xvfb` writes its numbers to `summary.toml`.
 
-## 9. Docs and checks
+## 9. Docs
 
-- [ ] 9.1 Update `docs/code-map.md` (`remote/` and the terminal server's ACP section, `brindle-transcript`, the agent zone, `brindle-ui`), `README.md`'s Agent tabs section, `CLAUDE.md`'s dump description and e2e notes, and `.claude/rules/transcript.md`.
-- [ ] 9.2 Tell `agents-acp-v2` what it inherits: add to its proposal that its v2 module goes behind `Dialect` and maps v2's tool content as design decision 9 says.
-- [ ] 9.3 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate agents-tool-content --strict`.
-- [ ] 9.4 Manual checks for the user, with `scripts/run-throwaway.sh` and a real agent profile: a pointer press on a tool row's line opens and closes it; the copy button of a diff and of an output; an agent's edit of an existing file shows its diff in the permission row before it is allowed, on Linux and on Windows; a command's output as it runs; the added and removed colours in a light and a dark theme.
+- [ ] 9.1 **Update the docs** for tool content:
+  - `docs/code-map.md`: `remote/` and the terminal server's ACP section (the modules, `Dialect`, the open outputs), `brindle-transcript` (the forms, the page's reach), the `agent/` entry (the detail, the policy) and `brindle-ui` (`Tool`, `Diff`);
+  - `README.md`'s Agent tabs section and its config table;
+  - `CLAUDE.md`'s dump description (the tool line's `open=` and `items=`, `detail=`, the `--- item`, `--- hunk`, `--- location` and `--- raw` lines) and the manual checks list (task 10.4's checks);
+  - `.claude/rules/transcript.md`.
+- [ ] 9.2 **Tell `agents-acp-v2` what it inherits.** Add to its proposal that its v2 module goes behind `Dialect` and maps v2's tool content as design decision 9 says, open outputs included.
+
+## 10. Integration and landing
+
+- [ ] 10.1 **Run the full local checks**:
+  - `cargo test --workspace --locked`;
+  - `cargo clippy --locked --workspace --all-targets -- -D warnings`;
+  - both harness self-tests (`BRINDLE_E2E=1 cargo test --test e2e -- --self-test`, `BRINDLE_PERF=1 cargo test --test perf -- --self-test`);
+  - `cargo build --release --locked`;
+  - the e2e agent cases under `scripts/with-xvfb` inside `systemd-run --user --scope`: `BRINDLE_E2E=1 cargo test --test e2e -- agent-`;
+  - `openspec validate agents-tool-content --strict`.
+  - Run the large-output chores (full test, release build, e2e) as their own briefs, per CLAUDE.md's Delegation section.
+- [ ] 10.2 **Open the PR** and wait for CI (`gh pr checks <n> --watch`):
+  - `commits`, `test`, `clippy`, `release`, `windows`;
+  - the three `e2e` shards (`--shard K/3` with `BRINDLE_E2E_SLOW=2`);
+  - `windows-e2e`, `e2e-archive` and `windows-e2e-archive`.
+  - Report each. Rerun an unrelated failure only with the user's go-ahead, naming its test and message.
+- [ ] 10.3 **Archive in the implementation PR**: `openspec archive agents-tool-content`, syncing the delta specs, as a `docs(openspec): archive agents-tool-content` commit on the same PR.
+  - Before it, re-check each MODIFIED block against the synced main specs: agent-sessions "Transcript event forms…", "Attach replays the transcript" and "Entries a client hasn't fetched stay current"; agent-zones "Tool call rows", "Permission rows" and "Agent commands in the palette"; ui-components "Tool rows".
+  - Re-check also any change archived since 20e9858 that touched them.
+- [ ] 10.4 **Hand the manual checks to the user**, with `scripts/run-throwaway.sh` (and `scripts/run-throwaway.ps1` on Windows) and a real agent profile, on Linux and on Windows:
+  - a pointer press on a tool row's line opens and closes it;
+  - the copy button of a diff and of an output;
+  - an agent's edit of an existing file shows its diff in the permission row before it is allowed;
+  - a Codex command's output as it runs;
+  - the added and removed colours in brindle-light, brindle-dark and solarized-dark, and in an agent zone whose profile theme differs from the window's;
+  - wheel scrolling past a long open diff.
