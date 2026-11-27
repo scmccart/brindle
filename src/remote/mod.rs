@@ -33,9 +33,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
+use crate::agent::model::NotSent;
 use crate::agent::sink::Sink as AgentSink;
 use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::config::RemoteTarget;
+
+/// The debug-only fault switch (`process R20`) that delays a session's
+/// thread between the core's answer and the running session, by a whole
+/// number of milliseconds (OpenSpec change `agents-client-state-fixes`,
+/// decision 4). Named here, which every platform compiles, so `main.rs`
+/// lists it without a platform `cfg`.
+pub const SESSION_START_DELAY: &str = "BRINDLE_TEST_SESSION_START_DELAY";
 
 /// What an agent zone's session starts from ([`agent_link`]).
 pub enum AgentStart {
@@ -61,44 +69,46 @@ pub enum AgentLink {}
 #[cfg(any(target_os = "linux", windows))]
 impl AgentLink {
     /// Sends a prompt while the session runs; the request's id, which its
-    /// answer comes back under (`AgentEvent::Reply`), or `None`.
-    pub fn prompt(&self, text: &str) -> Option<protocol::RequestId> {
+    /// answer comes back under (`AgentEvent::Reply`), or why nothing was
+    /// sent.
+    pub fn prompt(&self, text: &str) -> Result<protocol::RequestId, NotSent> {
         self.0.prompt(text)
     }
 
     /// Sends the held prompt again, as [`AgentLink::prompt`].
-    pub fn resend(&self) -> Option<protocol::RequestId> {
+    pub fn resend(&self) -> Result<protocol::RequestId, NotSent> {
         self.0.resend()
     }
 
     /// Discards the queued prompt, waiting or held, as [`AgentLink::prompt`].
-    pub fn unqueue(&self) -> Option<protocol::RequestId> {
+    pub fn unqueue(&self) -> Result<protocol::RequestId, NotSent> {
         self.0.unqueue()
     }
 
     /// Answers the permission request in entry `entry` (`None`: cancelled),
     /// as [`AgentLink::prompt`].
-    pub fn answer(&self, entry: u64, option: Option<String>) -> Option<protocol::RequestId> {
+    pub fn answer(&self, entry: u64, option: Option<String>) -> Result<protocol::RequestId, NotSent> {
         self.0.answer(entry, option)
     }
 
     /// Runs the session's ended agent again to continue its conversation
     /// (`AGENT_RESTART`), as [`AgentLink::prompt`].
-    pub fn restart(&self, request: AgentRestartRequest) -> Option<protocol::RequestId> {
+    pub fn restart(&self, request: AgentRestartRequest) -> Result<protocol::RequestId, NotSent> {
         self.0.restart(request)
     }
 
     /// Logs the agent in with its login method `method` (`AGENT_LOGIN`), as
     /// [`AgentLink::prompt`].
-    pub fn login(&self, method: &str) -> Option<protocol::RequestId> {
+    pub fn login(&self, method: &str) -> Result<protocol::RequestId, NotSent> {
         self.0.login(method)
     }
 
     /// Fetches the whole entries before entry `before` within `max_bytes`
     /// (`AGENT_FETCH`, OpenSpec change `agents-log-paging`), as
     /// [`AgentLink::prompt`]: the sink folds the page in front before the
-    /// reply comes; while the link is down the reply is its failure.
-    pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<protocol::RequestId> {
+    /// reply comes; while the link is down it isn't sent
+    /// ([`NotSent::LinkDown`]).
+    pub fn fetch(&self, before: u64, max_bytes: u32) -> Result<protocol::RequestId, NotSent> {
         self.0.fetch(before, max_bytes)
     }
 
@@ -106,26 +116,26 @@ impl AgentLink {
     /// (`AGENT_LIST`, OpenSpec change `agents-session-list`), as
     /// [`AgentLink::prompt`]: the page comes as `AgentEvent::Conversations`,
     /// a refusal as the reply.
-    pub fn list(&self, cursor: Option<String>) -> Option<protocol::RequestId> {
+    pub fn list(&self, cursor: Option<String>) -> Result<protocol::RequestId, NotSent> {
         self.0.list(cursor)
     }
 
     /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues
     /// `conversation`, or starts a new one; as [`AgentLink::prompt`].
-    pub fn choose(&self, conversation: Option<String>) -> Option<protocol::RequestId> {
+    pub fn choose(&self, conversation: Option<String>) -> Result<protocol::RequestId, NotSent> {
         self.0.choose(conversation)
     }
 
     /// Sets session option `option` to `value` (`AGENT_SET_OPTION`,
     /// OpenSpec change `agents-commands`), as [`AgentLink::prompt`]: the
     /// new value comes as an `Options` event once the agent answers.
-    pub fn set_option(&self, option: &str, value: protocol::client::OptionValue) -> Option<protocol::RequestId> {
+    pub fn set_option(&self, option: &str, value: protocol::client::OptionValue) -> Result<protocol::RequestId, NotSent> {
         self.0.set_option(option, value)
     }
 
-    /// Cancels the running turn, or the agent's login; true when it was
-    /// sent.
-    pub fn cancel(&self) -> bool {
+    /// Cancels the running turn, or the agent's login, or says why it
+    /// wasn't sent.
+    pub fn cancel(&self) -> Result<(), NotSent> {
         self.0.cancel()
     }
 
@@ -153,47 +163,47 @@ impl AgentLink {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 impl AgentLink {
-    pub fn prompt(&self, _text: &str) -> Option<protocol::RequestId> {
+    pub fn prompt(&self, _text: &str) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn resend(&self) -> Option<protocol::RequestId> {
+    pub fn resend(&self) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn unqueue(&self) -> Option<protocol::RequestId> {
+    pub fn unqueue(&self) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn answer(&self, _entry: u64, _option: Option<String>) -> Option<protocol::RequestId> {
+    pub fn answer(&self, _entry: u64, _option: Option<String>) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn restart(&self, _request: AgentRestartRequest) -> Option<protocol::RequestId> {
+    pub fn restart(&self, _request: AgentRestartRequest) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn login(&self, _method: &str) -> Option<protocol::RequestId> {
+    pub fn login(&self, _method: &str) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn fetch(&self, _before: u64, _max_bytes: u32) -> Option<protocol::RequestId> {
+    pub fn fetch(&self, _before: u64, _max_bytes: u32) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn list(&self, _cursor: Option<String>) -> Option<protocol::RequestId> {
+    pub fn list(&self, _cursor: Option<String>) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn choose(&self, _conversation: Option<String>) -> Option<protocol::RequestId> {
+    pub fn choose(&self, _conversation: Option<String>) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn set_option(&self, _option: &str, _value: protocol::client::OptionValue) -> Option<protocol::RequestId> {
+    pub fn set_option(&self, _option: &str, _value: protocol::client::OptionValue) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
-    pub fn cancel(&self) -> bool {
+    pub fn cancel(&self) -> Result<(), NotSent> {
         match *self {}
     }
 

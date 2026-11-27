@@ -11,7 +11,7 @@ use gpui::{AppContext as _, Entity, TestAppContext};
 use parking_lot::Mutex;
 
 use crate::FirstPrompt;
-use crate::agent::model::ChatModel;
+use crate::agent::model::{ChatModel, NotSent};
 use crate::agent::shared::AgentShared;
 use crate::agent::sink::Sink;
 use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
@@ -67,47 +67,47 @@ pub enum Call {
 
 pub type Calls = Rc<RefCell<Vec<Call>>>;
 
-/// Requests that record each call and answer with the next id, or with
-/// nothing while `down`.
+/// Requests that record each call and answer with the next id, or, while
+/// `refuse` holds a reason, with that.
 pub struct FakeRequests {
     calls: Calls,
-    next: Cell<RequestId>,
-    pub down: Rc<Cell<bool>>,
+    next: Rc<Cell<RequestId>>,
+    pub refuse: Rc<Cell<Option<NotSent>>>,
     /// The session's id.
     session: SessionId,
 }
 
 impl FakeRequests {
-    fn record(&self, call: Call) -> Option<RequestId> {
+    fn record(&self, call: Call) -> Result<RequestId, NotSent> {
         self.calls.borrow_mut().push(call);
-        if self.down.get() {
-            return None;
+        if let Some(why) = self.refuse.get() {
+            return Err(why);
         }
         let id = self.next.get();
         self.next.set(id + 1);
-        Some(id)
+        Ok(id)
     }
 }
 
 impl Requests for FakeRequests {
-    fn prompt(&self, text: &str) -> Option<RequestId> {
+    fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
         self.record(Call::Prompt(text.to_string()))
     }
 
-    fn resend(&self) -> Option<RequestId> {
+    fn resend(&self) -> Result<RequestId, NotSent> {
         self.record(Call::Resend)
     }
 
-    fn unqueue(&self) -> Option<RequestId> {
+    fn unqueue(&self) -> Result<RequestId, NotSent> {
         self.record(Call::Unqueue)
     }
 
-    fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
+    fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent> {
         self.record(Call::Answer(entry, option))
     }
 
-    fn cancel(&self) -> bool {
-        self.record(Call::Cancel).is_some()
+    fn cancel(&self) -> Result<(), NotSent> {
+        self.record(Call::Cancel).map(|_| ())
     }
 
     fn close(&self) {
@@ -126,43 +126,46 @@ impl Requests for FakeRequests {
         Some((self.session, None))
     }
 
-    fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+    fn restart(&self, request: AgentRestartRequest) -> Result<RequestId, NotSent> {
         self.record(Call::Restart(request))
     }
 
-    fn login(&self, method: &str) -> Option<RequestId> {
+    fn login(&self, method: &str) -> Result<RequestId, NotSent> {
         self.record(Call::Login(method.to_string()))
     }
 
-    fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+    fn fetch(&self, before: u64, max_bytes: u32) -> Result<RequestId, NotSent> {
         self.record(Call::Fetch(before, max_bytes))
     }
 
-    fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+    fn list(&self, cursor: Option<String>) -> Result<RequestId, NotSent> {
         self.record(Call::List(cursor))
     }
 
-    fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+    fn choose(&self, conversation: Option<String>) -> Result<RequestId, NotSent> {
         self.record(Call::Choose(conversation))
     }
 
-    fn set_option(&self, option: &str, value: OptionValue) -> Option<RequestId> {
+    fn set_option(&self, option: &str, value: OptionValue) -> Result<RequestId, NotSent> {
         self.record(Call::SetOption(option.to_string(), value))
     }
 }
 
 /// A [`Connect`] that records each start and gives fake requests for a
-/// new session ([`FakeRequests`], session 8, sharing the zone's calls), or
-/// `refuse`s it.
-fn fake_connect(calls: Calls, down: Rc<Cell<bool>>, starts: Starts, sinks: Sinks) -> Connect {
-    Box::new(move |_host, start, sink| {
+/// new session ([`FakeRequests`], session 8, sharing the zone's calls and
+/// its `refuse`). The fake session runs at once: its sink is told so
+/// before it is kept.
+fn fake_connect(calls: Calls, refuse: Rc<Cell<Option<NotSent>>>, starts: Starts, sinks: Sinks) -> Connect {
+    Box::new(move |_host, start, mut sink| {
         let start = match start {
             AgentStart::Spawn(request) => Start::Spawn(request()),
             AgentStart::Attach { session, .. } => Start::Attach(session),
         };
         starts.borrow_mut().push(start);
+        sink.running();
         sinks.borrow_mut().push(sink);
-        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(101), down: down.clone(), session: 8 };
+        let requests =
+            FakeRequests { calls: calls.clone(), next: Rc::new(Cell::new(101)), refuse: refuse.clone(), session: 8 };
         Ok(Box::new(requests) as Box<dyn Requests>)
     })
 }
@@ -182,30 +185,49 @@ pub struct Zone {
     pub sink: Sink,
     pub agent: Entity<Agent>,
     pub calls: Calls,
-    pub down: Rc<Cell<bool>>,
+    /// What the fake requests answer instead of an id, while set.
+    pub refuse: Rc<Cell<Option<NotSent>>>,
     pub shared: Arc<Mutex<AgentShared>>,
     /// What the zone's connect started (a continue in a new session), and
     /// the new sessions' sinks.
     pub starts: Starts,
     pub sinks: Sinks,
+    /// The next id the fake requests answer with.
+    next: Rc<Cell<RequestId>>,
 }
 
 impl Zone {
+    /// A zone whose session runs: its sink was told, as the session's
+    /// thread tells it once the session is set up.
     pub fn new(first: Option<&str>, cx: &mut TestAppContext) -> Self {
+        let mut zone = Self::starting(first, cx);
+        zone.sink.running();
+        zone
+    }
+
+    /// A zone whose session's thread hasn't handed it the running session
+    /// yet: nothing told its sink `running`.
+    pub fn starting(first: Option<&str>, cx: &mut TestAppContext) -> Self {
         let (sink, feed) = Sink::with_fault(None);
         let shared = feed.shared.clone();
         let calls = Calls::default();
-        let down = Rc::new(Cell::new(false));
-        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(1), down: down.clone(), session: 7 };
+        let refuse = Rc::new(Cell::new(None));
+        let next = Rc::new(Cell::new(1));
+        let requests = FakeRequests { calls: calls.clone(), next: next.clone(), refuse: refuse.clone(), session: 7 };
         let (starts, sinks) = (Starts::default(), Sinks::default());
-        let connect = fake_connect(calls.clone(), down.clone(), starts.clone(), sinks.clone());
+        let connect = fake_connect(calls.clone(), refuse.clone(), starts.clone(), sinks.clone());
         let first = first.map(|text| FirstPrompt::new(text.to_string()).unwrap());
         let agent = cx.new(|cx| {
             let model = ChatModel::new("Fake", first);
             let requests = Some(Box::new(requests) as Box<dyn Requests>);
             Agent::from_parts(model, feed, requests, "fake-acp".into(), Host::Local, None, connect, cx)
         });
-        Self { sink, agent, calls, down, shared, starts, sinks }
+        Self { sink, agent, calls, refuse, shared, starts, sinks, next }
+    }
+
+    /// The id the zone's fake requests answered their last request with.
+    pub fn last_request(&self) -> RequestId {
+        self.next.get() - 1
     }
 
     /// Folds `events` on this thread, as the reader thread does.

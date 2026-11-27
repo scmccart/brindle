@@ -3788,3 +3788,77 @@ pub fn tool_theme(ctx: &Ctx) -> Result<Outcome> {
     }
     Ok(Outcome::Pass)
 }
+
+// A session being set up (OpenSpec change `agents-client-state-fixes`, D-1):
+// `BRINDLE_TEST_SESSION_START_DELAY` holds the session's thread between the
+// core's answer and the running session, while the reader folds the agent's
+// `Ready`, so the zone shows the agent ready before it can send.
+
+/// The session start delay, in milliseconds: long enough that the steps
+/// after the agent shows ready fall inside it, stretched with the other
+/// delays.
+fn start_delay(ctx: &Ctx) -> String {
+    format!("{:.0}", ctx.scale().secs(3.0) * 1000.0)
+}
+
+/// The agent lines that show a refusal beside the prompt input.
+fn refusals(out: &crate::brindle::Output) -> Vec<&String> {
+    out.dump.agent.iter().filter(|line| line.contains("refusal=")).collect()
+}
+
+/// A launch's first prompt waits for the session to run, then goes once:
+/// never refused because the session was still being set up.
+pub fn first_prompt_before_the_session_runs(ctx: &Ctx) -> Result<Outcome> {
+    let (profile, received) = hello_agent(ctx)?;
+    let out = Run::new(ctx, "run")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("one")
+        .env("BRINDLE_TEST_SESSION_START_DELAY", &start_delay(ctx))
+        .wait_for(&answered())
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(refusals(&out).is_empty(), "refused: {:?}", refusals(&out));
+    ensure!(out.dump.agent_entries() == ["user \"one\"", "agent \"Hello!\""], "entries: {:?}", out.dump.agent);
+    ensure!(prompts_sent(&received)? == ["one"], "sent: {:?}", prompts_sent(&received)?);
+    Ok(Outcome::Pass)
+}
+
+/// An attached zone whose replay shows the agent ready, while its session
+/// is still being set up, takes no prompt: the input says it is
+/// connecting. Once the session runs it is ready, and enter sends the
+/// prompt, once, with no refusal. (Before the fix the input was ready
+/// during the delay, and enter was refused.)
+pub fn prompt_before_the_attached_session_runs(ctx: &Ctx) -> Result<Outcome> {
+    let received = ctx.dir.join("received.jsonl");
+    let profile = Script(hello_script(&received).lines().map(str::to_string).collect())
+        .step("expect session/prompt")
+        .step(says("again"))
+        .step(stop("end_turn"))
+        .profile(ctx, "attach")?;
+    let out = Run::new(ctx, "first")
+        .config(&profile)
+        .agent("Fake")
+        .first_prompt("one")
+        .keep_detached()
+        .wait_for(&answered())
+        .dump_at(4.0)
+        .run()?;
+    waited(&out)?;
+    let out = Run::new(ctx, "attached")
+        .config(&profile)
+        .restore()
+        .step_interval(0.25)
+        .env("BRINDLE_TEST_SESSION_START_DELAY", &start_delay(ctx))
+        .wait_for("prompt status=ready")
+        .send("hi")
+        .key("enter")
+        .wait_for("user \"hi\"")
+        .dump_at(10.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(refusals(&out).is_empty(), "refused: {:?}", refusals(&out));
+    ensure!(prompts_sent(&received)? == ["one", "hi"], "sent: {:?}", prompts_sent(&received)?);
+    Ok(Outcome::Pass)
+}

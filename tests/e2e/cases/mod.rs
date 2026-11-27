@@ -326,6 +326,18 @@ fn unix() -> Vec<Case> {
         // The agent profile is only listed: its agent never runs.
         display("agent-settings-profiles", agent::settings_profiles),
         needing("agent-broken", &[TestSwitch::SinkPanic], agent::broken).needs_fake_agent(),
+        needing(
+            "agent-first-prompt-before-the-session-runs",
+            &[TestSwitch::SessionStartDelay],
+            agent::first_prompt_before_the_session_runs,
+        )
+        .needs_fake_agent(),
+        needing(
+            "agent-prompt-before-the-attached-session-runs",
+            &[TestSwitch::SessionStartDelay],
+            agent::prompt_before_the_attached_session_runs,
+        )
+        .needs_fake_agent(),
         display("agent-continue-resume", agent::continue_resume).needs_fake_agent(),
         display("agent-continue-load", agent::continue_load).needs_fake_agent(),
         display("agent-continue-held", agent::continue_held).needs_fake_agent(),

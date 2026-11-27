@@ -7,9 +7,10 @@
 //! (`process R9`): a fold sends one merged [`AgentEvent::Changed`], of which
 //! at most one waits, since the zone takes every change from the shared
 //! fold at once; the life events (a replay's start and end, the link going
-//! down, the exit, the loss, the failure to start, the break, a request's
-//! answer, a note) are always queued, and are bounded by the session's one
-//! lifetime and the requests its zone sent.
+//! down, the session's thread handing over the running session, the exit,
+//! the loss, the failure to start, the break, a request's answer, a note)
+//! are always queued, and are bounded by the session's one lifetime and the
+//! requests its zone sent.
 //!
 //! The connection calls it through [`crate::remote::local`]'s
 //! `SessionSink`, under `Connection::deliver`'s `catch_unwind`: an event it
@@ -24,7 +25,7 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::agent::conversations::Page;
-use crate::agent::model::StartFailure;
+use crate::agent::model::{ReplyError, StartFailure};
 use crate::remote::protocol::client::AgentConversations;
 use crate::agent::shared::AgentShared;
 use crate::remote::protocol::RequestId;
@@ -51,9 +52,14 @@ pub enum AgentEvent {
     /// Brindle can't follow the session any more, saying why: it was
     /// detached, and nothing more comes.
     Broken(String),
-    /// The core answered the zone's request `request`, or it failed with
-    /// the link.
-    Reply { request: RequestId, outcome: Result<(), String> },
+    /// The session's thread handed the zone the running session: requests
+    /// can go now (OpenSpec change `agents-client-state-fixes`, decision 2).
+    /// Every event the reader delivered before it is queued before it.
+    SessionRunning,
+    /// The core answered the zone's request `request`, or it failed:
+    /// refused or never sent ([`ReplyError::Failed`]), or lost with the
+    /// link after it was written ([`ReplyError::Unanswered`]).
+    Reply { request: RequestId, outcome: Result<(), ReplyError> },
     /// A page of the agent's conversations answering the list `request`
     /// (`AGENT_CONVERSATIONS`, OpenSpec change `agents-session-list`), in
     /// place of its reply.
@@ -72,6 +78,7 @@ pub fn kind_of(event: &AgentEvent) -> Kind {
     match event {
         AgentEvent::Changed => Kind::Merged(Merge::Wakeup),
         AgentEvent::Replay(_)
+        | AgentEvent::SessionRunning
         | AgentEvent::LinkDown
         | AgentEvent::Exited(_)
         | AgentEvent::Lost(_)
@@ -242,10 +249,15 @@ impl Sink {
 
     /// The core's answer to request `request`. A fetch that failed (with
     /// the link) leaves no frames behind.
-    pub fn reply(&mut self, request: RequestId, outcome: Result<(), String>) {
+    pub fn reply(&mut self, request: RequestId, outcome: Result<(), ReplyError>) {
         self.pages.remove(&request);
         self.dropping.remove(&request);
         self.send(AgentEvent::Reply { request, outcome });
+    }
+
+    /// The session's thread handed over the running session.
+    pub fn running(&mut self) {
+        self.send(AgentEvent::SessionRunning);
     }
 
     /// `AGENT_CONVERSATIONS` answering the list `request`: the page goes to
@@ -376,7 +388,7 @@ mod tests {
             ]
         );
         let changes = feed.shared.lock().take_changes();
-        assert!(changes.reset && changes.from_replay, "{changes:?}");
+        assert!(changes.reset && changes.status_from == crate::agent::shared::StatusFrom::Replay, "{changes:?}");
         let texts: Vec<String> = feed
             .shared
             .lock()
@@ -386,6 +398,34 @@ mod tests {
             .collect();
         assert_eq!(texts.len(), 1);
         assert!(texts[0].contains("replayed"), "{texts:?}");
+    }
+
+    /// `agents-client-state-fixes` 4.4: the session's thread's
+    /// `SessionRunning` is a life event, never merged with a pending
+    /// `Changed` or dropped, queued after what was delivered before it; a
+    /// reply keeps whether it was refused or lost with the link.
+    #[test]
+    fn the_running_event_is_a_life_event_queued_in_order() {
+        assert_eq!(kind_of(&AgentEvent::SessionRunning), Kind::Life);
+        let (mut sink, mut feed) = Sink::with_fault(None);
+        sink.transcript(vec![added(1, "ready")]).unwrap();
+        sink.running();
+        sink.transcript(vec![added(2, "after")]).unwrap();
+        sink.reply(3, Err(ReplyError::Unanswered("the terminal server went away".into())));
+        sink.reply(4, Err(ReplyError::Failed("refused".into())));
+        assert_eq!(
+            taken(&mut feed),
+            [
+                AgentEvent::Changed,
+                AgentEvent::SessionRunning,
+                AgentEvent::Reply {
+                    request: 3,
+                    outcome: Err(ReplyError::Unanswered("the terminal server went away".into()))
+                },
+                AgentEvent::Reply { request: 4, outcome: Err(ReplyError::Failed("refused".into())) },
+            ],
+            "the second fold merged into the waiting `Changed`"
+        );
     }
 
     /// `agents-session-list` 4.1: a list's answer reaches the zone as its
@@ -494,7 +534,7 @@ mod tests {
         assert_eq!(taken(&mut feed), [AgentEvent::Changed]);
         assert_eq!(texts(&feed), ["1:one", "2:two", "3:three", "4:four"]);
         let changes = feed.shared.lock().take_changes();
-        assert_eq!((changes.prepended, changes.from_replay), (Some(2), true));
+        assert_eq!((changes.prepended, changes.status_from), (Some(2), crate::agent::shared::StatusFrom::Unchanged));
         assert!(feed.shared.lock().transcript().window().is_none());
     }
 

@@ -10,7 +10,7 @@ pub use brindle_transcript::{
     Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange, FileOp, HoldReason,
     LoginKind, LoginMethod, NoticeLevel, OptionCategory, OptionChoice, OptionControl, Output, PAGE_BYTES, PermissionKind,
     PermissionOption, PermissionOutcome, SessionOption, Slot, SlashCommand, StopReason, ToolItem, ToolKind, ToolStatus,
-    Transcript, TurnState, Window,
+    Transcript, TurnState, Window, clean,
 };
 
 /// What the zone's tests build tool content with.

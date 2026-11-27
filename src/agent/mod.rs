@@ -61,7 +61,8 @@ use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
     Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Link, ListDone, ListFor,
-    LoginChoice, LoginZoneEnd, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
+    Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit,
+    Unqueue, WorkingRow,
 };
 use crate::agent::commands::CompletionKey;
 use crate::agent::spawn::AgentSpawnRequest;
@@ -82,37 +83,38 @@ use crate::terminal::status::State;
 
 /// The requests an agent zone sends its session: the terminal server's
 /// [`crate::remote::AgentLink`], or a test's fake. Each returns the
-/// request's id, which its answer comes back under, or `None` when
-/// nothing was sent.
+/// request's id, which its answer comes back under, or why nothing was
+/// sent ([`NotSent`], which the model decides on: [`ChatModel::not_sent`]).
 pub trait Requests {
-    fn prompt(&self, text: &str) -> Option<RequestId>;
-    fn resend(&self) -> Option<RequestId>;
-    fn unqueue(&self) -> Option<RequestId>;
-    fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId>;
-    /// True when the cancel was sent.
-    fn cancel(&self) -> bool;
+    fn prompt(&self, text: &str) -> Result<RequestId, NotSent>;
+    fn resend(&self) -> Result<RequestId, NotSent>;
+    fn unqueue(&self) -> Result<RequestId, NotSent>;
+    fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent>;
+    /// `AGENT_CANCEL`, which has no answer.
+    fn cancel(&self) -> Result<(), NotSent>;
     fn close(&self);
     fn detach_with(&self, layout: Option<serde_json::Value>);
     fn set_layout(&self, layout: Option<serde_json::Value>);
     fn id_and_key(&self) -> Option<(SessionId, Option<SessionKey>)>;
     /// Runs the session's ended agent again (`AGENT_RESTART`).
-    fn restart(&self, request: AgentRestartRequest) -> Option<RequestId>;
+    fn restart(&self, request: AgentRestartRequest) -> Result<RequestId, NotSent>;
     /// Logs the agent in with its login method `method` (`AGENT_LOGIN`).
-    fn login(&self, method: &str) -> Option<RequestId>;
+    fn login(&self, method: &str) -> Result<RequestId, NotSent>;
     /// Asks for the entries before `before`, within `max_bytes`
-    /// (`AGENT_FETCH`): the page comes as a change before the reply.
-    fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId>;
+    /// (`AGENT_FETCH`): the page comes as a change before the reply. Never
+    /// sent while the link is down ([`NotSent::LinkDown`]).
+    fn fetch(&self, before: u64, max_bytes: u32) -> Result<RequestId, NotSent>;
     /// Asks for a page of the agent's conversations after `cursor`
     /// (`AGENT_LIST`): the page comes as [`AgentEvent::Conversations`] in
     /// place of a reply (OpenSpec change `agents-session-list`).
-    fn list(&self, cursor: Option<String>) -> Option<RequestId>;
+    fn list(&self, cursor: Option<String>) -> Result<RequestId, NotSent>;
     /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues
     /// `conversation`, or starts a new one with `None`.
-    fn choose(&self, conversation: Option<String>) -> Option<RequestId>;
+    fn choose(&self, conversation: Option<String>) -> Result<RequestId, NotSent>;
     /// Sets the session option whose id is `option` to `value`
     /// (`AGENT_SET_OPTION`, OpenSpec change `agents-commands`): the new
     /// value comes as an `Options` event once the agent answers.
-    fn set_option(&self, option: &str, value: OptionValue) -> Option<RequestId>;
+    fn set_option(&self, option: &str, value: OptionValue) -> Result<RequestId, NotSent>;
 }
 
 /// Opens an agent zone's session on a host (`remote::agent_link`), or a
@@ -128,23 +130,23 @@ fn server_connect() -> Connect {
 }
 
 impl Requests for crate::remote::AgentLink {
-    fn prompt(&self, text: &str) -> Option<RequestId> {
+    fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::prompt(self, text)
     }
 
-    fn resend(&self) -> Option<RequestId> {
+    fn resend(&self) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::resend(self)
     }
 
-    fn unqueue(&self) -> Option<RequestId> {
+    fn unqueue(&self) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::unqueue(self)
     }
 
-    fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
+    fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::answer(self, entry, option)
     }
 
-    fn cancel(&self) -> bool {
+    fn cancel(&self) -> Result<(), NotSent> {
         crate::remote::AgentLink::cancel(self)
     }
 
@@ -164,27 +166,27 @@ impl Requests for crate::remote::AgentLink {
         crate::remote::AgentLink::id_and_key(self)
     }
 
-    fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+    fn restart(&self, request: AgentRestartRequest) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::restart(self, request)
     }
 
-    fn login(&self, method: &str) -> Option<RequestId> {
+    fn login(&self, method: &str) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::login(self, method)
     }
 
-    fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+    fn fetch(&self, before: u64, max_bytes: u32) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::fetch(self, before, max_bytes)
     }
 
-    fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+    fn list(&self, cursor: Option<String>) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::list(self, cursor)
     }
 
-    fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+    fn choose(&self, conversation: Option<String>) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::choose(self, conversation)
     }
 
-    fn set_option(&self, option: &str, value: OptionValue) -> Option<RequestId> {
+    fn set_option(&self, option: &str, value: OptionValue) -> Result<RequestId, NotSent> {
         crate::remote::AgentLink::set_option(self, option, value)
     }
 }
@@ -542,14 +544,23 @@ impl Agent {
         )
         .restart();
         self.command = request.command.clone();
-        match self.requests.as_ref().and_then(|requests| requests.restart(request)) {
-            Some(req) => {
+        match self.through(|requests| requests.restart(request)) {
+            Ok(req) => {
                 let absorbed = self.model.restarting(req);
                 self.apply_absorbed(absorbed, cx);
             }
-            None => self.model.server_note(model::UNSENT),
+            Err(why) => {
+                let replied = self.model.restart_not_sent(why);
+                self.apply_replied(replied, cx);
+            }
         }
         cx.notify();
+    }
+
+    /// Sends through the zone's session; [`NotSent::Gone`] when it has
+    /// none (it never started).
+    fn through<T>(&self, send: impl FnOnce(&dyn Requests) -> Result<T, NotSent>) -> Result<T, NotSent> {
+        self.requests.as_deref().ok_or(NotSent::Gone).and_then(send)
     }
 
     /// A new session of `profile`'s agent continuing `conversation`, in its
@@ -627,14 +638,18 @@ impl Agent {
     }
 
     /// Ends a choosing agent's wait: continues `conversation`, or starts a
-    /// new one with `None` (`AGENT_CHOOSE`). Nothing unless it is choosing.
+    /// new one with `None` (`AGENT_CHOOSE`). One that can't go now isn't
+    /// sent, and the choosing screen says why ([`ChatModel::choose`]).
     pub fn choose(&mut self, conversation: Option<String>, cx: &mut Context<Self>) {
-        if !self.model.can_choose() {
-            return;
-        }
-        match self.requests.as_ref().and_then(|requests| requests.choose(conversation)) {
-            Some(request) => self.model.chose(request),
-            None => self.model.server_note(model::UNSENT),
+        match self.model.choose() {
+            Choose::Send => match self.through(|requests| requests.choose(conversation)) {
+                Ok(request) => self.model.chose(request),
+                Err(why) => {
+                    let replied = self.model.not_sent(Sent::Choose, why);
+                    self.apply_replied(replied, cx);
+                }
+            },
+            Choose::Refused => {}
         }
         cx.notify();
     }
@@ -744,6 +759,7 @@ impl Agent {
                 Link::Up => return,
             },
             AgentEvent::LinkDown => self.model.set_link(Link::Reconnecting),
+            AgentEvent::SessionRunning => self.model.session_running(),
             AgentEvent::Exited(_) => self.model.ended(),
             AgentEvent::Lost(reason) => self.model.lost(reason),
             AgentEvent::Failed(failure) => self.model.not_started(failure),
@@ -774,7 +790,11 @@ impl Agent {
     /// Hands what the model decided on: the view's splices, the status and
     /// title events, the first prompt's send.
     fn apply_absorbed(&mut self, absorbed: Absorbed, cx: &mut Context<Self>) {
-        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working, choosing } = absorbed;
+        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working, choosing, replied } =
+            absorbed;
+        if let Some(replied) = replied {
+            self.apply_replied(replied, cx);
+        }
         match choosing {
             Some(OnChoosing::ListLatest) => self.list(None, ListFor::Latest, cx),
             Some(OnChoosing::OpenList) => cx.emit(AgentAsk::Conversations),
@@ -794,13 +814,16 @@ impl Agent {
             cx.emit(TerminalEvent::TitleChanged);
         }
         match first {
-            Some(First::Send(text)) => match self.requests.as_ref().and_then(|requests| requests.prompt(&text)) {
-                Some(request) => self.model.sent(request, Sent::FirstPrompt(text)),
-                None => {
-                    let replied = self.model.unsent(Sent::FirstPrompt(text));
-                    self.apply_replied(replied, cx);
+            Some(First::Send(text)) => {
+                let sent = self.model.sent_prompt(text.clone(), true);
+                match self.through(|requests| requests.prompt(&text)) {
+                    Ok(request) => self.model.sent(request, sent),
+                    Err(why) => {
+                        let replied = self.model.not_sent(sent, why);
+                        self.apply_replied(replied, cx);
+                    }
                 }
-            },
+            }
             Some(First::Draft(text) | First::Show(text)) => cx.emit(AgentUpdate::SetDraft(text)),
             Some(First::SendIfUnchanged(text)) => cx.emit(AgentUpdate::SendFirstIfUnchanged(text)),
             None => {}
@@ -811,7 +834,8 @@ impl Agent {
     /// found its input still holding exactly `text`.
     pub fn send_first(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = text.to_string();
-        self.send(Sent::FirstPrompt(text.clone()), |requests| requests.prompt(&text), cx);
+        let sent = self.model.sent_prompt(text.clone(), true);
+        self.send(sent, |requests| requests.prompt(&text), cx);
     }
 
     /// The login row's method `method` was chosen: `AGENT_LOGIN` for an
@@ -833,8 +857,8 @@ impl Agent {
     pub fn cancel_login(&mut self, cx: &mut Context<Self>) {
         match self.model.cancel_login() {
             CancelLogin::Send => {
-                if !self.requests.as_ref().is_some_and(|requests| requests.cancel()) {
-                    self.model.server_note(model::UNSENT);
+                if let Err(why) = self.through(|requests| requests.cancel()) {
+                    self.model.cancel_not_sent(why);
                 }
             }
             CancelLogin::CloseZone => cx.emit(LoginZone::Close),
@@ -872,11 +896,16 @@ impl Agent {
 
     /// Sends what `send` sends, recording it as `sent`; one that couldn't
     /// go is refused as the model says.
-    fn send(&mut self, sent: Sent, send: impl FnOnce(&dyn Requests) -> Option<RequestId>, cx: &mut Context<Self>) {
-        match self.requests.as_deref().and_then(send) {
-            Some(request) => self.model.sent(request, sent),
-            None => {
-                let replied = self.model.unsent(sent);
+    fn send(
+        &mut self,
+        sent: Sent,
+        send: impl FnOnce(&dyn Requests) -> Result<RequestId, NotSent>,
+        cx: &mut Context<Self>,
+    ) {
+        match self.through(send) {
+            Ok(request) => self.model.sent(request, sent),
+            Err(why) => {
+                let replied = self.model.not_sent(sent, why);
                 self.apply_replied(replied, cx);
             }
         }
@@ -893,7 +922,10 @@ impl Agent {
     /// reason shown.
     pub fn prompt(&mut self, draft: &str, composing: bool, cx: &mut Context<Self>) {
         match self.model.submit(draft, composing) {
-            Submit::Send(text) => self.send(Sent::Prompt, |requests| requests.prompt(&text), cx),
+            Submit::Send(text) => {
+                let sent = self.model.sent_prompt(text.clone(), false);
+                self.send(sent, |requests| requests.prompt(&text), cx);
+            }
             Submit::Set { option, name, value } => {
                 cx.emit(AgentUpdate::ClearDraft);
                 self.set_option(&option, name, value, cx);
@@ -983,8 +1015,11 @@ impl Agent {
 
     /// Stops the running turn (escape, the stop button, `agent_cancel`).
     pub fn cancel(&mut self, cx: &mut Context<Self>) {
-        if self.model.cancel() && !self.requests.as_ref().is_some_and(|requests| requests.cancel()) {
-            self.model.server_note(model::UNSENT);
+        if !self.model.cancel() {
+            return;
+        }
+        if let Err(why) = self.through(|requests| requests.cancel()) {
+            self.model.cancel_not_sent(why);
             cx.notify();
         }
     }
@@ -1024,9 +1059,12 @@ impl Agent {
 
     fn send_fetch(&mut self, fetch: Fetch, cx: &mut Context<Self>) {
         let max_bytes = u32::try_from(fetch.max_bytes).unwrap_or(u32::MAX);
-        match self.requests.as_ref().and_then(|requests| requests.fetch(fetch.before.0, max_bytes)) {
-            Some(request) => self.model.fetching(request),
-            None => self.model.fetch_unsent(),
+        match self.through(|requests| requests.fetch(fetch.before.0, max_bytes)) {
+            Ok(request) => self.model.fetching(request),
+            Err(why) => {
+                // A fetch's refusal is its row's state: nothing to apply.
+                let _nothing = self.model.not_sent(Sent::Fetch, why);
+            }
         }
         cx.notify();
     }

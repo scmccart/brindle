@@ -70,13 +70,26 @@ pub struct Changes {
     /// A replay started: the transcript was rebuilt from nothing, and the
     /// zone starts over from it.
     pub reset: bool,
-    /// Some of these changes were folded during a replay: what they hold
-    /// already happened, and raises nothing.
-    pub from_replay: bool,
+    /// Where the newest `Turn` or `Agent` event in these changes was folded
+    /// (OpenSpec change `agents-client-state-fixes`, decision 8): one from
+    /// a replay already happened and raises nothing, while live ones after
+    /// it in the same changes do.
+    pub status_from: StatusFrom,
     /// Fetched entries were folded in front of the held ones
     /// ([`AgentShared::prepend`], OpenSpec change `agents-log-paging`):
     /// this many, every one before the entries the zone already shows.
     pub prepended: Option<usize>,
+}
+
+/// Where the newest `Turn` or `Agent` event of a batch of changes was
+/// folded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatusFrom {
+    /// None came.
+    #[default]
+    Unchanged,
+    Replay,
+    Live,
 }
 
 impl Changes {
@@ -159,7 +172,8 @@ impl AgentShared {
     pub fn replay_start(&mut self) {
         self.transcript = Transcript::new();
         self.replaying = true;
-        self.changes = Changes { reset: true, from_replay: true, ..Changes::default() };
+        // A replay that brings no status event is still all from a replay.
+        self.changes = Changes { reset: true, status_from: StatusFrom::Replay, ..Changes::default() };
     }
 
     /// A fold for a new session that takes the zone's place (a continue in
@@ -208,7 +222,9 @@ impl AgentShared {
             .apply(event)
             .map_err(|why| Broken(format!("an event from the terminal server couldn't be applied: {why}")))?;
         let changes = &mut self.changes;
-        changes.from_replay |= self.replaying;
+        if let Event::Turn { .. } | Event::Agent { .. } = event {
+            changes.status_from = if self.replaying { StatusFrom::Replay } else { StatusFrom::Live };
+        }
         // A paged copy ignores a change to an entry below its window: there
         // is nothing the zone shows to redraw.
         let held = |id: &EntryId| self.transcript.entry(*id).is_some();
@@ -239,8 +255,9 @@ impl AgentShared {
 
     /// Decodes a fetched page's events and folds them in front of the held
     /// entries ([`Transcript::prepend`]); `more` says whether entries are
-    /// still earlier. Recorded as `prepended`, and as from a replay: they
-    /// already happened and raise nothing. One that doesn't decode or fit
+    /// still earlier. Recorded as `prepended`, which says they already
+    /// happened: a page carries entries only, so it leaves `status_from`
+    /// alone. One that doesn't decode or fit
     /// leaves the transcript as it was, and the session is [`Broken`].
     pub fn prepend(&mut self, values: &[Value], more: bool) -> Result<(), Broken> {
         let events = values
@@ -254,7 +271,6 @@ impl AgentShared {
             .map_err(|why| Broken(format!("a page from the terminal server couldn't be applied: {why}")))?;
         let added = self.transcript.entries().count() - before;
         self.changes.prepended = Some(self.changes.prepended.unwrap_or(0) + added);
-        self.changes.from_replay = true;
         Ok(())
     }
 
@@ -356,6 +372,7 @@ mod tests {
                 ]),
                 slot_changed: true,
                 turn_or_agent: true,
+                status_from: StatusFrom::Live,
                 ..Changes::default()
             },
             "an appended entry keeps its first tail; a new entry's changes aren't listed"
@@ -373,7 +390,7 @@ mod tests {
         let changes = shared.take_changes();
         assert_eq!(changes.trimmed_through, Some(EntryId(3)));
         assert_eq!(changes.changed, BTreeMap::from([(EntryId(7), Dirty::Appended { from_byte: 8 })]), "trimmed ones go");
-        assert!(!changes.from_replay);
+        assert_eq!(changes.status_from, StatusFrom::Unchanged);
     }
 
     /// A replay starts over: it holds a waiting prompt or a held one (its
@@ -403,14 +420,37 @@ mod tests {
             shared.apply(&values(&source.replay())).unwrap();
             shared.replay_end();
             let changes = shared.take_changes();
-            assert!(changes.reset && changes.from_replay && changes.slot_changed && changes.turn_or_agent);
+            assert!(changes.reset && changes.slot_changed && changes.turn_or_agent);
+            assert_eq!(changes.status_from, StatusFrom::Replay);
             assert_eq!(changes.added_from, Some(EntryId(1)));
             assert_eq!(shared.transcript(), &source, "the copy is the server's log");
             assert_eq!(shared.transcript().slot(), &slot);
             shared.apply(&values(&[Event::Turn { state: TurnState::Working }])).unwrap();
             let live = shared.take_changes();
-            assert!(!live.from_replay && !live.reset && live.turn_or_agent);
+            assert!(!live.reset && live.turn_or_agent);
+            assert_eq!(live.status_from, StatusFrom::Live);
         }
+    }
+
+    /// D-10: `status_from` follows the newest `Turn` or `Agent` event of a
+    /// batch, so live ones after a replay in the same batch count as live,
+    /// and entries alone change nothing.
+    #[test]
+    fn the_newest_status_event_says_where_it_was_folded() {
+        let mut shared = AgentShared::new();
+        shared.apply(&values(&[added(1, agent("hi"))])).unwrap();
+        assert_eq!(shared.take_changes().status_from, StatusFrom::Unchanged, "entries alone");
+        shared.replay_start();
+        shared.apply(&values(&[Event::Turn { state: TurnState::Idle }])).unwrap();
+        shared.replay_end();
+        // A replay starts the log over, so its first entry is 1 again.
+        shared.apply(&values(&[added(1, agent("live")), Event::Agent { state: AgentState::Ready { name: None, version: None } }])).unwrap();
+        assert_eq!(shared.take_changes().status_from, StatusFrom::Live, "the live one came last");
+        shared.replay_start();
+        shared.apply(&values(&[Event::Turn { state: TurnState::Idle }])).unwrap();
+        shared.replay_end();
+        shared.apply(&values(&[added(1, agent("live"))])).unwrap();
+        assert_eq!(shared.take_changes().status_from, StatusFrom::Replay, "a live entry doesn't count");
     }
 
     /// A value `from_value` rejects and an event the fold rejects each
@@ -532,7 +572,8 @@ mod tests {
         shared.prepend(&values(&fetched.events), fetched.more).unwrap();
         let changes = shared.take_changes();
         assert_eq!(changes.prepended, Some(2));
-        assert!(changes.changed.is_empty() && changes.from_replay);
+        assert!(changes.changed.is_empty());
+        assert_eq!(changes.status_from, StatusFrom::Unchanged, "a page carries no status");
         assert_eq!(shared.transcript().entry(EntryId(2)), source.entry(EntryId(2)));
     }
 
@@ -635,7 +676,7 @@ mod tests {
         shared.prepend(&values(&[added(1, agent("one"))]), false).unwrap();
         let changes = shared.take_changes();
         assert_eq!(changes.prepended, Some(2));
-        assert!(changes.from_replay);
+        assert_eq!(changes.status_from, StatusFrom::Unchanged, "a page carries no status");
         assert_eq!(changes.added_from, None, "nothing new after the shown entries");
         assert!(shared.transcript().window().is_none());
         assert_eq!(shared.transcript().entries().count(), 3);

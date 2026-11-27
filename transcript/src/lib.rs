@@ -1857,6 +1857,25 @@ pub fn chunks(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// `text` with every control character but `\n`, `\t` and a `\r` before
+/// `\n` (or at the end, where a chunk may have cut a `\r\n`) replaced by
+/// U+FFFD (`agents-acp` decision 8). The core stores a prompt cleaned so,
+/// and a client compares a prompt it sent with the log by the same rule
+/// (OpenSpec change `agents-client-state-fixes`, decision 5).
+pub fn clean(text: &str) -> String {
+    let mut cleaned = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let keep = match c {
+            '\n' | '\t' => true,
+            '\r' => chars.peek().is_none_or(|next| *next == '\n'),
+            other => !other.is_control(),
+        };
+        cleaned.push(if keep { c } else { '\u{FFFD}' });
+    }
+    cleaned
+}
+
 /// How many bytes `text` takes inside a JSON string, as serde_json escapes
 /// it: `"` and `\` take two, the control characters two (`\b`, `\t`, `\n`,
 /// `\f`, `\r`) or six (`\u00XX`).
@@ -1874,6 +1893,15 @@ fn escaped_len(text: &str) -> usize {
 mod tests {
     use super::*;
     use crate::fuzz::{XorShift, random_transcript};
+
+    #[test]
+    fn clean_replaces_control_characters_but_line_ends_and_tabs() {
+        assert_eq!(clean("a\u{1b}b\u{7}c"), "a\u{fffd}b\u{fffd}c");
+        assert_eq!(clean("tab\there\nend"), "tab\there\nend");
+        assert_eq!(clean("crlf\r\nlone\rend\r"), "crlf\r\nlone\u{fffd}end\r");
+        assert_eq!(clean("\u{0}\u{85}ünï 🦀"), "\u{fffd}\u{fffd}ünï 🦀");
+        assert_eq!(clean(""), "");
+    }
 
     fn added(id: u64, entry: Entry) -> Event {
         Event::Added {

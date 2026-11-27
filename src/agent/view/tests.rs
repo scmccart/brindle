@@ -990,9 +990,10 @@ fn the_earlier_row_fetches_in_view_and_spins_until_the_page_comes() {
         f.view.update(f.cx, |view, cx| view.page(PageDirection::Up, cx));
         f.cx.run_until_parked();
     }
-    let Earlier::Loading { request, .. } = earlier(&mut f) else { panic!("no fetch: {:?}", earlier(&mut f)) };
+    assert!(matches!(earlier(&mut f), Earlier::Loading { .. }), "no fetch: {:?}", earlier(&mut f));
     let calls = f.zone.calls.borrow().clone();
-    assert!(calls.contains(&Call::Fetch(from.0, PAGE_BYTES as u32)), "{calls:?}");
+    assert_eq!(calls.last(), Some(&Call::Fetch(from.0, PAGE_BYTES as u32)), "{calls:?}");
+    let request = f.zone.last_request();
     assert!(running(&mut f), "the loader turns while the page is on its way");
     assert!(f.cx.debug_bounds("agent-earlier").is_some(), "the row is drawn");
 

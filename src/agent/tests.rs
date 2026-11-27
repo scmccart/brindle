@@ -2,7 +2,7 @@
 
 use super::test_support::{Call, FAKE_PROFILE, Start, Zone, added, agent, app, ready, set_config, settle, user};
 use super::*;
-use crate::agent::model::{AgentPhase, NoOffer, UNSENT};
+use crate::agent::model::{AgentPhase, NoOffer, NotSent, UNSENT};
 use crate::agent::transcript::{AgentState, Continuation, Entry, Event, NoticeLevel, Slot, TurnState};
 
 fn drained<T>(rx: &mut futures::channel::mpsc::UnboundedReceiver<T>) -> Vec<T> {
@@ -98,10 +98,10 @@ fn prompts_go_through_the_model_and_their_answers_come_back() {
     assert!(drained(&mut updates).is_empty(), "a refused prompt keeps its draft");
     zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), Some("the agent isn't ready")));
 
-    zone.down.set(true);
+    zone.refuse.set(Some(NotSent::Gone));
     zone.agent.update(&mut cx, |agent, cx| agent.prompt("lost", false, cx));
     zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), Some(UNSENT)));
-    zone.down.set(false);
+    zone.refuse.set(None);
 
     // Cancel, resend, unqueue and answer go only when the model has
     // something for them.
@@ -254,7 +254,7 @@ fn a_refused_restart_shows_why() {
         assert_eq!(agent.offer(cx), Offer::Restart, "offered again");
     });
     // One that couldn't go says so.
-    zone.down.set(true);
+    zone.refuse.set(Some(NotSent::Gone));
     zone.agent.update(&mut cx, |agent, cx| agent.continue_conversation(cx));
     zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), Some(UNSENT)));
 }
@@ -436,7 +436,7 @@ fn a_login_choice_sends_agent_login_and_cancel_login_cancels() {
     settle(&cx);
     zone.agent.update(&mut cx, |agent, cx| agent.cancel_login(cx));
     assert_eq!(zone.take_calls(), [Call::Cancel]);
-    zone.down.set(true);
+    zone.refuse.set(Some(NotSent::Gone));
     zone.agent.update(&mut cx, |agent, cx| agent.cancel_login(cx));
     zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), Some(UNSENT)));
 }
@@ -493,4 +493,75 @@ fn a_first_prompt_after_a_login_is_sent_if_unchanged() {
     assert!(zone.take_calls().is_empty(), "the view decides");
     zone.agent.update(&mut cx, |agent, cx| agent.send_first("hello there", cx));
     assert_eq!(zone.take_calls(), [Call::Prompt("hello there".into())]);
+}
+
+/// D-1 (`agents-client-state-fixes` task 4.5): a launch's first prompt
+/// whose agent is ready before the session's thread handed over the
+/// session waits for it, refusing nothing, and goes once it runs, once.
+#[test]
+fn a_first_prompt_waits_for_the_session_to_run_and_goes_once() {
+    let mut cx = app();
+    let mut zone = Zone::starting(Some("hello there"), &mut cx);
+    let mut updates = cx.events::<AgentUpdate, _>(&zone.agent);
+    zone.feed(&[ready()]);
+    settle(&cx);
+    assert!(zone.take_calls().is_empty(), "not sent before the session runs");
+    zone.agent.read_with(&cx, |agent, _| {
+        assert_eq!(agent.model().refusal(), None);
+        assert_eq!(agent.model().prompt_status(), model::PromptStatus::Disabled(model::DisabledWhy::Connecting));
+    });
+
+    zone.sink.running();
+    settle(&cx);
+    assert_eq!(zone.take_calls(), [Call::Prompt("hello there".into())]);
+    zone.feed(&[added(1, user("hello there")), ready()]);
+    settle(&cx);
+    assert!(zone.take_calls().is_empty(), "sent once");
+    let drafts = drained(&mut updates).into_iter().filter(|update| matches!(update, AgentUpdate::SetDraft(_)));
+    assert_eq!(drafts.count(), 0, "never the draft");
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), None));
+}
+
+/// `agents-client-state-fixes` task 4.5: enter before the session runs
+/// sends nothing and keeps the text, with no refusal; a send that meets
+/// a session still being set up (`NotSent::Starting`) is the same.
+#[test]
+fn enter_before_the_session_runs_keeps_the_text_without_a_refusal() {
+    let mut cx = app();
+    let mut zone = Zone::starting(None, &mut cx);
+    let mut updates = cx.events::<AgentUpdate, _>(&zone.agent);
+    zone.feed(&[ready()]);
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("early", false, cx));
+    assert!(zone.take_calls().is_empty(), "the model holds it");
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().refusal(), None));
+
+    zone.sink.running();
+    settle(&cx);
+    zone.refuse.set(Some(NotSent::Starting));
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("raced", false, cx));
+    assert_eq!(zone.take_calls(), [Call::Prompt("raced".into())]);
+    settle(&cx);
+    assert!(drained(&mut updates).is_empty(), "the input keeps its text");
+    zone.agent.read_with(&cx, |agent, _| {
+        assert_eq!(agent.model().refusal(), None);
+        assert_eq!(agent.model().prompt_status(), model::PromptStatus::Ready, "nothing waits for an answer");
+    });
+}
+
+/// D-11 (`agents-client-state-fixes` task 1.8): a conversation chosen
+/// while the link is down isn't sent, and the choosing screen says why.
+#[test]
+fn a_choice_while_reconnecting_says_why() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    zone.feed(&[Event::Agent { state: AgentState::Choosing { message: None } }]);
+    zone.sink.link_down();
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.choose(Some("c1".into()), cx));
+    assert!(!zone.take_calls().contains(&Call::Choose(Some("c1".into()))), "not sent");
+    zone.agent.read_with(&cx, |agent, _| {
+        let reason = agent.model().choosing_reason();
+        assert!(reason.contains("connection to the terminal server"), "{reason}");
+    });
 }

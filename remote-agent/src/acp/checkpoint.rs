@@ -1170,7 +1170,7 @@ pub fn not_restored(why: &Unreadable, cwd: &str, version: &str) -> AgentSession 
             id: EntryId::FIRST,
             entry: Entry::Notice {
                 level: NoticeLevel::Error,
-                text: format!("{NOT_RESTORED}: {}", reduce::clean(&why.to_string())),
+                text: format!("{NOT_RESTORED}: {}", brindle_transcript::clean(&why.to_string())),
             },
         },
         Event::Agent {
