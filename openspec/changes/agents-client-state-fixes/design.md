@@ -353,6 +353,13 @@ Task 1.1, at `b6a0316` (after `agents-commands`, PR #151). Every site the decisi
 - **1.5–1.7 and 1.9:** each test failed on `main` and passes with the model or `reparses` change it shows. So every finding of D-4, D-6, D-7, D-10 and D-12 is shown, and none is dropped.
 - **1.10:** the baseline loop of `agent-queue` and `agent-continue-profile-gone` on `main` (SLOW=2, under `scripts/with-xvfb` in a `systemd-run --user --scope`), scaled to one sequential loop of 50 (flag 9). The count is in the implementation report, read from `/var/tmp/bp/loops/baseline-flake/summary.txt`.
 
+## As built (sections 4–6, 2026-11-27)
+
+- **Commits:** the shell commit (1.3, 1.4, 1.8, 4.1–4.5, 5.1), then the docs commit (6.1, 6.2, 6.4).
+- **The bridges are gone.** `Agent::from_parts` and `renew` no longer call `session_running()`; `SessionRunning` comes from `run` after `Phase::Running` (flag 1). `AgentEvent::Reply` carries `ReplyError` from the connection (flag 2), and every `Requests` call returns `Result<_, NotSent>` with the real reason. Every `cfg_attr(not(test), expect(dead_code))` of flag 12 is removed.
+- **1.3, 5.2:** with the fix, `agent-first-prompt-before-the-session-runs` and `agent-prompt-before-the-attached-session-runs` passed 20 of 20 runs each (SLOW=1, one sequential loop under `scripts/with-xvfb` in a `systemd-run --user --scope`). The attached case's steps changed (flag 20); with its new steps it failed 5 of 5 runs on `main`'s binaries. The `agent-`, `palette` and `zone` filters passed once on the branch: 121 passed, 0 failed, 2 skipped (`remote-agent-ssh` and `remote-agent-login-terminal`, no static fake agent built), with `agent-queue` and `agent-continue-profile-gone` left out of that run (flag 19) and run afterwards in 5.3's loop.
+- **6.3, the withheld list (decision 11):** a terminal login is withheld for `cmd /c|/k`, a batch file and `ssh` (`agents-login` decision 9), and now also for `pwsh` with `-Command` or `-EncodedCommand` (any accepted prefix), for `powershell` without `-File`, and for `wsl` without `-e`/`--exec`. `pwsh -File`, `pwsh -CommandWithArgs`, `powershell -File` and `wsl --exec` pass their arguments through and are offered. No architecture rule or exception changed, so `docs/architecture/` is untouched.
+
 ## Decided while implementing (flags)
 
 1. **A bridge for `SessionHandle`.** The model's session starts `Starting`, but nothing raises `SessionRunning` until task 4.3. Until then `Agent::from_parts` calls `model.session_running()` right after building the model, and `renew` calls it after `respawning()`, which keeps `main`'s behaviour. Section 4 removes both calls once the session's thread raises the event.
