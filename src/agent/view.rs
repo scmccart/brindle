@@ -43,7 +43,7 @@ use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
     AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow,
-    Resend, ShownPart, Splice, WorkingRow, ZoneChoice,
+    Resend, ShownPart, WorkingRow, ZoneChoice,
 };
 use crate::agent::tool::{self, DetailPart};
 use crate::motion::{self, Motion};
@@ -281,19 +281,6 @@ fn allows(kind: PermissionKind) -> bool {
     }
 }
 
-/// The scroller's change for the working row (OpenSpec change
-/// `agents-zone-attention`, decision 2), the conversation's last item after
-/// the model's `len` blocks: inserted when it appears, removed when it
-/// goes, nothing otherwise. Applied after the model's splices, which all
-/// fall within the blocks.
-pub fn working_splice(before: bool, after: bool, len: usize) -> Option<Splice> {
-    match (before, after) {
-        (false, true) => Some(Splice { range: len..len, count: 1 }),
-        (true, false) => Some(Splice { range: len..len + 1, count: 0 }),
-        (false, false) | (true, true) => None,
-    }
-}
-
 /// A permission option's button: an allow option is destructive while
 /// the request is pending, a reject option an outline (decision 4).
 pub fn permission_variant(kind: PermissionKind) -> ButtonVariant {
@@ -318,9 +305,6 @@ pub struct AgentView {
     theme: Theme,
     /// The profile's font size, else the terminal size in effect.
     font_size_override: Option<f32>,
-    /// The working row while it shows, the scroller's last item; the view
-    /// wants the motion clock meanwhile.
-    working: Option<WorkingRow>,
     /// The Earlier row as the model last gave it (OpenSpec change
     /// `agents-log-paging` decision 11): the scroller's top row while there
     /// is one; the view wants the motion clock while it loads.
@@ -368,8 +352,7 @@ impl AgentView {
             prompt.set_placeholder("Message the agent", cx);
             prompt.set_held_color(theme.ansi[3].hsla(), cx);
         });
-        let working = agent.read(cx).model().working_row();
-        let count = agent.read(cx).model().blocks().len() + usize::from(working.is_some());
+        let count = agent.read(cx).model().item_count();
         let view = cx.weak_entity();
         let (top, told) = (view.clone(), view.clone());
         let scroller = cx.new(|cx| {
@@ -417,7 +400,6 @@ impl AgentView {
             cancel_login: cx.focus_handle(),
             theme,
             font_size_override,
-            working,
             earlier: Earlier::None,
             _subscriptions: subscriptions,
         };
@@ -434,7 +416,8 @@ impl AgentView {
             Earlier::Loading { .. } => true,
             Earlier::None | Earlier::Available { .. } | Earlier::Failed { .. } => false,
         };
-        Motion::want(cx.entity_id(), self.working.is_some() || loading, cx);
+        let working = self.agent.read(cx).model().working_row().is_some();
+        Motion::want(cx.entity_id(), working || loading, cx);
     }
 
     /// The model's Earlier row: the scroller shows it while there is one
@@ -554,15 +537,6 @@ impl AgentView {
                     scroller.splice(splice.range.clone(), splice.count, cx);
                 }
             }),
-            AgentUpdate::Working(after) => {
-                let len = self.agent.read(cx).model().blocks().len();
-                if let Some(splice) = working_splice(self.working.is_some(), after.is_some(), len) {
-                    self.scroller.update(cx, |scroller, cx| scroller.splice(splice.range, splice.count, cx));
-                }
-                self.working = after.clone();
-                self.refresh_motion(cx);
-                cx.notify();
-            }
             AgentUpdate::ClearDraft => self.prompt.update(cx, |prompt, cx| prompt.set_text("", cx)),
             AgentUpdate::SetDraft(text) => self.prompt.update(cx, |prompt, cx| prompt.set_text(text, cx)),
             AgentUpdate::SetDraftAt(text, cursor) => {
@@ -619,6 +593,8 @@ impl AgentView {
         let before = self.stops(cx);
         self.refresh(cx);
         self.follow_earlier(cx);
+        // The working row came or went.
+        self.refresh_motion(cx);
         let after = self.stops(cx);
         let focused = window.focused(cx);
         if focused.as_ref().is_some_and(|focused| before.contains(focused) && !after.contains(focused)) {
@@ -858,9 +834,9 @@ fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::
     let this = entity.read(cx);
     let blocks = this.agent.read(cx).model().blocks().len();
     if ix == blocks
-        && let Some(row) = &this.working
+        && let Some(row) = this.agent.read(cx).model().working_row()
     {
-        return working_row(row, Motion::step(cx));
+        return working_row(&row, Motion::step(cx));
     }
     let Some(block) = this.agent.read(cx).model().blocks().get(ix).cloned() else { return div().into_any_element() };
     let handles: Vec<(SharedString, FocusHandle)> = this

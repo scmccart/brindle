@@ -49,10 +49,18 @@ fn events_through_the_sink_reach_the_model_and_the_first_prompt_goes_once() {
     settle(&cx);
     let splices = drained(&mut updates);
     assert!(
-        splices.iter().all(|update| matches!(update, AgentUpdate::Splices(_) | AgentUpdate::Working(_))),
+        splices.iter().all(|update| matches!(update, AgentUpdate::Splices(_))),
         "only the list changes: {splices:?}"
     );
-    assert_eq!(splices.last(), Some(&AgentUpdate::Working(Some(model::WorkingRow::Working))), "the working row, last");
+    // The working row's insert, after the blocks' (OpenSpec change
+    // `agents-zone-focus-and-scroll`, decision 5).
+    let blocks = zone.agent.read_with(&cx, |agent, _| agent.model().blocks().len());
+    let last = splices
+        .iter()
+        .rev()
+        .find_map(|update| if let AgentUpdate::Splices(splices) = update { splices.last().cloned() } else { None });
+    assert_eq!(last, Some(model::Splice { range: blocks..blocks, count: 1 }), "the working row, last");
+    assert_eq!(zone.agent.read_with(&cx, |agent, _| agent.model().working_row()), Some(model::WorkingRow::Working));
     assert_eq!(drained(&mut terminal_events), [TerminalEvent::Status(None)], "working");
     zone.feed(&[Event::Turn { state: TurnState::Ended { stop: crate::agent::transcript::StopReason::EndTurn } }]);
     settle(&cx);

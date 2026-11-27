@@ -132,16 +132,11 @@ fn permission() -> Entry {
     }
 }
 
-/// `agents-zone-attention` decision 2: the working row is inserted after
-/// the blocks when it appears, removed from there when it goes, and left
-/// alone otherwise; an allow option is destructive, a reject an outline.
+/// `agents-zone-attention` decision 4: an allow option is destructive, a
+/// reject an outline. (The working row's splice is the model's now,
+/// `model.rs`'s `the_working_rows_splice_inserts_removes_or_leaves_it`.)
 #[test]
-fn the_working_rows_splice_and_the_permission_variants() {
-    assert_eq!(working_splice(false, true, 4), Some(Splice { range: 4..4, count: 1 }));
-    assert_eq!(working_splice(true, false, 4), Some(Splice { range: 4..5, count: 0 }));
-    assert_eq!(working_splice(false, true, 0), Some(Splice { range: 0..0, count: 1 }));
-    assert_eq!(working_splice(true, true, 4), None, "its text may change, its place doesn't");
-    assert_eq!(working_splice(false, false, 4), None);
+fn the_permission_variants() {
     assert_eq!(permission_variant(PermissionKind::AllowOnce), ButtonVariant::Destructive);
     assert_eq!(permission_variant(PermissionKind::AllowAlways), ButtonVariant::Destructive);
     assert_eq!(permission_variant(PermissionKind::RejectOnce), ButtonVariant::Outline);
@@ -158,11 +153,12 @@ fn the_working_row_ends_the_conversation_while_the_turn_works() {
     let mut f = Fixture::new();
     let shown = |f: &mut Fixture| {
         f.view.read_with(f.cx, |view, cx| {
-            let blocks = view.agent.read(cx).model().blocks().len();
+            let model = view.agent.read(cx).model();
+            let (blocks, working) = (model.blocks().len(), model.working_row());
             let items = view.scroller.read(cx).item_count();
             assert!(items == blocks || items == blocks + 1, "{items} items for {blocks} blocks");
-            assert_eq!(items == blocks + 1, view.working.is_some(), "the row is the last item exactly while it shows");
-            view.working.as_ref().map(|row| row.text().to_string())
+            assert_eq!(items == blocks + 1, working.is_some(), "the row is the last item exactly while it shows");
+            working.map(|row| row.text().to_string())
         })
     };
     let running = |f: &mut Fixture| f.cx.update(|_, cx| Motion::running(cx));
@@ -211,6 +207,27 @@ fn the_working_row_ends_the_conversation_while_the_turn_works() {
     f.cx.run_until_parked();
     assert!(!f.cx.update(|_, cx| Motion::wants(id, cx)), "released, it no longer wants the clock");
     assert!(running(&mut f), "the first view still does");
+}
+
+/// OpenSpec change `agents-zone-focus-and-scroll` decision 5 (E-6): one
+/// paced chunk that ends the session while the working row shows, then adds
+/// a notice, leaves the scroller with exactly the model's items, the notice
+/// drawn and the row gone.
+#[test]
+fn an_exit_and_a_notice_in_one_chunk_leave_no_empty_item() {
+    let mut f = Fixture::new();
+    f.feed(&[ready(), added(1, user("hi")), working()]);
+    let counts = |f: &mut Fixture| {
+        f.view.read_with(f.cx, |view, cx| (view.scroller.read(cx).item_count(), view.agent.read(cx).model().item_count()))
+    };
+    assert_eq!(counts(&mut f), (2, 2), "the block and the row");
+    // Both reach the agent's loop before it runs: one chunk.
+    f.zone.sink.exited(Some(0));
+    f.zone.feed(&[added(2, Entry::Notice { level: NoticeLevel::Warning, text: "the agent exited".into() })]);
+    f.settle();
+    assert_eq!(counts(&mut f), (2, 2), "the block and the notice, no stale row");
+    f.cx.run_until_parked();
+    assert!(f.cx.debug_bounds("agent-working").is_none(), "the row is gone");
 }
 
 /// The agent's order put allow first: the row turns it round.
