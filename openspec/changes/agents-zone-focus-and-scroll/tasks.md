@@ -61,7 +61,7 @@ Each group writes its tests first and watches them fail before the code they che
   `cargo test -p brindle-ui message_scroller focus_scope`.
   - *As run:* all failed to build first (19 errors: no `reveal_plan`, `Reveal`, `reveal`, `on_items_view` or `on_step`). These are new primitives, so no behaviour could fail before them.
 - [x] 5.2 Implement `reveal_plan`, `MessageScroller::reveal` and `on_items_view` (design 4), and `FocusScope::on_step`. Verify that 5.1 and the existing `focus_scope` tests pass.
-  - *As built:* `Reveal` has four cases, not two (flag 4): `InView`, `ToTop` (cut at the top, or taller than the view), `By(px)` (cut at the bottom: the least distance) and `Undrawn`. Only `Undrawn` below the view goes through gpui's `scroll_to_reveal_item`, after pinning the list at what the last frame showed; an undrawn item above goes to the top. `on_items_view` reports the owner's items with any part in view, an empty `0..0` when none, deferred from the after-draw canvas. `cargo test -p brindle-ui`: 317 passed.
+  - *As built:* `Reveal` has four cases, not two (flag 4): `InView`, `ToTop` (cut at the top, or taller than the view), `By(px)` (cut at the bottom: the least distance) and `Undrawn`. An undrawn item goes to the top; below the view, the next frame puts its end at the bottom (changed in section 7 from gpui's `scroll_to_reveal_item`, flag 4). `on_items_view` reports the owner's items with any part in view, an empty `0..0` when none, deferred from the after-draw canvas. `cargo test -p brindle-ui`: 317 passed.
 - [x] 5.3 Document `reveal`, `on_items_view` and `on_step` in `ui/README.md` (the scroller's and `FocusScope`'s entries) and the code map's `brindle-ui` entry. Verify each is named once in each.
   - *As run:* `grep -c` finds `reveal(`, `on_items_view` and `on_step` once in `ui/README.md` and once in `docs/code-map.md`.
 
@@ -81,10 +81,12 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 7. A focused permission button is in view (E-3, `src/agent/view.rs`, `model.rs`)
 
-- [ ] 7.1 Add tests and verify they fail first:
+- [x] 7.1 Add tests and verify they fail first:
   - `model.rs`: `a_pending_permission_names_its_block`, and `None` once answered.
   - `view/tests.rs`: `tab_to_a_permission_below_the_view_reveals_it_and_enter_answers_it`: away from the end, a permission arrives off screen, tab from the prompt; the block's buttons are drawn, the first is focused, and `--key enter` gives `Call::Answer` with the reject option. `a_permission_in_view_is_not_scrolled_to`. `scrolling_a_focused_permission_out_of_view_gives_focus_to_the_prompt`: the request is still pending (no `Call::Answer`).
-- [ ] 7.2 Add `ChatModel::permission_block`, pass `on_step` to the zone's `FocusScope` to reveal a permission's block, and handle `on_items_view` to give focus back (design 4). Verify that 7.1 and `tab_walks_the_prompt_the_row_the_permissions_and_stop` pass.
+  - *As run:* the model test failed to build (no `permission_block`). With `permission_block` added and the view not yet wired, `tab_to_a_permission_below_the_view_reveals_it_and_enter_answers_it` failed ("revealed": the block wasn't drawn after Tab) and `scrolling_a_focused_permission_out_of_view_gives_focus_to_the_prompt` failed (focus stayed on the button out of view). `a_permission_in_view_is_not_scrolled_to` passed, as a guard: before the fix nothing scrolls on Tab at all. The new conversation's entries are 1 to 22 (the transcript takes ids in order), so the request is entry 22.
+- [x] 7.2 Add `ChatModel::permission_block`, pass `on_step` to the zone's `FocusScope` to reveal a permission's block, and handle `on_items_view` to give focus back (design 4). Verify that 7.1 and `tab_walks_the_prompt_the_row_the_permissions_and_stop` pass.
+  - *As built:* `AgentView::reveal_permission` (from `on_step`) and `give_back` (from `on_items_view`, through the window's handle taken in `new`, since the callback has only `&mut App`), with the private `permission_of(handle)`. Wired first, the Tab test still failed: the undrawn block went through gpui's `scroll_to_reveal_item`, which counted it as no height and left it under the view, and the give-back took focus to the prompt. The scroller now puts an undrawn item below the view at its top and, after that frame, its end at the bottom, telling `on_items_view` only then (flag 4; `revealing_an_unmeasured_item_below_the_view_puts_its_end_at_the_bottom` in `message_scroller.rs` fails on the earlier version). `cargo test -p brindle`: 1297 passed, 2 ignored; `brindle-ui` 318 passed; the code map's agent view entry names the reveal and the give-back.
 
 ## 8. One press rule for the zone (E-1, `src/agent/view.rs`, `src/zone_view.rs`)
 
