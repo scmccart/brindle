@@ -15,6 +15,8 @@
 //!
 //! [`Overlay`]: crate::primitives::overlay::Overlay
 
+use std::rc::Rc;
+
 use gpui::{
     App, Div, Entity, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement, StyleRefinement, Styled,
     Window, div,
@@ -66,17 +68,27 @@ pub fn cycle(len: usize, current: Option<usize>, direction: TabDirection) -> Opt
 pub struct FocusScope<V: FocusStops + Focusable + 'static> {
     view: Entity<V>,
     base: Div,
+    on_step: Option<Rc<OnStep>>,
 }
+
+type OnStep = dyn Fn(&FocusHandle, &mut Window, &mut App);
 
 impl<V: FocusStops + Focusable + 'static> FocusScope<V> {
     pub fn new(view: &Entity<V>) -> Self {
-        Self { view: view.clone(), base: div() }
+        Self { view: view.clone(), base: div(), on_step: None }
+    }
+
+    /// Calls `on_step` with the stop Tab or shift-Tab just focused (not a
+    /// focus moved any other way), so the owner can bring it into view.
+    pub fn on_step(mut self, on_step: impl Fn(&FocusHandle, &mut Window, &mut App) + 'static) -> Self {
+        self.on_step = Some(Rc::new(on_step));
+        self
     }
 
     /// Moves focus one stop along. In a debug build, a focused handle that
     /// is neither a stop nor the view's own is a stop the view forgot to
     /// list, which Tab could never reach.
-    fn step(view: &Entity<V>, direction: TabDirection, window: &mut Window, cx: &mut App) {
+    fn step(view: &Entity<V>, direction: TabDirection, on_step: Option<&OnStep>, window: &mut Window, cx: &mut App) {
         let (stops, own) = {
             let view = view.read(cx);
             (view.stops(cx), view.focus_handle(cx))
@@ -89,6 +101,9 @@ impl<V: FocusStops + Focusable + 'static> FocusScope<V> {
         );
         if let Some(ix) = cycle(stops.len(), current, direction) {
             window.focus(&stops[ix]);
+            if let Some(on_step) = on_step {
+                on_step(&stops[ix], window, cx);
+            }
         }
     }
 }
@@ -109,13 +124,15 @@ impl<V: FocusStops + Focusable + 'static> IntoElement for FocusScope<V> {
     type Element = Div;
 
     fn into_element(self) -> Div {
-        let Self { view, base } = self;
+        let Self { view, base, on_step } = self;
         base.key_context("UiFocusScope")
             .on_action({
-                let view = view.clone();
-                move |_: &FocusNext, window, cx| Self::step(&view, TabDirection::Forward, window, cx)
+                let (view, on_step) = (view.clone(), on_step.clone());
+                move |_: &FocusNext, window, cx| Self::step(&view, TabDirection::Forward, on_step.as_deref(), window, cx)
             })
-            .on_action(move |_: &FocusPrev, window, cx| Self::step(&view, TabDirection::Backward, window, cx))
+            .on_action(move |_: &FocusPrev, window, cx| {
+                Self::step(&view, TabDirection::Backward, on_step.as_deref(), window, cx)
+            })
     }
 }
 
@@ -150,5 +167,65 @@ mod tests {
         assert_eq!(cycle(0, None, Forward), None);
         assert_eq!(cycle(0, None, Backward), None);
         assert_eq!(cycle(0, Some(0), Forward), None);
+    }
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{Context, Modifiers, Render, VisualTestContext, px};
+
+    /// Two stops in a scope that tells `seen` where Tab moved focus.
+    struct Stops {
+        a: FocusHandle,
+        b: FocusHandle,
+        seen: Rc<RefCell<Vec<FocusHandle>>>,
+    }
+
+    impl FocusStops for Stops {
+        fn stops(&self, _: &App) -> Vec<FocusHandle> {
+            vec![self.a.clone(), self.b.clone()]
+        }
+    }
+
+    impl Focusable for Stops {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.a.clone()
+        }
+    }
+
+    impl Render for Stops {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let seen = self.seen.clone();
+            let stop = |handle: &FocusHandle, name: &'static str| {
+                div().debug_selector(move || name.into()).track_focus(handle).w(px(100.)).h(px(40.))
+            };
+            FocusScope::new(&cx.entity())
+                .on_step(move |handle, _, _| seen.borrow_mut().push(handle.clone()))
+                .size_full()
+                .child(stop(&self.a, "stop-a"))
+                .child(stop(&self.b, "stop-b"))
+        }
+    }
+
+    /// `FocusScope::on_step` hears Tab's and shift-Tab's stop, and not a
+    /// focus a press moved.
+    #[test]
+    fn tab_tells_the_owner_which_stop_it_focused() {
+        let mut app = crate::test_support::app();
+        let seen: Rc<RefCell<Vec<FocusHandle>>> = Rc::default();
+        let told = seen.clone();
+        let (view, cx) = app.add_window_view(move |_, cx| Stops { a: cx.focus_handle(), b: cx.focus_handle(), seen: told });
+        let cx: &mut VisualTestContext = cx;
+        let (a, b) = view.read_with(cx, |view, _| (view.a.clone(), view.b.clone()));
+        cx.update(|window, _| window.focus(&a));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("tab");
+        assert_eq!(seen.borrow().as_slice(), std::slice::from_ref(&b));
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(*seen.borrow(), [b.clone(), a.clone()]);
+        let at = cx.debug_bounds("stop-b").expect("drawn").center();
+        cx.simulate_click(at, Modifiers::none());
+        assert!(cx.update(|window, _| b.is_focused(window)), "the press focused it");
+        assert_eq!(seen.borrow().len(), 2, "a press isn't a step");
     }
 }

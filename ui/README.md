@@ -65,7 +65,9 @@ rule, not a convenience.
     `Response`'s links). `TooltipFor` on a plain element can't, and keeps
     the window's set.
   - `FocusScope` and `FocusStops`: Tab and shift-Tab cycle through the stops a
-    view lists, and never leave it.
+    view lists, and never leave it. `on_step(callback)` tells the owner
+    which stop Tab or shift-Tab just focused (not a focus a press moved),
+    so it can bring a stop in a scrolled list into view.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
     its start, centre or end, flipping and clamping to stay in the window,
     or in a region of it given to `Anchored::within` (`place_within`).
@@ -357,7 +359,12 @@ rule, not a convenience.
     keeping the item at the top at the same fraction of its height. Rules 7
     and 8 settle after the frame that measured the item, one frame late.
     The pure parts are `top_after_splice`, `settle_anchor` and
-    `inserts_at_start`.
+    `inserts_at_start`. `reveal(ix)` scrolls the least distance that shows
+    an item whole, or its top when it is taller than the view, from what
+    the last frame showed (the pure `reveal_plan`), following the end again
+    when that shows the end; an item drawn whole stays put.
+    `on_items_view(callback)` tells the owner its items with any part in
+    view, after each frame that changed them.
   - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
     at the end on `muted`, as wide as its text up to four fifths of the
     row, the other side's (`Assistant`) at the start on the card with a

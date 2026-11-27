@@ -210,9 +210,40 @@ pub fn inserts_at_start(old: &Range<usize>, count: usize) -> bool {
     old.start == 0 && count > old.len()
 }
 
+/// What revealing an item does ([`reveal_plan`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Reveal {
+    /// Drawn whole in view: nothing moves.
+    InView,
+    /// Put its top at the view's top: it is cut at the top, or taller than
+    /// the view.
+    ToTop,
+    /// Scroll down this many pixels, so its end is at the view's bottom.
+    By(f32),
+    /// The last frame didn't draw it: the scroller finds it from the list.
+    Undrawn,
+}
+
+/// How to reveal an item drawn at `drawn` (its top and bottom, `None` when
+/// the last frame didn't draw it) in a view from `view.0` to `view.1`: the
+/// least distance that shows it whole, or its top when it is taller than
+/// the view.
+pub fn reveal_plan(drawn: Option<(f32, f32)>, view: (f32, f32)) -> Reveal {
+    let Some((top, bottom)) = drawn else { return Reveal::Undrawn };
+    let (view_top, view_bottom) = view;
+    if top >= view_top - 0.5 && bottom <= view_bottom + 0.5 {
+        Reveal::InView
+    } else if top < view_top || bottom - top > view_bottom - view_top {
+        Reveal::ToTop
+    } else {
+        Reveal::By(bottom - view_bottom)
+    }
+}
+
 type RenderItem = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement;
 type RenderTop = dyn FnMut(&mut Window, &mut App) -> AnyElement;
 type TopRowView = dyn Fn(bool, &mut App);
+type ItemsView = dyn Fn(Range<usize>, &mut App);
 
 /// Where the last frame drew the view and the items in it.
 #[derive(Default)]
@@ -240,6 +271,9 @@ pub struct MessageScroller {
     /// What the view's top waits on from the next frame (rules 7 and 8),
     /// while scrolled away.
     anchor: Option<Anchor>,
+    /// The owner's items in view in the last frame, as last told.
+    items_in_view: Option<Range<usize>>,
+    on_items_view: Option<Rc<ItemsView>>,
 }
 
 /// How far beyond the view items are laid out ahead of a scroll.
@@ -274,7 +308,16 @@ impl MessageScroller {
             top_in_view: false,
             on_top_row_view: None,
             anchor: None,
+            items_in_view: None,
+            on_items_view: None,
         }
+    }
+
+    /// Calls `on_view` with the owner's items in view (any part of them),
+    /// after each frame that changed them.
+    pub fn on_items_view(mut self, on_view: impl Fn(Range<usize>, &mut App) + 'static) -> Self {
+        self.on_items_view = Some(Rc::new(on_view));
+        self
     }
 
     /// The owner's top row, rendered by `render_top` while shown
@@ -496,6 +539,56 @@ impl MessageScroller {
             }
         }
     }
+
+    /// Scrolls the least distance that shows the owner's item `ix` whole,
+    /// or its top when it is taller than the view, from what the last frame
+    /// showed ([`reveal_plan`]); an item drawn whole in view stays put.
+    /// Revealing the end follows it again (`Follow::after_draw`).
+    pub fn reveal(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let list_ix = self.list_ix(ix);
+        let (plan, top, first) = {
+            let drawn = self.drawn.borrow();
+            let Some(viewport) = drawn.viewport else { return };
+            let bounds = drawn.items.iter().find(|(i, _)| *i == list_ix).map(|(_, b)| *b);
+            let plan = reveal_plan(
+                bounds.map(|b| (f32::from(b.top()), f32::from(b.bottom()))),
+                (f32::from(viewport.top()), f32::from(viewport.bottom())),
+            );
+            // What the view shows now, as a position: a list at its end
+            // keeps none, and gpui's own reveal would read the end as the
+            // top.
+            let top = drawn
+                .items
+                .iter()
+                .find(|(_, b)| b.bottom() > viewport.top())
+                .map(|(i, b)| ListOffset { item_ix: *i, offset_in_item: viewport.top() - b.top() });
+            (plan, top, drawn.items.iter().map(|(i, _)| *i).min())
+        };
+        match plan {
+            Reveal::InView => return,
+            Reveal::ToTop => self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: px(0.) }),
+            Reveal::By(distance) => {
+                if let Some(top) = top {
+                    self.state.scroll_to(top);
+                }
+                self.state.scroll_by(px(distance));
+            }
+            Reveal::Undrawn => match first {
+                Some(first) if list_ix < first => {
+                    self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: px(0.) });
+                }
+                Some(_) | None => {
+                    if let Some(top) = top {
+                        self.state.scroll_to(top);
+                    }
+                    self.state.scroll_to_reveal_item(list_ix);
+                }
+            },
+        }
+        self.follow = Follow::Away;
+        self.anchor = None;
+        cx.notify();
+    }
 }
 
 impl Render for MessageScroller {
@@ -534,6 +627,8 @@ impl Render for MessageScroller {
         let top_was_in_view = self.top_in_view;
         let on_top_row_view = self.on_top_row_view.clone();
         let settling = self.anchor.is_some();
+        let told = self.items_in_view.clone();
+        let on_items_view = self.on_items_view.clone();
         div()
             .relative()
             .size_full()
@@ -544,7 +639,7 @@ impl Render for MessageScroller {
             .child(
                 canvas(
                     move |bounds, _, cx| {
-                        let (last_bottom, top_in_view) = {
+                        let (last_bottom, top_in_view, in_view) = {
                             let mut drawn = drawn.borrow_mut();
                             drawn.viewport = Some(bounds);
                             let last_bottom = drawn
@@ -554,8 +649,23 @@ impl Render for MessageScroller {
                                 .map(|(_, b)| f32::from(b.bottom()));
                             let top_in_view = top_shown
                                 && drawn.items.iter().any(|(ix, b)| *ix == 0 && b.bottom() > bounds.top());
-                            (last_bottom, top_in_view)
+                            // The owner's items with any part in view.
+                            let owners = drawn
+                                .items
+                                .iter()
+                                .filter(|(ix, b)| {
+                                    !(top_shown && *ix == 0) && b.bottom() > bounds.top() && b.top() < bounds.bottom()
+                                })
+                                .map(|(ix, _)| ix - usize::from(top_shown));
+                            let in_view = owners.clone().min().zip(owners.max()).map_or(0..0, |(lo, hi)| lo..hi + 1);
+                            (last_bottom, top_in_view, in_view)
                         };
+                        if told.as_ref() != Some(&in_view) {
+                            after_draw.update(cx, |this, _| this.items_in_view = Some(in_view.clone())).ok();
+                            if let Some(on_view) = on_items_view.clone() {
+                                cx.defer(move |cx| on_view(in_view, cx));
+                            }
+                        }
                         if top_in_view != top_was_in_view {
                             after_draw
                                 .update(cx, |this, _| this.top_in_view = top_in_view)
@@ -986,6 +1096,107 @@ mod tests {
         let last = item_bounds(&scroller, 19, cx).expect("the end in view");
         assert_eq!((f32::from(last.bottom()), f32::from(last.size.height)), (300., 100.));
         assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::AtEnd);
+    }
+
+    /// `reveal_plan`: whole in view, cut at either edge (taller than the
+    /// view or not), or not drawn.
+    #[test]
+    fn an_item_drawn_whole_is_in_view() {
+        assert_eq!(reveal_plan(Some((0., 50.)), (0., 300.)), Reveal::InView);
+        assert_eq!(reveal_plan(Some((250., 300.)), (0., 300.)), Reveal::InView);
+        assert_eq!(reveal_plan(Some((-0.4, 299.6)), (0., 300.)), Reveal::InView, "within half a pixel");
+    }
+
+    #[test]
+    fn an_item_cut_at_either_edge_or_undrawn_scrolls() {
+        assert_eq!(reveal_plan(Some((-20., 30.)), (0., 300.)), Reveal::ToTop, "cut at the top");
+        assert_eq!(reveal_plan(Some((280., 330.)), (0., 300.)), Reveal::By(30.), "cut at the bottom: the least distance");
+        assert_eq!(reveal_plan(Some((200., 600.)), (0., 300.)), Reveal::ToTop, "taller than the view: its top");
+        assert_eq!(reveal_plan(Some((-100., 400.)), (0., 300.)), Reveal::ToTop);
+        assert_eq!(reveal_plan(None, (0., 300.)), Reveal::Undrawn);
+    }
+
+    fn reveal(scroller: &Entity<MessageScroller>, ix: usize, cx: &mut VisualTestContext) {
+        cx.update(|_, cx| scroller.update(cx, |s, cx| s.reveal(ix, cx)));
+        cx.run_until_parked();
+    }
+
+    /// The spec's "Above the view": at the end, revealing an item above
+    /// puts its top at the view's top, and the scroll button shows.
+    #[test]
+    fn revealing_an_item_above_the_view_puts_its_top_at_the_top_and_shows_the_button() {
+        let heights = Rc::new(RefCell::new(vec![50.; 20]));
+        let (scroller, cx) = host(heights);
+        assert_eq!(item_bounds(&scroller, 5, cx), None, "item 5 isn't drawn at the end");
+        reveal(&scroller, 5, cx);
+        assert_eq!(item_bounds(&scroller, 5, cx).map(|b| f32::from(b.top())), Some(0.));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::Away, "the button shows while away");
+    }
+
+    /// The spec's "Already in view": nothing moves.
+    #[test]
+    fn revealing_an_item_in_view_moves_nothing() {
+        let heights = Rc::new(RefCell::new(vec![50.; 20]));
+        let (scroller, cx) = host(heights);
+        let before = item_bounds(&scroller, 16, cx).expect("in view at the end");
+        reveal(&scroller, 16, cx);
+        assert_eq!(item_bounds(&scroller, 16, cx), Some(before));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::AtEnd);
+    }
+
+    /// The spec's "The last item": away, revealing the last item shows its
+    /// end at the view's bottom and follows the end again.
+    #[test]
+    fn revealing_the_last_item_while_away_follows_the_end_again() {
+        let heights = Rc::new(RefCell::new(vec![50.; 20]));
+        let (scroller, cx) = host(heights);
+        scroll_to(&scroller, ListOffset { item_ix: 5, offset_in_item: px(0.) }, cx);
+        assert_eq!(item_bounds(&scroller, 19, cx), None);
+        reveal(&scroller, 19, cx);
+        redraw(&scroller, cx);
+        assert_eq!(item_bounds(&scroller, 19, cx).map(|b| f32::from(b.bottom())), Some(300.));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::AtEnd);
+    }
+
+    /// Following (the list keeps no position, so gpui would read the end as
+    /// the top), revealing an item cut at the view's top works from what
+    /// the last frame showed: its top goes to the view's top.
+    #[test]
+    fn revealing_while_following_reads_the_last_frame_not_the_end() {
+        let heights = Rc::new(RefCell::new(vec![70.; 20]));
+        let (scroller, cx) = host(heights);
+        let cut = item_bounds(&scroller, 15, cx).expect("item 15 cut at the top");
+        assert_eq!(f32::from(cut.top()), -50.);
+        reveal(&scroller, 15, cx);
+        assert_eq!(item_bounds(&scroller, 15, cx).map(|b| f32::from(b.top())), Some(0.));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::Away);
+    }
+
+    /// `on_items_view`: told the owner's items in view after a frame that
+    /// changed them, and not after one that didn't.
+    #[test]
+    fn the_owner_hears_the_items_in_view_after_a_frame_that_changed_them() {
+        let mut app = test_support::app();
+        let heights = Rc::new(RefCell::new(vec![50.; 20]));
+        let seen: Rc<RefCell<Vec<Range<usize>>>> = Rc::default();
+        let told = seen.clone();
+        let (host, cx) = app.add_window_view(move |_, cx| {
+            let heights = heights.clone();
+            let told = told.clone();
+            let scroller = cx.new(|cx| {
+                MessageScroller::new(20, move |ix, _, _| div().h(px(heights.borrow()[ix])).w_full().into_any_element(), cx)
+                    .on_items_view(move |range, _| told.borrow_mut().push(range))
+            });
+            Host { scroller }
+        });
+        let scroller = host.read_with(cx, |host, _| host.scroller.clone());
+        let cx: &'static mut VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.run_until_parked();
+        assert_eq!(seen.borrow().as_slice(), std::slice::from_ref(&(14..20)));
+        redraw(&scroller, cx);
+        assert_eq!(seen.borrow().len(), 1, "the same items: nothing to tell");
+        scroll_to(&scroller, ListOffset { item_ix: 3, offset_in_item: px(25.) }, cx);
+        assert_eq!(*seen.borrow(), [14..20, 3..10]);
     }
 
     /// Task 5.2: a page up from the first item's top brings the top row
