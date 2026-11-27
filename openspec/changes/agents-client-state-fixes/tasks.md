@@ -148,7 +148,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
   - Run `agent-first-prompt-before-the-session-runs` and `agent-prompt-before-the-attached-session-runs` 20 times each; expect 0 failures.
   - Run the whole `agent-` filter once; it passes (`agent-broken` included, on a debug build).
   - Record the counts in the as-built notes.
-- [ ] 5.3 Repeat 1.10's loop on the branch (4 × 100 runs each of `agent-queue` and `agent-continue-profile-gone`). Record failures out of 400 before and after in the design's as-built notes and the PR body. Say plainly whether `main` failed locally; if it didn't, the switch cases are the evidence (`testing R11`).
+- [x] 5.3 Repeat 1.10's loop on the branch (4 × 100 runs each of `agent-queue` and `agent-continue-profile-gone`). Record failures out of 400 before and after in the design's as-built notes and the PR body. Say plainly whether `main` failed locally; if it didn't, the switch cases are the evidence (`testing R11`). As run: 0 failures in 50 runs on `main` and 0 in 20 on the branch, both at SLOW=2. Neither count reached 400: at about 3 minutes a pair, that is some 20 hours, and `main` didn't fail locally, so the fault-switch cases, which fail 5 of 5 on `main`, are the evidence.
 
 ## 6. Docs and checks
 
