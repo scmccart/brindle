@@ -118,7 +118,7 @@ use super::link::{Link, Wire};
 use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::budget::{Delivery, InputBudget, Offer};
-use crate::agent::model::{LINK_DOWN, agent_start};
+use crate::agent::model::{LINK_DOWN, NotSent, ReplyError, agent_start};
 use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::remote::protocol::client::{
     self, AgentPermission, AgentPrompt, AgentRequest, AgentRestart, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request,
@@ -224,9 +224,17 @@ pub trait SessionSink: Send {
         Ok(())
     }
     /// The core answered the agent request `request` (`OK`, or `ERROR`
-    /// with its text), or the request failed with the link or connection.
-    /// Only an agent session's sink sends requests that come back here.
-    fn reply(&mut self, _request: RequestId, _outcome: std::result::Result<(), String>) {}
+    /// with its text: [`ReplyError::Failed`]), or the request failed with
+    /// the link or connection: [`ReplyError::Unanswered`] when it was
+    /// written on a link that went down before its answer, so the core may
+    /// have taken it. Only an agent session's sink sends requests that come
+    /// back here.
+    fn reply(&mut self, _request: RequestId, _outcome: std::result::Result<(), ReplyError>) {}
+    /// The session's thread handed the tab the running session: requests
+    /// can go through it now (OpenSpec change `agents-client-state-fixes`,
+    /// decision 2). Called on that thread, after the session's phase says
+    /// so, never on the reader. A terminal's sink ignores it.
+    fn running(&mut self) {}
     /// One `AGENT_PAGE` frame answering the agent request `request` (an
     /// `AGENT_FETCH`, OpenSpec change `agents-log-paging`): its events, and
     /// on the last frame whether more are earlier. The sink folds the
@@ -428,29 +436,62 @@ enum Waiting {
     /// The `OK` or `ERROR` answering an agent session's request `req`
     /// (`AGENT_PROMPT`, `AGENT_RESEND`, `AGENT_UNQUEUE`, `AGENT_PERMISSION`):
     /// nobody blocks on it; the session's sink is told
-    /// ([`SessionSink::reply`]), whatever becomes of it.
-    Agent { req: RequestId, session: SessionId, sink: Sink },
+    /// ([`SessionSink::reply`]), whatever becomes of it. `carry` says
+    /// whether it goes out on the next link when its own goes down first.
+    Agent { req: RequestId, session: SessionId, sink: Sink, carry: Carry },
+}
+
+/// Whether an agent request still queued when its link goes down goes out
+/// on the next link (OpenSpec change `agents-client-state-fixes`, decision
+/// 6).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Carry {
+    NextLink,
+    /// A fetch: its `before` names the fold the next link's replay starts
+    /// over, so it fails with the link ([`State::link_lost`]).
+    Never,
 }
 
 impl Waiting {
+    /// The request failed, saying `message`: nothing happened (an agent's
+    /// sink is told [`ReplyError::Failed`]).
     fn fail(self, message: String) {
         match self {
             Self::Spawn { reply, .. } => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
             Self::Attach { reply, .. } => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
             Self::List(reply) => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
             Self::Done(reply) => reply.try_send(Err(anyhow::Error::msg(message))).ok(),
-            Self::Agent { req, session, sink } => {
-                reply_to(session, &sink, req, Err(message));
+            Self::Agent { req, session, sink, .. } => {
+                reply_to(session, &sink, req, Err(ReplyError::Failed(message)));
                 None
             }
         };
     }
+
+    /// The request was written on a link that went down before its answer,
+    /// saying `message`: an agent's sink is told [`ReplyError::Unanswered`],
+    /// since the core may have taken it; any other wait fails as
+    /// [`Waiting::fail`] fails it.
+    fn unanswered(self, message: String) {
+        match self {
+            Self::Agent { req, session, sink, .. } => reply_to(session, &sink, req, Err(ReplyError::Unanswered(message))),
+            other @ (Self::Spawn { .. } | Self::Attach { .. } | Self::List(_) | Self::Done(_)) => other.fail(message),
+        }
+    }
+}
+
+/// What a lost link takes out of the requests ([`State::link_lost`]).
+struct LinkLost {
+    /// Written on the link: their answers are gone.
+    unanswered: Vec<Pending>,
+    /// Queued, never to go out on another link ([`Carry::Never`]).
+    unsent: Vec<Pending>,
 }
 
 /// Tells `session`'s sink how its agent request `req` went, confining a
 /// panic to the call: it is only the request's bookkeeping, and the
 /// session's next event finds a sink that failed.
-fn reply_to(session: SessionId, sink: &Sink, req: RequestId, outcome: std::result::Result<(), String>) {
+fn reply_to(session: SessionId, sink: &Sink, req: RequestId, outcome: std::result::Result<(), ReplyError>) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| sink.lock().reply(req, outcome))) {
         log::error!("telling session {session}'s tab how request {req} went failed: {}", panic_text(&*payload));
     }
@@ -516,6 +557,17 @@ impl Pending {
 
     fn is_attach(&self) -> bool {
         matches!(self.waiting, Waiting::Attach { .. })
+    }
+
+    /// A queued agent request that never goes out on another link than the
+    /// one it was made on ([`Carry::Never`]).
+    fn stays_on_its_link(&self) -> bool {
+        match (&self.waiting, self.sent) {
+            (Waiting::Agent { carry: Carry::Never, .. }, Sent::Queued) => true,
+            (Waiting::Agent { carry: Carry::Never, .. }, Sent::Written | Sent::Carried)
+            | (Waiting::Agent { carry: Carry::NextLink, .. }, Sent::Queued | Sent::Written | Sent::Carried)
+            | (Waiting::Spawn { .. } | Waiting::Attach { .. } | Waiting::List(_) | Waiting::Done(_), _) => false,
+        }
     }
 
     /// A recorded attach that waits for a listing to confirm its session.
@@ -910,24 +962,34 @@ impl State {
     }
 
     /// The link went down. The requests written on it are taken out and
-    /// given back to fail, since their answers are gone, except attaches,
-    /// which are carried over for the next link's listing to decide
-    /// ([`carried_attaches`]). The listing waited for is gone with it.
-    fn link_lost(&mut self) -> Vec<Pending> {
+    /// given back as unanswered, since their answers are gone, except
+    /// attaches, which are carried over for the next link's listing to
+    /// decide ([`carried_attaches`]). Queued agent requests that never
+    /// cross a link (a fetch, [`Carry::Never`]) are taken out and given
+    /// back as unsent; every other queued request goes out on the next
+    /// link. The listing waited for is gone with it.
+    fn link_lost(&mut self) -> LinkLost {
         self.list = None;
         self.link = self.link.down();
-        let lost: Vec<RequestId> =
-            self.requests.iter().filter(|(_, pending)| pending.is_written()).map(|(&req, _)| req).collect();
-        let mut failed = Vec::new();
+        let lost: Vec<RequestId> = self
+            .requests
+            .iter()
+            .filter(|(_, pending)| pending.is_written() || pending.stays_on_its_link())
+            .map(|(&req, _)| req)
+            .collect();
+        let mut gone = LinkLost { unanswered: Vec::new(), unsent: Vec::new() };
         for req in lost {
             let Some(pending) = self.requests.get_mut(&req) else { continue };
-            if pending.is_attach() {
+            if pending.is_written() && pending.is_attach() {
                 pending.sent = Sent::Carried;
             } else if let Some(pending) = self.requests.remove(&req) {
-                failed.push(pending);
+                match pending.is_written() {
+                    true => gone.unanswered.push(pending),
+                    false => gone.unsent.push(pending),
+                }
             }
         }
-        failed
+        gone
     }
 
     /// What `SPAWNED` does: the session is shown with its spawn's sink when
@@ -1806,8 +1868,8 @@ impl Connection {
                     state.requests.remove(&req)
                 });
                 match pending.map(|pending| pending.waiting) {
-                    Some(Waiting::Agent { req, session, sink }) => {
-                        self.deliver(session, &sink, |sink| sink.reply(req, Err(error.message)));
+                    Some(Waiting::Agent { req, session, sink, .. }) => {
+                        self.deliver(session, &sink, |sink| sink.reply(req, Err(ReplyError::Failed(error.message))));
                     }
                     Some(other) => other.fail(error.message),
                     None => match error.session {
@@ -1838,7 +1900,7 @@ impl Connection {
                     Some(Waiting::Done(reply)) => {
                         reply.try_send(Ok(())).ok();
                     }
-                    Some(Waiting::Agent { req, session, sink }) => {
+                    Some(Waiting::Agent { req, session, sink, .. }) => {
                         // A restart that fell back to the SSH session's
                         // environment says so in its zone.
                         if let Some(text) = fallback {
@@ -2165,21 +2227,25 @@ impl Connection {
     }
 
     /// The link ended: the writer holds its messages, and requests that
-    /// went out on it fail, since their answers are gone. Attaches stay,
-    /// carried over to the next link.
+    /// went out on it fail as unanswered, since their answers are gone.
+    /// Queued fetches fail as not sent. Attaches stay, carried over to the
+    /// next link.
     fn disconnected(&self, reason: &str) {
         if let Some(current) = self.slot.lock().link.take() {
             current.wire.end();
         }
         self.unwatch_link();
-        let (failed, shown) = {
+        let (LinkLost { unanswered, unsent }, shown) = {
             let mut state = self.state.lock();
             let shown: Vec<(SessionId, Sink)> =
                 state.sessions.iter().map(|(&session, shown)| (session, shown.sink.clone())).collect();
             (state.link_lost(), shown)
         };
-        for pending in failed {
-            pending.waiting.fail(format!("the terminal server went away ({reason})"));
+        for pending in unanswered {
+            pending.waiting.unanswered(format!("the terminal server went away ({reason})"));
+        }
+        for pending in unsent {
+            pending.waiting.fail(LINK_DOWN.to_string());
         }
         for (session, sink) in shown {
             self.deliver(session, &sink, |sink| sink.link_down());
@@ -3031,34 +3097,37 @@ impl Running {
     }
 
     /// Sends the agent request `make` builds under a new request id while
-    /// the connection shows this session, and gives the id; `None` (nothing
-    /// sent) otherwise. Its `OK` or `ERROR`, or its failure with the link,
-    /// goes to the session's sink ([`SessionSink::reply`]) under that id.
-    /// Queued under the state lock, as [`Running::send_while_shown`] is.
-    fn agent_request(&self, make: impl FnOnce(RequestId) -> ToCore) -> Option<RequestId> {
+    /// the connection shows this session, and gives the id;
+    /// [`NotSent::Gone`] (nothing sent) once it no longer does. Its `OK` or
+    /// `ERROR`, or its failure with the link, goes to the session's sink
+    /// ([`SessionSink::reply`]) under that id. Queued under the state lock,
+    /// as [`Running::send_while_shown`] is; while the link is down it waits
+    /// for the next ([`Carry::NextLink`]).
+    fn agent_request(&self, make: impl FnOnce(RequestId) -> ToCore) -> Result<RequestId, NotSent> {
         let mut state = self.conn.state.lock();
-        let sink = state.shown(self.id, self.key.as_ref())?.sink.clone();
+        let sink = state.shown(self.id, self.key.as_ref()).ok_or(NotSent::Gone)?.sink.clone();
         let req = self.conn.req();
-        state.requests.insert(req, Pending::queued(Waiting::Agent { req, session: self.id, sink }));
+        let waiting = Waiting::Agent { req, session: self.id, sink, carry: Carry::NextLink };
+        state.requests.insert(req, Pending::queued(waiting));
         self.conn.send(make(req));
-        Some(req)
+        Ok(req)
     }
 
     /// A prompt for the agent (`AGENT_PROMPT`): sent now or queued by the
     /// core, which the transcript tells.
-    pub fn prompt(&self, text: &str) -> Option<RequestId> {
+    pub fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentPrompt(AgentPrompt { req, session, text: text.to_string() }))
     }
 
     /// Sends the held prompt again (`AGENT_RESEND`).
-    pub fn resend(&self) -> Option<RequestId> {
+    pub fn resend(&self) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentResend(AgentRequest { req, session }))
     }
 
     /// Discards the queue slot's prompt, waiting or held (`AGENT_UNQUEUE`).
-    pub fn unqueue(&self) -> Option<RequestId> {
+    pub fn unqueue(&self) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentUnqueue(AgentRequest { req, session }))
     }
@@ -3066,7 +3135,7 @@ impl Running {
     /// Runs the session's ended agent again to continue its conversation
     /// (`AGENT_RESTART`): `OK` once the core queued it, then the outcome
     /// as transcript events.
-    pub fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+    pub fn restart(&self, request: AgentRestartRequest) -> Result<RequestId, NotSent> {
         let session = self.id;
         let AgentRestartRequest { command, args, env } = request;
         self.agent_request(|req| ToCore::AgentRestart(AgentRestart { req, session, command, args, env }))
@@ -3075,7 +3144,7 @@ impl Running {
     /// Logs the agent in with its login method `method` (`AGENT_LOGIN`):
     /// `OK` once the agent was asked, then the login's states as
     /// transcript events. `AGENT_CANCEL` cancels it ([`Running::cancel`]).
-    pub fn login(&self, method: &str) -> Option<RequestId> {
+    pub fn login(&self, method: &str) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentLogin(client::AgentLogin { req, session, method: method.to_string() }))
     }
@@ -3083,29 +3152,25 @@ impl Running {
     /// Fetches the whole entries before `before` within `max_bytes`
     /// (`AGENT_FETCH`): `AGENT_PAGE` frames go to the session's sink
     /// ([`SessionSink::page`]), then its reply. While the link is down it
-    /// is answered at once with the link's failure, rather than held for
-    /// the next link (whose replay starts the zone over anyway).
-    pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+    /// isn't sent ([`NotSent::LinkDown`]), and one still queued when the
+    /// link goes down fails then ([`Carry::Never`]): it is never held for
+    /// the next link, whose replay starts the zone over anyway.
+    pub fn fetch(&self, before: u64, max_bytes: u32) -> Result<RequestId, NotSent> {
         let session = self.id;
-        let down = {
-            let mut state = self.conn.state.lock();
-            let sink = state.shown(self.id, self.key.as_ref())?.sink.clone();
-            let req = self.conn.req();
-            if state.link.is_up() {
-                state.requests.insert(req, Pending::queued(Waiting::Agent { req, session, sink }));
-                self.conn.send(ToCore::AgentFetch(client::AgentFetch { req, session, before, max_bytes }));
-                return Some(req);
-            }
-            (req, sink)
-        };
-        let (req, sink) = down;
-        reply_to(session, &sink, req, Err(LINK_DOWN.to_string()));
-        Some(req)
+        let mut state = self.conn.state.lock();
+        let sink = state.shown(self.id, self.key.as_ref()).ok_or(NotSent::Gone)?.sink.clone();
+        if !state.link.is_up() {
+            return Err(NotSent::LinkDown);
+        }
+        let req = self.conn.req();
+        state.requests.insert(req, Pending::queued(Waiting::Agent { req, session, sink, carry: Carry::Never }));
+        self.conn.send(ToCore::AgentFetch(client::AgentFetch { req, session, before, max_bytes }));
+        Ok(req)
     }
 
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`).
-    pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
+    pub fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentPermission(AgentPermission { req, session, entry, option }))
     }
@@ -3115,7 +3180,7 @@ impl Running {
     /// `agents-session-list`): the page comes to the session's sink
     /// ([`SessionSink::conversations`]) in place of an `OK`; a refusal, or
     /// the link's failure, as its reply.
-    pub fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+    pub fn list(&self, cursor: Option<String>) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentList(client::AgentList { req, session, cursor }))
     }
@@ -3124,7 +3189,7 @@ impl Running {
     /// conversation `conversation`, or starts a new one with `None`. `OK`
     /// once the agent was asked, then the start's states as transcript
     /// events.
-    pub fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+    pub fn choose(&self, conversation: Option<String>) -> Result<RequestId, NotSent> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentChoose(client::AgentChoose { req, session, conversation }))
     }
@@ -3133,21 +3198,22 @@ impl Running {
     /// (`AGENT_SET_OPTION`, OpenSpec change `agents-commands`): `OK` once
     /// the agent was asked; the new value comes as an `Options` event once
     /// the agent answers.
-    pub fn set_option(&self, option: &str, value: client::OptionValue) -> Option<RequestId> {
+    pub fn set_option(&self, option: &str, value: client::OptionValue) -> Result<RequestId, NotSent> {
         let session = self.id;
         let option = option.to_string();
         self.agent_request(|req| ToCore::AgentSetOption(client::AgentSetOption { req, session, option, value }))
     }
 
     /// Cancels the running turn (`AGENT_CANCEL`, which has no answer; a
-    /// refused one comes back as the session's note). True when it went.
-    pub fn cancel(&self) -> bool {
+    /// refused one comes back as the session's note); [`NotSent::Gone`]
+    /// once the connection no longer shows the session.
+    pub fn cancel(&self) -> Result<(), NotSent> {
         let state = self.conn.state.lock();
-        let shown = state.shows(self.id, self.key.as_ref());
-        if shown {
-            self.conn.send(ToCore::AgentCancel(SessionRef { session: self.id }));
+        if !state.shows(self.id, self.key.as_ref()) {
+            return Err(NotSent::Gone);
         }
-        shown
+        self.conn.send(ToCore::AgentCancel(SessionRef { session: self.id }));
+        Ok(())
     }
 
     /// Leaves the session running with no client (`DETACH`), with the
@@ -3490,7 +3556,7 @@ pub(super) mod fake {
             self.0.send(format!("page {request} {} {last:?}", serde_json::Value::Array(events))).ok();
             Ok(())
         }
-        fn reply(&mut self, request: RequestId, outcome: std::result::Result<(), String>) {
+        fn reply(&mut self, request: RequestId, outcome: std::result::Result<(), ReplyError>) {
             self.0.send(format!("reply {request} {outcome:?}")).ok();
         }
     }
@@ -5963,7 +6029,9 @@ mod tests {
         state.requests.insert(6, Pending { waiting: list_waiting(), sent: Sent::Written });
         state.requests.insert(7, Pending { waiting: done_waiting(), sent: Sent::Written });
 
-        assert_eq!(kinds(&state.link_lost()), ["done", "list", "spawn"]);
+        let lost = state.link_lost();
+        assert_eq!(kinds(&lost.unanswered), ["done", "list", "spawn"]);
+        assert!(lost.unsent.is_empty(), "no fetch was queued");
         assert_eq!(
             requests(&state),
             [
@@ -5976,8 +6044,27 @@ mod tests {
         assert_eq!(state.link, LinkPhase::Down(Negotiated(2)));
         assert!(state.list.is_none(), "the listing waited for went with the link");
         // Nothing was written since: a second loss changes nothing.
-        assert!(state.link_lost().is_empty());
+        let again = state.link_lost();
+        assert!(again.unanswered.is_empty() && again.unsent.is_empty());
         assert_eq!(requests(&state).len(), 4);
+    }
+
+    /// D-5 (`agents-client-state-fixes` task 1.4): a fetch still queued when
+    /// its link goes down fails then, and never goes out on the next link;
+    /// a queued prompt is carried to it.
+    #[test]
+    fn a_lost_link_fails_queued_fetches_and_carries_other_queued_requests() {
+        let mut state = State { link: LinkPhase::Up(Negotiated(4)), ..State::default() };
+        let (fetch_sink, _fetch_tab) = fake::sink();
+        let (prompt_sink, _prompt_tab) = fake::sink();
+        let fetch = Waiting::Agent { req: 1, session: 7, sink: fetch_sink, carry: Carry::Never };
+        let prompt = Waiting::Agent { req: 2, session: 7, sink: prompt_sink, carry: Carry::NextLink };
+        state.requests.insert(1, Pending::queued(fetch));
+        state.requests.insert(2, Pending::queued(prompt));
+        let lost = state.link_lost();
+        assert_eq!(kinds(&lost.unsent), ["agent"], "the fetch fails");
+        assert!(lost.unanswered.is_empty(), "nothing was written");
+        assert_eq!(requests(&state), [(2, "agent", Sent::Queued)], "only the prompt is carried");
     }
 
     /// 4.3: before the first link, a failed attempt fails new tabs' requests

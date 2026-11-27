@@ -867,15 +867,12 @@ pub const PROMPT_MAYBE_TAKEN: &str =
     "the connection to the terminal server dropped as the prompt was sent; it may have reached the agent";
 
 /// A choice made while the link is down.
-#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies `ChatModel::choose` in task 4.5"))]
 pub const CHOICE_LINK_DOWN: &str = "the connection to the terminal server is down; the choice wasn't sent";
 
 /// A choice made while another is on its way.
-#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies `ChatModel::choose` in task 4.5"))]
 pub const CHOICE_PENDING: &str = "a choice is already on its way";
 
 /// A choice made when the agent isn't choosing.
-#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies `ChatModel::choose` in task 4.5"))]
 pub const NOT_CHOOSING: &str = "the agent isn't choosing a conversation";
 
 /// Why a request wasn't sent (OpenSpec change `agents-client-state-fixes`,
@@ -884,7 +881,6 @@ pub const NOT_CHOOSING: &str = "the agent isn't choosing a conversation";
 pub enum NotSent {
     /// The session isn't handed to the zone yet: nothing was sent, and the
     /// zone can send once it runs.
-    #[cfg_attr(not(test), expect(dead_code, reason = "`Session::running` returns it in task 4.3"))]
     Starting,
     /// The zone let it go, it never started, or the connection no longer
     /// shows it (exited, lost, broken): nothing was sent, and nothing will
@@ -892,7 +888,6 @@ pub enum NotSent {
     Gone,
     /// The link is down, for a request that never waits for the next link
     /// (a fetch).
-    #[cfg_attr(not(test), expect(dead_code, reason = "`Running::fetch` returns it in task 4.2"))]
     LinkDown,
 }
 
@@ -903,7 +898,6 @@ pub enum ReplyError {
     Failed(String),
     /// It was written on a link that went down before its answer: the core
     /// may have taken it.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the connection's link-down handler sends it in task 4.2"))]
     Unanswered(String),
 }
 
@@ -984,7 +978,6 @@ pub fn taken(prompt: &PromptSent, entries: &[(EntryId, Entry)], window: Option<W
 
 /// What a choice does now ([`ChatModel::choose`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies it in task 4.5"))]
 pub enum Choose {
     /// Send `AGENT_CHOOSE`.
     Send,
@@ -1549,7 +1542,8 @@ impl ChatModel {
     }
 
     /// Whether `AGENT_CHOOSE` can go now: the agent is choosing on a link
-    /// that is up, with no choice on its way.
+    /// that is up, with no choice on its way ([`Self::choose`] decides).
+    #[cfg(test)]
     pub fn can_choose(&self) -> bool {
         self.is_choosing()
             && self.link == Link::Up
@@ -1559,7 +1553,6 @@ impl ChatModel {
 
     /// A conversation was chosen (decision 10): send it when it can go;
     /// otherwise the choosing screen says why, as its reason.
-    #[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies it in task 4.5"))]
     pub fn choose(&mut self) -> Choose {
         let why = if !self.is_choosing() {
             NOT_CHOOSING
@@ -3148,6 +3141,30 @@ impl ChatModel {
             | Sent::Fetch
             | Sent::Choose
             | Sent::SetOption { .. } => Replied::Nothing,
+        }
+    }
+
+    /// An `AGENT_RESTART` that couldn't go, for `why`: as [`Self::not_sent`]
+    /// says for a restart. Nothing was recorded for it ([`Self::restarting`]
+    /// comes only once one went), so the agent shown stays as it is.
+    pub fn restart_not_sent(&mut self, why: NotSent) -> Replied {
+        let was = match &self.phase {
+            AgentPhase::Live(state) => state.clone(),
+            AgentPhase::Connecting | AgentPhase::NotStarted(_) | AgentPhase::Lost { .. } | AgentPhase::Broken { .. } => {
+                AgentState::Starting
+            }
+        };
+        self.not_sent(Sent::Restart { was }, why)
+    }
+
+    /// A cancel, or Cancel login, that couldn't go, for `why` (decision 1's
+    /// table): nothing while the session is still being set up; once it is
+    /// gone, said beside the prompt input.
+    pub fn cancel_not_sent(&mut self, why: NotSent) {
+        match why {
+            NotSent::Starting => {}
+            NotSent::Gone => self.server_note(UNSENT),
+            NotSent::LinkDown => self.server_note(LINK_DOWN),
         }
     }
 

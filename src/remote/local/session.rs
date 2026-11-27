@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 
 use super::connection::{Abandon, Budget, Running, Sink};
 use super::{AttachRequest, Connection, Foreground, Host, SessionSink, SpawnRequest};
-use crate::agent::model::StartFailure;
+use crate::agent::model::{NotSent, StartFailure};
 use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::remote::SessionKey;
 use crate::remote::budget::{Delivery, Offer};
@@ -329,80 +329,88 @@ impl Session {
     }
 
     /// What an agent session's request is sent through: the running
-    /// session's handle, or nothing while it starts, after it went, or
-    /// when it never started. Agent requests aren't held while starting:
-    /// the zone offers none until its agent is ready.
-    fn running<T>(&self, call: impl FnOnce(&Running) -> Option<T>) -> Option<T> {
+    /// session's handle. While it starts nothing is sent
+    /// ([`NotSent::Starting`]): agent requests aren't held, and the zone
+    /// sends none until the session's thread says it runs
+    /// ([`SessionSink::running`]). After it went, or when it never started,
+    /// [`NotSent::Gone`].
+    fn running<T>(&self, call: impl FnOnce(&Running) -> Result<T, NotSent>) -> Result<T, NotSent> {
         match &*self.phase.lock() {
             Phase::Running(running) => call(running),
-            Phase::Starting(_) | Phase::Left(_) | Phase::Gone => None,
+            Phase::Starting(_) => Err(NotSent::Starting),
+            Phase::Left(_) | Phase::Gone => Err(NotSent::Gone),
         }
     }
 
     /// Sends the agent a prompt (`AGENT_PROMPT`) while the session runs;
     /// the request's id, which its answer comes back under
-    /// ([`SessionSink::reply`]), or `None` when nothing was sent.
-    pub fn prompt(&self, text: &str) -> Option<RequestId> {
+    /// ([`SessionSink::reply`]), or why nothing was sent.
+    pub fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
         self.running(|running| running.prompt(text))
     }
 
     /// Sends the held prompt again (`AGENT_RESEND`), as [`Session::prompt`].
-    pub fn resend(&self) -> Option<RequestId> {
+    pub fn resend(&self) -> Result<RequestId, NotSent> {
         self.running(Running::resend)
     }
 
     /// Discards the queued prompt, waiting or held (`AGENT_UNQUEUE`), as
     /// [`Session::prompt`].
-    pub fn unqueue(&self) -> Option<RequestId> {
+    pub fn unqueue(&self) -> Result<RequestId, NotSent> {
         self.running(Running::unqueue)
     }
 
     /// Runs the session's ended agent again to continue its conversation
     /// (`AGENT_RESTART`), as [`Session::prompt`].
-    pub fn restart(&self, request: AgentRestartRequest) -> Option<RequestId> {
+    pub fn restart(&self, request: AgentRestartRequest) -> Result<RequestId, NotSent> {
         self.running(|running| running.restart(request))
     }
 
     /// Logs the agent in with its login method `method` (`AGENT_LOGIN`), as
     /// [`Session::prompt`]; [`Session::cancel`] cancels the login.
-    pub fn login(&self, method: &str) -> Option<RequestId> {
+    pub fn login(&self, method: &str) -> Result<RequestId, NotSent> {
         self.running(|running| running.login(method))
     }
 
     /// Fetches the whole entries before `before` within `max_bytes`
     /// (`AGENT_FETCH`), as [`Session::prompt`]; its pages reach the sink
-    /// before its reply.
-    pub fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
+    /// before its reply. Not sent while the link is down
+    /// ([`NotSent::LinkDown`]).
+    pub fn fetch(&self, before: u64, max_bytes: u32) -> Result<RequestId, NotSent> {
         self.running(|running| running.fetch(before, max_bytes))
     }
 
     /// Asks for a page of the agent's conversations (`AGENT_LIST`), as
     /// [`Session::prompt`]; the page reaches the sink in place of a reply.
-    pub fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+    pub fn list(&self, cursor: Option<String>) -> Result<RequestId, NotSent> {
         self.running(|running| running.list(cursor))
     }
 
     /// Ends a choosing agent's wait (`AGENT_CHOOSE`), as [`Session::prompt`].
-    pub fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+    pub fn choose(&self, conversation: Option<String>) -> Result<RequestId, NotSent> {
         self.running(|running| running.choose(conversation))
     }
 
     /// Sets session option `option` to `value` (`AGENT_SET_OPTION`), as
     /// [`Session::prompt`].
-    pub fn set_option(&self, option: &str, value: crate::remote::protocol::client::OptionValue) -> Option<RequestId> {
+    pub fn set_option(
+        &self,
+        option: &str,
+        value: crate::remote::protocol::client::OptionValue,
+    ) -> Result<RequestId, NotSent> {
         self.running(|running| running.set_option(option, value))
     }
 
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`), as [`Session::prompt`].
-    pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
+    pub fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent> {
         self.running(|running| running.answer(entry, option))
     }
 
-    /// Cancels the running turn (`AGENT_CANCEL`) while the session runs;
-    /// true when it was sent.
-    pub fn cancel(&self) -> bool {
-        self.running(|running| running.cancel().then_some(())).is_some()
+    /// Cancels the running turn (`AGENT_CANCEL`) while the session runs,
+    /// or says why it wasn't sent.
+    pub fn cancel(&self) -> Result<(), NotSent> {
+        self.running(Running::cancel)
     }
 
     /// Ends the session (`CLOSE`), or makes sure it ends as soon as it
@@ -517,6 +525,11 @@ fn run(
         }
     }
     *phase = Phase::Running(running);
+    // The phase lock first, then the sink's, never both: the zone answers
+    // this by sending through the running session (decision 2), and every
+    // event the reader delivered before is queued before it.
+    drop(phase);
+    sink.lock().running();
 }
 
 /// `BRINDLE_TEST_SESSION_START_DELAY`'s value (debug builds only,
@@ -545,6 +558,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::agent::model::ReplyError;
     use crate::agent::sink::{AgentEvent, Feed, Sink as AgentSink};
     use crate::agent::transcript::{
         AgentState, Entry, EntryId, Event, HoldReason, PermissionOutcome, Slot, StopReason, Transcript, TurnState,
@@ -1735,8 +1749,13 @@ mod tests {
             start: None,
         };
         assert_eq!(spawn, expected);
-        shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
-        eventually(|| session.id_and_key() == Some((AGENT, SessionKey::from_wire("k7"))));
+        let life = shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
+        match life.as_slice() {
+            [] => assert_eq!(next_life(&mut feed), AgentEvent::SessionRunning),
+            [AgentEvent::SessionRunning] => {}
+            other => panic!("unexpected life events: {other:?}"),
+        }
+        assert_eq!(session.id_and_key(), Some((AGENT, SessionKey::from_wire("k7"))));
         Agent { _dir: dir, session, feed, connection, core }
     }
 
@@ -1998,7 +2017,7 @@ mod tests {
         let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
         assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(first), reply(second)]);
 
-        assert!(agent.session.cancel());
+        assert_eq!(agent.session.cancel(), Ok(()));
         let cancelled = |log: &Transcript| {
             *log.turn() == TurnState::Ended { stop: StopReason::Cancelled } && *log.slot() == held("next")
         };
@@ -2015,7 +2034,7 @@ mod tests {
         assert_eq!(shows(&mut agent.feed, "the held prompt queued", waiting), [reply(during)]);
 
         // Held again, and sent again when idle: a turn of its own.
-        assert!(agent.session.cancel());
+        assert_eq!(agent.session.cancel(), Ok(()));
         let held_again = |log: &Transcript| *log.slot() == held("next");
         shows(&mut agent.feed, "the prompt held again", held_again);
         let idle = agent.session.resend().unwrap();
@@ -2027,7 +2046,7 @@ mod tests {
         let more = agent.session.prompt("more").unwrap();
         let queued = |log: &Transcript| *log.slot() == Slot::Waiting { text: "more".into() };
         assert_eq!(shows(&mut agent.feed, "another queued", queued), [reply(more)]);
-        assert!(agent.session.cancel());
+        assert_eq!(agent.session.cancel(), Ok(()));
         shows(&mut agent.feed, "it held", |log| *log.slot() == held("more"));
         let discard = agent.session.unqueue().unwrap();
         assert_eq!(shows(&mut agent.feed, "the held prompt discarded", |log| *log.slot() == Slot::Empty), [
@@ -2148,7 +2167,7 @@ mod tests {
         });
         assert!(why.contains(crate::terminal::SINK_PANIC), "{why}");
         assert!(heard.contains(&reply(req)), "{heard:?}");
-        assert_eq!(session.prompt("more"), None, "no longer shown");
+        assert_eq!(session.prompt("more"), Err(NotSent::Gone), "no longer shown");
         let detached = || {
             let listed = connection.list().ok()?;
             listed.into_iter().find(|info| info.session == id).filter(|info| !info.attached)
@@ -2164,7 +2183,8 @@ mod tests {
     }
 
     /// 4.2: a request written when the link drops is answered all the same,
-    /// with the link's failure, and the zone hears the link went down.
+    /// as unanswered (the core may have taken it), and the zone hears the
+    /// link went down.
     #[test]
     fn an_agent_request_fails_with_the_link_and_the_zone_hears_it() {
         let mut agent = MiniAgent::default();
@@ -2177,14 +2197,17 @@ mod tests {
         // reading the next message, which it never answers.
         drop(core);
         let req = session.prompt("unanswered").unwrap();
-        let AgentEvent::Reply { request, outcome: Err(why) } = next_life(&mut feed) else { panic!("not failed") };
+        let AgentEvent::Reply { request, outcome: Err(ReplyError::Unanswered(why)) } = next_life(&mut feed) else {
+            panic!("not unanswered")
+        };
         assert_eq!(request, req);
         assert!(why.starts_with("the terminal server went away"), "{why}");
         assert_eq!(next_life(&mut feed), AgentEvent::LinkDown);
         drop(connection);
     }
 
-    /// 4.2: nothing is sent for a session that doesn't run yet, or any more.
+    /// 4.2, `agents-client-state-fixes` 4.3: nothing is sent for a session
+    /// that doesn't run yet (still starting) or any more (gone).
     #[test]
     fn agent_requests_go_only_while_the_session_runs() {
         let (release, wait) = mpsc::channel::<()>();
@@ -2197,13 +2220,63 @@ mod tests {
             agent_request(),
             Box::new(sink),
         );
-        assert_eq!(session.prompt("hi"), None);
-        assert_eq!((session.resend(), session.unqueue(), session.answer(1, None)), (None, None, None));
-        assert!(!session.cancel());
+        let starting = Err(NotSent::Starting);
+        assert_eq!(session.prompt("hi"), starting);
+        assert_eq!((session.resend(), session.unqueue(), session.answer(1, None)), (starting, starting, starting));
+        assert_eq!((session.fetch(1, 1024), session.list(None), session.choose(None)), (starting, starting, starting));
+        assert_eq!(session.cancel(), Err(NotSent::Starting));
         release.send(()).unwrap();
         // A connection that fails is no server.
         assert_eq!(next_life(&mut feed), AgentEvent::Failed(StartFailure::NoServer("offline".into())));
-        assert_eq!(session.prompt("hi"), None);
+        assert_eq!(session.prompt("hi"), Err(NotSent::Gone));
+        assert_eq!(session.cancel(), Err(NotSent::Gone));
+    }
+
+    /// `agents-client-state-fixes` 4.3 (D-1): the session's thread says the
+    /// session runs only once it does: when the zone takes
+    /// `SessionRunning`, a prompt goes, though the agent's `Ready` came
+    /// with `SPAWNED`, before the thread installed the session.
+    #[test]
+    fn the_running_event_comes_once_the_session_can_send() {
+        let dir = temp_dir("agent-running");
+        let mut mini = MiniAgent::default();
+        let core = scripted_core_at(&dir, 4, move |message, stream| mini.answer(message, stream));
+        let connection = connected(&dir);
+        let starting = connection.clone();
+        let (sink, mut feed) = AgentSink::with_fault(None);
+        let session = Session::start_agent_with(move || Ok(starting), agent_request(), Box::new(sink));
+        assert!(matches!(recv(&core), ToCore::SpawnAgent(_)));
+        assert_eq!(next_life(&mut feed), AgentEvent::SessionRunning, "the only life event of a start");
+        let req = session.prompt("hi").expect("sent once the session runs");
+        assert_eq!(recv(&core), ToCore::AgentPrompt(client::AgentPrompt { req, session: AGENT, text: "hi".into() }));
+        drop(connection);
+    }
+
+    /// `agents-client-state-fixes` 4.3: an attached session's
+    /// `SessionRunning` comes after its replay's start, which the reader
+    /// delivers before the attach's answer reaches the session's thread.
+    #[test]
+    fn an_attached_sessions_running_event_follows_its_replay_start() {
+        let dir = temp_dir("agent-attach-running");
+        let _core = scripted_core_at(&dir, 4, |message, stream| {
+            if let ToCore::Attach(attach) = message {
+                let start = client::ReplayStart { req: Some(attach.req), session: AGENT, pid: 4242 };
+                send(stream, ToClient::ReplayStart(start));
+                send(stream, ToClient::ReplayEnd(client::SessionRef { session: AGENT }));
+            }
+        });
+        let connection = connected(&dir);
+        let (sink, mut feed) = AgentSink::with_fault(None);
+        let request = AttachRequest { session: AGENT, key: SessionKey::from_wire("k7"), when: Attaching::Now { cols: 0, rows: 0 } };
+        let session = Session::attach_with(move || Ok(connection), request, Box::new(sink));
+        let mut life = Vec::new();
+        while !(life.contains(&AgentEvent::SessionRunning) && life.contains(&AgentEvent::Replay(false))) {
+            life.push(next_life(&mut feed));
+        }
+        let at = |event: &AgentEvent| life.iter().position(|seen| seen == event).expect("taken");
+        assert!(at(&AgentEvent::Replay(true)) < at(&AgentEvent::SessionRunning), "{life:?}");
+        assert_eq!(life.len(), 3, "{life:?}");
+        assert!(session.prompt("hi").is_ok());
     }
 
     /// 4.1: below client protocol 4 the gate refuses the spawn before it is
@@ -2245,7 +2318,9 @@ mod tests {
         let request = AttachRequest { session: AGENT, key: SessionKey::from_wire("k7"), when: Attaching::Now { cols: 0, rows: 0 } };
         let _session = Session::attach_with(move || Ok(connection), request, Box::new(sink));
         let both = |log: &Transcript| log.entries().count() == 2;
-        let life = shows(&mut feed, "the replay and the live event", both);
+        let mut life = shows(&mut feed, "the replay and the live event", both);
+        // Its place is `an_attached_sessions_running_event_follows_its_replay_start`'s.
+        life.retain(|event| *event != AgentEvent::SessionRunning);
         assert_eq!(life, [AgentEvent::Replay(true), AgentEvent::Replay(false)]);
         assert_eq!(says(feed.shared.lock().transcript()), ["agent: earlier", "agent: now"]);
         let changes = feed.shared.lock().take_changes();
@@ -2317,15 +2392,18 @@ mod tests {
         // The core goes after reading the fetch, never answering it.
         drop(core);
         let req = session.fetch(1, 1024).unwrap();
-        let AgentEvent::Reply { request, outcome: Err(why) } = next_life(&mut feed) else { panic!("not failed") };
+        let AgentEvent::Reply { request, outcome: Err(ReplyError::Unanswered(why)) } = next_life(&mut feed) else {
+            panic!("not unanswered")
+        };
         assert_eq!(request, req);
         assert!(why.starts_with("the terminal server went away"), "{why}");
         assert_eq!(next_life(&mut feed), AgentEvent::LinkDown);
         drop(connection);
     }
 
-    /// `agents-log-paging` 4.1: a fetch while the link is down is answered
-    /// at once with the link's failure.
+    /// `agents-log-paging` 4.1, `agents-client-state-fixes` 4.2: a fetch
+    /// while the link is down isn't sent, saying so at once, and no reply
+    /// follows.
     #[test]
     fn a_fetch_while_the_link_is_down_fails_at_once() {
         let mut agent = MiniAgent::default();
@@ -2333,7 +2411,7 @@ mod tests {
             agent_session_with("agent-fetch-down", None, move |message, stream| agent.answer(message, stream));
         drop(core);
         // The core goes after reading the next message, never answering it.
-        session.prompt("unanswered");
+        session.prompt("unanswered").unwrap();
         until("the link down", Duration::from_secs(10), || {
             while let Ok(Some(event)) = feed.events.try_next() {
                 feed.took([&event]);
@@ -2343,12 +2421,12 @@ mod tests {
             }
             None
         });
-        let req = session.fetch(1, 1024).expect("the session is still shown");
-        let reply = next_life(&mut feed);
-        assert_eq!(
-            reply,
-            AgentEvent::Reply { request: req, outcome: Err("the connection to the terminal server is down".into()) }
-        );
+        assert_eq!(session.fetch(1, 1024), Err(NotSent::LinkDown), "the session is still shown");
+        // The old synthetic reply was queued before `fetch` returned.
+        let after: Vec<AgentEvent> = std::iter::from_fn(|| feed.events.try_next().ok().flatten())
+            .filter(|event| matches!(event, AgentEvent::Reply { .. }))
+            .collect();
+        assert_eq!(after, [], "no reply follows");
         drop(connection);
     }
 
@@ -2365,7 +2443,7 @@ mod tests {
         assert!(matches!(recv(&agent.core), ToCore::AgentPrompt(_)));
         let AgentEvent::Broken(why) = next_life(&mut agent.feed) else { panic!("not broken") };
         assert_eq!(recv(&agent.core), ToCore::Detach(client::Detach { session: AGENT, layout: None }));
-        assert_eq!(agent.session.prompt("again"), None, "no longer shown");
+        assert_eq!(agent.session.prompt("again"), Err(NotSent::Gone), "no longer shown");
         assert_eq!(settled(&agent.connection, &agent.core), []);
         why
     }

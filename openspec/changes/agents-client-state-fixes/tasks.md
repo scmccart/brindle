@@ -12,13 +12,13 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
   - List the switch in `main.rs`'s `fault_switches()`, and update `fault_switches_are_listed_only_in_debug_builds` to expect it.
   - Add `TestSwitch::SessionStartDelay` to `tests/e2e/switches.rs` (host `Brindle`), with its row in the switches self-test.
   - Verify with `cargo test -p brindle fault_switches` and `BRINDLE_E2E=1 cargo test --test e2e -- --self-test`.
-- [ ] 1.3 Add the two e2e cases of design decision 4 to `tests/e2e/cases/agent.rs`, registered in `cases/mod.rs` with `needing(…, &[TestSwitch::SessionStartDelay], …).needs_fake_agent()`:
+- [x] 1.3 Add the two e2e cases of design decision 4 to `tests/e2e/cases/agent.rs`, registered in `cases/mod.rs` with `needing(…, &[TestSwitch::SessionStartDelay], …).needs_fake_agent()`:
   - `agent-first-prompt-before-the-session-runs` (`first_prompt_before_the_session_runs`).
   - `agent-prompt-before-the-attached-session-runs` (`prompt_before_the_attached_session_runs`).
   - Set the switch to `ctx.scale().secs(1.5)` in milliseconds.
   - Each case checks for no `refusal=` and checks `prompts_sent`.
   - Run each 20 times on this branch before any fix, and record the failures (expected 20 of 20, each dump showing `refusal="the agent session isn't connected; nothing was sent"`) in the design's as-built notes.
-- [ ] 1.4 Show D-5:
+- [x] 1.4 Show D-5:
   - Add `a_lost_link_fails_queued_fetches_and_carries_other_queued_requests` to `connection.rs`'s tests. It inserts a queued `Waiting::Agent` for a fetch and one for a prompt, calls `State::link_lost`, and expects the fetch failed and the prompt still queued.
   - Verify that it fails with `cargo test -p brindle a_lost_link_fails_queued_fetches`.
 - [x] 1.5 Show D-4 with a failing test, `a_prompt_lost_with_the_link_and_found_in_the_replay_clears_its_draft`, in `model.rs`'s tests:
@@ -34,7 +34,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
   - `a_live_permission_after_a_replay_raises_its_notice`: in one batch of changes, a replay of an idle ready agent, then live `Turn { Blocked }` and a permission entry; expect a notice.
   - `a_live_ready_after_a_replay_sends_the_first_prompt`: a first prompt, a replay showing `Starting`, then a live `Ready` in the same batch; expect `First::Send` once the link is up.
   - Put both in `model.rs`'s tests, using `AgentShared`'s `replay_start`, `apply` and `replay_end` before one `take_changes`.
-- [ ] 1.8 Show D-11's dropped choice with a failing entity test, `a_choice_while_reconnecting_says_why`, in `src/agent/tests.rs`: a choosing zone (fed `Choosing`), `sink.link_down()`, then `agent.choose(Some("c1"))`. Expect no `Call::Choose` and a choosing reason naming the link.
+- [x] 1.8 Show D-11's dropped choice with a failing entity test, `a_choice_while_reconnecting_says_why`, in `src/agent/tests.rs`: a choosing zone (fed `Choosing`), `sink.link_down()`, then `agent.choose(Some("c1"))`. Expect no `Call::Choose` and a choosing reason naming the link.
 - [x] 1.9 Show D-12:
   - Add rows to `login.rs`'s `commands_that_reparse_their_arguments_are_withheld`: `pwsh -Command agy acp`, `pwsh -c …`, `pwsh -ec …`, `powershell agy acp`, `powershell.exe -Command …`, `wsl agy acp`, `WSL.EXE agy acp`. Expect `Some(Withheld)`.
   - Verify that they fail with `cargo test -p brindle agent::login`.
@@ -90,13 +90,13 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 
 ## 4. Shell: the session, the connection and the entity
 
-- [ ] 4.1 Change the `SessionSink` trait in `connection.rs`:
+- [x] 4.1 Change the `SessionSink` trait in `connection.rs`:
   - Add `fn running(&mut self) {}`.
   - Change `reply` to take `Result<(), ReplyError>`.
   - Update `src/remote/local/agent.rs` and the terminal sink, which ignores both.
   - Update `connection.rs`'s test sinks, `fake::failing_sink` included.
   - Verify with `cargo build -p brindle`.
-- [ ] 4.2 In `connection.rs`:
+- [x] 4.2 In `connection.rs`:
   - Add `Carry` to `Waiting::Agent`: `NextLink` from `Running::agent_request`, `Never` from `Running::fetch`.
   - `State::link_lost` returns `LinkLost { unanswered, unsent }`.
   - Add `Waiting::unanswered`.
@@ -105,7 +105,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
   - `Running::fetch` returns `Err(NotSent::LinkDown)` while the link is down, and `agent_request` returns `Err(NotSent::Gone)`.
   - 1.4's test passes, and so does `a_lost_link_fails_written_requests_and_carries_written_attaches` (updated to the two lists).
   - Verify with `cargo test -p brindle remote::local::connection`.
-- [ ] 4.3 In `session.rs`:
+- [x] 4.3 In `session.rs`:
   - `Session::running` and every agent request return `Result<_, NotSent>` (design decision 1).
   - `run` raises `sink.lock().running()` after `*phase = Phase::Running(..)`, with the phase lock dropped first.
   - Change `AgentLink` in `src/remote/mod.rs` to match.
@@ -118,12 +118,12 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
     - `a_fetch_while_the_link_is_down_fails_at_once`: returns `Err(NotSent::LinkDown)`, and no reply follows.
     - `an_attached_agent_session_replays_its_transcript` and `a_fetchs_frames_are_folded_in_front_before_its_reply`: `status_from` replaces `from_replay`.
   - Verify with `cargo test -p brindle remote::local::session`.
-- [ ] 4.4 In `src/agent/sink.rs`:
+- [x] 4.4 In `src/agent/sink.rs`:
   - Add `AgentEvent::SessionRunning` (`Kind::Life`) and `Sink::running`.
   - Change `AgentEvent::Reply`'s outcome to `Result<(), ReplyError>`.
   - Test with `the_running_event_is_a_life_event_queued_in_order`.
   - Verify with `cargo test -p brindle agent::sink`.
-- [ ] 4.5 In `src/agent/mod.rs`:
+- [x] 4.5 In `src/agent/mod.rs`:
   - `Requests` methods return `Result`.
   - `apply` handles `SessionRunning` with `session_running`.
   - `apply_absorbed` hands `Absorbed::replied` to `apply_replied`.
@@ -143,7 +143,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 
 ## 5. UI and end-to-end
 
-- [ ] 5.1 Make `src/agent/view.rs` match `Earlier::Loading { .. }` with no request, in `refresh_motion` and in the row's drawing. In `view/tests.rs`, the paging test takes the fetch's id from `Call::Fetch` order, not from `Earlier::Loading`. Verify with `cargo test -p brindle agent::view`.
+- [x] 5.1 Make `src/agent/view.rs` match `Earlier::Loading { .. }` with no request, in `refresh_motion` and in the row's drawing. In `view/tests.rs`, the paging test takes the fetch's id from `Call::Fetch` order, not from `Earlier::Loading`. Verify with `cargo test -p brindle agent::view`.
 - [ ] 5.2 Check the e2e cases:
   - Run `agent-first-prompt-before-the-session-runs` and `agent-prompt-before-the-attached-session-runs` 20 times each; expect 0 failures.
   - Run the whole `agent-` filter once; it passes (`agent-broken` included, on a debug build).

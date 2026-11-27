@@ -1,10 +1,12 @@
 //! An agent zone's sink as the connection sees it: the reader's calls,
-//! each under `Connection::deliver`'s `catch_unwind`, handed to
+//! each under `Connection::deliver`'s `catch_unwind`, and the session
+//! thread's `running`, handed to
 //! [`crate::agent::sink::Sink`]. Output (a relay's lost-link line, an
 //! attach's retry line) is a terminal's: an agent session has none, so it
 //! is logged and dropped.
 
 use super::SessionSink;
+use crate::agent::model::ReplyError;
 use crate::agent::sink::Sink;
 use crate::remote::protocol::RequestId;
 
@@ -45,8 +47,12 @@ impl SessionSink for Sink {
         Sink::transcript(self, events)
     }
 
-    fn reply(&mut self, request: RequestId, outcome: Result<(), String>) {
+    fn reply(&mut self, request: RequestId, outcome: Result<(), ReplyError>) {
         Sink::reply(self, request, outcome);
+    }
+
+    fn running(&mut self) {
+        Sink::running(self);
     }
 
     fn page(&mut self, request: RequestId, events: Vec<serde_json::Value>, last: Option<bool>) -> Result<(), String> {
