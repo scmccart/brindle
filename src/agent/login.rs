@@ -142,19 +142,73 @@ fn program_name(program: &str) -> String {
     program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase()
 }
 
+/// The switch an argument names, lowercased, with one leading `-`, two
+/// `--` or one `/` removed; `None` for an argument that isn't one.
+fn switch_word(arg: &str) -> Option<String> {
+    let word = arg.strip_prefix("--").or_else(|| arg.strip_prefix('-')).or_else(|| arg.strip_prefix('/'))?;
+    (!word.is_empty()).then(|| word.to_ascii_lowercase())
+}
+
+/// Whether `word` is `full` or a prefix of it of at least `min` letters,
+/// as PowerShell matches a switch.
+fn prefix_of(word: &str, full: &str, min: usize) -> bool {
+    word.len() >= min && full.starts_with(word)
+}
+
+/// Whether one of `args` names a switch `spelled` accepts
+/// ([`switch_word`]).
+fn names_switch(args: &[String], spelled: impl Fn(&str) -> bool) -> bool {
+    args.iter().filter_map(|arg| switch_word(arg)).any(|word| spelled(&word))
+}
+
+/// PowerShell's `-File` (`-f`, or a prefix of `file` of 2+ letters).
+fn is_file(word: &str) -> bool {
+    word == "f" || prefix_of(word, "file", 2)
+}
+
+/// pwsh's `-Command` (any prefix of `command`: pwsh takes the first switch
+/// a prefix matches, so `-c` and `-co` are `-Command`) or
+/// `-EncodedCommand` (`-e`, `-ec`, or a prefix of `encodedcommand` of 2+
+/// letters). `-CommandWithArgs` (`-cwa`) is neither.
+fn is_command(word: &str) -> bool {
+    prefix_of(word, "command", 1) || word == "e" || word == "ec" || prefix_of(word, "encodedcommand", 2)
+}
+
 /// Why `command` can't run a terminal login, if it can't: it parses its
 /// arguments again, so the method's would be read as something else
-/// (`cmd /c`, a batch file), or it runs them elsewhere (`ssh`).
+/// (`cmd /c`, a batch file, `pwsh -Command`, `powershell`, `wsl` without
+/// `--exec`), or it runs them elsewhere (`ssh`). OpenSpec change
+/// `agents-client-state-fixes`, decision 11, added PowerShell and WSL.
 pub fn reparses(command: &AgentCommand) -> Option<Withheld> {
     let name = program_name(&command.program);
     let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    let args = &command.args;
     let why = if name.ends_with(".bat") || name.ends_with(".cmd") {
         "the login can't be run through a batch file".to_string()
     } else if stem == "cmd" {
-        let switch = command.args.iter().map(|a| a.to_ascii_lowercase()).find(|a| a == "/c" || a == "/k")?;
+        let switch = args.iter().map(|a| a.to_ascii_lowercase()).find(|a| a == "/c" || a == "/k")?;
         format!("the login can't be run through `cmd {switch}`")
     } else if stem == "ssh" {
         "the login can't be run through `ssh`".to_string()
+    } else if stem == "pwsh" {
+        // What follows `-File` is the script's own arguments.
+        let before_file: Vec<String> = args.iter().take_while(|arg| !switch_word(arg).is_some_and(|w| is_file(&w))).cloned().collect();
+        if !names_switch(&before_file, is_command) {
+            return None;
+        }
+        "the login can't be run through `pwsh -Command`".to_string()
+    } else if stem == "powershell" {
+        // Windows PowerShell reads its arguments as a command unless `-File`.
+        if names_switch(args, is_file) {
+            return None;
+        }
+        "the login can't be run through `powershell`, which reads its arguments as a command".to_string()
+    } else if stem == "wsl" {
+        // Without `--exec`, WSL hands the command line to the distribution's shell.
+        if args.iter().any(|arg| arg == "-e" || arg.eq_ignore_ascii_case("--exec")) {
+            return None;
+        }
+        "the login can't be run through `wsl` without `--exec`".to_string()
     } else {
         return None;
     };
@@ -304,12 +358,55 @@ mod tests {
         assert_eq!(withheld("ssh", &["host", "agent"]).as_deref(), Some("the login can't be run through `ssh`"));
         assert_eq!(withheld("C:/tools/ssh.exe", &["host"]).as_deref(), Some("the login can't be run through `ssh`"));
         assert_eq!(withheld("/usr/bin/ssh", &[]).as_deref(), Some("the login can't be run through `ssh`"));
+        // PowerShell and WSL (OpenSpec change `agents-client-state-fixes`,
+        // decision 11).
+        let pwsh = Some("the login can't be run through `pwsh -Command`");
+        assert_eq!(withheld("pwsh", &["-Command", "agy", "acp"]).as_deref(), pwsh);
+        assert_eq!(withheld("pwsh", &["-c", "agy acp"]).as_deref(), pwsh);
+        assert_eq!(withheld("pwsh.exe", &["-NoProfile", "-co", "agy acp"]).as_deref(), pwsh);
+        assert_eq!(withheld("pwsh", &["-ec", "YQBnAHkA"]).as_deref(), pwsh);
+        assert_eq!(withheld("C:/Program Files/PowerShell/7/pwsh.exe", &["-e", "YQBnAHkA"]).as_deref(), pwsh);
+        assert_eq!(withheld("pwsh", &["--EncodedCommand", "YQBnAHkA"]).as_deref(), pwsh);
+        let powershell = Some("the login can't be run through `powershell`, which reads its arguments as a command");
+        assert_eq!(withheld("powershell", &["agy", "acp"]).as_deref(), powershell);
+        assert_eq!(withheld("powershell.exe", &["-Command", "agy acp"]).as_deref(), powershell);
+        assert_eq!(withheld("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\PowerShell.exe", &[]).as_deref(), powershell);
+        let wsl = Some("the login can't be run through `wsl` without `--exec`");
+        assert_eq!(withheld("wsl", &["agy", "acp"]).as_deref(), wsl);
+        assert_eq!(withheld("WSL.EXE", &["agy", "acp"]).as_deref(), wsl);
+        assert_eq!(withheld("wsl", &["-d", "Ubuntu", "agy", "acp"]).as_deref(), wsl);
         // `cmd` without a switch that runs a command, and programs merely
         // named like them, are run as they are.
         assert_eq!(withheld("cmd", &[]), None);
         assert_eq!(withheld("/opt/cmdline/agy", &["acp"]), None);
         assert_eq!(withheld("sshd-agent", &[]), None);
         assert_eq!(withheld("npx", &["agent"]), None);
+    }
+
+    /// The forms that hand appended arguments through unparsed are offered:
+    /// a pwsh or powershell script (`-File`), pwsh's `-CommandWithArgs`,
+    /// and `wsl --exec`.
+    #[test]
+    fn commands_that_pass_arguments_through_are_offered() {
+        let withheld = |program: &str, args: &[&str]| reparses(&command(program, args)).map(|w| w.why);
+        for (program, args) in [
+            ("pwsh", &["-File", "agy.ps1", "acp"][..]),
+            ("pwsh", &["-f", "agy.ps1"]),
+            ("pwsh", &["-NoProfile", "-File", "agy.ps1", "-c"]),
+            ("pwsh", &["agy.ps1", "acp"]),
+            ("pwsh", &["-cwa", "agy $args", "acp"]),
+            ("pwsh", &["-CommandWithArgs", "agy $args"]),
+            ("powershell", &["-File", "agy.ps1", "acp"]),
+            ("powershell.exe", &["-ExecutionPolicy", "Bypass", "-fi", "agy.ps1"]),
+            ("wsl", &["--exec", "agy", "acp"]),
+            ("wsl.exe", &["-d", "Ubuntu", "-e", "agy", "acp"]),
+            ("wsl", &["--EXEC", "agy"]),
+            // Programs merely named like them.
+            ("pwsh-agent", &["-c"]),
+            ("/opt/wsl-tools/agy", &["acp"]),
+        ] {
+            assert_eq!(withheld(program, args), None, "{program} {args:?}");
+        }
     }
 
     /// An SSH *host* profile runs its own command on the host (Brindle's
