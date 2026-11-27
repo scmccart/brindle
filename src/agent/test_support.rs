@@ -71,7 +71,7 @@ pub type Calls = Rc<RefCell<Vec<Call>>>;
 /// nothing while `down`.
 pub struct FakeRequests {
     calls: Calls,
-    next: Cell<RequestId>,
+    next: Rc<Cell<RequestId>>,
     pub down: Rc<Cell<bool>>,
     /// The session's id.
     session: SessionId,
@@ -162,7 +162,7 @@ fn fake_connect(calls: Calls, down: Rc<Cell<bool>>, starts: Starts, sinks: Sinks
         };
         starts.borrow_mut().push(start);
         sinks.borrow_mut().push(sink);
-        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(101), down: down.clone(), session: 8 };
+        let requests = FakeRequests { calls: calls.clone(), next: Rc::new(Cell::new(101)), down: down.clone(), session: 8 };
         Ok(Box::new(requests) as Box<dyn Requests>)
     })
 }
@@ -188,6 +188,8 @@ pub struct Zone {
     /// the new sessions' sinks.
     pub starts: Starts,
     pub sinks: Sinks,
+    /// The next id the fake requests answer with.
+    next: Rc<Cell<RequestId>>,
 }
 
 impl Zone {
@@ -196,7 +198,8 @@ impl Zone {
         let shared = feed.shared.clone();
         let calls = Calls::default();
         let down = Rc::new(Cell::new(false));
-        let requests = FakeRequests { calls: calls.clone(), next: Cell::new(1), down: down.clone(), session: 7 };
+        let next = Rc::new(Cell::new(1));
+        let requests = FakeRequests { calls: calls.clone(), next: next.clone(), down: down.clone(), session: 7 };
         let (starts, sinks) = (Starts::default(), Sinks::default());
         let connect = fake_connect(calls.clone(), down.clone(), starts.clone(), sinks.clone());
         let first = first.map(|text| FirstPrompt::new(text.to_string()).unwrap());
@@ -205,7 +208,12 @@ impl Zone {
             let requests = Some(Box::new(requests) as Box<dyn Requests>);
             Agent::from_parts(model, feed, requests, "fake-acp".into(), Host::Local, None, connect, cx)
         });
-        Self { sink, agent, calls, down, shared, starts, sinks }
+        Self { sink, agent, calls, down, shared, starts, sinks, next }
+    }
+
+    /// The id the zone's fake requests answered their last request with.
+    pub fn last_request(&self) -> RequestId {
+        self.next.get() - 1
     }
 
     /// Folds `events` on this thread, as the reader thread does.

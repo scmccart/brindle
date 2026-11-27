@@ -2249,7 +2249,7 @@ mod tests {
         assert_eq!(life, [AgentEvent::Replay(true), AgentEvent::Replay(false)]);
         assert_eq!(says(feed.shared.lock().transcript()), ["agent: earlier", "agent: now"]);
         let changes = feed.shared.lock().take_changes();
-        assert!(changes.reset && changes.from_replay, "{changes:?}");
+        assert!(changes.reset && changes.status_from == crate::agent::shared::StatusFrom::Replay, "{changes:?}");
         assert!(matches!(recv(&core), ToCore::Attach(_)));
     }
 
@@ -2304,7 +2304,7 @@ mod tests {
         drop(shared);
         let changes = feed.shared.lock().take_changes();
         assert_eq!(changes.prepended, Some(2));
-        assert!(changes.from_replay);
+        assert_eq!(changes.status_from, crate::agent::shared::StatusFrom::Unchanged, "a page carries no status");
     }
 
     /// `agents-log-paging` 4.1: a fetch written when the link drops is

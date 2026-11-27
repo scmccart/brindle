@@ -22,7 +22,7 @@ use crate::agent::commands::{self, Completion, CompletionAction, CompletionKey, 
 use crate::agent::conversations::{Latest, Page, ZoneRun, latest_plan};
 use crate::agent::login::{self, AgentCommand, MethodOffer, TerminalLogin};
 use crate::agent::markdown::{self, Part};
-use crate::agent::shared::{Changes, Dirty};
+use crate::agent::shared::{Changes, Dirty, StatusFrom};
 use crate::agent::tool::{self, DetailPart, RowState, Shown, ToolPolicy};
 use crate::agent::transcript::{
     Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Exit, FileOp, HoldReason, NoticeLevel, PAGE_BYTES,
@@ -847,8 +847,170 @@ pub enum Why {
 pub const ALREADY_QUEUED: &str = "a prompt is already queued";
 
 /// The refusal shown when a request couldn't be sent at all
-/// ([`ChatModel::unsent`]).
+/// ([`ChatModel::not_sent`]).
 pub const UNSENT: &str = "the agent session isn't connected; nothing was sent";
+
+/// Why a list couldn't go while the zone's session is still being set up.
+pub const STARTING: &str = "the agent session is still starting";
+
+/// What a fetch, or another request that never waits for the next link,
+/// fails with while the link is down.
+pub const LINK_DOWN: &str = "the connection to the terminal server is down";
+
+/// A prompt whose answer was lost with the link, missing from the
+/// reconnect's replay.
+pub const PROMPT_NOT_TAKEN: &str = "the connection to the terminal server dropped before the prompt arrived; nothing was sent";
+
+/// A prompt whose answer was lost with the link, when the replay can't tell
+/// whether it arrived.
+pub const PROMPT_MAYBE_TAKEN: &str =
+    "the connection to the terminal server dropped as the prompt was sent; it may have reached the agent";
+
+/// A choice made while the link is down.
+#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies `ChatModel::choose` in task 4.5"))]
+pub const CHOICE_LINK_DOWN: &str = "the connection to the terminal server is down; the choice wasn't sent";
+
+/// A choice made while another is on its way.
+#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies `ChatModel::choose` in task 4.5"))]
+pub const CHOICE_PENDING: &str = "a choice is already on its way";
+
+/// A choice made when the agent isn't choosing.
+#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies `ChatModel::choose` in task 4.5"))]
+pub const NOT_CHOOSING: &str = "the agent isn't choosing a conversation";
+
+/// Why a request wasn't sent (OpenSpec change `agents-client-state-fixes`,
+/// decision 1): what the model does with it is [`ChatModel::not_sent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotSent {
+    /// The session isn't handed to the zone yet: nothing was sent, and the
+    /// zone can send once it runs.
+    #[cfg_attr(not(test), expect(dead_code, reason = "`Session::running` returns it in task 4.3"))]
+    Starting,
+    /// The zone let it go, it never started, or the connection no longer
+    /// shows it (exited, lost, broken): nothing was sent, and nothing will
+    /// be.
+    Gone,
+    /// The link is down, for a request that never waits for the next link
+    /// (a fetch).
+    #[cfg_attr(not(test), expect(dead_code, reason = "`Running::fetch` returns it in task 4.2"))]
+    LinkDown,
+}
+
+/// How a request the zone sent failed (decision 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplyError {
+    /// The core refused it, or it never went out: nothing happened.
+    Failed(String),
+    /// It was written on a link that went down before its answer: the core
+    /// may have taken it.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the connection's link-down handler sends it in task 4.2"))]
+    Unanswered(String),
+}
+
+/// The tests' refusals: the core's.
+#[cfg(test)]
+impl From<&str> for ReplyError {
+    fn from(why: &str) -> Self {
+        Self::Failed(why.to_string())
+    }
+}
+
+impl ReplyError {
+    /// What it says.
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Failed(why) | Self::Unanswered(why) => why,
+        }
+    }
+}
+
+/// Whether the session's thread has handed the zone the running session
+/// (decision 2): until it has, nothing can be sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionHandle {
+    Starting,
+    Running,
+}
+
+/// A prompt as the zone sent it: its text, and the newest entry the zone
+/// held then, which the replay is searched after when its answer is lost
+/// (decision 5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptSent {
+    pub text: String,
+    pub after: Option<EntryId>,
+}
+
+/// A prompt whose answer was lost with the link, waiting for the
+/// reconnect's replay to say whether the core took it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Uncertain {
+    sent: PromptSent,
+    /// The launch's first prompt, which was never in the input.
+    first: bool,
+}
+
+/// Whether the core took a prompt whose answer was lost ([`taken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    Yes,
+    No,
+    /// The replay's page doesn't reach back far enough to say.
+    CantTell,
+}
+
+/// Whether the core took `prompt`, from the reconnect's replay: the slot
+/// holds its cleaned text (queued behind a turn), or a user entry after the
+/// one the zone held when it was sent does; it can't tell when the replay's
+/// window starts past that entry's successor; else it didn't.
+pub fn taken(prompt: &PromptSent, entries: &[(EntryId, Entry)], window: Option<Window>, slot: &Slot) -> Taken {
+    let kept = crate::agent::transcript::clean(&prompt.text);
+    let queued = match slot {
+        Slot::Waiting { text } | Slot::Held { text, .. } => *text == kept,
+        Slot::Empty => false,
+    };
+    let logged = entries.iter().any(|(id, entry)| {
+        prompt.after.is_none_or(|after| *id > after) && matches!(entry, Entry::User { text } if *text == kept)
+    });
+    if queued || logged {
+        return Taken::Yes;
+    }
+    let cut = window.is_some_and(|window| match prompt.after {
+        Some(after) => window.from.0 > after.0.saturating_add(1),
+        None => window.earlier > 0,
+    });
+    if cut { Taken::CantTell } else { Taken::No }
+}
+
+/// What a choice does now ([`ChatModel::choose`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies it in task 4.5"))]
+pub enum Choose {
+    /// Send `AGENT_CHOOSE`.
+    Send,
+    /// Nothing is sent: the choosing screen says why.
+    Refused,
+}
+
+/// The launch's first prompt (decision 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FirstState {
+    None,
+    /// Waiting for the agent and the session.
+    Waiting(FirstPrompt),
+    /// Shown in the read-only input while the agent needs a login.
+    Shown(FirstPrompt),
+}
+
+/// The entries before the ones the zone holds, as stored (decision 7):
+/// whether a fetch is on its way is the request ledger's, and
+/// [`ChatModel::earlier`] derives the row from both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Paging {
+    None,
+    Available { count: u64 },
+    Failed { count: u64, why: SharedString },
+}
 
 /// What enter does with the prompt input's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -869,9 +1031,10 @@ pub enum Submit {
 /// A request the zone sent, kept until its reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Sent {
-    Prompt,
+    /// A typed prompt ([`ChatModel::sent_prompt`]).
+    Prompt(PromptSent),
     /// The launch's first prompt, put back as the draft if refused.
-    FirstPrompt(String),
+    FirstPrompt(PromptSent),
     Resend,
     Unqueue,
     Answer(EntryId),
@@ -981,12 +1144,13 @@ pub fn no_earlier_text(dir: &str) -> String {
 /// The entries before the ones the zone holds (OpenSpec change
 /// `agents-log-paging` decision 11), from the transcript's window: none,
 /// or `count` of them, which the zone can fetch, is fetching, or failed
-/// to fetch.
+/// to fetch. Derived on each read ([`ChatModel::earlier`]): `Loading` while
+/// the request ledger holds a fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Earlier {
     None,
     Available { count: u64 },
-    Loading { count: u64, request: RequestId },
+    Loading { count: u64 },
     Failed { count: u64, why: SharedString },
 }
 
@@ -1126,6 +1290,9 @@ pub struct Absorbed {
     /// The launch's agent is choosing for the first time: what its launch
     /// asked for (OpenSpec change `agents-session-list`).
     pub choosing: Option<OnChoosing>,
+    /// A prompt whose answer was lost with the link, settled now
+    /// (OpenSpec change `agents-client-state-fixes`, decision 5).
+    pub replied: Option<Replied>,
 }
 
 /// What a change compares against.
@@ -1166,8 +1333,16 @@ pub struct ChatModel {
     /// The thought drawn open on its own: the latest entry while a turn
     /// runs.
     auto_open: Option<EntryId>,
-    first: Option<FirstPrompt>,
+    first: FirstState,
+    /// The requests on their way, by id: the only record of a fetch in
+    /// flight ([`Self::earlier`]).
     pending: BTreeMap<RequestId, Sent>,
+    /// Whether the session's thread handed over the running session
+    /// ([`Self::session_running`]); a respawn starts it over.
+    handle: SessionHandle,
+    /// A prompt whose answer was lost with the link, until the reconnect's
+    /// replay settles it.
+    uncertain: Option<Uncertain>,
     refusal: Option<String>,
     /// The user typed after a `done` or `error` arrived.
     seen: bool,
@@ -1187,13 +1362,11 @@ pub struct ChatModel {
     /// A terminal login running in the zone beside: its method's id and
     /// name.
     terminal_login: Option<(String, String)>,
-    /// The first prompt is shown in the read-only input, waiting for a
-    /// login ([`First::Show`]).
-    first_shown: bool,
     /// The transcript's window: the zone holds the entries from its
     /// `from` on.
     window: Option<Window>,
-    earlier: Earlier,
+    /// The entries before the window, as last read from it.
+    paging: Paging,
     /// How tool call rows open on their own (`[agent]`, decision 10).
     policy: ToolPolicy,
     /// Tool call rows the user opened or closed.
@@ -1279,8 +1452,10 @@ impl ChatModel {
             blocks: Vec::new(),
             toggled: BTreeMap::new(),
             auto_open: None,
-            first,
+            first: first.map_or(FirstState::None, FirstState::Waiting),
             pending: BTreeMap::new(),
+            handle: SessionHandle::Starting,
+            uncertain: None,
             refusal: None,
             seen: false,
             note: None,
@@ -1289,9 +1464,8 @@ impl ChatModel {
             command: AgentCommand::default(),
             login_note: None,
             terminal_login: None,
-            first_shown: false,
             window: None,
-            earlier: Earlier::None,
+            paging: Paging::None,
             policy: ToolPolicy::default(),
             by_hand: BTreeMap::new(),
             texts: BTreeMap::new(),
@@ -1377,7 +1551,30 @@ impl ChatModel {
     /// Whether `AGENT_CHOOSE` can go now: the agent is choosing on a link
     /// that is up, with no choice on its way.
     pub fn can_choose(&self) -> bool {
-        self.is_choosing() && self.link == Link::Up && !self.pending.values().any(|sent| *sent == Sent::Choose)
+        self.is_choosing()
+            && self.link == Link::Up
+            && self.handle == SessionHandle::Running
+            && !self.pending.values().any(|sent| *sent == Sent::Choose)
+    }
+
+    /// A conversation was chosen (decision 10): send it when it can go;
+    /// otherwise the choosing screen says why, as its reason.
+    #[cfg_attr(not(test), expect(dead_code, reason = "`Agent::choose` applies it in task 4.5"))]
+    pub fn choose(&mut self) -> Choose {
+        let why = if !self.is_choosing() {
+            NOT_CHOOSING
+        } else if self.link == Link::Reconnecting {
+            CHOICE_LINK_DOWN
+        } else if self.pending.values().any(|sent| *sent == Sent::Choose) {
+            CHOICE_PENDING
+        } else if self.handle == SessionHandle::Starting {
+            STARTING
+        } else {
+            self.choosing.note = None;
+            return Choose::Send;
+        };
+        self.choosing.note = Some(why.into());
+        Choose::Refused
     }
 
     /// An `AGENT_CHOOSE` went out as `request`: the reason a list left goes.
@@ -1603,9 +1800,24 @@ impl ChatModel {
         None
     }
 
-    /// The entries before the ones the zone holds.
-    pub fn earlier(&self) -> &Earlier {
-        &self.earlier
+    /// The entries before the ones the zone holds: the stored paging state,
+    /// loading while a fetch is on its way (decision 7).
+    pub fn earlier(&self) -> Earlier {
+        let loading = self.pending.values().any(|sent| *sent == Sent::Fetch);
+        match &self.paging {
+            Paging::None => Earlier::None,
+            Paging::Available { count } | Paging::Failed { count, .. } if loading => Earlier::Loading { count: *count },
+            Paging::Available { count } => Earlier::Available { count: *count },
+            Paging::Failed { count, why } => Earlier::Failed { count: *count, why: why.clone() },
+        }
+    }
+
+    /// The paging state's count, when there is one.
+    fn paging_count(&self) -> Option<u64> {
+        match &self.paging {
+            Paging::None => None,
+            Paging::Available { count } | Paging::Failed { count, .. } => Some(*count),
+        }
     }
 
     /// The page to ask for now (decision 11), given whether the Earlier
@@ -1615,7 +1827,7 @@ impl ChatModel {
     /// a fetch waits, the link is down, the session can't be followed, or
     /// with nothing earlier.
     pub fn fetch_due(&self, row_in_view: bool, was_in_view: bool) -> Option<Fetch> {
-        let ask = match &self.earlier {
+        let ask = match &self.earlier() {
             Earlier::Available { .. } => row_in_view,
             Earlier::Failed { .. } => row_in_view && !was_in_view,
             Earlier::None | Earlier::Loading { .. } => false,
@@ -1625,7 +1837,7 @@ impl ChatModel {
 
     /// The Earlier row was pressed: after a failure, ask again.
     pub fn retry(&self) -> Option<Fetch> {
-        match &self.earlier {
+        match &self.earlier() {
             Earlier::Failed { .. } => self.fetch(),
             Earlier::None | Earlier::Available { .. } | Earlier::Loading { .. } => None,
         }
@@ -1641,68 +1853,45 @@ impl ChatModel {
             Link::Up => true,
             Link::Reconnecting => false,
         };
-        let window = self.window.filter(|_| live && up)?;
+        let running = match self.handle {
+            SessionHandle::Running => true,
+            SessionHandle::Starting => false,
+        };
+        let window = self.window.filter(|_| live && up && running)?;
         Some(Fetch { before: window.from, max_bytes: PAGE_BYTES })
     }
 
     /// The fetch [`Self::fetch_due`] or [`Self::retry`] asked for went out
-    /// as `request`.
+    /// as `request`: the ledger's record is what shows it loading.
     pub fn fetching(&mut self, request: RequestId) {
-        let count = match &self.earlier {
-            Earlier::Available { count } | Earlier::Failed { count, .. } => *count,
-            Earlier::None | Earlier::Loading { .. } => return,
-        };
-        self.earlier = Earlier::Loading { count, request };
         self.pending.insert(request, Sent::Fetch);
     }
 
-    /// The fetch [`Self::fetch_due`] or [`Self::retry`] asked for couldn't
-    /// go (the session isn't connected): failed, with [`UNSENT`].
-    pub fn fetch_unsent(&mut self) {
-        let count = match &self.earlier {
-            Earlier::Available { count } | Earlier::Failed { count, .. } => *count,
-            Earlier::None | Earlier::Loading { .. } => return,
+    /// The reply to a fetch, which [`Self::replied`] took from the ledger:
+    /// its page has already been folded, so an `Ok` finds the window moved;
+    /// a refusal shows on the row. A reply the zone no longer waits for (a
+    /// replay started since) never gets here.
+    fn fetched(&mut self, outcome: Result<(), ReplyError>) {
+        let Some(count) = self.paging_count() else { return };
+        self.paging = match outcome {
+            Ok(()) => Paging::Available { count },
+            Err(why) => Paging::Failed { count, why: why.text().to_string().into() },
         };
-        self.earlier = Earlier::Failed { count, why: UNSENT.into() };
-    }
-
-    /// The reply to fetch `request`: its page has already been folded, so
-    /// an `Ok` finds the window moved; a refusal shows on the row. A reply
-    /// the zone no longer waits for (a replay started since) changes
-    /// nothing.
-    fn fetched(&mut self, request: RequestId, outcome: Result<(), String>) {
-        let Earlier::Loading { count, request: waiting } = &self.earlier else { return };
-        if *waiting != request {
-            return;
-        }
-        let count = *count;
-        self.earlier = match outcome {
-            Ok(()) => Earlier::Available { count },
-            Err(why) => Earlier::Failed { count, why: why.into() },
-        };
-        if self.window.is_none() {
-            self.earlier = Earlier::None;
-        }
     }
 
     /// Follows the transcript's window: none when it has none; else its
     /// count, available again once a page came (or the zone starts over),
-    /// a fetch or a failure kept otherwise.
+    /// a failure kept otherwise.
     fn follow_window(&mut self, window: Option<Window>, reset: bool, paged: bool) {
         self.window = window;
         let Some(Window { earlier: count, .. }) = window else {
-            self.earlier = Earlier::None;
+            self.paging = Paging::None;
             return;
         };
-        let was = std::mem::replace(&mut self.earlier, Earlier::None);
-        self.earlier = if reset || paged {
-            Earlier::Available { count }
-        } else {
-            match was {
-                Earlier::None | Earlier::Available { .. } => Earlier::Available { count },
-                Earlier::Loading { request, .. } => Earlier::Loading { count, request },
-                Earlier::Failed { why, .. } => Earlier::Failed { count, why },
-            }
+        let was = std::mem::replace(&mut self.paging, Paging::None);
+        self.paging = match was {
+            Paging::Failed { why, .. } if !(reset || paged) => Paging::Failed { count, why },
+            Paging::None | Paging::Available { .. } | Paging::Failed { .. } => Paging::Available { count },
         };
     }
 
@@ -1763,6 +1952,7 @@ impl ChatModel {
                 self.rendered.retain(|id, _| *id > through);
                 self.texts.retain(|(id, _), _| *id > through);
                 self.by_hand.retain(|id, _| *id > through);
+                self.toggled.retain(|id, _| *id > through);
                 let gone = self.blocks.partition_point(|block| block.entry <= through);
                 self.blocks.drain(..gone);
                 if gone > 0 {
@@ -1821,7 +2011,33 @@ impl ChatModel {
         splices.extend(self.update_thoughts(changes.reset));
         splices.extend(self.refresh_rows());
         self.follow_window(transcript.window(), changes.reset, changes.prepended.is_some());
-        self.finish(before, splices, changes.from_replay)
+        // The reconnect's replay says whether a prompt whose answer was
+        // lost with the link was taken (decision 5).
+        let replied = if changes.reset { self.uncertain.take().map(|uncertain| self.settle_uncertain(uncertain, None)) } else { None };
+        Absorbed { replied, ..self.finish(before, splices, changes.status_from) }
+    }
+
+    /// Settles a prompt whose answer was lost with the link: as
+    /// `decided`, else from the entries, window and slot the zone now
+    /// holds ([`taken`]).
+    fn settle_uncertain(&mut self, uncertain: Uncertain, decided: Option<Taken>) -> Replied {
+        let Uncertain { sent, first } = uncertain;
+        let taken = decided.unwrap_or_else(|| taken(&sent, &self.entries, self.window, &self.slot));
+        let draft = |text: String| if first { Replied::SetDraft(text) } else { Replied::Nothing };
+        match taken {
+            Taken::Yes => {
+                self.refusal = None;
+                if first { Replied::Nothing } else { Replied::ClearDraft }
+            }
+            Taken::No => {
+                self.refusal = Some(PROMPT_NOT_TAKEN.into());
+                draft(sent.text)
+            }
+            Taken::CantTell => {
+                self.refusal = Some(PROMPT_MAYBE_TAKEN.into());
+                draft(sent.text)
+            }
+        }
     }
 
     /// Copies entry `id` again (its tail only when text was appended) and
@@ -2220,7 +2436,22 @@ impl ChatModel {
 
     /// The session's start failed.
     pub fn not_started(&mut self, failure: StartFailure) -> Absorbed {
-        self.life_event(|model| model.phase = AgentPhase::NotStarted(failure))
+        let absorbed = self.life_event(|model| model.phase = AgentPhase::NotStarted(failure));
+        self.nothing_will_replay(absorbed)
+    }
+
+    /// Nothing will replay the session now: a prompt whose answer was lost
+    /// with the link can't be told taken or not.
+    fn nothing_will_replay(&mut self, absorbed: Absorbed) -> Absorbed {
+        let replied = self.uncertain.take().map(|uncertain| self.settle_uncertain(uncertain, Some(Taken::CantTell)));
+        Absorbed { replied, ..absorbed }
+    }
+
+    /// The session's thread handed over the running session
+    /// (`AgentEvent::SessionRunning`, decision 2): requests can go, and a
+    /// first prompt or a launch's list waiting for it goes now.
+    pub fn session_running(&mut self) -> Absorbed {
+        self.life_event(|model| model.handle = SessionHandle::Running)
     }
 
     /// The session ended on its server (`EXIT`): the agent state shown
@@ -2232,13 +2463,15 @@ impl ChatModel {
     /// The session can't be got back.
     pub fn lost(&mut self, reason: impl Into<String>) -> Absorbed {
         let reason = reason.into();
-        self.life_event(|model| model.phase = AgentPhase::Lost { reason })
+        let absorbed = self.life_event(|model| model.phase = AgentPhase::Lost { reason });
+        self.nothing_will_replay(absorbed)
     }
 
     /// Brindle can't follow the session any more.
     pub fn broken(&mut self, reason: impl Into<String>) -> Absorbed {
         let reason = reason.into();
-        self.life_event(|model| model.phase = AgentPhase::Broken { reason })
+        let absorbed = self.life_event(|model| model.phase = AgentPhase::Broken { reason });
+        self.nothing_will_replay(absorbed)
     }
 
     /// The agent's conversation as the zone last knew it.
@@ -2273,9 +2506,12 @@ impl ChatModel {
     /// [`Offer::Respawn`]): it connects again, keeping the conversation it
     /// shows until the new session's first events replace it
     /// ([`crate::agent::shared::AgentShared::start_over`]). The old
-    /// session's requests and slot went with it.
+    /// session's requests, slot and uncertain prompt went with it, and so
+    /// did the rows' and thoughts' toggles: the new log's entries take the
+    /// same ids (decision 9). The new session isn't running until its
+    /// thread says so.
     pub fn respawning(&mut self) -> Absorbed {
-        self.life_event(|model| {
+        let mut absorbed = self.life_event(|model| {
             model.phase = AgentPhase::Connecting;
             model.life = SessionLife::Open;
             model.link = Link::Up;
@@ -2283,7 +2519,17 @@ impl ChatModel {
             model.slot = Slot::Empty;
             model.pending.clear();
             model.refusal = None;
-        })
+            model.handle = SessionHandle::Starting;
+            model.uncertain = None;
+            // A new conversation reuses the old one's ids (decision 9).
+            model.toggled.clear();
+            model.by_hand.clear();
+            model.auto_open = None;
+        });
+        // The old conversation's thoughts, still shown, drawn as the policy
+        // says, as its rows are.
+        absorbed.splices.extend(self.update_thoughts(true));
+        absorbed
     }
 
     /// The link to the endpoint went down or came back.
@@ -2296,10 +2542,16 @@ impl ChatModel {
         change(self);
         // A respawn's idle turn finishes the tool calls that ran.
         let splices = self.refresh_rows();
-        self.finish(before, splices, false)
+        self.finish(before, splices, StatusFrom::Unchanged)
     }
 
-    fn finish(&mut self, before: Before, splices: Vec<Splice>, from_replay: bool) -> Absorbed {
+    /// What every change ends with, `status_from` saying where the newest
+    /// turn or agent-state event of the change was folded (decision 8): one
+    /// from a replay raises nothing, sends no first prompt and starts no
+    /// launch's choice.
+    fn finish(&mut self, before: Before, splices: Vec<Splice>, status_from: StatusFrom) -> Absorbed {
+        let replayed = status_from == StatusFrom::Replay;
+        let running = self.handle == SessionHandle::Running;
         self.queue = queue_row(&self.slot, &self.phase, self.life);
         // The note beside the login row goes with it; a terminal login
         // whose agent moved on (it exited, the session ended) is forgotten.
@@ -2316,7 +2568,8 @@ impl ChatModel {
             self.choosing.note = None;
         }
         let choosing = match self.choosing.launch {
-            Some(launch) if self.is_choosing() && !from_replay => {
+            // A launch's list waits for the session too (decision 2).
+            Some(launch) if self.is_choosing() && !replayed && running => {
                 self.choosing.launch = None;
                 Some(match launch {
                     LaunchChoice::Last => OnChoosing::ListLatest,
@@ -2330,10 +2583,11 @@ impl ChatModel {
             working: (working != before.working).then_some(working),
             splices,
             status: changed.then_some(status),
-            notice: if changed { self.notice(before.status, status, from_replay) } else { None },
+            notice: if changed { self.notice(before.status, status, replayed) } else { None },
             title_changed: self.title() != before.title,
             queue_changed: self.queue != before.queue,
-            first: self.settle_first(from_replay),
+            first: self.settle_first(status_from),
+            replied: None,
         }
     }
 
@@ -2343,28 +2597,39 @@ impl ChatModel {
     /// can run, it is shown in the read-only input and kept, through the
     /// login, a failed or cancelled one included, and sent once the agent
     /// is ready if the input still holds it (OpenSpec change
-    /// `agents-login` decision 10).
-    fn settle_first(&mut self, from_replay: bool) -> Option<First> {
-        let first = self.first.as_ref()?;
+    /// `agents-login` decision 10). It waits for the running session too,
+    /// and for a link that is up (OpenSpec change
+    /// `agents-client-state-fixes`, decision 3).
+    fn settle_first(&mut self, status_from: StatusFrom) -> Option<First> {
+        let (first, shown) = match &self.first {
+            FirstState::None => return None,
+            FirstState::Waiting(first) => (first.clone(), false),
+            FirstState::Shown(first) => (first.clone(), true),
+        };
         let text = first.text().to_string();
         let now = match (&self.phase, self.life) {
             (_, SessionLife::Ended) => First::Draft(text),
-            (AgentPhase::Live(AgentState::Ready { .. }), SessionLife::Open) => match (from_replay, self.link) {
-                (true, Link::Up | Link::Reconnecting) => First::Draft(text),
-                (false, Link::Up) if self.first_shown => First::SendIfUnchanged(text),
-                (false, Link::Up) => First::Send(text),
-                (false, Link::Reconnecting) => return None,
-            },
+            (AgentPhase::Live(AgentState::Ready { .. }), SessionLife::Open) => {
+                match (status_from, self.link, self.handle) {
+                    (StatusFrom::Replay, _, _) => First::Draft(text),
+                    (StatusFrom::Unchanged | StatusFrom::Live, Link::Reconnecting, _)
+                    | (StatusFrom::Unchanged | StatusFrom::Live, Link::Up, SessionHandle::Starting) => return None,
+                    (StatusFrom::Unchanged | StatusFrom::Live, Link::Up, SessionHandle::Running) if shown => {
+                        First::SendIfUnchanged(text)
+                    }
+                    (StatusFrom::Unchanged | StatusFrom::Live, Link::Up, SessionHandle::Running) => First::Send(text),
+                }
+            }
             (
                 AgentPhase::Connecting
                 | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. } | AgentState::Choosing { .. }),
                 SessionLife::Open,
             ) => return None,
             (AgentPhase::Live(AgentState::LoginRequired { .. }), SessionLife::Open) if self.logins_usable() => {
-                if self.first_shown {
+                if shown {
                     return None;
                 }
-                self.first_shown = true;
+                self.first = FirstState::Shown(first);
                 return Some(First::Show(text));
             }
             (
@@ -2380,15 +2645,17 @@ impl ChatModel {
                 SessionLife::Open,
             ) => First::Draft(text),
         };
-        self.first = None;
-        self.first_shown = false;
+        self.first = FirstState::None;
         Some(now)
     }
 
     /// The launch's first prompt while the read-only input shows it,
     /// waiting for a login (the dump's `first=`).
     pub fn first_shown(&self) -> Option<&str> {
-        self.first.as_ref().filter(|_| self.first_shown).map(FirstPrompt::text)
+        match &self.first {
+            FirstState::Shown(first) => Some(first.text()),
+            FirstState::None | FirstState::Waiting(_) => None,
+        }
     }
 
     /// Whether the agent needs a login, or is logging in, on an open
@@ -2580,6 +2847,10 @@ impl ChatModel {
             AgentPhase::Live(AgentState::Ready { .. }) => match (self.life, self.link) {
                 (SessionLife::Ended, _) => disabled(DisabledWhy::Exited),
                 (SessionLife::Open, Link::Reconnecting) => disabled(DisabledWhy::Reconnecting),
+                // Ready, but the session isn't handed over yet (decision 2).
+                (SessionLife::Open, Link::Up) if self.handle == SessionHandle::Starting => {
+                    disabled(DisabledWhy::Connecting)
+                }
                 (SessionLife::Open, Link::Up) if self.in_flight() => PromptStatus::Submitted,
                 (SessionLife::Open, Link::Up) if running(&self.turn) => PromptStatus::Streaming,
                 (SessionLife::Open, Link::Up) => PromptStatus::Ready,
@@ -2587,8 +2858,10 @@ impl ChatModel {
         }
     }
 
+    /// A prompt is on its way, or its answer was lost with the link and the
+    /// replay hasn't said whether it arrived.
     fn in_flight(&self) -> bool {
-        self.pending.values().any(|sent| matches!(sent, Sent::Prompt | Sent::FirstPrompt(_)))
+        self.uncertain.is_some() || self.pending.values().any(|sent| matches!(sent, Sent::Prompt(_) | Sent::FirstPrompt(_)))
     }
 
     /// Enter in the prompt input with `draft`, `composing` when an IME
@@ -2790,31 +3063,92 @@ impl ChatModel {
         self.pending.insert(request, sent);
     }
 
+    /// What the ledger records for prompt `text` (the launch's `first`, or
+    /// a typed one): the newest entry the zone holds now, which the replay
+    /// is searched after if its answer is lost (decision 5).
+    pub fn sent_prompt(&self, text: impl Into<String>, first: bool) -> Sent {
+        let sent = PromptSent { text: text.into(), after: self.entries.last().map(|(id, _)| *id) };
+        if first { Sent::FirstPrompt(sent) } else { Sent::Prompt(sent) }
+    }
+
     /// The server answered `request`: a prompt accepted empties the input;
     /// a refusal is shown beside it, and a refused first prompt becomes
-    /// the draft.
-    pub fn replied(&mut self, request: RequestId, outcome: Result<(), String>) -> Replied {
+    /// the draft. A prompt whose answer was lost with the link waits for
+    /// the reconnect's replay ([`Absorbed::replied`]).
+    pub fn replied(&mut self, request: RequestId, outcome: Result<(), ReplyError>) -> Replied {
         let Some(sent) = self.pending.remove(&request) else { return Replied::Nothing };
         if sent == Sent::Fetch {
-            self.fetched(request, outcome);
+            self.fetched(outcome);
             return Replied::Nothing;
         }
         self.answered(sent, outcome)
     }
 
-    /// A request [`Self::submit`] or the queue's or a permission's
-    /// decision asked for couldn't go (the session isn't connected, or the
-    /// link fell between the decision and the send): answered as a refusal
-    /// with [`UNSENT`], so a first prompt becomes the draft.
-    pub fn unsent(&mut self, sent: Sent) -> Replied {
-        // A set that couldn't go is said beside the input, as any request's
-        // (`agents-commands` decision 9); the server's refusals go to the
-        // notice line.
-        if let Sent::SetOption { .. } = sent {
-            self.refusal = Some(UNSENT.into());
-            return Replied::Nothing;
+    /// A request couldn't go, for `why` (decision 1's table): one that
+    /// meets a session still being set up is held, never refused; one whose
+    /// session is gone is refused with [`UNSENT`], a first prompt becoming
+    /// the draft; a fetch with the link down fails with [`LINK_DOWN`].
+    pub fn not_sent(&mut self, sent: Sent, why: NotSent) -> Replied {
+        let text = match why {
+            NotSent::Starting => return self.held_back(sent),
+            NotSent::Gone => UNSENT,
+            NotSent::LinkDown => LINK_DOWN,
+        };
+        match sent {
+            Sent::Fetch => {
+                if let Some(count) = self.paging_count() {
+                    self.paging = Paging::Failed { count, why: text.into() };
+                }
+                Replied::Nothing
+            }
+            // A set that couldn't go is said beside the input, as any
+            // request's (`agents-commands` decision 9); the server's
+            // refusals go to the notice line.
+            Sent::SetOption { .. } => {
+                self.refusal = Some(text.into());
+                Replied::Nothing
+            }
+            Sent::Prompt(_)
+            | Sent::FirstPrompt(_)
+            | Sent::Resend
+            | Sent::Unqueue
+            | Sent::Answer(_)
+            | Sent::Restart { .. }
+            | Sent::Login
+            | Sent::List(_)
+            | Sent::Choose => self.answered(sent, Err(ReplyError::Failed(text.into()))),
         }
-        self.answered(sent, Err(UNSENT.into()))
+    }
+
+    /// A request that met a session still being set up: nothing recorded
+    /// and nothing refused. A first prompt waits again, and a launch's list
+    /// is asked again once the session runs; the palette is told the agent
+    /// is still starting.
+    fn held_back(&mut self, sent: Sent) -> Replied {
+        match sent {
+            Sent::FirstPrompt(PromptSent { text, .. }) => match FirstPrompt::new(text.clone()) {
+                Ok(first) => {
+                    self.first = FirstState::Waiting(first);
+                    Replied::Nothing
+                }
+                // Never: it was one. Kept as the draft rather than lost.
+                Err(_) => Replied::SetDraft(text),
+            },
+            Sent::List(ListFor::Palette) => Replied::Listed(ListDone::Palette(Err(STARTING.into()))),
+            Sent::List(ListFor::Latest) => {
+                self.choosing.launch = Some(LaunchChoice::Last);
+                Replied::Nothing
+            }
+            Sent::Prompt(_)
+            | Sent::Resend
+            | Sent::Unqueue
+            | Sent::Answer(_)
+            | Sent::Restart { .. }
+            | Sent::Login
+            | Sent::Fetch
+            | Sent::Choose
+            | Sent::SetOption { .. } => Replied::Nothing,
+        }
     }
 
     /// The terminal server's word about the session that answers no request
@@ -2850,9 +3184,21 @@ impl ChatModel {
         phase && self.life == SessionLife::Open
     }
 
-    fn answered(&mut self, sent: Sent, outcome: Result<(), String>) -> Replied {
-        match (sent, outcome) {
-            (Sent::Prompt, Ok(())) => {
+    fn answered(&mut self, sent: Sent, outcome: Result<(), ReplyError>) -> Replied {
+        // A prompt whose answer was lost: the reconnect's replay says.
+        let outcome = match (sent, outcome) {
+            (Sent::Prompt(sent), Err(ReplyError::Unanswered(_))) => {
+                self.uncertain = Some(Uncertain { sent, first: false });
+                return Replied::Nothing;
+            }
+            (Sent::FirstPrompt(sent), Err(ReplyError::Unanswered(_))) => {
+                self.uncertain = Some(Uncertain { sent, first: true });
+                return Replied::Nothing;
+            }
+            (sent, outcome) => (sent, outcome.map_err(|why| why.text().to_string())),
+        };
+        match outcome {
+            (Sent::Prompt(_), Ok(())) => {
                 self.refusal = None;
                 Replied::ClearDraft
             }
@@ -2878,7 +3224,7 @@ impl ChatModel {
                 self.login_note = Some(why);
                 Replied::Nothing
             }
-            (Sent::FirstPrompt(text), Err(why)) => {
+            (Sent::FirstPrompt(PromptSent { text, .. }), Err(why)) => {
                 self.refusal = Some(why);
                 Replied::SetDraft(text)
             }
@@ -2892,7 +3238,7 @@ impl ChatModel {
                 self.refusal = Some(why);
                 Replied::Nothing
             }
-            (Sent::Prompt | Sent::Resend | Sent::Unqueue | Sent::Answer(_), Err(why)) => {
+            (Sent::Prompt(_) | Sent::Resend | Sent::Unqueue | Sent::Answer(_), Err(why)) => {
                 self.refusal = Some(why);
                 Replied::Nothing
             }
@@ -2905,7 +3251,7 @@ impl ChatModel {
             AgentPhase::Live(_) => true,
             AgentPhase::Connecting | AgentPhase::NotStarted(_) | AgentPhase::Lost { .. } | AgentPhase::Broken { .. } => false,
         };
-        live && self.life == SessionLife::Open && self.link == Link::Up
+        live && self.life == SessionLife::Open && self.link == Link::Up && self.handle == SessionHandle::Running
     }
 
     /// The queue row's remove, or a held prompt's discard
@@ -3267,7 +3613,7 @@ impl ChatModel {
         if let Some(at_end) = at_end {
             out.push_str(if at_end { " at=end" } else { " at=away" });
         }
-        match &self.earlier {
+        match &self.earlier() {
             Earlier::None => out.push_str(" earlier=none"),
             Earlier::Available { count } => out.push_str(&format!(" earlier={count}")),
             Earlier::Loading { .. } => out.push_str(" earlier=loading"),
@@ -3570,7 +3916,15 @@ mod tests {
     }
 
     impl Zone {
+        /// A zone whose session runs, as most tests want.
         fn new(first: Option<&str>) -> Self {
+            let mut zone = Self::starting(first);
+            zone.model.session_running();
+            zone
+        }
+
+        /// A zone whose session isn't handed over yet.
+        fn starting(first: Option<&str>) -> Self {
             let first = first.map(|text| FirstPrompt::new(text.to_string()).unwrap());
             Self { shared: AgentShared::new(), model: ChatModel::new("Fake", first) }
         }
@@ -3898,7 +4252,7 @@ mod tests {
         // A refused send leaves it as the draft, with the refusal.
         let mut zone = Zone::new(Some("run the tests"));
         zone.feed(&[ready()]);
-        zone.model.sent(7, Sent::FirstPrompt("run the tests".into()));
+        zone.model.sent(7, zone.model.sent_prompt("run the tests", true));
         assert_eq!(zone.model.prompt_status(), PromptStatus::Submitted);
         assert_eq!(zone.model.replied(7, Err("the agent isn't ready".into())), Replied::SetDraft("run the tests".into()));
         assert_eq!(zone.model.refusal(), Some("the agent isn't ready"));
@@ -3973,10 +4327,10 @@ mod tests {
 
         assert_eq!(zone.model.submit("again", true), Submit::Nothing(Why::Composing));
         assert_eq!(zone.model.submit(" \n", false), Submit::Nothing(Why::Blank));
-        zone.model.sent(1, Sent::Prompt);
+        zone.model.sent(1, zone.model.sent_prompt("again", false));
         assert_eq!(zone.model.submit("again", false), Submit::Nothing(Why::InFlight));
         assert_eq!(zone.model.replied(1, Ok(())), Replied::ClearDraft);
-        zone.model.sent(2, Sent::Prompt);
+        zone.model.sent(2, zone.model.sent_prompt("again", false));
         assert_eq!(zone.model.replied(2, Err("no".into())), Replied::Nothing, "a refused prompt keeps the draft");
         assert_eq!(zone.model.refusal(), Some("no"));
         assert_eq!(zone.model.replied(2, Ok(())), Replied::Nothing, "answered once");
@@ -4540,7 +4894,7 @@ mod tests {
         assert_eq!(zone.model.note(), Some("the profile \"Old\" is gone; this tab uses \"Fake\""));
         let mut held = Zone::ready();
         held.feed(&[queue(held_slot())]);
-        held.model.sent(1, Sent::Prompt);
+        held.model.sent(1, held.model.sent_prompt("next", false));
         held.model.replied(1, Err("the agent isn't ready".into()));
         let dump = held.model.describe(1, true, &found(&held.model), &linux);
         assert!(dump.contains("--- queued held reason=stopped:max_tokens resend=yes \"next\"\n"), "{dump}");
@@ -4732,7 +5086,7 @@ mod tests {
             Replied::OptionRefused("Model wasn't changed: an earlier change of an option hasn't been answered yet".into())
         );
         assert_eq!(zone.model.refusal(), None, "not beside the input");
-        assert_eq!(zone.model.unsent(Sent::SetOption { name: "Model".into() }), Replied::Nothing);
+        assert_eq!(zone.model.not_sent(Sent::SetOption { name: "Model".into() }, NotSent::Gone), Replied::Nothing);
         assert_eq!(zone.model.refusal(), Some(UNSENT));
         assert_eq!(zone.model.footer_flip("fast"), Some(("Fast \"mode\"".into(), OptionValue::Toggle { on: true })));
         assert_eq!(zone.model.footer_flip("model"), None, "a select's choices show");
@@ -4763,16 +5117,18 @@ mod tests {
         assert!(!zone.model.cancel(), "already cancelling");
     }
 
-    /// A request that couldn't go is answered as a refusal: a prompt's
-    /// draft stays, a first prompt becomes the draft; a server's note is
-    /// shown the same way.
+    /// A request that couldn't go because its session is gone is answered
+    /// as a refusal: a prompt's draft stays, a first prompt becomes the
+    /// draft; a server's note is shown the same way.
     #[test]
     fn an_unsent_request_is_refused_and_a_first_prompt_becomes_the_draft() {
         let mut zone = Zone::ready();
-        assert_eq!(zone.model.unsent(Sent::Prompt), Replied::Nothing);
+        let prompt = zone.model.sent_prompt("go", false);
+        assert_eq!(zone.model.not_sent(prompt, NotSent::Gone), Replied::Nothing);
         assert_eq!(zone.model.refusal(), Some(UNSENT));
-        assert_eq!(zone.model.unsent(Sent::FirstPrompt("go".into())), Replied::SetDraft("go".into()));
-        assert_eq!(zone.model.unsent(Sent::Resend), Replied::Nothing);
+        let first = zone.model.sent_prompt("go", true);
+        assert_eq!(zone.model.not_sent(first, NotSent::Gone), Replied::SetDraft("go".into()));
+        assert_eq!(zone.model.not_sent(Sent::Resend, NotSent::Gone), Replied::Nothing);
         zone.model.server_note("the terminal server: no turn is running");
         assert_eq!(zone.model.refusal(), Some("the terminal server: no turn is running"));
         assert_eq!(zone.model.prompt_status(), PromptStatus::Ready, "nothing is in flight");
@@ -5312,6 +5668,7 @@ mod tests {
         assert_eq!((zone.model.life(), zone.model.link()), (SessionLife::Open, Link::Up));
         assert_eq!(zone.model.queue(), &QueueRow::None, "the old session's slot went with it");
         assert_eq!(texts(&zone.model), ["hi", "Hello!"], "shown until the new session's events");
+        zone.model.session_running();
 
         let mut fresh = AgentShared::new();
         fresh.start_over();
@@ -5638,7 +5995,7 @@ mod tests {
         let mut zone = paged(&server);
         let window = zone.shared.transcript().window().expect("800 KiB is paged");
         let count = window.earlier;
-        assert_eq!(*zone.model.earlier(), Earlier::Available { count });
+        assert_eq!(zone.model.earlier(), Earlier::Available { count });
         assert_eq!(zone.model.title(), "Long talk", "the page carries the title");
         assert_eq!(zone.model.blocks().first().map(|block| block.entry), Some(window.from));
 
@@ -5647,7 +6004,7 @@ mod tests {
         let fetch = zone.model.fetch_due(true, false).expect("a fetch while the row shows");
         assert_eq!(fetch, Fetch { before: window.from, max_bytes: PAGE_BYTES });
         zone.model.fetching(7);
-        assert!(matches!(zone.model.earlier(), Earlier::Loading { count: c, request: 7 } if *c == count));
+        assert_eq!(zone.model.earlier(), Earlier::Loading { count });
         assert_eq!(zone.model.fetch_due(true, true), None, "nothing more while it loads");
         assert!(conversation_line(&zone.model).ends_with(" earlier=loading"));
 
@@ -5664,7 +6021,7 @@ mod tests {
         assert!(zone.model.seen && zone.model.shown_status().is_none(), "the prepend unsaw the done");
         let left = zone.shared.transcript().window().map_or(0, |window| window.earlier);
         assert!(left < count);
-        assert_eq!(*zone.model.earlier(), if left == 0 { Earlier::None } else { Earlier::Available { count: left } });
+        assert_eq!(zone.model.earlier(), if left == 0 { Earlier::None } else { Earlier::Available { count: left } });
         let first = zone.model.blocks()[0].entry;
         assert!(zone.model.rendered.contains_key(&first) || matches!(zone.shared.transcript().entry(first), Some(Entry::User { .. })));
         let ids: Vec<EntryId> = zone.model.entries.iter().map(|(id, _)| *id).collect();
@@ -5678,7 +6035,7 @@ mod tests {
             answer_fetch(&mut zone, &server, fetch, request);
             request += 1;
         }
-        assert_eq!(*zone.model.earlier(), Earlier::None);
+        assert_eq!(zone.model.earlier(), Earlier::None);
         assert_eq!(zone.model.entries.len() as u64, 41);
         assert_eq!(zone.model.entries[0].0, EntryId(1));
         assert!(conversation_line(&zone.model).ends_with(" earlier=none"));
@@ -5717,7 +6074,7 @@ mod tests {
         zone.model.fetching(3);
         zone.model.replied(3, Err("the connection to the terminal server is down".into()));
         assert_eq!(
-            *zone.model.earlier(),
+            zone.model.earlier(),
             Earlier::Failed { count, why: "the connection to the terminal server is down".into() }
         );
         assert_eq!(
@@ -5746,14 +6103,14 @@ mod tests {
         zone.model.fetching(5);
         // A reconnect replays the newest page again.
         zone.replay(&server.page(PAGE_BYTES));
-        assert_eq!(*zone.model.earlier(), Earlier::Available { count });
+        assert_eq!(zone.model.earlier(), Earlier::Available { count });
         assert_eq!(zone.model.replied(5, Err("late".into())), Replied::Nothing);
-        assert_eq!(*zone.model.earlier(), Earlier::Available { count }, "the late reply changed nothing");
+        assert_eq!(zone.model.earlier(), Earlier::Available { count }, "the late reply changed nothing");
         assert_eq!(zone.model.refusal(), None);
         // A short log has no window, and nothing to fetch.
         let mut short = Zone::ready();
         short.feed(&[added(1, user("hi"))]);
-        assert_eq!(*short.model.earlier(), Earlier::None);
+        assert_eq!(short.model.earlier(), Earlier::None);
         assert_eq!(short.model.fetch_due(true, false), None);
     }
 
@@ -6173,7 +6530,9 @@ mod tests {
 
     /// A zone started to choose, for a launch's `launch`, in `~/src/app`.
     fn chooser(launch: Option<LaunchChoice>) -> Zone {
-        Zone { shared: AgentShared::new(), model: ChatModel::choosing("Fake", None, launch, "~/src/app") }
+        let mut zone = Zone { shared: AgentShared::new(), model: ChatModel::choosing("Fake", None, launch, "~/src/app") };
+        zone.model.session_running();
+        zone
     }
 
     fn page(ids: &[(&str, Option<&str>)]) -> Page {
@@ -6303,7 +6662,7 @@ mod tests {
         zone.feed(&[choosing(None)]);
         zone.model.sent(7, Sent::List(ListFor::Palette));
         let why = format!("session 3: {}", crate::remote::protocol::client::LIST_NOT_OFFERED);
-        let replied = zone.model.replied(7, Err(why));
+        let replied = zone.model.replied(7, Err(ReplyError::Failed(why)));
         let words = crate::remote::protocol::client::LIST_NOT_OFFERED;
         assert_eq!(replied, Replied::Listed(ListDone::Palette(Err(words.into()))));
         // Marked: New conversation alone.
@@ -6328,5 +6687,302 @@ mod tests {
         assert!(zone.model.can_choose());
         assert!(!Zone::ready().model.can_choose(), "a ready agent doesn't choose");
         assert!(Zone::ready().model.can_list());
+    }
+
+    // --- OpenSpec change `agents-client-state-fixes` ---------------------
+
+    /// D-4: a prompt whose answer was lost with the link, found in the
+    /// reconnect's replay, was taken: no refusal, and the input empties.
+    #[test]
+    fn a_prompt_lost_with_the_link_and_found_in_the_replay_clears_its_draft() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("hi")), added(2, agent("Hello!"))]);
+        zone.model.sent(7, zone.model.sent_prompt("next", false));
+        let replied = zone.model.replied(7, Err(ReplyError::Unanswered("the terminal server went away (the relay ended)".into())));
+        assert_eq!((replied, zone.model.refusal()), (Replied::Nothing, None), "not refused yet");
+        zone.model.set_link(Link::Reconnecting);
+        zone.model.set_link(Link::Up);
+        let absorbed = zone.replay(&[ready(), added(1, user("hi")), added(2, agent("Hello!")), added(3, user("next"))]);
+        assert_eq!(zone.model.refusal(), None);
+        assert_eq!(absorbed.replied, Some(Replied::ClearDraft));
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Ready, "settled");
+    }
+
+    /// D-6: a new conversation in the zone forgets the old rows' and
+    /// thoughts' toggles: the new log's entries at the same ids are drawn
+    /// as the policy says.
+    #[test]
+    fn a_new_conversation_forgets_the_old_rows_and_thoughts() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("go")), turn(TurnState::Working), added(2, thought("hmm"))]);
+        assert!(zone.model.thought_open(EntryId(2)), "the streaming thought opens on its own");
+        zone.model.toggle_thought(EntryId(2));
+        assert!(!zone.model.thought_open(EntryId(2)), "closed by hand");
+        zone.feed(&[added(3, in_progress("c1", vec![diff_item("/p/a.rs")])), tool_completed(3)]);
+        zone.feed(&[turn(TurnState::Ended { stop: StopReason::EndTurn })]);
+        assert_eq!(row(&zone.model, 3).0, RowState::Closed, "finished: closed by policy");
+        zone.model.toggle_tool(EntryId(3));
+        assert_eq!(row(&zone.model, 3).0, RowState::Open, "opened by hand");
+
+        zone.model.respawning();
+        zone.shared = AgentShared::new();
+        zone.shared.start_over();
+        zone.feed(&[ready(), added(1, user("again")), turn(TurnState::Working), added(2, thought("thinking"))]);
+        assert!(zone.model.thought_open(EntryId(2)), "the new streaming thought is open");
+        zone.feed(&[added(3, in_progress("c9", vec![diff_item("/p/b.rs")])), tool_completed(3)]);
+        assert_eq!(row(&zone.model, 3).0, RowState::Closed, "the new call is closed by policy");
+        assert_drawn_afresh(&zone.model);
+    }
+
+    /// D-7: a respawn that doesn't start leaves no fetch loading.
+    #[test]
+    fn a_respawn_that_doesnt_start_leaves_no_fetch_loading() {
+        let server = long_log(40);
+        let mut zone = paged(&server);
+        zone.model.fetching(5);
+        assert!(matches!(zone.model.earlier(), Earlier::Loading { .. }));
+        zone.model.respawning();
+        zone.model.not_started(StartFailure::NoServer("no helper".into()));
+        assert!(!matches!(zone.model.earlier(), Earlier::Loading { .. }), "{:?}", zone.model.earlier());
+    }
+
+    /// D-10: in one batch of changes, a replay of an idle ready agent, then
+    /// a live permission: its notice is raised.
+    #[test]
+    fn a_live_permission_after_a_replay_raises_its_notice() {
+        let mut zone = Zone::ready();
+        zone.model.set_link(Link::Reconnecting);
+        zone.shared.replay_start();
+        let replayed = [ready(), added(1, user("go")), added(2, agent("done")), turn(TurnState::Ended { stop: StopReason::EndTurn })];
+        zone.shared.apply(&replayed.iter().map(Event::to_value).collect::<Vec<_>>()).unwrap();
+        zone.shared.replay_end();
+        let live = [added(3, user("more")), turn(TurnState::Working), added(4, permission("Run ls")), turn(TurnState::Blocked)];
+        zone.shared.apply(&live.iter().map(Event::to_value).collect::<Vec<_>>()).unwrap();
+        zone.model.set_link(Link::Up);
+        let absorbed = zone.absorb();
+        assert_eq!(absorbed.status, Some(Some(State::Blocked)));
+        assert!(absorbed.notice.is_some(), "the live permission is announced");
+    }
+
+    /// D-10: a first prompt, a replay showing the agent starting, then a
+    /// live `Ready` in the same batch: the prompt is sent.
+    #[test]
+    fn a_live_ready_after_a_replay_sends_the_first_prompt() {
+        let mut zone = Zone::new(Some("run the tests"));
+        zone.shared.replay_start();
+        zone.shared.apply(&[agent_state(AgentState::Starting).to_value()]).unwrap();
+        zone.shared.replay_end();
+        zone.shared.apply(&[ready().to_value()]).unwrap();
+        assert_eq!(zone.absorb().first, Some(First::Send("run the tests".into())));
+    }
+
+    // Section 3: the session handle (decisions 1 and 2).
+
+    /// D-1: the agent is ready before the session's thread hands over the
+    /// session; the first prompt goes only once it runs.
+    #[test]
+    fn a_first_prompt_waits_for_the_session_to_run() {
+        let mut zone = Zone::starting(Some("run the tests"));
+        assert_eq!(zone.feed(&[ready()]).first, None, "the session isn't running yet");
+        assert_eq!(zone.model.first_shown(), None);
+        assert_eq!(zone.model.session_running().first, Some(First::Send("run the tests".into())));
+        assert_eq!(zone.feed(&[ready()]).first, None, "once");
+    }
+
+    #[test]
+    fn the_input_says_connecting_until_the_session_runs() {
+        let mut zone = Zone::starting(None);
+        zone.feed(&[ready()]);
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::Connecting));
+        assert_eq!(zone.model.submit("hi", false), Submit::Nothing(Why::NotReady(DisabledWhy::Connecting)));
+        assert!(!zone.model.can_choose());
+        zone.model.session_running();
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Ready);
+        assert_eq!(zone.model.submit("hi", false), Submit::Send("hi".into()));
+        zone.model.respawning();
+        zone.feed(&[ready()]);
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::Connecting), "a respawn starts again");
+    }
+
+    /// A launch's `-c` list waits for the running session too.
+    #[test]
+    fn a_launchs_list_waits_for_the_session_to_run() {
+        let mut last =
+            Zone { shared: AgentShared::new(), model: ChatModel::choosing("Fake", None, Some(LaunchChoice::Last), "~/src/app") };
+        assert_eq!(last.feed(&[choosing(None)]).choosing, None, "not before the session runs");
+        assert_eq!(last.model.session_running().choosing, Some(OnChoosing::ListLatest));
+        assert_eq!(last.feed(&[choosing(None)]).choosing, None, "once");
+    }
+
+    /// Decision 1's table, one row per cell.
+    #[test]
+    fn each_request_that_isnt_sent_does_what_its_case_says() {
+        // Starting: nothing is refused.
+        let mut zone = Zone::starting(Some("go"));
+        let prompt = zone.model.sent_prompt("hi", false);
+        assert_eq!(zone.model.not_sent(prompt, NotSent::Starting), Replied::Nothing);
+        assert_eq!(zone.model.refusal(), None);
+        zone.feed(&[ready()]);
+        zone.model.session_running();
+        let first = zone.model.sent_prompt("go", true);
+        assert_eq!(zone.model.not_sent(first, NotSent::Starting), Replied::Nothing, "it waits again");
+        assert_eq!(zone.model.refusal(), None);
+        assert_eq!(zone.feed(&[ready()]).first, Some(First::Send("go".into())), "and goes on the next change");
+        assert_eq!(
+            zone.model.not_sent(Sent::List(ListFor::Palette), NotSent::Starting),
+            Replied::Listed(ListDone::Palette(Err(STARTING.into())))
+        );
+        for sent in [Sent::Resend, Sent::Unqueue, Sent::Answer(EntryId(1)), Sent::Login, Sent::Choose, Sent::SetOption { name: "Model".into() }] {
+            assert_eq!(zone.model.not_sent(sent.clone(), NotSent::Starting), Replied::Nothing, "{sent:?}");
+            assert_eq!(zone.model.refusal(), None, "{sent:?}");
+        }
+        let mut last =
+            Zone { shared: AgentShared::new(), model: ChatModel::choosing("Fake", None, Some(LaunchChoice::Last), "~/src/app") };
+        last.model.session_running();
+        assert_eq!(last.feed(&[choosing(None)]).choosing, Some(OnChoosing::ListLatest));
+        assert_eq!(last.model.not_sent(Sent::List(ListFor::Latest), NotSent::Starting), Replied::Nothing);
+        assert_eq!(last.feed(&[choosing(None)]).choosing, Some(OnChoosing::ListLatest), "asked again");
+        let server = long_log(40);
+        let mut paged_zone = paged(&server);
+        let before = paged_zone.model.earlier();
+        assert_eq!(paged_zone.model.not_sent(Sent::Fetch, NotSent::Starting), Replied::Nothing);
+        assert_eq!(paged_zone.model.earlier(), before, "a fetch waits for the row");
+
+        // Gone: refused with UNSENT, a first prompt becoming the draft.
+        let mut gone = Zone::ready();
+        let first = gone.model.sent_prompt("go", true);
+        assert_eq!(gone.model.not_sent(first, NotSent::Gone), Replied::SetDraft("go".into()));
+        assert_eq!(gone.model.refusal(), Some(UNSENT));
+        let Earlier::Available { count } = before else { panic!("{before:?}") };
+        paged_zone.model.not_sent(Sent::Fetch, NotSent::Gone);
+        assert_eq!(paged_zone.model.earlier(), Earlier::Failed { count, why: UNSENT.into() });
+
+        // LinkDown: a fetch fails with it, and the rest are refused with it.
+        let mut down = paged(&server);
+        down.model.not_sent(Sent::Fetch, NotSent::LinkDown);
+        assert_eq!(down.model.earlier(), Earlier::Failed { count, why: LINK_DOWN.into() });
+        let prompt = down.model.sent_prompt("hi", false);
+        assert_eq!(down.model.not_sent(prompt, NotSent::LinkDown), Replied::Nothing);
+        assert_eq!(down.model.refusal(), Some(LINK_DOWN));
+    }
+
+    // Section 3: a prompt whose answer was lost (decision 5).
+
+    /// Sends prompt `text` from `zone` and loses its answer with the link,
+    /// which then comes back.
+    fn lose_prompt(zone: &mut Zone, text: &str, first: bool) {
+        zone.model.sent(7, zone.model.sent_prompt(text, first));
+        let replied = zone.model.replied(7, Err(ReplyError::Unanswered("the terminal server went away".into())));
+        assert_eq!((replied, zone.model.refusal()), (Replied::Nothing, None), "not refused yet");
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Submitted, "still in flight");
+        zone.model.set_link(Link::Reconnecting);
+        zone.model.set_link(Link::Up);
+    }
+
+    #[test]
+    fn a_prompt_lost_with_the_link_and_queued_in_the_slot_clears_its_draft() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("hi")), turn(TurnState::Working)]);
+        lose_prompt(&mut zone, "next", false);
+        let absorbed = zone.replay(&[ready(), added(1, user("hi")), turn(TurnState::Working), queue(Slot::Waiting { text: "next".into() })]);
+        assert_eq!((absorbed.replied, zone.model.refusal()), (Some(Replied::ClearDraft), None));
+    }
+
+    #[test]
+    fn a_prompt_lost_with_the_link_and_missing_from_the_replay_is_refused_then() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("hi")), added(2, agent("Hello!"))]);
+        lose_prompt(&mut zone, "next", false);
+        let absorbed = zone.replay(&[ready(), added(1, user("hi")), added(2, agent("Hello!"))]);
+        assert_eq!((absorbed.replied, zone.model.refusal()), (Some(Replied::Nothing), Some(PROMPT_NOT_TAKEN)));
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Ready, "settled");
+        assert_eq!(zone.feed(&[added(3, agent("more"))]).replied, None, "once");
+    }
+
+    /// The user's entry, wherever it went, would be before the replayed
+    /// page: the zone can't tell.
+    #[test]
+    fn a_prompt_lost_with_the_link_past_the_replayed_page_may_have_been_sent() {
+        let mut server = long_log(40);
+        let mut zone = paged(&server);
+        lose_prompt(&mut zone, "next", false);
+        for id in 42..=81 {
+            server.apply(&added(id, agent(&format!("**{id}** {}", "y".repeat(20 * 1024))))).unwrap();
+        }
+        let absorbed = zone.replay(&server.page(PAGE_BYTES));
+        assert!(zone.shared.transcript().window().is_some_and(|window| window.from.0 > 42));
+        assert_eq!((absorbed.replied, zone.model.refusal()), (Some(Replied::Nothing), Some(PROMPT_MAYBE_TAKEN)));
+    }
+
+    /// The reducer cleans a prompt's text before logging it; the search
+    /// matches the cleaned text.
+    #[test]
+    fn a_cleaned_prompt_is_found_in_the_replay() {
+        let mut zone = Zone::ready();
+        lose_prompt(&mut zone, "ring \u{7} me", false);
+        let absorbed = zone.replay(&[ready(), added(1, user(&crate::agent::transcript::clean("ring \u{7} me")))]);
+        assert_eq!((absorbed.replied, zone.model.refusal()), (Some(Replied::ClearDraft), None));
+    }
+
+    #[test]
+    fn a_first_prompt_lost_with_the_link_becomes_the_draft_only_when_not_taken() {
+        let mut taken = Zone::new(Some("go"));
+        assert_eq!(taken.feed(&[ready()]).first, Some(First::Send("go".into())));
+        lose_prompt(&mut taken, "go", true);
+        let absorbed = taken.replay(&[ready(), added(1, user("go"))]);
+        assert_eq!((absorbed.replied, taken.model.refusal()), (Some(Replied::Nothing), None));
+
+        let mut lost = Zone::new(Some("go"));
+        lost.feed(&[ready()]);
+        lose_prompt(&mut lost, "go", true);
+        let absorbed = lost.replay(&[ready()]);
+        assert_eq!((absorbed.replied, lost.model.refusal()), (Some(Replied::SetDraft("go".into())), Some(PROMPT_NOT_TAKEN)));
+
+        // Nothing will replay: the zone can't tell, and the text is kept.
+        let mut ended = Zone::new(Some("go"));
+        ended.feed(&[ready()]);
+        lose_prompt(&mut ended, "go", true);
+        let absorbed = ended.model.lost("the holder went away");
+        assert_eq!((absorbed.replied, ended.model.refusal()), (Some(Replied::SetDraft("go".into())), Some(PROMPT_MAYBE_TAKEN)));
+    }
+
+    #[test]
+    fn a_failed_reply_is_still_a_refusal_at_once() {
+        let mut zone = Zone::ready();
+        zone.model.sent(7, zone.model.sent_prompt("next", false));
+        assert_eq!(zone.model.replied(7, Err(ReplyError::Failed("the agent isn't ready".into()))), Replied::Nothing);
+        assert_eq!(zone.model.refusal(), Some("the agent isn't ready"));
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Ready, "nothing waits");
+        assert_eq!(zone.replay(&[ready()]).replied, None);
+        zone.model.sent(8, zone.model.sent_prompt("go", true));
+        assert_eq!(zone.model.replied(8, Err(ReplyError::Failed("no".into()))), Replied::SetDraft("go".into()));
+    }
+
+    // Section 3: a choice (decision 10).
+
+    #[test]
+    fn a_choice_that_cant_go_says_why() {
+        let mut ready = Zone::ready();
+        assert_eq!(ready.model.choose(), Choose::Refused, "not choosing");
+
+        let mut zone = chooser(None);
+        zone.feed(&[choosing(None)]);
+        zone.model.set_link(Link::Reconnecting);
+        assert_eq!(zone.model.choose(), Choose::Refused);
+        assert_eq!(zone.model.choosing_reason(), CHOICE_LINK_DOWN);
+        zone.model.set_link(Link::Up);
+        assert_eq!(zone.model.choose(), Choose::Send);
+        assert_eq!(zone.model.choosing_reason(), CHOOSING, "the reason goes");
+        zone.model.chose(9);
+        assert_eq!(zone.model.choose(), Choose::Refused);
+        assert_eq!(zone.model.choosing_reason(), CHOICE_PENDING);
+
+        let mut starting =
+            Zone { shared: AgentShared::new(), model: ChatModel::choosing("Fake", None, None, "~/src/app") };
+        starting.feed(&[choosing(None)]);
+        assert_eq!(starting.model.choose(), Choose::Refused);
+        assert_eq!(starting.model.choosing_reason(), STARTING);
+        starting.model.session_running();
+        assert_eq!(starting.model.choose(), Choose::Send);
     }
 }

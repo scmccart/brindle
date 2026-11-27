@@ -335,3 +335,46 @@ None: no wire, config or state change, and no server change beyond moving `clean
 
 1. **Should `sh -c`, `bash -c` (including Windows' `bash.exe`, which is WSL) and similar `-c` shells withhold terminal logins too?** Appended arguments become `$0`, `$1`, … of the script, so `--login` is dropped unless the script forwards `"$@"`. The login would run the agent as a plain start. Recommendation: withhold them in a follow-up row of the same table ("the login can't be run through `sh -c`"), once a real profile of that shape is seen, since C5 named only `pwsh`, `powershell` and `wsl`.
 2. **Should `SessionRunning` go through `Connection::deliver`'s `catch_unwind`, like the reader's calls?** Recommendation: no. It would need the connection in `run` after the start, the sink's `running` only queues, and `failed` sets the precedent.
+
+## Re-read on main (2026-11-27)
+
+Task 1.1, at `b6a0316` (after `agents-commands`, PR #151). Every site the decisions cite is where they say, give or take the line numbers below; none changed meaning.
+
+- `src/agent/model.rs`: `Sent` ~871, `Earlier` ~986, `fetching` ~1650, `fetched` ~1673, `absorb` ~1735, `respawning` ~2277, `settle_first` ~2347, `prompt_status` ~2560, `can_send` ~2903. `agents-commands` added `Sent::SetOption` and its arms in `answered` and `unsent` (a set that can't go is said beside the input; the server's refusal of one goes to the notice line). `not_sent` keeps both.
+- `src/remote/local/connection.rs`: `Waiting` 406, `LINK_DOWN` 451, `State::link_lost` 919, the `Spawned` arm 1789, the `ReplayStart` arm 1856, `Running::agent_request` 3041, `Running::fetch` 3091.
+- `src/remote/local/session.rs`: `Session::running` ~334, `run` 452.
+- `remote-agent/src/acp/reduce.rs`: `clean` 3518 (moved by task 2.1).
+
+## As built (sections 1–3, 2026-11-27)
+
+- **Commits:** `3b5c79c` (2.1, `clean` in `brindle-transcript`), `510e321` (1.2, the fault switch), `12d9720` (1.9 and 3.9, `reparses`), then the model commit (1.5–1.7 and 3.1–3.8).
+- **1.3:** both cases ran 20 times each on a build of `main` plus the switch (SLOW=1): 20 of 20 failed, every dump showing `refusal="the agent session isn't connected; nothing was sent"`. The first case's wait for `agent "Hello!"` was still pending; the attached case's wait for `user "hi"` gave up. The cases aren't committed: they stay red until section 4, so they are kept as a patch for it (flag 7).
+- **1.4 and 1.8:** each test was run on `main` and failed as expected. 1.4: `a_lost_link_fails_queued_fetches_and_carries_other_queued_requests` left `[(1,"agent",Queued),(2,"agent",Queued)]` where `[(2,"agent",Queued)]` was expected. 1.8: `a_choice_while_reconnecting_says_why` showed the reason "choose a conversation, or start a new one". Both are shell fixes (section 4), so they are kept as patches too.
+- **1.5–1.7 and 1.9:** each test failed on `main` and passes with the model or `reparses` change it shows. So every finding of D-4, D-6, D-7, D-10 and D-12 is shown, and none is dropped.
+- **1.10:** the baseline loop of `agent-queue` and `agent-continue-profile-gone` on `main` (SLOW=2, under `scripts/with-xvfb` in a `systemd-run --user --scope`), scaled to one sequential loop of 50 (flag 9). The count is in the implementation report, read from `/var/tmp/bp/loops/baseline-flake/summary.txt`.
+
+## Decided while implementing (flags)
+
+1. **A bridge for `SessionHandle`.** The model's session starts `Starting`, but nothing raises `SessionRunning` until task 4.3. Until then `Agent::from_parts` calls `model.session_running()` right after building the model, and `renew` calls it after `respawning()`, which keeps `main`'s behaviour. Section 4 removes both calls once the session's thread raises the event.
+2. **Bridges for `ReplyError` and `NotSent`.** `AgentEvent::Reply` still carries `Result<(), String>`, and the entity maps it to `ReplyError::Failed` (task 4.4 tells `Unanswered` apart). `Requests` still returns `Option`, and `None` becomes `not_sent(sent, NotSent::Gone)`, the old `unsent` (task 4.5).
+3. **`replay_start` sets `status_from = Replay`, not `Unchanged`.** That way a replay that brings no `Turn` or `Agent` event still counts as from a replay, as `from_replay` did, and raises nothing. Any status event folded later in the batch overwrites it.
+4. **`Uncertain` has no `why`.** The refusal text is decided when the replay settles it (`PROMPT_NOT_TAKEN` or `PROMPT_MAYBE_TAKEN`), so the lost reply's own text isn't needed.
+5. **`Choose::Refused` carries no text.** `choose()` sets `choosing.note` itself and the screen shows it as the reason. `choosing_reason` still prefers the agent's own `Choosing { message }`, so with an agent message the refusal reason isn't shown. Section 4 or 5 may want the note first.
+6. **The e2e delay is 3 s scaled, not 1.5 s,** and the attached case runs at `step_interval(0.25)`, so its steps (ready, type, enter) fall inside the delay on a loaded machine.
+7. **Red tests are kept as patches, not committed** (the brief forbids red tests and `#[ignore]`). They are in `~/.cache/claude-tasks/brindle/agents-client-state-fixes/`: `section4-failing-1.3-e2e-cases.patch` (both e2e cases and their registration), `section4-failing-1.4-connection.patch` and `section4-failing-1.8-entity.patch`.
+8. **The `reparses` rules:**
+   - `pwsh` scans only the arguments before a `-File`, and is withheld when one of them names `-Command` (any prefix from `-c`) or `-EncodedCommand` (`-e`, `-ec`, or any prefix of 2+ letters). `-CommandWithArgs`/`-cwa` passes through.
+   - `powershell` is withheld unless an argument names `-File` (`-f` or a prefix of 2+ letters).
+   - `wsl` is withheld unless an argument is exactly `-e` or `--exec` (the latter in any case).
+   - Switches are read with `-`, `--` or `/` and in any case.
+9. **1.10 is one sequential loop of 50, not 4 parallel loops of 100.** The e2e artifact root is compiled in (`CARGO_TARGET_TMPDIR/e2e/<case>`), so parallel loops of the same case collide.
+10. **`LINK_DOWN` is `pub` in `model.rs`,** and `connection.rs` imports it.
+11. **The tests' fake requests share their id counter with the fixture** (`test_support::Zone::last_request`). Without it the view's paging test couldn't read the fetch's id, since `Earlier::Loading` lost `request`.
+12. **What section 4 wires is marked `#[cfg_attr(not(test), expect(dead_code, …))]`:** `CHOICE_LINK_DOWN`, `CHOICE_PENDING`, `NOT_CHOOSING`, `NotSent::Starting`, `NotSent::LinkDown`, `ReplyError::Unanswered`, `Choose` and `ChatModel::choose`. Each attribute names the task that uses it, and `expect` fails the build once the item is used, which forces its removal.
+13. **`not_sent(_, Starting)` refuses nothing.**
+    - A prompt and the queue's, a permission's, a login's, a choice's or an option's request return `Nothing`. The input is disabled while `Starting`, so the shell shouldn't send them.
+    - A first prompt waits again (`FirstState::Waiting`).
+    - A launch's list is asked again once the session runs (`choosing.launch` restored).
+    - The palette's list is answered `Err(STARTING)`.
+    - A fetch leaves the paging as it was.
+14. **`respawning` also clears `auto_open`,** with `toggled` and `by_hand`, and draws the old conversation's thoughts again by policy, so that nothing of the old ids carries over (decision 9).

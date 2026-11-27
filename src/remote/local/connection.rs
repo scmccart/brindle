@@ -118,7 +118,7 @@ use super::link::{Link, Wire};
 use super::relay::{self, Dial, Timings};
 use super::{Connected, Endpoint, Refused};
 use crate::remote::budget::{Delivery, InputBudget, Offer};
-use crate::agent::model::agent_start;
+use crate::agent::model::{LINK_DOWN, agent_start};
 use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::remote::protocol::client::{
     self, AgentPermission, AgentPrompt, AgentRequest, AgentRestart, Data, Kill, KillTarget, Policy, Reparent, ReplayStart, Request,
@@ -446,9 +446,6 @@ impl Waiting {
         };
     }
 }
-
-/// What a fetch sent while the link is down is answered with.
-const LINK_DOWN: &str = "the connection to the terminal server is down";
 
 /// Tells `session`'s sink how its agent request `req` went, confining a
 /// panic to the call: it is only the request's bookkeeping, and the

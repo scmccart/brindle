@@ -61,7 +61,8 @@ use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
     Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Link, ListDone, ListFor,
-    LoginChoice, LoginZoneEnd, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
+    LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, ReplyError, Sent, Splice, Submit,
+    Unqueue, WorkingRow,
 };
 use crate::agent::commands::CompletionKey;
 use crate::agent::spawn::AgentSpawnRequest;
@@ -459,6 +460,9 @@ impl Agent {
     ) -> Self {
         let (shared, taker, events) = feed.split();
         let mut model = model;
+        // Until the session's thread raises `SessionRunning` (task 4.3), the
+        // zone takes its session as running from the start, as before.
+        model.session_running();
         if let Some(settings) = cx.try_global::<Settings>() {
             model.set_policy(ToolPolicy::of(&settings.config.agent));
         }
@@ -607,6 +611,9 @@ impl Agent {
         self._events = Self::drain(events, taker, cx);
         let absorbed = self.model.respawning();
         self.apply_absorbed(absorbed, cx);
+        // As `from_parts`, until `SessionRunning` comes (task 4.3).
+        let absorbed = self.model.session_running();
+        self.apply_absorbed(absorbed, cx);
         self.requests = match link {
             Ok(requests) => Some(requests),
             Err(unsupported) => {
@@ -749,7 +756,9 @@ impl Agent {
             AgentEvent::Failed(failure) => self.model.not_started(failure),
             AgentEvent::Broken(reason) => self.model.broken(reason),
             AgentEvent::Reply { request, outcome } => {
-                let replied = self.model.replied(request, outcome);
+                // Until the sink tells a lost answer apart (task 4.4),
+                // every failure is one the core refused.
+                let replied = self.model.replied(request, outcome.map_err(ReplyError::Failed));
                 self.apply_replied(replied, cx);
                 return;
             }
@@ -774,7 +783,11 @@ impl Agent {
     /// Hands what the model decided on: the view's splices, the status and
     /// title events, the first prompt's send.
     fn apply_absorbed(&mut self, absorbed: Absorbed, cx: &mut Context<Self>) {
-        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working, choosing } = absorbed;
+        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working, choosing, replied } =
+            absorbed;
+        if let Some(replied) = replied {
+            self.apply_replied(replied, cx);
+        }
         match choosing {
             Some(OnChoosing::ListLatest) => self.list(None, ListFor::Latest, cx),
             Some(OnChoosing::OpenList) => cx.emit(AgentAsk::Conversations),
@@ -794,13 +807,16 @@ impl Agent {
             cx.emit(TerminalEvent::TitleChanged);
         }
         match first {
-            Some(First::Send(text)) => match self.requests.as_ref().and_then(|requests| requests.prompt(&text)) {
-                Some(request) => self.model.sent(request, Sent::FirstPrompt(text)),
-                None => {
-                    let replied = self.model.unsent(Sent::FirstPrompt(text));
-                    self.apply_replied(replied, cx);
+            Some(First::Send(text)) => {
+                let sent = self.model.sent_prompt(text.clone(), true);
+                match self.requests.as_ref().and_then(|requests| requests.prompt(&text)) {
+                    Some(request) => self.model.sent(request, sent),
+                    None => {
+                        let replied = self.model.not_sent(sent, NotSent::Gone);
+                        self.apply_replied(replied, cx);
+                    }
                 }
-            },
+            }
             Some(First::Draft(text) | First::Show(text)) => cx.emit(AgentUpdate::SetDraft(text)),
             Some(First::SendIfUnchanged(text)) => cx.emit(AgentUpdate::SendFirstIfUnchanged(text)),
             None => {}
@@ -811,7 +827,8 @@ impl Agent {
     /// found its input still holding exactly `text`.
     pub fn send_first(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = text.to_string();
-        self.send(Sent::FirstPrompt(text.clone()), |requests| requests.prompt(&text), cx);
+        let sent = self.model.sent_prompt(text.clone(), true);
+        self.send(sent, |requests| requests.prompt(&text), cx);
     }
 
     /// The login row's method `method` was chosen: `AGENT_LOGIN` for an
@@ -876,7 +893,8 @@ impl Agent {
         match self.requests.as_deref().and_then(send) {
             Some(request) => self.model.sent(request, sent),
             None => {
-                let replied = self.model.unsent(sent);
+                // `Requests` can't say why yet (task 4.5): gone, as before.
+                let replied = self.model.not_sent(sent, NotSent::Gone);
                 self.apply_replied(replied, cx);
             }
         }
@@ -893,7 +911,10 @@ impl Agent {
     /// reason shown.
     pub fn prompt(&mut self, draft: &str, composing: bool, cx: &mut Context<Self>) {
         match self.model.submit(draft, composing) {
-            Submit::Send(text) => self.send(Sent::Prompt, |requests| requests.prompt(&text), cx),
+            Submit::Send(text) => {
+                let sent = self.model.sent_prompt(text.clone(), false);
+                self.send(sent, |requests| requests.prompt(&text), cx);
+            }
             Submit::Set { option, name, value } => {
                 cx.emit(AgentUpdate::ClearDraft);
                 self.set_option(&option, name, value, cx);
@@ -1026,7 +1047,9 @@ impl Agent {
         let max_bytes = u32::try_from(fetch.max_bytes).unwrap_or(u32::MAX);
         match self.requests.as_ref().and_then(|requests| requests.fetch(fetch.before.0, max_bytes)) {
             Some(request) => self.model.fetching(request),
-            None => self.model.fetch_unsent(),
+            None => {
+                self.model.not_sent(Sent::Fetch, NotSent::Gone);
+            }
         }
         cx.notify();
     }

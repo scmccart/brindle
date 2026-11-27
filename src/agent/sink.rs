@@ -376,7 +376,7 @@ mod tests {
             ]
         );
         let changes = feed.shared.lock().take_changes();
-        assert!(changes.reset && changes.from_replay, "{changes:?}");
+        assert!(changes.reset && changes.status_from == crate::agent::shared::StatusFrom::Replay, "{changes:?}");
         let texts: Vec<String> = feed
             .shared
             .lock()
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(taken(&mut feed), [AgentEvent::Changed]);
         assert_eq!(texts(&feed), ["1:one", "2:two", "3:three", "4:four"]);
         let changes = feed.shared.lock().take_changes();
-        assert_eq!((changes.prepended, changes.from_replay), (Some(2), true));
+        assert_eq!((changes.prepended, changes.status_from), (Some(2), crate::agent::shared::StatusFrom::Unchanged));
         assert!(feed.shared.lock().transcript().window().is_none());
     }
 
