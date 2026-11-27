@@ -150,6 +150,9 @@ pub const RESUME_AND_LOAD: &str = r#"{"loadSession":true,"sessionCapabilities":{
 pub const LOAD_ONLY: &str = r#"{"loadSession":true}"#;
 pub const RESUME_ONLY: &str = r#"{"sessionCapabilities":{"resume":{}}}"#;
 pub const NEITHER: &str = r#"{}"#;
+/// Both ways to continue, and a list of conversations (OpenSpec change
+/// `agents-session-list`).
+pub const LISTS: &str = r#"{"loadSession":true,"sessionCapabilities":{"resume":{},"list":{}}}"#;
 
 /// A script whose agent answers `initialize` as `fake` 1.0 offering
 /// `capabilities` (one of [`RESUME_AND_LOAD`] and the others), its record

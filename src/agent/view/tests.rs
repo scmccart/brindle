@@ -537,7 +537,7 @@ fn the_prompt_state_follows_the_model() {
     use crate::agent::model::DisabledWhy;
     let model = ChatModel::new("Fake", None);
     let state = prompt_state(&model, &Offer::None(NoOffer::NotEnded));
-    assert_eq!((state.status, state.queued, state.action), (UiStatus::Disabled, None, None));
+    assert_eq!((state.status, state.queued.clone(), state.action()), (UiStatus::Disabled, None, None));
     assert_eq!(state.reason.as_ref().map(SharedString::as_ref), Some(DisabledWhy::Connecting.text()));
     assert_eq!(bubble_part(0, true), BubblePart::Whole);
     assert_eq!(bubble_part(0, false), BubblePart::First);
@@ -592,19 +592,21 @@ fn the_reason_line_follows_the_offer() {
     let shown = |f: &mut Fixture, offer: Offer| f.zone.agent.read_with(f.cx, |agent, _| prompt_state(agent.model(), &offer));
     let state = shown(&mut f, Offer::Restart);
     assert_eq!(state.status, UiStatus::Disabled);
-    assert_eq!((text(&state).as_deref(), state.action), (Some(DisabledWhy::Exited.text()), Some(CONTINUE.into())));
-    for (why, says) in [
-        (NoOffer::NotOffered, "the agent can't continue conversations"),
-        (NoOffer::NoConversation, "the agent never started a conversation"),
-        (NoOffer::ProfileGone { name: "Fake".into() }, "the profile Fake is gone"),
+    assert_eq!((text(&state).as_deref(), state.action()), (Some(DisabledWhy::Exited.text()), Some(CONTINUE.into())));
+    let all = [ZoneChoice::Continue, ZoneChoice::Conversations, ZoneChoice::New];
+    assert_eq!(state.actions, all);
+    for (why, says, actions) in [
+        (NoOffer::NotOffered, "the agent can't continue conversations", &all[1..]),
+        (NoOffer::NoConversation, "the agent never started a conversation", &all[1..]),
+        (NoOffer::ProfileGone { name: "Fake".into() }, "the profile Fake is gone", &[][..]),
     ] {
         let state = shown(&mut f, Offer::None(why));
-        assert_eq!((text(&state).as_deref(), state.action), (Some(says), None));
+        assert_eq!((text(&state).as_deref(), state.actions.as_slice()), (Some(says), actions));
     }
     let mut g = Fixture::new();
     g.feed(&[ready()]);
     let state = shown(&mut g, Offer::None(NoOffer::NotEnded));
-    assert_eq!((state.reason, state.action), (None, None));
+    assert_eq!((state.reason.clone(), state.action()), (None, None));
     let mut h = Fixture::new();
     h.zone.sink.failed(&anyhow::Error::new(StartFailure::NoServer("no helper".into())));
     h.settle();
@@ -645,9 +647,11 @@ fn the_continue_button_and_agent_continue_restart_the_agent() {
 #[test]
 fn no_continue_button_when_it_isnt_offered() {
     let mut f = ended_view(Continuation::Neither, Some(FAKE_PROFILE));
-    assert_eq!(action(&mut f), None);
+    // Conversations… and New conversation stay (`agents-session-list`).
+    assert_eq!(action(&mut f).as_deref(), Some("Conversations…"));
     assert_eq!(reason_text(&mut f).as_deref(), Some("the agent can't continue conversations"));
-    assert_eq!(f.tabs(1), [f.prompt_handle()], "Tab finds no other stop");
+    let stops = f.view.read_with(f.cx, |view, cx| view.prompt.read(cx).action_stops());
+    assert_eq!(f.tabs(1), [stops[0].clone()], "Tab finds Conversations…, not a continue");
     f.cx.dispatch_action(AgentContinue);
     assert!(f.calls().is_empty());
 

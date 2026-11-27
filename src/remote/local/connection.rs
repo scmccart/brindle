@@ -242,6 +242,17 @@ pub trait SessionSink: Send {
         log::debug!("terminal server: a page of {} events for a terminal dropped", events.len());
         Ok(())
     }
+    /// `AGENT_CONVERSATIONS` answering the agent request `request` (an
+    /// `AGENT_LIST`, OpenSpec change `agents-session-list`): a page of the
+    /// agent's conversations, and the cursor for the next. A terminal's sink
+    /// never gets one.
+    fn conversations(&mut self, _request: RequestId, listed: client::AgentConversations) {
+        log::debug!(
+            "terminal server: {} listed conversations for session {} dropped",
+            listed.conversations.len(),
+            listed.session
+        );
+    }
     /// The link to the core went down; the session stays shown, and a
     /// reconnect's replay of it (or its loss) follows.
     fn link_down(&mut self) {}
@@ -1465,10 +1476,19 @@ impl Connection {
         abandon: Option<&Abandon>,
     ) -> Result<Running> {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let AgentSpawnRequest { command, args, cwd, env, profile, conversation } = request;
+        let AgentSpawnRequest { command, args, cwd, env, profile, conversation, start } = request;
         let started = self.ask("start the agent session", abandon, None, |req, reply| {
-            let spawn =
-                SpawnAgent { req, command, args, cwd, env, policy: Policy::Detach, profile: Some(profile), conversation };
+            let spawn = SpawnAgent {
+                req,
+                command,
+                args,
+                cwd,
+                env,
+                policy: Policy::Detach,
+                profile: Some(profile),
+                conversation,
+                start,
+            };
             (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;
         let Started { session, pid, key } = started;
@@ -1949,6 +1969,30 @@ impl Connection {
             // An `AGENT_FETCH`'s answer: its frames go to the session's
             // sink while the fetch still waits, and the last ends the wait
             // with its `OK`, after the sink folded the page.
+            ToClient::AgentConversations(listed) => {
+                let (req, session) = (listed.req, listed.session);
+                let waiting = {
+                    let mut state = self.state.lock();
+                    match state.requests.get(&req).map(|pending| &pending.waiting) {
+                        Some(Waiting::Agent { session: asked, .. }) if *asked == session => {
+                            state.requests.remove(&req).map(|pending| pending.waiting)
+                        }
+                        Some(
+                            Waiting::Agent { .. }
+                            | Waiting::Spawn { .. }
+                            | Waiting::Attach { .. }
+                            | Waiting::List(_)
+                            | Waiting::Done(_),
+                        )
+                        | None => None,
+                    }
+                };
+                let Some(Waiting::Agent { sink, .. }) = waiting else {
+                    log::debug!("terminal server: conversations for session {session} answering no list, dropped");
+                    return;
+                };
+                self.deliver(session, &sink, |sink| sink.conversations(req, listed));
+            }
             ToClient::AgentPage(client::AgentPage { req, session, events, last }) => {
                 let waiting = {
                     let state = self.state.lock();
@@ -2392,7 +2436,9 @@ impl Connection {
             | ToCore::AgentResend(AgentRequest { req, .. })
             | ToCore::AgentRestart(AgentRestart { req, .. })
             | ToCore::AgentLogin(client::AgentLogin { req, .. })
-            | ToCore::AgentFetch(client::AgentFetch { req, .. }) => Some(*req),
+            | ToCore::AgentFetch(client::AgentFetch { req, .. })
+            | ToCore::AgentList(client::AgentList { req, .. })
+            | ToCore::AgentChoose(client::AgentChoose { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2734,6 +2780,8 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentRestart(_)
         | ToCore::AgentLogin(_)
         | ToCore::AgentFetch(_)
+        | ToCore::AgentList(_)
+        | ToCore::AgentChoose(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -3061,6 +3109,25 @@ impl Running {
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentPermission(AgentPermission { req, session, entry, option }))
+    }
+
+    /// Asks the agent for a page of its conversations in the session's
+    /// directory after `cursor` (`AGENT_LIST`, OpenSpec change
+    /// `agents-session-list`): the page comes to the session's sink
+    /// ([`SessionSink::conversations`]) in place of an `OK`; a refusal, or
+    /// the link's failure, as its reply.
+    pub fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentList(client::AgentList { req, session, cursor }))
+    }
+
+    /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues the
+    /// conversation `conversation`, or starts a new one with `None`. `OK`
+    /// once the agent was asked, then the start's states as transcript
+    /// events.
+    pub fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentChoose(client::AgentChoose { req, session, conversation }))
     }
 
     /// Cancels the running turn (`AGENT_CANCEL`, which has no answer; a
@@ -3661,6 +3728,7 @@ mod tests {
             policy: Policy::Detach,
             profile: None,
             conversation: None,
+            start: None,
         });
         let restart =
             ToCore::AgentRestart(AgentRestart { req: 6, session: 9, command: "agy".into(), args: Vec::new(), env: own.clone() });

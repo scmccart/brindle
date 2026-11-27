@@ -18,6 +18,7 @@ use gpui::SharedString;
 
 use crate::FirstPrompt;
 use crate::agent::close::AgentBusy;
+use crate::agent::conversations::{Latest, Page, ZoneRun, latest_plan};
 use crate::agent::login::{self, AgentCommand, MethodOffer, TerminalLogin};
 use crate::agent::markdown::{self, Part};
 use crate::agent::shared::{Changes, Dirty};
@@ -491,6 +492,17 @@ fn hold_word(reason: &HoldReason) -> String {
 const EXITED: &str = "the agent has exited";
 const NEEDS_LOGIN: &str = "the agent needs a login";
 const LOGGING_IN: &str = "the agent is logging in";
+/// A choosing agent's reason line (`agents-session-list` decision 6).
+const CHOOSING: &str = "choose a conversation, or start a new one";
+
+/// A core refusal's words without the `session N: ` it starts with, for a
+/// list's failure, which the palette shows in place of rows.
+fn without_session(why: &str) -> &str {
+    why.strip_prefix("session ")
+        .and_then(|rest| rest.split_once(": "))
+        .filter(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+        .map_or(why, |(_, words)| words)
+}
 
 /// Whether a held prompt can be sent again, for the phase and the
 /// session's life: only to a ready agent whose session is open.
@@ -500,6 +512,7 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
         SessionLife::Open => match phase {
             AgentPhase::Live(AgentState::Ready { .. }) => return Resend::Available,
             AgentPhase::Live(AgentState::Starting) => "the agent is starting",
+            AgentPhase::Live(AgentState::Choosing { .. }) => CHOOSING,
             AgentPhase::Live(AgentState::LoggingIn { .. }) => LOGGING_IN,
             AgentPhase::Live(AgentState::LoginRequired { .. }) => NEEDS_LOGIN,
             AgentPhase::Live(AgentState::Failed { .. }) => "the agent failed",
@@ -582,7 +595,9 @@ pub fn failure_text(phase: &AgentPhase, life: SessionLife, names: Names<'_>, log
         }),
         AgentPhase::NotStarted(StartFailure::TooOld { endpoint }) => Some(alert(too_old_text(endpoint), true, None)),
         // A login running says so on its row, not in an alert.
-        AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match life {
+        AgentPhase::Live(
+            AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. } | AgentState::Choosing { .. },
+        ) => match life {
             SessionLife::Open => None,
             SessionLife::Ended => {
                 Some(alert(format!("the agent session on {} has ended", names.endpoint), true, None))
@@ -631,6 +646,9 @@ pub enum DisabledWhy {
     Connecting,
     NotStarted,
     Starting,
+    /// The agent waits for a conversation to be chosen (OpenSpec change
+    /// `agents-session-list`).
+    Choosing,
     /// The agent needs a login, which the zone's login row offers.
     LoginRequired,
     /// The agent needs a login the zone can't run: it offers no method
@@ -653,6 +671,7 @@ impl DisabledWhy {
             Self::Connecting => "connecting to the terminal server",
             Self::NotStarted => "the agent didn't start",
             Self::Starting => "the agent is starting",
+            Self::Choosing => CHOOSING,
             Self::LoginRequired => NEEDS_LOGIN,
             Self::LoginElsewhere => {
                 "the agent needs a login; log in through its own command line, then open the profile again"
@@ -766,7 +785,8 @@ pub fn continue_offer(
                 | AgentState::Ready { .. }
                 | AgentState::LoginRequired { .. }
                 | AgentState::LoggingIn { .. }
-                | AgentState::Failed { .. },
+                | AgentState::Failed { .. }
+                | AgentState::Choosing { .. },
             ),
             SessionLife::Open | SessionLife::Ended,
         ) => return Offer::None(NoOffer::NotEnded),
@@ -851,6 +871,96 @@ pub enum Sent {
     /// `AGENT_FETCH` (OpenSpec change `agents-log-paging`): its page comes
     /// as a change before the reply; a refusal shows on the Earlier row.
     Fetch,
+    /// `AGENT_LIST` (OpenSpec change `agents-session-list`), for what it
+    /// says: its page comes in place of the reply.
+    List(ListFor),
+    /// `AGENT_CHOOSE`: a refusal is shown beside the prompt input.
+    Choose,
+}
+
+/// What a list the zone's agent answers is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListFor {
+    /// The conversations palette: the page or the refusal is handed to it.
+    Palette,
+    /// A `-c` launch: the latest is chosen ([`latest_plan`]).
+    Latest,
+}
+
+/// What a launch asks of its choosing zone (design decision 8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchChoice {
+    /// `-c`: the latest conversation, else the choosing screen.
+    Last,
+    /// `-r`: the conversations palette.
+    List,
+}
+
+/// What the zone does, once, when its launch's agent is first choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnChoosing {
+    /// Ask for the first page, for the latest (`-c`).
+    ListLatest,
+    /// Open the conversations palette on the zone (`-r`).
+    OpenList,
+}
+
+/// What a list's answer asks of the zone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListDone {
+    /// The palette's page, or why there is none: handed to the palette.
+    Palette(Result<Page, String>),
+    /// The latest conversation, to choose (`AGENT_CHOOSE`).
+    Choose(String),
+    Nothing,
+}
+
+/// Where the agent a conversations palette lists through is
+/// ([`ChatModel::lister_state`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListerState {
+    Starting,
+    /// Choosing, or ready: it can be asked for a list.
+    Lists,
+    /// It can't list, saying why.
+    Failed(String),
+}
+
+/// A button of a pane that has no conversation running (design decision
+/// 6), each a keyboard stop on the reason line: Continue conversation,
+/// Conversations…, New conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneChoice {
+    Continue,
+    Conversations,
+    New,
+}
+
+impl ZoneChoice {
+    /// The button's label.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Continue => "Continue conversation",
+            Self::Conversations => "Conversations…",
+            Self::New => "New conversation",
+        }
+    }
+
+    /// The stop's name in the dump's focus line, and the prompt line's
+    /// `actions=`.
+    pub fn word(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Conversations => "conversations",
+            Self::New => "new",
+        }
+    }
+}
+
+/// The reason a choosing zone shows when the latest was asked for and
+/// there is none (`-c` with nothing to continue).
+pub fn no_earlier_text(dir: &str) -> String {
+    format!("no earlier conversation in {dir}")
 }
 
 /// The entries before the ones the zone holds (OpenSpec change
@@ -879,6 +989,8 @@ pub enum Replied {
     ClearDraft,
     /// The first prompt was refused: it becomes the draft.
     SetDraft(String),
+    /// A list was answered (OpenSpec change `agents-session-list`).
+    Listed(ListDone),
     /// The input is left as it is.
     Nothing,
 }
@@ -993,6 +1105,9 @@ pub struct Absorbed {
     /// The working row ([`ChatModel::working_row`]), when it changed: the
     /// view applies it after `splices` ([`crate::agent::view::working_splice`]).
     pub working: Option<Option<WorkingRow>>,
+    /// The launch's agent is choosing for the first time: what its launch
+    /// asked for (OpenSpec change `agents-session-list`).
+    pub choosing: Option<OnChoosing>,
 }
 
 /// What a change compares against.
@@ -1073,6 +1188,25 @@ pub struct ChatModel {
     /// Each pending permission's tool entry, when the zone holds it (the
     /// newest with the call the permission names, before it).
     permission_tools: BTreeMap<EntryId, EntryId>,
+    /// What the zone knows of choosing (OpenSpec change
+    /// `agents-session-list`).
+    choosing: Choosing,
+}
+
+/// A zone's facts about choosing a conversation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Choosing {
+    /// The session was started to choose, and no conversation has started
+    /// in it yet: session restore leaves it out, and a quit ends it.
+    started: bool,
+    /// What the launch asked for, until the agent is first choosing.
+    launch: Option<LaunchChoice>,
+    /// The directory as shown, for the reasons that name it.
+    dir: String,
+    /// The reason a list left: none to continue, or its refusal.
+    note: Option<String>,
+    /// A list was refused because the agent can't list.
+    unlisted: bool,
 }
 
 fn running(turn: &TurnState) -> bool {
@@ -1120,6 +1254,133 @@ impl ChatModel {
             texts: BTreeMap::new(),
             last_user: None,
             permission_tools: BTreeMap::new(),
+            choosing: Choosing::default(),
+        }
+    }
+
+    /// A zone whose session starts choosing (OpenSpec change
+    /// `agents-session-list`), in the directory shown as `dir`, for a
+    /// launch's `launch` choice and `first` prompt.
+    pub fn choosing(
+        profile: impl Into<String>,
+        first: Option<FirstPrompt>,
+        launch: Option<LaunchChoice>,
+        dir: impl Into<String>,
+    ) -> Self {
+        let mut model = Self::new(profile, first);
+        model.choosing = Choosing { started: true, launch, dir: dir.into(), note: None, unlisted: false };
+        model
+    }
+
+    /// The zone's session was replaced by one starting a new conversation,
+    /// or another listed one: the conversation it knew is no longer its
+    /// own, so nothing continues it or titles the zone.
+    pub fn forget_conversation(&mut self) {
+        self.conversation = None;
+    }
+
+    /// Whether the agent is choosing on an open session.
+    pub fn is_choosing(&self) -> bool {
+        matches!(self.phase, AgentPhase::Live(AgentState::Choosing { .. })) && self.life == SessionLife::Open
+    }
+
+    /// Whether the session was started to choose and no conversation has
+    /// started in it.
+    pub fn started_choosing(&self) -> bool {
+        self.choosing.started
+    }
+
+    /// The reason a choosing zone shows: the agent's message for a refused
+    /// choice, else a list's (none to continue, a refusal), else the
+    /// screen's own.
+    pub fn choosing_reason(&self) -> String {
+        match &self.phase {
+            AgentPhase::Live(AgentState::Choosing { message: Some(message) }) => message.clone(),
+            AgentPhase::Live(_) | AgentPhase::Connecting | AgentPhase::NotStarted(_) | AgentPhase::Lost { .. } | AgentPhase::Broken { .. } => {
+                self.choosing.note.clone().unwrap_or_else(|| CHOOSING.into())
+            }
+        }
+    }
+
+    /// The pane's buttons (design decision 6) for the continue `offer`: a
+    /// choosing agent's Conversations… (unless it can't list) and New
+    /// conversation; a stopped agent's Continue conversation when it can,
+    /// then Conversations… and New conversation; none while an agent
+    /// runs, or once the zone's profile is gone.
+    pub fn zone_choices(&self, offer: &Offer) -> Vec<ZoneChoice> {
+        let list = |unlisted: bool| if unlisted { vec![ZoneChoice::New] } else { vec![ZoneChoice::Conversations, ZoneChoice::New] };
+        if self.is_choosing() {
+            return list(self.choosing.unlisted);
+        }
+        match offer {
+            Offer::Restart | Offer::Respawn { .. } => [vec![ZoneChoice::Continue], list(self.choosing.unlisted)].concat(),
+            // An agent that never started keeps its own reason, alone.
+            Offer::None(NoOffer::NoConversation) if matches!(self.phase, AgentPhase::NotStarted(_)) => Vec::new(),
+            Offer::None(NoOffer::NoConversation | NoOffer::NotOffered) => list(self.choosing.unlisted),
+            Offer::None(NoOffer::ProfileGone { .. }) => Vec::new(),
+            // A choosing session that ended is stopped too.
+            Offer::None(NoOffer::NotEnded) if matches!(self.phase, AgentPhase::Live(AgentState::Choosing { .. })) => {
+                list(self.choosing.unlisted)
+            }
+            Offer::None(NoOffer::NotEnded) => Vec::new(),
+        }
+    }
+
+    /// Whether `AGENT_CHOOSE` can go now: the agent is choosing on a link
+    /// that is up, with no choice on its way.
+    pub fn can_choose(&self) -> bool {
+        self.is_choosing() && self.link == Link::Up && !self.pending.values().any(|sent| *sent == Sent::Choose)
+    }
+
+    /// An `AGENT_CHOOSE` went out as `request`: the reason a list left goes.
+    pub fn chose(&mut self, request: RequestId) {
+        self.choosing.note = None;
+        self.refusal = None;
+        self.pending.insert(request, Sent::Choose);
+    }
+
+    /// Whether a list can be asked for now: the agent is ready or choosing
+    /// on a link that is up.
+    #[cfg(test)]
+    pub fn can_list(&self) -> bool {
+        let live = matches!(self.phase, AgentPhase::Live(AgentState::Ready { .. } | AgentState::Choosing { .. }));
+        live && self.life == SessionLife::Open && self.link == Link::Up
+    }
+
+    /// `AGENT_CONVERSATIONS` answered the list `request` with `page`.
+    pub fn listed(&mut self, request: RequestId, page: Page) -> ListDone {
+        match self.pending.remove(&request) {
+            Some(Sent::List(ListFor::Palette)) => ListDone::Palette(Ok(page)),
+            Some(Sent::List(ListFor::Latest)) => match latest_plan(&page.conversations) {
+                Latest::Continue(id) => ListDone::Choose(id),
+                Latest::None => {
+                    self.choosing.note = Some(no_earlier_text(&self.choosing.dir));
+                    ListDone::Nothing
+                }
+            },
+            Some(other) => {
+                // Not a list: kept for its own reply.
+                self.pending.insert(request, other);
+                ListDone::Nothing
+            }
+            None => ListDone::Nothing,
+        }
+    }
+
+    /// A list for `purpose` was refused with `why` (or couldn't go): the
+    /// palette's is handed on; a launch's becomes the screen's reason. A
+    /// list the agent can't answer at all marks it.
+    fn list_refused(&mut self, purpose: ListFor, why: String) -> ListDone {
+        let why = without_session(&why).to_owned();
+        if why == crate::remote::protocol::client::LIST_NOT_OFFERED {
+            self.choosing.unlisted = true;
+        }
+        match purpose {
+            ListFor::Palette => ListDone::Palette(Err(why)),
+            ListFor::Latest => {
+                self.choosing.note = Some(why);
+                ListDone::Nothing
+            }
         }
     }
 
@@ -1257,7 +1518,8 @@ impl ChatModel {
                     | AgentState::LoggingIn { .. }
                     | AgentState::Failed { .. }
                     | AgentState::Exited { .. }
-                    | AgentState::Lost { .. },
+                    | AgentState::Lost { .. }
+                    | AgentState::Choosing { .. },
                 )
                 | AgentPhase::Connecting
                 | AgentPhase::NotStarted(_)
@@ -1927,7 +2189,6 @@ impl ChatModel {
     }
 
     /// The agent's conversation as the zone last knew it.
-    #[cfg(test)]
     pub fn conversation(&self) -> Option<&Conversation> {
         self.conversation.as_ref()
     }
@@ -1996,7 +2257,23 @@ impl ChatModel {
         let status = self.shown_status();
         let changed = status != before.status;
         let working = self.working_row();
+        // A conversation started: the session is an ordinary one now.
+        if matches!(self.phase, AgentPhase::Live(AgentState::Ready { .. })) {
+            self.choosing.started = false;
+            self.choosing.note = None;
+        }
+        let choosing = match self.choosing.launch {
+            Some(launch) if self.is_choosing() && !from_replay => {
+                self.choosing.launch = None;
+                Some(match launch {
+                    LaunchChoice::Last => OnChoosing::ListLatest,
+                    LaunchChoice::List => OnChoosing::OpenList,
+                })
+            }
+            Some(_) | None => None,
+        };
         Absorbed {
+            choosing,
             working: (working != before.working).then_some(working),
             splices,
             status: changed.then_some(status),
@@ -2026,7 +2303,8 @@ impl ChatModel {
                 (false, Link::Reconnecting) => return None,
             },
             (
-                AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. }),
+                AgentPhase::Connecting
+                | AgentPhase::Live(AgentState::Starting | AgentState::LoggingIn { .. } | AgentState::Choosing { .. }),
                 SessionLife::Open,
             ) => return None,
             (AgentPhase::Live(AgentState::LoginRequired { .. }), SessionLife::Open) if self.logins_usable() => {
@@ -2070,7 +2348,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::Failed { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::NotStarted(_)
@@ -2112,7 +2391,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::Failed { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::NotStarted(_)
@@ -2134,7 +2414,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::Failed { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { .. },
             )
             | AgentPhase::Connecting
             | AgentPhase::NotStarted(_)
@@ -2231,6 +2512,7 @@ impl ChatModel {
             AgentPhase::Lost { .. } => disabled(DisabledWhy::Lost),
             AgentPhase::Broken { .. } => disabled(DisabledWhy::Broken),
             AgentPhase::Live(AgentState::Starting) => disabled(DisabledWhy::Starting),
+            AgentPhase::Live(AgentState::Choosing { .. }) => disabled(DisabledWhy::Choosing),
             AgentPhase::Live(AgentState::LoggingIn { .. }) => disabled(DisabledWhy::LoggingIn),
             AgentPhase::Live(AgentState::LoginRequired { .. }) if self.terminal_login.is_some() => {
                 disabled(DisabledWhy::LoggingIn)
@@ -2336,7 +2618,10 @@ impl ChatModel {
                 | AgentState::LoginRequired { .. }
                 | AgentState::LoggingIn { .. }
                 | AgentState::Failed { .. },
-            ) => true,
+            ) => !self.choosing.started,
+            // Nothing to bring back: the session isn't recorded, and a quit
+            // ends it (OpenSpec change `agents-session-list`).
+            AgentPhase::Live(AgentState::Choosing { .. }) => false,
             AgentPhase::Live(AgentState::Exited { .. } | AgentState::Lost { .. })
             | AgentPhase::NotStarted(_)
             | AgentPhase::Lost { .. }
@@ -2357,6 +2642,13 @@ impl ChatModel {
             ) => Replied::Nothing,
             // Answered through `fetched`, which knows the request.
             (Sent::Fetch, Ok(()) | Err(_)) => Replied::Nothing,
+            // A list's page comes as `listed`: an `OK` answers none.
+            (Sent::List(_) | Sent::Choose, Ok(())) => Replied::Nothing,
+            (Sent::List(purpose), Err(why)) => Replied::Listed(self.list_refused(purpose, why)),
+            (Sent::Choose, Err(why)) => {
+                self.refusal = Some(why);
+                Replied::Nothing
+            }
             (Sent::Login, Err(why)) => {
                 self.login_note = Some(why);
                 Replied::Nothing
@@ -2507,6 +2799,54 @@ impl ChatModel {
         }
     }
 
+    /// What the conversations plans see the zone's agent do (OpenSpec
+    /// change `agents-session-list` decisions 3 and 5).
+    pub fn zone_run(&self) -> ZoneRun {
+        match &self.phase {
+            AgentPhase::Live(AgentState::Ready { .. }) => match (self.life, self.link) {
+                (SessionLife::Open, Link::Up) => ZoneRun::Ready,
+                (SessionLife::Open, Link::Reconnecting) => ZoneRun::Busy,
+                (SessionLife::Ended, _) => ZoneRun::Stopped,
+            },
+            AgentPhase::Live(AgentState::Choosing { .. }) => ZoneRun::Choosing,
+            AgentPhase::NotStarted(_)
+            | AgentPhase::Lost { .. }
+            | AgentPhase::Broken { .. }
+            | AgentPhase::Live(AgentState::Exited { .. } | AgentState::Lost { .. }) => ZoneRun::Stopped,
+            AgentPhase::Connecting
+            | AgentPhase::Live(
+                AgentState::Starting
+                | AgentState::LoginRequired { .. }
+                | AgentState::LoggingIn { .. }
+                | AgentState::Failed { .. },
+            ) => ZoneRun::Busy,
+        }
+    }
+
+    /// Where an agent the conversations palette lists through is: starting,
+    /// able to list, or unable to, and why (decision 3: a login needed, or
+    /// the failure's text). `command` and `endpoint` are what the alert
+    /// names.
+    pub fn lister_state(&self, command: &str, endpoint: &str) -> ListerState {
+        match &self.phase {
+            AgentPhase::Connecting | AgentPhase::Live(AgentState::Starting) => ListerState::Starting,
+            AgentPhase::Live(AgentState::Choosing { .. } | AgentState::Ready { .. }) if self.life == SessionLife::Open => {
+                ListerState::Lists
+            }
+            AgentPhase::Live(AgentState::LoginRequired { .. } | AgentState::LoggingIn { .. }) => {
+                ListerState::Failed(format!("{} needs a login: open the profile to log in", self.profile))
+            }
+            AgentPhase::Live(AgentState::Choosing { .. } | AgentState::Ready { .. })
+            | AgentPhase::NotStarted(_)
+            | AgentPhase::Lost { .. }
+            | AgentPhase::Broken { .. }
+            | AgentPhase::Live(AgentState::Failed { .. } | AgentState::Exited { .. } | AgentState::Lost { .. }) => {
+                let text = self.alert(command, endpoint).map(|alert| alert.text);
+                ListerState::Failed(text.unwrap_or_else(|| format!("{} can't list conversations", self.profile)))
+            }
+        }
+    }
+
     /// The alert for the zone's phase, if any ([`failure_text`]).
     pub fn alert(&self, command: &str, endpoint: &str) -> Option<Alert> {
         let agent = self.agent_label();
@@ -2523,8 +2863,9 @@ impl ChatModel {
             ) => message.clone(),
             AgentPhase::Live(AgentState::Exited { code: Some(code), .. }) => format!("exited with status {code}"),
             AgentPhase::Live(AgentState::Exited { code: None, .. }) => "ended by a signal".into(),
-            AgentPhase::Live(AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. }) => match &self
-                .turn
+            AgentPhase::Live(
+                AgentState::Starting | AgentState::Ready { .. } | AgentState::LoggingIn { .. } | AgentState::Choosing { .. },
+            ) => match &self.turn
             {
                 TurnState::Failed { message } => message.clone(),
                 TurnState::Ended { stop } => format!("the turn ended: {}", stop_word(stop)),
@@ -2632,7 +2973,11 @@ impl ChatModel {
         }
         out.push_str(&format!(" state={}", state_word(&self.phase)));
         match &self.phase {
-            AgentPhase::Live(AgentState::LoginRequired { message, .. } | AgentState::Failed { message }) => {
+            AgentPhase::Live(
+                AgentState::LoginRequired { message, .. }
+                | AgentState::Failed { message }
+                | AgentState::Choosing { message: Some(message) },
+            ) => {
                 out.push_str(&format!(" message={message:?}"));
             }
             // The failure as logged, the server's cause verbatim (on
@@ -2643,7 +2988,8 @@ impl ChatModel {
                 | AgentState::Ready { .. }
                 | AgentState::LoggingIn { .. }
                 | AgentState::Exited { .. }
-                | AgentState::Lost { .. },
+                | AgentState::Lost { .. }
+                | AgentState::Choosing { message: None },
             )
             | AgentPhase::Connecting
             | AgentPhase::Lost { .. }
@@ -2707,6 +3053,14 @@ impl ChatModel {
         }
         if let Some(refusal) = &self.refusal {
             out.push_str(&format!(" refusal={refusal:?}"));
+        }
+        if self.is_choosing() {
+            out.push_str(&format!(" reason={:?}", self.choosing_reason()));
+        }
+        let choices = self.zone_choices(offer);
+        if !choices.is_empty() {
+            let words: Vec<&str> = choices.iter().map(|choice| choice.word()).collect();
+            out.push_str(&format!(" actions={}", words.join(",")));
         }
         out.push('\n');
         out
@@ -2889,6 +3243,7 @@ fn state_word(phase: &AgentPhase) -> String {
         AgentPhase::Connecting => "connecting".into(),
         AgentPhase::NotStarted(_) => "not-started".into(),
         AgentPhase::Live(AgentState::Starting) => "starting".into(),
+        AgentPhase::Live(AgentState::Choosing { .. }) => "choosing".into(),
         AgentPhase::Live(AgentState::Ready { .. }) => "ready".into(),
         AgentPhase::Live(AgentState::LoginRequired { .. }) => "login-required".into(),
         AgentPhase::Live(AgentState::LoggingIn { .. }) => "logging-in".into(),
@@ -4362,7 +4717,8 @@ mod tests {
                                 | AgentState::Ready { .. }
                                 | AgentState::LoginRequired { .. }
                                 | AgentState::LoggingIn { .. }
-                                | AgentState::Failed { .. },
+                                | AgentState::Failed { .. }
+                                | AgentState::Choosing { .. },
                             ) => false,
                         };
                         let kept = matches!(phase, AgentPhase::Live(_)) && life == SessionLife::Open;
@@ -5389,5 +5745,170 @@ mod tests {
         assert_eq!(zone.model.tool_copy_text(EntryId(1), 0).as_deref(), Some("ok\n"));
         assert_eq!(zone.model.tool_copy_text(EntryId(1), 1), None);
         assert_eq!(zone.model.tool_copy_text(EntryId(2), 0), None);
+    }
+
+    // `agents-session-list` 4.3: the choosing screen.
+
+    fn choosing(message: Option<&str>) -> Event {
+        agent_state(AgentState::Choosing { message: message.map(Into::into) })
+    }
+
+    /// A zone started to choose, for a launch's `launch`, in `~/src/app`.
+    fn chooser(launch: Option<LaunchChoice>) -> Zone {
+        Zone { shared: AgentShared::new(), model: ChatModel::choosing("Fake", None, launch, "~/src/app") }
+    }
+
+    fn page(ids: &[(&str, Option<&str>)]) -> Page {
+        let conversations = ids
+            .iter()
+            .map(|(id, updated)| crate::agent::conversations::Listed {
+                id: (*id).into(),
+                title: None,
+                updated: updated.map(Into::into),
+            })
+            .collect();
+        Page { conversations, next: None }
+    }
+
+    /// Decision 6's table: each row's reason and buttons; a gone profile
+    /// offers none; a running agent none.
+    #[test]
+    fn the_choosing_screens_table() {
+        use crate::agent::transcript::Continuation;
+        use ZoneChoice::{Continue, Conversations, New};
+        let mut zone = chooser(None);
+        zone.feed(&[choosing(None)]);
+        let offer = found(&zone.model);
+        assert_eq!(offer, Offer::None(NoOffer::NotEnded));
+        assert_eq!(zone.model.zone_choices(&offer), [Conversations, New]);
+        assert_eq!(zone.model.choosing_reason(), CHOOSING);
+        assert_eq!(zone.model.prompt_status(), PromptStatus::Disabled(DisabledWhy::Choosing));
+        // A refused choice's message is the reason.
+        zone.feed(&[choosing(Some("no such session"))]);
+        assert_eq!(zone.model.choosing_reason(), "no such session");
+        // The agent can't list: New conversation alone, with its reason.
+        let request = 5;
+        zone.model.sent(request, Sent::List(ListFor::Latest));
+        let replied = zone.model.replied(request, Err(crate::remote::protocol::client::LIST_NOT_OFFERED.into()));
+        assert_eq!(replied, Replied::Listed(ListDone::Nothing));
+        zone.feed(&[choosing(None)]);
+        assert_eq!(zone.model.zone_choices(&found(&zone.model)), [New]);
+        assert_eq!(zone.model.choosing_reason(), "the agent can't list conversations");
+
+        // Exited, can continue; can't continue; the profile gone.
+        let mut ended = Zone::new(None);
+        ended.feed(&[conversation_event(Continuation::Resume), ready(), agent_state(AgentState::Exited { code: Some(1), stderr: String::new() })]);
+        assert_eq!(ended.model.zone_choices(&found(&ended.model)), [Continue, Conversations, New]);
+        let gone = ended.model.offer(&ProfileFound::Gone { name: "Fake".into() });
+        assert_eq!(ended.model.zone_choices(&gone), []);
+        let mut neither = Zone::new(None);
+        neither.feed(&[conversation_event(Continuation::Neither), ready(), agent_state(AgentState::Lost { message: "gone".into() })]);
+        assert_eq!(neither.model.zone_choices(&found(&neither.model)), [Conversations, New]);
+        assert_eq!(Zone::ready().model.zone_choices(&found(&Zone::ready().model)), []);
+    }
+
+    /// While choosing: no working row, no status asking for attention, no
+    /// prompt sent, and `state=choosing` with its reason in the dump; the
+    /// session isn't kept for restore until a conversation starts.
+    #[test]
+    fn a_choosing_zone_waits_quietly() {
+        let mut zone = chooser(None);
+        assert!(!zone.model.keeps_session(), "started to choose");
+        zone.feed(&[agent_state(AgentState::Starting), choosing(None)]);
+        assert_eq!(zone.model.working_row(), None);
+        assert!(zone.model.shown_status().is_none_or(|state| state == State::Idle));
+        assert_eq!(zone.model.submit("hi", false), Submit::Nothing(Why::NotReady(DisabledWhy::Choosing)));
+        assert!(!zone.model.keeps_session());
+        let dump = zone.model.describe(1, true, &found(&zone.model), &|_| unreachable!());
+        assert!(dump.contains("state=choosing"), "{dump}");
+        assert!(dump.contains(&format!("--- prompt status=disabled reason={CHOOSING:?} actions=conversations,new\n")), "{dump}");
+        zone.feed(&[ready()]);
+        assert!(zone.model.keeps_session(), "a conversation started");
+        assert!(!zone.model.started_choosing());
+    }
+
+    /// `-c`: the first time the agent chooses, the zone lists for the
+    /// latest, once; the newest is chosen, or the screen says there is none
+    /// in the directory. `-r` opens the list; nothing from a replay.
+    #[test]
+    fn a_launch_lists_for_the_latest_or_opens_the_list() {
+        let mut last = chooser(Some(LaunchChoice::Last));
+        assert_eq!(last.feed(&[agent_state(AgentState::Starting)]).choosing, None);
+        assert_eq!(last.feed(&[choosing(None)]).choosing, Some(OnChoosing::ListLatest));
+        assert_eq!(last.feed(&[choosing(None)]).choosing, None, "once");
+        assert!(last.model.can_list());
+        last.model.sent(3, Sent::List(ListFor::Latest));
+        let newest = page(&[("old", Some("2026-11-01T00:00:00Z")), ("new", Some("2026-11-02T00:00:00Z"))]);
+        assert_eq!(last.model.listed(3, newest), ListDone::Choose("new".into()));
+        last.model.sent(4, Sent::List(ListFor::Latest));
+        assert_eq!(last.model.listed(4, page(&[])), ListDone::Nothing);
+        assert_eq!(last.model.choosing_reason(), "no earlier conversation in ~/src/app");
+        assert_eq!(last.model.listed(4, page(&[])), ListDone::Nothing, "answered already");
+
+        let mut list = chooser(Some(LaunchChoice::List));
+        assert_eq!(list.replay(&[choosing(None)]).choosing, None, "not from a replay");
+        assert_eq!(list.feed(&[choosing(None)]).choosing, Some(OnChoosing::OpenList));
+    }
+
+    /// What the conversations plans see of a zone, and whether a palette
+    /// can list through it.
+    #[test]
+    fn a_zones_run_and_its_listers_state() {
+        let mut zone = chooser(None);
+        assert_eq!((zone.model.zone_run(), zone.model.lister_state("f", "A8")), (ZoneRun::Busy, ListerState::Starting));
+        zone.feed(&[choosing(None)]);
+        assert_eq!((zone.model.zone_run(), zone.model.lister_state("f", "A8")), (ZoneRun::Choosing, ListerState::Lists));
+        let ready = Zone::ready();
+        assert_eq!((ready.model.zone_run(), ready.model.lister_state("f", "A8")), (ZoneRun::Ready, ListerState::Lists));
+        let mut login = chooser(None);
+        login.feed(&[agent_state(AgentState::LoginRequired { message: "log in".into(), methods: Vec::new() })]);
+        assert_eq!(login.model.zone_run(), ZoneRun::Busy);
+        assert_eq!(
+            login.model.lister_state("f", "A8"),
+            ListerState::Failed("Fake needs a login: open the profile to log in".into())
+        );
+        let mut exited = chooser(None);
+        exited.feed(&[agent_state(AgentState::Exited { code: Some(2), stderr: String::new() })]);
+        assert_eq!(exited.model.zone_run(), ZoneRun::Stopped);
+        assert_eq!(exited.model.lister_state("f", "A8"), ListerState::Failed("Fake exited with status 2".into()));
+    }
+
+    /// A list's refusal loses the core's `session N: `, and the agent that
+    /// can't list is marked so from it.
+    #[test]
+    fn a_lists_refusal_keeps_the_agents_words() {
+        assert_eq!(without_session("session 12: the index is locked"), "the index is locked");
+        assert_eq!(without_session("session x: kept"), "session x: kept");
+        assert_eq!(without_session("session : kept"), "session : kept");
+        assert_eq!(without_session("no prefix: kept"), "no prefix: kept");
+        let mut zone = chooser(None);
+        zone.feed(&[choosing(None)]);
+        zone.model.sent(7, Sent::List(ListFor::Palette));
+        let why = format!("session 3: {}", crate::remote::protocol::client::LIST_NOT_OFFERED);
+        let replied = zone.model.replied(7, Err(why));
+        let words = crate::remote::protocol::client::LIST_NOT_OFFERED;
+        assert_eq!(replied, Replied::Listed(ListDone::Palette(Err(words.into()))));
+        // Marked: New conversation alone.
+        assert_eq!(zone.model.zone_choices(&found(&zone.model)), [ZoneChoice::New]);
+    }
+
+    /// The palette's list is handed on, page or refusal; a choice can go
+    /// once while choosing, and its refusal shows.
+    #[test]
+    fn a_palettes_list_and_a_choice() {
+        let mut zone = chooser(None);
+        zone.feed(&[choosing(None)]);
+        zone.model.sent(7, Sent::List(ListFor::Palette));
+        assert_eq!(zone.model.listed(7, page(&[("a", None)])), ListDone::Palette(Ok(page(&[("a", None)]))));
+        zone.model.sent(8, Sent::List(ListFor::Palette));
+        assert_eq!(zone.model.replied(8, Err("the agent's error".into())), Replied::Listed(ListDone::Palette(Err("the agent's error".into()))));
+        assert!(zone.model.can_choose());
+        zone.model.chose(9);
+        assert!(!zone.model.can_choose(), "one choice on its way");
+        assert_eq!(zone.model.replied(9, Err("the agent isn't choosing".into())), Replied::Nothing);
+        assert_eq!(zone.model.refusal(), Some("the agent isn't choosing"));
+        assert!(zone.model.can_choose());
+        assert!(!Zone::ready().model.can_choose(), "a ready agent doesn't choose");
+        assert!(Zone::ready().model.can_list());
     }
 }

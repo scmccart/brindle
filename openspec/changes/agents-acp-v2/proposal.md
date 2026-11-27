@@ -29,7 +29,7 @@ Open questions, to answer before a design:
 4. **The status mapping** for `requires_action` that isn't a permission request (an elicitation, which step 1 refuses) and for `unknown`.
 5. **Prompt retries:** whether to send v2's `idempotencyKey`, which could close step 1's known gap where a core killed between checkpointing a prompt and writing it leaves the turn stuck.
 6. **The schema crate:** whether the pinned `agent-client-protocol-schema` carries a v2 that matches the spec at the time, and what moving the pin brings into `Cargo.lock`.
-7. **The follow-ups' v2 halves:** if `agents-login` and `agents-session-recovery` have landed, their v1 requests map onto `auth/login` and `session/resume { replayFrom }` here.
+7. **The follow-ups' v2 halves:** if `agents-login` and `agents-session-recovery` have landed, their v1 requests map onto `auth/login` and `session/resume { replayFrom }` here. From `agents-session-list` it inherits listing and choosing: `session/list` (with `cwd` and `cursor`, answered with `sessions` and `nextCursor`) is unchanged in v2, so the list, its bounds and `AGENT_LIST`/`AGENT_CONVERSATIONS` carry over as they are, and a chosen conversation continues through v2's `session/resume`, as the recovery requests do, since `session/load` is gone.
 
 ## What the full changes already say
 

@@ -50,7 +50,8 @@ use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{
-    self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, SessionInfo, Spawned, ToClient,
+    self, Data, Exit, Kill, KillTarget, Policy, Request, Resize, SessionInfo, SpawnStart, Spawned,
+    ToClient,
 };
 use brindle_remote_protocol::holder::{self as h1, HeldSession, MetaFault, SessionMeta, ToHolder};
 use brindle_remote_protocol::{RequestId, SessionId};
@@ -621,9 +622,11 @@ impl Session {
                     scrollback: 0,
                     started: unix_now(),
                 },
-                Content::Agent(Box::new(match &spawn.conversation {
-                    None => Agent::new(cwd.clone()),
-                    Some(conversation) => Agent::continuing(conversation),
+                Content::Agent(Box::new(match (&spawn.conversation, spawn.start) {
+                    (None, None) => Agent::new(cwd.clone()),
+                    // `client_spawn_agent` refuses a spawn naming both.
+                    (None, Some(SpawnStart::Choose)) => Agent::choosing(cwd.clone()),
+                    (Some(conversation), _) => Agent::continuing(conversation),
                 })),
                 0,
                 0,

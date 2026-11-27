@@ -582,6 +582,15 @@ pub enum AgentState {
     /// The agent was lost with the holder that ran it, so neither its exit
     /// status nor its standard error is known; `message` says so.
     Lost { message: String },
+    /// Initialized, with no conversation yet: the session waits for a
+    /// client to choose one to continue, or a new one (OpenSpec change
+    /// `agents-session-list`, decision 1). `message` is the agent's refusal
+    /// of the last choice, when it refused one (flag 5); none encodes as
+    /// `{"agent":"choosing"}`.
+    Choosing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
 }
 
 /// A login method an agent advertised (OpenSpec change `agents-login`,
@@ -1535,6 +1544,10 @@ impl Transcript {
     pub fn activity(&self) -> Activity {
         match &self.agent {
             AgentState::Starting | AgentState::LoggingIn { .. } => Activity::Working,
+            // Nothing runs on the user's behalf while a conversation is
+            // chosen (`agents-session-list`'s "A choosing zone waits
+            // quietly").
+            AgentState::Choosing { .. } => Activity::Idle,
             AgentState::LoginRequired { .. }
             | AgentState::Failed { .. }
             | AgentState::Exited { .. }
@@ -2328,6 +2341,7 @@ mod tests {
         };
         let rows = [
             (AgentState::Starting, TurnState::Idle, Activity::Working),
+            (AgentState::Choosing { message: None }, TurnState::Idle, Activity::Idle),
             (ready(), TurnState::Working, Activity::Working),
             (ready(), TurnState::Cancelling, Activity::Working),
             (ready(), TurnState::Blocked, Activity::Blocked),

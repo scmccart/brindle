@@ -894,7 +894,7 @@ impl Gallery {
                     PromptInputEvent::Stop => "stop".to_string(),
                     PromptInputEvent::RemoveQueued => "remove".to_string(),
                     PromptInputEvent::ResendQueued => "resend".to_string(),
-                    PromptInputEvent::Action => "action".to_string(),
+                    PromptInputEvent::Action(_) => "action".to_string(),
                 };
                 this.prompt_log.push(entry);
                 cx.notify();

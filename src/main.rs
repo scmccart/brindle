@@ -48,6 +48,7 @@ use gpui::{
 };
 
 use crate::actions::{Quit, ReloadConfig};
+use crate::agent::model::LaunchChoice;
 use crate::config::{Config, ConfigReport};
 use crate::latency::Latency;
 use crate::reattach::Listing;
@@ -89,6 +90,10 @@ AGENT:
                                  the directory brindle agent runs in)
     -p, --prompt <PROMPT>        A first prompt, sent once the agent is ready;
                                  - reads it from standard input
+    -c, --continue               Continue the latest conversation in the
+                                 directory, else choose one or start anew
+    -r, --resume                 List the directory's conversations to choose
+                                 one
 
 OPTIONS:
         --config <FILE>          Use FILE instead of ~/.config/brindle/config.toml
@@ -369,12 +374,14 @@ pub enum PromptArg {
     Stdin,
 }
 
-/// `brindle agent [PROFILE] [-d DIR] [-p PROMPT]`.
+/// `brindle agent [PROFILE] [-d DIR] [-p PROMPT] [-c | -r]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentLaunch {
     pub profile: Option<String>,
     pub cwd: Option<PathBuf>,
     pub prompt: Option<PromptArg>,
+    /// `-c` or `-r` (OpenSpec change `agents-session-list` decision 8).
+    pub choose: Option<LaunchChoice>,
 }
 
 impl AgentLaunch {
@@ -505,7 +512,7 @@ impl Args {
                     Some(here) => here.join(d),
                     None => d.clone(),
                 }),
-                with: LaunchWith::Agent { launched_in: here, first: launch.first_prompt() },
+                with: LaunchWith::Agent { launched_in: here, first: launch.first_prompt(), choose: launch.choose },
             })),
             Asked::Attach(session) => Some(Opening::Attach(*session)),
         }
@@ -534,7 +541,12 @@ impl Args {
                 request.command = launch.command.as_ref().map(Command::argv);
             }
             Asked::Agent(launch) => {
-                request.kind = Some(TabKind::Agent.word().into());
+                // A continue goes under a kind of its own, which an older
+                // Brindle refuses by name (`agents-session-list` decision 8).
+                request.kind = Some(match launch.choose {
+                    Some(_) => instance::AGENT_CHOOSE_KIND.into(),
+                    None => TabKind::Agent.word().into(),
+                });
                 let prompt = match &launch.prompt {
                     Some(PromptArg::Text(prompt)) => Some(prompt.text().to_string()),
                     // `main` read standard input before anything else, so
@@ -548,6 +560,7 @@ impl Args {
                         None => d.clone(),
                     }),
                     prompt,
+                    choose: launch.choose.map(instance::AgentChoose::of),
                 });
             }
             Asked::Attach(session) => request.attach = Some(*session),
@@ -678,6 +691,30 @@ fn parse_args_from(mut it: impl Iterator<Item = String>, home: Option<&Path>) ->
                 agent.prompt = Some(prompt_arg(&arg, value_of(it, &arg, "a prompt (- reads it from standard input)")?)?);
             }
             "--prompt" => return Err("--prompt belongs to brindle agent: brindle agent [PROFILE] --prompt PROMPT".into()),
+            // An earlier conversation (OpenSpec change `agents-session-list`
+            // decision 8), only after `agent`.
+            "-c" | "--continue" | "-r" | "--resume" if subcommand == Some(TabKind::Agent) => {
+                let choose = match arg.as_str() {
+                    "-c" | "--continue" => LaunchChoice::Last,
+                    _ => LaunchChoice::List,
+                };
+                agent.choose = Some(match (agent.choose, choose) {
+                    (None, choose) => choose,
+                    (Some(was), now) if was == now => {
+                        return Err(format!("{arg} was given twice: brindle agent continues one conversation"));
+                    }
+                    (Some(_), _) => {
+                        return Err("-c and -r can't be given together: -c continues the latest conversation, \
+                                    -r lists them"
+                            .into());
+                    }
+                });
+            }
+            "-c" | "--continue" | "-r" | "--resume" => {
+                return Err(format!(
+                    "{arg} belongs to brindle agent: brindle agent [PROFILE] {arg} continues an earlier conversation"
+                ));
+            }
             // The flat launch options, removed (decision 3): each says what
             // to type instead, with the user's own values.
             "-p" | "--profile" => {
@@ -1197,7 +1234,11 @@ fn forwarded_launch(
                 .map_err(Refusal::Usage)?;
             // `-d` was made absolute where the launch ran; without it, the
             // profile's `cwd`, else that directory.
-            let with = LaunchWith::Agent { launched_in: request.launch_dir.clone(), first: launch.first_prompt() };
+            let with = LaunchWith::Agent {
+                launched_in: request.launch_dir.clone(),
+                first: launch.first_prompt(),
+                choose: launch.choose,
+            };
             Ok(Some(Launch::Request(LaunchRequest { profile, with, cwd: launch.cwd })))
         }
     }
@@ -1563,6 +1604,7 @@ fn session_lock(state_dir: &Path, args: &Args) -> Option<session::Lock> {
                     Some(lock)
                 }
                 Err(_) => {
+                    let refused = instance::refusal_text(request.kind.as_deref(), &refused);
                     console_output();
                     eprintln!("brindle: {refused}");
                     show_unprinted(&refused);
@@ -2124,7 +2166,8 @@ mod tests {
     #[test]
     fn an_agent_launch_takes_a_profile_a_directory_and_a_prompt() {
         assert_eq!(agent(&["agent"]), AgentLaunch::default(), "brindle agent alone asks for a tab");
-        let expected = AgentLaunch { profile: Some("Fake".into()), cwd: Some("/srv".into()), prompt: text("run the tests") };
+        let expected =
+            AgentLaunch { profile: Some("Fake".into()), cwd: Some("/srv".into()), prompt: text("run the tests"), choose: None };
         for args in [
             &["agent", "Fake", "-d", "/srv", "-p", "run the tests"][..],
             &["agent", "-p", "run the tests", "Fake", "-d", "/srv"],
@@ -2138,6 +2181,35 @@ mod tests {
         assert_eq!(agent(&["agent", "-p", "-"]).prompt, Some(PromptArg::Stdin), "-p - reads standard input");
         assert_eq!(agent(&["agent", "-p", " two\nlines "]).prompt, text(" two\nlines "), "a prompt is kept as it is");
         assert_eq!(agent(&["agent", "agent"]).profile.as_deref(), Some("agent"), "a profile named like a subcommand");
+    }
+
+    /// `agents-session-list` 6.1: `-c` and `-r` under `agent`, with the
+    /// other options in any order, and their usage errors.
+    #[test]
+    fn an_agent_launch_continues_or_lists() {
+        for (args, choose) in [
+            (&["agent", "-c"][..], LaunchChoice::Last),
+            (&["agent", "--continue", "Fake"], LaunchChoice::Last),
+            (&["agent", "-r"], LaunchChoice::List),
+            (&["agent", "-d", "/srv", "--resume", "-p", "hi"], LaunchChoice::List),
+        ] {
+            assert_eq!(agent(args).choose, Some(choose), "{args:?}");
+        }
+        let refused = |args: &[&str]| match parse_args_from(args.iter().map(|a| a.to_string()), None) {
+            Err(why) => why,
+            Ok(_) => panic!("{args:?} was taken"),
+        };
+        assert!(refused(&["agent", "-c", "-r"]).starts_with("-c and -r can't be given together"));
+        assert!(refused(&["agent", "--resume", "--continue"]).starts_with("-c and -r can't be given together"));
+        assert_eq!(refused(&["agent", "-c", "--continue"]), "--continue was given twice: brindle agent continues one conversation");
+        assert_eq!(refused(&["agent", "-r", "-r"]), "-r was given twice: brindle agent continues one conversation");
+        for option in ["-c", "--continue", "-r", "--resume"] {
+            let why = refused(&["terminal", option]);
+            assert!(why.starts_with(&format!("{option} belongs to brindle agent")), "{why}");
+            assert!(refused(&[option]).starts_with(&format!("{option} belongs to brindle agent")));
+        }
+        let request = parse(&["agent", "Fake", "-c"]).instance_request(None, None);
+        assert_eq!(request.encode(), "{\"kind\":\"agent-choose\",\"agent\":{\"profile\":\"Fake\",\"choose\":\"last\"}}\n");
     }
 
     #[test]
@@ -2381,14 +2453,17 @@ mod tests {
         // An agent launch: the directory it runs in, `-d` relative to it,
         // and its first prompt.
         let Some(Opening::Tab(tab)) = parse(&["agent"]).opening(2, here()) else { panic!("brindle agent opens a tab") };
-        assert_eq!((tab.profile, tab.with, tab.cwd), (2, LaunchWith::Agent { launched_in: here(), first: None }, None));
+        assert_eq!(
+            (tab.profile, tab.with, tab.cwd),
+            (2, LaunchWith::Agent { launched_in: here(), first: None, choose: None }, None)
+        );
         let Some(Opening::Tab(tab)) = parse(&["agent", "Fake", "-d", "src", "-p", "hi"]).opening(1, here()) else {
             panic!("brindle agent opens a tab")
         };
         let first = FirstPrompt::new("hi".into()).ok();
         assert_eq!(
             (tab.profile, tab.with, tab.cwd),
-            (1, LaunchWith::Agent { launched_in: here(), first }, Some("/work/src".into()))
+            (1, LaunchWith::Agent { launched_in: here(), first, choose: None }, Some("/work/src".into()))
         );
         #[cfg(any(target_os = "linux", windows))]
         assert!(matches!(parse(&["--attach", "7"]).opening(0, here()), Some(Opening::Attach(7))));
@@ -2570,6 +2645,7 @@ mod tests {
                 profile: profile.map(str::to_string),
                 cwd: cwd.map(PathBuf::from),
                 prompt: prompt.map(str::to_string),
+                choose: None,
             }),
             ..Default::default()
         };
@@ -2669,7 +2745,8 @@ mod tests {
             Some(instance::AgentRequest {
                 profile: Some("Fake".into()),
                 cwd: Some(here.join("rel")),
-                prompt: Some("hi".into())
+                prompt: Some("hi".into()),
+                choose: None,
             }),
             "-d is made absolute here"
         );
@@ -2713,7 +2790,7 @@ mod tests {
             Launch::Request(LaunchRequest { profile, with, cwd }) => match with {
                 LaunchWith::Profile => Opens::Tab(profile, None, cwd),
                 LaunchWith::Command(program, args) => Opens::Tab(profile, Some((program, args)), cwd),
-                LaunchWith::Agent { launched_in, first } => {
+                LaunchWith::Agent { launched_in, first, choose: _ } => {
                     Opens::Agent(profile, launched_in, first.map(|first| first.text().to_string()), cwd)
                 }
             },

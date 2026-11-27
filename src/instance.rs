@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::model::LaunchChoice;
 use crate::{AgentLaunch, Command, FirstPrompt, PromptArg, TabKind, TerminalLaunch};
 
 /// What an instance answers a request of the `agent` kind without its
@@ -75,6 +76,54 @@ pub struct AgentRequest {
     pub cwd: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// `-c` or `-r` (OpenSpec change `agents-session-list` decision 8),
+    /// sent under [`AGENT_CHOOSE_KIND`] so an older Brindle refuses it
+    /// rather than open a new conversation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub choose: Option<AgentChoose>,
+}
+
+/// The kind of a request that continues an earlier conversation: an agent
+/// request with its `choose` field.
+pub const AGENT_CHOOSE_KIND: &str = "agent-choose";
+
+/// What an agent request's `choose` asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentChoose {
+    /// `-c`: the latest conversation.
+    Last,
+    /// `-r`: the list.
+    List,
+}
+
+impl AgentChoose {
+    pub fn of(choice: LaunchChoice) -> Self {
+        match choice {
+            LaunchChoice::Last => Self::Last,
+            LaunchChoice::List => Self::List,
+        }
+    }
+
+    fn launch(self) -> LaunchChoice {
+        match self {
+            Self::Last => LaunchChoice::Last,
+            Self::List => LaunchChoice::List,
+        }
+    }
+}
+
+/// The words a launch prints when the running Brindle refused its request
+/// with `why`: for a continue (`kind` [`AGENT_CHOOSE_KIND`]) refused by
+/// kind, that the running Brindle is older and can't continue one, with
+/// its answer; else the answer itself.
+pub fn refusal_text(kind: Option<&str>, why: &str) -> String {
+    match kind {
+        Some(AGENT_CHOOSE_KIND) if why.contains(&format!("can't open {AGENT_CHOOSE_KIND} tabs")) => {
+            format!("the running Brindle is older and can't continue a conversation ({why})")
+        }
+        Some(_) | None => why.to_string(),
+    }
 }
 
 impl AgentRequest {
@@ -87,7 +136,8 @@ impl AgentRequest {
             )),
             None => None,
         };
-        Ok(AgentLaunch { profile: self.profile.clone(), cwd: self.cwd.clone(), prompt })
+        let choose = self.choose.map(AgentChoose::launch);
+        Ok(AgentLaunch { profile: self.profile.clone(), cwd: self.cwd.clone(), prompt, choose })
     }
 }
 
@@ -121,7 +171,9 @@ impl Request {
         };
         match self.kind.as_deref() {
             Some(kind) if kind == TabKind::Terminal.word() => Ok(terminal()),
-            Some(kind) if kind == TabKind::Agent.word() => match &self.agent {
+            // This version reads a continue as an agent request with its
+            // choice.
+            Some(kind) if kind == TabKind::Agent.word() || kind == AGENT_CHOOSE_KIND => match &self.agent {
                 Some(agent) => agent.launch().map(Forward::Agent),
                 None => Err(NO_AGENT_FIELDS.into()),
             },
@@ -572,7 +624,12 @@ mod tests {
             profile: Some("work".into()),
             cwd: Some("/srv".into()),
             command: Some(vec!["htop".into(), "-d".into(), "10".into()]),
-            agent: Some(AgentRequest { profile: Some("Fake".into()), cwd: Some("/src".into()), prompt: Some("hi".into()) }),
+            agent: Some(AgentRequest {
+                profile: Some("Fake".into()),
+                cwd: Some("/src".into()),
+                prompt: Some("hi".into()),
+                choose: Some(AgentChoose::Last),
+            }),
             attach: Some(7),
             launch_dir: Some("/home/u".into()),
             activation_token: Some("tok".into()),
@@ -654,7 +711,39 @@ mod tests {
             profile: profile.map(Into::into),
             cwd: cwd.map(Into::into),
             prompt: prompt.map(|text| PromptArg::Text(FirstPrompt::new(text.into()).unwrap())),
+            choose: None,
         }))
+    }
+
+    /// `agents-session-list` 6.1: a continue's line, byte for byte, under
+    /// its own kind; this version reads it as an agent request with its
+    /// choice; an older one's refusal of the kind is worded for the launch.
+    #[test]
+    fn a_continue_goes_under_its_own_kind() {
+        let request = |choose| Request {
+            kind: Some(AGENT_CHOOSE_KIND.into()),
+            agent: Some(AgentRequest { profile: Some("Fake".into()), choose: Some(choose), ..Default::default() }),
+            ..Default::default()
+        };
+        let line = "{\"kind\":\"agent-choose\",\"agent\":{\"profile\":\"Fake\",\"choose\":\"last\"}}\n";
+        assert_eq!(request(AgentChoose::Last).encode(), line);
+        assert_eq!(Request::decode(line), Ok(request(AgentChoose::Last)));
+        let launch = |choose| {
+            Ok(Forward::Agent(AgentLaunch { profile: Some("Fake".into()), choose: Some(choose), ..Default::default() }))
+        };
+        assert_eq!(request(AgentChoose::Last).asked(), launch(LaunchChoice::Last));
+        assert_eq!(request(AgentChoose::List).asked(), launch(LaunchChoice::List));
+        assert!(request(AgentChoose::List).encode().contains("\"choose\":\"list\""));
+        assert_eq!(AgentChoose::of(LaunchChoice::List), AgentChoose::List);
+
+        // An older Brindle refuses the kind by name.
+        let older = "this Brindle (0.40.0) can't open agent-choose tabs; quit it and launch again";
+        assert_eq!(
+            refusal_text(Some(AGENT_CHOOSE_KIND), older),
+            format!("the running Brindle is older and can't continue a conversation ({older})")
+        );
+        assert_eq!(refusal_text(Some("agent"), "Brindle is quitting"), "Brindle is quitting");
+        assert_eq!(refusal_text(Some(AGENT_CHOOSE_KIND), "Brindle is quitting"), "Brindle is quitting");
     }
 
     /// `process R6`: an agent request's line, byte for byte, with each
@@ -667,6 +756,7 @@ mod tests {
                 profile: Some("Fake".into()),
                 cwd: Some("/src".into()),
                 prompt: Some("run the tests".into()),
+                choose: None,
             }),
             launch_dir: Some("/home/u/src".into()),
             ..Default::default()
@@ -717,7 +807,7 @@ mod tests {
     fn an_agent_requests_size_is_checked_by_fits() {
         let with_prompt = |prompt: String| Request {
             kind: Some("agent".into()),
-            agent: Some(AgentRequest { profile: Some("Fake".into()), cwd: None, prompt: Some(prompt) }),
+            agent: Some(AgentRequest { profile: Some("Fake".into()), cwd: None, prompt: Some(prompt), choose: None }),
             launch_dir: Some("/home/u".into()),
             ..Default::default()
         };

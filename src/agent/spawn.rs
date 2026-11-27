@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use crate::agent::transcript::Conversation;
 use crate::config::{Config, Profile, ProfileKind};
 use crate::remote::Host;
-use crate::remote::protocol::client::AgentConversation;
+use crate::remote::protocol::client::{AgentConversation, SpawnStart};
 
 /// The variables that describe a terminal, which an agent (on plain pipes,
 /// with no grid) doesn't get from Brindle: those Brindle sets for its
@@ -50,9 +50,31 @@ pub struct AgentSpawnRequest {
     /// A conversation for the agent to continue instead of starting one
     /// (`SPAWN_AGENT`'s `conversation`): a continue in a new session.
     pub conversation: Option<AgentConversation>,
+    /// `Some(Choose)`: the agent is initialized and then waits for a
+    /// conversation to be chosen (`SPAWN_AGENT`'s `start`, OpenSpec change
+    /// `agents-session-list` decision 1). Never with `conversation`.
+    pub start: Option<SpawnStart>,
 }
 
 impl AgentSpawnRequest {
+    /// This start choosing: initialized, it waits for `AGENT_CHOOSE`
+    /// instead of starting a conversation.
+    pub fn choosing(self) -> Self {
+        Self { start: Some(SpawnStart::Choose), conversation: None, ..self }
+    }
+
+    /// This start continuing the listed conversation `id` of directory
+    /// `cwd` (a choice from a list a running zone's agent gave), in that
+    /// directory, as [`Self::continuing`] does a zone's own.
+    pub fn continuing_listed(self, id: &str, cwd: &str) -> Self {
+        Self {
+            cwd: Some(cwd.to_string()),
+            conversation: Some(AgentConversation { id: id.to_string(), cwd: cwd.to_string() }),
+            start: None,
+            ..self
+        }
+    }
+
     /// This start continuing `conversation` (an `Offer::Respawn`), in the
     /// conversation's directory, which ACP ties it to (the server runs it
     /// there whatever `cwd` says).
@@ -150,6 +172,7 @@ pub fn agent_spawn_request(
         env: environment(profile, host, vars, ignore_case),
         profile: profile.name.clone(),
         conversation: None,
+        start: None,
     }
 }
 
@@ -323,6 +346,23 @@ mod tests {
         assert_eq!(continuing.cwd.as_deref(), Some("/home/u/src"));
         assert_eq!(continuing.conversation, Some(AgentConversation { id: "sess-1".into(), cwd: "/home/u/src".into() }));
         assert_eq!((continuing.command, continuing.args, continuing.env), (start.command, start.args, start.env));
+    }
+
+    /// A choosing start keeps the directory and asks to choose; a listed
+    /// conversation continued in a new session names it and runs in its
+    /// directory, choosing nothing (`agents-session-list` decisions 1, 5).
+    #[test]
+    fn a_choosing_start_and_a_listed_conversations_continue() {
+        let profile = agent("cwd = \"/srv\"\n");
+        let start = request(&profile, &Host::Local, None, &OpenedBy::Window);
+        assert_eq!(start.start, None, "a new zone's start starts a conversation");
+        let choosing = start.clone().choosing();
+        assert_eq!(choosing.start, Some(SpawnStart::Choose));
+        assert_eq!((choosing.cwd.as_deref(), choosing.conversation.as_ref()), (Some("/srv"), None));
+        let listed = choosing.continuing_listed("s7", "/home/u/api");
+        assert_eq!(listed.start, None, "a continue never also chooses");
+        assert_eq!(listed.cwd.as_deref(), Some("/home/u/api"));
+        assert_eq!(listed.conversation, Some(AgentConversation { id: "s7".into(), cwd: "/home/u/api".into() }));
     }
 
     /// The profile a continue runs is found by the session's profile name,

@@ -30,7 +30,12 @@ use self::overlays::{Opens, OverlayKind, PaletteRole, Toggle, toggle};
 use self::previews::Previews;
 use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
-use crate::agent::Agent;
+use crate::agent::conversations::{
+    self as conversations, ConversationsModel, Lister, Open, Pane, Place, ZoneAt, ZoneFacts, list_dir, lister_plan, open_mark,
+    open_plan,
+};
+use crate::agent::model::{ListFor, ListerState};
+use crate::agent::{Agent, AgentListed};
 use crate::agent::spawn::OpenedBy;
 use crate::config::{Config, Profile, ProfileKey, ProfileKind};
 use crate::TabKind;
@@ -38,7 +43,8 @@ use crate::config_edit;
 use crate::notify::osc::Source;
 use crate::notify::{self, Notifier};
 use crate::picker::{
-    KillOutcome, Listing, Palette, PaletteEvent, PaletteRow, PromptRequest, SessionRef, SessionRow, SessionsModel, SubmitFn,
+    KillOutcome, Listing, Palette, PaletteEvent, PaletteGroup, PaletteRow, PromptRequest, SessionRef, SessionRow, SessionsModel,
+    SubmitFn,
 };
 use crate::settings::Zoom;
 use crate::motion::Motion;
@@ -62,7 +68,7 @@ use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::zone_view::{
-    CloseZoneAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
+    CloseZoneAsk, ConversationsAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
     ZoneTreeView, describe_badge, ui_badge,
 };
 use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
@@ -362,6 +368,12 @@ enum PaletteKind {
     /// the zone that was active when it opened, split only if it is still
     /// there and fits.
     SplitProfile { keys: Vec<ProfileKey>, tab: TabId, zone: ZoneId, axis: SplitAxis },
+    /// An agent profile's earlier conversations (OpenSpec change
+    /// `agents-session-list`).
+    Conversations(Box<ConversationsPalette>),
+    /// Which agent profile's conversations to list, by row (each one's key
+    /// when the palette opened), for the pane `from`.
+    ConversationsProfile { keys: Vec<ProfileKey>, from: ZoneAt },
 }
 
 impl PaletteKind {
@@ -372,8 +384,27 @@ impl PaletteKind {
             Self::Prompt => PaletteRole::Prompt,
             Self::Sessions { .. } => PaletteRole::Sessions,
             Self::SplitProfile { .. } => PaletteRole::SplitProfile,
+            Self::Conversations(_) | Self::ConversationsProfile { .. } => PaletteRole::Conversations,
         }
     }
+}
+
+/// The conversations palette (OpenSpec change `agents-session-list`
+/// decisions 3 to 5): its model, `profile`'s conversations on `host` in
+/// `dir`, asked from the pane `from`, listed through `lister`.
+struct ConversationsPalette {
+    model: ConversationsModel,
+    profile: Profile,
+    host: Host,
+    dir: Option<PathBuf>,
+    from: ZoneAt,
+    lister: Entity<Agent>,
+    /// The agent started for the list (`lister` itself), which the palette
+    /// holds until a choice takes it: closing the palette ends it.
+    chooser: Option<Entity<Agent>>,
+    /// Whether the first page was asked for.
+    asked: bool,
+    _subscriptions: Vec<Subscription>,
 }
 
 /// The window's overlay, and what its slot needs while it is open. At most
@@ -969,6 +1000,8 @@ impl Workspace {
         }
         self.record_session(window, cx);
         self.quitting = true;
+        // An agent the conversations palette started ends (decision 12).
+        self.close_palette_chooser(cx);
         // Each tab's kept sessions are detached with its layout.
         for (index, tab) in self.tabs.iter().enumerate() {
             let title = tab.manual_title.clone();
@@ -1067,9 +1100,17 @@ impl Workspace {
                 };
                 ZoneStart::Terminal(cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx)))
             }
-            LaunchPlan::Agent { opened, first } => {
+            LaunchPlan::Agent { opened, first, choose: None } => {
                 let cwd = agent_cwd(request.cwd, &host);
                 ZoneStart::Agent(cx.new(|cx| Agent::spawn(&profile, &host, cwd, opened, first, cx)))
+            }
+            // `-c`, `-r`: the zone's agent starts choosing (OpenSpec change
+            // `agents-session-list` decision 8).
+            LaunchPlan::Agent { opened, first, choose: Some(choose) } => {
+                let cwd = agent_cwd(request.cwd, &host);
+                ZoneStart::Agent(
+                    cx.new(|cx| Agent::spawn_choosing(&profile, &host, cwd, opened, first, Some(choose), cx)),
+                )
             }
         };
         self.insert_zone_tab(profile, host, start, true, window, cx);
@@ -1403,7 +1444,337 @@ impl Workspace {
             cx.subscribe(view, |this, _, SplitRefused(refusal): &SplitRefused, cx| {
                 this.show_notice(refusal.text().to_string(), cx);
             }),
+            cx.subscribe_in(view, window, |this, view, ask: &ConversationsAsk, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.open_zone_conversations(ZoneAt { tab, zone: ask.zone }, window, cx);
+            }),
         ]
+    }
+
+    /// What the conversations plans know of every zone of the window, the
+    /// active tab's the most recent.
+    fn conversation_facts(&self, cx: &App) -> Vec<ZoneFacts> {
+        let active = self.active_tab().map(|tab| tab.id);
+        self.tabs
+            .iter()
+            .flat_map(|tab| {
+                let base = if Some(tab.id) == active { 1 << 32 } else { 0 };
+                tab.zones.read(cx).zone_facts(tab.id, base, cx)
+            })
+            .collect()
+    }
+
+    /// The active tab's active zone.
+    fn active_zone_at(&self, cx: &App) -> Option<ZoneAt> {
+        let tab = self.active_tab()?;
+        Some(ZoneAt { tab: tab.id, zone: tab.zones.read(cx).active_id() })
+    }
+
+    fn tab_zones(&self, tab: TabId) -> Option<Entity<ZoneTreeView>> {
+        self.tabs.iter().find(|t| t.id == tab).map(|t| t.zones.clone())
+    }
+
+    /// An agent zone's Conversations… (and `agent_conversations`, and a
+    /// `-r` launch): the palette for its own profile, from it.
+    fn open_zone_conversations(&mut self, from: ZoneAt, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(zones) = self.tab_zones(from.tab) else { return };
+        let Some(zone) = zones.read(cx).zone(from.zone) else { return };
+        let config = Self::settings(cx);
+        // The config's profile of that name, else the zone's as last seen.
+        let profile = config
+            .profile_index(&zone.profile.name)
+            .map_or_else(|| zone.profile.clone(), |ix| config.profiles[ix].clone());
+        self.open_conversations(profile, from, window, cx);
+    }
+
+    /// `agent_continue_conversation`: the conversations palette for the
+    /// config's agent profile, asking which first when it has several (the
+    /// active zone's first when it is one), from the active zone.
+    fn continue_agent_conversation(&mut self, _: &AgentContinueConversation, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.toggles_open(OverlayKind::Palette(PaletteRole::Conversations), window, cx) {
+            return;
+        }
+        let Some(from) = self.active_zone_at(cx) else { return };
+        let config = Self::settings(cx);
+        let names = config.profiles.iter().map(|p| p.name.as_str());
+        let agents: Vec<ProfileKey> = (0..config.profiles.len())
+            .filter(|&ix| config.profiles[ix].kind() == ProfileKind::Agent)
+            .filter_map(|ix| ProfileKey::of(names.clone(), ix))
+            .collect();
+        let active = self
+            .tab_zones(from.tab)
+            .and_then(|zones| zones.read(cx).zone(from.zone).map(|zone| zone.profile.name.clone()))
+            .and_then(|name| config.profile_index(&name))
+            .and_then(|ix| ProfileKey::of(names.clone(), ix));
+        let keys = conversations::ask_order(agents, active.as_ref());
+        let profiles: Vec<Profile> =
+            keys.iter().filter_map(|key| config.find_profile(key).map(|ix| config.profiles[ix].clone())).collect();
+        match profiles.as_slice() {
+            [] => {}
+            [profile] => {
+                let profile = profile.clone();
+                self.open_conversations(profile, from, window, cx);
+            }
+            [..] => {
+                let rows = profile_rows(&profiles, &[]);
+                let palette = cx.new(|cx| Palette::list(rows, "Continue a conversation of…", cx));
+                self.show_palette(palette, PaletteKind::ConversationsProfile { keys, from }, window, cx);
+            }
+        }
+    }
+
+    /// Opens the conversations palette for `profile` from the pane `from`
+    /// (decisions 3 and 4): its directory as a new zone of the profile
+    /// split from the pane would get, listed through a ready zone of the
+    /// profile there or an agent started choosing for it.
+    fn open_conversations(&mut self, profile: Profile, from: ZoneAt, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(zones) = self.tab_zones(from.tab) else { return };
+        let (host, dir) = {
+            let zones = zones.read(cx);
+            let Some(zone) = zones.zone(from.zone) else { return };
+            let pane_dir = zones.zone_working_directory(from.zone, cx);
+            let pane = Pane { profile: &zone.profile, host: &zone.host, dir: pane_dir.as_deref() };
+            list_dir(pane, &profile, dirs::home_dir().as_deref())
+        };
+        let facts = self.conversation_facts(cx);
+        let (lister, chooser) = match lister_plan(&profile.name, &host, dir.as_deref(), from, &facts) {
+            Lister::Zone(at) => {
+                let Some(agent) = self.tab_zones(at.tab).and_then(|zones| zones.read(cx).agent_of(at.zone, cx)) else {
+                    return;
+                };
+                (agent, None)
+            }
+            Lister::Chooser => {
+                let agent = cx.new(|cx| {
+                    Agent::spawn_choosing(&profile, &host, dir.clone(), OpenedBy::Window, None, None, cx)
+                });
+                (agent.clone(), Some(agent))
+            }
+        };
+        let mut model =
+            ConversationsModel::new(profile.name.clone(), Agent::dir_shown(&host, dir.as_deref()), chooser.is_some());
+        model.set_open(
+            facts
+                .iter()
+                .filter_map(|zone| zone.conversation.clone())
+                .filter(|id| open_mark(id, &profile.name, &host, &facts))
+                .collect(),
+        );
+        let subscriptions = vec![
+            cx.observe_in(&lister, window, |this, _, _, cx| this.conversations_lister_changed(cx)),
+            cx.subscribe(&lister, |this, _, AgentListed(outcome): &AgentListed, cx| {
+                this.conversations_listed(outcome.clone(), cx);
+            }),
+        ];
+        let title = model.title();
+        let empty = model.empty_text().map(SharedString::from);
+        let palette = cx.new(|cx| Palette::list_grouped(vec![PaletteGroup::unnamed(Vec::new())], title, empty, cx));
+        let state = ConversationsPalette {
+            model,
+            profile,
+            host,
+            dir,
+            from,
+            lister: lister.clone(),
+            chooser,
+            asked: false,
+            _subscriptions: subscriptions,
+        };
+        self.show_palette(palette, PaletteKind::Conversations(Box::new(state)), window, cx);
+        // A ready zone lists at once; a chooser once it is choosing.
+        self.conversations_lister_changed(cx);
+    }
+
+    /// The open conversations palette, if that is what shows.
+    fn conversations_palette(&mut self) -> Option<&mut ConversationsPalette> {
+        match &mut self.overlay {
+            Overlay::Palette { kind: PaletteKind::Conversations(palette), .. } => Some(palette),
+            Overlay::Closed
+            | Overlay::SessionsOpening(_)
+            | Overlay::Palette { .. }
+            | Overlay::Settings
+            | Overlay::ProfileMenu
+            | Overlay::ContextMenu { .. }
+            | Overlay::CloseConfirm { .. }
+            | Overlay::LinkConfirm { .. } => None,
+        }
+    }
+
+    /// The lister's agent changed: once it can list, the first page is
+    /// asked for; one that can't says why in the palette.
+    fn conversations_lister_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(palette) = self.conversations_palette() else { return };
+        let lister = palette.lister.clone();
+        match palette.model.state() {
+            conversations::ListState::Starting | conversations::ListState::Listing => {}
+            conversations::ListState::Listed | conversations::ListState::Failed(_) => return,
+        }
+        match lister.read(cx).lister_state() {
+            ListerState::Starting => return,
+            ListerState::Lists if !palette.asked => {
+                palette.model.listing();
+                palette.asked = true;
+                lister.update(cx, |agent, cx| agent.list(None, ListFor::Palette, cx));
+            }
+            ListerState::Lists => return,
+            ListerState::Failed(why) => palette.model.failed(why),
+        }
+        self.show_conversations(false, cx);
+    }
+
+    /// A list the palette asked for was answered.
+    fn conversations_listed(&mut self, outcome: Result<conversations::Page, String>, cx: &mut Context<Self>) {
+        let Some(palette) = self.conversations_palette() else { return };
+        match outcome {
+            Ok(page) => palette.model.page(page),
+            Err(why) => palette.model.failed(why),
+        }
+        self.show_conversations(true, cx);
+    }
+
+    /// Shows the conversations palette's model, keeping the highlighted row
+    /// when `keep` (a page appended below it).
+    fn show_conversations(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.palette.view().cloned() else { return };
+        let Some(palette) = self.conversations_palette() else { return };
+        let rows = palette.model.rows(unix_now() as i64);
+        let empty = palette.model.empty_text().map(SharedString::from);
+        let keep = if keep { view.read(cx).highlighted(cx) } else { None };
+        view.update(cx, |view, cx| view.set_groups(vec![PaletteGroup::unnamed(rows)], empty, keep, cx));
+        cx.notify();
+    }
+
+    /// Takes the conversations palette out of the overlay, so closing the
+    /// palette leaves its chooser to whoever takes it.
+    fn take_conversations(&mut self) -> Option<Box<ConversationsPalette>> {
+        self.conversations_palette()?;
+        match std::mem::replace(&mut self.overlay, Overlay::Closed) {
+            Overlay::Palette { kind: PaletteKind::Conversations(palette), .. } => Some(palette),
+            Overlay::Closed
+            | Overlay::SessionsOpening(_)
+            | Overlay::Palette { .. }
+            | Overlay::Settings
+            | Overlay::ProfileMenu
+            | Overlay::ContextMenu { .. }
+            | Overlay::CloseConfirm { .. }
+            | Overlay::LinkConfirm { .. } => None,
+        }
+    }
+
+    /// Ends the agent the open conversations palette started, which no
+    /// choice took (decision 3: escape, another overlay, the window closing,
+    /// a quit).
+    fn close_palette_chooser(&mut self, cx: &mut Context<Self>) {
+        if let Some(chooser) = self.conversations_palette().and_then(|palette| palette.chooser.take()) {
+            chooser.update(cx, |agent, _| agent.close());
+        }
+    }
+
+    /// Confirming row `ix` of the conversations palette.
+    fn conversations_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = self.conversations_palette() else { return };
+        match palette.model.confirm(ix) {
+            conversations::Pick::Nothing => {}
+            conversations::Pick::More(cursor) => {
+                let lister = palette.lister.clone();
+                lister.update(cx, |agent, cx| agent.list(Some(cursor), ListFor::Palette, cx));
+                self.show_conversations(true, cx);
+            }
+            conversations::Pick::Conversation(listed) => {
+                let (profile, host, from) = (palette.profile.name.clone(), palette.host.clone(), palette.from);
+                let facts = self.conversation_facts(cx);
+                match open_plan(&listed.id, &profile, &host, from, &facts) {
+                    Open::Show(at) => {
+                        self.dismiss_overlay(window, cx);
+                        self.show_zone(at, window, cx);
+                    }
+                    Open::Here(at) => self.open_here(at, listed.id, window, cx),
+                    Open::Ask => {
+                        let splits = self.tab_zones(from.tab).is_some_and(|zones| {
+                            let zones = zones.read(cx);
+                            zones.can_split(from.zone, SplitAxis::Horizontal, window, cx)
+                                || zones.can_split(from.zone, SplitAxis::Vertical, window, cx)
+                        });
+                        let Some(palette) = self.conversations_palette() else { return };
+                        palette.model.ask(listed, splits);
+                        self.clear_palette_filter(window, cx);
+                        self.show_conversations(false, cx);
+                    }
+                }
+            }
+            conversations::Pick::Place(listed, place) => self.open_placed(listed.id, place, window, cx),
+        }
+    }
+
+    /// Empties the open palette's filter (the question's rows are no
+    /// conversation's).
+    fn clear_palette_filter(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.palette.view().cloned() else { return };
+        let input = view.read(cx).input(cx);
+        input.update(cx, |input, cx| input.set_text("", cx));
+    }
+
+    /// Activates the tab of `at` and focuses that zone.
+    fn show_zone(&mut self, at: ZoneAt, window: &mut Window, cx: &mut Context<Self>) {
+        self.activate(Pick::Tab(at.tab), window, cx);
+        if let Some(zones) = self.tab_zones(at.tab) {
+            zones.update(cx, |zones, cx| zones.focus_zone(at.zone, window, cx));
+        }
+    }
+
+    /// The pane `at` takes conversation `id` (decision 5's `Here`): a
+    /// choosing zone chooses it; a stopped zone shows the chooser that
+    /// listed it, its own session closed, or, listed through another zone's
+    /// agent, a new session continuing it.
+    fn open_here(&mut self, at: ZoneAt, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = self.take_conversations() else { return };
+        self.dismiss_overlay(window, cx);
+        let Some(zones) = self.tab_zones(at.tab) else { return };
+        let Some(agent) = zones.read(cx).agent_of(at.zone, cx) else { return };
+        if agent.read(cx).model().is_choosing() {
+            // It listed for itself: it is the lister, no chooser.
+            agent.update(cx, |agent, cx| agent.choose(Some(id), cx));
+        } else if let Some(chooser) = palette.chooser {
+            chooser.update(cx, |agent, cx| agent.choose(Some(id), cx));
+            zones.update(cx, |zones, cx| zones.replace_agent(at.zone, chooser, window, cx));
+        } else {
+            agent.update(cx, |agent, cx| agent.continue_listed(&id, cx));
+        }
+        self.show_zone(at, window, cx);
+    }
+
+    /// The question's answer (decision 5's `Ask`): conversation `id` opens
+    /// in a split of the pane or a new tab, the chooser taking it or a new
+    /// session continuing it.
+    fn open_placed(&mut self, id: String, place: Place, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(palette) = self.take_conversations() else { return };
+        self.dismiss_overlay(window, cx);
+        let ConversationsPalette { profile, host, dir, from, chooser, .. } = *palette;
+        let agent = match chooser {
+            Some(chooser) => {
+                chooser.update(cx, |agent, cx| agent.choose(Some(id), cx));
+                chooser
+            }
+            None => cx.new(|cx| Agent::spawn_continuing(&profile, &host, dir, &id, cx)),
+        };
+        let axis = match place {
+            Place::SplitRight => SplitAxis::Horizontal,
+            Place::SplitDown => SplitAxis::Vertical,
+            Place::NewTab => {
+                self.insert_zone_tab(profile, host, ZoneStart::Agent(agent), true, window, cx);
+                return;
+            }
+        };
+        let spec = ZoneSpec::of(profile, host, Self::settings(cx));
+        let split = self.tab_zones(from.tab).is_some_and(|zones| {
+            zones.update(cx, |zones, cx| zones.split_zone_with(from.zone, axis, spec, ZoneStart::Agent(agent.clone()), window, cx))
+        });
+        if !split {
+            // The pane went, or got too small: the conversation's agent
+            // goes too, and the notice says why.
+            agent.update(cx, |agent, _| agent.close());
+            self.show_notice("the zone can't be split now; the conversation wasn't opened".into(), cx);
+        }
     }
 
     /// The palette a split asks with: `ask`'s profiles, each row as the
@@ -2167,12 +2538,28 @@ impl Workspace {
 
     /// Escape (or a click outside) on a palette.
     fn palette_dismissed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Escape at the conversations palette's question goes back to the
+        // list.
+        if self.conversations_palette().is_some_and(|palette| palette.model.back()) {
+            self.show_conversations(false, cx);
+            return;
+        }
         self.dismiss_overlay(window, cx);
     }
 
     fn palette_confirmed(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Overlay::Palette { kind, .. } = &self.overlay else { return };
         match kind {
+            PaletteKind::Conversations(_) => self.conversations_confirmed(ix, window, cx),
+            PaletteKind::ConversationsProfile { keys, from } => {
+                let (key, from) = (keys.get(ix).cloned(), *from);
+                let config = Self::settings(cx);
+                let Some(profile) = key.and_then(|key| config.find_profile(&key)).map(|ix| config.profiles[ix].clone())
+                else {
+                    return;
+                };
+                self.open_conversations(profile, from, window, cx);
+            }
             PaletteKind::NewTab { keys } => {
                 let key = keys.get(ix).cloned();
                 self.dismiss_overlay(window, cx);
@@ -2317,7 +2704,9 @@ impl Workspace {
                     PaletteKind::NewTab { .. }
                     | PaletteKind::Commands { .. }
                     | PaletteKind::Prompt
-                    | PaletteKind::SplitProfile { .. },
+                    | PaletteKind::SplitProfile { .. }
+                    | PaletteKind::Conversations(_)
+                    | PaletteKind::ConversationsProfile { .. },
                 ..
             }
             | Overlay::Settings
@@ -2480,6 +2869,7 @@ impl Workspace {
     /// goes too, so it never opens over whatever replaces this overlay.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.palette.close(window, cx);
+        self.close_palette_chooser(cx);
         self.overlay = Overlay::Closed;
         self.settings.close(window, cx);
         self._settings_subscriptions.clear();
@@ -2663,7 +3053,14 @@ impl Workspace {
     /// What `--wait-for` matches in the active zone: the terminal's visible
     /// screen text, or the agent zone's dump lines.
     pub fn active_screen_text(&self, cx: &App) -> Option<String> {
-        Some(self.active_tab()?.zones.read(cx).active_content()?.wait_text(cx))
+        let mut text = self.active_tab()?.zones.read(cx).active_content()?.wait_text(cx);
+        // The conversations palette's line too (`agents-session-list`), so a
+        // step can wait for its list.
+        if let Overlay::Palette { kind: PaletteKind::Conversations(palette), .. } = &self.overlay {
+            text.push('\n');
+            text.push_str(&palette.model.describe());
+        }
+        Some(text)
     }
 
     /// Debug hook for `--dump-screen-after`.
@@ -2745,6 +3142,9 @@ impl Workspace {
             out.push_str(&find);
         }
         if let Some(palette) = self.palette.view() {
+            if let Overlay::Palette { kind: PaletteKind::Conversations(conversations), .. } = &self.overlay {
+                out.push_str(&conversations.model.describe());
+            }
             out.push_str(&palette.read(cx).describe(cx));
         }
         if let Some(dialog) = self.settings.view() {
@@ -3638,6 +4038,7 @@ impl Render for Workspace {
                     .on_action(cx.listener(Self::focus_tab_strip))
                     .on_action(cx.listener(Self::close_window))
                     .on_action(cx.listener(Self::attach_session))
+                    .on_action(cx.listener(Self::continue_agent_conversation))
                     .on_action(cx.listener(Self::increase_font_size))
                     .on_action(cx.listener(Self::decrease_font_size))
                     .on_action(cx.listener(Self::reset_font_size))

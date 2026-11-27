@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use crate::FirstPrompt;
+use crate::agent::model::LaunchChoice;
 use crate::agent::spawn::OpenedBy;
 use crate::config::ProfileKind;
 use crate::remote::Host;
@@ -20,8 +21,9 @@ pub enum LaunchWith {
     /// the profile's.
     Command(String, Vec<String>),
     /// `brindle agent`, run in `launched_in` (`None` when that couldn't be
-    /// read), with its first prompt.
-    Agent { launched_in: Option<PathBuf>, first: Option<FirstPrompt> },
+    /// read), with its first prompt, and `-c` or `-r` as `choose` (OpenSpec
+    /// change `agents-session-list` decision 8).
+    Agent { launched_in: Option<PathBuf>, first: Option<FirstPrompt>, choose: Option<LaunchChoice> },
 }
 
 /// What a launch's tab runs (design.md decision 3).
@@ -29,8 +31,9 @@ pub enum LaunchWith {
 pub enum LaunchPlan {
     /// A terminal tab, running `command` or the profile's own.
     Terminal { command: Option<(String, Vec<String>)> },
-    /// An agent tab, opened as `opened` says, with its first prompt.
-    Agent { opened: OpenedBy, first: Option<FirstPrompt> },
+    /// An agent tab, opened as `opened` says, with its first prompt, its
+    /// agent started choosing for `choose` when given.
+    Agent { opened: OpenedBy, first: Option<FirstPrompt>, choose: Option<LaunchChoice> },
 }
 
 /// What a launch opens for a profile of `kind`: the profile's kind decides
@@ -44,11 +47,11 @@ pub fn launch_plan(kind: ProfileKind, with: LaunchWith) -> LaunchPlan {
             LaunchPlan::Terminal { command: Some((program, args)) }
         }
         (ProfileKind::Terminal, LaunchWith::Profile | LaunchWith::Agent { .. }) => LaunchPlan::Terminal { command: None },
-        (ProfileKind::Agent, LaunchWith::Agent { launched_in, first }) => {
-            LaunchPlan::Agent { opened: OpenedBy::AgentCommand(launched_in), first }
+        (ProfileKind::Agent, LaunchWith::Agent { launched_in, first, choose }) => {
+            LaunchPlan::Agent { opened: OpenedBy::AgentCommand(launched_in), first, choose }
         }
         (ProfileKind::Agent, LaunchWith::Profile | LaunchWith::Command(..)) => {
-            LaunchPlan::Agent { opened: OpenedBy::Window, first: None }
+            LaunchPlan::Agent { opened: OpenedBy::Window, first: None, choose: None }
         }
     }
 }
@@ -178,7 +181,7 @@ mod tests {
     fn the_profile_kind_decides_what_a_launch_runs() {
         let first = FirstPrompt::new("hi".into()).ok();
         let here = Some(PathBuf::from("/work"));
-        let agent = LaunchWith::Agent { launched_in: here.clone(), first: first.clone() };
+        let agent = LaunchWith::Agent { launched_in: here.clone(), first: first.clone(), choose: Some(LaunchChoice::Last) };
         let command = LaunchWith::Command("htop".into(), vec!["-d".into()]);
         let terminal = |command: Option<(&str, &[&str])>| LaunchPlan::Terminal {
             command: command.map(|(p, a)| (p.to_string(), a.iter().map(|a| a.to_string()).collect())),
@@ -188,9 +191,9 @@ mod tests {
         assert_eq!(launch_plan(ProfileKind::Terminal, agent.clone()), terminal(None));
         assert_eq!(
             launch_plan(ProfileKind::Agent, agent),
-            LaunchPlan::Agent { opened: OpenedBy::AgentCommand(here), first }
+            LaunchPlan::Agent { opened: OpenedBy::AgentCommand(here), first, choose: Some(LaunchChoice::Last) }
         );
-        let window = LaunchPlan::Agent { opened: OpenedBy::Window, first: None };
+        let window = LaunchPlan::Agent { opened: OpenedBy::Window, first: None, choose: None };
         assert_eq!(launch_plan(ProfileKind::Agent, LaunchWith::Profile), window);
         assert_eq!(launch_plan(ProfileKind::Agent, command), window);
     }

@@ -23,7 +23,9 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use parking_lot::Mutex;
 use serde_json::Value;
 
+use crate::agent::conversations::Page;
 use crate::agent::model::StartFailure;
+use crate::remote::protocol::client::AgentConversations;
 use crate::agent::shared::AgentShared;
 use crate::remote::protocol::RequestId;
 use crate::terminal::events::{Admit, EventGate, Kind, Merge, Recovered};
@@ -52,6 +54,10 @@ pub enum AgentEvent {
     /// The core answered the zone's request `request`, or it failed with
     /// the link.
     Reply { request: RequestId, outcome: Result<(), String> },
+    /// A page of the agent's conversations answering the list `request`
+    /// (`AGENT_CONVERSATIONS`, OpenSpec change `agents-session-list`), in
+    /// place of its reply.
+    Conversations { request: RequestId, page: Page },
     /// The core's word about the session that answers no request (a
     /// refused cancel, a holder's fault report).
     Note(String),
@@ -72,6 +78,7 @@ pub fn kind_of(event: &AgentEvent) -> Kind {
         | AgentEvent::Failed(_)
         | AgentEvent::Broken(_)
         | AgentEvent::Reply { .. }
+        | AgentEvent::Conversations { .. }
         | AgentEvent::Note(_)
         | AgentEvent::EndpointNote(_) => Kind::Life,
     }
@@ -241,6 +248,12 @@ impl Sink {
         self.send(AgentEvent::Reply { request, outcome });
     }
 
+    /// `AGENT_CONVERSATIONS` answering the list `request`: the page goes to
+    /// the zone in place of the request's reply.
+    pub fn conversations(&mut self, request: RequestId, listed: AgentConversations) {
+        self.send(AgentEvent::Conversations { request, page: Page::of(listed) });
+    }
+
     pub fn link_down(&mut self) {
         self.send(AgentEvent::LinkDown);
     }
@@ -373,6 +386,33 @@ mod tests {
             .collect();
         assert_eq!(texts.len(), 1);
         assert!(texts[0].contains("replayed"), "{texts:?}");
+    }
+
+    /// `agents-session-list` 4.1: a list's answer reaches the zone as its
+    /// page, in the server's order, with its cursor.
+    #[test]
+    fn a_lists_answer_reaches_the_zone_as_a_page() {
+        use crate::agent::conversations::{Listed, Page};
+        use crate::remote::protocol::client::{AgentConversations, ListedConversation};
+        let (mut sink, mut feed) = Sink::with_fault(None);
+        let listed = AgentConversations {
+            req: 4,
+            session: 7,
+            conversations: vec![
+                ListedConversation { id: "b".into(), title: Some("Fix".into()), updated: None },
+                ListedConversation { id: "a".into(), title: None, updated: Some("2026-11-01T00:00:00Z".into()) },
+            ],
+            next: Some("c2".into()),
+        };
+        sink.conversations(4, listed);
+        let page = Page {
+            conversations: vec![
+                Listed { id: "b".into(), title: Some("Fix".into()), updated: None },
+                Listed { id: "a".into(), title: None, updated: Some("2026-11-01T00:00:00Z".into()) },
+            ],
+            next: Some("c2".into()),
+        };
+        assert_eq!(taken(&mut feed), [AgentEvent::Conversations { request: 4, page }]);
     }
 
     /// An event that doesn't decode is refused with why; the ones before it

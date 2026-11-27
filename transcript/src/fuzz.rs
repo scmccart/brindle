@@ -272,8 +272,11 @@ fn login_method(rng: &mut XorShift) -> LoginMethod {
 }
 
 fn agent(rng: &mut XorShift) -> AgentState {
-    match rng.below(7) {
+    match rng.below(8) {
         0 => AgentState::Starting,
+        6 => AgentState::Choosing {
+            message: rng.chance(2).then(|| text(rng)),
+        },
         1 => AgentState::Ready {
             name: rng.chance(2).then(|| text(rng)),
             version: rng.chance(2).then(|| text(rng)),

@@ -10,7 +10,7 @@ use brindle_remote_protocol::serde_json::Value;
 
 use super::envelope::{BadParams, Id, RpcError};
 use super::forms::{
-    Continued, Initialized, Methods, NewSession, NotificationKind, PermissionRequest, Request,
+    Continued, Initialized, Listing, Methods, NewSession, NotificationKind, PermissionRequest, Request,
     RequestKind, SessionUpdate,
 };
 use super::v1;
@@ -105,6 +105,12 @@ impl Dialect {
     pub fn continue_method(self, how: Continued) -> &'static str {
         match self {
             Self::V1 => v1::encode::continue_method(how),
+        }
+    }
+
+    pub fn list_result(self, result: &Value) -> Result<Listing, BadParams> {
+        match self {
+            Self::V1 => v1::decode::list_result(result),
         }
     }
 

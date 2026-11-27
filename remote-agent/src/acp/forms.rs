@@ -50,6 +50,32 @@ pub struct Initialized {
     /// (`agentCapabilities.sessionCapabilities.resume`). A malformed
     /// capability reads as not offered.
     pub continuation: Continuation,
+    /// Whether the agent lists its conversations
+    /// (`agentCapabilities.sessionCapabilities.list`; OpenSpec change
+    /// `agents-session-list`). A malformed capability reads as not offered.
+    pub lists: bool,
+}
+
+/// A page of the agent's conversations, as its answer to a list gave them,
+/// in its order (`agents-session-list`, decision 2): each read on its own,
+/// so `unreadable` counts the ones that weren't.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Listing {
+    pub conversations: Vec<Listed>,
+    /// The cursor for the next page, when the agent has more.
+    pub next: Option<String>,
+    pub unreadable: usize,
+}
+
+/// One listed conversation, as sent (not yet bounded or cleaned).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub id: String,
+    /// Its directory; the reducer keeps only the session's.
+    pub cwd: String,
+    pub title: Option<String>,
+    /// When it was last active, in the agent's text.
+    pub updated: Option<String>,
 }
 
 /// The agent's `agentInfo`.
@@ -376,6 +402,13 @@ pub enum Request<'a> {
         id: u64,
         session: &'a str,
         text: &'a str,
+    },
+    /// A page of the agent's conversations in `cwd`, after `cursor`
+    /// (`agents-session-list`).
+    List {
+        id: u64,
+        cwd: &'a str,
+        cursor: Option<&'a str>,
     },
     /// Cancels `session`'s turn, a notification.
     Cancel { session: &'a str },

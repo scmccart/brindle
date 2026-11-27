@@ -87,6 +87,8 @@ pub fn all() -> Vec<Case> {
         // A diff and its permission detail through the holder on Windows.
         display("windows-agent-tool-diff", super::agent::permission_detail).needs_fake_agent(),
         display("windows-agent-continue", agent_continue).needs_fake_agent(),
+        // `brindle agent -c` through the holder's pipe session (`agents-session-list`).
+        display("windows-agent-continue-latest", super::conversations::continue_latest).needs_fake_agent(),
         display("windows-agent-login", agent_login).needs_fake_agent(),
         display("windows-agent-login-withheld", agent_login_withheld).needs_fake_agent(),
         // A login program's exit status through the holder's ConPTY: 0

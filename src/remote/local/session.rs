@@ -376,6 +376,17 @@ impl Session {
         self.running(|running| running.fetch(before, max_bytes))
     }
 
+    /// Asks for a page of the agent's conversations (`AGENT_LIST`), as
+    /// [`Session::prompt`]; the page reaches the sink in place of a reply.
+    pub fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+        self.running(|running| running.list(cursor))
+    }
+
+    /// Ends a choosing agent's wait (`AGENT_CHOOSE`), as [`Session::prompt`].
+    pub fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+        self.running(|running| running.choose(conversation))
+    }
+
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`), as [`Session::prompt`].
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
@@ -1485,6 +1496,7 @@ mod tests {
             env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
             profile: "Claude".into(),
             conversation: None,
+            start: None,
         }
     }
 
@@ -1686,6 +1698,7 @@ mod tests {
             policy: client::Policy::Detach,
             profile: Some("Claude".into()),
             conversation: None,
+            start: None,
         };
         assert_eq!(spawn, expected);
         shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
@@ -1775,6 +1788,40 @@ mod tests {
         assert_eq!(shows(&mut agent.feed, "the continued agent ready", ready), [reply(req)]);
         let again = agent.session.restart(request).unwrap();
         let refused = AgentEvent::Reply { request: again, outcome: Err("session 7: the agent hasn't ended".into()) };
+        assert_eq!(next_life(&mut agent.feed), refused);
+    }
+
+    /// `agents-session-list` 4.1: a list goes out as `AGENT_LIST` with its
+    /// cursor and its `AGENT_CONVERSATIONS` comes back as the zone's page;
+    /// a choice goes out as `AGENT_CHOOSE`, its refusal under its id.
+    #[test]
+    fn a_list_and_a_choice_go_out_and_their_answers_come_back() {
+        let mut agent = agent_session_with("agent-list", None, move |message, stream| match message {
+            ToCore::SpawnAgent(spawn) => {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: AGENT, pid: 4242, key: "k7".into() }));
+                let ready = AgentState::Ready { name: Some("fake".into()), version: None };
+                transcript(stream, &[Event::Agent { state: ready }]);
+            }
+            ToCore::AgentList(list) => {
+                let conversations = vec![client::ListedConversation { id: "s1".into(), title: None, updated: None }];
+                let listed = client::AgentConversations { req: list.req, session: AGENT, conversations, next: None };
+                send(stream, ToClient::AgentConversations(listed));
+            }
+            ToCore::AgentChoose(choose) => refuse(stream, choose.req, "session 7: the agent isn't choosing"),
+            _ => {}
+        });
+        let req = agent.session.list(Some("c1".into())).unwrap();
+        let sent = client::AgentList { req, session: AGENT, cursor: Some("c1".into()) };
+        assert_eq!(recv(&agent.core), ToCore::AgentList(sent));
+        let page = crate::agent::conversations::Page {
+            conversations: vec![crate::agent::conversations::Listed { id: "s1".into(), title: None, updated: None }],
+            next: None,
+        };
+        assert_eq!(next_life(&mut agent.feed), AgentEvent::Conversations { request: req, page });
+        let chose = agent.session.choose(Some("s1".into())).unwrap();
+        let sent = client::AgentChoose { req: chose, session: AGENT, conversation: Some("s1".into()) };
+        assert_eq!(recv(&agent.core), ToCore::AgentChoose(sent));
+        let refused = AgentEvent::Reply { request: chose, outcome: Err("session 7: the agent isn't choosing".into()) };
         assert_eq!(next_life(&mut agent.feed), refused);
     }
 
@@ -2009,6 +2056,7 @@ mod tests {
             env: BTreeMap::new(),
             profile: "Fake".into(),
             conversation: None,
+            start: None,
         };
         let (sink, mut feed) = AgentSink::with_fault(Some(b"BRINDLE-FAULT-REAL".to_vec()));
         let session = Session::start_agent_with(move || Ok(starting), request, Box::new(sink));

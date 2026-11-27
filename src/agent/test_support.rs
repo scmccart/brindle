@@ -59,6 +59,8 @@ pub enum Call {
     Restart(AgentRestartRequest),
     Login(String),
     Fetch(u64, u32),
+    List(Option<String>),
+    Choose(Option<String>),
 }
 
 pub type Calls = Rc<RefCell<Vec<Call>>>;
@@ -132,6 +134,14 @@ impl Requests for FakeRequests {
 
     fn fetch(&self, before: u64, max_bytes: u32) -> Option<RequestId> {
         self.record(Call::Fetch(before, max_bytes))
+    }
+
+    fn list(&self, cursor: Option<String>) -> Option<RequestId> {
+        self.record(Call::List(cursor))
+    }
+
+    fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
+        self.record(Call::Choose(conversation))
     }
 }
 

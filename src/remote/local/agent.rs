@@ -53,6 +53,10 @@ impl SessionSink for Sink {
         Sink::page(self, request, events, last)
     }
 
+    fn conversations(&mut self, request: RequestId, listed: crate::remote::protocol::client::AgentConversations) {
+        Sink::conversations(self, request, listed);
+    }
+
     fn link_down(&mut self) {
         Sink::link_down(self);
     }

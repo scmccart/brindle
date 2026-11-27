@@ -577,7 +577,7 @@ writes its WinGet manifest.
 ```
 brindle [--no-restore]              # the window: the restored tabs, else the default profile
 brindle terminal [PROFILE] [-d DIR] [-e COMMAND ARGS...]   # a terminal tab
-brindle agent [PROFILE] [-d DIR] [-p PROMPT]               # an agent tab
+brindle agent [PROFILE] [-d DIR] [-p PROMPT] [-c | -r]     # an agent tab
 brindle --attach ID                 # a detached terminal server session
 brindle --list-actions | --list-themes | --shell-integration bash|zsh|fish|pwsh
 brindle --export-ui-tokens          # the built-in themes' UI tokens as CSS
@@ -783,7 +783,13 @@ font_size = 14
 agent profile), in DIR (else the profile's `cwd`, else the directory it was
 typed in). `-p PROMPT` is a first prompt, sent once the agent is ready, and
 `-p -` reads it from standard input (a file or a pipe, at most 256 KiB of
-UTF-8; one trailing line break is dropped). A terminal profile named after
+UTF-8; one trailing line break is dropped). `-c` (`--continue`) continues
+the latest of the agent's conversations in that directory, and `-r`
+(`--resume`) opens the list of them to choose one (see
+[Earlier conversations](#earlier-conversations)); they can't be given
+together, and a first prompt is sent once the chosen conversation is ready.
+A running Brindle from before them refuses such a launch, which then says so
+and exits with status 1. A terminal profile named after
 `agent`, an agent profile named after `terminal`, and `agent` in a config
 with no agent profile are refused with status 2. As with `brindle terminal`,
 a launch beside a running Brindle is handed to it. From `brindle --help`:
@@ -874,6 +880,36 @@ Session…") as `agent · <activity>`, and `brindle-remote list` lists them too.
 An agent that needs a login says so, with its own message: log in through the
 agent's own command line, then open a new tab. An agent that exits, or speaks
 another ACP version, leaves its conversation readable.
+
+#### Earlier conversations
+
+An agent that offers ACP's `session/list` can list the conversations it had
+in a directory, newest first. Agent Conversations… (`agent_conversations`)
+in an agent zone lists its agent's conversations in the zone's directory,
+and Continue Agent Conversation… (`agent_continue_conversation`, from any
+zone, listed when the config has an agent profile) lists them for the
+agent profile you pick (asked when there are several, the active zone's
+first) in the active zone's directory. Neither has a default key. The list
+reuses a ready agent of that profile and directory, else starts one that
+waits for the choice. Each row is the conversation's title (an untitled one
+reads `Untitled` and the start of its id), with when it was last active,
+and "open" when a zone shows it; "More…" loads the next page. Choosing a
+conversation a zone shows goes to that zone; choosing another from a
+stopped or choosing agent zone continues it there; from anywhere else it
+asks where: Split Right, Split Down or New Tab (escape goes back to the
+list). Escape closes the list, and an agent started only for it.
+
+An agent that exits, is lost or can't go on shows, beside the reason, up to
+three buttons after the prompt input in tab order: Continue conversation
+(when the agent can continue that one), Conversations… (the list, when it
+can list) and New conversation (starts the profile again in a new session).
+A zone whose profile is gone from the config offers none. A tab opened with
+`-c` or `-r`, or a zone whose choice was refused, shows the choosing screen:
+its reason ("choose a conversation, or start a new one", "no earlier
+conversation in …", or the agent's refusal) and the Conversations… and New
+conversation buttons. A zone that is still choosing when Brindle quits is
+closed, so it isn't restored. An agent that can't list says so in the list
+instead of rows, as does a list the agent failed.
 
 Not yet: syntax highlighting, logging in from the zone (`agents-login`), going on after an agent exits (`agents-session-recovery`),
 and ACP version 2

@@ -79,6 +79,13 @@
 //!   with no client attached, and the exit then ends the agent as any.
 //! - **Listing:** [`Agent::info`] maps the log's [`Activity`] onto the
 //!   wire's [`AgentActivity`] with an exhaustive `match` ([`activity`]).
+//! - **Choosing** (change `agents-session-list`): a `SPAWN_AGENT` with
+//!   `start: "choose"` starts as [`Agent::choosing`], whose agent waits
+//!   after `initialize`. `AGENT_LIST` steps `Command::List`: nothing is
+//!   sent at once, and the step whose [`Output::listed`] answers it sends
+//!   `AGENT_CONVERSATIONS` or the `ERROR` to the attached client.
+//!   `AGENT_CHOOSE` steps `Command::Choose`, answered `OK` or `ERROR` as
+//!   any command.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
@@ -100,7 +107,7 @@ use super::policy::{
 use super::sessions::{Life, SpawnRequest};
 use super::{Core, log};
 use crate::acp::checkpoint;
-use crate::acp::reduce::{self, AgentSession, Command, Input, Output, Refused};
+use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused};
 use crate::server::event_loop::{EventLoop, Token};
 use crate::server::fault;
 use crate::server::platform;
@@ -154,6 +161,12 @@ impl Agent {
     /// A new agent session working in `cwd` (absolute).
     pub(super) fn new(cwd: String) -> Self {
         Self::with(Acp::Running(Box::new(AgentSession::new(cwd, VERSION.to_owned()))))
+    }
+
+    /// A new agent session in `cwd` whose agent waits for a client to
+    /// choose a conversation (`agents-session-list` decision 1).
+    pub(super) fn choosing(cwd: String) -> Self {
+        Self::with(Acp::Running(Box::new(AgentSession::choosing(cwd, VERSION.to_owned()))))
     }
 
     /// A new agent session continuing `conversation` (a `SPAWN_AGENT` that
@@ -257,7 +270,8 @@ impl Agent {
                     | AgentState::LoggingIn { .. }
                     | AgentState::Failed { .. }
                     | AgentState::Exited { .. }
-                    | AgentState::Lost { .. } => None,
+                    | AgentState::Lost { .. }
+                    | AgentState::Choosing { .. } => None,
                 };
                 AgentInfo {
                     activity: activity(transcript.activity()),
@@ -353,7 +367,9 @@ fn inject_fault(input: &Input<'_>) {
             | Command::Resend
             | Command::Cancel
             | Command::Answer { .. }
-            | Command::Login { .. },
+            | Command::Login { .. }
+            | Command::List { .. }
+            | Command::Choose { .. },
         )
         | Input::Fault { .. }
         | Input::Tick => return,
@@ -432,6 +448,32 @@ impl AgentCommand {
             },
         }
     }
+
+    /// `AGENT_LIST` (OpenSpec change `agents-session-list`): answered by
+    /// `AGENT_CONVERSATIONS` once the agent answers, not by `OK`.
+    pub(super) fn list(list: client::AgentList) -> Self {
+        Self {
+            request: AgentRequest::List,
+            req: Some(list.req),
+            session: list.session,
+            command: Command::List {
+                req: list.req,
+                cursor: list.cursor,
+            },
+        }
+    }
+
+    /// `AGENT_CHOOSE` (`agents-session-list`).
+    pub(super) fn choose(choose: client::AgentChoose) -> Self {
+        Self {
+            request: AgentRequest::Choose,
+            req: Some(choose.req),
+            session: choose.session,
+            command: Command::Choose {
+                conversation: choose.conversation,
+            },
+        }
+    }
 }
 
 impl<L: EventLoop> Core<L> {
@@ -443,7 +485,11 @@ impl<L: EventLoop> Core<L> {
         let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
         let refusal = policy::agent_request_refusal(protocol, AgentRequest::Spawn)
             .map(|refusal| refusal.to_string())
-            .or_else(|| policy::agent_spawn_refusal(&spawn.command).map(str::to_owned));
+            .or_else(|| policy::agent_spawn_refusal(&spawn.command).map(str::to_owned))
+            .or_else(|| {
+                (spawn.conversation.is_some() && spawn.start.is_some())
+                    .then(|| "SPAWN_AGENT can't both continue a conversation and choose one".to_owned())
+            });
         if let Some(refusal) = refusal {
             return self.send_client(client, error(Some(spawn.req), None, refusal));
         }
@@ -620,7 +666,10 @@ impl<L: EventLoop> Core<L> {
         if let Err(message) = running {
             return self.send_client(client, error(req, Some(id), message));
         }
+        // A list taken is answered by `AGENT_CONVERSATIONS` later.
+        let answered_later = matches!(command, Command::List { .. });
         match self.agent_step(id, Input::Command(command)) {
+            Some(Ok(())) if answered_later => {}
             Some(Ok(())) => {
                 if let Some(req) = req {
                     self.send_client(client, ToClient::Ok(client::Request { req }));
@@ -683,6 +732,37 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// The answer to a list of session `id`'s conversations, to the client
+    /// attached now (`agents-session-list` decision 2): `AGENT_CONVERSATIONS`
+    /// in one frame, or the `ERROR` naming the session. Dropped with no
+    /// client attached, which asked on a link since gone.
+    fn send_listed(&mut self, id: SessionId, answer: ListAnswer) {
+        let ListAnswer { req, result } = answer;
+        let Some(client) = self.sessions.get(&id).and_then(|session| session.ownership.client()) else {
+            return log!("session {id}: a list of its conversations answered no client");
+        };
+        match result {
+            Ok(page) => {
+                if page.unreadable > 0 {
+                    log!(
+                        "session {id}: {} of its agent's listed conversations couldn't be read",
+                        page.unreadable
+                    );
+                }
+                let listed = client::AgentConversations {
+                    req,
+                    session: id,
+                    conversations: page.conversations,
+                    next: page.next,
+                };
+                self.send_client(client, ToClient::AgentConversations(listed));
+            }
+            Err(message) => {
+                self.send_client(client, error(Some(req), Some(id), format!("session {id}: {message}")));
+            }
+        }
+    }
+
     /// Steps agent session `id` with `input` and applies what it says;
     /// gives the reply to a client's command. Nothing for a session that
     /// isn't a running agent's.
@@ -711,7 +791,11 @@ impl<L: EventLoop> Core<L> {
             checkpoint,
             hang_up,
             wake,
+            listed,
         } = output;
+        if let Some(answer) = listed {
+            self.send_listed(id, answer);
+        }
         let session = self.sessions.get_mut(&id)?;
         let client = session
             .ownership
