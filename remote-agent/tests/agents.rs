@@ -302,6 +302,12 @@ fn agent_core(tag: &str, env: &[(&str, &str)]) -> (TempDir, TestClient) {
     (dir, client)
 }
 
+/// The client capabilities `initialize` offers: terminal logins and
+/// boolean session options.
+fn capabilities() -> Value {
+    json!({"auth": {"terminal": true}, "session": {"configOptions": {"boolean": {}}}})
+}
+
 fn ready(log: &Transcript) -> bool {
     matches!(log.agent(), AgentState::Ready { .. })
 }
@@ -2653,8 +2659,9 @@ fn initialize_advertises_terminal_logins_and_a_terminal_method_is_the_clients_to
     let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
     let log = client.transcript_until(id, "needs a login", needs_any_login);
 
-    // `auth.terminal`, and no `fs` or `terminal` capability.
-    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], json!({"auth": {"terminal": true}}));
+    // `auth.terminal` and boolean options (`agents-commands`), and no `fs`
+    // or `terminal` capability.
+    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], capabilities());
     let terminal = LoginMethod {
         id: "cli-login".into(),
         name: "Log in from the terminal".into(),
@@ -2714,7 +2721,7 @@ fn a_restart_while_a_login_is_needed_at_the_start_runs_a_new_agent_with_session_
     // `session/new`; the old one nothing more.
     assert_eq!(methods(&first), ["initialize", "session/new"]);
     assert_eq!(methods(&record), ["initialize", "session/new"]);
-    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], json!({"auth": {"terminal": true}}));
+    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], capabilities());
 
     client.prompt(id, "hi").unwrap();
     let log = client.transcript_until(id, "has the turn's end", ended(1));

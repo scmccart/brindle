@@ -226,6 +226,15 @@ The design was checked against `feat/agents-session-list` (PR #150) on 2026-11-2
 11. **A refused set's notice travels as its own event** from `AgentView` to `Workspace::show_notice` (beside `LinkFailed`, passed on by the zone tree as `LinkFailed` is), not as a `LinkFailed`, whose name says what it is for.
 12. **Task 1.5 stays**: the shape of `session/set_model` is pinned by the Codex and Antigravity captures, but claude-code-acp, the one agent whose model only it sets, hasn't been captured taking it.
 13. **This change is implemented on top of `agents-session-list`** (the branch is stacked on PR #150); the tasks' check that it is archived first is met by its merge, and its `Phase::Choosing`, `PromptInput::set_actions` and message 64 are taken as given.
+14. **The texts** (server half, as built): the refusals read "the agent offers no option \"ID\"", "option \"ID\" offers no choice \"VALUE\"" (a toggle sent to a select, or a choice to a toggle, names `true`/`false` as its value) and "an earlier change of an option hasn't been answered yet", each after the core's `session N: `; the agent's refusal of a set is a warning notice "the agent didn't change NAME to SHOWN: WHY" (SHOWN the choice's name, or `on`/`off`), and an answer Brindle can't read gives WHY "its answer isn't one Brindle can read"; a bounded list is one warning notice, "the agent offered N commands; K are kept" (or "options").
+15. **A start's events come in the order conversation, options, notice, ready**: the options are emitted in `Step::ready` after the `Conversation` event and before the start's notice and `Ready`, so a client that folds `Ready` already holds them; commands come whenever the agent sends them, `Phase::Creating` included.
+16. **`rpc::Purpose` loses `Copy` and `Ord`** to carry `SetOption { id, value }`; it was matched and cloned, never ordered or copied in a way that mattered.
+17. **Reading an option item by item**: a missing or `null` `category` is `Other { name: "" }`, a category that isn't a string makes the item unreadable; a `select` without `currentValue` or `options` is unreadable, its unreadable choices are dropped and the option kept; an unknown `type` is left out uncounted (as the design's "another `type` left out"), and so is a `modes` or `models` value of the wrong shape (the option is just not made). A `configOptions` that isn't an array counts as one unreadable item.
+18. **The bounds skip, they don't stop**: an item that alone would push its event past `TEXT_CHUNK` is left out and the next is tried; ids and values over 1 KiB or holding a control character are left out rather than cleaned (a set names them), while names, descriptions and hints are cleaned and cut.
+19. **A config list keeps the options made from modes and models** (`Dialect::merge_options`) until it holds an option of that category itself; a kept option whose id the list now uses gets `'` appended, so ids stay unique.
+20. **The mode notice compares by phase**: an update while ready compares with the option held (or, with none held, the mode last in effect); a run's first list compares with the mode last in effect; a load's replay and the phases before ready compare with nothing and leave the mode last in effect alone, so a replayed mode update never adds a notice.
+21. **A checkpoint's keys must match its options exactly**: `option_keys` holding a key for an option the record lacks, or lacking one it holds, makes the checkpoint unreadable (`Unreadable::Field { name: "option_keys" }`) rather than leaving an option no set can reach.
+22. **"Two attached clients" in the real-role tests is an attach after**: a session has one attached client at a time, so task 3.1's and 3.2a's second client attaches once the first has detached, and its replay must hold both lists.
 
 ## The user's decisions
 
@@ -251,6 +260,11 @@ The unstable `models` list is read as one more option, which the user chose over
 - Fuzzy matching can list a command the user didn't mean → prefix matches come first, and enter takes only the highlighted one.
 - `OptionKey::Modes` and `OptionKey::Models` put v1 ideas in the version-free forms → they are opaque outside `acp/v1/`, and the architecture test says so.
 - The model list is unstable ACP, read by hand → it is used only when the agent offers no `model` option, lives in `acp/v1/` alone, is pinned by a capture, and a shape that stops decoding only removes that one option.
+
+## As built
+
+- **`session/set_model` (task 1.5, not done):** the capture of claude-code-acp 0.16.2 taking it needs a Claude Code session started from a script, which can't be run from inside the Claude Code session that built this, so the task stays open. The adapter's source (`ClaudeAcpAgent.unstable_setSessionModel`) answers `{}` after setting the model, as Codex 2.12 and Antigravity 1.5.16 are captured doing, so the model list is read and set as decisions 3 and 4 say; the encoding is pinned by those two captures (`acp/v1/encode.rs`'s `the_captured_sets_are_written_as_brindle_writes_them`). A capture is still owed before release.
+- **The fake ACP agent** needed no new step (task 3.3): `respond`, `respond-error`, `respond-to`, `send` and `wait-file` write every case.
 
 ## Migration Plan
 

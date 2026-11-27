@@ -85,7 +85,10 @@
 //!   sent at once, and the step whose [`Output::listed`] answers it sends
 //!   `AGENT_CONVERSATIONS` or the `ERROR` to the attached client.
 //!   `AGENT_CHOOSE` steps `Command::Choose`, answered `OK` or `ERROR` as
-//!   any command.
+//!   any command, and so does `AGENT_SET_OPTION`'s `Command::SetOption`
+//!   (OpenSpec change `agents-commands`): `OK` means the set was sent (or
+//!   asked for the current value), and the agent's answer reaches every
+//!   attached client as an `Options` event or a notice.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
@@ -369,7 +372,8 @@ fn inject_fault(input: &Input<'_>) {
             | Command::Answer { .. }
             | Command::Login { .. }
             | Command::List { .. }
-            | Command::Choose { .. },
+            | Command::Choose { .. }
+            | Command::SetOption { .. },
         )
         | Input::Fault { .. }
         | Input::Tick => return,
@@ -471,6 +475,19 @@ impl AgentCommand {
             session: choose.session,
             command: Command::Choose {
                 conversation: choose.conversation,
+            },
+        }
+    }
+
+    /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`).
+    pub(super) fn set_option(set: client::AgentSetOption) -> Self {
+        Self {
+            request: AgentRequest::SetOption,
+            req: Some(set.req),
+            session: set.session,
+            command: Command::SetOption {
+                option: set.option,
+                value: set.value,
             },
         }
     }
@@ -685,19 +702,6 @@ impl<L: EventLoop> Core<L> {
                 self.send_client(client, error(req, Some(id), message));
             }
         }
-    }
-
-    /// `AGENT_SET_OPTION` from `client` (OpenSpec change `agents-commands`):
-    /// refused by name below protocol 4, as every agent message is. The
-    /// reducer doesn't take sets yet (that change's task 3.1), so a
-    /// protocol 4 client's is refused with the reason.
-    pub(super) fn client_agent_set_option(&mut self, client: Token, set: client::AgentSetOption) {
-        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
-        let message = match policy::agent_request_refusal(protocol, AgentRequest::SetOption) {
-            Some(refusal) => refusal.to_string(),
-            None => format!("session {}: the agent's options can't be set yet", set.session),
-        };
-        self.send_client(client, error(Some(set.req), Some(set.session), message));
     }
 
     /// `AGENT_FETCH` from `client` (decision 5): the whole entries before

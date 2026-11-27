@@ -4,8 +4,11 @@
 //! message into these and encodes each [`Request`] as that version's line.
 //! Plain data, with no ACP method or field name in it.
 
+use brindle_remote_protocol::client::OptionValue;
+use brindle_remote_protocol::serde_json::{Map, Value};
 use brindle_transcript::{
-    Continuation, Exit, Location, LoginMethod, PermissionKind, ToolKind, ToolStatus,
+    Continuation, Exit, Location, LoginMethod, PermissionKind, SessionOption, SlashCommand,
+    ToolKind, ToolStatus,
 };
 
 use super::envelope::Id;
@@ -123,6 +126,75 @@ pub struct Methods {
 pub struct NewSession {
     /// The ACP session id every later request names.
     pub session_id: String,
+    /// The options it offered (OpenSpec change `agents-commands`).
+    pub offered: Offered,
+}
+
+/// The session options an agent offered, each with the key that sets it
+/// (OpenSpec change `agents-commands`, design decision 3): from a start's
+/// answer, a `config_option_update` or a set's answer. `unreadable` counts
+/// the items left out because they couldn't be read. Not yet bounded or
+/// cleaned: the reducer does both.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Offered {
+    pub options: Vec<OfferedOption>,
+    pub unreadable: usize,
+}
+
+/// One offered option and the key its set goes by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfferedOption {
+    pub option: SessionOption,
+    pub key: OptionKey,
+}
+
+/// How an option is set, opaque outside the version modules: the reducer
+/// keeps it beside its option, compares it whole and hands it back in
+/// [`Request::SetOption`]; only a version's encoder reads it. `Modes` and
+/// `Models` are v1's (session modes and the unstable model list), named
+/// only here and in `acp/v1/` (`tests/architecture.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionKey {
+    /// A config option, by the agent's id for it.
+    Config { id: String },
+    Modes,
+    Models,
+}
+
+impl OptionKey {
+    /// The key as a checkpoint stores it: `{"config": ID}`, `"modes"` or
+    /// `"models"`.
+    pub fn to_value(&self) -> Value {
+        match self {
+            Self::Config { id } => {
+                let mut object = Map::new();
+                object.insert("config".into(), Value::from(id.as_str()));
+                Value::Object(object)
+            }
+            Self::Modes => Value::from("modes"),
+            Self::Models => Value::from("models"),
+        }
+    }
+
+    /// The key a checkpoint stored, or `None` for anything else.
+    pub fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::String(name) => match name.as_str() {
+                "modes" => Some(Self::Modes),
+                "models" => Some(Self::Models),
+                _ => None,
+            },
+            Value::Object(object) if object.len() == 1 => object
+                .get("config")
+                .and_then(Value::as_str)
+                .map(|id| Self::Config { id: id.to_owned() }),
+            Value::Null
+            | Value::Bool(_)
+            | Value::Number(_)
+            | Value::Array(_)
+            | Value::Object(_) => None,
+        }
+    }
 }
 
 /// A `session/update` notification.
@@ -149,8 +221,20 @@ pub enum Update {
     /// (OpenSpec change `agents-session-title`, decision 2). Its
     /// `updatedAt` and `_meta` aren't read.
     SessionInfo { title: Patch<String> },
-    /// Any other kind, known (`plan`, `usage_update`,
-    /// `available_commands_update`, …) or not.
+    /// `available_commands_update`: the whole list, as sent (not yet
+    /// bounded or cleaned), and how many entries couldn't be read
+    /// (OpenSpec change `agents-commands`).
+    Commands {
+        commands: Vec<SlashCommand>,
+        unreadable: usize,
+    },
+    /// `config_option_update`: the whole list.
+    Options(Offered),
+    /// The current value of the option set by `key` changed (v1's
+    /// `current_mode_update`, keyed [`OptionKey::Modes`]); the reducer
+    /// applies it to the held option whose key equals it.
+    Current { key: OptionKey, value: String },
+    /// Any other kind, known (`plan`, `usage_update`, …) or not.
     Ignored { kind: String },
 }
 
@@ -409,6 +493,14 @@ pub enum Request<'a> {
         id: u64,
         cwd: &'a str,
         cursor: Option<&'a str>,
+    },
+    /// Sets the option `key` names in conversation `session` to `value`
+    /// (OpenSpec change `agents-commands`).
+    SetOption {
+        id: u64,
+        session: &'a str,
+        key: &'a OptionKey,
+        value: &'a OptionValue,
     },
     /// Cancels `session`'s turn, a notification.
     Cancel { session: &'a str },

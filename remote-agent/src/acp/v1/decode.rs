@@ -11,8 +11,15 @@
 //! - **`session/update`** is dispatched here on its `sessionUpdate` kind,
 //!   never through the crate's `SessionUpdate` enum, which costs the helper
 //!   more than a megabyte (decision 5, check 2). Only chunks, tool calls,
-//!   tool call updates and `session_info_update`'s title are decoded; every
-//!   other kind is [`Update::Ignored`].
+//!   tool call updates, `session_info_update`'s title and (OpenSpec change
+//!   `agents-commands`) `available_commands_update`, `config_option_update`
+//!   and `current_mode_update` are decoded; every other kind is
+//!   [`Update::Ignored`].
+//! - **Session options** are read by hand from the raw JSON, item by item
+//!   ([`start_options`]): config options, then one option made from v1's
+//!   `modes` and one from the unstable `models` list when no config option
+//!   has their category, keyed [`OptionKey::Modes`] and
+//!   [`OptionKey::Models`].
 //! - **The stop reason** is read from the result's `Value`, since the crate's
 //!   `StopReason` has no catch-all: a reason Brindle doesn't know is
 //!   [`StopReason::Other`].
@@ -34,7 +41,8 @@ use std::collections::BTreeMap;
 use agent_client_protocol_schema::v1 as acp;
 use brindle_remote_protocol::serde_json::{self, Map, Value};
 use brindle_transcript::{
-    Exit, Location, LoginKind, LoginMethod, PermissionKind, StopReason, ToolKind, ToolStatus,
+    Exit, Location, LoginKind, LoginMethod, OptionCategory, OptionChoice, OptionControl,
+    PermissionKind, SessionOption, SlashCommand, StopReason, ToolKind, ToolStatus,
 };
 
 use crate::acp::envelope::{BadParams, Id, RpcError};
@@ -42,7 +50,7 @@ use crate::acp::forms::{
     AgentInfo, Content, ContentKind, Continued, Initialized, Listed, Listing, MAX_LOGIN_ARG,
     MAX_LOGIN_ARGS,
     MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
-    NewSession, NotificationKind, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
+    NewSession, NotificationKind, Offered, OfferedOption, OptionKey, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
     RequestedOption, SessionUpdate, ToolCall, ToolChange, ToolDetail, ToolItemForm,
     UNSUPPORTED_VERSION, Update,
 };
@@ -246,6 +254,7 @@ pub fn new_session_result(result: &Value) -> Result<NewSession, BadParams> {
         serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
     Ok(NewSession {
         session_id: response.session_id.0.to_string(),
+        offered: start_options(result),
     })
 }
 
@@ -338,6 +347,9 @@ pub fn session_update(params: &Value) -> Result<SessionUpdate, BadParams> {
         "session_info_update" => Update::SessionInfo {
             title: session_title(update),
         },
+        "available_commands_update" => commands(update)?,
+        "config_option_update" => options_update(update)?,
+        "current_mode_update" => current_mode(update)?,
         other => Update::Ignored {
             kind: other.to_owned(),
         },
@@ -643,11 +655,302 @@ pub fn cancel_request(params: &Value) -> Result<Id, BadParams> {
 /// result has nothing the reducer reads, but must be an object the schema
 /// crate accepts. A load's replay came before it, as `session/update`
 /// notifications.
-pub fn continued_result(how: Continued, result: &Value) -> Result<(), BadParams> {
+pub fn continued_result(how: Continued, result: &Value) -> Result<Offered, BadParams> {
     match how {
-        Continued::Resume => resume_result(result),
-        Continued::Load => load_result(result),
+        Continued::Resume => resume_result(result)?,
+        Continued::Load => load_result(result)?,
     }
+    Ok(start_options(result))
+}
+
+/// The options a start's answer (`session/new`, `session/resume`,
+/// `session/load`) offers (OpenSpec change `agents-commands`, decisions 3
+/// and 12): its `configOptions`, item by item; then, when none of them has
+/// category `mode`, one option made from `modes`, and when none has
+/// category `model`, one made from the unstable `models` list. A `modes` or
+/// `models` that can't be read is left out and not counted: an agent that
+/// sends one has done nothing wrong by ACP.
+pub fn start_options(result: &Value) -> Offered {
+    let mut offered = config_options(result.get("configOptions"));
+    let has = |offered: &Offered, category: &OptionCategory| {
+        offered.options.iter().any(|held| held.option.category == *category)
+    };
+    if !has(&offered, &OptionCategory::Mode)
+        && let Some((current, choices)) =
+            result.get("modes").and_then(|modes| listed(modes, "currentModeId", "availableModes", "id"))
+    {
+        let id = free_id(&offered.options, "mode");
+        offered.options.push(made(id, "Mode", OptionCategory::Mode, current, choices, OptionKey::Modes));
+    }
+    if !has(&offered, &OptionCategory::Model)
+        && let Some((current, choices)) = result
+            .get("models")
+            .and_then(|models| listed(models, "currentModelId", "availableModels", "modelId"))
+    {
+        let id = free_id(&offered.options, "model");
+        offered.options.push(made(id, "Model", OptionCategory::Model, current, choices, OptionKey::Models));
+    }
+    offered
+}
+
+/// The answer to a set of the option `key` names: a config option's
+/// (`session/set_config_option`) carries the whole list of config options;
+/// `session/set_mode`'s and `session/set_model`'s are empty by design.
+pub fn set_option_result(key: &OptionKey, result: &Value) -> Result<Option<Offered>, BadParams> {
+    match key {
+        OptionKey::Config { .. } => match result.get("configOptions") {
+            Some(Value::Array(_)) => Ok(Some(config_options(result.get("configOptions")))),
+            Some(_) | None => Err(BadParams::missing("configOptions")),
+        },
+        OptionKey::Modes | OptionKey::Models => Ok(None),
+    }
+}
+
+/// The options after a whole list of config options (`config_option_update`
+/// or a set's answer) replaces the ones `held` had: the options made from
+/// `modes` and `models` stay, unless the new list now has an option of
+/// their category, and each keeps its id unless a config option took it.
+pub fn merge_options(held: &[OfferedOption], mut update: Offered) -> Offered {
+    for kept in held {
+        let category = match kept.key {
+            OptionKey::Config { .. } => continue,
+            OptionKey::Modes => OptionCategory::Mode,
+            OptionKey::Models => OptionCategory::Model,
+        };
+        if update.options.iter().any(|offered| offered.option.category == category) {
+            continue;
+        }
+        let mut kept = kept.clone();
+        kept.option.id = free_id(&update.options, &kept.option.id);
+        update.options.push(kept);
+    }
+    update
+}
+
+/// A list of config options, item by item: `select` (flat or grouped) and
+/// `boolean` are read, an item of another `type` is left out, and one that
+/// can't be read is counted. No list, or `null`, is none; one that isn't a
+/// list counts as one unreadable.
+fn config_options(list: Option<&Value>) -> Offered {
+    let mut offered = Offered::default();
+    let items = match list {
+        None | Some(Value::Null) => return offered,
+        Some(Value::Array(items)) => items,
+        Some(_) => {
+            offered.unreadable = 1;
+            return offered;
+        }
+    };
+    for item in items {
+        match config_option(item) {
+            Read::Option(option) => offered.options.push(option),
+            Read::Other => {}
+            Read::Unreadable => offered.unreadable += 1,
+        }
+    }
+    offered
+}
+
+/// What one config option read as.
+enum Read {
+    Option(OfferedOption),
+    /// A `type` Brindle doesn't show, left out without a word.
+    Other,
+    Unreadable,
+}
+
+fn config_option(item: &Value) -> Read {
+    let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_owned);
+    let (Some(id), Some(name)) = (text("id"), text("name")) else {
+        return Read::Unreadable;
+    };
+    let Ok(description) = optional_text(item, "description") else {
+        return Read::Unreadable;
+    };
+    let category = match item.get("category") {
+        None | Some(Value::Null) => OptionCategory::Other {
+            name: String::new(),
+        },
+        Some(Value::String(category)) => match category.as_str() {
+            "mode" => OptionCategory::Mode,
+            "model" => OptionCategory::Model,
+            "model_config" => OptionCategory::ModelConfig,
+            "thought_level" => OptionCategory::ThoughtLevel,
+            other => OptionCategory::Other {
+                name: other.to_owned(),
+            },
+        },
+        Some(_) => return Read::Unreadable,
+    };
+    let kind = match item.get("type").and_then(Value::as_str) {
+        Some("select") => {
+            let (Some(current), Some(Value::Array(listed))) = (text("currentValue"), item.get("options"))
+            else {
+                return Read::Unreadable;
+            };
+            OptionControl::Select {
+                current,
+                choices: select_choices(listed),
+            }
+        }
+        Some("boolean") => match item.get("currentValue") {
+            Some(Value::Bool(on)) => OptionControl::Toggle { on: *on },
+            Some(_) | None => return Read::Unreadable,
+        },
+        Some(_) => return Read::Other,
+        None => return Read::Unreadable,
+    };
+    Read::Option(OfferedOption {
+        key: OptionKey::Config { id: id.clone() },
+        option: SessionOption {
+            id,
+            name,
+            description,
+            category,
+            kind,
+        },
+    })
+}
+
+/// A select's choices, flat (`[{value, name, description?}]`) or grouped
+/// (`[{group, name, options: [...]}]`, each choice naming its group's
+/// name), in order; a choice that can't be read is left out, the option
+/// kept.
+fn select_choices(listed: &[Value]) -> Vec<OptionChoice> {
+    let mut choices = Vec::new();
+    for item in listed {
+        if item.get("group").is_some()
+            && let Some(Value::Array(grouped)) = item.get("options")
+        {
+            let group = item.get("name").and_then(Value::as_str);
+            choices.extend(
+                grouped
+                    .iter()
+                    .filter_map(|choice| select_choice(choice, "value", group)),
+            );
+        } else {
+            choices.extend(select_choice(item, "value", None));
+        }
+    }
+    choices
+}
+
+fn select_choice(item: &Value, value: &str, group: Option<&str>) -> Option<OptionChoice> {
+    let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_owned);
+    Some(OptionChoice {
+        value: text(value)?,
+        name: text("name")?,
+        description: optional_text(item, "description").ok()?,
+        group: group.map(str::to_owned),
+    })
+}
+
+/// A field that is a string, absent or `null`; any other type is `Err`.
+fn optional_text(item: &Value, key: &str) -> Result<Option<String>, ()> {
+    match item.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err(()),
+    }
+}
+
+/// v1's `modes` (`{currentModeId, availableModes: [{id, name,
+/// description?}]}`) or the unstable `models` (`{currentModelId,
+/// availableModels: [{modelId, name, description?}]}`), read by hand as a
+/// current value and its choices; `None` for any other shape or an empty
+/// list. A choice that can't be read is left out.
+fn listed(state: &Value, current: &str, list: &str, value: &str) -> Option<(String, Vec<OptionChoice>)> {
+    let current = state.get(current)?.as_str()?.to_owned();
+    let choices: Vec<OptionChoice> = state
+        .get(list)?
+        .as_array()?
+        .iter()
+        .filter_map(|choice| select_choice(choice, value, None))
+        .collect();
+    (!choices.is_empty()).then_some((current, choices))
+}
+
+/// An option made from `modes` or `models`.
+fn made(
+    id: String,
+    name: &str,
+    category: OptionCategory,
+    current: String,
+    choices: Vec<OptionChoice>,
+    key: OptionKey,
+) -> OfferedOption {
+    OfferedOption {
+        option: SessionOption {
+            id,
+            name: name.to_owned(),
+            description: None,
+            category,
+            kind: OptionControl::Select { current, choices },
+        },
+        key,
+    }
+}
+
+/// `id`, followed by as many `'` as it takes to be no option's id in
+/// `options` (decision 1).
+fn free_id(options: &[OfferedOption], id: &str) -> String {
+    let mut id = id.to_owned();
+    while options.iter().any(|held| held.option.id == id) {
+        id.push('\'');
+    }
+    id
+}
+
+/// `available_commands_update`'s `availableCommands` (`[{name,
+/// description, input: {hint} | null}]`), item by item: a command without a
+/// string `name` and `description` is counted and left out, and an `input`
+/// without a string `hint` gives none.
+fn commands(update: &Value) -> Result<Update, BadParams> {
+    let listed = update
+        .get("availableCommands")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BadParams::missing("availableCommands"))?;
+    let mut commands = Vec::new();
+    let mut unreadable = 0;
+    for item in listed {
+        let text = |key: &str| item.get(key).and_then(Value::as_str).map(str::to_owned);
+        match (text("name"), text("description")) {
+            (Some(name), Some(description)) => commands.push(SlashCommand {
+                name,
+                description,
+                hint: item
+                    .get("input")
+                    .and_then(|input| input.get("hint"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            }),
+            (None, _) | (_, None) => unreadable += 1,
+        }
+    }
+    Ok(Update::Commands {
+        commands,
+        unreadable,
+    })
+}
+
+/// `config_option_update`'s whole list.
+fn options_update(update: &Value) -> Result<Update, BadParams> {
+    match update.get("configOptions") {
+        Some(Value::Array(_)) => Ok(Update::Options(config_options(update.get("configOptions")))),
+        Some(_) | None => Err(BadParams::missing("configOptions")),
+    }
+}
+
+/// `current_mode_update`'s mode, for the option made from `modes`.
+fn current_mode(update: &Value) -> Result<Update, BadParams> {
+    let value = update
+        .get("currentModeId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| BadParams::missing("currentModeId"))?;
+    Ok(Update::Current {
+        key: OptionKey::Modes,
+        value: value.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -1139,6 +1442,280 @@ mod tests {
             }));
         }
         (lines.len(), decoded)
+    }
+
+    // --- commands and options (agents-commands) -------------------------
+
+    fn option_ids(offered: &Offered) -> Vec<&str> {
+        offered
+            .options
+            .iter()
+            .map(|offered| offered.option.id.as_str())
+            .collect()
+    }
+
+    fn select(id: &str, category: &str, current: &str, values: &[&str]) -> Value {
+        let options: Vec<Value> = values
+            .iter()
+            .map(|value| json!({"value": value, "name": value.to_uppercase()}))
+            .collect();
+        json!({"id": id, "name": id, "category": category, "type": "select",
+               "currentValue": current, "options": options})
+    }
+
+    /// Every captured start answer, `available_commands_update`,
+    /// `config_option_update` and answer to `session/set_config_option`
+    /// reads with nothing unreadable.
+    #[test]
+    fn every_captured_list_reads_whole() {
+        let mut counts = [0usize; 4];
+        for (name, bytes) in CAPTURES {
+            if name.starts_with("gemini") || name.starts_with("handwritten") {
+                continue;
+            }
+            let mut sent: HashMap<String, String> = HashMap::new();
+            for (direction, line) in capture_lines(bytes) {
+                let Ok(line) = serde_json::from_slice::<Value>(line) else {
+                    continue;
+                };
+                let id = line.get("id").map(Value::to_string).unwrap_or_default();
+                if direction == "c>a" {
+                    if let Some(method) = line["method"].as_str() {
+                        sent.insert(id, method.to_owned());
+                    }
+                    continue;
+                }
+                if let Some(result) = line.get("result") {
+                    match sent.get(&id).map(String::as_str) {
+                        Some("session/new" | "session/load" | "session/resume") => {
+                            let offered = start_options(result);
+                            assert_eq!(offered.unreadable, 0, "{name}");
+                            assert!(offered.options.len() >= 2, "{name}: {offered:?}");
+                            counts[0] += 1;
+                        }
+                        Some("session/set_config_option") => {
+                            let key = OptionKey::Config { id: "x".into() };
+                            let offered = set_option_result(&key, result)
+                                .unwrap_or_else(|e| panic!("{name}: {e:?}"))
+                                .unwrap_or_else(|| panic!("{name}: no list"));
+                            assert_eq!(offered.unreadable, 0, "{name}");
+                            counts[3] += 1;
+                        }
+                        Some("session/set_mode" | "session/set_model") => {
+                            assert_eq!(result, &json!({}), "{name}");
+                            assert_eq!(set_option_result(&OptionKey::Modes, result), Ok(None));
+                        }
+                        Some(_) | None => {}
+                    }
+                }
+                if line["method"] == "session/update" {
+                    match session_update(&line["params"]).map(|update| update.update) {
+                        Ok(Update::Commands { unreadable, .. }) => {
+                            assert_eq!(unreadable, 0, "{name}");
+                            counts[1] += 1;
+                        }
+                        Ok(Update::Options(offered)) => {
+                            assert_eq!(offered.unreadable, 0, "{name}");
+                            assert!(!offered.options.is_empty(), "{name}");
+                            counts[2] += 1;
+                        }
+                        Ok(_) => {}
+                        Err(e) => panic!("{name}: {e:?}"),
+                    }
+                }
+            }
+        }
+        assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
+    }
+
+    #[test]
+    fn a_commands_update_reads_each_entry_its_hint_from_its_input() {
+        let update = json!({"sessionUpdate": "available_commands_update", "availableCommands": [
+            {"name": "compact", "description": "Compacts", "input": {"hint": "<instructions>"}},
+            {"name": "review", "description": "Reviews", "input": null},
+            {"name": "odd", "description": "Odd input", "input": {"other": 1}},
+            {"name": 7, "description": "not a name"},
+            {"name": "nodesc"},
+            "not an object"]});
+        let Ok(Update::Commands {
+            commands,
+            unreadable,
+        }) = commands(&update)
+        else {
+            panic!("not commands");
+        };
+        assert_eq!(
+            commands,
+            [
+                SlashCommand {
+                    name: "compact".into(),
+                    description: "Compacts".into(),
+                    hint: Some("<instructions>".into()),
+                },
+                SlashCommand {
+                    name: "review".into(),
+                    description: "Reviews".into(),
+                    hint: None,
+                },
+                SlashCommand {
+                    name: "odd".into(),
+                    description: "Odd input".into(),
+                    hint: None,
+                },
+            ]
+        );
+        assert_eq!(unreadable, 3);
+        assert!(commands_of(json!({"sessionUpdate": "available_commands_update"})).is_err());
+    }
+
+    fn commands_of(update: Value) -> Result<Update, BadParams> {
+        commands(&update)
+    }
+
+    #[test]
+    fn config_options_read_flat_and_grouped_selects_and_booleans_item_by_item() {
+        let list = json!([
+            {"id": "model", "name": "Model", "description": "Which model", "category": "model",
+             "type": "select", "currentValue": "opus", "options": [
+                {"group": "anthropic", "name": "Anthropic", "options": [
+                    {"value": "opus", "name": "Opus", "description": "Big"},
+                    {"value": "sonnet", "name": "Sonnet"},
+                    {"value": 3, "name": "bad choice"}]},
+                {"value": "local", "name": "Local"}]},
+            {"id": "fast", "name": "Fast", "type": "boolean", "currentValue": true},
+            {"id": "speed", "name": "Speed", "category": "_speed", "type": "slider", "currentValue": 3},
+            {"id": "nameless", "type": "boolean", "currentValue": true},
+            {"id": "notbool", "name": "N", "type": "boolean", "currentValue": "yes"},
+            {"id": "notype", "name": "N", "currentValue": true},
+            {"id": "badcat", "name": "N", "category": 5, "type": "boolean", "currentValue": true},
+            {"id": "cfg", "name": "Context", "category": "model_config", "type": "select",
+             "currentValue": "1m", "options": [{"value": "1m", "name": "1M"}]}]);
+        let offered = config_options(Some(&list));
+        assert_eq!(option_ids(&offered), ["model", "fast", "cfg"]);
+        // An unknown `type` is left out without a word.
+        assert_eq!(offered.unreadable, 4);
+        let model = &offered.options[0];
+        assert_eq!(model.key, OptionKey::Config { id: "model".into() });
+        assert_eq!(model.option.description.as_deref(), Some("Which model"));
+        assert_eq!(
+            model.option.kind,
+            OptionControl::Select {
+                current: "opus".into(),
+                choices: vec![
+                    OptionChoice {
+                        value: "opus".into(),
+                        name: "Opus".into(),
+                        description: Some("Big".into()),
+                        group: Some("Anthropic".into()),
+                    },
+                    OptionChoice {
+                        value: "sonnet".into(),
+                        name: "Sonnet".into(),
+                        description: None,
+                        group: Some("Anthropic".into()),
+                    },
+                    OptionChoice {
+                        value: "local".into(),
+                        name: "Local".into(),
+                        description: None,
+                        group: None,
+                    },
+                ],
+            }
+        );
+        assert_eq!(offered.options[1].option.kind, OptionControl::Toggle { on: true });
+        // No category is one of no name.
+        assert_eq!(
+            offered.options[1].option.category,
+            OptionCategory::Other {
+                name: String::new()
+            }
+        );
+        assert_eq!(offered.options[2].option.category, OptionCategory::ModelConfig);
+        assert_eq!(config_options(Some(&json!({"a": 1}))).unreadable, 1);
+        assert_eq!(config_options(None), Offered::default());
+        assert_eq!(config_options(Some(&Value::Null)), Offered::default());
+    }
+
+    #[test]
+    fn modes_and_the_model_list_make_one_option_each_unless_a_config_option_is_one() {
+        let modes = json!({"currentModeId": "default", "availableModes": [
+            {"id": "default", "name": "Default"}, {"id": "plan", "name": "Plan", "description": "Plans"}]});
+        let models = json!({"currentModelId": "sonnet", "availableModels": [
+            {"modelId": "opus", "name": "Opus"}, {"modelId": "sonnet", "name": "Sonnet"}]});
+        // claude-code-acp's shape: modes and the model list alone.
+        let offered = start_options(&json!({"sessionId": "s", "modes": modes, "models": models}));
+        assert_eq!(option_ids(&offered), ["mode", "model"]);
+        assert_eq!(offered.options[0].key, OptionKey::Modes);
+        assert_eq!(offered.options[0].option.name, "Mode");
+        assert_eq!(offered.options[0].option.category, OptionCategory::Mode);
+        assert_eq!(offered.options[1].key, OptionKey::Models);
+        assert!(matches!(
+            &offered.options[1].option.kind,
+            OptionControl::Select { current, choices } if current == "sonnet" && choices.len() == 2
+        ));
+        // Both offered: the config options stand alone.
+        let offered = start_options(&json!({"modes": modes, "models": models, "configOptions": [
+            select("mode", "mode", "default", &["default", "plan"]),
+            select("model", "model", "opus", &["opus"])]}));
+        assert_eq!(option_ids(&offered), ["mode", "model"]);
+        assert!(offered.options.iter().all(|o| matches!(o.key, OptionKey::Config { .. })));
+        // A config option of another category taking the id: `mode'`.
+        let offered = start_options(&json!({"modes": modes, "configOptions": [
+            select("mode", "thought_level", "low", &["low", "high"])]}));
+        assert_eq!(option_ids(&offered), ["mode", "mode'"]);
+        assert_eq!(offered.options[1].key, OptionKey::Modes);
+        // A model list of the wrong shape is left out, uncounted.
+        for models in [
+            json!([1, 2]),
+            json!({"currentModelId": 1, "availableModels": []}),
+            json!({"currentModelId": "a", "availableModels": "all"}),
+            json!({"currentModelId": "a", "availableModels": [{"id": "a", "name": "A"}]}),
+        ] {
+            let offered = start_options(&json!({"models": models}));
+            assert_eq!(offered, Offered::default(), "{models}");
+        }
+    }
+
+    #[test]
+    fn a_mode_update_is_keyed_to_the_modes_and_a_set_answer_read_by_key() {
+        let update = json!({"sessionId": "s", "update": {"sessionUpdate": "current_mode_update", "currentModeId": "plan"}});
+        assert_eq!(
+            session_update(&update).map(|update| update.update),
+            Ok(Update::Current {
+                key: OptionKey::Modes,
+                value: "plan".into()
+            })
+        );
+        let bad = json!({"sessionId": "s", "update": {"sessionUpdate": "current_mode_update"}});
+        assert!(session_update(&bad).is_err());
+        let bad = json!({"sessionId": "s", "update": {"sessionUpdate": "config_option_update"}});
+        assert!(session_update(&bad).is_err());
+        let config = OptionKey::Config { id: "model".into() };
+        let answer = json!({"configOptions": [select("model", "model", "opus", &["opus"])]});
+        assert_eq!(
+            set_option_result(&config, &answer).map(|offered| offered.map(|o| o.options.len())),
+            Ok(Some(1))
+        );
+        assert!(set_option_result(&config, &json!({})).is_err());
+        assert_eq!(set_option_result(&OptionKey::Models, &json!(null)), Ok(None));
+    }
+
+    #[test]
+    fn a_config_list_keeps_the_options_made_from_modes_until_it_covers_them() {
+        let modes = json!({"currentModeId": "default", "availableModes": [{"id": "default", "name": "Default"}]});
+        let held = start_options(&json!({"modes": modes, "configOptions": [select("model", "model", "a", &["a"])]}));
+        assert_eq!(option_ids(&held), ["model", "mode"]);
+        let update = config_options(Some(&json!([select("model", "model", "b", &["a", "b"])])));
+        let merged = merge_options(&held.options, update);
+        assert_eq!(option_ids(&merged), ["model", "mode"]);
+        // A config option now named `mode`, of another category: the kept
+        // one moves aside.
+        let update = config_options(Some(&json!([select("mode", "other", "x", &["x"])])));
+        assert_eq!(option_ids(&merge_options(&held.options, update)), ["mode", "mode'"]);
+        // One of category mode replaces it.
+        let update = config_options(Some(&json!([select("m", "mode", "x", &["x"])])));
+        assert_eq!(option_ids(&merge_options(&held.options, update)), ["m"]);
     }
 
     #[test]
@@ -1658,6 +2235,9 @@ mod tests {
                         Update::ToolCall(_) => "tool call",
                         Update::ToolChanged(_) => "tool changed",
                         Update::SessionInfo { .. } => "session info",
+                        Update::Commands { .. } => "commands",
+                        Update::Options(_) => "options",
+                        Update::Current { .. } => "current",
                         Update::Ignored { .. } => "ignored",
                     });
                 }
@@ -1669,6 +2249,7 @@ mod tests {
             "tool call",
             "tool changed",
             "session info",
+            "commands",
             "ignored",
         ] {
             assert!(seen.contains(&kind), "{kind}");
