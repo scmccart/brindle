@@ -38,7 +38,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 - [x] 1.9 Show D-12:
   - Add rows to `login.rs`'s `commands_that_reparse_their_arguments_are_withheld`: `pwsh -Command agy acp`, `pwsh -c …`, `pwsh -ec …`, `powershell agy acp`, `powershell.exe -Command …`, `wsl agy acp`, `WSL.EXE agy acp`. Expect `Some(Withheld)`.
   - Verify that they fail with `cargo test -p brindle agent::login`.
-- [ ] 1.10 Record the baseline:
+- [x] 1.10 Record the baseline:
   - Loop `agent-queue` and `agent-continue-profile-gone` on `main`: 4 parallel loops of 100 whole e2e runs each, under `scripts/with-xvfb` with `BRINDLE_E2E_SLOW=2`, each loop in its own `systemd-run --user --scope`.
   - Record failures out of 400 per case in the as-built notes.
   - Any test of 1.4 to 1.9 that passes on `main` marks its finding "traced, not shown": drop that fix (design, "Findings, traced") and keep the test.
