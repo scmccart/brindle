@@ -1026,6 +1026,94 @@ fn the_earlier_row_fetches_in_view_and_spins_until_the_page_comes() {
     assert!(!running(&mut f), "no agent works and nothing loads");
 }
 
+// OpenSpec change `agents-zone-focus-and-scroll`, task 7.1.
+
+/// A turn running over twenty long agent messages, taller than the window.
+fn long_turn(f: &mut Fixture) {
+    let mut events = vec![ready(), added(1, user("go")), working()];
+    for n in 0..20u64 {
+        events.push(added(n + 2, crate::agent::test_support::agent(&format!("{n} {}", "word ".repeat(600)))));
+    }
+    f.feed(&events);
+}
+
+/// Where the last frame drew item `ix`, if it did, and the scroller's view.
+fn drawn(f: &mut Fixture, ix: usize) -> (Option<gpui::Bounds<Pixels>>, gpui::Bounds<Pixels>) {
+    let viewport = f.cx.debug_bounds("message-scroller").expect("the scroller is drawn");
+    (f.view.read_with(f.cx, |view, cx| view.scroller.read(cx).item_bounds(ix)), viewport)
+}
+
+fn permission_block(f: &mut Fixture, entry: u64) -> usize {
+    f.view.read_with(f.cx, |view, cx| view.agent.read(cx).model().permission_block(EntryId(entry))).expect("pending")
+}
+
+fn page_up(f: &mut Fixture) {
+    f.view.update(f.cx, |view, cx| view.page(PageDirection::Up, cx));
+    f.settle();
+}
+
+/// The spec's "Tab to a permission below the view": away from the end, a
+/// request arrives below the view; Tab from the prompt focuses its first
+/// button and brings the block wholly into view, and enter answers it.
+#[test]
+fn tab_to_a_permission_below_the_view_reveals_it_and_enter_answers_it() {
+    let mut f = Fixture::new();
+    long_turn(&mut f);
+    for _ in 0..3 {
+        page_up(&mut f);
+    }
+    f.feed(&[added(22, permission())]);
+    let block = permission_block(&mut f, 22);
+    assert_eq!(drawn(&mut f, block).0, None, "below the view");
+    let reject = f.view.read_with(f.cx, |view, _| view.permission_handle(EntryId(22), "reject-once").cloned()).unwrap();
+    f.cx.simulate_keystrokes("tab");
+    f.settle();
+    assert_eq!(f.focused(), Some(reject));
+    let (bounds, viewport) = drawn(&mut f, block);
+    let bounds = bounds.expect("revealed");
+    assert!(
+        bounds.top() >= viewport.top() - px(0.5) && bounds.bottom() <= viewport.bottom() + px(0.5),
+        "{bounds:?} wholly in {viewport:?}"
+    );
+    f.calls();
+    f.cx.simulate_keystrokes("enter");
+    assert_eq!(f.calls(), [Call::Answer(22, Some("reject-once".into()))]);
+}
+
+/// The spec's "A permission already in view": Tab to it moves nothing.
+#[test]
+fn a_permission_in_view_is_not_scrolled_to() {
+    let mut f = Fixture::new();
+    long_turn(&mut f);
+    f.feed(&[added(22, permission())]);
+    let block = permission_block(&mut f, 22);
+    let before = drawn(&mut f, block).0.expect("in view at the end");
+    f.cx.simulate_keystrokes("tab");
+    f.settle();
+    assert_eq!(drawn(&mut f, block).0, Some(before));
+    assert_eq!(f.view.read_with(f.cx, |view, cx| view.scroller.read(cx).follow()), brindle_ui::Follow::AtEnd);
+}
+
+/// The spec's "A focused permission scrolled out of view": focus goes back
+/// to the prompt and the request stays pending.
+#[test]
+fn scrolling_a_focused_permission_out_of_view_gives_focus_to_the_prompt() {
+    let mut f = Fixture::new();
+    long_turn(&mut f);
+    f.feed(&[added(22, permission())]);
+    let block = permission_block(&mut f, 22);
+    let prompt = f.prompt_handle();
+    f.cx.simulate_keystrokes("tab");
+    assert_ne!(f.focused(), Some(prompt.clone()), "on the permission");
+    for _ in 0..3 {
+        page_up(&mut f);
+    }
+    assert_eq!(drawn(&mut f, block).0, None, "out of view");
+    assert_eq!(f.focused(), Some(prompt));
+    assert!(!f.calls().iter().any(|call| matches!(call, Call::Answer(..))), "nothing answered");
+    assert_eq!(permission_block(&mut f, 22), block, "still pending");
+}
+
 // OpenSpec change `agents-zone-focus-and-scroll`, task 6.1.
 
 /// What an item's height depends on besides its text and the width: the

@@ -274,6 +274,10 @@ pub struct MessageScroller {
     /// The owner's items in view in the last frame, as last told.
     items_in_view: Option<Range<usize>>,
     on_items_view: Option<Rc<ItemsView>>,
+    /// A revealed item below the view (list index), put at the view's top
+    /// for the next frame to measure; while it waits the owner isn't told
+    /// what is in view, since the view is still moving.
+    revealing: Option<usize>,
 }
 
 /// How far beyond the view items are laid out ahead of a scroll.
@@ -310,6 +314,7 @@ impl MessageScroller {
             anchor: None,
             items_in_view: None,
             on_items_view: None,
+            revealing: None,
         }
     }
 
@@ -376,6 +381,8 @@ impl MessageScroller {
     fn splice_list(&mut self, old: Range<usize>, count: usize) {
         let was = Top::of(self.state.logical_scroll_top());
         self.state.splice(old.clone(), count);
+        // A splice moves the indices under a pending reveal: it is dropped.
+        self.revealing = None;
         if self.follow == Follow::AtEnd {
             self.anchor = None;
             return;
@@ -478,6 +485,7 @@ impl MessageScroller {
         self.follow = Follow::AtEnd;
         self.top_in_view = false;
         self.anchor = None;
+        self.revealing = None;
         cx.notify();
     }
 
@@ -508,6 +516,7 @@ impl MessageScroller {
         self.state.scroll_to(ListOffset { item_ix: self.state.item_count(), offset_in_item: px(0.) });
         self.follow = Follow::AtEnd;
         self.anchor = None;
+        self.revealing = None;
         cx.notify();
     }
 
@@ -572,6 +581,7 @@ impl MessageScroller {
                 .map(|(i, b)| ListOffset { item_ix: *i, offset_in_item: viewport.top() - b.top() });
             (plan, top, drawn.items.iter().map(|(i, _)| *i).min())
         };
+        self.revealing = None;
         match plan {
             Reveal::InView => return,
             Reveal::ToTop => self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: px(0.) }),
@@ -581,20 +591,41 @@ impl MessageScroller {
                 }
                 self.state.scroll_by(px(distance));
             }
-            Reveal::Undrawn => match first {
-                Some(first) if list_ix < first => {
-                    self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: px(0.) });
-                }
-                Some(_) | None => {
-                    if let Some(top) = top {
-                        self.state.scroll_to(top);
-                    }
-                    self.state.scroll_to_reveal_item(list_ix);
-                }
-            },
+            Reveal::Undrawn => {
+                // Its top at the view's top, where it is sure to be drawn
+                // and measured; below the view, the next frame then moves
+                // its end to the view's bottom (`finish_reveal`), the least
+                // distance. gpui's `scroll_to_reveal_item` counts an
+                // unmeasured item as no height, leaving it under the view.
+                self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: px(0.) });
+                let below = first.is_none_or(|first| list_ix > first);
+                self.revealing = below.then_some(list_ix);
+            }
         }
         self.follow = Follow::Away;
         self.anchor = None;
+        cx.notify();
+    }
+
+    /// After the frame that drew a revealed item below the view at the
+    /// view's top: its end goes to the view's bottom when it fits.
+    fn finish_reveal(&mut self, list_ix: usize, cx: &mut Context<Self>) {
+        if self.revealing != Some(list_ix) {
+            return;
+        }
+        self.revealing = None;
+        let (bounds, viewport) = {
+            let drawn = self.drawn.borrow();
+            (drawn.items.iter().find(|(i, _)| *i == list_ix).map(|(_, b)| *b), drawn.viewport)
+        };
+        if let (Some(bounds), Some(viewport)) = (bounds, viewport) {
+            let room = viewport.size.height - bounds.size.height;
+            if room > px(0.) {
+                self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: viewport.top() - bounds.top() });
+                self.state.scroll_by(-room);
+            }
+        }
+        // A frame tells the owner what is in view now.
         cx.notify();
     }
 }
@@ -637,6 +668,7 @@ impl Render for MessageScroller {
         let settling = self.anchor.is_some();
         let told = self.items_in_view.clone();
         let on_items_view = self.on_items_view.clone();
+        let revealing = self.revealing;
         div()
             .debug_selector(|| "message-scroller".into())
             .relative()
@@ -669,7 +701,7 @@ impl Render for MessageScroller {
                             let in_view = owners.clone().min().zip(owners.max()).map_or(0..0, |(lo, hi)| lo..hi + 1);
                             (last_bottom, top_in_view, in_view)
                         };
-                        if told.as_ref() != Some(&in_view) {
+                        if revealing.is_none() && told.as_ref() != Some(&in_view) {
                             after_draw.update(cx, |this, _| this.items_in_view = Some(in_view.clone())).ok();
                             if let Some(on_view) = on_items_view.clone() {
                                 cx.defer(move |cx| on_view(in_view, cx));
@@ -685,6 +717,11 @@ impl Render for MessageScroller {
                         }
                         if follow.after_draw(last_bottom, f32::from(bounds.bottom())) != follow {
                             after_draw.update(cx, |this, cx| this.scroll_to_end(cx)).ok();
+                        } else if let Some(ix) = revealing {
+                            let finish = after_draw.clone();
+                            cx.defer(move |cx| {
+                                finish.update(cx, |this, cx| this.finish_reveal(ix, cx)).ok();
+                            });
                         } else if settling {
                             // After the frame, so its notify draws another.
                             let settle = after_draw.clone();
@@ -1140,6 +1177,32 @@ mod tests {
         reveal(&scroller, 5, cx);
         assert_eq!(item_bounds(&scroller, 5, cx).map(|b| f32::from(b.top())), Some(0.));
         assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::Away, "the button shows while away");
+    }
+
+    /// Revealing an item below the view that no frame has measured yet puts
+    /// its end at the view's bottom (the least distance), over two frames,
+    /// and the owner hears what is in view only once it has settled.
+    #[test]
+    fn revealing_an_unmeasured_item_below_the_view_puts_its_end_at_the_bottom() {
+        let mut app = test_support::app();
+        let seen: Rc<RefCell<Vec<Range<usize>>>> = Rc::default();
+        let told = seen.clone();
+        let (host, cx) = app.add_window_view(move |_, cx| {
+            let told = told.clone();
+            let scroller = cx.new(|cx| {
+                MessageScroller::new(40, move |_, _, _| div().h(px(50.)).w_full().into_any_element(), cx)
+                    .on_items_view(move |range, _| told.borrow_mut().push(range))
+            });
+            Host { scroller }
+        });
+        let scroller = host.read_with(cx, |host, _| host.scroller.clone());
+        let cx: &'static mut VisualTestContext = Box::leak(Box::new(cx.clone()));
+        cx.run_until_parked();
+        scroll_to(&scroller, ListOffset { item_ix: 0, offset_in_item: px(0.) }, cx);
+        seen.borrow_mut().clear();
+        reveal(&scroller, 20, cx);
+        assert_eq!(item_bounds(&scroller, 20, cx).map(|b| f32::from(b.bottom())), Some(300.));
+        assert_eq!(seen.borrow().as_slice(), std::slice::from_ref(&(15..21)), "told once, where it settled");
     }
 
     /// The spec's "Already in view": nothing moves.

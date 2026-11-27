@@ -16,6 +16,7 @@
 //! changes, the stop button when the turn ends, a permission answered, the
 //! Continue button once pressed), focus goes back to the prompt.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
@@ -380,7 +381,8 @@ impl AgentView {
         });
         let count = agent.read(cx).model().item_count();
         let view = cx.weak_entity();
-        let (top, told) = (view.clone(), view.clone());
+        let (top, told, gave) = (view.clone(), view.clone(), view.clone());
+        let window_handle = window.window_handle();
         let scroller = cx.new(|cx| {
             MessageScroller::new(count, move |ix, _, cx| render_block(&view, ix, cx), cx)
                 .with_top_row(move |_, cx| earlier_row(&top, cx))
@@ -390,6 +392,12 @@ impl AgentView {
                         this.agent.update(cx, |agent, cx| agent.fetch_if_due(in_view, !in_view, cx));
                     })
                     .ok();
+                })
+                // A focused permission's block may have left the view.
+                .on_items_view(move |in_view, cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| gave.update(cx, |this, cx| this.give_back(in_view, window, cx)))
+                        .ok();
                 })
         });
         let area = prompt.read(cx).area().clone();
@@ -678,6 +686,33 @@ impl AgentView {
                 };
                 self.permissions.push((key, handle));
             }
+        }
+    }
+
+    /// The pending request whose button `handle` is, if it is one.
+    fn permission_of(&self, handle: &FocusHandle) -> Option<EntryId> {
+        self.permissions.iter().find(|(_, own)| own == handle).map(|((entry, _), _)| *entry)
+    }
+
+    /// Brings the block of the permission button Tab just focused into
+    /// view; any other stop is in the prompt area, always shown.
+    fn reveal_permission(&mut self, handle: &FocusHandle, cx: &mut Context<Self>) {
+        let Some(entry) = self.permission_of(handle) else { return };
+        if let Some(block) = self.agent.read(cx).model().permission_block(entry) {
+            self.scroller.update(cx, |scroller, cx| scroller.reveal(block, cx));
+        }
+    }
+
+    /// A frame changed the items in view to `in_view`: a focused permission
+    /// button whose block left the view gives focus to the prompt, as a
+    /// stop that left the model does (`sync`). Nothing is answered.
+    fn give_back(&mut self, in_view: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focused) = window.focused(cx) else { return };
+        let Some(entry) = self.permission_of(&focused) else { return };
+        let block = self.agent.read(cx).model().permission_block(entry);
+        if block.is_none_or(|block| !in_view.contains(&block)) {
+            let prompt = self.prompt.read(cx).focus_handle(cx);
+            window.focus(&prompt);
         }
     }
 
@@ -1277,6 +1312,14 @@ impl Render for AgentView {
             .font_family(family)
             .child(
                 FocusScope::new(&cx.entity())
+                    // Tab onto a permission button brings its block into
+                    // view (decision 4).
+                    .on_step({
+                        let view = cx.weak_entity();
+                        move |handle, _, cx| {
+                            view.update(cx, |this, cx| this.reveal_permission(handle, cx)).ok();
+                        }
+                    })
                     .size_full()
                     .min_h_0()
                     .flex()

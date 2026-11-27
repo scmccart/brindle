@@ -3369,6 +3369,24 @@ impl ChatModel {
             .collect()
     }
 
+    /// The block a pending permission request's buttons are drawn in, or
+    /// `None` when `entry` is no pending request (OpenSpec change
+    /// `agents-zone-focus-and-scroll` decision 4).
+    pub fn permission_block(&self, entry: EntryId) -> Option<usize> {
+        self.blocks.iter().position(|block| {
+            block.entry == entry
+                && match &block.body {
+                    BlockBody::Permission { outcome, .. } => outcome.is_none(),
+                    BlockBody::UserText { .. }
+                    | BlockBody::AgentPart { .. }
+                    | BlockBody::Thought { .. }
+                    | BlockBody::Tool { .. }
+                    | BlockBody::ToolDetail(_)
+                    | BlockBody::Notice { .. } => false,
+                }
+        })
+    }
+
     /// `copy_last_agent_message`: the latest agent message's text.
     pub fn last_agent_message(&self) -> Option<&str> {
         self.entries.iter().rev().find_map(|(_, entry)| match entry {
@@ -4608,6 +4626,27 @@ mod tests {
         assert!(!zone.model.answer(EntryId(1), "allow-once"), "answered");
         assert!(zone.model.pending_permissions().is_empty());
         assert!(zone.model.describe(1, true, &found(&zone.model), &linux).contains("outcome=selected:allow-once"));
+    }
+
+    /// OpenSpec change `agents-zone-focus-and-scroll` decision 4: a pending
+    /// request names the block its buttons are drawn in, and none once
+    /// answered.
+    #[test]
+    fn a_pending_permission_names_its_block() {
+        let mut zone = Zone::ready();
+        zone.feed(&[
+            turn(TurnState::Working),
+            added(1, Entry::User { text: "go".into() }),
+            added(2, thought("hmm")),
+            added(3, permission("Run cargo test?")),
+        ]);
+        let ix = zone.model.permission_block(EntryId(3)).expect("pending");
+        assert_eq!(zone.model.blocks()[ix].entry, EntryId(3));
+        assert!(matches!(zone.model.blocks()[ix].body, BlockBody::Permission { outcome: None, .. }));
+        assert_eq!(zone.model.permission_block(EntryId(2)), None, "a thought isn't a request");
+        assert_eq!(zone.model.permission_block(EntryId(9)), None, "no such entry");
+        zone.feed(&[Event::Answered { id: EntryId(3), outcome: PermissionOutcome::Selected { option: "allow-once".into() } }]);
+        assert_eq!(zone.model.permission_block(EntryId(3)), None, "answered");
     }
 
     /// Decision 10: the shown status is the activity's while live, with

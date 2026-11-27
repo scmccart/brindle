@@ -362,9 +362,12 @@ rule, not a convenience.
     `inserts_at_start`. `reveal(ix)` scrolls the least distance that shows
     an item whole, or its top when it is taller than the view, from what
     the last frame showed (the pure `reveal_plan`), following the end again
-    when that shows the end; an item drawn whole stays put.
+    when that shows the end; an item drawn whole stays put. An item the
+    last frame didn't draw takes a second frame when it is below the view,
+    since gpui knows its height only once it is drawn.
     `on_items_view(callback)` tells the owner its items with any part in
-    view, after each frame that changed them.
+    view, after each frame that changed them (not while a reveal is still
+    moving the view).
   - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
     at the end on `muted`, as wide as its text up to four fifths of the
     row, the other side's (`Assistant`) at the start on the card with a
