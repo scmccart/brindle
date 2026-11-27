@@ -457,6 +457,8 @@ fn run(
     abandon: &Abandon,
     budget: Budget,
 ) {
+    #[cfg(debug_assertions)]
+    let delay = start_delay(std::env::var(crate::remote::SESSION_START_DELAY).ok().as_deref());
     let left = || matches!(&*phase.lock(), Phase::Left(_));
     let started = match connect() {
         // An agent zone tells a server it couldn't reach from one that
@@ -478,6 +480,13 @@ fn run(
             Start::Attach(request) => connection.attach(request, sink.clone(), Some(abandon)),
         },
     };
+    // The fault injector's delay, not a wait for a condition: the core has
+    // answered and the reader goes on folding, but the session isn't
+    // running yet (`BRINDLE_TEST_SESSION_START_DELAY`, debug builds only).
+    #[cfg(debug_assertions)]
+    if let (Ok(_), Some(delay)) = (&started, delay) {
+        std::thread::sleep(delay);
+    }
     let mut phase = phase.lock();
     let running = match started {
         Ok(running) => running.with_budget(budget),
@@ -510,6 +519,15 @@ fn run(
     *phase = Phase::Running(running);
 }
 
+/// `BRINDLE_TEST_SESSION_START_DELAY`'s value (debug builds only,
+/// `process R20`): a whole number of milliseconds; anything else, or
+/// nothing, delays nothing.
+#[cfg(debug_assertions)]
+fn start_delay(value: Option<&str>) -> Option<std::time::Duration> {
+    let millis = value.filter(|millis| !millis.is_empty() && millis.bytes().all(|b| b.is_ascii_digit()))?;
+    millis.parse().ok().map(std::time::Duration::from_millis)
+}
+
 /// An agent spawn's failure as its zone tells it: the gate's own refusal
 /// (a server too old) as it is, anything else the server's (or the link's)
 /// refusal of `command`, verbatim.
@@ -538,6 +556,16 @@ mod tests {
     use crate::remote::protocol::client::{self, KillTarget, Spawned, ToClient, ToCore, Welcome};
     use crate::test_support::TempDir;
     use crate::test_support::wait::{limit, until};
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_session_start_delay_switch_reads_whole_milliseconds() {
+        assert_eq!(start_delay(Some("1500")), Some(Duration::from_millis(1500)));
+        assert_eq!(start_delay(Some("0")), Some(Duration::ZERO));
+        for value in [None, Some(""), Some("1.5"), Some("-3"), Some("2s"), Some("99999999999999999999999")] {
+            assert_eq!(start_delay(value), None, "{value:?}");
+        }
+    }
 
     /// What the tab saw.
     struct Recorder(mpsc::Sender<String>);

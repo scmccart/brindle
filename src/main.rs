@@ -1327,10 +1327,10 @@ fn startup_launch(
 const LAUNCH_LISTING: &str = "BRINDLE_TEST_LAUNCH_LISTING";
 
 /// The fault switches (`process R20`) this build honours, as
-/// `--list-fault-switches` prints them: both in a debug build, none in a
+/// `--list-fault-switches` prints them: all three in a debug build, none in a
 /// release build, which never reads them.
 fn fault_switches() -> &'static [&'static str] {
-    if cfg!(debug_assertions) { &[terminal::SINK_PANIC, LAUNCH_LISTING] } else { &[] }
+    if cfg!(debug_assertions) { &[terminal::SINK_PANIC, LAUNCH_LISTING, remote::SESSION_START_DELAY] } else { &[] }
 }
 
 /// `BRINDLE_TEST_LAUNCH_LISTING` (debug builds only, `process R20`): what
@@ -2915,7 +2915,7 @@ mod tests {
     fn fault_switches_are_listed_only_in_debug_builds() {
         let listed = fault_switches();
         if cfg!(debug_assertions) {
-            assert_eq!(listed, ["BRINDLE_TEST_SINK_PANIC", "BRINDLE_TEST_LAUNCH_LISTING"]);
+            assert_eq!(listed, ["BRINDLE_TEST_SINK_PANIC", "BRINDLE_TEST_LAUNCH_LISTING", "BRINDLE_TEST_SESSION_START_DELAY"]);
         } else {
             assert!(listed.is_empty(), "{listed:?}");
         }

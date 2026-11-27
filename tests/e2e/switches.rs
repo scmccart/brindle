@@ -23,6 +23,9 @@ pub enum TestSwitch {
     SinkPanic,
     /// The launch's listing of the server is slowed or fails.
     LaunchListing,
+    /// A session's thread waits between the core's answer and the running
+    /// session (OpenSpec change `agents-client-state-fixes`).
+    SessionStartDelay,
     /// A holder panics handling input holding the marker.
     HolderPanic,
 }
@@ -40,13 +43,14 @@ impl TestSwitch {
         match self {
             TestSwitch::SinkPanic => "BRINDLE_TEST_SINK_PANIC",
             TestSwitch::LaunchListing => "BRINDLE_TEST_LAUNCH_LISTING",
+            TestSwitch::SessionStartDelay => "BRINDLE_TEST_SESSION_START_DELAY",
             TestSwitch::HolderPanic => "BRINDLE_TEST_HOLDER_PANIC",
         }
     }
 
     pub fn host(self) -> SwitchHost {
         match self {
-            TestSwitch::SinkPanic | TestSwitch::LaunchListing => SwitchHost::Brindle,
+            TestSwitch::SinkPanic | TestSwitch::LaunchListing | TestSwitch::SessionStartDelay => SwitchHost::Brindle,
             TestSwitch::HolderPanic => SwitchHost::Helper,
         }
     }
@@ -128,11 +132,14 @@ pub fn self_test() -> Result {
         binary: PathBuf::from(binary),
         switches: Ok(names.iter().map(|name| name.to_string()).collect()),
     };
-    let debug_brindle = listing("/debug/brindle", &["BRINDLE_TEST_SINK_PANIC", "BRINDLE_TEST_LAUNCH_LISTING"]);
+    let debug_brindle = listing(
+        "/debug/brindle",
+        &["BRINDLE_TEST_SINK_PANIC", "BRINDLE_TEST_LAUNCH_LISTING", "BRINDLE_TEST_SESSION_START_DELAY"],
+    );
     let debug_helper = listing("/debug/brindle-remote", &["BRINDLE_TEST_HOLDER_PANIC", "BRINDLE_TEST_FEED_PANIC"]);
     let release_brindle = listing("/release/brindle", &[]);
     let release_helper = listing("/release/brindle-remote", &[]);
-    let all = [TestSwitch::SinkPanic, TestSwitch::LaunchListing, TestSwitch::HolderPanic];
+    let all = [TestSwitch::SinkPanic, TestSwitch::LaunchListing, TestSwitch::SessionStartDelay, TestSwitch::HolderPanic];
 
     // A listed switch runs, whatever the other host has; no needs always run.
     ensure!(readiness(&all, &debug_brindle, &debug_helper, true) == Readiness::Run, "debug binaries didn't run");
@@ -143,6 +150,14 @@ pub fn self_test() -> Result {
     ensure!(
         readiness(&[TestSwitch::HolderPanic], &release_brindle, &debug_helper, false) == Readiness::Run,
         "a helper switch needed Brindle's listing"
+    );
+    ensure!(
+        readiness(&[TestSwitch::SessionStartDelay], &debug_brindle, &release_helper, false) == Readiness::Run,
+        "the session start delay is Brindle's"
+    );
+    ensure!(
+        matches!(readiness(&[TestSwitch::SessionStartDelay], &release_brindle, &debug_helper, false), Readiness::Skip(_)),
+        "a release Brindle has no session start delay"
     );
     ensure!(readiness(&[], &release_brindle, &release_helper, true) == Readiness::Run, "no needs didn't run");
 

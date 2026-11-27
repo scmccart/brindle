@@ -37,6 +37,13 @@ use crate::agent::sink::Sink as AgentSink;
 use crate::agent::spawn::{AgentRestartRequest, AgentSpawnRequest};
 use crate::config::RemoteTarget;
 
+/// The debug-only fault switch (`process R20`) that delays a session's
+/// thread between the core's answer and the running session, by a whole
+/// number of milliseconds (OpenSpec change `agents-client-state-fixes`,
+/// decision 4). Named here, which every platform compiles, so `main.rs`
+/// lists it without a platform `cfg`.
+pub const SESSION_START_DELAY: &str = "BRINDLE_TEST_SESSION_START_DELAY";
+
 /// What an agent zone's session starts from ([`agent_link`]).
 pub enum AgentStart {
     /// A new agent session: what it runs, said on the session's own
