@@ -18,6 +18,9 @@ pub enum PaletteRole {
     /// An agent profile's earlier conversations (OpenSpec change
     /// `agents-session-list`), or which agent profile's to list.
     Conversations,
+    /// An agent zone's session options, or one option's choices (OpenSpec
+    /// change `agents-commands`).
+    AgentOptions,
 }
 
 /// An overlay the window shows.
@@ -73,13 +76,14 @@ pub fn toggle(open: Option<OverlayKind>, wanted: OverlayKind, how: Opens) -> Tog
 mod tests {
     use super::*;
 
-    const KINDS: [OverlayKind; 11] = [
+    const KINDS: [OverlayKind; 12] = [
         OverlayKind::Palette(PaletteRole::NewTab),
         OverlayKind::Palette(PaletteRole::Commands),
         OverlayKind::Palette(PaletteRole::Prompt),
         OverlayKind::Palette(PaletteRole::Sessions),
         OverlayKind::Palette(PaletteRole::SplitProfile),
         OverlayKind::Palette(PaletteRole::Conversations),
+        OverlayKind::Palette(PaletteRole::AgentOptions),
         OverlayKind::Settings,
         OverlayKind::ProfileMenu,
         OverlayKind::ContextMenu,

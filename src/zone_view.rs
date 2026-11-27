@@ -23,7 +23,7 @@ use crate::agent::close::{BusyAgent, ClosePlan, Closing, close_plan};
 use crate::agent::login::{self, TerminalLogin};
 use crate::agent::model::LoginZoneEnd;
 use crate::agent::conversations::{ZoneAt, ZoneFacts, ZoneRun};
-use crate::agent::{Agent, AgentAsk, LoginZone};
+use crate::agent::{Agent, AgentAsk, LoginZone, OptionRefused};
 use crate::agent::spawn::OpenedBy;
 use crate::agent::view::{AgentView, ConfirmLink};
 use brindle_ui::FocusStops as _;
@@ -924,6 +924,14 @@ pub struct ConversationsAsk {
     pub zone: ZoneId,
 }
 
+/// Agent zone `zone` asks for the options palette on it (OpenSpec change
+/// `agents-commands`, flag 7): every option, or option `option`'s choices.
+#[derive(Clone, Debug)]
+pub struct OptionsAsk {
+    pub zone: ZoneId,
+    pub option: Option<String>,
+}
+
 pub struct ZoneTreeView {
     tree: ZoneTree,
     zones: HashMap<ZoneId, Zone>,
@@ -954,6 +962,10 @@ impl EventEmitter<CloseZoneAsk> for ZoneTreeView {}
 impl EventEmitter<SplitAsk> for ZoneTreeView {}
 impl EventEmitter<SplitRefused> for ZoneTreeView {}
 impl EventEmitter<ConversationsAsk> for ZoneTreeView {}
+impl EventEmitter<OptionsAsk> for ZoneTreeView {}
+/// A set an agent zone's server refused, passed on to the window's notice
+/// line.
+impl EventEmitter<OptionRefused> for ZoneTreeView {}
 /// A zone's link wasn't opened, passed on to the window (whichever tab the
 /// zone is in: an opener can fail after its tab went to the background).
 impl EventEmitter<LinkFailed> for ZoneTreeView {}
@@ -1052,11 +1064,15 @@ impl ZoneTreeView {
                     this.on_login_zone(id, event, window, cx);
                 });
                 // Its conversations palette, which the window opens.
-                let ask = cx.subscribe(&agent, move |_, _, AgentAsk::Conversations: &AgentAsk, cx| {
-                    cx.emit(ConversationsAsk { zone: id });
+                // And its options palette (OpenSpec change `agents-commands`).
+                let ask = cx.subscribe(&agent, move |_, _, ask: &AgentAsk, cx| match ask {
+                    AgentAsk::Conversations => cx.emit(ConversationsAsk { zone: id }),
+                    AgentAsk::Options { option } => cx.emit(OptionsAsk { zone: id, option: option.clone() }),
                 });
+                // A set the server refused, for the notice line.
+                let refused = cx.subscribe(&agent, |_, _, refused: &OptionRefused, cx| cx.emit(refused.clone()));
                 let title: SharedString = agent.read(cx).title().into();
-                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link, login, ask])
+                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link, login, ask, refused])
             }
         };
         let focus = content.focus_handle(cx);

@@ -56,6 +56,13 @@ actions!(
         // (each only when the input's status allows it).
         PromptSubmit,
         PromptStop,
+        // A prompt input's suggestions while they show: the keys the
+        // owner's list takes before the text area's own.
+        PromptSuggestionUp,
+        PromptSuggestionDown,
+        PromptSuggestionEnter,
+        PromptSuggestionTab,
+        PromptSuggestionEscape,
     ]
 );
 
@@ -164,6 +171,18 @@ pub fn default_bindings() -> Vec<KeyBinding> {
     ];
     bindings.extend(editing_bindings(i));
     bindings.extend(editing_bindings(a));
+    // While a prompt input shows suggestions, its list takes up, down,
+    // enter, tab and escape before the text area does: matched at the text
+    // area's own depth and bound after its keys, these come first, and
+    // enter goes on to the text area's while an input method composes.
+    let suggesting = Some("PromptSuggesting > TextArea");
+    bindings.extend([
+        KeyBinding::new("up", PromptSuggestionUp, suggesting),
+        KeyBinding::new("down", PromptSuggestionDown, suggesting),
+        KeyBinding::new("enter", PromptSuggestionEnter, suggesting),
+        KeyBinding::new("tab", PromptSuggestionTab, suggesting),
+        KeyBinding::new("escape", PromptSuggestionEscape, suggesting),
+    ]);
     bindings
 }
 
@@ -237,10 +256,57 @@ mod tests {
         let prompt = in_context(&bindings, "PromptInput");
         let prompt: Vec<&str> = prompt.iter().map(|(_, name)| name.as_str()).collect();
         assert_eq!(prompt, ["brindle_ui::PromptSubmit", "brindle_ui::PromptStop"]);
+        let suggesting = in_context(&bindings, "PromptSuggesting > TextArea");
+        assert_eq!(suggesting.len(), 5);
         // Every binding is in one of the crate's contexts.
         assert_eq!(
             bindings.len(),
-            text_input.len() + text_area.len() + layer.len() + command.len() + scope.len() + list.len() + prompt.len()
+            text_input.len()
+                + text_area.len()
+                + layer.len()
+                + command.len()
+                + scope.len()
+                + list.len()
+                + prompt.len()
+                + suggesting.len()
         );
+    }
+
+    /// While a prompt input shows suggestions, its list's keys come before
+    /// the text area's and the owner's; enter's next are the text area's
+    /// and the prompt's, which a composing input method reaches by passing
+    /// it on. Without suggestions the keys are as before.
+    #[test]
+    fn suggestions_take_their_keys_first() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+        let keymap = Keymap::new(default_bindings());
+        let stack = |suggesting: bool| -> Vec<KeyContext> {
+            let mut prompt = KeyContext::parse("PromptInput").unwrap();
+            if suggesting {
+                prompt.add("PromptSuggesting");
+            }
+            let focus = KeyContext::parse("UiFocusScope").unwrap();
+            vec![focus, prompt, KeyContext::parse("TextArea").unwrap()]
+        };
+        let names = |key: &str, suggesting: bool| -> Vec<String> {
+            let press = Keystroke::parse(key).unwrap();
+            let (bindings, _) = keymap.bindings_for_input(&[press], &stack(suggesting));
+            bindings.iter().map(|b| b.action().name().to_string()).collect()
+        };
+        for (key, action) in [
+            ("up", "PromptSuggestionUp"),
+            ("down", "PromptSuggestionDown"),
+            ("tab", "PromptSuggestionTab"),
+            ("escape", "PromptSuggestionEscape"),
+        ] {
+            assert_eq!(names(key, true)[0], format!("brindle_ui::{action}"), "{key}");
+        }
+        assert_eq!(
+            names("enter", true),
+            ["brindle_ui::PromptSuggestionEnter", "brindle_ui::TextAreaEnter", "brindle_ui::PromptSubmit"]
+        );
+        assert_eq!(names("up", false)[0], "brindle_ui::TextAreaUp");
+        assert_eq!(names("tab", false)[0], "brindle_ui::FocusNext");
+        assert_eq!(names("escape", false)[0], "brindle_ui::PromptStop");
     }
 }

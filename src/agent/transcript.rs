@@ -8,8 +8,9 @@
 
 pub use brindle_transcript::{
     Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange, FileOp, HoldReason,
-    LoginKind, LoginMethod, NoticeLevel, Output, PAGE_BYTES, PermissionKind, PermissionOption, PermissionOutcome, Slot,
-    StopReason, ToolItem, ToolKind, ToolStatus, Transcript, TurnState, Window,
+    LoginKind, LoginMethod, NoticeLevel, OptionCategory, OptionChoice, OptionControl, Output, PAGE_BYTES, PermissionKind,
+    PermissionOption, PermissionOutcome, SessionOption, Slot, SlashCommand, StopReason, ToolItem, ToolKind, ToolStatus,
+    Transcript, TurnState, Window,
 };
 
 /// What the zone's tests build tool content with.

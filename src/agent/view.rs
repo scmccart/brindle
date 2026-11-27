@@ -30,10 +30,13 @@ use brindle_ui::{
     PageDirection, PromptAction, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
     Resend as UiResend, Response, RichBlock, Shimmer, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
+use brindle_ui::{FooterItem, Suggestion, SuggestionKey, Suggestions};
+
+use crate::agent::commands::{Completion, CompletionKey, OptionItem};
 use brindle_ui::{Code, CodeBlock, Diff};
 
 use crate::actions::{
-    AgentCancel, AgentContinue, AgentConversations, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
+    AgentCancel, AgentContinue, AgentConversations, AgentNextMode, AgentOptions, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
     CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts, ToggleAgentToolDetails,
 };
 use crate::agent::login::MethodOffer;
@@ -185,6 +188,39 @@ pub fn prompt_state(model: &ChatModel, offer: &Offer) -> PromptState {
         }
     };
     PromptState { status, queued: queued_of(model.queue()), reason, actions: model.zone_choices(offer) }
+}
+
+/// The prompt input's suggestions for the model's completion list (OpenSpec
+/// change `agents-commands`), each row keyed by its label.
+pub fn suggestions_of(completion: &Completion) -> Suggestions {
+    let rows = completion
+        .items
+        .iter()
+        .map(|item| Suggestion {
+            key: item.label.clone().into(),
+            label: item.label.clone().into(),
+            hint: item.hint.clone().map(Into::into),
+            description: item.description.clone().map(Into::into),
+        })
+        .collect();
+    Suggestions { rows, highlighted: completion.highlighted }
+}
+
+/// The prompt input's footer for the options under it, each keyed by its
+/// option's id.
+pub fn footer_of(items: &[OptionItem]) -> Vec<FooterItem> {
+    items.iter().map(|item| FooterItem { key: item.id.clone().into(), label: item.label.clone().into() }).collect()
+}
+
+/// The completion list's key for the prompt input's.
+pub fn completion_key_of(key: SuggestionKey) -> CompletionKey {
+    match key {
+        SuggestionKey::Up => CompletionKey::Up,
+        SuggestionKey::Down => CompletionKey::Down,
+        SuggestionKey::Enter => CompletionKey::Enter,
+        SuggestionKey::Tab => CompletionKey::Tab,
+        SuggestionKey::Escape => CompletionKey::Escape,
+    }
 }
 
 /// The prompt input's queue row for the model's [`QueueRow`].
@@ -358,6 +394,13 @@ impl AgentView {
             cx.subscribe(&area, |this, _, _: &TextAreaEvent, cx| {
                 this.agent.update(cx, |agent, cx| agent.seen(cx));
             }),
+            // The completion list follows the text and the cursor (OpenSpec
+            // change `agents-commands`): any change of the area's.
+            cx.observe(&area, |this, area, cx| {
+                let area = area.read(cx);
+                let (text, cursor, composing) = (area.text().to_string(), area.cursor(), area.composing());
+                this.agent.update(cx, |agent, cx| agent.typed(&text, cursor, composing, cx));
+            }),
             // A closed zone can't keep the clock running.
             cx.on_release({
                 let id = cx.entity_id();
@@ -522,6 +565,9 @@ impl AgentView {
             }
             AgentUpdate::ClearDraft => self.prompt.update(cx, |prompt, cx| prompt.set_text("", cx)),
             AgentUpdate::SetDraft(text) => self.prompt.update(cx, |prompt, cx| prompt.set_text(text, cx)),
+            AgentUpdate::SetDraftAt(text, cursor) => {
+                self.prompt.update(cx, |prompt, cx| prompt.set_text_at(text, *cursor, cx));
+            }
             AgentUpdate::SendFirstIfUnchanged(text) => {
                 if self.prompt.read(cx).area().read(cx).text() == text.as_str() {
                     self.agent.update(cx, |agent, cx| agent.send_first(text, cx));
@@ -540,6 +586,18 @@ impl AgentView {
             PromptInputEvent::Stop => self.agent.update(cx, |agent, cx| agent.cancel(cx)),
             PromptInputEvent::RemoveQueued => self.agent.update(cx, |agent, cx| agent.unqueue(cx)),
             PromptInputEvent::ResendQueued => self.agent.update(cx, |agent, cx| agent.resend(cx)),
+            PromptInputEvent::SuggestionKey(key) => {
+                let key = completion_key_of(*key);
+                self.agent.update(cx, |agent, cx| agent.completion(Some(key), None, cx));
+            }
+            PromptInputEvent::SuggestionPressed(label) => {
+                let label = label.to_string();
+                self.agent.update(cx, |agent, cx| agent.completion(None, Some(&label), cx));
+            }
+            PromptInputEvent::Footer(id) => {
+                let id = id.to_string();
+                self.agent.update(cx, |agent, cx| agent.footer_pressed(&id, cx));
+            }
             PromptInputEvent::Action(key) => {
                 let choice = [ZoneChoice::Continue, ZoneChoice::Conversations, ZoneChoice::New]
                     .into_iter()
@@ -586,11 +644,15 @@ impl AgentView {
             }
         }
         self.login = login;
+        let suggestions = agent.model().completion().map(suggestions_of);
+        let footer = footer_of(&agent.model().option_items());
         self.prompt.update(cx, |prompt, cx| {
             prompt.set_status(state.status, cx);
             prompt.set_queued(state.queued, cx);
             prompt.set_reason(state.reason, cx);
             prompt.set_actions(prompt_actions(&state.actions), cx);
+            prompt.set_suggestions(suggestions, cx);
+            prompt.set_footer(footer, cx);
         });
         let mut kept = std::mem::take(&mut self.permissions);
         for (entry, options) in pending {
@@ -640,6 +702,16 @@ impl AgentView {
     /// profile and directory.
     fn conversations(&mut self, _: &AgentConversations, _: &mut Window, cx: &mut Context<Self>) {
         self.agent.update(cx, |agent, cx| agent.ask_conversations(cx));
+    }
+
+    /// `agent_options`: the window's options palette on the zone.
+    fn options(&mut self, _: &AgentOptions, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.ask_options(None, cx));
+    }
+
+    /// `agent_next_mode`: the mode after the current one.
+    fn next_mode(&mut self, _: &AgentNextMode, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.next_mode(cx));
     }
 
     fn copy_queued(&mut self, _: &CopyQueuedPrompt, _: &mut Window, cx: &mut Context<Self>) {
@@ -1167,6 +1239,8 @@ impl Render for AgentView {
             .on_action(cx.listener(Self::resend))
             .on_action(cx.listener(Self::continue_conversation))
             .on_action(cx.listener(Self::conversations))
+            .on_action(cx.listener(Self::options))
+            .on_action(cx.listener(Self::next_mode))
             .on_action(cx.listener(Self::copy_queued))
             .on_action(cx.listener(Self::copy_last))
             .on_action(cx.listener(Self::copy_last_code))

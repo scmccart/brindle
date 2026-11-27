@@ -37,11 +37,13 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, App, AppContext, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Render, SharedString, Styled, Subscription, Window, div,
-    prelude::FluentBuilder, rems,
+    InteractiveElement, IntoElement, KeyContext, ParentElement, Render, SharedString, Styled, Subscription, Window, div, prelude::FluentBuilder, rems,
 };
 
-use crate::actions::{PromptStop, PromptSubmit};
+use crate::actions::{
+    PromptStop, PromptSubmit, PromptSuggestionDown, PromptSuggestionEnter, PromptSuggestionEscape, PromptSuggestionTab,
+    PromptSuggestionUp,
+};
 use crate::components::{Button, Textarea, Tooltip, TooltipFor, trigger_label};
 use crate::icon::Icon;
 use crate::style::{ButtonSize, ButtonVariant};
@@ -120,9 +122,50 @@ impl Queued {
     }
 }
 
+/// A row of the suggestions above the text area: the owner's key for it,
+/// its label, and an optional hint and description, each cut to one line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    pub key: SharedString,
+    pub label: SharedString,
+    pub hint: Option<SharedString>,
+    pub description: Option<SharedString>,
+}
+
+/// The suggestions the owner holds, and the row it highlights.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestions {
+    pub rows: Vec<Suggestion>,
+    pub highlighted: usize,
+}
+
+/// A key the suggestions take while they show, before the text area's own:
+/// the owner says what each does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKey {
+    Up,
+    Down,
+    Enter,
+    Tab,
+    Escape,
+}
+
+/// An item under the text area: the owner's key for it, and its label.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FooterItem {
+    pub key: SharedString,
+    pub label: SharedString,
+}
+
 /// What a prompt input asks its owner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptInputEvent {
+    /// A key the suggestions take while they show.
+    SuggestionKey(SuggestionKey),
+    /// The suggestion with this key was pressed: accept it.
+    SuggestionPressed(SharedString),
+    /// The footer item with this key was pressed.
+    Footer(SharedString),
     /// Send this text (the draft, which stays until the owner clears it).
     Submit(String),
     /// Stop the running turn.
@@ -188,6 +231,10 @@ pub struct PromptInput {
     reason: Option<SharedString>,
     /// The reason line's action buttons, in order.
     actions: Vec<PromptAction>,
+    /// The owner's suggestions above the text area, while it gives some.
+    suggestions: Option<Suggestions>,
+    /// The owner's items under the text area.
+    footer: Vec<FooterItem>,
     held_color: Option<Hsla>,
     stop_handle: FocusHandle,
     /// The action buttons' handles by key (`types R3`): a button keeps its
@@ -219,6 +266,8 @@ impl PromptInput {
             queued: None,
             reason: None,
             actions: Vec::new(),
+            suggestions: None,
+            footer: Vec::new(),
             held_color: None,
             stop_handle: cx.focus_handle(),
             action_handles: Vec::new(),
@@ -243,6 +292,17 @@ impl PromptInput {
         self.area.update(cx, |area, cx| {
             area.set_text(text, cx);
             area.move_to_end(cx);
+        });
+        cx.notify();
+    }
+
+    /// Replaces the draft with the cursor at byte `cursor` (an owner's
+    /// suggestion written in).
+    pub fn set_text_at(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        let cursor = cursor.min(text.len());
+        self.area.update(cx, |area, cx| {
+            area.set_text(text, cx);
+            area.select(cursor..cursor, cx);
         });
         cx.notify();
     }
@@ -311,6 +371,39 @@ impl PromptInput {
             self.actions = actions;
             cx.notify();
         }
+    }
+
+    /// Suggestions above the text area, none taking focus: while they show,
+    /// up, down, enter, tab and escape in the text area ask the owner
+    /// ([`PromptInputEvent::SuggestionKey`]) rather than doing their own,
+    /// enter going on to the text area while an input method composes; a
+    /// press on a row asks the owner with its key. `None` (or no rows)
+    /// takes them away. The owner holds the rows and the highlight, and
+    /// changes the text itself.
+    pub fn set_suggestions(&mut self, suggestions: Option<Suggestions>, cx: &mut Context<Self>) {
+        let suggestions = suggestions.filter(|s| !s.rows.is_empty());
+        if self.suggestions != suggestions {
+            self.suggestions = suggestions;
+            cx.notify();
+        }
+    }
+
+    pub fn suggestions(&self) -> Option<&Suggestions> {
+        self.suggestions.as_ref()
+    }
+
+    /// Items under the text area, separated by a middle dot, each asking
+    /// the owner with its key on a press ([`PromptInputEvent::Footer`]);
+    /// none is a keyboard stop.
+    pub fn set_footer(&mut self, footer: Vec<FooterItem>, cx: &mut Context<Self>) {
+        if self.footer != footer {
+            self.footer = footer;
+            cx.notify();
+        }
+    }
+
+    pub fn footer(&self) -> &[FooterItem] {
+        &self.footer
     }
 
     /// The first action's label.
@@ -405,6 +498,113 @@ impl PromptInput {
         } else {
             cx.propagate();
         }
+    }
+
+    /// A key the suggestions take: the owner's while they show. Enter while
+    /// an input method composes goes on to the text area, which commits it.
+    fn suggestion_key(&mut self, key: SuggestionKey, cx: &mut Context<Self>) {
+        let composing = key == SuggestionKey::Enter && self.area.read(cx).composing();
+        if self.suggestions.is_none() || composing {
+            cx.propagate();
+            return;
+        }
+        cx.emit(PromptInputEvent::SuggestionKey(key));
+    }
+
+    /// The suggestions above the text area: a row per suggestion, its
+    /// label, hint and description on one line, the highlighted one on the
+    /// accent; a press asks the owner. No row takes focus.
+    fn suggestion_list(&self, suggestions: &Suggestions, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let t = cx.ui_theme();
+        let (muted, accent, accent_fg, border, radius) =
+            (t.muted_foreground, t.accent, t.accent_foreground, t.border, t.radius_md());
+        let rows: Vec<gpui::AnyElement> = suggestions
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(ix, row)| {
+                let key = row.key.clone();
+                let highlighted = ix == suggestions.highlighted;
+                let selector: SharedString = format!("prompt-suggestion-{ix}").into();
+                div()
+                    .id(gpui::ElementId::Name(selector.clone()))
+                    .debug_selector(move || selector.to_string())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_w_0()
+                    .px_2()
+                    .py_0p5()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .when(highlighted, |d| d.bg(accent).text_color(accent_fg))
+                    .child(trigger_label(row.label.clone()).flex_initial())
+                    .when_some(row.hint.clone(), |d, hint| d.child(trigger_label(hint).flex_initial().text_color(muted)))
+                    .when_some(row.description.clone(), |d, description| {
+                        d.child(trigger_label(description).min_w(rems(3.)).text_color(muted))
+                    })
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |_, _, window, cx| {
+                        // The text area keeps focus: the press is the owner's.
+                        window.prevent_default();
+                        cx.emit(PromptInputEvent::SuggestionPressed(key.clone()));
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .debug_selector(|| "prompt-suggestions".into())
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .p_1()
+            .rounded(radius)
+            .border_1()
+            .border_color(border)
+            .text_size(rems(0.8125))
+            .children(rows)
+    }
+
+    /// The items under the text area, `·` between them: small ghost
+    /// labels, each a press asking the owner, none a stop.
+    fn footer_row(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let t = cx.ui_theme();
+        let (muted, fg, hover, radius) = (t.muted_foreground, t.foreground, t.accent, t.radius_md());
+        let mut children: Vec<gpui::AnyElement> = Vec::new();
+        for (ix, item) in self.footer.iter().enumerate() {
+            if ix > 0 {
+                children.push(div().text_color(muted).child("·").into_any_element());
+            }
+            let key = item.key.clone();
+            let selector: SharedString = format!("prompt-footer-{ix}").into();
+            children.push(
+                div()
+                    .id(gpui::ElementId::Name(selector.clone()))
+                    .debug_selector(move || selector.to_string())
+                    .px_1()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .text_color(muted)
+                    .hover(move |s| s.bg(hover).text_color(fg))
+                    .child(item.label.clone())
+                    .on_mouse_down(gpui::MouseButton::Left, cx.listener(move |_, _, window, cx| {
+                        window.prevent_default();
+                        cx.emit(PromptInputEvent::Footer(key.clone()));
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .debug_selector(|| "prompt-footer".into())
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .text_size(rems(0.75))
+            .children(children)
     }
 
     fn submit_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -555,6 +755,14 @@ impl Render for PromptInput {
                 )
             })
             .collect();
+        let suggestions = self.suggestions.clone().map(|suggestions| self.suggestion_list(&suggestions, cx));
+        let footer = (!self.footer.is_empty()).then(|| self.footer_row(cx));
+        // While suggestions show, their keys are bound in this context.
+        let mut context = KeyContext::default();
+        context.add("PromptInput");
+        if self.suggestions.is_some() {
+            context.add("PromptSuggesting");
+        }
         div()
             .flex()
             .flex_col()
@@ -562,16 +770,31 @@ impl Render for PromptInput {
             .w_full()
             .min_w_0()
             .children(row)
+            .children(suggestions)
             // The context wraps the text area alone, so the row's and the
             // toolbar's buttons keep their own enter.
             .child(
                 div()
                     .debug_selector(|| "prompt-area".into())
-                    .key_context("PromptInput")
+                    .key_context(context)
                     .on_action(cx.listener(Self::on_submit))
                     .on_action(cx.listener(Self::on_stop))
+                    .on_action(cx.listener(|this, _: &PromptSuggestionUp, _, cx| this.suggestion_key(SuggestionKey::Up, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &PromptSuggestionDown, _, cx| this.suggestion_key(SuggestionKey::Down, cx)),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &PromptSuggestionEnter, _, cx| this.suggestion_key(SuggestionKey::Enter, cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &PromptSuggestionTab, _, cx| this.suggestion_key(SuggestionKey::Tab, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &PromptSuggestionEscape, _, cx| {
+                            this.suggestion_key(SuggestionKey::Escape, cx)
+                        }),
+                    )
                     .child(Textarea::new(&self.area)),
             )
+            .children(footer)
             .child(
                 div()
                     .flex()
@@ -965,6 +1188,106 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(bounds("prompt-reason", cx), Some(expected));
+    }
+
+    fn suggestions(highlighted: usize) -> Suggestions {
+        let row = |key: &'static str, hint: Option<&'static str>| Suggestion {
+            key: key.into(),
+            label: format!("/{key}").into(),
+            hint: hint.map(Into::into),
+            description: Some(format!("about {key}").into()),
+        };
+        Suggestions { rows: vec![row("compact", Some("<how>")), row("context", None), row("review", None)], highlighted }
+    }
+
+    /// The spec's "Prompt input suggestions": rows above the text area,
+    /// which keeps focus; a press asks the owner by key and changes no
+    /// text; taken away, no list shows.
+    #[test]
+    fn suggestions_show_above_and_a_press_asks_the_owner() {
+        let (_, input, events, cx) = host();
+        cx.simulate_input("/co");
+        update(&input, cx, |input, cx| input.set_suggestions(Some(suggestions(1)), cx));
+        let list = bounds("prompt-suggestions", cx).expect("the list shows");
+        let area = bounds("prompt-area", cx).expect("drawn");
+        assert!(list.bottom() <= area.top(), "{list:?} above {area:?}");
+        for ix in 0..3 {
+            assert!(cx.debug_bounds(["prompt-suggestion-0", "prompt-suggestion-1", "prompt-suggestion-2"][ix]).is_some());
+        }
+        click("prompt-suggestion-2", cx);
+        assert_eq!(take(&events), [PromptInputEvent::SuggestionPressed("review".into())]);
+        assert_eq!(input.read_with(cx, |input, cx| input.text(cx).to_string()), "/co", "the owner's to change");
+        let focused = cx.update(|window, cx| input.read(cx).focused(window, cx));
+        assert_eq!(focused, Some(PromptFocus::Text), "the text area keeps focus");
+        // Typing goes on in the text area.
+        cx.simulate_input("m");
+        assert_eq!(input.read_with(cx, |input, cx| input.text(cx).to_string()), "/com");
+        update(&input, cx, |input, cx| input.set_suggestions(None, cx));
+        assert!(input.read_with(cx, |input, _| input.suggestions().is_none()));
+        let empty = Suggestions { rows: Vec::new(), highlighted: 0 };
+        update(&input, cx, |input, cx| input.set_suggestions(Some(empty), cx));
+        assert!(input.read_with(cx, |input, _| input.suggestions().is_none()), "no rows, no list");
+    }
+
+    /// While suggestions show, up, down, enter, tab and escape ask the
+    /// owner and do nothing else: enter submits nothing, escape doesn't
+    /// stop a turn, tab and the arrows leave the text alone. Enter while an
+    /// input method composes goes to the text area. Without them, the keys
+    /// are as before.
+    #[test]
+    fn the_suggestions_take_their_keys_first() {
+        let (host, input, events, cx) = host();
+        cx.simulate_input("/co");
+        update(&input, cx, |input, cx| {
+            input.set_status(PromptStatus::Streaming, cx);
+            input.set_suggestions(Some(suggestions(0)), cx);
+        });
+        for (key, asked) in [
+            ("up", SuggestionKey::Up),
+            ("down", SuggestionKey::Down),
+            ("enter", SuggestionKey::Enter),
+            ("tab", SuggestionKey::Tab),
+            ("escape", SuggestionKey::Escape),
+        ] {
+            cx.simulate_keystrokes(key);
+            assert_eq!(take(&events), [PromptInputEvent::SuggestionKey(asked)], "{key}");
+        }
+        assert_eq!(input.read_with(cx, |input, cx| input.text(cx).to_string()), "/co");
+        assert_eq!(host.read_with(cx, |host, _| host.escapes), 0);
+        let area = input.read_with(cx, |input, _| input.area().clone());
+        cx.update(|window, cx| {
+            area.update(cx, |area, cx| area.replace_and_mark_text_in_range(None, "e", None, window, cx));
+        });
+        cx.simulate_keystrokes("enter");
+        assert!(take(&events).is_empty(), "the composition's");
+        update(&input, cx, |input, cx| input.set_suggestions(None, cx));
+        cx.update(|window, cx| input.read(cx).focus_handle(cx).focus(window));
+        cx.simulate_keystrokes("escape");
+        assert_eq!(take(&events), [PromptInputEvent::Stop], "escape stops again");
+    }
+
+    /// The spec's "Prompt input footer items": the items show under the
+    /// text area with a dot between them, a press asks the owner with the
+    /// item's key, and none is a stop.
+    #[test]
+    fn footer_items_ask_the_owner_and_are_no_stops() {
+        let (_, input, events, cx) = host();
+        let stops = input.read_with(cx, |input, _| (input.row_stops(), input.action_stops()));
+        let item = |key: &'static str, label: &'static str| FooterItem { key: key.into(), label: label.into() };
+        update(&input, cx, |input, cx| {
+            input.set_footer(vec![item("mode", "Auto"), item("model", "Opus"), item("effort", "Medium")], cx)
+        });
+        let footer = bounds("prompt-footer", cx).expect("the footer shows");
+        let area = bounds("prompt-area", cx).expect("drawn");
+        assert!(footer.top() >= area.bottom(), "{footer:?} under {area:?}");
+        click("prompt-footer-1", cx);
+        assert_eq!(take(&events), [PromptInputEvent::Footer("model".into())]);
+        let focused = cx.update(|window, cx| input.read(cx).focused(window, cx));
+        assert_eq!(focused, Some(PromptFocus::Text), "the press takes no focus");
+        assert_eq!(input.read_with(cx, |input, _| (input.row_stops(), input.action_stops())), stops, "no new stops");
+        assert_eq!(input.read_with(cx, |input, _| input.footer().len()), 3);
+        update(&input, cx, |input, cx| input.set_footer(Vec::new(), cx));
+        assert!(input.read_with(cx, |input, _| input.footer().is_empty()));
     }
 
     /// Submitted draws the spinner, and a set text replaces the draft.

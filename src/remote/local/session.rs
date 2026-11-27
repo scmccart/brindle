@@ -387,6 +387,12 @@ impl Session {
         self.running(|running| running.choose(conversation))
     }
 
+    /// Sets session option `option` to `value` (`AGENT_SET_OPTION`), as
+    /// [`Session::prompt`].
+    pub fn set_option(&self, option: &str, value: crate::remote::protocol::client::OptionValue) -> Option<RequestId> {
+        self.running(|running| running.set_option(option, value))
+    }
+
     /// Answers the permission request in entry `entry` with `option`, or
     /// cancelled with none (`AGENT_PERMISSION`), as [`Session::prompt`].
     pub fn answer(&self, entry: u64, option: Option<String>) -> Option<RequestId> {
@@ -1823,6 +1829,35 @@ mod tests {
         assert_eq!(recv(&agent.core), ToCore::AgentChoose(sent));
         let refused = AgentEvent::Reply { request: chose, outcome: Err("session 7: the agent isn't choosing".into()) };
         assert_eq!(next_life(&mut agent.feed), refused);
+    }
+
+    /// `agents-commands` 4.1: a set goes out as `AGENT_SET_OPTION` naming
+    /// the option and the value, its `OK` and its refusal coming back under
+    /// its id.
+    #[test]
+    fn a_set_option_goes_out_and_its_answer_comes_back() {
+        use client::OptionValue;
+        let mut agent = agent_session_with("agent-set-option", None, move |message, stream| match message {
+            ToCore::SpawnAgent(spawn) => {
+                send(stream, ToClient::Spawned(Spawned { req: spawn.req, session: AGENT, pid: 4242, key: "k7".into() }));
+                let ready = AgentState::Ready { name: Some("fake".into()), version: None };
+                transcript(stream, &[Event::Agent { state: ready }]);
+            }
+            ToCore::AgentSetOption(set) if set.option == "mode" => ok(stream, set.req),
+            ToCore::AgentSetOption(set) => refuse(stream, set.req, "session 7: the agent offers no option \"nope\""),
+            _ => {}
+        });
+        let choice = OptionValue::Choice { value: "plan".into() };
+        let req = agent.session.set_option("mode", choice.clone()).unwrap();
+        let sent = client::AgentSetOption { req, session: AGENT, option: "mode".into(), value: choice };
+        assert_eq!(recv(&agent.core), ToCore::AgentSetOption(sent));
+        assert_eq!(next_life(&mut agent.feed), reply(req));
+        let toggle = OptionValue::Toggle { on: true };
+        let refused = agent.session.set_option("nope", toggle.clone()).unwrap();
+        let sent = client::AgentSetOption { req: refused, session: AGENT, option: "nope".into(), value: toggle };
+        assert_eq!(recv(&agent.core), ToCore::AgentSetOption(sent));
+        let outcome = Err("session 7: the agent offers no option \"nope\"".into());
+        assert_eq!(next_life(&mut agent.feed), AgentEvent::Reply { request: refused, outcome });
     }
 
     /// `agents-login` 7.1: a login choice goes out as `AGENT_LOGIN` on the

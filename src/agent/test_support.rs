@@ -20,6 +20,7 @@ use crate::agent::{Agent, Connect, Requests};
 use crate::config::{Config, ConfigReport};
 use crate::remote::{AgentStart, Host};
 use crate::remote::SessionKey;
+use crate::remote::protocol::client::OptionValue;
 use crate::remote::protocol::{RequestId, SessionId};
 use crate::settings::Settings;
 
@@ -61,6 +62,7 @@ pub enum Call {
     Fetch(u64, u32),
     List(Option<String>),
     Choose(Option<String>),
+    SetOption(String, OptionValue),
 }
 
 pub type Calls = Rc<RefCell<Vec<Call>>>;
@@ -142,6 +144,10 @@ impl Requests for FakeRequests {
 
     fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
         self.record(Call::Choose(conversation))
+    }
+
+    fn set_option(&self, option: &str, value: OptionValue) -> Option<RequestId> {
+        self.record(Call::SetOption(option.to_string(), value))
     }
 }
 

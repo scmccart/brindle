@@ -63,6 +63,10 @@ pub struct Changes {
     pub slot_changed: bool,
     /// A `Turn` or `Agent` event came.
     pub turn_or_agent: bool,
+    /// A `Commands` or `Options` event came (OpenSpec change
+    /// `agents-commands`): read both lists whole with
+    /// [`Transcript::commands`] and [`Transcript::options`].
+    pub lists_changed: bool,
     /// A replay started: the transcript was rebuilt from nothing, and the
     /// zone starts over from it.
     pub reset: bool,
@@ -223,9 +227,8 @@ impl AgentShared {
             Event::Queue { .. } => changes.slot_changed = true,
             // The conversation decides whether a continue is offered.
             Event::Turn { .. } | Event::Agent { .. } | Event::Conversation { .. } => changes.turn_or_agent = true,
-            // The agent's commands and options (`agents-commands`): redrawn
-            // as the agent's state is, until the zone shows them itself.
-            Event::Commands { .. } | Event::Options { .. } => changes.turn_or_agent = true,
+            // The agent's commands and options (`agents-commands`).
+            Event::Commands { .. } | Event::Options { .. } => changes.lists_changed = true,
             Event::Trimmed { through, .. } => changes.trimmed(*through),
             // Only in a replay, after its reset: the zone reads the window
             // from the transcript on every absorb.
@@ -531,6 +534,62 @@ mod tests {
         assert_eq!(changes.prepended, Some(2));
         assert!(changes.changed.is_empty() && changes.from_replay);
         assert_eq!(shared.transcript().entry(EntryId(2)), source.entry(EntryId(2)));
+    }
+
+    fn commands() -> Event {
+        let compact = crate::agent::transcript::SlashCommand {
+            name: "compact".into(),
+            description: "Free up context".into(),
+            hint: Some("<instructions>".into()),
+        };
+        Event::Commands { commands: vec![compact] }
+    }
+
+    fn options() -> Event {
+        use crate::agent::transcript::{OptionCategory, OptionChoice, OptionControl, SessionOption};
+        let choice = |value: &str| OptionChoice { value: value.into(), name: value.into(), description: None, group: None };
+        let mode = SessionOption {
+            id: "mode".into(),
+            name: "Mode".into(),
+            description: None,
+            category: OptionCategory::Mode,
+            kind: OptionControl::Select { current: "auto".into(), choices: vec![choice("auto"), choice("plan")] },
+        };
+        Event::Options { options: vec![mode] }
+    }
+
+    /// `agents-commands` 4.1: each list event folds and says so, replacing
+    /// the last; a replay holding both carries both.
+    #[test]
+    fn the_commands_and_the_options_fold_and_replay() {
+        let mut shared = AgentShared::new();
+        shared.apply(&values(&[commands()])).unwrap();
+        assert_eq!(shared.take_changes(), Changes { lists_changed: true, ..Changes::default() });
+        assert_eq!(shared.transcript().commands().len(), 1);
+        shared.apply(&values(&[options()])).unwrap();
+        assert_eq!(shared.take_changes(), Changes { lists_changed: true, ..Changes::default() });
+        assert_eq!(shared.transcript().options().len(), 1);
+        shared.apply(&values(&[Event::Commands { commands: vec![] }])).unwrap();
+        assert!(shared.take_changes().lists_changed);
+        assert!(shared.transcript().commands().is_empty(), "replaced whole");
+
+        let mut source = Transcript::new();
+        for event in [
+            added(1, Entry::User { text: "hi".into() }),
+            Event::Agent { state: AgentState::Ready { name: None, version: None } },
+            commands(),
+            options(),
+        ] {
+            source.apply(&event).unwrap();
+        }
+        let mut shared = AgentShared::new();
+        shared.replay_start();
+        shared.apply(&values(&source.replay())).unwrap();
+        shared.replay_end();
+        let changes = shared.take_changes();
+        assert!(changes.reset && changes.lists_changed);
+        assert_eq!(shared.transcript(), &source);
+        assert_eq!((shared.transcript().commands().len(), shared.transcript().options().len()), (1, 1));
     }
 
     /// Tool content for an entry below the window changes nothing the zone

@@ -114,8 +114,8 @@ pub use menu::{
 pub use message::{Bubble, BubbleEdges, BubblePart, BubbleStyle, From as MessageFrom, Message, bubble_style};
 pub use message_scroller::{Follow, MessageScroller, PageDirection, PageScroll, page_scroll};
 pub use prompt_input::{
-    PromptAction, PromptFocus, PromptInput, PromptInputEvent, PromptRequest, PromptStatus, Queued, Resend, button_request,
-    enter_submits,
+    FooterItem, PromptAction, PromptFocus, PromptInput, PromptInputEvent, PromptRequest, PromptStatus, Queued, Resend,
+    Suggestion, SuggestionKey, Suggestions, button_request, enter_submits,
     escape_stops, first_line, is_blank,
 };
 pub use popover::{Popover, PopoverContent, PopoverTrigger, TriggerAction, follows_trigger, trigger_action};

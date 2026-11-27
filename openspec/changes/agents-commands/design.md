@@ -235,6 +235,16 @@ The design was checked against `feat/agents-session-list` (PR #150) on 2026-11-2
 20. **The mode notice compares by phase**: an update while ready compares with the option held (or, with none held, the mode last in effect); a run's first list compares with the mode last in effect; a load's replay and the phases before ready compare with nothing and leave the mode last in effect alone, so a replayed mode update never adds a notice.
 21. **A checkpoint's keys must match its options exactly**: `option_keys` holding a key for an option the record lacks, or lacking one it holds, makes the checkpoint unreadable (`Unreadable::Field { name: "option_keys" }`) rather than leaving an option no set can reach.
 22. **"Two attached clients" in the real-role tests is an attach after**: a session has one attached client at a time, so task 3.1's and 3.2a's second client attaches once the first has detached, and its replay must hold both lists.
+23. **The pure completion code is its own module**: `completion`, `accept`, `completion_key`, `option_commands`, `local_command`, `option_items`, `next_mode` and the options palette's rows live in `src/agent/commands.rs` (a whole pure module, in `PURE_MODULES` and `fcis`'s table), not in `model.rs`, which keeps the list's state (`draft`, `completion`, `dismissed`) and calls them.
+24. **A name is matched as it is typed**: a word starting with `brindle:` matches the long names only, any other word the short names only, so `/re` doesn't fuzzy-match `brindle:` letters. A shadowed option command is listed by its long name.
+25. **The dump's category words** are `mode`, `model`, `model_config`, `thought_level` and `other:NAME`, the wire's names in snake case.
+26. **A refused set's notice reads `NAME wasn't changed: WHY`**, WHY the server's reason without its `session N: ` prefix; a set that couldn't go at all (no link) shows `UNSENT` beside the input as any request's does.
+27. **A bare option command opens the options palette on its choices and clears the input** (`Submit::Choose`), as a footer press on a select does.
+28. **A press on a suggestion row is enter on it**: a command row writes its name and a space, a choice row sets the choice. The press takes no focus.
+29. **The suggestion keys are bindings, not key listeners**: `PromptSuggestionUp`/`Down`/`Enter`/`Tab`/`Escape` in the context `PromptSuggesting > TextArea`, which the prompt input adds only while suggestions show, so they come before the text area's and the zone's own; enter goes on (`propagate`) while an input method composes.
+30. **`AgentAsk` is `Clone`, not `Copy`**, since its new `Options { option }` variant carries the option's id; `shared::Changes` gains `lists_changed` for the two list events, which no longer count as a turn or agent change.
+31. **The options palette marks the current choice with `current` in its detail**, and its highlight starts on the first row, not the current choice (a palette has no initial highlight to set).
+32. **Agent Options… and Next Agent Mode are listed only in an agent zone**: the palette's facts read the active zone's model (`ChatModel::has_options`), and a terminal zone's are always false.
 
 ## The user's decisions
 

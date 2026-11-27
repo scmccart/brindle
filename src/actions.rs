@@ -125,6 +125,12 @@ actions!(
         /// its directory, as its Conversations… button does (OpenSpec
         /// change `agents-session-list`).
         AgentConversations,
+        /// Lists the agent session's options, leading to their choices
+        /// (OpenSpec change `agents-commands`).
+        AgentOptions,
+        /// Sets the session's mode to the choice after the current one,
+        /// wrapping.
+        AgentNextMode,
         /// Lists an agent profile's earlier conversations in the pane's
         /// directory, asking which profile when the config has several.
         AgentContinueConversation,
@@ -229,6 +235,8 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("agent_resend", Some("Send Held Prompt Again"), || Box::new(AgentResend)),
     ("agent_continue", Some("Continue This Conversation"), || Box::new(AgentContinue)),
     ("agent_conversations", Some("Agent Conversations…"), || Box::new(AgentConversations)),
+    ("agent_options", Some("Agent Options…"), || Box::new(AgentOptions)),
+    ("agent_next_mode", Some("Next Agent Mode"), || Box::new(AgentNextMode)),
     ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
     ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
     ("copy_last_code_block", Some("Copy Last Code Block"), || Box::new(CopyLastCodeBlock)),
@@ -360,6 +368,11 @@ pub struct PaletteFacts {
     /// split commands are listed only while it has one.
     pub terminal_profiles: bool,
     pub agent_profiles: bool,
+    /// The active agent zone's session has options, and a mode option
+    /// with two or more choices (OpenSpec change `agents-commands`, flag
+    /// 8): Agent Options… and Next Agent Mode are listed only then.
+    pub agent_options: bool,
+    pub agent_modes: bool,
 }
 
 /// The kind of profile a split command asks for, or `None` for any other
@@ -434,6 +447,9 @@ pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
         None if action.partial_eq(&AgentContinueConversation) || action.partial_eq(&AgentConversations) => {
             facts.agent_profiles
         }
+        // The session's options (OpenSpec change `agents-commands`).
+        None if action.partial_eq(&AgentOptions) => facts.agent_options,
+        None if action.partial_eq(&AgentNextMode) => facts.agent_modes,
         None => true,
     };
     kind_listed
@@ -689,7 +705,44 @@ mod tests {
 
     /// A zone's facts in a config with profiles of both kinds.
     fn both_kinds(zone: PaletteZone) -> PaletteFacts {
-        PaletteFacts { zone, prompt_marks: false, terminal_profiles: true, agent_profiles: true }
+        PaletteFacts {
+            zone,
+            prompt_marks: false,
+            terminal_profiles: true,
+            agent_profiles: true,
+            agent_options: true,
+            agent_modes: true,
+        }
+    }
+
+    /// `agents-commands` 6.3: Agent Options… only while the agent zone's
+    /// session has options, Next Agent Mode only with a mode to step; no
+    /// default keys.
+    #[test]
+    fn the_option_commands_are_listed_only_with_options() {
+        use std::any::TypeId;
+        let listed = |facts: PaletteFacts, available: &[TypeId]| -> Vec<&'static str> {
+            palette_commands()
+                .into_iter()
+                .filter(|(_, a)| palette_lists(&**a, facts))
+                .filter(|(_, a)| available.contains(&a.as_any().type_id()))
+                .map(|(l, _)| l)
+                .collect()
+        };
+        let agent_zone = [TypeId::of::<AgentOptions>(), TypeId::of::<AgentNextMode>()];
+        let agent = PaletteFacts { agent_options: false, agent_modes: false, ..both_kinds(PaletteZone::Agent) };
+        assert!(listed(agent, &agent_zone).is_empty(), "no options");
+        let options = PaletteFacts { agent_options: true, ..agent };
+        assert_eq!(listed(options, &agent_zone), ["Agent Options…"], "options without a mode to step");
+        let modes = PaletteFacts { agent_options: true, agent_modes: true, ..agent };
+        assert_eq!(listed(modes, &agent_zone), ["Agent Options…", "Next Agent Mode"]);
+        // A terminal zone has no agent view to answer them (nothing makes
+        // them available there), and its facts never say options.
+        assert!(listed(PaletteFacts { zone: PaletteZone::Terminal, ..agent }, &agent_zone).is_empty());
+        let bindings = default_bindings();
+        for action in [&AgentOptions as &dyn Action, &AgentNextMode] {
+            assert!(bindings.iter().all(|b| !b.action().partial_eq(action)), "{} has no default key", action.name());
+        }
     }
 
     /// A kind's two split commands are listed only while the config has a
