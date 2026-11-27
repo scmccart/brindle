@@ -10,8 +10,8 @@ use brindle_remote_protocol::serde_json::Value;
 
 use super::envelope::{BadParams, Id, RpcError};
 use super::forms::{
-    Continued, Initialized, Listing, Methods, NewSession, NotificationKind, PermissionRequest, Request,
-    RequestKind, SessionUpdate,
+    Continued, Initialized, Listing, Methods, NewSession, NotificationKind, Offered, OfferedOption, OptionKey,
+    PermissionRequest, Request, RequestKind, SessionUpdate,
 };
 use super::v1;
 use brindle_transcript::StopReason;
@@ -94,9 +94,33 @@ impl Dialect {
         }
     }
 
-    pub fn continued_result(self, how: Continued, result: &Value) -> Result<(), BadParams> {
+    /// A continue's answer: the options it offers (OpenSpec change
+    /// `agents-commands`, decision 12).
+    pub fn continued_result(self, how: Continued, result: &Value) -> Result<Offered, BadParams> {
         match self {
             Self::V1 => v1::decode::continued_result(how, result),
+        }
+    }
+
+    /// The answer to a set of the option `key` names: the whole list when
+    /// the answer carries one, `None` when it is empty by design.
+    pub fn set_option_result(
+        self,
+        key: &OptionKey,
+        result: &Value,
+    ) -> Result<Option<Offered>, BadParams> {
+        match self {
+            Self::V1 => v1::decode::set_option_result(key, result),
+        }
+    }
+
+    /// The options after a list from `config_option_update` or a set's
+    /// answer replaces `held`'s: the version's own options outside the
+    /// config options (v1's modes and model list) stay until the new list
+    /// covers them.
+    pub fn merge_options(self, held: &[OfferedOption], update: Offered) -> Offered {
+        match self {
+            Self::V1 => v1::decode::merge_options(held, update),
         }
     }
 

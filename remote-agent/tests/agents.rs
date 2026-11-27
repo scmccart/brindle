@@ -20,8 +20,8 @@ use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
 use brindle_remote_protocol::serde_json::{self, Value, json};
 use brindle_transcript::{
     AgentState, DiffLine, Entry, EntryId, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, LoginKind,
-    LoginMethod, Output, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind, ToolStatus,
-    TurnState,
+    LoginMethod, OptionControl, Output, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind,
+    ToolStatus, TurnState,
 };
 
 use support::fake_agent::{
@@ -300,6 +300,12 @@ fn agent_core(tag: &str, env: &[(&str, &str)]) -> (TempDir, TestClient) {
     let client = TestClient::hello(&dir.path, &format!("token-{tag}"));
     dir.track(client.core_pid());
     (dir, client)
+}
+
+/// The client capabilities `initialize` offers: terminal logins and
+/// boolean session options.
+fn capabilities() -> Value {
+    json!({"auth": {"terminal": true}, "session": {"configOptions": {"boolean": {}}}})
 }
 
 fn ready(log: &Transcript) -> bool {
@@ -662,6 +668,14 @@ fn shape(event: &Event) -> String {
         Event::Conversation { conversation } => format!("conversation {}", conversation.id),
         Event::Trimmed { dropped, .. } => format!("trimmed {dropped}"),
         Event::Window { from, earlier } => format!("window {from} {earlier}"),
+        Event::Commands { commands } => format!(
+            "commands {}",
+            commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>().join(" ")
+        ),
+        Event::Options { options } => format!(
+            "options {}",
+            options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>().join(" ")
+        ),
     }
 }
 
@@ -1966,6 +1980,8 @@ fn kind(event: &Event) -> &'static str {
         Event::Conversation { .. } => "conversation",
         Event::Trimmed { .. } => "trimmed",
         Event::Window { .. } => "window",
+        Event::Commands { .. } => "commands",
+        Event::Options { .. } => "options",
     }
 }
 
@@ -2643,8 +2659,9 @@ fn initialize_advertises_terminal_logins_and_a_terminal_method_is_the_clients_to
     let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
     let log = client.transcript_until(id, "needs a login", needs_any_login);
 
-    // `auth.terminal`, and no `fs` or `terminal` capability.
-    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], json!({"auth": {"terminal": true}}));
+    // `auth.terminal` and boolean options (`agents-commands`), and no `fs`
+    // or `terminal` capability.
+    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], capabilities());
     let terminal = LoginMethod {
         id: "cli-login".into(),
         name: "Log in from the terminal".into(),
@@ -2704,7 +2721,7 @@ fn a_restart_while_a_login_is_needed_at_the_start_runs_a_new_agent_with_session_
     // `session/new`; the old one nothing more.
     assert_eq!(methods(&first), ["initialize", "session/new"]);
     assert_eq!(methods(&record), ["initialize", "session/new"]);
-    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], json!({"auth": {"terminal": true}}));
+    assert_eq!(sent(&record, "initialize", 0)["params"]["clientCapabilities"], capabilities());
 
     client.prompt(id, "hi").unwrap();
     let log = client.transcript_until(id, "has the turn's end", ended(1));
@@ -3619,4 +3636,305 @@ fn a_login_a_list_needs_returns_the_agent_to_choosing() {
     let listed = client.list_conversations(id, None).unwrap();
     assert!(listed.conversations.is_empty());
     assert_eq!(methods(&record), ["initialize", "session/list", "authenticate", "session/list"]);
+}
+
+// OpenSpec change `agents-commands`: commands and session options.
+
+/// v1's `modes`, in mode `current`.
+fn modes_in(current: &str) -> Value {
+    json!({"currentModeId": current, "availableModes": [
+        {"id": "default", "name": "Default"}, {"id": "plan", "name": "Plan"}]})
+}
+
+/// The config options: a model select at `model` and a `fast` toggle.
+fn config_options(model: &str) -> Value {
+    json!([
+        {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": model,
+         "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"}]},
+        {"id": "fast", "name": "Fast", "category": "speed", "type": "boolean", "currentValue": false}])
+}
+
+/// A `respond` step answering a start with the options in mode `mode`; a
+/// `session/new`'s names `s1`.
+fn options_answer(mode: &str, new: bool) -> String {
+    let mut answer = json!({"modes": modes_in(mode), "configOptions": config_options("opus")});
+    if new {
+        answer["sessionId"] = json!("s1");
+    }
+    format!("respond {answer}")
+}
+
+/// A `send` step of the agent's commands.
+fn commands_step(names: &[&str]) -> String {
+    let commands: Vec<Value> = names
+        .iter()
+        .map(|name| json!({"name": name, "description": format!("Runs {name}"), "input": {"hint": "what"}}))
+        .collect();
+    update(json!({"sessionUpdate": "available_commands_update", "availableCommands": commands}))
+}
+
+/// A script whose agent offers `capabilities`, answers `session/new` with
+/// the options in mode `default`, and sends the commands `compact` and
+/// `review`; the test adds the rest.
+fn with_options(dir: &Path, name: &str, capabilities: &str) -> (AgentScript, PathBuf) {
+    let (mut script, record) = initialized(dir, name, capabilities);
+    script
+        .step("expect session/new")
+        .step(options_answer("default", true))
+        .step(commands_step(&["compact", "review"]));
+    (script, record)
+}
+
+fn choice(value: &str) -> client::OptionValue {
+    client::OptionValue::Choice { value: value.into() }
+}
+
+/// The current value of option `id`, as text.
+fn current(log: &Transcript, id: &str) -> Option<String> {
+    log.options().iter().find(|option| option.id == id).map(|option| match &option.kind {
+        OptionControl::Select { current, .. } => current.clone(),
+        OptionControl::Toggle { on } => on.to_string(),
+    })
+}
+
+fn offers(log: &Transcript) -> bool {
+    ready(log) && log.options().len() == 3 && log.commands().len() == 2
+}
+
+fn noticed(text: &'static str) -> impl FnMut(&Transcript) -> bool {
+    move |log| notices(log).iter().any(|notice| notice == text)
+}
+
+#[test]
+fn a_set_reaches_the_agent_and_its_answer_every_client_that_attaches() {
+    let (mut dir, mut client) = agent_core("agent-set-option", &[]);
+    let (mut script, record) = with_options(&dir.path, "set-option", RESUME_AND_LOAD);
+    script.step("expect session/set_config_option");
+    let held = script.gate();
+    script
+        .step(format!("respond {}", json!({"configOptions": config_options("sonnet")})))
+        .step("expect session/set_mode")
+        .step("respond {}")
+        .step("expect session/set_config_option")
+        .step(r#"respond-error -32602 "model unavailable""#)
+        .step("expect session/prompt")
+        .step(said("working"));
+    let mid_turn = script.gate();
+    // The prompt is the core's request 6 (`initialize`, `session/new` and
+    // the three sets before it; a refused set takes no id).
+    script
+        .step("expect session/set_mode")
+        .step("respond {}")
+        .step(r#"respond-to 6 {"stopReason":"end_turn"}"#);
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    let log = client.transcript_until(id, "offers its options and commands", offers);
+    assert_eq!(current(&log, "mode").as_deref(), Some("default"));
+    assert_eq!(log.commands()[0].hint.as_deref(), Some("what"));
+
+    // Each refusal names the session and why, and sends nothing.
+    let refusals = [
+        ("speed", choice("x"), format!("session {id}: the agent offers no option \"speed\"")),
+        ("model", choice("gpt-5"), format!("session {id}: option \"model\" offers no choice \"gpt-5\"")),
+        ("fast", choice("on"), format!("session {id}: option \"fast\" offers no choice \"on\"")),
+    ];
+    for (option, value, text) in refusals {
+        assert_eq!(client.set_option(id, option, value).unwrap_err().message, text);
+    }
+    // The current value is OK with nothing sent.
+    client.set_option(id, "model", choice("opus")).unwrap();
+
+    // A set goes out with its key; another waits for its answer.
+    client.set_option(id, "model", choice("sonnet")).unwrap();
+    let busy = client.set_option(id, "mode", choice("plan")).unwrap_err();
+    assert_eq!(busy.message, format!("session {id}: an earlier change of an option hasn't been answered yet"));
+    held.open();
+    client.transcript_until(id, "has the model set", |log| current(log, "model").as_deref() == Some("sonnet"));
+    client.set_option(id, "mode", choice("plan")).unwrap();
+    let log = client.transcript_until(id, "says the mode changed", noticed("Mode: Plan"));
+    assert_eq!(current(&log, "mode").as_deref(), Some("plan"));
+    // The agent's refusal is a notice; the options stay.
+    client.set_option(id, "model", choice("opus")).unwrap();
+    let log = client.transcript_until(
+        id,
+        "says the agent refused",
+        noticed("the agent didn't change Model to Opus: model unavailable"),
+    );
+    assert_eq!(current(&log, "model").as_deref(), Some("sonnet"));
+
+    // During a turn, too.
+    client.prompt(id, "hi").unwrap();
+    client.transcript_until(id, "is working", |log| says(log).contains(&"agent: working".to_owned()));
+    mid_turn.open();
+    client.set_option(id, "mode", choice("default")).unwrap();
+    let live = client.transcript_until(id, "has the turn's end and the mode", |log| {
+        ended(1)(log) && current(log, "mode").as_deref() == Some("default")
+    });
+    let sent = recorded(&record);
+    let sets: Vec<(String, Value)> = sent
+        .iter()
+        .filter(|line| line["method"].as_str().is_some_and(|method| method.starts_with("session/set_")))
+        .map(|line| (line["method"].as_str().unwrap_or_default().to_owned(), line["params"].clone()))
+        .collect();
+    assert_eq!(
+        sets,
+        [
+            ("session/set_config_option".to_owned(), json!({"sessionId": "s1", "configId": "model", "value": "sonnet"})),
+            ("session/set_mode".to_owned(), json!({"sessionId": "s1", "modeId": "plan"})),
+            ("session/set_config_option".to_owned(), json!({"sessionId": "s1", "configId": "model", "value": "opus"})),
+            ("session/set_mode".to_owned(), json!({"sessionId": "s1", "modeId": "default"})),
+        ]
+    );
+
+    // A client that attaches later gets both lists in the replay.
+    client.detach(id);
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    let replayed = later.transcript(id);
+    assert_eq!(replayed, live);
+    assert_eq!(replayed.options(), live.options());
+    assert_eq!(replayed.commands(), live.commands());
+}
+
+#[test]
+fn a_set_needs_protocol_4_and_an_attached_ready_agent() {
+    let (mut dir, mut client) = agent_core("agent-set-refused", &[]);
+    let (mut script, _) = initialized(&dir.path, "set-refused", RESUME_AND_LOAD);
+    script.step("expect session/new");
+    let answer = script.gate();
+    script.step(options_answer("default", true));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    // Before the start's answer the agent isn't ready.
+    let refusal = client.set_option(id, "mode", choice("plan")).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent isn't ready"));
+    answer.open();
+    client.transcript_until(id, "is ready", |log| ready(log) && log.options().len() == 3);
+    // Only the attached client sets, and a terminal session has none.
+    let mut other = TestClient::hello(&dir.path, "other");
+    let refusal = other.set_option(id, "mode", choice("plan")).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id} isn't attached to this client"));
+    // Below protocol 4 the message is refused by name.
+    let mut old = TestClient::hello_with(&dir.path, "old", |hello| hello.max = 3);
+    let refusal = old.set_option(id, "mode", choice("plan")).unwrap_err();
+    assert_eq!(refusal.message, "AGENT_SET_OPTION needs client protocol 4");
+}
+
+#[test]
+fn both_lists_survive_a_core_kill_and_a_set_in_flight_is_dropped() {
+    let token = "token-agent-options-kill";
+    let (mut dir, mut client) = agent_core("agent-options-kill", &[]);
+    let (mut script, record) = with_options(&dir.path, "options-kill", RESUME_AND_LOAD);
+    script.step("expect session/set_mode");
+    let late = script.gate();
+    script.step("respond {}").step("expect session/set_mode").step("respond {}");
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    let before = client.transcript_until(id, "offers its options and commands", offers);
+    client.set_option(id, "mode", choice("plan")).unwrap();
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    client.reconnect_replay();
+    let log = client.transcript(id);
+    assert_eq!(log.options(), before.options());
+    assert_eq!(log.commands(), before.commands());
+    assert_eq!(current(&log, "mode").as_deref(), Some("default"), "the old value until the agent says");
+    // The late answer answers nothing the new core sent; a new set goes.
+    late.open();
+    client.set_option(id, "mode", choice("plan")).unwrap();
+    let log = client.transcript_until(id, "says the mode changed", noticed("Mode: Plan"));
+    assert_eq!(current(&log, "mode").as_deref(), Some("plan"));
+    assert_eq!(methods(&record), ["initialize", "session/new", "session/set_mode", "session/set_mode"]);
+}
+
+/// An agent with the options, one turn, then an exit once the gate opens.
+fn options_then_exit(client: &mut TestClient, dir: &mut TempDir, name: &str, capabilities: &str) -> SessionId {
+    let (mut script, _) = with_options(&dir.path, name, capabilities);
+    script.step("expect session/prompt").step(said("first")).step(stop("end_turn"));
+    let gate = script.gate();
+    script.step("exit 1");
+    let (id, _) = spawned(client, dir, detached(&script.write()));
+    client.transcript_until(id, "offers its options and commands", offers);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", ended(1));
+    gate.open();
+    let log = client.transcript_until(id, "has the agent's exit", agent_exited);
+    assert!(log.options().is_empty() && log.commands().is_empty());
+    id
+}
+
+#[test]
+fn an_exit_empties_both_lists_and_a_resume_in_another_mode_fills_them_and_says_so() {
+    let (mut dir, mut client) = agent_core("agent-options-resume", &[]);
+    let id = options_then_exit(&mut client, &mut dir, "options-resume", RESUME_AND_LOAD);
+    // Both lists were emptied by an event each, with the exit's state.
+    let shapes: Vec<String> = client.events(id).iter().map(shape).collect();
+    let at = |wanted: &str| shapes.iter().rposition(|shape| shape == wanted);
+    let (commands, options) = (at("commands "), at("options "));
+    let exited = shapes.iter().rposition(|shape| shape.starts_with("state Exited"));
+    assert!(commands.is_some() && options.is_some() && exited.is_some(), "{shapes:#?}");
+    assert!(commands < options && options < exited, "{shapes:#?}");
+    let mut later = client;
+    let refusal = later.set_option(id, "mode", choice("plan")).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent isn't ready"));
+
+    let (mut again, record) = initialized(&dir.path, "options-resume-again", RESUME_ONLY);
+    again.step("expect session/resume").step(options_answer("plan", false)).step(commands_step(&["compact"]));
+    later.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut later, &mut dir, id);
+    let log = if log.commands().is_empty() {
+        later.transcript_until(id, "has its commands", |log| log.commands().len() == 1)
+    } else {
+        log
+    };
+    assert_eq!(log.options().len(), 3);
+    assert_eq!(current(&log, "mode").as_deref(), Some("plan"));
+    assert_eq!(notices(&log).iter().filter(|text| *text == "Mode: Plan").count(), 1);
+    assert_eq!(methods(&record), ["initialize", "session/resume"]);
+}
+
+#[test]
+fn a_load_in_the_same_mode_fills_the_lists_from_its_answer_with_no_mode_notice() {
+    let (mut dir, mut client) = agent_core("agent-options-load", &[]);
+    let id = options_then_exit(&mut client, &mut dir, "options-load", LOAD_ONLY);
+    let (mut again, _) = initialized(&dir.path, "options-load-again", LOAD_ONLY);
+    // The replay's mode update counts for nothing; the answer stands.
+    again
+        .step("expect session/load")
+        .step(user_said("one"))
+        .step(update(json!({"sessionUpdate": "current_mode_update", "currentModeId": "plan"})))
+        .step(said("first"))
+        .step(options_answer("default", false));
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    assert_eq!(log.options().len(), 3);
+    assert_eq!(current(&log, "mode").as_deref(), Some("default"));
+    assert!(notices(&log).iter().all(|text| !text.starts_with("Mode")), "{:?}", notices(&log));
+    assert_eq!(
+        notices(&log).last().map(String::as_str),
+        Some("conversation continued; the agent's replay of 2 updates wasn't shown")
+    );
+}
+
+#[test]
+fn an_attach_to_a_conversation_longer_than_a_page_gets_both_lists() {
+    let (mut dir, mut client) = agent_core("agent-options-paged", &[]);
+    let (mut script, _) = with_options(&dir.path, "options-paged", RESUME_AND_LOAD);
+    script.step("expect session/prompt");
+    for n in 0..40 {
+        script.step(user_said(&format!("{n} {}", "u".repeat(1000))));
+        script.step(said(&format!("{n} {}", "a".repeat(1000))));
+    }
+    script.step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "offers its options and commands", offers);
+    client.prompt(id, "go").unwrap();
+    let live = client.transcript_until(id, "has the turn", |log| {
+        matches!(log.turn(), TurnState::Ended { .. }) && log.entries().count() > 60
+    });
+    client.detach(id);
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent_paged(id, Some(16_384)).unwrap();
+    let page = later.transcript(id);
+    assert!(page.window().is_some(), "a page, not the whole log");
+    assert!(page.entries().count() < live.entries().count());
+    assert_eq!(page.options(), live.options());
+    assert_eq!(page.commands(), live.commands());
 }

@@ -355,6 +355,9 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentChoose(choose) => {
                 self.client_agent_command(client, AgentCommand::choose(choose))
             }
+            ToCore::AgentSetOption(set) => {
+                self.client_agent_command(client, AgentCommand::set_option(set))
+            }
         }
     }
 

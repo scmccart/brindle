@@ -77,6 +77,8 @@ pub fn all() -> Vec<Case> {
         display("windows-elevated-instances", elevated_instances),
         display("windows-elevation-badge", elevation_badge),
         display("windows-agent-turn", super::agent::turn).needs_fake_agent(),
+        // OpenSpec change `agents-commands`: the completion list.
+        display("windows-agent-command-completion", super::agent_options::command_completion).needs_fake_agent(),
         display("windows-agent-close-confirm", super::agent::close_confirm).needs_fake_agent(),
         // An agent split of a PowerShell zone by its key (`zones-mixed-tabs`).
         display("windows-agent-split", super::mixed::agent_beside_shell).needs_fake_agent(),

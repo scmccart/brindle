@@ -338,7 +338,7 @@ fn a_stopped_zone_starts_anew_or_takes_a_listed_conversation() {
     let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
     let _subscription = cx.update(|cx| {
         let asked = asked.clone();
-        cx.subscribe(&choosing.agent, move |_, event: &AgentAsk, _| asked.borrow_mut().push(*event))
+        cx.subscribe(&choosing.agent, move |_, event: &AgentAsk, _| asked.borrow_mut().push(event.clone()))
     });
     choosing.agent.update(&mut cx, |agent, cx| agent.ask_conversations(cx));
     settle(&cx);

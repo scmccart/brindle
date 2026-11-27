@@ -35,7 +35,8 @@ use crate::agent::conversations::{
     open_plan,
 };
 use crate::agent::model::{ListFor, ListerState};
-use crate::agent::{Agent, AgentListed};
+use crate::agent::commands::{self, OptionPick};
+use crate::agent::{Agent, AgentListed, OptionRefused};
 use crate::agent::spawn::OpenedBy;
 use crate::config::{Config, Profile, ProfileKey, ProfileKind};
 use crate::TabKind;
@@ -68,7 +69,7 @@ use crate::terminal::{Request99, Terminal, TerminalEvent};
 use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
 use crate::theme::Theme;
 use crate::zone_view::{
-    CloseZoneAsk, ConversationsAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
+    CloseZoneAsk, ConversationsAsk, OptionsAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
     ZoneTreeView, describe_badge, ui_badge,
 };
 use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
@@ -374,6 +375,10 @@ enum PaletteKind {
     /// Which agent profile's conversations to list, by row (each one's key
     /// when the palette opened), for the pane `from`.
     ConversationsProfile { keys: Vec<ProfileKey>, from: ZoneAt },
+    /// An agent zone's session options, or one option's choices (OpenSpec
+    /// change `agents-commands`): what each row does, by row, for the zone
+    /// `from`.
+    AgentOptions { from: ZoneAt, picks: Vec<OptionPick> },
 }
 
 impl PaletteKind {
@@ -385,6 +390,7 @@ impl PaletteKind {
             Self::Sessions { .. } => PaletteRole::Sessions,
             Self::SplitProfile { .. } => PaletteRole::SplitProfile,
             Self::Conversations(_) | Self::ConversationsProfile { .. } => PaletteRole::Conversations,
+            Self::AgentOptions { .. } => PaletteRole::AgentOptions,
         }
     }
 }
@@ -1448,6 +1454,13 @@ impl Workspace {
                 let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
                 this.open_zone_conversations(ZoneAt { tab, zone: ask.zone }, window, cx);
             }),
+            // An agent zone's options palette and a set its server refused
+            // (OpenSpec change `agents-commands`).
+            cx.subscribe_in(view, window, |this, view, ask: &OptionsAsk, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.open_agent_options(ZoneAt { tab, zone: ask.zone }, ask.option.as_deref(), window, cx);
+            }),
+            cx.subscribe(view, |this, _, OptionRefused(text): &OptionRefused, cx| this.show_notice(text.clone(), cx)),
         ]
     }
 
@@ -1472,6 +1485,34 @@ impl Workspace {
 
     fn tab_zones(&self, tab: TabId) -> Option<Entity<ZoneTreeView>> {
         self.tabs.iter().find(|t| t.id == tab).map(|t| t.zones.clone())
+    }
+
+    /// An agent zone's options palette (OpenSpec change `agents-commands`,
+    /// flag 7): every option of zone `from`'s session, or option
+    /// `option`'s choices; the choice goes back to the zone, which sends
+    /// the set. Nothing when there is nothing to list.
+    fn open_agent_options(&mut self, from: ZoneAt, option: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent) = self.tab_zones(from.tab).and_then(|zones| zones.read(cx).agent_of(from.zone, cx)) else {
+            return;
+        };
+        let Some(list) = commands::options_palette(agent.read(cx).model().options(), option) else { return };
+        let palette = cx.new(|cx| Palette::list_grouped(list.groups, list.title, None, cx));
+        self.show_palette(palette, PaletteKind::AgentOptions { from, picks: list.picks }, window, cx);
+    }
+
+    /// A row of the options palette was chosen: a select's choices listed,
+    /// or the set sent through the zone.
+    fn agent_options_confirmed(&mut self, from: ZoneAt, pick: Option<OptionPick>, window: &mut Window, cx: &mut Context<Self>) {
+        match pick {
+            Some(OptionPick::Open { option }) => self.open_agent_options(from, Some(&option), window, cx),
+            Some(OptionPick::Set { option, name, value }) => {
+                self.dismiss_overlay(window, cx);
+                if let Some(agent) = self.tab_zones(from.tab).and_then(|zones| zones.read(cx).agent_of(from.zone, cx)) {
+                    agent.update(cx, |agent, cx| agent.set_option(&option, name, value, cx));
+                }
+            }
+            None => {}
+        }
     }
 
     /// An agent zone's Conversations… (and `agent_conversations`, and a
@@ -2451,8 +2492,16 @@ impl Workspace {
             window.available_actions(cx).iter().map(|a| a.as_any().type_id()).collect();
         // The palette lists what the tab can run: GPUI's answer, applied.
         let agent = self.active_tab().is_some_and(|t| t.zones.read(cx).active_content().is_some_and(|c| c.agent_view().is_some()));
+        // What the active agent zone's session offers (OpenSpec change
+        // `agents-commands`, flag 8).
+        let (agent_options, agent_modes) = self
+            .active_tab()
+            .and_then(|t| t.zones.read(cx).active_content().and_then(|c| c.agent_view().cloned()))
+            .map_or((false, false), |view| view.read(cx).agent().read(cx).model().has_options());
         let profiles = &Self::settings(cx).profiles;
         let facts = PaletteFacts {
+            agent_options,
+            agent_modes,
             terminal_profiles: profiles.iter().any(|p| p.kind() == ProfileKind::Terminal),
             agent_profiles: profiles.iter().any(|p| p.kind() == ProfileKind::Agent),
             zone: if agent { PaletteZone::Agent } else { PaletteZone::Terminal },
@@ -2551,6 +2600,10 @@ impl Workspace {
         let Overlay::Palette { kind, .. } = &self.overlay else { return };
         match kind {
             PaletteKind::Conversations(_) => self.conversations_confirmed(ix, window, cx),
+            PaletteKind::AgentOptions { from, picks } => {
+                let (from, pick) = (*from, picks.get(ix).cloned());
+                self.agent_options_confirmed(from, pick, window, cx);
+            }
             PaletteKind::ConversationsProfile { keys, from } => {
                 let (key, from) = (keys.get(ix).cloned(), *from);
                 let config = Self::settings(cx);
@@ -2706,7 +2759,8 @@ impl Workspace {
                     | PaletteKind::Prompt
                     | PaletteKind::SplitProfile { .. }
                     | PaletteKind::Conversations(_)
-                    | PaletteKind::ConversationsProfile { .. },
+                    | PaletteKind::ConversationsProfile { .. }
+                    | PaletteKind::AgentOptions { .. },
                 ..
             }
             | Overlay::Settings

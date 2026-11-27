@@ -85,7 +85,10 @@
 //!   sent at once, and the step whose [`Output::listed`] answers it sends
 //!   `AGENT_CONVERSATIONS` or the `ERROR` to the attached client.
 //!   `AGENT_CHOOSE` steps `Command::Choose`, answered `OK` or `ERROR` as
-//!   any command.
+//!   any command, and so does `AGENT_SET_OPTION`'s `Command::SetOption`
+//!   (OpenSpec change `agents-commands`): `OK` means the set was sent (or
+//!   asked for the current value), and the agent's answer reaches every
+//!   attached client as an `Options` event or a notice.
 
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
@@ -369,7 +372,8 @@ fn inject_fault(input: &Input<'_>) {
             | Command::Answer { .. }
             | Command::Login { .. }
             | Command::List { .. }
-            | Command::Choose { .. },
+            | Command::Choose { .. }
+            | Command::SetOption { .. },
         )
         | Input::Fault { .. }
         | Input::Tick => return,
@@ -471,6 +475,19 @@ impl AgentCommand {
             session: choose.session,
             command: Command::Choose {
                 conversation: choose.conversation,
+            },
+        }
+    }
+
+    /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`).
+    pub(super) fn set_option(set: client::AgentSetOption) -> Self {
+        Self {
+            request: AgentRequest::SetOption,
+            req: Some(set.req),
+            session: set.session,
+            command: Command::SetOption {
+                option: set.option,
+                value: set.value,
             },
         }
     }

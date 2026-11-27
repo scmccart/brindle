@@ -692,6 +692,81 @@ impl Continuation {
     }
 }
 
+/// The most commands [`Event::Commands`] carries (OpenSpec change
+/// `agents-commands`, design decision 2); the reducer keeps the first ones.
+pub const MAX_COMMANDS: usize = 256;
+
+/// The most options [`Event::Options`] carries.
+pub const MAX_OPTIONS: usize = 32;
+
+/// The most choices one option's [`OptionControl::Select`] holds.
+pub const MAX_CHOICES: usize = 256;
+
+/// A slash command the agent offers (ACP's `available_commands_update`):
+/// typed as `/NAME` at the start of a prompt, and sent as one. `hint` says
+/// what to type after it, when the command takes input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SlashCommand {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// One of the session's options as the agent offers it (OpenSpec change
+/// `agents-commands`, design decision 1): the mode, the model, a thinking
+/// level or one of the agent's own. `id` is what a set names; ids are
+/// unique within the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub category: OptionCategory,
+    pub kind: OptionControl,
+}
+
+/// What an option is about; a category Brindle doesn't know keeps its name,
+/// as [`StopReason::Other`] does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "category", rename_all = "snake_case")]
+pub enum OptionCategory {
+    Mode,
+    Model,
+    ModelConfig,
+    ThoughtLevel,
+    Other { name: String },
+}
+
+/// How an option is set: one of a list of choices, or on and off. A
+/// `Select`'s `current` may name no choice (an agent does that while a list
+/// loads); it is kept as sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "control", rename_all = "snake_case")]
+pub enum OptionControl {
+    Select {
+        current: String,
+        choices: Vec<OptionChoice>,
+    },
+    Toggle {
+        on: bool,
+    },
+}
+
+/// One choice of a [`OptionControl::Select`]: `value` is what a set sends,
+/// `name` what the user is shown, `group` the name of the group the agent
+/// put it in, if any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
 /// A transcript event: one change to the log, the slot, the turn or the
 /// agent's state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,6 +858,12 @@ pub enum Event {
         from: EntryId,
         earlier: u64,
     },
+    /// The agent's slash commands, the whole list, replacing the last
+    /// (OpenSpec change `agents-commands`); an empty list clears them.
+    Commands { commands: Vec<SlashCommand> },
+    /// The session's options, the whole list, replacing the last; an empty
+    /// list clears them.
+    Options { options: Vec<SessionOption> },
 }
 
 impl Event {
@@ -1013,6 +1094,10 @@ pub struct Transcript {
     size: usize,
     /// Set by [`Event::Window`]; `None` when every kept entry is held.
     window: Option<Window>,
+    /// Set by [`Event::Commands`]: the agent's latest list.
+    commands: Vec<SlashCommand>,
+    /// Set by [`Event::Options`]: the agent's latest list.
+    options: Vec<SessionOption>,
 }
 
 impl Default for Transcript {
@@ -1027,6 +1112,8 @@ impl Default for Transcript {
             trimmed: None,
             size: 0,
             window: None,
+            commands: Vec::new(),
+            options: Vec::new(),
         }
     }
 }
@@ -1187,6 +1274,8 @@ impl Transcript {
                 self.conversation = Some(conversation.clone());
             }
             Event::Trimmed { through, dropped } => self.trim(*through, *dropped)?,
+            Event::Commands { commands } => self.commands.clone_from(commands),
+            Event::Options { options } => self.options.clone_from(options),
             Event::Window { from, earlier } => {
                 if !self.entries.is_empty() {
                     return Err(FoldError::WindowAfterEntries);
@@ -1307,6 +1396,18 @@ impl Transcript {
         self.conversation.as_ref()
     }
 
+    /// The agent's slash commands, as it last listed them; empty while the
+    /// agent offers none or isn't running.
+    pub fn commands(&self) -> &[SlashCommand] {
+        &self.commands
+    }
+
+    /// The session's options, as the agent last listed them; empty while
+    /// the agent offers none or isn't running.
+    pub fn options(&self) -> &[SessionOption] {
+        &self.options
+    }
+
     /// The kept entries, oldest first.
     pub fn entries(&self) -> impl Iterator<Item = (EntryId, &Entry)> {
         self.entries.iter().map(|kept| (kept.id, &kept.entry))
@@ -1343,7 +1444,8 @@ impl Transcript {
     /// each entry's `Added` with its text split into `Appended`s of at most
     /// [`TEXT_CHUNK`] bytes and a permission's outcome as its `Answered`,
     /// the slot's `Queue` when it isn't empty, the `Conversation` when there
-    /// is one, then `Turn` and `Agent`.
+    /// is one, then `Turn` and `Agent`, then `Commands` and `Options` when
+    /// each isn't empty.
     pub fn replay(&self) -> Vec<Event> {
         self.replay_from(0)
     }
@@ -1355,8 +1457,8 @@ impl Transcript {
     /// newest tool entry with that call before it; OpenSpec change
     /// `agents-tool-content`, design decision 15); then a `Window` naming
     /// how many kept entries precede them. Everything that isn't an entry
-    /// (the slot, the conversation, the turn, the agent's state) is in
-    /// every page. A log that fits the budget pages as its `replay()`.
+    /// (the slot, the conversation, the turn, the agent's state, its
+    /// commands and options) is in every page, outside the budget. A log that fits the budget pages as its `replay()`.
     pub fn page(&self, budget: usize) -> Vec<Event> {
         let mut start = self.entries.len() - self.newest_within(self.entries.len(), budget);
         for (index, kept) in self.entries.iter().enumerate() {
@@ -1432,6 +1534,8 @@ impl Transcript {
             | Event::Agent { .. }
             | Event::Conversation { .. }
             | Event::Trimmed { .. }
+            | Event::Commands { .. }
+            | Event::Options { .. }
             | Event::Window { .. } => None,
         }) else {
             return match self.window {
@@ -1536,6 +1640,16 @@ impl Transcript {
         events.push(Event::Agent {
             state: self.agent.clone(),
         });
+        if !self.commands.is_empty() {
+            events.push(Event::Commands {
+                commands: self.commands.clone(),
+            });
+        }
+        if !self.options.is_empty() {
+            events.push(Event::Options {
+                options: self.options.clone(),
+            });
+        }
         events
     }
 
@@ -1631,6 +1745,8 @@ fn entry_change(event: &Event) -> Option<EntryId> {
         | Event::Agent { .. }
         | Event::Conversation { .. }
         | Event::Trimmed { .. }
+        | Event::Commands { .. }
+        | Event::Options { .. }
         | Event::Window { .. } => None,
     }
 }
@@ -3720,5 +3836,172 @@ mod tests {
             .unwrap();
         let from = copy.window().unwrap().from;
         assert!(from > EntryId(30) && from <= permission, "{from}");
+    }
+
+    fn compact() -> SlashCommand {
+        SlashCommand {
+            name: "compact".into(),
+            description: "Free up context".into(),
+            hint: Some("<instructions>".into()),
+        }
+    }
+
+    fn mode_option(current: &str) -> SessionOption {
+        SessionOption {
+            id: "mode".into(),
+            name: "Mode".into(),
+            description: None,
+            category: OptionCategory::Mode,
+            kind: OptionControl::Select {
+                current: current.into(),
+                choices: vec![
+                    OptionChoice {
+                        value: "ask".into(),
+                        name: "Ask".into(),
+                        description: Some("Asks first".into()),
+                        group: None,
+                    },
+                    OptionChoice {
+                        value: "code".into(),
+                        name: "Code".into(),
+                        description: None,
+                        group: Some("Edits".into()),
+                    },
+                ],
+            },
+        }
+    }
+
+    fn fast_option() -> SessionOption {
+        SessionOption {
+            id: "fast".into(),
+            name: "Fast mode".into(),
+            description: Some("Speed".into()),
+            category: OptionCategory::Other {
+                name: "speed".into(),
+            },
+            kind: OptionControl::Toggle { on: false },
+        }
+    }
+
+    #[test]
+    fn commands_and_options_encode_tagged_and_round_trip() {
+        let commands = Event::Commands {
+            commands: vec![compact()],
+        };
+        assert_eq!(
+            commands.to_value(),
+            serde_json::json!({"event": "commands", "commands": [
+                {"name": "compact", "description": "Free up context", "hint": "<instructions>"}
+            ]})
+        );
+        let options = Event::Options {
+            options: vec![mode_option("ask"), fast_option()],
+        };
+        assert_eq!(
+            options.to_value(),
+            serde_json::json!({"event": "options", "options": [
+                {"id": "mode", "name": "Mode", "category": {"category": "mode"},
+                 "kind": {"control": "select", "current": "ask", "choices": [
+                     {"value": "ask", "name": "Ask", "description": "Asks first"},
+                     {"value": "code", "name": "Code", "group": "Edits"}
+                 ]}},
+                {"id": "fast", "name": "Fast mode", "description": "Speed",
+                 "category": {"category": "other", "name": "speed"},
+                 "kind": {"control": "toggle", "on": false}}
+            ]})
+        );
+        for event in [
+            commands,
+            options,
+            Event::Commands { commands: vec![] },
+            Event::Options { options: vec![] },
+        ] {
+            assert_eq!(Event::from_value(&event.to_value()), Ok(event));
+        }
+        // A missing list is a decode error, as any missing field is.
+        assert!(Event::from_value(&serde_json::json!({"event": "options"})).is_err());
+        assert!(
+            Event::from_value(&serde_json::json!({"event": "options", "options": [
+                {"id": "x", "name": "X", "category": {"category": "later"},
+                 "kind": {"control": "toggle", "on": true}}
+            ]}))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn commands_and_options_replace_whole_and_an_empty_list_clears() {
+        let mut transcript = Transcript::new();
+        let set = |transcript: &mut Transcript, event: Event| transcript.apply(&event).unwrap();
+        set(
+            &mut transcript,
+            Event::Commands {
+                commands: vec![compact(), compact()],
+            },
+        );
+        set(
+            &mut transcript,
+            Event::Commands {
+                commands: vec![compact()],
+            },
+        );
+        assert_eq!(transcript.commands(), [compact()]);
+        set(
+            &mut transcript,
+            Event::Options {
+                options: vec![mode_option("ask"), fast_option()],
+            },
+        );
+        set(
+            &mut transcript,
+            Event::Options {
+                options: vec![mode_option("code")],
+            },
+        );
+        assert_eq!(transcript.options(), [mode_option("code")]);
+        set(&mut transcript, Event::Commands { commands: vec![] });
+        set(&mut transcript, Event::Options { options: vec![] });
+        assert!(transcript.commands().is_empty() && transcript.options().is_empty());
+        assert_eq!(transcript, Transcript::new());
+    }
+
+    #[test]
+    fn a_replay_and_a_page_carry_both_lists_after_the_agent_and_a_fetch_neither() {
+        let mut server = long(10, 100);
+        assert!(
+            !server
+                .replay()
+                .iter()
+                .any(|event| matches!(event, Event::Commands { .. } | Event::Options { .. })),
+            "empty lists are left out"
+        );
+        let commands = Event::Commands {
+            commands: vec![compact()],
+        };
+        let options = Event::Options {
+            options: vec![mode_option("ask"), fast_option()],
+        };
+        server.apply(&commands).unwrap();
+        server.apply(&options).unwrap();
+        let replay = server.replay();
+        let tail = &replay[replay.len() - 3..];
+        assert!(matches!(tail[0], Event::Agent { .. }));
+        assert_eq!(tail[1..], [commands.clone(), options.clone()]);
+        assert_eq!(fold(&replay), Ok(server.clone()));
+        // A page holds them whatever its budget, after the agent.
+        let page = server.page(150);
+        assert_eq!(page[page.len() - 2..], [commands, options]);
+        let copy = fold(&page).unwrap();
+        assert!(copy.window().is_some());
+        assert_eq!(copy, server.suffix(copy.window().unwrap().from));
+        // A fetch brings entries only.
+        let fetched = server.fetch(copy.window().unwrap().from, 150);
+        assert!(
+            fetched
+                .events
+                .iter()
+                .all(|event| matches!(event, Event::Added { .. } | Event::Appended { .. }))
+        );
     }
 }

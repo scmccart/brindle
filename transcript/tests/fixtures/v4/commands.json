@@ -1,0 +1,1 @@
+{"commands":[{"description":"Free up context by summarizing the conversation","hint":"<optional custom summarization instructions>","name":"compact"},{"description":"Show current context usage","name":"context"}],"event":"commands"}

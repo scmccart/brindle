@@ -1,6 +1,6 @@
 # Proposal
 
-**Depends on:** `agents-profiles` (the agent zone and its prompt input, and through it `agents-sessions`' reducer, transcript and client protocol 4) and `agents-tool-content` (the `Dialect` seam that keeps each ACP version in its own module), implemented and archived. It doesn't touch `agents-markdown`, `agents-session-recovery`, `agents-login` or `agents-log-paging`.
+**Depends on:** `agents-profiles` (the agent zone and its prompt input, and through it `agents-sessions`' reducer, transcript and client protocol 4) and `agents-tool-content` (the `Dialect` seam that keeps each ACP version in its own module), implemented and archived, and `agents-session-list` (the choosing phase, `AGENT_CHOOSE` 64, the prompt input's keyed buttons), on whose branch this one is stacked. It builds on what `agents-session-recovery`, `agents-login`, `agents-session-title` and `agents-log-paging` made (design decision 12) and changes none of their requirements; it doesn't touch `agents-markdown`.
 **Next:** `agents-session-info` (the conversation's title and context usage, proposal-only), then `agents-plans` and `agents-prompt-context`, still to be proposed.
 
 ## Why
@@ -38,10 +38,10 @@ None.
 
 ## Impact
 
-- **`brindle-transcript`** (`transcript/`): `Command`, `SessionOption`, `OptionCategory`, `OptionKind`, `Choice`; `Event::Commands` and `Event::Options`; the transcript's state and replay; new `tests/fixtures/v4/` files (none edited).
-- **`brindle-remote-protocol`** (`remote-protocol/`): a new client message, `AGENT_SET_OPTION`, with its fixtures and fuzzing. Its number is 24.
-- **`brindle-remote-agent`** (`remote-agent/src/acp/`): the forms and `acp/v1/`'s decoding of commands, config options, modes and their updates; `session/set_config_option` and `session/set_mode`; the boolean option capability in `initialize`; the reducer's option handling, including emptying both lists when the agent stops and filling them from a continued agent's answer. The checkpoint's format 2 is amended (unreleased).
-- **`brindle`** (`src/agent/`): the chat model's commands, options and completion; the view's list and footer; two actions in `src/actions.rs`; the options palette.
+- **`brindle-transcript`** (`transcript/`): `SlashCommand`, `SessionOption`, `OptionCategory`, `OptionControl`, `OptionChoice`; `Event::Commands` and `Event::Options`; the transcript's state, replay and pages; new `tests/fixtures/v4/` files (none edited).
+- **`brindle-remote-protocol`** (`remote-protocol/`): a new client message, `AGENT_SET_OPTION`, with its fixtures and fuzzing. Its number is 24, kept for it when `agents-session-list` numbered its own.
+- **`brindle-remote-agent`** (`remote-agent/src/acp/`, `remote-agent/src/server/core/`): the forms and `acp/v1/`'s decoding of commands, config options, modes, the model list and their updates; `session/set_config_option`, `session/set_mode` and `session/set_model`; the boolean option capability in `initialize`; the reducer's option handling, including emptying both lists when the agent stops and filling them from a continued agent's answer; the core's handling of the new message. The checkpoint's format 2 is amended (unreleased).
+- **`brindle`** (`src/agent/`, `src/remote/`, `src/workspace.rs`, `src/actions.rs`): the chat model's commands, options and completion; the view's list and footer; the client's set request; two actions; the options palette.
 - **`brindle-ui`** (`ui/`): `PromptInput` gains a suggestion list and footer items. Its dependency list is unchanged.
 - **Tests:** the existing captures already hold every agent's commands and options; real-role tests through the fake ACP agent; new `agent-command-*` and `agent-option-*` e2e cases.
 - **Docs:** `docs/code-map.md`, `README.md`'s Agent tabs section, `CLAUDE.md`'s dump and action notes.

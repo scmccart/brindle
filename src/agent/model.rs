@@ -18,6 +18,7 @@ use gpui::SharedString;
 
 use crate::FirstPrompt;
 use crate::agent::close::AgentBusy;
+use crate::agent::commands::{self, Completion, CompletionAction, CompletionKey, Local, OptionItem, Pick, Stage};
 use crate::agent::conversations::{Latest, Page, ZoneRun, latest_plan};
 use crate::agent::login::{self, AgentCommand, MethodOffer, TerminalLogin};
 use crate::agent::markdown::{self, Part};
@@ -25,9 +26,10 @@ use crate::agent::shared::{Changes, Dirty};
 use crate::agent::tool::{self, DetailPart, RowState, Shown, ToolPolicy};
 use crate::agent::transcript::{
     Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Exit, FileOp, HoldReason, NoticeLevel, PAGE_BYTES,
-    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind, ToolStatus, Transcript,
-    TurnState, Window, status_of,
+    OptionCategory, OptionControl, PermissionKind, PermissionOption, PermissionOutcome, SessionOption, Slot, SlashCommand,
+    StopReason, ToolItem, ToolKind, ToolStatus, Transcript, TurnState, Window, status_of,
 };
+pub use crate::remote::protocol::client::OptionValue;
 use crate::terminal::links::Plan;
 use crate::terminal::status::State;
 
@@ -836,6 +838,9 @@ pub enum Why {
     InFlight,
     /// A turn runs and the slot holds a prompt.
     AlreadyQueued,
+    /// An option command named none of its option's choices (OpenSpec
+    /// change `agents-commands`): the text stays, with the reason.
+    NoSuchChoice,
 }
 
 /// The words for a prompt kept because one is already queued.
@@ -851,6 +856,13 @@ pub enum Submit {
     /// Send this as a prompt (the server sends it, or queues it during a
     /// turn); the input keeps it until the server accepts it.
     Send(String),
+    /// An option command (OpenSpec change `agents-commands`, decision 6):
+    /// ask the server to set option `option` (named `name`) to `value`,
+    /// the input emptied, nothing sent to the agent or queued.
+    Set { option: String, name: String, value: OptionValue },
+    /// An option command alone: show option `option`'s choices, the input
+    /// emptied.
+    Choose { option: String },
     Nothing(Why),
 }
 
@@ -876,6 +888,9 @@ pub enum Sent {
     List(ListFor),
     /// `AGENT_CHOOSE`: a refusal is shown beside the prompt input.
     Choose,
+    /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`) for the
+    /// option named `name`: a refusal goes to the window's notice line.
+    SetOption { name: String },
 }
 
 /// What a list the zone's agent answers is for.
@@ -991,6 +1006,9 @@ pub enum Replied {
     SetDraft(String),
     /// A list was answered (OpenSpec change `agents-session-list`).
     Listed(ListDone),
+    /// A set was refused (OpenSpec change `agents-commands`, flag 11):
+    /// this text goes to the window's notice line, and nothing changes.
+    OptionRefused(String),
     /// The input is left as it is.
     Nothing,
 }
@@ -1191,6 +1209,31 @@ pub struct ChatModel {
     /// What the zone knows of choosing (OpenSpec change
     /// `agents-session-list`).
     choosing: Choosing,
+    /// The agent's slash commands and the session's options, as the
+    /// transcript last had them (OpenSpec change `agents-commands`).
+    commands: Vec<SlashCommand>,
+    options: Vec<SessionOption>,
+    /// The prompt input's text and cursor as last typed, which the
+    /// completion list follows.
+    draft: (String, usize),
+    /// The completion list while it shows.
+    completion: Option<Completion>,
+    /// Escape closed the list: it stays closed until the text stops being
+    /// a command word.
+    dismissed: bool,
+}
+
+/// What a key the completion list takes does (OpenSpec change
+/// `agents-commands`, decision 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyOutcome {
+    /// The list changed (its highlight, or it was dismissed): redraw it.
+    Redraw,
+    /// Put this text in the input, the cursor at this byte.
+    Text(String, usize),
+    /// Ask the server to set option `option` (named `name`) to `value`,
+    /// the input emptied.
+    Set { option: String, name: String, value: OptionValue },
 }
 
 /// A zone's facts about choosing a conversation.
@@ -1255,6 +1298,11 @@ impl ChatModel {
             last_user: None,
             permission_tools: BTreeMap::new(),
             choosing: Choosing::default(),
+            commands: Vec::new(),
+            options: Vec::new(),
+            draft: (String::new(), 0),
+            completion: None,
+            dismissed: false,
         }
     }
 
@@ -1764,6 +1812,11 @@ impl ChatModel {
         }
         if changes.reset || changes.slot_changed {
             self.slot = transcript.slot().clone();
+        }
+        if changes.reset || changes.lists_changed {
+            self.commands = transcript.commands().to_vec();
+            self.options = transcript.options().to_vec();
+            self.refresh_completion();
         }
         splices.extend(self.update_thoughts(changes.reset));
         splices.extend(self.refresh_rows());
@@ -2543,6 +2596,24 @@ impl ChatModel {
     /// server queues it); while a turn runs with the slot taken it keeps
     /// the text with the reason; with no turn, a held prompt doesn't block.
     pub fn submit(&mut self, draft: &str, composing: bool) -> Submit {
+        // An option command is Brindle's (OpenSpec change `agents-commands`,
+        // decision 6): carried out during a turn too, never queued.
+        if !composing && let Some(local) = self.local(draft) {
+            return match local {
+                Local::Set { option, name, value } => {
+                    self.refusal = None;
+                    Submit::Set { option, name, value }
+                }
+                Local::Choose { option } => {
+                    self.refusal = None;
+                    Submit::Choose { option }
+                }
+                Local::NoSuchChoice { .. } => {
+                    self.refusal = local.reason();
+                    Submit::Nothing(Why::NoSuchChoice)
+                }
+            };
+        }
         let why = if composing {
             Some(Why::Composing)
         } else if draft.trim().is_empty() {
@@ -2567,9 +2638,151 @@ impl ChatModel {
             }
             None => {
                 self.refusal = None;
-                Submit::Send(draft.to_string())
+                // A command goes without the whitespace typed before it.
+                Submit::Send(commands::command_text(draft).unwrap_or(draft).to_string())
             }
         }
+    }
+
+    /// What submitting `text` does when it is an option command of this
+    /// session's (`commands::local_command`).
+    pub fn local(&self, text: &str) -> Option<Local> {
+        commands::local_command(text, &self.options, &self.commands)
+    }
+
+    /// The session's options.
+    pub fn options(&self) -> &[SessionOption] {
+        &self.options
+    }
+
+    /// The options under the prompt input.
+    pub fn option_items(&self) -> Vec<OptionItem> {
+        commands::option_items(&self.options)
+    }
+
+    /// The set `agent_next_mode` asks for, if there is one.
+    pub fn next_mode(&self) -> Option<(String, String, OptionValue)> {
+        let (option, value) = commands::next_mode(&self.options)?;
+        let name = self.option_name(&option);
+        Some((option, name, value))
+    }
+
+    /// Whether the session offers options (`agent_options` is listed), and
+    /// a mode option `agent_next_mode` can step.
+    pub fn has_options(&self) -> (bool, bool) {
+        (!self.options.is_empty(), commands::next_mode(&self.options).is_some())
+    }
+
+    /// Option `id`'s name, else the id.
+    pub fn option_name(&self, id: &str) -> String {
+        self.options.iter().find(|option| option.id == id).map_or_else(|| id.to_string(), |option| option.name.clone())
+    }
+
+    /// The set a press on option `id` under the input asks for, when it is
+    /// a toggle: the other value. `None` for a select, whose choices show.
+    pub fn footer_flip(&self, id: &str) -> Option<(String, OptionValue)> {
+        let option = self.options.iter().find(|option| option.id == id)?;
+        match &option.kind {
+            OptionControl::Toggle { on } => Some((option.name.clone(), OptionValue::Toggle { on: !on })),
+            OptionControl::Select { .. } => None,
+        }
+    }
+
+    /// The prompt input's text and cursor (a byte) changed: the completion
+    /// list follows, unless an input method composes (it is left as it
+    /// is). True when the list changed.
+    pub fn typed(&mut self, text: &str, cursor: usize, composing: bool) -> bool {
+        if composing || (self.draft.0 == text && self.draft.1 == cursor) {
+            return false;
+        }
+        self.draft = (text.to_string(), cursor.min(text.len()));
+        let before = self.completion.clone();
+        self.refresh_completion();
+        before != self.completion
+    }
+
+    /// The list for the draft as it is: none while dismissed, the
+    /// highlight kept on the same row while the list's stage and word stay.
+    fn refresh_completion(&mut self) {
+        let (text, cursor) = (&self.draft.0, self.draft.1);
+        if !commands::in_command(text, cursor) {
+            self.dismissed = false;
+        }
+        let fresh = if self.dismissed { None } else { commands::completion(text, cursor, &self.commands, &self.options) };
+        self.completion = match (fresh, self.completion.take()) {
+            (Some(mut fresh), Some(old)) if fresh.stage == old.stage && fresh.query == old.query => {
+                if let Some(at) = old.items.get(old.highlighted).and_then(|kept| fresh.items.iter().position(|i| i == kept)) {
+                    fresh.highlighted = at;
+                }
+                Some(fresh)
+            }
+            (fresh, _) => fresh,
+        };
+    }
+
+    /// The completion list while it shows.
+    pub fn completion(&self) -> Option<&Completion> {
+        self.completion.as_ref()
+    }
+
+    /// A key the list takes while it shows; `None` with no list.
+    pub fn completion_key(&mut self, key: CompletionKey) -> Option<KeyOutcome> {
+        let completion = self.completion.as_ref()?;
+        let (len, highlighted) = (completion.items.len(), completion.highlighted);
+        let action = commands::completion_key(key, &completion.stage);
+        match action {
+            CompletionAction::Previous | CompletionAction::Next => {
+                let moved = commands::moved(highlighted, len, action == CompletionAction::Next);
+                if let Some(completion) = &mut self.completion {
+                    completion.highlighted = moved;
+                }
+                Some(KeyOutcome::Redraw)
+            }
+            CompletionAction::Dismiss => {
+                self.dismissed = true;
+                self.completion = None;
+                Some(KeyOutcome::Redraw)
+            }
+            CompletionAction::Accept | CompletionAction::Set => self.take(highlighted),
+            CompletionAction::Write => self.write_choice(),
+        }
+    }
+
+    /// Row `label` of the list was pressed: taken as enter takes the
+    /// highlighted one. `None` when no row has it now.
+    pub fn suggestion_pressed(&mut self, label: &str) -> Option<KeyOutcome> {
+        let item = self.completion.as_ref()?.items.iter().position(|item| item.label == label)?;
+        self.take(item)
+    }
+
+    /// Item `item` taken: a command's name written into the text, or a
+    /// choice set.
+    fn take(&mut self, item: usize) -> Option<KeyOutcome> {
+        let completion = self.completion.as_ref()?;
+        let suggestion = completion.items.get(item)?;
+        match (&completion.stage, &suggestion.pick) {
+            (Stage::Choices { option, .. }, Pick::Choice { value }) => {
+                let (option, value) = (option.clone(), value.clone());
+                let name = self.option_name(&option);
+                self.completion = None;
+                Some(KeyOutcome::Set { option, name, value })
+            }
+            (Stage::Commands, Pick::Command { .. }) => {
+                let (text, cursor) = commands::accept(&self.draft.0, completion, item)?;
+                self.typed(&text, cursor, false);
+                Some(KeyOutcome::Text(text, cursor))
+            }
+            // Never built: each stage lists its own picks.
+            (Stage::Commands, Pick::Choice { .. }) | (Stage::Choices { .. }, Pick::Command { .. }) => None,
+        }
+    }
+
+    /// Tab in the second stage: the highlighted choice's name written in.
+    pub fn write_choice(&mut self) -> Option<KeyOutcome> {
+        let completion = self.completion.as_ref()?;
+        let (text, cursor) = commands::accept(&self.draft.0, completion, completion.highlighted)?;
+        self.typed(&text, cursor, false);
+        Some(KeyOutcome::Text(text, cursor))
     }
 
     /// A request went out as `request`.
@@ -2594,6 +2807,13 @@ impl ChatModel {
     /// link fell between the decision and the send): answered as a refusal
     /// with [`UNSENT`], so a first prompt becomes the draft.
     pub fn unsent(&mut self, sent: Sent) -> Replied {
+        // A set that couldn't go is said beside the input, as any request's
+        // (`agents-commands` decision 9); the server's refusals go to the
+        // notice line.
+        if let Sent::SetOption { .. } = sent {
+            self.refusal = Some(UNSENT.into());
+            return Replied::Nothing;
+        }
         self.answered(sent, Err(UNSENT.into()))
     }
 
@@ -2644,6 +2864,11 @@ impl ChatModel {
             (Sent::Fetch, Ok(()) | Err(_)) => Replied::Nothing,
             // A list's page comes as `listed`: an `OK` answers none.
             (Sent::List(_) | Sent::Choose, Ok(())) => Replied::Nothing,
+            // The new value comes as the agent's `Options`, never before.
+            (Sent::SetOption { .. }, Ok(())) => Replied::Nothing,
+            (Sent::SetOption { name }, Err(why)) => {
+                Replied::OptionRefused(format!("{name} wasn't changed: {}", without_session(&why)))
+            }
             (Sent::List(purpose), Err(why)) => Replied::Listed(self.list_refused(purpose, why)),
             (Sent::Choose, Err(why)) => {
                 self.refusal = Some(why);
@@ -3018,6 +3243,7 @@ impl ChatModel {
         for note in self.notes() {
             out.push_str(&format!("--- note {note:?}\n"));
         }
+        out.push_str(&self.list_lines());
         for (id, entry) in &self.entries {
             out.push_str(&format!("--- entry {id} {}\n", self.entry_line(*id, entry)));
             out.push_str(&self.part_lines(*id, plan));
@@ -3063,6 +3289,40 @@ impl ChatModel {
             out.push_str(&format!(" actions={}", words.join(",")));
         }
         out.push('\n');
+        if let Some(completion) = &self.completion {
+            out.push_str(&completion.lines());
+        }
+        out
+    }
+
+    /// The `--- commands` line and an `--- option` line per option, in the
+    /// order the input shows them (OpenSpec change `agents-commands`,
+    /// decision 8); nothing for an empty list.
+    fn list_lines(&self) -> String {
+        let mut out = String::new();
+        if !self.commands.is_empty() {
+            out.push_str(&format!("--- commands count={}\n", self.commands.len()));
+        }
+        for item in self.option_items() {
+            let Some(option) = self.options.iter().find(|option| option.id == item.id) else { continue };
+            let category = match &option.category {
+                OptionCategory::Mode => "mode".to_string(),
+                OptionCategory::Model => "model".to_string(),
+                OptionCategory::ModelConfig => "model_config".to_string(),
+                OptionCategory::ThoughtLevel => "thought_level".to_string(),
+                OptionCategory::Other { name } => format!("other:{name}"),
+            };
+            let (kind, current, choices) = match &option.kind {
+                OptionControl::Select { current, choices } => {
+                    ("select", format!("{current:?}"), format!(" choices={}", choices.len()))
+                }
+                OptionControl::Toggle { on } => ("toggle", if *on { "on" } else { "off" }.to_string(), String::new()),
+            };
+            out.push_str(&format!(
+                "--- option id={:?} category={category} kind={kind} current={current} name={:?}{choices}\n",
+                option.id, option.name
+            ));
+        }
         out
     }
 
@@ -4327,6 +4587,164 @@ mod tests {
 
     fn held_slot() -> Slot {
         held(HoldReason::Stopped { stop: StopReason::MaxTokens })
+    }
+
+    /// A ready zone whose agent offers `/compact` and `/context`, a mode
+    /// (auto, plan), a model (opus, sonnet) and a toggle.
+    fn with_lists() -> Zone {
+        use crate::agent::transcript::OptionChoice;
+        let mut zone = Zone::ready();
+        let command = |name: &str, hint: Option<&str>| SlashCommand {
+            name: name.into(),
+            description: format!("about {name}"),
+            hint: hint.map(Into::into),
+        };
+        let choice =
+            |value: &str, name: &str| OptionChoice { value: value.into(), name: name.into(), description: None, group: None };
+        let select = |id: &str, name: &str, category, current: &str, choices| SessionOption {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            category,
+            kind: OptionControl::Select { current: current.into(), choices },
+        };
+        let options = vec![
+            select("mode", "Mode", OptionCategory::Mode, "auto", vec![choice("auto", "Auto"), choice("plan", "Plan")]),
+            select("model", "Model", OptionCategory::Model, "opus", vec![choice("opus", "Opus"), choice("sonnet", "Sonnet")]),
+            SessionOption {
+                id: "fast".into(),
+                name: "Fast \"mode\"".into(),
+                description: None,
+                category: OptionCategory::Other { name: "speed".into() },
+                kind: OptionControl::Toggle { on: false },
+            },
+        ];
+        zone.feed(&[
+            Event::Commands { commands: vec![command("compact", Some("<how>")), command("context", None)] },
+            Event::Options { options },
+        ]);
+        zone
+    }
+
+    /// `agents-commands` 4.4: the lists' lines after the notes and before
+    /// the entries, the completion's after the prompt line, names escaped;
+    /// `--wait-for` sees them too; an agent with neither has no line.
+    #[test]
+    fn the_dump_shows_the_commands_the_options_and_the_completion() {
+        assert!(!Zone::ready().model.describe(1, true, &found(&Zone::ready().model), &linux).contains("--- option"));
+        let mut zone = with_lists();
+        zone.feed(&[added(1, user("hi"))]);
+        zone.model.typed("/co", 3, false);
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        let lines: Vec<&str> = dump.lines().collect();
+        let at = |prefix: &str| lines.iter().position(|line| line.starts_with(prefix)).unwrap_or_else(|| panic!("{prefix}: {dump}"));
+        assert_eq!(lines[at("--- commands")], "--- commands count=2");
+        assert_eq!(
+            lines[at("--- option")..at("--- option") + 3],
+            [
+                "--- option id=\"mode\" category=mode kind=select current=\"auto\" name=\"Mode\" choices=2",
+                "--- option id=\"model\" category=model kind=select current=\"opus\" name=\"Model\" choices=2",
+                "--- option id=\"fast\" category=other:speed kind=toggle current=off name=\"Fast \\\"mode\\\"\"",
+            ]
+        );
+        assert!(at("--- commands") < at("--- entry"), "{dump}");
+        assert_eq!(lines[at("--- completion")], "--- completion query=\"co\" highlighted=0");
+        assert!(at("--- prompt") < at("--- completion"), "{dump}");
+        assert_eq!(lines[at("--- completion") + 1], "/compact  <how>  about compact");
+        let wait = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(wait.contains("--- commands count=2\n") && wait.contains("--- completion query=\"co\""), "{wait}");
+    }
+
+    /// `agents-commands` 6.1a: an option command is Brindle's, set at once
+    /// during a turn too; a bare one asks for the choices; a choice the
+    /// option lacks keeps the text with its reason; whitespace before a
+    /// command the agent's goes without it.
+    #[test]
+    fn an_option_command_is_brindles_and_the_rest_go_to_the_agent() {
+        let mut zone = with_lists();
+        zone.feed(&[turn(TurnState::Working)]);
+        let set = zone.model.submit("/model sonnet", false);
+        assert_eq!(
+            set,
+            Submit::Set { option: "model".into(), name: "Model".into(), value: OptionValue::Choice { value: "sonnet".into() } }
+        );
+        assert_eq!(zone.model.submit("/mode", false), Submit::Choose { option: "mode".into() });
+        assert_eq!(zone.model.submit("/model gpt", false), Submit::Nothing(Why::NoSuchChoice));
+        assert_eq!(zone.model.refusal(), Some("Model has no choice \"gpt\""));
+        assert_eq!(zone.model.submit("/model gpt", true), Submit::Nothing(Why::Composing), "composing");
+        zone.feed(&[turn(TurnState::Idle)]);
+        assert_eq!(zone.model.submit("  /compact now", false), Submit::Send("/compact now".into()));
+        assert_eq!(zone.model.refusal(), None);
+        assert_eq!(zone.model.submit("  plain", false), Submit::Send("  plain".into()), "not a command: as typed");
+    }
+
+    /// `agents-commands` 6.1: the list follows the text, its keys move,
+    /// accept and dismiss, a press takes a row, composition leaves it
+    /// alone, and a choice taken asks for the set.
+    #[test]
+    fn the_completion_list_follows_the_text_and_takes_its_keys() {
+        let mut zone = with_lists();
+        assert_eq!(zone.model.completion_key(CompletionKey::Down), None, "no list, no key");
+        assert!(zone.model.typed("/", 1, false));
+        assert_eq!(zone.model.completion().map(|c| c.items.len()), Some(5), "two commands, three options");
+        assert!(!zone.model.typed("/c", 2, true), "composing leaves it");
+        assert!(zone.model.typed("/co", 3, false));
+        assert_eq!(zone.model.completion_key(CompletionKey::Down), Some(KeyOutcome::Redraw));
+        assert_eq!(zone.model.completion().map(|c| c.highlighted), Some(1));
+        assert_eq!(zone.model.completion_key(CompletionKey::Enter), Some(KeyOutcome::Text("/context ".into(), 9)));
+        assert!(zone.model.completion().is_none(), "the command's words take no list");
+        zone.model.typed("/co", 3, false);
+        assert_eq!(zone.model.completion_key(CompletionKey::Escape), Some(KeyOutcome::Redraw));
+        assert!(zone.model.completion().is_none());
+        zone.model.typed("/com", 4, false);
+        assert!(zone.model.completion().is_none(), "dismissed while the word is a command");
+        zone.model.typed("", 0, false);
+        zone.model.typed("/mo", 3, false);
+        assert!(zone.model.completion().is_some(), "dismissal ends with the command word");
+        assert_eq!(zone.model.suggestion_pressed("/model"), Some(KeyOutcome::Text("/model ".into(), 7)));
+        let choices = zone.model.completion().expect("the model's choices");
+        assert_eq!(choices.highlighted, 0, "on the current choice, opus");
+        assert_eq!(zone.model.completion_key(CompletionKey::Tab), Some(KeyOutcome::Text("/model Opus".into(), 11)));
+        zone.model.typed("/model ", 7, false);
+        zone.model.completion_key(CompletionKey::Down);
+        assert_eq!(
+            zone.model.completion_key(CompletionKey::Enter),
+            Some(KeyOutcome::Set {
+                option: "model".into(),
+                name: "Model".into(),
+                value: OptionValue::Choice { value: "sonnet".into() }
+            })
+        );
+        assert_eq!(zone.model.suggestion_pressed("/nothing"), None);
+    }
+
+    /// A set's answer: an OK changes nothing until the agent's options do;
+    /// the server's refusal is the notice's text, an unsent set the
+    /// input's.
+    #[test]
+    fn a_set_options_answer() {
+        let mut zone = with_lists();
+        zone.model.sent(3, Sent::SetOption { name: "Model".into() });
+        assert_eq!(zone.model.replied(3, Ok(())), Replied::Nothing);
+        zone.model.sent(4, Sent::SetOption { name: "Model".into() });
+        assert_eq!(
+            zone.model.replied(4, Err("session 2: an earlier change of an option hasn't been answered yet".into())),
+            Replied::OptionRefused("Model wasn't changed: an earlier change of an option hasn't been answered yet".into())
+        );
+        assert_eq!(zone.model.refusal(), None, "not beside the input");
+        assert_eq!(zone.model.unsent(Sent::SetOption { name: "Model".into() }), Replied::Nothing);
+        assert_eq!(zone.model.refusal(), Some(UNSENT));
+        assert_eq!(zone.model.footer_flip("fast"), Some(("Fast \"mode\"".into(), OptionValue::Toggle { on: true })));
+        assert_eq!(zone.model.footer_flip("model"), None, "a select's choices show");
+        assert_eq!(zone.model.has_options(), (true, true));
+        assert_eq!(
+            zone.model.next_mode(),
+            Some(("mode".into(), "Mode".into(), OptionValue::Choice { value: "plan".into() }))
+        );
+        // The agent stopped: both lists go.
+        zone.feed(&[Event::Commands { commands: vec![] }, Event::Options { options: vec![] }]);
+        assert_eq!(zone.model.has_options(), (false, false));
+        assert!(zone.model.option_items().is_empty());
     }
 
     /// The copy actions read the zone's own copy.

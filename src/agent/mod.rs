@@ -20,6 +20,11 @@ pub mod spawn;
 // model (OpenSpec change `agents-session-list`).
 pub mod conversations;
 
+// Slash commands and session options: completion, the option commands,
+// the options under the input and their palette (OpenSpec change
+// `agents-commands`).
+pub mod commands;
+
 // Whether a close asks first, and what the confirmation says.
 pub mod close;
 
@@ -55,9 +60,10 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, LaunchChoice, Link, ListDone, ListFor, LoginChoice,
-    LoginZoneEnd, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Link, ListDone, ListFor,
+    LoginChoice, LoginZoneEnd, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit, Unqueue, WorkingRow,
 };
+use crate::agent::commands::CompletionKey;
 use crate::agent::spawn::AgentSpawnRequest;
 use crate::agent::shared::AgentShared;
 use crate::agent::tool::ToolPolicy;
@@ -66,6 +72,7 @@ use crate::agent::spawn::{AgentRestartRequest, OpenedBy, agent_spawn_request, co
 use crate::agent::transcript::{Conversation, EntryId};
 use crate::config::{Config, Profile};
 use crate::notify::osc::{Notice, Source};
+use crate::remote::protocol::client::OptionValue;
 use crate::remote::protocol::{RequestId, SessionId};
 use crate::remote::{AgentStart, Host, SessionKey, Unsupported};
 use crate::settings::Settings;
@@ -102,6 +109,10 @@ pub trait Requests {
     /// Ends a choosing agent's wait (`AGENT_CHOOSE`): continues
     /// `conversation`, or starts a new one with `None`.
     fn choose(&self, conversation: Option<String>) -> Option<RequestId>;
+    /// Sets the session option whose id is `option` to `value`
+    /// (`AGENT_SET_OPTION`, OpenSpec change `agents-commands`): the new
+    /// value comes as an `Options` event once the agent answers.
+    fn set_option(&self, option: &str, value: OptionValue) -> Option<RequestId>;
 }
 
 /// Opens an agent zone's session on a host (`remote::agent_link`), or a
@@ -172,6 +183,10 @@ impl Requests for crate::remote::AgentLink {
     fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
         crate::remote::AgentLink::choose(self, conversation)
     }
+
+    fn set_option(&self, option: &str, value: OptionValue) -> Option<RequestId> {
+        crate::remote::AgentLink::set_option(self, option, value)
+    }
 }
 
 /// What an [`Agent`] asks of its view, beside the status and title events
@@ -195,6 +210,9 @@ pub enum AgentUpdate {
     /// the view sends it ([`Agent::send_first`]) only if the input still
     /// holds exactly this (OpenSpec change `agents-login` decision 10).
     SendFirstIfUnchanged(String),
+    /// The completion list wrote into the input (OpenSpec change
+    /// `agents-commands`): this text, the cursor at this byte.
+    SetDraftAt(String, usize),
 }
 
 /// What an agent zone asks of its tab for a terminal login (OpenSpec
@@ -209,12 +227,22 @@ pub enum LoginZone {
 
 /// What an agent zone asks of its window about its conversations (OpenSpec
 /// change `agents-session-list`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAsk {
     /// Open the conversations palette on the zone (Conversations…, or a
     /// `-r` launch's agent now choosing).
     Conversations,
+    /// Open the options palette on the zone (OpenSpec change
+    /// `agents-commands`, flag 7): every option (Agent Options…), or option
+    /// `option`'s choices (a press under the input, an option command
+    /// alone).
+    Options { option: Option<String> },
 }
+
+/// A set the server refused (OpenSpec change `agents-commands`, flag 11):
+/// its words, for the window's notice line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OptionRefused(pub String);
 
 /// A list the palette asked for was answered: the page, or why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +294,7 @@ impl EventEmitter<AgentUpdate> for Agent {}
 impl EventEmitter<LoginZone> for Agent {}
 impl EventEmitter<AgentAsk> for Agent {}
 impl EventEmitter<AgentListed> for Agent {}
+impl EventEmitter<OptionRefused> for Agent {}
 
 impl Agent {
     /// Starts an agent of `profile` in a new session of `host`'s terminal
@@ -836,6 +865,7 @@ impl Agent {
             Replied::ClearDraft => cx.emit(AgentUpdate::ClearDraft),
             Replied::SetDraft(text) => cx.emit(AgentUpdate::SetDraft(text)),
             Replied::Listed(done) => self.apply_listed(done, cx),
+            Replied::OptionRefused(text) => cx.emit(OptionRefused(text)),
             Replied::Nothing => {}
         }
     }
@@ -864,8 +894,74 @@ impl Agent {
     pub fn prompt(&mut self, draft: &str, composing: bool, cx: &mut Context<Self>) {
         match self.model.submit(draft, composing) {
             Submit::Send(text) => self.send(Sent::Prompt, |requests| requests.prompt(&text), cx),
+            Submit::Set { option, name, value } => {
+                cx.emit(AgentUpdate::ClearDraft);
+                self.set_option(&option, name, value, cx);
+            }
+            Submit::Choose { option } => {
+                cx.emit(AgentUpdate::ClearDraft);
+                self.ask_options(Some(option), cx);
+            }
             Submit::Nothing(_) => cx.notify(),
         }
+    }
+
+    /// Asks the server to set option `option` (named `name`) to `value`
+    /// (`AGENT_SET_OPTION`, OpenSpec change `agents-commands`): nothing
+    /// shows as changed until the agent answers; a refusal goes to the
+    /// window's notice line ([`OptionRefused`]).
+    pub fn set_option(&mut self, option: &str, name: String, value: OptionValue, cx: &mut Context<Self>) {
+        self.send(Sent::SetOption { name }, |requests| requests.set_option(option, value), cx);
+    }
+
+    /// The window's options palette on the zone: every option, or option
+    /// `option`'s choices.
+    pub fn ask_options(&mut self, option: Option<String>, cx: &mut Context<Self>) {
+        cx.emit(AgentAsk::Options { option });
+    }
+
+    /// A press on option `id` under the prompt input: a toggle flips, a
+    /// select's choices show in the window's palette.
+    pub fn footer_pressed(&mut self, id: &str, cx: &mut Context<Self>) {
+        match self.model.footer_flip(id) {
+            Some((name, value)) => self.set_option(id, name, value, cx),
+            None => self.ask_options(Some(id.to_string()), cx),
+        }
+    }
+
+    /// `agent_next_mode`: the mode after the current one, wrapping; nothing
+    /// without a mode option to step.
+    pub fn next_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some((option, name, value)) = self.model.next_mode() {
+            self.set_option(&option, name, value, cx);
+        }
+    }
+
+    /// The prompt input's text or cursor changed: the completion list
+    /// follows ([`ChatModel::typed`]).
+    pub fn typed(&mut self, text: &str, cursor: usize, composing: bool, cx: &mut Context<Self>) {
+        if self.model.typed(text, cursor, composing) {
+            cx.notify();
+        }
+    }
+
+    /// A key the completion list takes, or a press on its row `label`
+    /// (`None`: a key).
+    pub fn completion(&mut self, key: Option<CompletionKey>, label: Option<&str>, cx: &mut Context<Self>) {
+        let outcome = match (key, label) {
+            (Some(key), _) => self.model.completion_key(key),
+            (None, Some(label)) => self.model.suggestion_pressed(label),
+            (None, None) => None,
+        };
+        match outcome {
+            Some(KeyOutcome::Redraw) | None => {}
+            Some(KeyOutcome::Text(text, cursor)) => cx.emit(AgentUpdate::SetDraftAt(text, cursor)),
+            Some(KeyOutcome::Set { option, name, value }) => {
+                cx.emit(AgentUpdate::ClearDraft);
+                self.set_option(&option, name, value, cx);
+            }
+        }
+        cx.notify();
     }
 
     /// The held prompt's send again (`agent_resend`).

@@ -865,10 +865,13 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 14] = [
+const AGENT_LINES: [&str; 17] = [
     "agent ",
     "login ",
     "note ",
+    "commands ",
+    "option ",
+    "completion",
     "entry ",
     "block ",
     "link ",
@@ -970,6 +973,9 @@ pub struct Dump {
     /// `--- queued …`, `--- conversation …`, `--- prompt …`), in place of a
     /// screen: one line each without the `--- `.
     pub agent: Vec<String>,
+    /// The completion list's rows after `--- completion …`, in order, in
+    /// the palette rows' form (OpenSpec change `agents-commands`).
+    pub completion_rows: Vec<String>,
 }
 
 /// `--- fonts terminal="DejaVu Sans Mono" ui="Inter"`
@@ -1006,7 +1012,14 @@ impl Dump {
         let mut dump = Dump::default();
         let mut screen = Vec::new();
         let mut in_screen = false;
+        // Lines after `--- completion …` up to the next `--- ` line are its rows.
+        let mut in_completion = false;
         for line in text.lines() {
+            if in_completion && !line.starts_with("--- ") {
+                dump.completion_rows.push(line.to_string());
+                continue;
+            }
+            in_completion = line.starts_with("--- completion");
             if let Some(rest) = line.strip_prefix("--- tab ") {
                 let title = rest.split_once(' ').map(|(_, t)| t).unwrap_or("");
                 let active = title.ends_with(" (active)");
@@ -1420,6 +1433,21 @@ pub fn self_test_dump() -> Result {
          --- conversation entries=2 at=end\n--- prompt status=ready\n--- focus other modality=keyboard\n",
     );
     ensure!(dump.agent.len() == 10, "agent lines {:?}", dump.agent);
+    // The lists' lines are agent lines; the completion's rows follow it.
+    let lists = Dump::parse(
+        "--- agent zone=1 state=ready\n--- commands count=2\n\
+         --- option id=\"mode\" category=mode kind=select current=\"auto\" name=\"Mode\" choices=2\n\
+         --- prompt status=ready\n--- completion query=\"co\" highlighted=0\n/compact  <how>  Free up context\n\
+         /context    Show usage\n--- focus agent stop=prompt modality=keyboard\n",
+    );
+    ensure!(lists.agent.len() == 5, "agent lines {:?}", lists.agent);
+    ensure!(lists.agent[4] == "completion query=\"co\" highlighted=0", "the completion line {:?}", lists.agent);
+    ensure!(
+        lists.completion_rows == ["/compact  <how>  Free up context", "/context    Show usage"],
+        "rows {:?}",
+        lists.completion_rows
+    );
+    ensure!(lists.focus.as_deref() == Some("agent"), "focus after the rows {:?}", lists.focus);
     ensure!(dump.agent_working().as_deref() == Some("Working…"), "working {:?}", dump.agent);
     ensure!(dump.agent_blocks(2) == ["part=0 kind=paragraph \"Hello!\""], "blocks {:?}", dump.agent_blocks(2));
     ensure!(dump.agent_blocks(1).is_empty() && dump.agent_links(1).is_empty(), "entry 1's {:?}", dump.agent);

@@ -2438,7 +2438,8 @@ impl Connection {
             | ToCore::AgentLogin(client::AgentLogin { req, .. })
             | ToCore::AgentFetch(client::AgentFetch { req, .. })
             | ToCore::AgentList(client::AgentList { req, .. })
-            | ToCore::AgentChoose(client::AgentChoose { req, .. }) => Some(*req),
+            | ToCore::AgentChoose(client::AgentChoose { req, .. })
+            | ToCore::AgentSetOption(client::AgentSetOption { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2782,6 +2783,7 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentFetch(_)
         | ToCore::AgentList(_)
         | ToCore::AgentChoose(_)
+        | ToCore::AgentSetOption(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -3128,6 +3130,16 @@ impl Running {
     pub fn choose(&self, conversation: Option<String>) -> Option<RequestId> {
         let session = self.id;
         self.agent_request(|req| ToCore::AgentChoose(client::AgentChoose { req, session, conversation }))
+    }
+
+    /// Sets the session option whose id is `option` to `value`
+    /// (`AGENT_SET_OPTION`, OpenSpec change `agents-commands`): `OK` once
+    /// the agent was asked; the new value comes as an `Options` event once
+    /// the agent answers.
+    pub fn set_option(&self, option: &str, value: client::OptionValue) -> Option<RequestId> {
+        let session = self.id;
+        let option = option.to_string();
+        self.agent_request(|req| ToCore::AgentSetOption(client::AgentSetOption { req, session, option, value }))
     }
 
     /// Cancels the running turn (`AGENT_CANCEL`, which has no answer; a

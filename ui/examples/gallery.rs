@@ -815,6 +815,10 @@ impl Gallery {
         let prompt = cx.new(|cx| {
             let mut prompt = PromptInput::new(cx);
             prompt.set_placeholder("Ask anything…", cx);
+            // An agent's options under the input, as an agent zone shows
+            // them (OpenSpec change `agents-commands`).
+            let item = |key: &str, label: &str| brindle_ui::FooterItem { key: key.to_string().into(), label: label.to_string().into() };
+            prompt.set_footer(vec![item("mode", "Auto"), item("model", "Opus"), item("effort", "Medium")], cx);
             prompt
         });
         // A narrow disabled prompt input with a reason (the layout section),
@@ -895,6 +899,9 @@ impl Gallery {
                     PromptInputEvent::RemoveQueued => "remove".to_string(),
                     PromptInputEvent::ResendQueued => "resend".to_string(),
                     PromptInputEvent::Action(_) => "action".to_string(),
+                    PromptInputEvent::SuggestionKey(key) => format!("suggestion-key:{key:?}"),
+                    PromptInputEvent::SuggestionPressed(key) => format!("suggestion:{key}"),
+                    PromptInputEvent::Footer(key) => format!("footer:{key}"),
                 };
                 this.prompt_log.push(entry);
                 cx.notify();
@@ -3456,6 +3463,8 @@ mod check {
         c.run_check("prompt-input-queue-row-buttons-are-stops-asking-the-owner", check).await;
         let check = prompt_reason_action(&mut c).await;
         c.run_check("prompt-input-reason-action-is-a-stop-asking-the-owner", check).await;
+        let check = prompt_suggestions_and_footer(&mut c).await;
+        c.run_check("prompt-input-suggestions-take-their-keys-and-the-footer-is-no-stop", check).await;
         let check = confirmation_space_on_reject(&mut c).await;
         c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
         let check = confirmation_described_actions(&mut c).await;
@@ -6076,6 +6085,41 @@ mod check {
         c.tick().await;
         let stop = c.with(|gallery, _, cx| gallery.prompt.read(cx).action_stop())?;
         ensure!(stop.is_none(), "the action taken away is still a stop");
+        Ok(())
+    }
+
+    /// The spec's "Prompt input suggestions" and "Prompt input footer
+    /// items", by keys: while suggestions show, down, tab, enter and escape
+    /// ask the owner and leave the text and focus alone; taken away, Tab
+    /// from the text area passes the footer by.
+    async fn prompt_suggestions_and_footer(c: &mut Checker) -> Check {
+        focus_prompt(c).await?;
+        type_text(c, "/co").await?;
+        let row = |key: &str| brindle_ui::Suggestion {
+            key: key.to_string().into(),
+            label: format!("/{key}").into(),
+            hint: None,
+            description: Some("a command".into()),
+        };
+        let rows = brindle_ui::Suggestions { rows: vec![row("compact"), row("context")], highlighted: 0 };
+        c.with(move |gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_suggestions(Some(rows), cx)))?;
+        c.tick().await;
+        for key in ["down", "tab", "enter", "escape"] {
+            c.key(key).await?;
+        }
+        let (text, _, log) = prompt_state(c)?;
+        let asked = ["Down", "Tab", "Enter", "Escape"].map(|key| format!("suggestion-key:{key}"));
+        ensure!(log == asked, "the keys asked {log:?}");
+        ensure!(text == "/co", "the keys changed the text to {text:?}");
+        let area = c.with(|gallery, _, cx| gallery.prompt.focus_handle(cx))?;
+        ensure!(c.focused(&area)?, "the text area lost focus to the suggestions");
+        c.with(|gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_suggestions(None, cx)))?;
+        c.tick().await;
+        let stops = c.with(|gallery, _, cx| {
+            let prompt = gallery.prompt.read(cx);
+            (prompt.row_stops().len(), prompt.action_stops().len(), prompt.footer().len())
+        })?;
+        ensure!(stops == (0, 0, 3), "the footer's items are {stops:?}, not three items and no stops");
         Ok(())
     }
 

@@ -415,6 +415,15 @@ fn the_agent_messages_reject_bad_values_without_panicking() {
             client::MSG_AGENT_CONVERSATIONS,
             format!(r#"{{"req":1,"session":1,"conversations":[{{"id":{value},"title":{value},"updated":{value}}}]}}"#),
         ));
+        // Options (`agents-commands`).
+        cases.push((
+            client::MSG_AGENT_SET_OPTION,
+            format!(r#"{{"req":{value},"session":{value},"option":{value},"value":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_SET_OPTION,
+            format!(r#"{{"req":1,"session":1,"option":"m","value":{{"kind":{value},"value":{value},"on":{value}}}}}"#),
+        ));
     }
     let decoders = decoders();
     for (msg_type, payload) in cases {

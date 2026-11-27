@@ -911,10 +911,32 @@ conversation buttons. A zone that is still choosing when Brindle quits is
 closed, so it isn't restored. An agent that can't list says so in the list
 instead of rows, as does a list the agent failed.
 
+#### Commands and options
+
+Typing `/` at the start of the prompt (after any spaces) lists the agent's
+slash commands above the input, then Brindle's option commands; typing
+narrows the list. Up and down move through it, enter or tab write the
+highlighted command's name and a space, and escape closes it until the text
+stops being a command; a press on a row takes it. An agent command is sent
+when you send the prompt, as text.
+
+The session's options (its mode, model, and anything else the agent
+offers) show under the input; a press on one lists its choices, or flips a
+toggle. Each option is also a command of Brindle's: `/mode plan` or
+`/model sonnet` sets it at once, during a turn too, and `/model` alone lists
+its choices. When an agent command has the same name, Brindle's is
+`/brindle:model`, which always works. Agent Options… (`agent_options`)
+lists the options and their choices, and Next Agent Mode
+(`agent_next_mode`) steps the mode, wrapping; neither has a default key. A
+new value shows once the agent takes it; a refusal says why on the
+window's config line, or in the conversation when the agent refused. An
+agent that stops takes its commands and options with it, and a continued
+one brings its own.
+
 Not yet: syntax highlighting, logging in from the zone (`agents-login`), going on after an agent exits (`agents-session-recovery`),
 and ACP version 2
 (`agents-acp-v2`), each a change of its own; nor the agent's file and
-terminal access, modes, slash commands, finding or selecting text in a conversation, or editing agent profiles
+terminal access, finding or selecting text in a conversation, or editing agent profiles
 in the settings dialog.
 
 **Release note:** a Brindle from before agent tabs rejects a config with an

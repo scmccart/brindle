@@ -61,7 +61,8 @@ pub fn start_of(message: &ToCore) -> Option<Start> {
         | ToCore::AgentLogin(_)
         | ToCore::AgentFetch(_)
         | ToCore::AgentList(_)
-        | ToCore::AgentChoose(_) => None,
+        | ToCore::AgentChoose(_)
+        | ToCore::AgentSetOption(_) => None,
     }
 }
 
@@ -183,7 +184,8 @@ pub fn over_endpoint(message: &ToCore, endpoint: &EndpointEnv) -> Option<(ToCore
         | ToCore::AgentLogin(_)
         | ToCore::AgentFetch(_)
         | ToCore::AgentList(_)
-        | ToCore::AgentChoose(_) => return None,
+        | ToCore::AgentChoose(_)
+        | ToCore::AgentSetOption(_) => return None,
     };
     Some((message, fallback))
 }

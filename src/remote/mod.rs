@@ -116,6 +116,13 @@ impl AgentLink {
         self.0.choose(conversation)
     }
 
+    /// Sets session option `option` to `value` (`AGENT_SET_OPTION`,
+    /// OpenSpec change `agents-commands`), as [`AgentLink::prompt`]: the
+    /// new value comes as an `Options` event once the agent answers.
+    pub fn set_option(&self, option: &str, value: protocol::client::OptionValue) -> Option<protocol::RequestId> {
+        self.0.set_option(option, value)
+    }
+
     /// Cancels the running turn, or the agent's login; true when it was
     /// sent.
     pub fn cancel(&self) -> bool {
@@ -179,6 +186,10 @@ impl AgentLink {
     }
 
     pub fn choose(&self, _conversation: Option<String>) -> Option<protocol::RequestId> {
+        match *self {}
+    }
+
+    pub fn set_option(&self, _option: &str, _value: protocol::client::OptionValue) -> Option<protocol::RequestId> {
         match *self {}
     }
 

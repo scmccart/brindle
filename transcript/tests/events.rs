@@ -26,9 +26,9 @@ use std::sync::Once;
 
 use brindle_transcript::{
     AgentState, Continuation, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange,
-    FileOp, HoldReason, Hunk, Location, LoginKind, LoginMethod, NoticeLevel, Output,
-    PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind,
-    ToolStatus, TurnState,
+    FileOp, HoldReason, Hunk, Location, LoginKind, LoginMethod, NoticeLevel, OptionCategory,
+    OptionChoice, OptionControl, Output, PermissionKind, PermissionOption, PermissionOutcome,
+    SessionOption, SlashCommand, Slot, StopReason, ToolItem, ToolKind, ToolStatus, TurnState,
 };
 use serde_json::Value;
 
@@ -50,7 +50,10 @@ macro_rules! forms {
 
 forms!(event_form, EVENT_FORMS, Event, "Event::":
     Added, Appended, ToolChanged, ToolItems, ToolOutput, Answered, Queue, Turn, Agent,
-    Conversation, Trimmed, Window);
+    Conversation, Trimmed, Window, Commands, Options);
+forms!(category_form, CATEGORY_FORMS, OptionCategory, "OptionCategory::":
+    Mode, Model, ModelConfig, ThoughtLevel, Other);
+forms!(control_form, CONTROL_FORMS, OptionControl, "OptionControl::": Select, Toggle);
 forms!(tool_item_form, TOOL_ITEM_FORMS, ToolItem, "ToolItem::": Text, Diff, Output);
 forms!(file_op_form, FILE_OP_FORMS, FileOp, "FileOp::": Add, Delete, Modify, Move, Copy, Other);
 forms!(diff_line_form, DIFF_LINE_FORMS, DiffLine, "DiffLine::": Context, Added, Removed);
@@ -97,6 +100,8 @@ fn expected_forms() -> Vec<&'static str> {
         FILE_OP_FORMS,
         DIFF_LINE_FORMS,
         EXIT_FORMS,
+        CATEGORY_FORMS,
+        CONTROL_FORMS,
     ]
     .concat()
 }
@@ -193,7 +198,16 @@ fn forms(event: &Event) -> Vec<&'static str> {
         Event::Conversation { conversation } => {
             forms.push(continuation_form(&conversation.continuation));
         }
-        Event::Appended { .. } | Event::Trimmed { .. } | Event::Window { .. } => {}
+        Event::Options { options } => {
+            for option in options {
+                forms.push(category_form(&option.category));
+                forms.push(control_form(&option.kind));
+            }
+        }
+        Event::Appended { .. }
+        | Event::Trimmed { .. }
+        | Event::Window { .. }
+        | Event::Commands { .. } => {}
     }
     forms
 }
@@ -810,7 +824,102 @@ fn fixtures() -> Vec<(&'static str, Event)> {
             "tool-changed-more",
             changed_content(None, None, None, Some(5)),
         ),
+        (
+            "commands",
+            Event::Commands {
+                commands: vec![
+                    SlashCommand {
+                        name: "compact".into(),
+                        description: "Free up context by summarizing the conversation".into(),
+                        hint: Some("<optional custom summarization instructions>".into()),
+                    },
+                    SlashCommand {
+                        name: "context".into(),
+                        description: "Show current context usage".into(),
+                        hint: None,
+                    },
+                ],
+            },
+        ),
+        ("commands-empty", Event::Commands { commands: vec![] }),
+        (
+            "options",
+            Event::Options {
+                options: vec![
+                    select_option(
+                        "mode",
+                        "Mode",
+                        OptionCategory::Mode,
+                        "default",
+                        vec![choice("default", "Default", None), choice("plan", "Plan", None)],
+                    ),
+                    select_option(
+                        "model",
+                        "Model",
+                        OptionCategory::Model,
+                        "opus",
+                        vec![
+                            choice("opus", "Opus", Some("Large")),
+                            choice("sonnet", "Sonnet", Some("Large")),
+                            choice("haiku", "Haiku", Some("Small")),
+                        ],
+                    ),
+                    select_option(
+                        "effort",
+                        "Effort",
+                        OptionCategory::ThoughtLevel,
+                        "medium",
+                        vec![choice("low", "Low", None), choice("medium", "Medium", None)],
+                    ),
+                    select_option(
+                        "context",
+                        "Context",
+                        OptionCategory::ModelConfig,
+                        "200k",
+                        vec![choice("200k", "200k", None)],
+                    ),
+                    SessionOption {
+                        id: "fast".into(),
+                        name: "Fast mode".into(),
+                        description: Some("Answers sooner".into()),
+                        category: OptionCategory::Other {
+                            name: "speed".into(),
+                        },
+                        kind: OptionControl::Toggle { on: false },
+                    },
+                ],
+            },
+        ),
+        ("options-empty", Event::Options { options: vec![] }),
     ]
+}
+
+fn choice(value: &str, name: &str, group: Option<&str>) -> OptionChoice {
+    OptionChoice {
+        value: value.into(),
+        name: name.into(),
+        description: (value == "plan").then(|| "Plans before it edits".into()),
+        group: group.map(Into::into),
+    }
+}
+
+fn select_option(
+    id: &str,
+    name: &str,
+    category: OptionCategory,
+    current: &str,
+    choices: Vec<OptionChoice>,
+) -> SessionOption {
+    SessionOption {
+        id: id.into(),
+        name: name.into(),
+        description: (id == "mode").then(|| "What the agent may do unasked".into()),
+        category,
+        kind: OptionControl::Select {
+            current: current.into(),
+            choices,
+        },
+    }
 }
 
 fn conversation(id: &str, continuation: Continuation) -> Event {
@@ -1022,7 +1131,9 @@ fn a_conversation_with_a_field_it_doesnt_know_decodes_the_same() {
 
 /// The fields whose strings are a closed enum's values: the tags and the
 /// fieldless enums. Every other string is free text.
-const ENUM_FIELDS: [&str; 15] = [
+const ENUM_FIELDS: [&str; 17] = [
+    "category",
+    "control",
     "item",
     "op",
     "exit",

@@ -9,11 +9,12 @@
 use std::collections::BTreeMap;
 
 use brindle_remote_protocol::RequestId;
+use brindle_remote_protocol::client::OptionValue;
 use brindle_transcript::EntryId;
 
 use super::dialect::Dialect;
 use super::envelope::Id;
-use super::forms::{Continued, Request};
+use super::forms::{Continued, OptionKey, Request};
 
 /// The most permission requests an agent may have waiting at once; one
 /// past it is answered `cancelled` at once, with a notice (decision 4).
@@ -21,7 +22,7 @@ pub const MAX_PENDING_PERMISSIONS: usize = 16;
 
 /// What one of the core's requests was for, which says how its response
 /// is read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Purpose {
     Initialize,
     NewSession,
@@ -36,6 +37,10 @@ pub enum Purpose {
     /// A list of the agent's conversations, for the client's request `req`
     /// (`agents-session-list` decision 2). Never checkpointed (flag 4).
     List { req: RequestId },
+    /// A set of the session option `id` to `value` (OpenSpec change
+    /// `agents-commands`, flag 3): an answer's notice names them, and an
+    /// empty answer sets the value. Never checkpointed, as a list isn't.
+    SetOption { id: String, value: OptionValue },
 }
 
 /// The cap of [`MAX_PENDING_PERMISSIONS`] is reached: answer this request
@@ -199,8 +204,43 @@ impl Rpc {
             | Purpose::Prompt
             | Purpose::Resume
             | Purpose::Load
-            | Purpose::Authenticate => None,
+            | Purpose::Authenticate
+            | Purpose::SetOption { .. } => None,
         })
+    }
+
+    /// Sets the option `key` names, which Brindle calls `option`, to
+    /// `value` in conversation `session`.
+    pub fn set_option(
+        &mut self,
+        session: &str,
+        option: &str,
+        key: &OptionKey,
+        value: &OptionValue,
+    ) -> Vec<u8> {
+        let id = self.request(Purpose::SetOption {
+            id: option.to_owned(),
+            value: value.clone(),
+        });
+        self.dialect.encode(Request::SetOption {
+            id,
+            session,
+            key,
+            value,
+        })
+    }
+
+    /// Whether a set of an option is awaited.
+    pub fn setting(&self) -> bool {
+        self.outgoing
+            .values()
+            .any(|purpose| matches!(purpose, Purpose::SetOption { .. }))
+    }
+
+    /// Stops awaiting any set of an option.
+    pub fn forget_sets(&mut self) {
+        self.outgoing
+            .retain(|_, purpose| !matches!(purpose, Purpose::SetOption { .. }));
     }
 
     /// Stops awaiting the list, if one is out, giving its client request.
@@ -351,17 +391,58 @@ mod tests {
         include_str!("../../tests/fixtures/acp/claude-code-acp-0.16.2-auth-terminal.log");
 
     #[test]
-    fn initialize_asks_for_version_1_advertising_only_auth_terminal() {
+    fn initialize_asks_for_version_1_advertising_auth_terminal_and_boolean_options() {
         let mut rpc = Rpc::new();
+        // The capture's line, from before the boolean capability
+        // (`agents-commands`), with it added beside `auth`.
+        let earlier = captured(CLAUDE_AUTH, r#"{"jsonrpc":"2.0","id":1,"method":"initialize""#);
         assert_eq!(
             text(&rpc.initialize("0.3.0")),
-            captured(CLAUDE_AUTH, r#"{"jsonrpc":"2.0","id":1,"method":"initialize""#)
+            earlier.replace(
+                r#"{"auth":{"terminal":true}}"#,
+                r#"{"auth":{"terminal":true},"session":{"configOptions":{"boolean":{}}}}"#
+            )
         );
         assert_eq!(
             text(&Rpc::new().initialize("1.2.3")),
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1,\
-             \"clientCapabilities\":{\"auth\":{\"terminal\":true}},\"clientInfo\":{\"name\":\"brindle\",\"version\":\"1.2.3\"}}}\n"
+             \"clientCapabilities\":{\"auth\":{\"terminal\":true},\"session\":{\"configOptions\":{\"boolean\":{}}}},\
+             \"clientInfo\":{\"name\":\"brindle\",\"version\":\"1.2.3\"}}}\n"
         );
+    }
+
+    #[test]
+    fn a_set_names_its_key_and_value_and_awaits_its_answer_out_of_the_checkpoint() {
+        let mut rpc = Rpc::from_parts(9, BTreeMap::new(), BTreeMap::new())
+            .unwrap_or_else(|e| panic!("{e:?}"));
+        let choice = OptionValue::Choice {
+            value: "plan".into(),
+        };
+        let toggle = OptionValue::Toggle { on: true };
+        let config = OptionKey::Config { id: "mode".into() };
+        let fast = OptionKey::Config { id: "fast".into() };
+        assert!(!rpc.setting());
+        assert_eq!(
+            text(&rpc.set_option("s1", "mode", &config, &choice)),
+            "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"session/set_config_option\",\"params\":\
+             {\"sessionId\":\"s1\",\"configId\":\"mode\",\"value\":\"plan\"}}\n"
+        );
+        assert_eq!(
+            text(&rpc.set_option("s1", "fast", &fast, &toggle)),
+            "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"session/set_config_option\",\"params\":\
+             {\"sessionId\":\"s1\",\"configId\":\"fast\",\"type\":\"boolean\",\"value\":true}}\n"
+        );
+        assert!(rpc.setting());
+        assert_eq!(
+            rpc.answered(&Id::number(9)),
+            Some(Purpose::SetOption {
+                id: "mode".into(),
+                value: choice,
+            })
+        );
+        rpc.forget_sets();
+        assert!(!rpc.setting() && rpc.outgoing().is_empty());
+        assert_eq!(rpc.next_id(), 11);
     }
 
     #[test]
@@ -399,7 +480,7 @@ mod tests {
         assert_eq!(rpc.forget_id(2), None);
         assert_eq!(rpc.answered(&Id::number(2)), None);
         assert_eq!(
-            rpc.outgoing().values().copied().collect::<Vec<_>>(),
+            rpc.outgoing().values().cloned().collect::<Vec<_>>(),
             [Purpose::Initialize]
         );
         // The ids go on past it.
@@ -433,7 +514,7 @@ mod tests {
         assert_eq!(
             rpc.outgoing()
                 .iter()
-                .map(|(id, p)| (*id, *p))
+                .map(|(id, p)| (*id, p.clone()))
                 .collect::<Vec<_>>(),
             [(7, Purpose::Resume), (8, Purpose::Load)]
         );
@@ -556,7 +637,7 @@ mod tests {
         assert_eq!(
             rpc.outgoing()
                 .iter()
-                .map(|(id, p)| (*id, *p))
+                .map(|(id, p)| (*id, p.clone()))
                 .collect::<Vec<_>>(),
             [
                 (1, Purpose::Initialize),
@@ -593,7 +674,7 @@ mod tests {
         assert!(rpc.forget(Purpose::Prompt));
         assert!(!rpc.forget(Purpose::Prompt));
         assert_eq!(
-            rpc.outgoing().values().copied().collect::<Vec<_>>(),
+            rpc.outgoing().values().cloned().collect::<Vec<_>>(),
             [Purpose::NewSession]
         );
     }

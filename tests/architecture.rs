@@ -763,6 +763,22 @@ fn acp_versions_stay_in_their_modules() {
         "the reducer, rpc and the checkpoint read acp/forms.rs, never a version's \
          module (docs/architecture/ports-and-adapters.md R14)",
     );
+    // The option keys of v1's session modes and model list exist in the
+    // forms only so a key can be stored (OpenSpec change `agents-commands`,
+    // flag 10): nothing outside acp/forms.rs and acp/v1/ makes or matches
+    // one; the reducer compares keys whole.
+    let forms = acp.join("forms.rs");
+    let v1 = acp.join("v1");
+    let keyless: Vec<PathBuf> = files
+        .iter()
+        .filter(|file| **file != forms && !file.starts_with(&v1))
+        .cloned()
+        .collect();
+    assert_none(
+        offenders(&keyless, Scope::All, &["OptionKey::Modes", "OptionKey::Models"]),
+        "only remote-agent/src/acp/forms.rs and acp/v1/ name OptionKey::Modes and \
+         OptionKey::Models (docs/architecture/ports-and-adapters.md R14)",
+    );
 }
 
 /// The transcript crate's one door in the app: no file in `src/` but
@@ -1124,7 +1140,7 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 67] = [
+const PURE_MODULES: [&str; 68] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1147,6 +1163,7 @@ const PURE_MODULES: [&str; 67] = [
     "src/agent/tool.rs",
     "src/agent/model.rs",
     "src/agent/conversations.rs",
+    "src/agent/commands.rs",
     "src/layout.rs",
     "src/reattach.rs",
     "src/workspace/tabs.rs",

@@ -48,7 +48,11 @@
 //! character included; left out when there are none, as in a checkpoint
 //! from before `agents-tool-content`), the count of a bad-line run not yet
 //! written as a notice, and the [`Lines`] state: which partial it is and
-//! `covers`, every stdout byte fed, the partial line's included.
+//! `covers`, every stdout byte fed, the partial line's included. Since
+//! OpenSpec change `agents-commands` (format 2, amended) it also holds
+//! each held option's key by its id (`option_keys`) and the mode values
+//! last in effect (`modes`), each left out when empty; the commands and
+//! options themselves are log events. A set of an option out isn't kept.
 //!
 //! **Bounds.** A checkpoint is at most [`MAX_CHECKPOINT_LEN`] (64 MiB, what a
 //! holder keeps): the log's 16 MiB, an 8 MiB partial line, a 256 KiB prompt
@@ -77,6 +81,7 @@ use brindle_transcript::{
 
 use super::dialect::{Dialect, Unsupported};
 use super::envelope::Id;
+use super::forms::OptionKey;
 use super::lines::{Lines, Partial};
 use super::plain::{self, Mode};
 use super::reduce::{
@@ -368,6 +373,23 @@ fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
     if session.chose {
         state.insert("chose".into(), json!(true));
     }
+    // The options' keys and the modes last in effect (`agents-commands`,
+    // decision 12), left out when empty, as a state from before has none.
+    if !session.keys.is_empty() {
+        state.insert(
+            "option_keys".into(),
+            Value::Object(
+                session
+                    .keys
+                    .iter()
+                    .map(|(id, key)| (id.clone(), key.to_value()))
+                    .collect(),
+            ),
+        );
+    }
+    if !session.modes.is_empty() {
+        state.insert("modes".into(), json!(session.modes));
+    }
     (state, bytes)
 }
 
@@ -518,8 +540,9 @@ fn log_name(log: Log) -> &'static str {
 }
 
 /// A request's purpose as checkpointed; none for a list, which isn't
-/// (`agents-session-list` flag 4): its late answer is ignored.
-fn purpose_name(purpose: Purpose) -> Option<&'static str> {
+/// (`agents-session-list` flag 4): its late answer is ignored; nor for a
+/// set of an option (`agents-commands` flag 3).
+fn purpose_name(purpose: &Purpose) -> Option<&'static str> {
     Some(match purpose {
         Purpose::Initialize => "initialize",
         Purpose::NewSession => "new_session",
@@ -527,7 +550,7 @@ fn purpose_name(purpose: Purpose) -> Option<&'static str> {
         Purpose::Resume => "resume",
         Purpose::Load => "load",
         Purpose::Authenticate => "authenticate",
-        Purpose::List { .. } => return None,
+        Purpose::List { .. } | Purpose::SetOption { .. } => return None,
     })
 }
 
@@ -543,7 +566,7 @@ fn rpc_value(rpc: &Rpc) -> Value {
     let outgoing: Vec<Value> = rpc
         .outgoing()
         .iter()
-        .filter_map(|(id, purpose)| Some(json!([id, purpose_name(*purpose)?])))
+        .filter_map(|(id, purpose)| Some(json!([id, purpose_name(purpose)?])))
         .collect();
     let permissions: Vec<Value> = rpc
         .permissions()
@@ -784,6 +807,31 @@ fn restore(
         Some(value) => value.as_bool().ok_or(Unreadable::Field { name }),
     };
     let (lists, chose) = (flag("lists")?, flag("chose")?);
+    let mut keys = BTreeMap::new();
+    if let Some(stored) = state.get("option_keys") {
+        for (id, key) in object(stored, "option_keys")? {
+            let key = OptionKey::from_value(key).ok_or(Unreadable::Field {
+                name: "option_keys",
+            })?;
+            keys.insert(id.clone(), key);
+        }
+    }
+    let modes: BTreeMap<String, String> = match state.get("modes") {
+        None => BTreeMap::new(),
+        Some(modes) => serde_json::from_value(modes.clone())
+            .map_err(|_| Unreadable::Field { name: "modes" })?,
+    };
+    // Each key is a held option's.
+    if keys.len() != transcript.options().len()
+        || transcript
+            .options()
+            .iter()
+            .any(|option| !keys.contains_key(&option.id))
+    {
+        return Err(Unreadable::Field {
+            name: "option_keys",
+        });
+    }
 
     // Each entry the state names is the log's, of the kind it is named as.
     if let Some(run) = run {
@@ -850,6 +898,8 @@ fn restore(
         methods,
         lists,
         chose,
+        keys,
+        modes,
     })
 }
 
@@ -3098,5 +3148,112 @@ mod tests {
                 Err(Unreadable::Field { name: "outputs" })
             );
         }
+    }
+
+    // --- commands and options (agents-commands) -------------------------
+
+    /// Ready in `s1` with commands, and the options made from v1's modes
+    /// (keys the reducer can't name) beside a config option.
+    fn with_options() -> Agent {
+        let mut agent = Agent::new();
+        agent.step(Input::Spawned);
+        agent.feed(&result(
+            1,
+            json!({"protocolVersion": 1,
+            "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"resume": {}}},
+            "agentInfo": {"name": "fake", "version": "1.0"}}),
+        ));
+        agent.feed(&result(2, json!({"sessionId": "s1",
+            "modes": {"currentModeId": "default", "availableModes": [
+                {"id": "default", "name": "Default"}, {"id": "plan", "name": "Plan"}]},
+            "configOptions": [{"id": "fast", "name": "Fast", "type": "boolean", "currentValue": false}]})));
+        agent.feed(&update(json!({"sessionUpdate": "available_commands_update",
+            "availableCommands": [{"name": "compact", "description": "Compacts", "input": {"hint": "how"}}]})));
+        assert_eq!(agent.s.transcript.options().len(), 2);
+        agent
+    }
+
+    #[test]
+    fn options_from_modes_round_trip_as_a_base_and_with_segments_and_a_set_out_is_dropped() {
+        let mut agent = with_options();
+        let restored = agent.round_trip();
+        assert_eq!(restored, agent.s);
+        assert_eq!(restored.keys.len(), 2);
+        assert_eq!(restored.modes.get("mode").map(String::as_str), Some("default"));
+        // A restored session sets its options by their keys.
+        let mut again = Agent {
+            s: restored,
+            now: agent.now,
+        };
+        let out = again.step(Input::Command(Command::SetOption {
+            option: "mode".into(),
+            value: brindle_remote_protocol::client::OptionValue::Choice {
+                value: "plan".into(),
+            },
+        }));
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(sent(&out.stdin)[0]["method"], "session/set_mode");
+        // With segments: a mode change and new commands as events.
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.feed(&update(
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": "plan"}),
+        )));
+        stored.saw(agent.feed(&update(json!({"sessionUpdate": "available_commands_update",
+            "availableCommands": []}))));
+        stored.append(&agent.s);
+        let decoded = stored.decode(agent.now);
+        assert_eq!(decoded, agent.s);
+        assert_eq!(decoded.modes.get("mode").map(String::as_str), Some("plan"));
+        assert!(decoded.transcript.commands().is_empty());
+        // A set out at an encode isn't kept; its id is.
+        let out = agent.step(Input::Command(Command::SetOption {
+            option: "fast".into(),
+            value: brindle_remote_protocol::client::OptionValue::Toggle { on: true },
+        }));
+        assert_eq!(out.reply, Some(Ok(())));
+        assert!(agent.s.rpc.setting());
+        let bytes = encode(&agent.s).expect("it fits");
+        let adopted = adopt(&bytes, false, "/home/u/src", "0.3.0", agent.now);
+        assert_eq!(adopted.restored, Ok(()));
+        assert!(!adopted.session.rpc.setting());
+        assert_eq!(adopted.session.rpc.next_id(), agent.s.rpc.next_id());
+        assert_eq!(adopted.session.transcript.options(), agent.s.transcript.options());
+    }
+
+    #[test]
+    fn a_checkpoint_from_before_options_reads_with_both_lists_empty() {
+        let agent = Agent::busy();
+        let bytes = encode(&agent.s).expect("it fits");
+        let (state, partial) = state_of(&bytes);
+        assert!(state.get("option_keys").is_none() && state.get("modes").is_none());
+        for restored in [decode(&bytes, agent.now), decode(&rebuild(&state, &partial), agent.now)] {
+            let restored = restored.expect("it reads");
+            assert!(restored.transcript.commands().is_empty());
+            assert!(restored.transcript.options().is_empty());
+            assert!(restored.keys.is_empty() && restored.modes.is_empty());
+        }
+        // Keys that aren't the held options' make it unreadable.
+        let agent = with_options();
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        state["option_keys"] = json!({"fast": {"config": "fast"}});
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field {
+                name: "option_keys"
+            })
+        );
+        state["option_keys"] = json!({"fast": "fast", "mode": "modes"});
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field {
+                name: "option_keys"
+            })
+        );
+        state["option_keys"] = json!({"fast": {"config": "fast"}, "mode": "modes"});
+        state["modes"] = json!({"mode": 3});
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field { name: "modes" })
+        );
     }
 }

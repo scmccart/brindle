@@ -587,6 +587,46 @@ fn a_choosing_session_survives_an_upgrade_and_then_chooses() {
     assert_eq!(methods(&record), ["initialize", "session/list", "session/load"]);
 }
 
+/// OpenSpec change `agents-commands`, task 3.2: the agent's commands and
+/// options, those made from its modes included, come through an upgrade,
+/// and the next core sets them by their keys.
+#[test]
+fn an_upgrade_keeps_the_commands_and_options_and_sets_them_after() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-options");
+    let (mut script, record) = initialized(&dir.path, "options", NEITHER);
+    let answer = json!({"sessionId": "s1",
+        "modes": {"currentModeId": "default", "availableModes": [
+            {"id": "default", "name": "Default"}, {"id": "plan", "name": "Plan"}]},
+        "configOptions": [{"id": "fast", "name": "Fast", "type": "boolean", "currentValue": false}]});
+    script
+        .step("expect session/new")
+        .step(format!("respond {answer}"))
+        .step(update(json!({"sessionUpdate": "available_commands_update",
+            "availableCommands": [{"name": "compact", "description": "Compacts", "input": null}]})))
+        .step("expect session/set_mode")
+        .step("respond {}");
+    let spawn = client::SpawnAgent { policy: client::Policy::Detach, ..client_agent(&script.write()) };
+    let (id, pid) = client.spawn_agent(spawn);
+    dir.track(pid);
+    let before = client.transcript_until(id, "offers its options and commands", |log| {
+        agent_ready(log) && log.options().len() == 2 && log.commands().len() == 1
+    });
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    assert_eq!(client.transcript(id), before);
+    client
+        .set_option(id, "mode", client::OptionValue::Choice { value: "plan".into() })
+        .unwrap();
+    let log = client.transcript_until(id, "is in plan mode", |log| {
+        log.options().iter().any(|option| {
+            option.id == "mode"
+                && matches!(&option.kind, brindle_transcript::OptionControl::Select { current, .. } if current == "plan")
+        })
+    });
+    assert_eq!(log.commands(), before.commands());
+    assert_eq!(methods(&record), ["initialize", "session/new", "session/set_mode"]);
+}
+
 #[test]
 fn a_held_prompt_survives_an_upgrade_and_is_sent_again() {
     let (mut dir, mut client) = agent_core("agent-upgrade-held");
