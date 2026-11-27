@@ -55,12 +55,15 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 5. Reveal and give-back primitives (E-3, `brindle-ui`)
 
-- [ ] 5.1 Add tests and verify they fail first:
+- [x] 5.1 Add tests and verify they fail first:
   - `message_scroller.rs`: pure `reveal_plan` tests (`an_item_drawn_whole_is_in_view`, `an_item_cut_at_either_edge_or_undrawn_scrolls`); component tests `revealing_an_item_above_the_view_puts_its_top_at_the_top_and_shows_the_button`, `revealing_an_item_in_view_moves_nothing`, `revealing_the_last_item_while_away_follows_the_end_again`, `revealing_while_following_reads_the_last_frame_not_the_end` (the gpui `None` case of design 4), and `the_owner_hears_the_items_in_view_after_a_frame_that_changed_them`.
   - `focus_scope.rs`: `tab_tells_the_owner_which_stop_it_focused`, for Tab and shift-Tab, and not for a focus moved by a press.
   `cargo test -p brindle-ui message_scroller focus_scope`.
-- [ ] 5.2 Implement `reveal_plan`, `MessageScroller::reveal` and `on_items_view` (design 4), and `FocusScope::on_step`. Verify that 5.1 and the existing `focus_scope` tests pass.
-- [ ] 5.3 Document `reveal`, `on_items_view` and `on_step` in `ui/README.md` (the scroller's and `FocusScope`'s entries) and the code map's `brindle-ui` entry. Verify each is named once in each.
+  - *As run:* all failed to build first (19 errors: no `reveal_plan`, `Reveal`, `reveal`, `on_items_view` or `on_step`). These are new primitives, so no behaviour could fail before them.
+- [x] 5.2 Implement `reveal_plan`, `MessageScroller::reveal` and `on_items_view` (design 4), and `FocusScope::on_step`. Verify that 5.1 and the existing `focus_scope` tests pass.
+  - *As built:* `Reveal` has four cases, not two (flag 4): `InView`, `ToTop` (cut at the top, or taller than the view), `By(px)` (cut at the bottom: the least distance) and `Undrawn`. Only `Undrawn` below the view goes through gpui's `scroll_to_reveal_item`, after pinning the list at what the last frame showed; an undrawn item above goes to the top. `on_items_view` reports the owner's items with any part in view, an empty `0..0` when none, deferred from the after-draw canvas. `cargo test -p brindle-ui`: 317 passed.
+- [x] 5.3 Document `reveal`, `on_items_view` and `on_step` in `ui/README.md` (the scroller's and `FocusScope`'s entries) and the code map's `brindle-ui` entry. Verify each is named once in each.
+  - *As run:* `grep -c` finds `reveal(`, `on_items_view` and `on_step` once in `ui/README.md` and once in `docs/code-map.md`.
 
 ## 6. Remeasure only when a measure changed, and no fetch from a hidden zone (E-8, E-4, `src/agent/view.rs`)
 
