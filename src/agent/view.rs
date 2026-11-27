@@ -1108,8 +1108,13 @@ fn block_element(
             });
         Message::new(id("message"), from)
             .part(bubble_part(block.part, block.last))
-            .child(div().when(block.part > 0, |d| d.pt_3()).child(content))
-            .action(copy)
+            .child(
+                div()
+                    .debug_selector(|| "agent-message-content".into())
+                    .when(block.part > 0, |d| d.pt_3())
+                    .child(content),
+            )
+            .action(div().debug_selector(|| "agent-message-copy".into()).child(copy))
             .into_any_element()
     };
     match &block.body {
@@ -1280,8 +1285,23 @@ impl Render for AgentView {
         // components inside.
         let tokens = cx.ui_theme();
         let (bg, fg) = (tokens.background, tokens.foreground);
+        let prompt_handle = self.prompt.read(cx).focus_handle(cx);
         let content = div()
             .key_context("AgentZone")
+            // The zone's press rule (OpenSpec change
+            // `agents-zone-focus-and-scroll` decision 1): a press, of any
+            // button, that no control under it took focuses the prompt. A
+            // control that takes focus (the text area, a permission's,
+            // the login row's or the queue row's buttons, stop, Continue)
+            // has already focused itself and prevented the default, so
+            // this does nothing for it; bubble listeners run child first.
+            // Without this, the zone tree's tracked focus would take the
+            // press and leave the keyboard in no stop.
+            .on_any_mouse_down(move |_, window, cx| {
+                if !window.default_prevented() {
+                    brindle_ui::focus_from_pointer(&prompt_handle, window, cx);
+                }
+            })
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::unqueue))
