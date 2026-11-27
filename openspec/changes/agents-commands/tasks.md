@@ -46,27 +46,27 @@ Before starting, check that the changes this one builds on are implemented (the 
 
 ## 6. The zone
 
-- [ ] 6.1 Wire completion in `src/agent/view.rs` (`AgentView`): recompute on every text or cursor change, take the list's keys before the prompt input's own, accept on a row press; verify in the e2e case of 7.1.
-- [ ] 6.1a Run `local_command` on every submit before the prompt is sent: send the set and clear the input, open the choices, or keep the text with the reason beside it (`ChatModel::refusal`); a first prompt from `-p` and the queue's prompts skip it; verify in the e2e case of 7.1a.
-- [ ] 6.2 Show the footer from `option_items`; a press opens the option's choices in the window's palette (`AgentAsk::Options`, `PaletteKind::AgentOptions` in `src/workspace.rs`; flag 7) or flips a toggle; send the set, and show a server refusal as a transient notice on the config line (`Workspace::show_notice`, through an event of its own from `AgentView`; flag 11).
+- [x] 6.1 Wire completion in `src/agent/view.rs` (`AgentView`): recompute on every text or cursor change, take the list's keys before the prompt input's own, accept on a row press; verify in the e2e case of 7.1.
+- [x] 6.1a Run `local_command` on every submit before the prompt is sent: send the set and clear the input, open the choices, or keep the text with the reason beside it (`ChatModel::refusal`); a first prompt from `-p` and the queue's prompts skip it; verify in the e2e case of 7.1a.
+- [x] 6.2 Show the footer from `option_items`; a press opens the option's choices in the window's palette (`AgentAsk::Options`, `PaletteKind::AgentOptions` in `src/workspace.rs`; flag 7) or flips a toggle; send the set, and show a server refusal as a transient notice on the config line (`Workspace::show_notice`, through an event of its own from `AgentView`; flag 11).
 - [x] 6.3 Add `agent_options` ("Agent Options…") and `agent_next_mode` ("Next Agent Mode") to `ACTIONS` in `src/actions.rs` with no default keys, handled only by `AgentView` and listed only when the session has options (a mode option with two or more choices for the second), through new `PaletteFacts` fields read by `palette_lists` (flag 8); verify with unit tests for the palette's listing in an agent zone with and without options and in a terminal zone.
 
 ## 7. End-to-end cases (fake ACP agent)
 
 Each in `tests/e2e/cases/agent.rs`, registered in `tests/e2e/cases/mod.rs` with `.needs_fake_agent()`, the agent's steps gated on files the case creates (`Gate`, the script's `wait-file`).
 
-- [ ] 7.1 `agent-command-completion`: the list on `/`, narrowing, down and enter taking a command, escape closing it without stopping the turn, enter then sending `/name` as a prompt, and tab moving focus when no list shows.
-- [ ] 7.1a `agent-option-command`: `/mo` lists `/mode` and `/model`; `/model so` and enter sets the model with no user entry and an empty input; `/mode ` lists every choice with the current one highlighted; `/model gpt` keeps the text with its reason; `/mode plan` during a turn sets at once and queues nothing; an agent command named like an option is sent to the agent, the list shows Brindle's as `/brindle:model`, and `/brindle:model so` sets the model; `/brindle:mode plan` sets the mode with no conflict; ` /mode plan` with a space first sets the mode, and ` /compact` with a space first reaches the agent as `/compact`.
-- [ ] 7.2 `agent-option-set`: the options in the dump, `agent_options` choosing a model, the value changing only after the agent's answer (behind a `Gate`), and the footer following an update the agent sends on its own.
-- [ ] 7.3 `agent-option-modes`: an agent with modes only shows one mode option; `agent_next_mode` steps and wraps it; the conversation gets its `Mode:` notices.
-- [ ] 7.4 `agent-option-refused`: a second set while one is unanswered shows its reason in the dump's `--- config` line; the agent's error shows as a notice in the conversation.
-- [ ] 7.5 `agent-option-restore`: quit and relaunch, and the restored zone shows the same commands and options without the agent sending them again.
-- [ ] 7.5a `agent-option-continue` (decision 12): the agent exits and the dump shows no `--- option` or `--- commands` line and no completion on `/`; Continue brings them back, with a `Mode:` notice when the continued agent starts in another mode.
+- [x] 7.1 `agent-command-completion`: the list on `/`, narrowing, down and enter taking a command, escape closing it without stopping the turn, enter then sending `/name` as a prompt, and tab moving focus when no list shows.
+- [x] 7.1a `agent-option-command`: `/mo` lists `/mode` and `/model`; `/model so` and enter sets the model with no user entry and an empty input; `/mode ` lists every choice with the current one highlighted; `/model gpt` keeps the text with its reason; `/mode plan` during a turn sets at once and queues nothing; an agent command named like an option is sent to the agent, the list shows Brindle's as `/brindle:model`, and `/brindle:model so` sets the model; `/brindle:mode plan` sets the mode with no conflict; ` /mode plan` with a space first sets the mode, and ` /compact` with a space first reaches the agent as `/compact`.
+- [x] 7.2 `agent-option-set`: the options in the dump, `agent_options` choosing a model, the value changing only after the agent's answer (behind a `Gate`), and the footer following an update the agent sends on its own.
+- [x] 7.3 `agent-option-modes`: an agent with modes only shows one mode option; `agent_next_mode` steps and wraps it; the conversation gets its `Mode:` notices.
+- [x] 7.4 `agent-option-refused`: a second set while one is unanswered shows its reason in the dump's `--- config` line; the agent's error shows as a notice in the conversation.
+- [x] 7.5 `agent-option-restore`: quit and relaunch, and the restored zone shows the same commands and options without the agent sending them again.
+- [x] 7.5a `agent-option-continue` (decision 12): the agent exits and the dump shows no `--- option` or `--- commands` line and no completion on `/`; Continue brings them back, with a `Mode:` notice when the continued agent starts in another mode.
 - [ ] 7.6 Run the agent cases on Windows (one `windows-agent-*` case with the completion list, in `tests/e2e/cases/win.rs`) and in the archive jobs (the `agent-*` filter of `e2e-archive` and `windows-e2e-archive` picks the new cases up).
 
 ## 8. Docs and checks
 
-- [ ] 8.1 Update `docs/code-map.md` (the agent zone, the reducer, client protocol 4's messages), `README.md`'s "Agent tabs" section (commands, options, the two actions), and `CLAUDE.md`'s dump description and action notes.
-- [ ] 8.2 Tell `agents-acp-v2` what it inherits: add to its proposal the v2 mapping of design decision 3.
+- [x] 8.1 Update `docs/code-map.md` (the agent zone, the reducer, client protocol 4's messages), `README.md`'s "Agent tabs" section (commands, options, the two actions), and `CLAUDE.md`'s dump description and action notes.
+- [x] 8.2 Tell `agents-acp-v2` what it inherits: add to its proposal the v2 mapping of design decision 3.
 - [ ] 8.3 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate agents-commands --strict`.
 - [ ] 8.4 Manual checks for the user, with `scripts/run-throwaway.sh` and a real agent profile: a pointer press on a suggestion row and on each footer item; a real agent's `/compact`; switching a real agent's mode and model and seeing it take effect in the next turn; IME composition in the prompt input while the list shows.

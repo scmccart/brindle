@@ -245,6 +245,8 @@ The design was checked against `feat/agents-session-list` (PR #150) on 2026-11-2
 30. **`AgentAsk` is `Clone`, not `Copy`**, since its new `Options { option }` variant carries the option's id; `shared::Changes` gains `lists_changed` for the two list events, which no longer count as a turn or agent change.
 31. **The options palette marks the current choice with `current` in its detail**, and its highlight starts on the first row, not the current choice (a palette has no initial highlight to set).
 32. **Agent Options… and Next Agent Mode are listed only in an agent zone**: the palette's facts read the active zone's model (`ChatModel::has_options`), and a terminal zone's are always false.
+33. **The e2e cases live in `tests/e2e/cases/agent_options.rs`**, not `agent.rs` (already 3,800 lines), as `conversations.rs` holds `agents-session-list`'s; they use `agent.rs`'s script helpers. `windows-agent-command-completion` runs `agent-command-completion` on Windows. Enter on a list takes the highlighted command (the agent-zones spec's "Enter takes the command"), so a case that sends a command it typed in full (` /compact`) closes the list with escape first.
+34. **The dump parser's completion rows** are `Dump::completion_rows`: the lines after `--- completion` up to the next `--- ` line, in the self-test.
 
 ## The user's decisions
 

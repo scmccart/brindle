@@ -7,6 +7,7 @@
 #[cfg(windows)]
 mod win;
 mod agent;
+mod agent_options;
 mod cards;
 mod clipboard;
 mod cli;
@@ -338,6 +339,13 @@ fn unix() -> Vec<Case> {
         display("agent-conversations-list", conversations::list).needs_fake_agent(),
         display("agent-conversations-open", conversations::open).needs_fake_agent(),
         display("agent-conversations-stopped", conversations::stopped).needs_fake_agent(),
+        display("agent-command-completion", agent_options::command_completion).needs_fake_agent(),
+        display("agent-option-command", agent_options::option_command).needs_fake_agent(),
+        display("agent-option-set", agent_options::option_set).needs_fake_agent(),
+        display("agent-option-modes", agent_options::option_modes).needs_fake_agent(),
+        display("agent-option-refused", agent_options::option_refused).needs_fake_agent(),
+        display("agent-option-restore", agent_options::option_restore).needs_fake_agent(),
+        display("agent-option-continue", agent_options::option_continue).needs_fake_agent(),
         display("agent-conversations-cli", conversations::cli).needs_fake_agent(),
         display("agent-conversations-failures", conversations::failures).needs_fake_agent(),
     ]
