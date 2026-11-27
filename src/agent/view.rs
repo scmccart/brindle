@@ -72,6 +72,15 @@ pub fn link_press(target: &str, modifiers: &Modifiers, plan: impl FnOnce(&str) -
     links::wants_links(modifiers).then(|| link_action(target, plan(target)))
 }
 
+/// The link gesture's new state when `modifiers` change it from `was`
+/// ([`links::wants_links`]: ctrl held, alt not), else `None`: only a flip
+/// changes what a link's pointer shows (OpenSpec change
+/// `agents-zone-focus-and-scroll` decision 6).
+pub fn link_gesture_flip(was: bool, modifiers: &Modifiers) -> Option<bool> {
+    let now = links::wants_links(modifiers);
+    (now != was).then_some(now)
+}
+
 /// What an agent zone does with a link pressed with the gesture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkStep {
@@ -336,6 +345,8 @@ pub struct AgentView {
     /// What the items were last measured at; `remeasure_if_changed`, from
     /// `set_profile` and the Settings observer, refreshes it.
     measure: Measure,
+    /// Whether the modifiers held last made the link gesture.
+    link_gesture: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -440,6 +451,7 @@ impl AgentView {
             font_size_override,
             earlier: Earlier::None,
             measure: measure_of(font_size_override, cx),
+            link_gesture: false,
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
@@ -1318,8 +1330,14 @@ impl Render for AgentView {
             // A link shows the pointing hand only while ctrl is held: a
             // modifiers change with the pointer still reaches only the
             // focused path (the prompt input, inside this), so the frame is
-            // drawn again here for the links' pointer to follow it.
-            .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
+            // drawn again here for the links' pointer to follow it, when
+            // the gesture flipped and only then (decision 6).
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                if let Some(now) = link_gesture_flip(this.link_gesture, &event.modifiers) {
+                    this.link_gesture = now;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &AgentScrollToBottom, _, cx| this.scroll_to_end(cx)))
             .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll_to_end(cx)))
             .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| this.page(PageDirection::Up, cx)))

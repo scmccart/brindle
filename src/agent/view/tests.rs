@@ -1026,6 +1026,50 @@ fn the_earlier_row_fetches_in_view_and_spins_until_the_page_comes() {
     assert!(!running(&mut f), "no agent works and nothing loads");
 }
 
+// OpenSpec change `agents-zone-focus-and-scroll`, task 9.1.
+
+/// The link gesture flips with ctrl alone (alt cancels it, shift and the
+/// rest don't touch it), and only a flip asks for a redraw.
+#[test]
+fn the_link_gesture_flips_on_ctrl_alone() {
+    let ctrl = Modifiers::control();
+    let ctrl_alt = Modifiers { control: true, alt: true, ..Modifiers::default() };
+    let ctrl_shift = Modifiers { control: true, shift: true, ..Modifiers::default() };
+    assert_eq!(link_gesture_flip(false, &ctrl), Some(true));
+    assert_eq!(link_gesture_flip(true, &ctrl), None, "still held");
+    assert_eq!(link_gesture_flip(true, &ctrl_shift), None, "shift added: no change");
+    assert_eq!(link_gesture_flip(true, &Modifiers::none()), Some(false));
+    assert_eq!(link_gesture_flip(false, &Modifiers::shift()), None);
+    assert_eq!(link_gesture_flip(false, &ctrl_alt), None, "ctrl-alt isn't the gesture");
+    assert_eq!(link_gesture_flip(true, &ctrl_alt), Some(false));
+}
+
+/// A shift press and release redraw nothing; ctrl's press and release
+/// each redraw once.
+#[test]
+fn a_shift_press_doesnt_redraw_and_ctrl_does() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let mut f = Fixture::new();
+    f.feed(&[ready(), added(1, crate::agent::test_support::agent("See <https://example.com>."))]);
+    let notified = Rc::new(Cell::new(0));
+    let view = f.view.clone();
+    let _observed = f.cx.update(|_, cx| {
+        let notified = notified.clone();
+        cx.observe(&view, move |_, _| notified.set(notified.get() + 1))
+    });
+    let count = |modifiers: Modifiers, f: &mut Fixture| {
+        notified.set(0);
+        f.cx.simulate_modifiers_change(modifiers);
+        f.settle();
+        notified.get()
+    };
+    assert_eq!(count(Modifiers::shift(), &mut f), 0, "shift down");
+    assert_eq!(count(Modifiers::none(), &mut f), 0, "shift up");
+    assert_eq!(count(Modifiers::control(), &mut f), 1, "ctrl down");
+    assert_eq!(count(Modifiers::none(), &mut f), 1, "ctrl up");
+}
+
 // OpenSpec change `agents-zone-focus-and-scroll`, task 7.1.
 
 /// A turn running over twenty long agent messages, taller than the window.
