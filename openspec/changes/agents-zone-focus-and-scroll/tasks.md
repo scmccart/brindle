@@ -4,18 +4,24 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 1. Re-open the sites on `main`
 
-- [ ] 1.1 After `agents-commands` (PR #151) and any sibling remediation change that has merged (`agents-client-state-fixes`, `agents-module-structure`, `agents-absorb-cost`), re-open every site design.md's Context cites on `main`: `AgentView::render`'s root, `set_profile`, `on_update`, `follow_earlier`, `FocusStops::stops`; `ChatModel::finish`, `working_row`, `fetch_due`; `Agent::apply_absorbed` and `drain`; `MessageScroller::splice` and `refresh_top_row`; `FocusScope::step`; `ZoneTreeView::render_leaf` and its root; `RateLimiter`. Note in this task what moved (a module split, a new control in the zone, the `Earlier` shape) and adjust the later tasks' paths before starting them. Verify by listing each site's current file and line here.
+- [x] 1.1 After `agents-commands` (PR #151) and any sibling remediation change that has merged (`agents-client-state-fixes`, `agents-module-structure`, `agents-absorb-cost`), re-open every site design.md's Context cites on `main`: `AgentView::render`'s root, `set_profile`, `on_update`, `follow_earlier`, `FocusStops::stops`; `ChatModel::finish`, `working_row`, `fetch_due`; `Agent::apply_absorbed` and `drain`; `MessageScroller::splice` and `refresh_top_row`; `FocusScope::step`; `ZoneTreeView::render_leaf` and its root; `RateLimiter`. Note in this task what moved (a module split, a new control in the zone, the `Earlier` shape) and adjust the later tasks' paths before starting them. Verify by listing each site's current file and line here.
+  - **Base:** `fix/agents-client-state` at `dd43e7c` (PR #153, `agents-client-state-fixes`, not merged), over `main` at `b6a0316` (with `agents-commands`, #151). `agents-module-structure` and `agents-absorb-cost` haven't landed: `model.rs` is still one file, and absorb still renders per chunk.
+  - **Sites:** `src/agent/view.rs`: `AgentView::render`'s root `div` `:1234` (the `AgentZone` key context; `on_modifiers_changed` `:1253`), `set_profile` `:530`, `on_update` `:550`, `follow_earlier` `:443`, `FocusStops::stops` `:346`. `src/agent/model.rs`: `ChatModel::finish` `:2545`, `working_row` `:1749`, `fetch_due` `:1822`, `Absorbed` `:1270`. `src/agent/mod.rs`: `drain` `:712`, `apply_absorbed` `:792`, `AgentUpdate::Working` `:204`. `ui/src/components/message_scroller.rs`: `splice` `:237`, `refresh_top_row` `:215`. `ui/src/primitives/focus_scope.rs`: `FocusScope::step` `:79`. `src/zone_view.rs`: `render_leaf` `:2061` (its capture handler `:2077`), the root's `track_focus` `:2236`, `restyle` `:1483`. `src/notify/policy.rs`: `RateLimiter` `:134`.
+  - **What moved:** `agents-commands` added the prompt input's completion list and its footer of option buttons (`PromptInput::set_suggestions`, `set_footer`), which take no focus; their presses reach the root rule as the proposal's Overlap says. `agents-client-state-fixes` made `ChatModel::earlier()` computed (`Paging` plus whether a `Sent::Fetch` is pending) rather than stored; `Earlier`'s four variants and `fetch_due`'s rule are unchanged, so task 6.1's hidden-zone test is written against them as they are. No path in the later tasks changes.
 
 ## 2. Agent notifications get their own bucket (E-9, `src/notify/policy.rs`)
 
-- [ ] 2.1 Add tests to `policy.rs`'s `mod tests` and verify they fail first (`cargo test -p brindle notify::policy`):
+- [x] 2.1 Add tests to `policy.rs`'s `mod tests` and verify they fail first (`cargo test -p brindle notify::policy`):
   - `three_program_notifications_leave_an_agents_bucket_alone`: three `Source::Osc` notifications for tab 1, then a `Source::Agent` one for tab 1 at the same instant, is allowed; a fourth `Osc` is not.
   - `an_agent_has_three_at_once_then_one_every_two_seconds`.
   - `every_class_counts_against_the_global_cap`: ten mixed notifications across tabs, then an agent's is refused.
   - `every_source_has_a_limit_class`: `LimitClass::of` for each `Source` (an exhaustive list in the test).
   Replace `agent_notices_take_the_program_rate_limit`, which pins the old behaviour.
-- [ ] 2.2 Add `enum LimitClass { Bell, Program, Agent }` with `of(Source)` (exhaustive, no `_ =>`, `railway R3`) and `limit()`, `AGENT_PER_TAB` with the programs' numbers, and key `RateLimiter.tabs` by `(u64, LimitClass)` (design 7). Verify that 2.1 and the existing limiter tests pass.
-- [ ] 2.3 In `docs/code-map.md`'s `notify/` entry, say that agents have their own per-tab bucket under the global cap, and that this replaces `agents-profiles` 7.1. Verify the entry names `LimitClass`.
+  - *As run:* the four tests (with `Source::Osc9` for "`Source::Osc`") failed to build first: `LimitClass` and `AGENT_PER_TAB` didn't exist (12 errors, `cargo test -p brindle --bin brindle notify::policy`). The old pin went.
+- [x] 2.2 Add `enum LimitClass { Bell, Program, Agent }` with `of(Source)` (exhaustive, no `_ =>`, `railway R3`) and `limit()`, `AGENT_PER_TAB` with the programs' numbers, and key `RateLimiter.tabs` by `(u64, LimitClass)` (design 7). Verify that 2.1 and the existing limiter tests pass.
+  - *As run:* `cargo test -p brindle --bin brindle notify::`: 51 passed.
+- [x] 2.3 In `docs/code-map.md`'s `notify/` entry, say that agents have their own per-tab bucket under the global cap, and that this replaces `agents-profiles` 7.1. Verify the entry names `LimitClass`.
+  - *As built:* the agent bullet names `AGENT_PER_TAB`, `LimitClass::{Bell, Program, Agent}` and `LimitClass::of`, and says it replaces `agents-profiles` 7.1.
 
 ## 3. The working row's splice comes from the model (E-6, `src/agent/model.rs`, `mod.rs`, `view.rs`)
 
