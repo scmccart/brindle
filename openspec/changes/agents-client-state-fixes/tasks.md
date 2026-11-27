@@ -144,7 +144,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 ## 5. UI and end-to-end
 
 - [x] 5.1 Make `src/agent/view.rs` match `Earlier::Loading { .. }` with no request, in `refresh_motion` and in the row's drawing. In `view/tests.rs`, the paging test takes the fetch's id from `Call::Fetch` order, not from `Earlier::Loading`. Verify with `cargo test -p brindle agent::view`.
-- [ ] 5.2 Check the e2e cases:
+- [x] 5.2 Check the e2e cases:
   - Run `agent-first-prompt-before-the-session-runs` and `agent-prompt-before-the-attached-session-runs` 20 times each; expect 0 failures.
   - Run the whole `agent-` filter once; it passes (`agent-broken` included, on a debug build).
   - Record the counts in the as-built notes.
@@ -158,7 +158,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 - [x] 6.2 Update `CLAUDE.md`'s e2e paragraph. Next to `agent-broken`'s fault switch, name the two new cases and `BRINDLE_TEST_SESSION_START_DELAY`: they skip on a release build, as `agent-broken` does.
 - [x] 6.3 Note the amended withheld list in this change's as-built notes (design decision 11). No architecture rule or exception changes, so `docs/architecture/` is untouched.
 - [x] 6.4 Add one line to the designs of `agents-prompt-context` and `agents-prompt-images` (or, if they are archived by then, to their follow-ups): the uncertain prompt's `taken` must compare the attachment list as well as the text (design decision 5).
-- [ ] 6.5 Run the checks:
+- [x] 6.5 Run the checks:
   - `cargo test --workspace`
   - `cargo clippy --locked --workspace --all-targets -- -D warnings`
   - `BRINDLE_E2E=1 cargo test --test e2e -- --self-test`
