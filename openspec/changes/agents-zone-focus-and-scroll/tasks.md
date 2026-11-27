@@ -90,7 +90,7 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 8. One press rule for the zone (E-1, `src/agent/view.rs`, `src/zone_view.rs`)
 
-- [ ] 8.1 Add tests to `zone_view.rs`'s `mod tests`, using the `Tab` fixture with an agent zone in a `VisualTestContext`, and verify they fail first (`cargo test -p brindle zone_view::tests::a_press`); each finds its target through `debug_bounds` and presses with `simulate_mouse_down`/`simulate_click`, as `code_blocks_copy_from_their_button_and_the_palette` does:
+- [x] 8.1 Add tests to `zone_view.rs`'s `mod tests`, using the `Tab` fixture with an agent zone in a `VisualTestContext`, and verify they fail first (`cargo test -p brindle zone_view::tests::a_press`); each finds its target through `debug_bounds` and presses with `simulate_mouse_down`/`simulate_click`, as `code_blocks_copy_from_their_button_and_the_palette` does:
   - `a_press_on_a_messages_text_keeps_the_prompt_focused`, then typed text reaches the draft;
   - `a_press_on_a_thoughts_label_opens_it_and_keeps_the_prompt_focused` (`reasoning-trigger`);
   - `a_press_on_a_tool_rows_line_opens_it_and_keeps_the_prompt_focused` (`tool-title`);
@@ -102,8 +102,11 @@ Each group writes its tests first and watches them fail before the code they che
   - `a_press_on_a_permission_button_answers_it` (passes before and after);
   - `a_press_into_an_inactive_agent_zone_focuses_its_prompt`.
   Record in this task what the dump's focus line reads before the fix (`Workspace::describe_focus` on the same state: `--- focus other modality=pointer` expected) and after (`--- focus agent stop=prompt modality=pointer`). If no test fails, follow design 8a.
-- [ ] 8.2 Add the root `on_any_mouse_down` to `AgentView::render` (design 1), with a comment naming the rule and why a control that takes focus is unaffected; update the comment on `render_leaf`'s capture handler. Verify that 8.1 and `cargo test -p brindle agent:: zone_view::` pass.
-- [ ] 8.3 In `docs/code-map.md`'s agent view entry, add the press rule in one sentence. Add design 11's three manual checks to `CLAUDE.md`'s "Manual checks" list, after "a pointer press into an inactive agent zone focusing it" (which they extend). Verify both.
+  - *As run:* nine of the ten failed before the fix, each with `focused_stop` `None` after the press, which the dump's `Workspace::describe_focus` reads as `--- focus other modality=pointer` (the zone tree's tracked handle had focus); `escape_after_a_press_cancels_the_turn` sent no `Cancel`. `a_press_into_an_inactive_agent_zone_focuses_its_prompt` failed too: the capture handler made the zone active and focused its prompt, then the tree's tracked-focus listener took the press. `a_press_on_a_permission_button_answers_it` passed, as expected. `simulate_click` runs the tracked-focus listener, so design 8a's hand check wasn't needed. The tests find their targets through two debug selectors added to an agent message, `agent-message-content` and `agent-message-copy` (no-ops in release builds), and the copy test hovers the message first so its button shows. After the fix every one reads `Some("prompt")`, the dump's `--- focus agent stop=prompt modality=pointer`.
+- [x] 8.2 Add the root `on_any_mouse_down` to `AgentView::render` (design 1), with a comment naming the rule and why a control that takes focus is unaffected; update the comment on `render_leaf`'s capture handler. Verify that 8.1 and `cargo test -p brindle agent:: zone_view::` pass.
+  - *As built:* on the `AgentZone` root, calling `brindle_ui::focus_from_pointer` with the prompt's handle when `!window.default_prevented()`. `cargo test -p brindle`: 1307 passed, 2 ignored; architecture 51 passed.
+- [x] 8.3 In `docs/code-map.md`'s agent view entry, add the press rule in one sentence. Add design 11's three manual checks to `CLAUDE.md`'s "Manual checks" list, after "a pointer press into an inactive agent zone focusing it" (which they extend). Verify both.
+  - *As built:* the code map's sentence follows the reveal and give-back one; `CLAUDE.md` has the three checks as three items after that line, each "on Linux and on Windows".
 
 ## 9. Redraw on the link gesture only (E-7, `src/agent/view.rs`)
 
