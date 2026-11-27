@@ -1374,6 +1374,24 @@ impl TestClient {
         self.agent_reply(req)
     }
 
+    /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`): set the
+    /// session option `option` to `value`.
+    pub fn set_option(
+        &mut self,
+        session: SessionId,
+        option: &str,
+        value: client::OptionValue,
+    ) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentSetOption(client::AgentSetOption {
+            req,
+            session,
+            option: option.into(),
+            value,
+        }));
+        self.agent_reply(req)
+    }
+
     /// `AGENT_CANCEL`, which has no reply (an `ERROR` without a `req` if
     /// it is refused).
     pub fn cancel(&mut self, session: SessionId) {
