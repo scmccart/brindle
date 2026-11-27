@@ -63,7 +63,7 @@ Before starting:
 
 ## 9. Integration
 
-- [ ] 9.1 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests, the release build and the e2e suite under `scripts/with-xvfb` in a systemd scope; `openspec validate agents-session-list --strict`.
-- [ ] 9.2 The PR's CI: every job, the three e2e shards and the archive jobs; a `windows-agent-*` case with `-c` on the Windows runner (written as `windows-agent-continue-latest`; needs windows-e2e).
-- [ ] 9.3 Archive the change in the implementation PR, checking the MODIFIED blocks against the main specs first.
-- [ ] 9.4 Hand the manual checks to the user, with `scripts/run-throwaway.sh` and real agent profiles.
+- [x] 9.1 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests, the release build and the e2e suite under `scripts/with-xvfb` in a systemd scope; `openspec validate agents-session-list --strict`. (Workspace: every suite passed except holder.rs's known load flake `everything_a_core_sent_before_it_went_counts_however_much_it_was`, from #56; clippy clean; valid. The filtered e2e run covered 175 cases (agent-, palette, zone, restore, local-server, cli); the full suite and the release build ran on CI.)
+- [x] 9.2 The PR's CI: every job, the three e2e shards and the archive jobs; a `windows-agent-*` case with `-c` on the Windows runner (written as `windows-agent-continue-latest`; needs windows-e2e). (#150: all 13 checks green, windows-e2e and windows-e2e-archive included.)
+- [x] 9.3 Archive the change in the implementation PR, checking the MODIFIED blocks against the main specs first.
+- [x] 9.4 Hand the manual checks to the user, with `scripts/run-throwaway.sh` and real agent profiles. (In #150's description.)
