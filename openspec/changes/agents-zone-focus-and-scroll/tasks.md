@@ -110,8 +110,10 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 9. Redraw on the link gesture only (E-7, `src/agent/view.rs`)
 
-- [ ] 9.1 Add tests and verify they fail first: pure `the_link_gesture_flips_on_ctrl_alone`; `view/tests.rs` `a_shift_press_doesnt_redraw_and_ctrl_does`, counting the view's notifies through an `observe` while `simulate_modifiers_change` sends shift, then ctrl, then nothing. `cargo test -p brindle agent::view`.
-- [ ] 9.2 Store `link_gesture`, notify only on a flip (design 6). Verify that 9.1 and `markdown`'s link tests in `view/tests.rs` pass.
+- [x] 9.1 Add tests and verify they fail first: pure `the_link_gesture_flips_on_ctrl_alone`; `view/tests.rs` `a_shift_press_doesnt_redraw_and_ctrl_does`, counting the view's notifies through an `observe` while `simulate_modifiers_change` sends shift, then ctrl, then nothing. `cargo test -p brindle agent::view`.
+  - *As run:* the pure test failed to build (no `link_gesture_flip`); with the function added and the listener unchanged, `a_shift_press_doesnt_redraw_and_ctrl_does` failed at "shift down" (1 notify, 0 expected). The test sends shift, nothing, ctrl, nothing: a release is a modifiers change too.
+- [x] 9.2 Store `link_gesture`, notify only on a flip (design 6). Verify that 9.1 and `markdown`'s link tests in `view/tests.rs` pass.
+  - *As built:* `cargo test -p brindle -- link`: 82 passed; `cargo test -p brindle`: 1309 passed, 2 ignored.
 
 ## 10. Integration
 
