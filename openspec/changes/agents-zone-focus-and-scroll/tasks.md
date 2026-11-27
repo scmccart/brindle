@@ -117,9 +117,16 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 10. Integration
 
-- [ ] 10.1 Run `cargo test --workspace --locked` and `cargo clippy --locked --workspace --all-targets -- -D warnings`; both pass.
-- [ ] 10.2 Under `scripts/with-xvfb` (inside `systemd-run --user --scope`), run `BRINDLE_E2E=1 cargo test --test e2e -- agent zones` after `cargo build`; every case passes unchanged (design 5: the dump doesn't change).
-- [ ] 10.3 Run the `architecture-review` skill on the branch's diff against `docs/architecture/`; fix what it finds or record why not.
+- [x] 10.1 Run `cargo test --workspace --locked` and `cargo clippy --locked --workspace --all-targets -- -D warnings`; both pass.
+  - *As run:* 3,026 tests passed and none failed across the workspace (`brindle` 1,310 with 2 ignored, architecture 51, `brindle-ui` 319); clippy clean. One workspace run printed three `FAILED`/`panicked` lines whose output wasn't kept, and the runs after it printed none, so the test that failed isn't known (flag 8).
+- [x] 10.2 Under `scripts/with-xvfb` (inside `systemd-run --user --scope`), run `BRINDLE_E2E=1 cargo test --test e2e -- agent zones` after `cargo build`; every case passes unchanged (design 5: the dump doesn't change).
+  - *As run:* `cargo build -p brindle -p brindle-remote-agent --bins`, then `BRINDLE_E2E=1 cargo test --test e2e -- agent zone` (`zone` takes in `zones-*`): 106 passed, 0 failed, 2 skipped (`remote-agent-ssh` and `remote-agent-login-terminal`, with no static musl fake agent built). The run was on `9c94e9c`, before 10.3's two extractions, which change no behaviour. The e2e self-test: 16 ok.
+- [x] 10.3 Run the `architecture-review` skill on the branch's diff against `docs/architecture/`; fix what it finds or record why not.
+  - *As run:* reviewed by hand against the rules, since the skill delegates to subagents, which this run may not start (flag 7). Two decisions sat in shell code (`fcis R1`) and were moved into pure functions with tests: `gives_back(block, in_view)` in `view.rs` (`a_focused_permission_gives_back_only_out_of_view`), and `end_at_bottom(item, view)` in `message_scroller.rs` (`a_revealed_item_at_the_top_moves_its_end_to_the_bottom_when_it_fits`). Also checked:
+    - no `_ =>` arm on an enum of Brindle's own, and no panic on outside bytes (`railway R3`, `R5`);
+    - `brindle-ui` gained no app knowledge (`ports R2`);
+    - nothing new in `render` or `prepaint` does IO; `measure_of` runs in the Settings observer (`process R14`);
+    - no test sleeps or sets environment variables (`testing R7`, `R9`).
 - [ ] 10.4 Hand the user design 11's manual checks with `scripts/run-throwaway.sh` (and `scripts/run-throwaway.ps1` on Windows); record each result here.
 
 ## Workflow follow-up
