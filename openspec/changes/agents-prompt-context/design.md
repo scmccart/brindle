@@ -204,6 +204,7 @@ Kept texts are files, and their references are in the checkpoint, so a waiting o
 - **`agents-markdown`, `agents-markdown-layout-fixes`:** a user's text stays plain and a message is one bubble, with its attachments listed inside it under the text; an attachment's text is drawn as code, never rendered as Markdown.
 - **`remote-login-environment`:** an agent on a remote host now starts in its login shell's environment. The cache directory is found from the terminal server's own environment and home on that host, not the agent's, so `XDG_CACHE_HOME` set only in a shell profile doesn't move it; `attachments_dir` on the profile's remote is how to place it.
 - **Pointer presses** can't be driven from e2e cases (the in-process pointer hook is the proposal-only `debug-pointer-hook`), so the remove mark, a text attachment's row and drops stay manual checks.
+- **`agents-client-state-fixes` (decision 5):** a prompt whose answer was lost with the link is settled by the reconnect's replay through the pure `taken` in `src/agent/model.rs`, which compares the cleaned text with the slot and the user entries after the one the zone held when it was sent. Once a prompt carries attachments, `PromptSent` must record them and `taken` must compare the attachment list as well as the text, or a prompt that differs only in its attachments is taken for the one sent.
 
 ### 14. Tests
 

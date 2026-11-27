@@ -138,6 +138,7 @@ As for text: kept images are files and their references are in the checkpoint, s
 - **The checkpoint** is format 2; nothing of an image or an upload is in it but the references, as for text.
 - **The holder's bound** is still one constant for every session (`INPUT_QUEUE_LIMIT`, 4 MiB, checked at `remote-agent/src/server/holder.rs`); H1 3 gained `CHECKPOINT_APPEND` and is still unreleased, so decision 4's larger bound for pipe sessions stands.
 - **Drawing.** The preview, the image row and the opened image are parts of the zone, in the zone's token set.
+- **`agents-client-state-fixes` (decision 5):** a prompt whose answer was lost with the link is settled by the reconnect's replay through the pure `taken` (`src/agent/model.rs`), which compares the cleaned text with the slot and the later user entries. Once a prompt carries images, `PromptSent` must record them and `taken` must compare the attachment list as well as the text.
 
 ### 12. Tests
 

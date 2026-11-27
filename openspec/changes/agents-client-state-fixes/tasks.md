@@ -152,12 +152,12 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 
 ## 6. Docs and checks
 
-- [ ] 6.1 Update `docs/code-map.md`:
+- [x] 6.1 Update `docs/code-map.md`:
   - The `agent/` entry: `SessionRunning`, `NotSent`, `ReplyError`, the uncertain prompt, `StatusFrom`, derived `earlier()`, `Choose`.
   - The `remote/` client entry: `Carry`, `link_lost`'s two lists, `Session::running`'s `Result`, the fault switch.
-- [ ] 6.2 Update `CLAUDE.md`'s e2e paragraph. Next to `agent-broken`'s fault switch, name the two new cases and `BRINDLE_TEST_SESSION_START_DELAY`: they skip on a release build, as `agent-broken` does.
+- [x] 6.2 Update `CLAUDE.md`'s e2e paragraph. Next to `agent-broken`'s fault switch, name the two new cases and `BRINDLE_TEST_SESSION_START_DELAY`: they skip on a release build, as `agent-broken` does.
 - [ ] 6.3 Note the amended withheld list in this change's as-built notes (design decision 11). No architecture rule or exception changes, so `docs/architecture/` is untouched.
-- [ ] 6.4 Add one line to the designs of `agents-prompt-context` and `agents-prompt-images` (or, if they are archived by then, to their follow-ups): the uncertain prompt's `taken` must compare the attachment list as well as the text (design decision 5).
+- [x] 6.4 Add one line to the designs of `agents-prompt-context` and `agents-prompt-images` (or, if they are archived by then, to their follow-ups): the uncertain prompt's `taken` must compare the attachment list as well as the text (design decision 5).
 - [ ] 6.5 Run the checks:
   - `cargo test --workspace`
   - `cargo clippy --locked --workspace --all-targets -- -D warnings`
