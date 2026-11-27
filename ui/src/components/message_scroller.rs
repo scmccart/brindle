@@ -57,7 +57,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels,
+    AnyElement, App, Bounds, Context, InteractiveElement, IntoElement, ListAlignment, ListOffset, ListState, ParentElement, Pixels,
     Render, Styled, Window, canvas, div, list, px,
 };
 
@@ -495,6 +495,14 @@ impl MessageScroller {
         self.state.logical_scroll_top()
     }
 
+    /// Where the last frame drew the owner's item `ix` in view, if it did
+    /// (window coordinates; the view itself is the `message-scroller`
+    /// debug selector's bounds).
+    pub fn item_bounds(&self, ix: usize) -> Option<Bounds<Pixels>> {
+        let list_ix = self.list_ix(ix);
+        self.drawn.borrow().items.iter().find(|(i, _)| *i == list_ix).map(|(_, b)| *b)
+    }
+
     /// Scrolls to the end and follows it.
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.state.scroll_to(ListOffset { item_ix: self.state.item_count(), offset_in_item: px(0.) });
@@ -630,6 +638,7 @@ impl Render for MessageScroller {
         let told = self.items_in_view.clone();
         let on_items_view = self.on_items_view.clone();
         div()
+            .debug_selector(|| "message-scroller".into())
             .relative()
             .size_full()
             .min_h_0()

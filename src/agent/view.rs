@@ -287,6 +287,29 @@ pub fn permission_variant(kind: PermissionKind) -> ButtonVariant {
     if allows(kind) { ButtonVariant::Destructive } else { ButtonVariant::Outline }
 }
 
+/// What a conversation item's height depends on besides its text and the
+/// width (which the list follows itself): the text size and the two
+/// families (OpenSpec change `agents-zone-focus-and-scroll` decision 3).
+/// The zone doesn't read the terminal's line height; a change that makes
+/// it do so adds it here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Measure {
+    pub size: Pixels,
+    pub ui_family: SharedString,
+    pub code_family: SharedString,
+}
+
+/// The measure in effect: the profile's size, else the terminal size in
+/// effect (zoom included), and the UI and code families.
+fn measure_of(font_size_override: Option<f32>, cx: &App) -> Measure {
+    let settings = Settings::get(cx);
+    Measure {
+        size: settings.font_size(font_size_override),
+        ui_family: settings.ui_font_family(),
+        code_family: settings.font().family,
+    }
+}
+
 /// An agent zone's view.
 pub struct AgentView {
     agent: Entity<Agent>,
@@ -309,6 +332,9 @@ pub struct AgentView {
     /// `agents-log-paging` decision 11): the scroller's top row while there
     /// is one; the view wants the motion clock while it loads.
     earlier: Earlier,
+    /// What the items were last measured at; `remeasure_if_changed`, from
+    /// `set_profile` and the Settings observer, refreshes it.
+    measure: Measure,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -371,8 +397,12 @@ impl AgentView {
             cx.subscribe_in(&agent, window, |this, _, update: &AgentUpdate, _, cx| this.on_update(update, cx)),
             cx.observe_in(&agent, window, |this, _, window, cx| this.sync(window, cx)),
             // The continue offer reads the config's profiles: an edit can
-            // take the button away or bring it back.
-            cx.observe_global_in::<Settings>(window, |this, window, cx| this.sync(window, cx)),
+            // take the button away or bring it back. A zoom, a font
+            // preview or a reload may change what the items measure at.
+            cx.observe_global_in::<Settings>(window, |this, window, cx| {
+                this.remeasure_if_changed(cx);
+                this.sync(window, cx);
+            }),
             cx.subscribe(&prompt, |this, _, event: &PromptInputEvent, cx| this.on_prompt(event, cx)),
             cx.subscribe(&area, |this, _, _: &TextAreaEvent, cx| {
                 this.agent.update(cx, |agent, cx| agent.seen(cx));
@@ -401,6 +431,7 @@ impl AgentView {
             theme,
             font_size_override,
             earlier: Earlier::None,
+            measure: measure_of(font_size_override, cx),
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
@@ -515,12 +546,19 @@ impl AgentView {
         self.prompt.update(cx, |prompt, cx| prompt.set_held_color(held, cx));
         self.theme = theme;
         self.font_size_override = font_size_override;
-        // Every block is measured again at the new size.
-        self.scroller.update(cx, |scroller, cx| {
-            let count = scroller.item_count();
-            scroller.splice(0..count, count, cx);
-        });
+        // A theme changes colours only; a size may change the heights.
+        self.remeasure_if_changed(cx);
         cx.notify();
+    }
+
+    /// Measures every item again, keeping the view's place, when what they
+    /// measure at changed; otherwise nothing (decision 3).
+    fn remeasure_if_changed(&mut self, cx: &mut Context<Self>) {
+        let measure = measure_of(self.font_size_override, cx);
+        if measure != self.measure {
+            self.measure = measure;
+            self.scroller.update(cx, |scroller, cx| scroller.remeasure_all(cx));
+        }
     }
 
     /// The size the conversation and the prompt are drawn at: the

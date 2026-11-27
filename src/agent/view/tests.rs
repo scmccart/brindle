@@ -1025,3 +1025,215 @@ fn the_earlier_row_fetches_in_view_and_spins_until_the_page_comes() {
     assert!(matches!(earlier(&mut f), Earlier::Available { count: left } if left < count) || earlier(&mut f) == Earlier::None);
     assert!(!running(&mut f), "no agent works and nothing loads");
 }
+
+// OpenSpec change `agents-zone-focus-and-scroll`, task 6.1.
+
+/// What an item's height depends on besides its text and the width: the
+/// size and the two families, and nothing else.
+#[test]
+fn a_measure_differs_on_size_or_either_family_only() {
+    let measure = Measure { size: px(14.), ui_family: "Inter".into(), code_family: "Mono".into() };
+    assert_eq!(measure.clone(), Measure { size: px(14.), ui_family: "Inter".into(), code_family: "Mono".into() });
+    assert_ne!(measure, Measure { size: px(15.), ..measure.clone() });
+    assert_ne!(measure, Measure { ui_family: "Other".into(), ..measure.clone() });
+    assert_ne!(measure, Measure { code_family: "Other".into(), ..measure.clone() });
+}
+
+/// A view in an 800×500 zone (`SplitHost`, unsplit), its conversation ten
+/// long single-paragraph agent messages, each one tall list item.
+fn tall_view() -> (Zone, Entity<AgentView>, &'static mut VisualTestContext) {
+    let mut app = app();
+    let mut zone = Zone::new(None, &mut app);
+    let agent = zone.agent.clone();
+    let (host, cx) = app.add_window_view(|window, cx| {
+        let view = cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx));
+        SplitHost { view, split: false }
+    });
+    let cx: &'static mut VisualTestContext = Box::leak(Box::new(cx.clone()));
+    let mut events = vec![ready(), added(1, user("go"))];
+    for n in 0..10u64 {
+        let text = format!("{n} {}", "word ".repeat(600));
+        events.push(added(n + 2, crate::agent::test_support::agent(&text)));
+    }
+    events.push(ended(StopReason::EndTurn));
+    zone.feed(&events);
+    settle(cx);
+    let view = host.read_with(cx, |host, _| host.view.clone());
+    (zone, view, cx)
+}
+
+/// Pages up from the end until an item's middle is at the view's top.
+fn away_in_an_item(view: &Entity<AgentView>, cx: &mut VisualTestContext) -> gpui::ListOffset {
+    for _ in 0..10 {
+        view.update(cx, |view, cx| view.page(PageDirection::Up, cx));
+        cx.run_until_parked();
+        let top = view.read_with(cx, |view, cx| view.scroller.read(cx).scroll_top());
+        if top.offset_in_item > px(0.) && top.item_ix > 2 {
+            return top;
+        }
+    }
+    panic!("no item's middle reached the top");
+}
+
+/// The item at the view's top: its index, where it is drawn and how far
+/// into it the view starts, as a fraction of its height.
+fn top_item(view: &Entity<AgentView>, cx: &mut VisualTestContext) -> (usize, gpui::Bounds<Pixels>, f32) {
+    let viewport = cx.debug_bounds("message-scroller").expect("the scroller is drawn");
+    view.read_with(cx, |view, cx| {
+        let scroller = view.scroller.read(cx);
+        let ix = scroller.scroll_top().item_ix;
+        let bounds = scroller.item_bounds(ix).expect("the top item is drawn");
+        (ix, bounds, f32::from(viewport.top() - bounds.top()) / f32::from(bounds.size.height))
+    })
+}
+
+/// The spec's "A config reload while reading back": a theme change at the
+/// same size leaves the view where it is.
+#[test]
+fn a_reload_with_the_same_size_leaves_the_view_where_it_is() {
+    let (_zone, view, cx) = tall_view();
+    let before = away_in_an_item(&view, cx);
+    let dark = crate::theme::builtin_theme("brindle-dark").expect("a built-in");
+    view.update(cx, |view, cx| view.set_profile(dark, None, cx));
+    cx.run_until_parked();
+    let after = view.read_with(cx, |view, cx| view.scroller.read(cx).scroll_top());
+    assert_eq!((after.item_ix, after.offset_in_item), (before.item_ix, before.offset_in_item));
+}
+
+/// The spec's "A zoom while reading back": the item at the top stays at
+/// the same fraction of its new height, and a page up moves the view by a
+/// page through items above measured at the new size, not the old.
+#[test]
+fn a_zoom_remeasures_and_keeps_the_top_entry() {
+    let (_zone, view, cx) = tall_view();
+    away_in_an_item(&view, cx);
+    let (ix, _, fraction) = top_item(&view, cx);
+    cx.update(|_, cx| gpui::BorrowAppContext::update_global::<Settings, _>(cx, |settings, _| settings.zoom += 6.));
+    cx.run_until_parked();
+    let (after, bounds, zoomed) = top_item(&view, cx);
+    assert_eq!(after, ix, "the same entry at the top");
+    assert!((zoomed - fraction).abs() < 0.01, "at {zoomed} of its height, {fraction} before the zoom");
+    let viewport = cx.debug_bounds("message-scroller").expect("drawn");
+    let page = f32::from(viewport.size.height) - 24.;
+    view.update(cx, |view, cx| view.page(PageDirection::Up, cx));
+    cx.run_until_parked();
+    let moved = view.read_with(cx, |view, cx| view.scroller.read(cx).item_bounds(ix)).expect("still in view");
+    assert!(
+        (f32::from(moved.top() - bounds.top()) - page).abs() < 1.,
+        "a page up moved the entry from {:?} to {:?}, not by {page}",
+        bounds.top(),
+        moved.top()
+    );
+}
+
+/// The spec's "Reading a code block while it streams": away with a growing
+/// agent part's middle at the top, more lines arrive and its top stays.
+#[test]
+fn a_streaming_fence_at_the_top_keeps_its_lines() {
+    let mut app = app();
+    let mut zone = Zone::new(None, &mut app);
+    let agent = zone.agent.clone();
+    let (host, cx) = app.add_window_view(|window, cx| {
+        let view = cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx));
+        SplitHost { view, split: false }
+    });
+    let cx: &'static mut VisualTestContext = Box::leak(Box::new(cx.clone()));
+    let lines = |from: usize, to: usize| (from..to).map(|n| format!("line {n}\n")).collect::<String>();
+    zone.feed(&[
+        ready(),
+        added(1, user("go")),
+        working(),
+        added(2, crate::agent::test_support::agent(&format!("```\n{}", lines(0, 80)))),
+    ]);
+    settle(cx);
+    let view = host.read_with(cx, |host, _| host.view.clone());
+    // Up into the fence, the conversation's last block.
+    let fence = view.read_with(cx, |view, cx| view.agent.read(cx).model().blocks().len() - 1);
+    let mut top = None;
+    for _ in 0..10 {
+        view.update(cx, |view, cx| view.page(PageDirection::Up, cx));
+        cx.run_until_parked();
+        let at = view.read_with(cx, |view, cx| view.scroller.read(cx).scroll_top());
+        if at.item_ix == fence && at.offset_in_item > px(0.) {
+            top = Some(at);
+            break;
+        }
+    }
+    assert!(top.is_some(), "the fence's middle never reached the top");
+    let (ix, before, _) = top_item(&view, cx);
+    zone.feed(&[Event::Appended { id: EntryId(2), text: lines(80, 120) }]);
+    settle(cx);
+    let (after_ix, after, _) = top_item(&view, cx);
+    assert_eq!((after_ix, after.top()), (ix, before.top()), "the fence's lines in view stayed put");
+    assert!(after.size.height > before.size.height, "it grew");
+}
+
+/// A view that its host can stop drawing, as a hidden tab's zone.
+struct HideHost {
+    view: Entity<AgentView>,
+    shown: bool,
+}
+
+impl Render for HideHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let root = div().w(px(800.)).h(px(500.)).flex().flex_col();
+        if self.shown { root.child(self.view.clone()) } else { root }
+    }
+}
+
+/// The spec's "A page that arrives in a hidden tab" (E-4): a short page
+/// shows the Earlier row in view at the end, so a fetch is asked; the view
+/// stops being drawn, the page arrives, and no other page is asked until
+/// a frame shows the row in view again.
+#[test]
+fn a_page_that_arrives_in_a_hidden_zone_asks_for_no_other() {
+    use crate::agent::transcript::{PAGE_BYTES, Transcript};
+    let mut app = app();
+    let mut zone = Zone::new(None, &mut app);
+    let agent = zone.agent.clone();
+    let (host, cx) = app.add_window_view(|window, cx| {
+        let view = cx.new(|cx| AgentView::new(agent, Theme::default(), None, window, cx));
+        HideHost { view, shown: true }
+    });
+    let cx: &'static mut VisualTestContext = Box::leak(Box::new(cx.clone()));
+    // Thoughts, each closed once another follows: a page of them is a few
+    // short rows, so the Earlier row is in view at the end.
+    let mut server = Transcript::new();
+    let mut events = vec![ready(), added(1, user("go"))];
+    for n in 0..40u64 {
+        events.push(added(n + 2, Entry::Thought { text: format!("{n} {}", "x".repeat(100 * 1024)) }));
+    }
+    events.push(ended(StopReason::EndTurn));
+    for event in &events {
+        server.apply(event).unwrap();
+    }
+    zone.sink.replay(true);
+    zone.sink.transcript(server.page(PAGE_BYTES).iter().map(Event::to_value).collect()).unwrap();
+    zone.sink.replay(false);
+    settle(cx);
+    let fetches = |zone: &Zone| zone.calls.borrow().iter().filter(|call| matches!(call, Call::Fetch(..))).count();
+    assert_eq!(fetches(&zone), 1, "the row in view at the end asks: {:?}", zone.calls.borrow());
+    let request = zone.last_request();
+
+    let host = host.clone();
+    let set_shown = move |shown: bool, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            host.update(cx, |host, cx| {
+                host.shown = shown;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+    };
+    set_shown(false, cx);
+    let window = zone.shared.lock().transcript().window().expect("paged");
+    let fetched = server.fetch(window.from, PAGE_BYTES);
+    zone.sink.page(request, fetched.events.iter().map(Event::to_value).collect(), Some(fetched.more)).unwrap();
+    zone.sink.reply(request, Ok(()));
+    settle(cx);
+    assert_eq!(fetches(&zone), 1, "a hidden zone asks for no other page: {:?}", zone.calls.borrow());
+
+    set_shown(true, cx);
+    settle(cx);
+    assert_eq!(fetches(&zone), 2, "shown with the row in view, it asks again");
+}
