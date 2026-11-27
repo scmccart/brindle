@@ -21,13 +21,36 @@
 //! before the owner's, shown while the owner says so
 //! ([`MessageScroller::show_top_row`]) and rendered by the owner's
 //! `render_top` ([`MessageScroller::with_top_row`]); the owner's indices
-//! don't count it. Items spliced in at the owner's start while the row is
-//! the first item in view re-anchor the view on the item that was first,
-//! which moves it by at most the row's height. GPUI's list draws its top
-//! padding above whichever item is at its scroll position, not above its
-//! first item, so the row can't be drawn there. Whether the row was in view
-//! in the last frame is [`MessageScroller::top_row_in_view`], and a change
-//! of it calls the owner's [`MessageScroller::on_top_row_view`] callback.
+//! don't count it. GPUI's list draws its top padding above whichever item
+//! is at its scroll position, not above its first item, so the row can't
+//! be drawn there. Whether the row was in view in the last frame is
+//! [`MessageScroller::top_row_in_view`], and a change of it calls the
+//! owner's [`MessageScroller::on_top_row_view`] callback.
+//!
+//! Where the view is, as items change (OpenSpec change
+//! `agents-zone-focus-and-scroll`, decision 2), in list indices (the top
+//! row, while shown, is item 0):
+//! 1. Following the end, the list keeps no position and lays out from the
+//!    bottom: any splice or remeasure keeps the end in view.
+//! 2. Away, a splice wholly before the item at the top moves its index by
+//!    the change in count and keeps its offset.
+//! 3. Away, a splice wholly after it leaves it.
+//! 4. Away, a splice that replaces it keeps its index while that is among
+//!    the new items, else takes the last new one, and keeps the offset, so
+//!    an item growing at the top keeps its lines in view.
+//! 5. Away, a splice that removes it puts the next item at the top, whole.
+//! 6. An insert at the owner's start leaves whether the top row is in view
+//!    to the next frame drawn. Away with the row the first item in view,
+//!    the item that was first goes to the view's top (moving by at most the
+//!    row's height), the row and the new items above it.
+//! 7. An item at the top that shrank to its offset or less gives the top to
+//!    the next item, once a frame has measured it.
+//! 8. [`MessageScroller::remeasure_all`] measures every item again; away,
+//!    the item at the top stays there at the same fraction of its height,
+//!    once a frame has measured it.
+//!
+//! Rules 2 to 5 are [`top_after_splice`], 7 and 8 [`settle_anchor`] (a
+//! settle that moves the view draws one more frame), 6 [`inserts_at_start`].
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -109,6 +132,84 @@ pub fn page_scroll(dir: PageDirection, page: f32, above: Option<f32>, below: Opt
     }
 }
 
+/// The item at the view's top and how far into it the view starts, in
+/// pixels (a list index and offset, as gpui's `ListOffset`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Top {
+    pub item: usize,
+    pub offset: f32,
+}
+
+impl Top {
+    fn of(offset: ListOffset) -> Self {
+        Self { item: offset.item_ix, offset: f32::from(offset.offset_in_item) }
+    }
+
+    fn list_offset(self) -> ListOffset {
+        ListOffset { item_ix: self.item, offset_in_item: px(self.offset) }
+    }
+}
+
+/// Where the view's top goes when the items in `old` (list indices) are
+/// replaced by `count` items, while scrolled away (rules 2 to 5): a splice
+/// wholly before the top item moves its index by the change in count and
+/// keeps its offset, and one wholly after it leaves it; a splice that
+/// replaces the top item keeps its index while that is among the new items,
+/// else takes the last new item, and keeps the offset; one that removes it
+/// puts the item after the removed run at the top.
+pub fn top_after_splice(top: Top, old: Range<usize>, count: usize) -> Top {
+    if old.end <= top.item {
+        Top { item: top.item - old.len() + count, ..top }
+    } else if old.start > top.item {
+        top
+    } else if count > 0 {
+        Top { item: top.item.min(old.start + count - 1), ..top }
+    } else {
+        Top { item: old.start, offset: 0. }
+    }
+}
+
+/// What the view's top waits on until a frame has measured its item
+/// again: that the item didn't shrink under the offset (a splice that
+/// replaced it, rule 7), or the offset at the same fraction of the item's
+/// new height (every item measured again, rule 8).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Anchor {
+    Offset { item: usize, offset: f32 },
+    Fraction { item: usize, fraction: f32 },
+}
+
+impl Anchor {
+    fn item(self) -> usize {
+        match self {
+            Anchor::Offset { item, .. } | Anchor::Fraction { item, .. } => item,
+        }
+    }
+
+    fn with_item(self, item: usize) -> Self {
+        match self {
+            Anchor::Offset { offset, .. } => Anchor::Offset { item, offset },
+            Anchor::Fraction { fraction, .. } => Anchor::Fraction { item, fraction },
+        }
+    }
+}
+
+/// The top once the anchor's item measures `height`: the item after it
+/// when it shrank to its offset or less, the fraction's offset in it, or
+/// nothing to change.
+pub fn settle_anchor(anchor: Anchor, height: f32) -> Option<Top> {
+    match anchor {
+        Anchor::Offset { item, offset } => (height <= offset).then_some(Top { item: item + 1, offset: 0. }),
+        Anchor::Fraction { item, fraction } => Some(Top { item, offset: fraction * height }),
+    }
+}
+
+/// Whether a splice of the owner's items `old` by `count` inserts items at
+/// the owner's start (rule 6): it starts at the first item and adds some.
+pub fn inserts_at_start(old: &Range<usize>, count: usize) -> bool {
+    old.start == 0 && count > old.len()
+}
+
 type RenderItem = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement;
 type RenderTop = dyn FnMut(&mut Window, &mut App) -> AnyElement;
 type TopRowView = dyn Fn(bool, &mut App);
@@ -136,6 +237,9 @@ pub struct MessageScroller {
     /// Whether the top row was in view in the last frame.
     top_in_view: bool,
     on_top_row_view: Option<Rc<TopRowView>>,
+    /// What the view's top waits on from the next frame (rules 7 and 8),
+    /// while scrolled away.
+    anchor: Option<Anchor>,
 }
 
 /// How far beyond the view items are laid out ahead of a scroll.
@@ -169,6 +273,7 @@ impl MessageScroller {
             top_shown: false,
             top_in_view: false,
             on_top_row_view: None,
+            anchor: None,
         }
     }
 
@@ -201,9 +306,9 @@ impl MessageScroller {
             return;
         }
         if shown {
-            self.state.splice(0..0, 1);
+            self.splice_list(0..0, 1);
         } else {
-            self.state.splice(0..1, 0);
+            self.splice_list(0..1, 0);
             self.top_in_view = false;
         }
         self.top_shown = shown;
@@ -211,17 +316,42 @@ impl MessageScroller {
     }
 
     /// The top row changed (its height may have): it is measured again,
-    /// the view kept where it was.
+    /// the view kept where it was (rule 4).
     pub fn refresh_top_row(&mut self, cx: &mut Context<Self>) {
         if !self.top_shown {
             return;
         }
-        let top = self.state.logical_scroll_top();
-        self.state.splice(0..1, 1);
-        if self.follow == Follow::Away && top.item_ix == 0 {
-            self.state.scroll_to(top);
-        }
+        self.splice_list(0..1, 1);
         cx.notify();
+    }
+
+    /// The list's items `old` replaced by `count`, the view's top kept by
+    /// rules 2 to 5 while scrolled away (gpui's own rewrite of it, which
+    /// puts a replaced top item's start at the top, is never relied on).
+    /// A replaced top item waits on the next frame for rule 7; a pending
+    /// anchor follows its item.
+    fn splice_list(&mut self, old: Range<usize>, count: usize) {
+        let was = Top::of(self.state.logical_scroll_top());
+        self.state.splice(old.clone(), count);
+        if self.follow == Follow::AtEnd {
+            self.anchor = None;
+            return;
+        }
+        let top = top_after_splice(was, old.clone(), count);
+        self.state.scroll_to(top.list_offset());
+        let replaced = old.contains(&was.item);
+        self.anchor = match (replaced, count > 0, self.anchor) {
+            // Every item measured again, and this one replaced once more:
+            // still the fraction of its height last drawn.
+            (true, true, Some(anchor @ Anchor::Fraction { .. })) if anchor.item() == was.item => {
+                Some(anchor.with_item(top.item))
+            }
+            (true, true, _) => Some(Anchor::Offset { item: top.item, offset: top.offset }),
+            // The top item removed: the next is at the top, whole.
+            (true, false, _) => None,
+            (false, _, Some(anchor)) if anchor.item() == was.item => Some(anchor.with_item(top.item)),
+            (false, _, Some(_) | None) => None,
+        };
     }
 
     /// Whether the top row was in view in the last frame.
@@ -229,22 +359,74 @@ impl MessageScroller {
         self.top_in_view
     }
 
-    /// The items in `old` were replaced by `count` items (an item that
-    /// changed is replaced by itself, so it is measured again). Items
-    /// inserted at the start while the top row is the first item in view
-    /// put the item that was first at the view's top (it moves up by what
-    /// showed of the row), so the inserted items and the row are above.
+    /// The owner's items in `old` were replaced by `count` items (an item
+    /// that changed is replaced by itself, so it is measured again), the
+    /// view kept by the module's rules. Items inserted at the start while
+    /// the top row is the first item in view put the item that was first at
+    /// the view's top (it moves up by what showed of the row), so the
+    /// inserted items and the row are above. Any insert at the start leaves
+    /// whether the row is in view to the next frame (rule 6).
     pub fn splice(&mut self, old: Range<usize>, count: usize, cx: &mut Context<Self>) {
         let top = self.state.logical_scroll_top();
-        let anchor = self.top_shown && self.follow == Follow::Away && top.item_ix == 0 && old == (0..0) && count > 0;
-        self.state.splice(self.list_ix(old.start)..self.list_ix(old.end), count);
-        if anchor {
+        let row_first = self.top_shown && self.follow == Follow::Away && top.item_ix == 0 && old == (0..0) && count > 0;
+        if row_first {
+            self.state.splice(self.list_ix(0)..self.list_ix(0), count);
             self.state.scroll_to(ListOffset { item_ix: self.list_ix(count), offset_in_item: px(0.) });
-            // The row is above the view now; the next frame says so again
-            // only if it shows.
+            self.anchor = None;
+        } else {
+            self.splice_list(self.list_ix(old.start)..self.list_ix(old.end), count);
+        }
+        if inserts_at_start(&old, count) {
             self.top_in_view = false;
         }
         cx.notify();
+    }
+
+    /// Every item, the top row included, measured again (rule 8): their
+    /// heights changed with something only the owner knows (a text size, a
+    /// font). Scrolled away, the item at the top stays there at the same
+    /// fraction of its height once the next frame has measured it; at the
+    /// end, the end stays in view.
+    pub fn remeasure_all(&mut self, cx: &mut Context<Self>) {
+        let count = self.state.item_count();
+        let was = Top::of(self.state.logical_scroll_top());
+        self.state.splice(0..count, count);
+        if self.follow == Follow::Away {
+            let drawn = self.drawn.borrow().items.iter().find(|(ix, _)| *ix == was.item).map(|(_, b)| f32::from(b.size.height));
+            self.state.scroll_to(was.list_offset());
+            self.anchor = Some(match drawn {
+                Some(height) if height > 0. => Anchor::Fraction { item: was.item, fraction: was.offset / height },
+                // Not drawn in the last frame: its offset, kept.
+                Some(_) | None => Anchor::Offset { item: was.item, offset: was.offset },
+            });
+        } else {
+            self.anchor = None;
+        }
+        cx.notify();
+    }
+
+    /// After a frame: the pending anchor, settled against the height its
+    /// item was drawn at. A settle that moves the view draws again.
+    fn settle(&mut self, cx: &mut Context<Self>) {
+        let Some(anchor) = self.anchor.take() else { return };
+        if self.follow == Follow::AtEnd {
+            return;
+        }
+        let now = Top::of(self.state.logical_scroll_top());
+        if now.item != anchor.item() {
+            return;
+        }
+        let height = self.drawn.borrow().items.iter().find(|(ix, _)| *ix == now.item).map(|(_, b)| f32::from(b.size.height));
+        let Some(height) = height else { return };
+        // A replaced item is checked at the offset the view is at now.
+        let anchor = match anchor {
+            Anchor::Offset { item, .. } => Anchor::Offset { item, offset: now.offset },
+            fraction @ Anchor::Fraction { .. } => fraction,
+        };
+        if let Some(top) = settle_anchor(anchor, height).filter(|top| *top != now) {
+            self.state.scroll_to(top.list_offset());
+            cx.notify();
+        }
     }
 
     /// Every item replaced by `count` new ones, scrolled to the end.
@@ -252,6 +434,7 @@ impl MessageScroller {
         self.state.reset(self.list_ix(count));
         self.follow = Follow::AtEnd;
         self.top_in_view = false;
+        self.anchor = None;
         cx.notify();
     }
 
@@ -273,6 +456,7 @@ impl MessageScroller {
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
         self.state.scroll_to(ListOffset { item_ix: self.state.item_count(), offset_in_item: px(0.) });
         self.follow = Follow::AtEnd;
+        self.anchor = None;
         cx.notify();
     }
 
@@ -349,6 +533,7 @@ impl Render for MessageScroller {
         let top_shown = self.top_shown;
         let top_was_in_view = self.top_in_view;
         let on_top_row_view = self.on_top_row_view.clone();
+        let settling = self.anchor.is_some();
         div()
             .relative()
             .size_full()
@@ -381,6 +566,12 @@ impl Render for MessageScroller {
                         }
                         if follow.after_draw(last_bottom, f32::from(bounds.bottom())) != follow {
                             after_draw.update(cx, |this, cx| this.scroll_to_end(cx)).ok();
+                        } else if settling {
+                            // After the frame, so its notify draws another.
+                            let settle = after_draw.clone();
+                            cx.defer(move |cx| {
+                                settle.update(cx, |this, cx| this.settle(cx)).ok();
+                            });
                         }
                     },
                     |_, _, _, _| {},
@@ -648,6 +839,153 @@ mod tests {
             assert_eq!(item_bounds(&scroller, 0, cx), None);
             assert!(!scroller.read_with(cx, |s, _| s.top_row_in_view()));
         }
+    }
+
+    fn top(item: usize, offset: f32) -> Top {
+        Top { item, offset }
+    }
+
+    /// Rules 2 to 5, in list indices (`top_after_splice`).
+    #[test]
+    fn the_top_after_a_splice() {
+        // a_splice_before_the_top_shifts_it_and_keeps_its_offset
+        assert_eq!(top_after_splice(top(5, 12.), 1..3, 4), top(7, 12.));
+        assert_eq!(top_after_splice(top(5, 12.), 5..5, 2), top(7, 12.), "an insert at the top's index goes before it");
+        assert_eq!(top_after_splice(top(5, 12.), 0..2, 0), top(3, 12.));
+        // a_splice_after_the_top_leaves_it
+        assert_eq!(top_after_splice(top(5, 12.), 6..8, 1), top(5, 12.));
+        assert_eq!(top_after_splice(top(5, 12.), 9..9, 3), top(5, 12.));
+        // a_splice_that_replaces_the_top_keeps_its_item_and_offset
+        assert_eq!(top_after_splice(top(5, 12.), 5..6, 1), top(5, 12.));
+        assert_eq!(top_after_splice(top(5, 12.), 3..8, 6), top(5, 12.));
+        assert_eq!(top_after_splice(top(0, 12.), 0..1, 1), top(0, 12.), "the top row replaced by itself");
+        // a_splice_that_shortens_past_the_top_keeps_the_last_new_item
+        assert_eq!(top_after_splice(top(6, 12.), 3..8, 2), top(4, 12.));
+        // a_splice_that_removes_the_top_puts_the_next_item_at_the_top
+        assert_eq!(top_after_splice(top(5, 12.), 4..6, 0), top(4, 0.));
+        assert_eq!(top_after_splice(top(0, 12.), 0..1, 0), top(0, 0.));
+    }
+
+    /// Rules 7 and 8 (`settle_anchor`).
+    #[test]
+    fn settling_an_anchor() {
+        // an_item_that_grew_needs_no_settling
+        assert_eq!(super::settle_anchor(Anchor::Offset { item: 3, offset: 200. }, 600.), None);
+        assert_eq!(super::settle_anchor(Anchor::Offset { item: 3, offset: 200. }, 200.5), None);
+        // an_item_shrunk_under_its_offset_gives_the_top_to_the_next_item
+        assert_eq!(super::settle_anchor(Anchor::Offset { item: 3, offset: 400. }, 100.), Some(top(4, 0.)));
+        assert_eq!(super::settle_anchor(Anchor::Offset { item: 3, offset: 100. }, 100.), Some(top(4, 0.)));
+        // a_fraction_settles_at_the_new_height
+        assert_eq!(super::settle_anchor(Anchor::Fraction { item: 5, fraction: 0.4 }, 200.), Some(top(5, 80.)));
+        assert_eq!(super::settle_anchor(Anchor::Fraction { item: 5, fraction: 0.4 }, 50.), Some(top(5, 20.)));
+    }
+
+    /// Rule 6, in the owner's indices (`inserts_at_start`).
+    #[test]
+    fn an_insert_at_the_start() {
+        // only_an_insert_at_the_owners_first_item_counts
+        assert!(super::inserts_at_start(&(0..0), 3));
+        assert!(super::inserts_at_start(&(0..2), 5), "a replay that adds items");
+        assert!(!super::inserts_at_start(&(0..3), 1), "a replay that shortens");
+        assert!(!super::inserts_at_start(&(0..1), 1), "the first item replaced by itself");
+        assert!(!super::inserts_at_start(&(4..4), 2), "an insert further on");
+        assert!(!super::inserts_at_start(&(0..0), 0));
+    }
+
+    /// Twenty 50px items with item 3 `tall`, scrolled `into` px into item 3.
+    fn away_in_a_tall_item(tall: f32, into: f32) -> (Entity<MessageScroller>, Rc<RefCell<Vec<f32>>>, &'static mut VisualTestContext) {
+        let mut items = vec![50.; 20];
+        items[3] = tall;
+        let heights = Rc::new(RefCell::new(items));
+        let (scroller, cx) = host(heights.clone());
+        scroll_to(&scroller, ListOffset { item_ix: 3, offset_in_item: px(into) }, cx);
+        (scroller, heights, cx)
+    }
+
+    /// The spec's "The item at the top grows" (rule 4): scrolled 200px into
+    /// item 3, which is replaced by a taller one; its lines in view stay.
+    #[test]
+    fn a_top_item_that_grows_while_away_keeps_its_lines() {
+        let (scroller, heights, cx) = away_in_a_tall_item(400., 200.);
+        let before = item_bounds(&scroller, 3, cx).expect("item 3 at the top");
+        assert_eq!(f32::from(before.top()), -200.);
+        heights.borrow_mut()[3] = 600.;
+        cx.update(|_, cx| scroller.update(cx, |s, cx| s.splice(3..4, 1, cx)));
+        cx.run_until_parked();
+        let after = item_bounds(&scroller, 3, cx).expect("item 3 at the top");
+        assert_eq!((f32::from(after.top()), f32::from(after.size.height)), (-200., 600.));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::Away);
+    }
+
+    /// The spec's "The item at the top shrinks above the view" (rule 7):
+    /// 400px into a 600px item, replaced by a 100px one; once the frames
+    /// settle, the item after it is at the view's top.
+    #[test]
+    fn a_top_item_that_shrinks_under_the_view_gives_the_top_to_the_next() {
+        let (scroller, heights, cx) = away_in_a_tall_item(600., 400.);
+        heights.borrow_mut()[3] = 100.;
+        cx.update(|_, cx| scroller.update(cx, |s, cx| s.splice(3..4, 1, cx)));
+        cx.run_until_parked();
+        let next = item_bounds(&scroller, 4, cx).expect("item 4 in view");
+        assert_eq!(f32::from(next.top()), 0.);
+        let top = scroller.read_with(cx, |s, _| s.scroll_top());
+        assert_eq!((top.item_ix, top.offset_in_item), (4, px(0.)));
+    }
+
+    /// The spec's "Items inserted at the start" (rule 6): following the end
+    /// with the top row in view, a prepend makes the row's fact unknown
+    /// until a frame shows it again.
+    #[test]
+    fn a_prepend_while_following_clears_the_top_row_until_a_frame_shows_it() {
+        let heights = Rc::new(RefCell::new(vec![50.; 3]));
+        let (scroller, seen, cx) = host_with_top(heights.clone());
+        assert!(scroller.read_with(cx, |s, _| s.top_row_in_view()), "a short list shows its row");
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::AtEnd);
+        heights.borrow_mut().insert(0, 50.);
+        // Read before the test context draws the frame the splice asks for.
+        let in_view = cx.update(|_, cx| {
+            scroller.update(cx, |s, cx| {
+                s.splice(0..0, 1, cx);
+                s.top_row_in_view()
+            })
+        });
+        assert!(!in_view, "unknown until a frame shows it");
+        cx.run_until_parked();
+        assert!(scroller.read_with(cx, |s, _| s.top_row_in_view()), "the frame shows it again");
+        assert_eq!(*seen.borrow(), [true, true], "the owner hears it come into view again");
+    }
+
+    /// The spec's "Every item measured again" (rule 8): 40% into item 5,
+    /// every height doubled and every item measured again; item 5 is at the
+    /// top at the same fraction, and an item above has its new height once
+    /// scrolled to.
+    #[test]
+    fn remeasuring_every_item_keeps_the_top_item_at_its_fraction() {
+        let heights = Rc::new(RefCell::new(vec![100.; 20]));
+        let (scroller, cx) = host(heights.clone());
+        scroll_to(&scroller, ListOffset { item_ix: 5, offset_in_item: px(40.) }, cx);
+        assert_eq!(item_bounds(&scroller, 5, cx).map(|b| f32::from(b.top())), Some(-40.));
+        heights.borrow_mut().iter_mut().for_each(|h| *h *= 2.);
+        cx.update(|_, cx| scroller.update(cx, |s, cx| s.remeasure_all(cx)));
+        cx.run_until_parked();
+        let fifth = item_bounds(&scroller, 5, cx).expect("item 5 at the top");
+        assert_eq!((f32::from(fifth.top()), f32::from(fifth.size.height)), (-80., 200.));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::Away);
+        scroll_to(&scroller, ListOffset { item_ix: 1, offset_in_item: px(0.) }, cx);
+        assert_eq!(item_bounds(&scroller, 1, cx).map(|b| f32::from(b.size.height)), Some(200.));
+    }
+
+    /// Rule 8 while following: the end stays in view.
+    #[test]
+    fn remeasuring_while_following_keeps_the_end() {
+        let heights = Rc::new(RefCell::new(vec![50.; 20]));
+        let (scroller, cx) = host(heights.clone());
+        heights.borrow_mut().iter_mut().for_each(|h| *h *= 2.);
+        cx.update(|_, cx| scroller.update(cx, |s, cx| s.remeasure_all(cx)));
+        cx.run_until_parked();
+        let last = item_bounds(&scroller, 19, cx).expect("the end in view");
+        assert_eq!((f32::from(last.bottom()), f32::from(last.size.height)), (300., 100.));
+        assert_eq!(scroller.read_with(cx, |s, _| s.follow()), Follow::AtEnd);
     }
 
     /// Task 5.2: a page up from the first item's top brings the top row
