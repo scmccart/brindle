@@ -175,3 +175,9 @@ None: no state, wire or config changes. A build with this change behaves the sam
 ## Open Questions
 
 1. **If the one-frame settle of rules 7 and 8 shows as a flicker in the manual zoom check:** measure the top item in the scroller's own prepaint before the list lays out (a second `layout_as_root` of that one item at the list's width) and pass the settled offset to the list in the same frame. Recommendation: ship the post-frame settle, and take this only if the manual check shows the flicker.
+
+## As built (2026-11-27)
+
+Built on `fix/agents-client-state` (PR #153) at `dd43e7c`; task 1.1 lists the sites. Numbered flags are decisions taken while building that the design didn't settle.
+
+1. **A respawn's splices (decision 5).** `ChatModel::respawning` used to call `life_event` (whose `finish` now appends the working row's splice) and then append the thoughts' splices, which would have put a block splice after the row's. It now gathers the rows' and thoughts' splices and calls `finish` once, so the row's splice is still the last. A respawn always removes the row (the phase goes to `Connecting`), so the old order was harmless in practice; the change keeps decision 5's rule ("the row's splice ends the absorb's") true for every `Absorbed`.
