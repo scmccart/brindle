@@ -364,7 +364,8 @@ rule, not a convenience.
     the last frame showed (the pure `reveal_plan`), following the end again
     when that shows the end; an item drawn whole stays put. An item the
     last frame didn't draw takes a second frame when it is below the view,
-    since gpui knows its height only once it is drawn.
+    since gpui knows its height only once it is drawn (the pure
+    `end_at_bottom`).
     `on_items_view(callback)` tells the owner its items with any part in
     view, after each frame that changed them (not while a reveal is still
     moving the view).

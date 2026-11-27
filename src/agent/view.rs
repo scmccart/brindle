@@ -81,6 +81,13 @@ pub fn link_gesture_flip(was: bool, modifiers: &Modifiers) -> Option<bool> {
     (now != was).then_some(now)
 }
 
+/// Whether a focused permission button gives focus to the prompt after a
+/// frame whose items in view are `in_view`: its block (`None` when the
+/// request is no longer pending) isn't among them (decision 4).
+pub fn gives_back(block: Option<usize>, in_view: &Range<usize>) -> bool {
+    block.is_none_or(|block| !in_view.contains(&block))
+}
+
 /// What an agent zone does with a link pressed with the gesture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkStep {
@@ -722,7 +729,7 @@ impl AgentView {
         let Some(focused) = window.focused(cx) else { return };
         let Some(entry) = self.permission_of(&focused) else { return };
         let block = self.agent.read(cx).model().permission_block(entry);
-        if block.is_none_or(|block| !in_view.contains(&block)) {
+        if gives_back(block, &in_view) {
             let prompt = self.prompt.read(cx).focus_handle(cx);
             window.focus(&prompt);
         }

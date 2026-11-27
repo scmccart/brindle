@@ -1096,6 +1096,19 @@ fn page_up(f: &mut Fixture) {
     f.settle();
 }
 
+/// Focus goes back to the prompt when the focused permission's block left
+/// the view, or the request is gone; it stays while any part shows.
+#[test]
+fn a_focused_permission_gives_back_only_out_of_view() {
+    assert!(!gives_back(Some(5), &(3..8)));
+    assert!(!gives_back(Some(3), &(3..8)), "the first in view");
+    assert!(!gives_back(Some(7), &(3..8)), "the last in view");
+    assert!(gives_back(Some(8), &(3..8)), "below");
+    assert!(gives_back(Some(2), &(3..8)), "above");
+    assert!(gives_back(Some(0), &(0..0)), "nothing in view");
+    assert!(gives_back(None, &(3..8)), "no longer pending");
+}
+
 /// The spec's "Tab to a permission below the view": away from the end, a
 /// request arrives below the view; Tab from the prompt focuses its first
 /// button and brings the block wholly into view, and enter answers it.

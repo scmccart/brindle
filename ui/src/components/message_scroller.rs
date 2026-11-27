@@ -240,6 +240,14 @@ pub fn reveal_plan(drawn: Option<(f32, f32)>, view: (f32, f32)) -> Reveal {
     }
 }
 
+/// How far up to scroll an item of height `item` drawn at the top of a
+/// view of height `view` so its end is at the view's bottom, or `None`
+/// when it fills the view (its top stays at the top).
+pub fn end_at_bottom(item: f32, view: f32) -> Option<f32> {
+    let room = view - item;
+    (room > 0.).then_some(room)
+}
+
 type RenderItem = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement;
 type RenderTop = dyn FnMut(&mut Window, &mut App) -> AnyElement;
 type TopRowView = dyn Fn(bool, &mut App);
@@ -618,12 +626,11 @@ impl MessageScroller {
             let drawn = self.drawn.borrow();
             (drawn.items.iter().find(|(i, _)| *i == list_ix).map(|(_, b)| *b), drawn.viewport)
         };
-        if let (Some(bounds), Some(viewport)) = (bounds, viewport) {
-            let room = viewport.size.height - bounds.size.height;
-            if room > px(0.) {
-                self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: viewport.top() - bounds.top() });
-                self.state.scroll_by(-room);
-            }
+        if let (Some(bounds), Some(viewport)) = (bounds, viewport)
+            && let Some(up) = end_at_bottom(f32::from(bounds.size.height), f32::from(viewport.size.height))
+        {
+            self.state.scroll_to(ListOffset { item_ix: list_ix, offset_in_item: viewport.top() - bounds.top() });
+            self.state.scroll_by(px(-up));
         }
         // A frame tells the owner what is in view now.
         cx.notify();
@@ -1151,6 +1158,13 @@ mod tests {
         assert_eq!(reveal_plan(Some((0., 50.)), (0., 300.)), Reveal::InView);
         assert_eq!(reveal_plan(Some((250., 300.)), (0., 300.)), Reveal::InView);
         assert_eq!(reveal_plan(Some((-0.4, 299.6)), (0., 300.)), Reveal::InView, "within half a pixel");
+    }
+
+    #[test]
+    fn a_revealed_item_at_the_top_moves_its_end_to_the_bottom_when_it_fits() {
+        assert_eq!(end_at_bottom(50., 300.), Some(250.));
+        assert_eq!(end_at_bottom(300., 300.), None, "it fills the view");
+        assert_eq!(end_at_bottom(400., 300.), None, "taller: its top stays");
     }
 
     #[test]
