@@ -45,7 +45,7 @@ Run e2e cases headless and outside Brindle's systemd scope: `systemd-run --user 
 
 ## 2. Shared contract: one `clean`
 
-- [ ] 2.1 Move `clean` from `remote-agent/src/acp/reduce.rs` to `brindle-transcript` (`transcript/src/lib.rs`, `pub fn clean`), unchanged:
+- [x] 2.1 Move `clean` from `remote-agent/src/acp/reduce.rs` to `brindle-transcript` (`transcript/src/lib.rs`, `pub fn clean`), unchanged:
   - Make `reduce.rs` import it.
   - Move its unit test, or add `clean_replaces_control_characters_but_line_ends_and_tabs` if it has none.
   - Verify with `cargo test -p brindle-transcript` and `cargo test -p brindle-remote-agent`. The reducer's transcript tests pass unchanged.

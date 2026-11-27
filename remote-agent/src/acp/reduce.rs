@@ -56,7 +56,7 @@ use brindle_transcript::{
     AgentState, Continuation, Conversation, Entry, EntryId, Event, LoginKind, LoginMethod,
     MAX_CHOICES, MAX_COMMANDS, MAX_OPTIONS, NoticeLevel, OptionCategory, OptionChoice,
     OptionControl, PermissionOption, PermissionOutcome, SessionOption, Slot, SlashCommand,
-    StopReason, TEXT_CHUNK, Transcript, TurnState, chunks,
+    StopReason, TEXT_CHUNK, Transcript, TurnState, chunks, clean,
 };
 use brindle_transcript::{
     CALL_LIMIT, DiffLine, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, Location, MAX_ITEMS,
@@ -3510,23 +3510,6 @@ fn placeholder(kind: ContentKind) -> &'static str {
         ContentKind::Resource => "[resource]",
         ContentKind::Unknown => "[content Brindle can't show]",
     }
-}
-
-/// `text` with every control character but `\n`, `\t` and a `\r` before
-/// `\n` (or at the end, where a chunk may have cut a `\r\n`) replaced by
-/// U+FFFD (decision 8).
-pub fn clean(text: &str) -> String {
-    let mut cleaned = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        let keep = match c {
-            '\n' | '\t' => true,
-            '\r' => chars.peek().is_none_or(|next| *next == '\n'),
-            other => !other.is_control(),
-        };
-        cleaned.push(if keep { c } else { '\u{FFFD}' });
-    }
-    cleaned
 }
 
 /// The agent's readable name (`agents-session-title` decision 4):
