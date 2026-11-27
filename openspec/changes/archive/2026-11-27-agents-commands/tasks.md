@@ -62,11 +62,11 @@ Each in `tests/e2e/cases/agent.rs`, registered in `tests/e2e/cases/mod.rs` with 
 - [x] 7.4 `agent-option-refused`: a second set while one is unanswered shows its reason in the dump's `--- config` line; the agent's error shows as a notice in the conversation.
 - [x] 7.5 `agent-option-restore`: quit and relaunch, and the restored zone shows the same commands and options without the agent sending them again.
 - [x] 7.5a `agent-option-continue` (decision 12): the agent exits and the dump shows no `--- option` or `--- commands` line and no completion on `/`; Continue brings them back, with a `Mode:` notice when the continued agent starts in another mode.
-- [ ] 7.6 Run the agent cases on Windows (one `windows-agent-*` case with the completion list, in `tests/e2e/cases/win.rs`) and in the archive jobs (the `agent-*` filter of `e2e-archive` and `windows-e2e-archive` picks the new cases up).
+- [x] 7.6 Run the agent cases on Windows (one `windows-agent-*` case with the completion list, in `tests/e2e/cases/win.rs`) and in the archive jobs (the `agent-*` filter of `e2e-archive` and `windows-e2e-archive` picks the new cases up). (#151: `windows-agent-command-completion` passed on windows-e2e, which had 72 passed and 0 failed; both archive jobs green.)
 
 ## 8. Docs and checks
 
 - [x] 8.1 Update `docs/code-map.md` (the agent zone, the reducer, client protocol 4's messages), `README.md`'s "Agent tabs" section (commands, options, the two actions), and `CLAUDE.md`'s dump description and action notes.
 - [x] 8.2 Tell `agents-acp-v2` what it inherits: add to its proposal the v2 mapping of design decision 3.
-- [ ] 8.3 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate agents-commands --strict`.
-- [ ] 8.4 Manual checks for the user, with `scripts/run-throwaway.sh` and a real agent profile: a pointer press on a suggestion row and on each footer item; a real agent's `/compact`; switching a real agent's mode and model and seeing it take effect in the next turn; IME composition in the prompt input while the list shows.
+- [x] 8.3 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate agents-commands --strict`. (Local: 2952 passed, the one failure relay.rs's timing flake `a_login_shell_that_takes_too_long_is_ended_and_reported`; clippy clean; self-tests pass; valid. The full e2e suite passed in #151's three CI shards.)
+- [x] 8.4 Manual checks for the user, with `scripts/run-throwaway.sh` and a real agent profile: a pointer press on a suggestion row and on each footer item; a real agent's `/compact`; switching a real agent's mode and model and seeing it take effect in the next turn; IME composition in the prompt input while the list shows.
