@@ -34,6 +34,7 @@
 //! |   21 | `AGENT_RESTART` | client → core | `req, session, command, args, env` (protocol 4)                |
 //! |   22 | `AGENT_LOGIN`   | client → core | `req, session, method` (protocol 4)                            |
 //! |   23 | `AGENT_FETCH`   | client → core | `req, session, before, max_bytes` (protocol 4)                 |
+//! |   24 | `AGENT_SET_OPTION` | client → core | `req, session, option, value` (protocol 4)                  |
 //! |   31 | `AGENT_LIST`    | client → core | `req, session, cursor?` (protocol 4)                           |
 //! |   64 | `AGENT_CHOOSE`  | client → core | `req, session, conversation?` (protocol 4)                     |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
@@ -160,6 +161,13 @@
 //!   page of its conversations in the session's directory, `cursor` being
 //!   an earlier reply's `next`; the core keeps no list. Only the client
 //!   that has the session attached may send either.
+//! - Options (OpenSpec change `agents-commands`, amending protocol 4
+//!   before it shipped): the agent's slash commands and session options
+//!   travel as transcript events. `AGENT_SET_OPTION` → `OK` or `ERROR`
+//!   asks a ready agent to set option `option` (an id the session's
+//!   options list) to `value` ([`OptionValue`]): `OK` means asked (or
+//!   already so), and the agent's answer arrives as transcript events.
+//!   Any client attached to the session may send it, during a turn too.
 //!
 //! A client below 4 isn't shown agent sessions, and is refused an `ATTACH`
 //! of one with an `ERROR` naming the session. Nothing else differs from
@@ -211,7 +219,9 @@ pub const MSG_AGENT_RESTART: u8 = 21;
 pub const MSG_AGENT_LOGIN: u8 = 22;
 /// Protocol 4.
 pub const MSG_AGENT_FETCH: u8 = 23;
-/// Protocol 4 (`agents-session-list`; 24 to 30 are kept for the changes
+/// Protocol 4 (`agents-commands`).
+pub const MSG_AGENT_SET_OPTION: u8 = 24;
+/// Protocol 4 (`agents-session-list`; 25 to 30 are kept for the changes
 /// planned before it).
 pub const MSG_AGENT_LIST: u8 = 31;
 /// Protocol 4 (`agents-session-list`): the first of the clients' second
@@ -629,6 +639,25 @@ pub struct AgentLogin {
     pub method: String,
 }
 
+/// `AGENT_SET_OPTION` (protocol 4, OpenSpec change `agents-commands`): set
+/// the session option whose id is `option` to `value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSetOption {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub option: String,
+    pub value: OptionValue,
+}
+
+/// The value an `AGENT_SET_OPTION` sets: one of a select option's choices,
+/// by its value, or a toggle's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OptionValue {
+    Choice { value: String },
+    Toggle { on: bool },
+}
+
 /// `AGENT_FETCH` (protocol 4): the entries before entry `before`, up to
 /// `max_bytes` of them (the core clamps it), answered by `AGENT_PAGE`s.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -918,6 +947,8 @@ pub enum ToCore {
     AgentList(AgentList),
     /// Protocol 4: end a choosing agent's wait.
     AgentChoose(AgentChoose),
+    /// Protocol 4: set one of the session's options.
+    AgentSetOption(AgentSetOption),
 }
 
 impl ToCore {
@@ -948,6 +979,7 @@ impl ToCore {
             Self::AgentFetch(m) => wire::json(MSG_AGENT_FETCH, m),
             Self::AgentList(m) => wire::json(MSG_AGENT_LIST, m),
             Self::AgentChoose(m) => wire::json(MSG_AGENT_CHOOSE, m),
+            Self::AgentSetOption(m) => wire::json(MSG_AGENT_SET_OPTION, m),
         }
     }
 
@@ -980,6 +1012,9 @@ impl ToCore {
             MSG_AGENT_FETCH => Self::AgentFetch(wire::from_json("AGENT_FETCH", frame)?),
             MSG_AGENT_LIST => Self::AgentList(wire::from_json("AGENT_LIST", frame)?),
             MSG_AGENT_CHOOSE => Self::AgentChoose(wire::from_json("AGENT_CHOOSE", frame)?),
+            MSG_AGENT_SET_OPTION => {
+                Self::AgentSetOption(wire::from_json("AGENT_SET_OPTION", frame)?)
+            }
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -1273,6 +1308,20 @@ pub(crate) mod samples {
                 session: 9,
                 conversation: None,
             }),
+            ToCore::AgentSetOption(AgentSetOption {
+                req: 23,
+                session: 9,
+                option: "model".into(),
+                value: OptionValue::Choice {
+                    value: "sonnet".into(),
+                },
+            }),
+            ToCore::AgentSetOption(AgentSetOption {
+                req: 24,
+                session: 9,
+                option: "fast".into(),
+                value: OptionValue::Toggle { on: true },
+            }),
             ToCore::SpawnAgent(SpawnAgent {
                 req: 23,
                 command: "fake-acp-agent".into(),
@@ -1469,7 +1518,8 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in (MSG_DATA..=MSG_AGENT_FETCH).chain([MSG_AGENT_LIST, MSG_AGENT_CHOOSE]) {
+        for expected in (MSG_DATA..=MSG_AGENT_SET_OPTION).chain([MSG_AGENT_LIST, MSG_AGENT_CHOOSE])
+        {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -1625,6 +1675,7 @@ mod tests {
             MSG_AGENT_LOGIN,
             MSG_AGENT_LIST,
             MSG_AGENT_CHOOSE,
+            MSG_AGENT_SET_OPTION,
             43,
             44,
             255,
@@ -1774,6 +1825,48 @@ mod tests {
         ] {
             let frame = Frame::new(MSG_AGENT_LOGIN, payload.to_vec()).unwrap();
             assert!(ToCore::decode(&frame).is_err());
+        }
+        // AGENT_SET_OPTION is type 24, its value tagged by kind; a missing
+        // field, a wrong type or an unknown kind doesn't decode.
+        let frame = ToCore::AgentSetOption(AgentSetOption {
+            req: 4,
+            session: 5,
+            option: "mode".into(),
+            value: OptionValue::Choice {
+                value: "plan".into(),
+            },
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.msg_type, 24);
+        assert_eq!(
+            frame.payload,
+            br#"{"req":4,"session":5,"option":"mode","value":{"kind":"choice","value":"plan"}}"#
+        );
+        let frame = ToCore::AgentSetOption(AgentSetOption {
+            req: 4,
+            session: 5,
+            option: "fast".into(),
+            value: OptionValue::Toggle { on: false },
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame.payload,
+            br#"{"req":4,"session":5,"option":"fast","value":{"kind":"toggle","on":false}}"#
+        );
+        for payload in [
+            &br#"{"req":4,"session":5,"option":"mode"}"#[..],
+            br#"{"req":4,"session":5,"value":{"kind":"toggle","on":true}}"#,
+            br#"{"session":5,"option":"m","value":{"kind":"toggle","on":true}}"#,
+            br#"{"req":4,"session":5,"option":7,"value":{"kind":"toggle","on":true}}"#,
+            br#"{"req":4,"session":5,"option":"m","value":{"kind":"toggle","on":"yes"}}"#,
+            br#"{"req":4,"session":5,"option":"m","value":{"kind":"choice"}}"#,
+            br#"{"req":4,"session":5,"option":"m","value":{"kind":"number","value":3}}"#,
+            br#"{"req":4,"session":5,"option":"m","value":"plan"}"#,
+        ] {
+            let frame = Frame::new(MSG_AGENT_SET_OPTION, payload.to_vec()).unwrap();
+            assert!(ToCore::decode(&frame).is_err(), "{payload:?}");
         }
         // A conversation without its id is refused.
         let frame = Frame::new(

@@ -314,6 +314,60 @@ fn conversation(rng: &mut XorShift) -> Conversation {
     }
 }
 
+fn short_text(rng: &mut XorShift) -> String {
+    (0..rng.below(6))
+        .map(|_| CHARS[rng.below(CHARS.len())])
+        .collect()
+}
+
+fn commands(rng: &mut XorShift) -> Vec<SlashCommand> {
+    (0..rng.below(4))
+        .map(|_| SlashCommand {
+            name: short_text(rng),
+            description: short_text(rng),
+            hint: rng.chance(2).then(|| short_text(rng)),
+        })
+        .collect()
+}
+
+pub(crate) fn session_option(rng: &mut XorShift) -> SessionOption {
+    let category = match rng.below(5) {
+        0 => OptionCategory::Mode,
+        1 => OptionCategory::Model,
+        2 => OptionCategory::ModelConfig,
+        3 => OptionCategory::ThoughtLevel,
+        _ => OptionCategory::Other {
+            name: short_text(rng),
+        },
+    };
+    let kind = if rng.chance(3) {
+        OptionControl::Toggle { on: rng.chance(2) }
+    } else {
+        OptionControl::Select {
+            current: short_text(rng),
+            choices: (0..rng.below(4))
+                .map(|_| OptionChoice {
+                    value: short_text(rng),
+                    name: short_text(rng),
+                    description: rng.chance(2).then(|| short_text(rng)),
+                    group: rng.chance(2).then(|| short_text(rng)),
+                })
+                .collect(),
+        }
+    };
+    SessionOption {
+        id: short_text(rng),
+        name: short_text(rng),
+        description: rng.chance(2).then(|| short_text(rng)),
+        category,
+        kind,
+    }
+}
+
+fn options(rng: &mut XorShift) -> Vec<SessionOption> {
+    (0..rng.below(4)).map(|_| session_option(rng)).collect()
+}
+
 fn tool_changed(rng: &mut XorShift, id: EntryId) -> Event {
     Event::ToolChanged {
         id,
@@ -334,7 +388,7 @@ fn tool_changed(rng: &mut XorShift, id: EntryId) -> Event {
 /// Any event, with ids near the log's, valid or not.
 fn event(rng: &mut XorShift, near: u64) -> Event {
     let id = EntryId(near.saturating_sub(3) + rng.below(6) as u64);
-    match rng.below(12) {
+    match rng.below(15) {
         0 => Event::Added {
             id,
             entry: entry(rng),
@@ -368,6 +422,12 @@ fn event(rng: &mut XorShift, near: u64) -> Event {
         8 => Event::Trimmed {
             through: id,
             dropped: rng.below(4) as u64,
+        },
+        12 => Event::Commands {
+            commands: commands(rng),
+        },
+        13 => Event::Options {
+            options: options(rng),
         },
         _ => Event::Window {
             from: id,
@@ -451,9 +511,15 @@ fn step(rng: &mut XorShift, transcript: &mut Transcript) -> Option<Event> {
             }
         }
         6 => Event::Queue { slot: slot(rng) },
-        7 => match rng.below(3) {
+        7 => match rng.below(5) {
             0 => Event::Turn { state: turn(rng) },
             1 => Event::Agent { state: agent(rng) },
+            2 => Event::Commands {
+                commands: commands(rng),
+            },
+            3 => Event::Options {
+                options: options(rng),
+            },
             _ => Event::Conversation {
                 conversation: conversation(rng),
             },
@@ -569,6 +635,21 @@ const WORDS: &[&str] = &[
     "more",
     "cut",
     "content",
+    "commands",
+    "hint",
+    "category",
+    "control",
+    "select",
+    "toggle",
+    "current",
+    "choices",
+    "value",
+    "group",
+    "on",
+    "mode",
+    "model",
+    "model_config",
+    "thought_level",
 ];
 
 fn random_json(rng: &mut XorShift, depth: usize) -> Value {
@@ -767,6 +848,7 @@ fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
     let mut rng = XorShift::new(0x7e57_0003);
     let mut paged = 0usize;
     let mut tools = 0usize;
+    let mut listed = 0usize;
     for _ in 0..LOGS {
         let log = random_transcript(&mut rng);
         for budget in budgets(&mut rng, &log) {
@@ -814,6 +896,11 @@ fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
                 (copy.slot(), copy.turn(), copy.agent(), copy.conversation()),
                 (log.slot(), log.turn(), log.agent(), log.conversation())
             );
+            assert_eq!(
+                (copy.commands(), copy.options()),
+                (log.commands(), log.options())
+            );
+            listed += usize::from(!log.commands().is_empty() && !log.options().is_empty());
             if copy.encoded_len() > budget {
                 assert!(
                     copy.entries().count() == 1 || copy.entries().next().map(|(id, _)| id) == lowest,
@@ -824,6 +911,7 @@ fn a_page_folds_to_the_logs_suffix_and_holds_what_it_must() {
     }
     assert!(paged > LOGS / 2, "only {paged} pages had a window");
     assert!(tools > LOGS / 20, "only {tools} pending permissions named a tool entry");
+    assert!(listed > 0, "no paged log held both commands and options");
 }
 
 #[test]

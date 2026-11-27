@@ -662,6 +662,14 @@ fn shape(event: &Event) -> String {
         Event::Conversation { conversation } => format!("conversation {}", conversation.id),
         Event::Trimmed { dropped, .. } => format!("trimmed {dropped}"),
         Event::Window { from, earlier } => format!("window {from} {earlier}"),
+        Event::Commands { commands } => format!(
+            "commands {}",
+            commands.iter().map(|command| command.name.as_str()).collect::<Vec<_>>().join(" ")
+        ),
+        Event::Options { options } => format!(
+            "options {}",
+            options.iter().map(|option| option.id.as_str()).collect::<Vec<_>>().join(" ")
+        ),
     }
 }
 
@@ -1966,6 +1974,8 @@ fn kind(event: &Event) -> &'static str {
         Event::Conversation { .. } => "conversation",
         Event::Trimmed { .. } => "trimmed",
         Event::Window { .. } => "window",
+        Event::Commands { .. } => "commands",
+        Event::Options { .. } => "options",
     }
 }
 

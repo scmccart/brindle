@@ -687,6 +687,19 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// `AGENT_SET_OPTION` from `client` (OpenSpec change `agents-commands`):
+    /// refused by name below protocol 4, as every agent message is. The
+    /// reducer doesn't take sets yet (that change's task 3.1), so a
+    /// protocol 4 client's is refused with the reason.
+    pub(super) fn client_agent_set_option(&mut self, client: Token, set: client::AgentSetOption) {
+        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+        let message = match policy::agent_request_refusal(protocol, AgentRequest::SetOption) {
+            Some(refusal) => refusal.to_string(),
+            None => format!("session {}: the agent's options can't be set yet", set.session),
+        };
+        self.send_client(client, error(Some(set.req), Some(set.session), message));
+    }
+
     /// `AGENT_FETCH` from `client` (decision 5): the whole entries before
     /// `before` within the clamped budget, as `AGENT_PAGE` frames, the last
     /// saying whether more are earlier; or the `ERROR`

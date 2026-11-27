@@ -196,6 +196,8 @@ impl AgentShared {
             | Event::Agent { .. }
             | Event::Conversation { .. }
             | Event::Trimmed { .. }
+            | Event::Commands { .. }
+            | Event::Options { .. }
             | Event::Window { .. } => None,
         };
         self.transcript
@@ -221,6 +223,9 @@ impl AgentShared {
             Event::Queue { .. } => changes.slot_changed = true,
             // The conversation decides whether a continue is offered.
             Event::Turn { .. } | Event::Agent { .. } | Event::Conversation { .. } => changes.turn_or_agent = true,
+            // The agent's commands and options (`agents-commands`): redrawn
+            // as the agent's state is, until the zone shows them itself.
+            Event::Commands { .. } | Event::Options { .. } => changes.turn_or_agent = true,
             Event::Trimmed { through, .. } => changes.trimmed(*through),
             // Only in a replay, after its reset: the zone reads the window
             // from the transcript on every absorb.

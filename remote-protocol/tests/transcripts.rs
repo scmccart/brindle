@@ -53,7 +53,9 @@ macro_rules! forms {
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
     Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
-    AgentResend, AgentRestart, AgentLogin, AgentFetch, AgentList, AgentChoose);
+    AgentResend, AgentRestart, AgentLogin, AgentFetch, AgentList, AgentChoose, AgentSetOption);
+forms!(option_value_form, OPTION_VALUE_FORMS, client::OptionValue, "client::OptionValue::":
+    Choice, Toggle);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
     Process, Transcript, AgentPage, AgentConversations);
@@ -151,6 +153,7 @@ fn expected_forms() -> Vec<&'static str> {
         SPAWN_MODE_FORMS,
         PERMISSION_OPTION_FORMS,
         PAGE_END_FORMS,
+        OPTION_VALUE_FORMS,
     ]
     .concat()
 }
@@ -215,6 +218,9 @@ impl Step {
                 }
                 if let client::ToCore::AgentPermission(answer) = message {
                     forms.push(permission_option_form(answer));
+                }
+                if let client::ToCore::AgentSetOption(set) = message {
+                    forms.push(option_value_form(&set.value));
                 }
                 forms
             }
@@ -1534,7 +1540,174 @@ fn transcripts() -> Vec<Transcript> {
     .chain(agent_transcripts())
     .chain(paging_transcripts())
     .chain(session_list_transcripts())
+    .chain(options_transcripts())
     .collect()
+}
+
+fn set_option(req: u64, session: u32, option: &str, value: client::OptionValue) -> Step {
+    c(client::ToCore::AgentSetOption(client::AgentSetOption {
+        req,
+        session,
+        option: option.into(),
+        value,
+    }))
+}
+
+fn choice_value(value: &str) -> client::OptionValue {
+    client::OptionValue::Choice {
+        value: value.into(),
+    }
+}
+
+/// The fake agent's options in the options transcripts, with the mode, the
+/// model and the fast toggle as given.
+fn fake_options(mode: &str, model: &str, fast: bool) -> serde_json::Value {
+    json!({"event": "options", "options": [
+        {"id": "mode", "name": "Mode", "category": {"category": "mode"},
+         "kind": {"control": "select", "current": mode, "choices": [
+             {"value": "default", "name": "Default"},
+             {"value": "plan", "name": "Plan", "description": "Plans before it edits"},
+         ]}},
+        {"id": "model", "name": "Model", "category": {"category": "model"},
+         "kind": {"control": "select", "current": model, "choices": [
+             {"value": "opus", "name": "Opus"},
+             {"value": "sonnet", "name": "Sonnet"},
+         ]}},
+        {"id": "fast", "name": "Fast mode", "category": {"category": "other", "name": "speed"},
+         "kind": {"control": "toggle", "on": fast}},
+    ]})
+}
+
+/// Transcripts added by `agents-commands`, within protocol 4 before it
+/// shipped (its design decisions 2 and 4).
+fn options_transcripts() -> Vec<Transcript> {
+    vec![
+        Transcript {
+            name: "client-agent-set-option",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with options: an agent session's commands and options after its start, a model chosen, a toggle turned on, the mode changed with its notice, and a set naming the current value answered with nothing sent.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                c(client::ToCore::SpawnAgent(client::SpawnAgent {
+                    req: 1,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/options.script".into()],
+                    cwd: Some("~/src".into()),
+                    env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                    policy: Policy::Detach,
+                    profile: Some("Agent".into()),
+                    conversation: None,
+                    start: None,
+                })),
+                s(client::ToClient::Spawned(client::Spawned {
+                    req: 1,
+                    session: 1,
+                    pid: 5000,
+                    key: KEY.into(),
+                })),
+                transcript(
+                    1,
+                    vec![
+                        json!({"event": "commands", "commands": [
+                            {"name": "compact", "description": "Summarize the conversation", "hint": "<instructions>"},
+                            {"name": "review", "description": "Review the changes"},
+                        ]}),
+                        conversation("resume_and_load"),
+                        fake_options("default", "opus", false),
+                        ready(),
+                    ],
+                ),
+                set_option(2, 1, "model", choice_value("sonnet")),
+                ok(2),
+                transcript(1, vec![fake_options("default", "sonnet", false)]),
+                set_option(3, 1, "fast", client::OptionValue::Toggle { on: true }),
+                ok(3),
+                transcript(1, vec![fake_options("default", "sonnet", true)]),
+                set_option(4, 1, "mode", choice_value("plan")),
+                ok(4),
+                transcript(
+                    1,
+                    vec![
+                        fake_options("plan", "sonnet", true),
+                        added(1, notice("Mode: Plan")),
+                    ],
+                ),
+                set_option(5, 1, "mode", choice_value("plan")),
+                ok(5),
+            ],
+        },
+        Transcript {
+            name: "client-agent-set-option-refused",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with options: sets refused before the agent is ready, for an option the agent doesn't offer, for a choice it doesn't list and for the wrong kind of value, and while an earlier set is unanswered; then the agent refusing a set, which leaves a notice.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                spawn_choosing(1),
+                spawned(1, 1, 5000),
+                transcript(1, vec![choosing(None)]),
+                set_option(2, 1, "mode", choice_value("plan")),
+                error(Some(2), Some(1), "session 1: the agent isn't ready"),
+                choose(3, 1, None),
+                ok(3),
+                transcript(
+                    1,
+                    vec![
+                        conversation("resume_and_load"),
+                        fake_options("default", "opus", false),
+                        ready(),
+                    ],
+                ),
+                set_option(4, 1, "speed", choice_value("fast")),
+                error(Some(4), Some(1), "session 1: the agent offers no option \"speed\""),
+                set_option(5, 1, "model", choice_value("gpt-5")),
+                error(Some(5), Some(1), "session 1: option \"model\" offers no choice \"gpt-5\""),
+                set_option(6, 1, "fast", choice_value("on")),
+                error(Some(6), Some(1), "session 1: option \"fast\" offers no choice \"on\""),
+                set_option(7, 1, "model", choice_value("sonnet")),
+                ok(7),
+                set_option(8, 1, "mode", choice_value("plan")),
+                error(
+                    Some(8),
+                    Some(1),
+                    "session 1: an earlier change of an option hasn't been answered yet",
+                ),
+                transcript(
+                    1,
+                    vec![added(
+                        1,
+                        json!({"type": "notice", "level": "warning", "text": "the agent didn't change Model to Sonnet: model unavailable"}),
+                    )],
+                ),
+                set_option(9, 1, "mode", choice_value("plan")),
+                ok(9),
+            ],
+        },
+        Transcript {
+            name: "client-agent-set-option-old-client",
+            protocol: Protocol::Client3,
+            about: "A protocol 3 client sending AGENT_SET_OPTION is refused.",
+            steps: vec![
+                c(client::ToCore::Hello(client::Hello {
+                    min: 1,
+                    max: 3,
+                    client_version: "0.5.0".into(),
+                    client_token: TOKEN.into(),
+                    ..Default::default()
+                })),
+                s(client::ToClient::Welcome(client::Welcome {
+                    protocol: 3,
+                    core_version: "0.6.0".into(),
+                    core_build: "e4a3".into(),
+                    pid: 4242,
+                    holder_protocols: vec![3],
+                })),
+                set_option(2, 2, "mode", choice_value("plan")),
+                error(Some(2), Some(2), "AGENT_SET_OPTION needs client protocol 4"),
+            ],
+        },
+    ]
 }
 
 /// A `SPAWN_AGENT` of the fake agent in `~/src` that chooses before it

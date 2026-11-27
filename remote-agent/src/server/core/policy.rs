@@ -778,6 +778,8 @@ pub(super) enum AgentRequest {
     Fetch,
     List,
     Choose,
+    /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`).
+    SetOption,
 }
 
 impl AgentRequest {
@@ -794,6 +796,7 @@ impl AgentRequest {
             Self::Fetch => "AGENT_FETCH",
             Self::List => "AGENT_LIST",
             Self::Choose => "AGENT_CHOOSE",
+            Self::SetOption => "AGENT_SET_OPTION",
         }
     }
 }
@@ -1537,6 +1540,7 @@ mod tests {
             (AgentRequest::Fetch, "AGENT_FETCH needs client protocol 4"),
             (AgentRequest::List, "AGENT_LIST needs client protocol 4"),
             (AgentRequest::Choose, "AGENT_CHOOSE needs client protocol 4"),
+            (AgentRequest::SetOption, "AGENT_SET_OPTION needs client protocol 4"),
         ];
         for (request, text) in cases {
             for protocol in 1..AGENT_PROTOCOL {
