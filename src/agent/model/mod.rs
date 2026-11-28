@@ -659,7 +659,7 @@ mod tests {
         let held = zone.model.held_text();
         assert_eq!(held.entries, 2048 + 10 * 1024 + 4096, "{held:?}");
         assert_eq!((held.user_parts, held.rendered, held.text_renders), (2048, 10 * 1024, 4096), "{held:?}");
-        assert_eq!((held.text_sources, held.detail_sources), (0, 0), "the tool text held once beside its entry: {held:?}");
+        assert_eq!(held.text_sources, 0, "the tool text held once beside its entry: {held:?}");
     }
 
     /// The end of a replay brings a reconnecting link back up, and does

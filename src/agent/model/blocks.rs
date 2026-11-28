@@ -778,20 +778,17 @@ impl ChatModel {
         held.rendered = self.rendered.values().flatten().map(|part| markdown::shown_text(&part.block).len()).sum();
         held.text_renders = self.texts.values().map(|(_, blocks)| rich(blocks)).sum();
         held.text_sources = self.texts.values().map(|(source, _)| source.len()).sum();
-        let detail_source = |part: &ShownPart| match &part.part {
-            DetailPart::Text { source, .. } => source.len(),
-            DetailPart::Diff { .. }
-            | DetailPart::Output { .. }
-            | DetailPart::Locations { .. }
-            | DetailPart::Raw { .. }
-            | DetailPart::Mark { .. } => 0,
-        };
+        // A drawn text part names its item and holds no source (OpenSpec
+        // change `agents-absorb-cost` decision 8), so it adds nothing here.
         for block in &self.blocks {
             match &block.body {
                 BlockBody::UserText { text } => held.user_parts += text.len(),
-                BlockBody::ToolDetail(part) => held.detail_sources += detail_source(part),
-                BlockBody::Permission { detail, .. } => held.detail_sources += detail.iter().map(detail_source).sum::<usize>(),
-                BlockBody::AgentPart { .. } | BlockBody::Thought { .. } | BlockBody::Tool { .. } | BlockBody::Notice { .. } => {}
+                BlockBody::ToolDetail(_)
+                | BlockBody::Permission { .. }
+                | BlockBody::AgentPart { .. }
+                | BlockBody::Thought { .. }
+                | BlockBody::Tool { .. }
+                | BlockBody::Notice { .. } => {}
             }
         }
         held
@@ -812,8 +809,6 @@ pub(super) struct HeldText {
     pub text_renders: usize,
     /// Tool text items' sources kept beside their renders.
     pub text_sources: usize,
-    /// Tool text items' sources in drawn detail parts.
-    pub detail_sources: usize,
 }
 
 #[cfg(test)]
