@@ -4798,3 +4798,366 @@ fn each_attachment_refusal_says_why_and_a_refused_prompt_leaves_no_file() {
     assert_eq!(files_in(&store), ["2"]);
     assert_eq!(prompts(&record), ["now"]);
 }
+
+/// Waits until `store` holds exactly `files`.
+fn holds(store: &Path, files: &[&str]) {
+    let held = eventually(TIMEOUT, || files_in(store) == files);
+    assert!(held, "{} holds {:?}, not {files:?}", store.display(), files_in(store));
+}
+
+/// Removes a kept text behind the core's back (read-only on Windows).
+fn remove_behind(file: &Path) {
+    #[cfg(windows)]
+    {
+        let mut permissions = std::fs::metadata(file).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(file, permissions).unwrap();
+    }
+    std::fs::remove_file(file).unwrap();
+}
+
+/// The marker's keep time in `store`, in seconds since the epoch.
+fn marker_of(store: &Path) -> u64 {
+    let text = std::fs::read_to_string(store.join("expires")).expect("a marker");
+    text.trim().parse().unwrap_or_else(|_| panic!("a marker of {text:?}"))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+/// Task 3.2: a discarded prompt's text goes.
+#[test]
+fn a_discarded_prompt_leaves_no_kept_text() {
+    let (mut dir, mut client) = agent_core("attach-discard", &[]);
+    let (script, _, gate) = gated_turn(&dir, "attach-discard", &[stop("end_turn")], 1);
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.attach_text(id, 1, "notes", "queued\n").unwrap();
+    client.prompt_with(id, "two", vec![text(1)]).unwrap();
+    let log = client.transcript_until(id, "has the prompt waiting", |log| *log.slot() != Slot::Empty);
+    assert_eq!(log.slot().attachments(), [kept_text(1, "notes", "queued\n")]);
+    let store = the_store(&dir);
+    assert_eq!(files_in(&store), ["1"]);
+    client.unqueue(id).unwrap();
+    holds(&store, &[]);
+    gate.open();
+}
+
+/// Task 3.2: an entry the log drops past its 16 MiB takes its text.
+#[test]
+fn a_trimmed_entry_leaves_no_kept_text() {
+    const MESSAGES: usize = 17;
+    let (mut dir, mut client) = agent_core("attach-trim", &[]);
+    let (mut script, _) = started(&dir.path, "attach-trim");
+    let text_of = |n: usize| format!("{n:02}:{}", "x".repeat(1024 * 1024 - 3));
+    script.step("expect session/prompt");
+    for n in 0..MESSAGES {
+        script
+            .step(said(&text_of(n)))
+            .step(update(json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "next"}})));
+    }
+    script.step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "notes", "trimmed\n").unwrap();
+    client.prompt_with(id, "talk", vec![text(1)]).unwrap();
+    let log = client.transcript_until(id, "has the turn's end", turn_is(end(StopReason::EndTurn)));
+    assert!(says(&log).iter().all(|line| line != "user: talk"), "the user entry was trimmed");
+    holds(&the_store(&dir), &[]);
+}
+
+/// Task 3.2: what a connection attached and no prompt took goes when it
+/// detaches the session or closes.
+#[test]
+fn untaken_uploads_go_when_their_connection_detaches_or_closes() {
+    let (mut dir, mut client) = agent_core("attach-untaken", &[]);
+    let (script, _) = agent_script(&dir, "untaken", &[]);
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "a", "one\n").unwrap();
+    let store = the_store(&dir);
+    assert_eq!(files_in(&store), ["1"]);
+    client.detach(id);
+    holds(&store, &[]);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    later.attach_text(id, 1, "b", "two\n").unwrap();
+    assert_eq!(files_in(&store), ["2"]);
+    drop(later);
+    holds(&store, &[]);
+}
+
+/// Task 3.2: a text the store lost is left out of the prompt, with a
+/// notice naming it.
+#[test]
+fn a_text_gone_from_its_store_is_left_out_with_a_notice() {
+    let (mut dir, mut client) = agent_core("attach-gone", &[]);
+    let (script, record) = attaching_agent(&dir, "gone", EMBEDS, &["without it"]);
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "build log", "lost\n").unwrap();
+    remove_behind(&the_store(&dir).join("1"));
+    client.prompt_with(id, "look", vec![text(1)]).unwrap();
+    let log = client.transcript_until(id, "has the turn's end", ended(1));
+    assert_eq!(user_attachments(&log, 0), [kept_text(1, "build log", "lost\n")]);
+    let notices = notices(&log);
+    assert!(
+        notices.iter().any(|notice| notice == "the attached text \"build log\" is no longer kept, so the prompt went without it"),
+        "{notices:?}"
+    );
+    assert_eq!(prompt_parts(&record)[0], [json!({"type": "text", "text": "look"})]);
+    let refusal = client.read_attachment(id, 1).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: attachment 1 is no longer kept"));
+}
+
+/// Task 3.2: a closed session's store stays with its marker for its keep
+/// time; with 0 days it goes with the session.
+#[test]
+fn a_closed_sessions_store_keeps_its_marker_and_with_0_days_goes() {
+    let (mut dir, mut client) = agent_core("attach-close", &[]);
+    let (script, _) = agent_script(&dir, "close", &["kept", "gone"]);
+    let (kept_id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    let zero = client::SpawnAgent { attachments_keep_days: Some(0), ..client_agent(&script) };
+    let (gone_id, _) = spawned(&mut client, &mut dir, zero);
+    for id in [kept_id, gone_id] {
+        client.transcript_until(id, "is ready", ready);
+    }
+    client.attach_text(kept_id, 1, "a", "kept\n").unwrap();
+    let kept_store = the_store(&dir);
+    // Upload numbers are the connection's, whichever session they're for.
+    client.attach_text(gone_id, 2, "b", "gone\n").unwrap();
+    let gone_store = stores_in(&attachments_root(&dir))
+        .into_iter()
+        .find(|store| *store != kept_store)
+        .expect("the second session's store");
+    for (id, upload) in [(kept_id, 1), (gone_id, 2)] {
+        client.prompt_with(id, "hi", vec![text(upload)]).unwrap();
+        client.transcript_until(id, "has the turn's end", ended(1));
+    }
+
+    let before = unix_now();
+    for id in [kept_id, gone_id] {
+        client.send(client::ToCore::Close(client::SessionRef { session: id }));
+        exit_of(&mut client, id);
+    }
+    holds(&kept_store, &["1", "expires"]);
+    let until = marker_of(&kept_store);
+    assert!(
+        (before + 14 * 86_400..=unix_now() + 14 * 86_400).contains(&until),
+        "kept until {until}, closed at {before}"
+    );
+    assert!(eventually(TIMEOUT, || !gone_store.exists()), "the 0-day store outlived its session");
+}
+
+/// Task 3.2: a core's start sweeps its attachments directory: a store
+/// whose marker's time has passed goes, one before it stays, and so does
+/// a directory that isn't a store.
+#[test]
+fn a_core_start_removes_a_store_whose_time_has_passed() {
+    let mut dir = TempDir::new("attach-sweep");
+    let root = attachments_root(&dir);
+    let past = root.join("20200101-0123456789abcdef");
+    let future = root.join("20200101-fedcba9876543210");
+    let other = root.join("mine");
+    for (store, marker) in [(&past, "1000\n"), (&future, "99999999999\n")] {
+        std::fs::create_dir_all(store).unwrap();
+        std::fs::write(store.join("1"), "text\n").unwrap();
+        std::fs::write(store.join("expires"), marker).unwrap();
+    }
+    std::fs::create_dir_all(&other).unwrap();
+    start_core(&dir.path, &[]).unwrap();
+    let client = TestClient::hello(&dir.path, "token-attach-sweep");
+    dir.track(client.core_pid());
+    assert!(eventually(TIMEOUT, || !past.exists()), "the passed store is still there");
+    assert_eq!(files_in(&future), ["1", "expires"]);
+    assert!(other.exists());
+}
+
+/// Task 3.2: a session whose spawn names its attachments directory keeps
+/// its text there, not in the cache.
+#[test]
+fn a_session_with_its_own_attachments_directory_keeps_its_text_there() {
+    let (mut dir, mut client) = agent_core("attach-own-dir", &[]);
+    let (script, _) = agent_script(&dir, "own-dir", &[]);
+    let own = dir.path.join("own");
+    let spawn = client::SpawnAgent { attachments_dir: Some(own.display().to_string()), ..client_agent(&script) };
+    let (id, _) = spawned(&mut client, &mut dir, spawn);
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "a", "here\n").unwrap();
+    let [store] = &stores_in(&own)[..] else {
+        panic!("one store in {}: {:?}", own.display(), stores_in(&own));
+    };
+    assert_eq!(std::fs::read_to_string(store.join("1")).unwrap(), "here\n");
+    assert!(stores_in(&attachments_root(&dir)).is_empty());
+}
+
+/// Task 3.2: a waiting prompt's text survives a core's kill, and is read
+/// again for the prompt the next core sends.
+#[test]
+fn a_waiting_prompt_keeps_its_attachment_across_a_core_restart() {
+    let token = "token-attach-killed";
+    let (mut dir, mut client) = agent_core("attach-killed", &[]);
+    let (mut script, record) = initialized(&dir.path, "attach-killed", EMBEDS);
+    script
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(ask("perm-1"))
+        .step(r#"expect-response "perm-1""#);
+    let gate = script.gate();
+    script.step(said("first turn")).step(stop("end_turn"));
+    let finished = script.reached();
+    script.step("expect session/prompt").step(said("next turn")).step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    let log = client.transcript_until(id, "waits on the permission", blocked);
+    client.attach_text(id, 1, "notes", "across the kill\n").unwrap();
+    client.prompt_with(id, "two", vec![text(1)]).unwrap();
+    // The answer's bytes follow the waiting prompt's checkpoint.
+    client.answer(id, permissions(&log)[0].0, Some("allow-once")).unwrap();
+    answered(&record, 1);
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {
+        gate.open();
+        reaches(&finished);
+    });
+    client.reconnect_replay();
+    let log = client.transcript_until(id, "has the second turn's end", |log| {
+        says(log).contains(&"agent: next turn".to_owned()) && *log.turn() == end(StopReason::EndTurn)
+    });
+    assert_eq!(user_attachments(&log, 1), [kept_text(1, "notes", "across the kill\n")]);
+    let parts = &prompt_parts(&record)[1];
+    assert_eq!(parts[1]["resource"]["text"], "across the kill\n", "{parts:?}");
+    assert_eq!(files_in(&the_store(&dir)), ["1"]);
+    assert_eq!(client.read_attachment(id, 1).unwrap(), "across the kill\n");
+}
+
+/// Task 3.2a: an agent's exit leaves its session's texts in place and
+/// readable, with 0 days too; a held prompt's text reaches the agent a
+/// continue starts; and closing the session then ends its store.
+#[test]
+fn an_agents_exit_keeps_its_texts_and_a_continue_sends_the_held_one() {
+    const CAPABILITIES: &str = r#"{"loadSession":true,"sessionCapabilities":{"resume":{}},"promptCapabilities":{"embeddedContext":true}}"#;
+    let (mut dir, mut client) = agent_core("attach-continue", &[]);
+    let (mut script, first) = continuable(&dir.path, "attach-continue", CAPABILITIES);
+    script.step("expect session/prompt");
+    let gate = script.gate();
+    script.step("exit 1");
+    let spawn = client::SpawnAgent { attachments_keep_days: Some(0), ..client_agent(&script.write()) };
+    let (id, _) = spawned(&mut client, &mut dir, spawn);
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "a", "sent\n").unwrap();
+    client.prompt_with(id, "fix it", vec![text(1)]).unwrap();
+    client.attach_text(id, 2, "b", "held\n").unwrap();
+    client.prompt_with(id, "next", vec![text(2)]).unwrap();
+    prompted(&first, &["fix it"]);
+    gate.open();
+    let log = kept(&mut client, id, "has the agent's exit", agent_exited);
+    assert_eq!(*log.slot(), Slot::Held {
+        text: "next".into(),
+        reason: HoldReason::AgentStopped,
+        attachments: vec![kept_text(2, "b", "held\n")],
+    });
+    let store = the_store(&dir);
+    assert_eq!(files_in(&store), ["1", "2"], "an exit removes nothing");
+    assert_eq!(client.read_attachment(id, 1).unwrap(), "sent\n");
+    assert_eq!(client.read_attachment(id, 2).unwrap(), "held\n");
+
+    let (mut again, record) = initialized(&dir.path, "attach-continue-again", CAPABILITIES);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("done"))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    client.resend(id).unwrap();
+    client.transcript_until(id, "has the resent prompt's turn", |log| says(log).contains(&"agent: done".to_owned()));
+    let parts = &prompt_parts(&record)[0];
+    assert_eq!(parts[0]["text"], "next");
+    assert_eq!(parts[1]["resource"]["text"], "held\n", "{parts:?}");
+
+    client.send(client::ToCore::Close(client::SessionRef { session: id }));
+    exit_of(&mut client, id);
+    assert!(eventually(TIMEOUT, || !store.exists()), "the 0-day store outlived its session");
+}
+
+/// Task 3.2a: a prompt refused because the agent needs a login leaves no
+/// upload or file behind.
+#[test]
+fn a_prompt_refused_for_a_login_leaves_no_upload() {
+    let (mut dir, mut client) = agent_core("attach-login", &[]);
+    let (script, _) = login_at_start(&dir, "attach-login");
+    let (id, _) = needing_login(&mut client, &mut dir, &script.write(), "log in first");
+    client.attach_text(id, 1, "a", "for later\n").unwrap();
+    let store = the_store(&dir);
+    let refusal = client.prompt_with(id, "hi", vec![text(1)]).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the agent needs a login"));
+    assert_eq!(files_in(&store), Vec::<String>::new());
+    let refusal = client.prompt_with(id, "hi", vec![text(1)]).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: this connection holds no upload 1"));
+}
+
+/// Task 3.2a: a text on an entry an attach left out of its page, and a
+/// fetch brought in, can be read.
+#[test]
+fn a_kept_text_on_a_fetched_entry_can_be_read() {
+    let (mut dir, mut client) = agent_core("attach-fetch", &[]);
+    let (script, _) = agent_script(&dir, "attach-fetch", &["first", "second"]);
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "a", "early\n").unwrap();
+    client.prompt_with(id, "one", vec![text(1)]).unwrap();
+    client.transcript_until(id, "has the first turn", ended(1));
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the second turn", ended(2));
+    client.detach(id);
+
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent_paged(id, Some(64)).unwrap();
+    let page = later.transcript(id);
+    assert!(page.window().is_some(), "the first entries are left out of a 64-byte page");
+    assert!(says(&page).iter().all(|line| line != "user: one"), "{:?}", says(&page));
+    let whole = later.fetch_to_start(id);
+    assert_eq!(user_attachments(&whole, 0), [kept_text(1, "a", "early\n")]);
+    assert_eq!(later.read_attachment(id, 1).unwrap(), "early\n");
+}
+
+/// Task 3.3: the store's directories are the user's alone, and a kept
+/// text can't be written.
+#[test]
+fn a_kept_text_is_the_users_alone_and_read_only() {
+    let (mut dir, mut client) = agent_core("attach-private", &[]);
+    let (script, _) = agent_script(&dir, "attach-private", &[]);
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "a", "secret\n").unwrap();
+    let store = the_store(&dir);
+    let file = store.join("1");
+    assert!(std::fs::metadata(&file).unwrap().permissions().readonly());
+    assert!(std::fs::OpenOptions::new().write(true).open(&file).is_err(), "a kept text opens for writing");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&attachments_root(&dir)), 0o700);
+        assert_eq!(mode(&store), 0o700);
+        assert_eq!(mode(&file), 0o400);
+    }
+    #[cfg(windows)]
+    {
+        use brindle_remote_protocol::win::{Dacl, SYSTEM_SID, own_sid};
+        let private = |path: &Path| Dacl::of_path(path).unwrap().allows_only(&[&own_sid().unwrap(), SYSTEM_SID]);
+        assert!(private(&attachments_root(&dir)));
+        assert!(private(&store));
+        assert!(private(&file));
+    }
+}
