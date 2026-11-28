@@ -445,7 +445,7 @@ impl Agent {
         let home = dirs::home_dir();
         let directory = spawn::directory(profile, host, cwd.clone(), &opened, home.as_deref());
         let (sink, feed) = Sink::new();
-        let keeping = spawn::Keeping::of(host, &Settings::get(cx).config.agent);
+        let keeping = spawn::Keeping::of(host, profile, &Settings::get(cx).config.agent);
         let request = {
             let (profile, host) = (profile.clone(), host.clone());
             // Built on the session's thread, as a terminal's spawn request
@@ -677,7 +677,7 @@ impl Agent {
         }
         let (sink, feed) = Sink::new();
         feed.shared.lock().start_over();
-        let keeping = spawn::Keeping::of(&self.host, &Settings::get(cx).config.agent);
+        let keeping = spawn::Keeping::of(&self.host, profile, &Settings::get(cx).config.agent);
         let request = {
             let (profile, host, cwd) = (profile.clone(), self.host.clone(), directory.clone());
             // On the session's thread, as a new zone's start.

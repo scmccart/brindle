@@ -69,6 +69,7 @@ fn unix() -> Vec<Case> {
         display("remote-ssh-container", remote::ssh_container),
         display("remote-agent-ssh", remote::agent_ssh),
         display("remote-agent-login-terminal", remote::agent_login_terminal),
+        display("remote-agent-attach", remote::agent_attach),
         display("remote-ssh-quit", remote::ssh_quit),
         display("remote-ssh-reattach-size", remote::ssh_reattach_size),
         display("remote-ssh-reattach-background", remote::ssh_reattach_background),
