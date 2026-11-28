@@ -102,6 +102,9 @@ pub struct Limit {
 
 pub const BELL_PER_TAB: Limit = Limit { capacity: 1, interval: Duration::from_secs(5) };
 pub const OSC_PER_TAB: Limit = Limit { capacity: 3, interval: Duration::from_secs(2) };
+/// An agent zone's notifications, apart from its tab's programs' (OpenSpec
+/// change `agents-zone-focus-and-scroll`, decision 7), with their numbers.
+pub const AGENT_PER_TAB: Limit = Limit { capacity: 3, interval: Duration::from_secs(2) };
 pub const GLOBAL: Limit = Limit { capacity: 10, interval: Duration::from_secs(2) };
 
 #[derive(Clone, Copy, Debug)]
@@ -127,12 +130,40 @@ impl Bucket {
     }
 }
 
-/// Per-tab limits for bells and for program notifications, under a global
-/// cap. A notification is charged only when every bucket it needs has a
-/// token.
+/// Which of a tab's buckets a notification takes a token from: a tab's
+/// bells, its programs' notifications and its agents' each have their own,
+/// so a noisy terminal can't drop an agent's "needs permission".
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LimitClass {
+    Bell,
+    Program,
+    Agent,
+}
+
+impl LimitClass {
+    pub fn of(source: Source) -> Self {
+        match source {
+            Source::Bell => Self::Bell,
+            Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 => Self::Program,
+            Source::Agent => Self::Agent,
+        }
+    }
+
+    pub fn limit(self) -> Limit {
+        match self {
+            Self::Bell => BELL_PER_TAB,
+            Self::Program => OSC_PER_TAB,
+            Self::Agent => AGENT_PER_TAB,
+        }
+    }
+}
+
+/// Per-tab limits for each [`LimitClass`], under a global cap that charges
+/// every class. A notification is charged only when every bucket it needs
+/// has a token.
 #[derive(Debug)]
 pub struct RateLimiter {
-    tabs: HashMap<(u64, bool), Bucket>,
+    tabs: HashMap<(u64, LimitClass), Bucket>,
     global: Option<Bucket>,
 }
 
@@ -148,9 +179,9 @@ impl RateLimiter {
     }
 
     pub fn allow(&mut self, tab: u64, source: Source, now: Instant) -> bool {
-        let is_bell = source == Source::Bell;
-        let limit = if is_bell { BELL_PER_TAB } else { OSC_PER_TAB };
-        let tab_bucket = self.tabs.entry((tab, is_bell)).or_insert_with(|| Bucket::full(limit, now));
+        let class = LimitClass::of(source);
+        let limit = class.limit();
+        let tab_bucket = self.tabs.entry((tab, class)).or_insert_with(|| Bucket::full(limit, now));
         tab_bucket.refill(limit, now);
         let global = self.global.get_or_insert_with(|| Bucket::full(GLOBAL, now));
         global.refill(GLOBAL, now);
@@ -168,8 +199,8 @@ impl RateLimiter {
         if self.tabs.len() < 64 {
             return;
         }
-        self.tabs.retain(|&(_, is_bell), bucket| {
-            let limit = if is_bell { BELL_PER_TAB } else { OSC_PER_TAB };
+        self.tabs.retain(|&(_, class), bucket| {
+            let limit = class.limit();
             bucket.refill(limit, now);
             bucket.tokens < f64::from(limit.capacity)
         });
@@ -386,14 +417,67 @@ mod tests {
         assert!(summary.chars().count() <= MAX_TITLE_CHARS, "{summary}");
     }
 
-    /// Agent notices share the programs' per-tab bucket, not the bell's.
+    /// The spec's "An agent beside a noisy terminal": three program
+    /// notifications use up the tab's program bucket, not its agent's.
     #[test]
-    fn agent_notices_take_the_program_rate_limit() {
+    fn three_program_notifications_leave_an_agents_bucket_alone() {
+        let mut limiter = RateLimiter::new();
+        let t0 = Instant::now();
+        let programs = (0..3).filter(|_| limiter.allow(1, Source::Osc9, t0)).count();
+        assert_eq!(programs, 3);
+        assert!(limiter.allow(1, Source::Agent, t0), "the agent's needs permission isn't dropped");
+        assert!(!limiter.allow(1, Source::Osc9, t0), "the programs' bucket is empty");
+        assert!(limiter.allow(1, Source::Bell, t0), "the bell's bucket is apart too");
+    }
+
+    /// An agent's bucket has the programs' numbers: three at once, then one
+    /// every two seconds.
+    #[test]
+    fn an_agent_has_three_at_once_then_one_every_two_seconds() {
         let mut limiter = RateLimiter::new();
         let t0 = Instant::now();
         let allowed = (0..5).filter(|_| limiter.allow(1, Source::Agent, t0)).count();
-        assert_eq!(allowed, OSC_PER_TAB.capacity as usize);
-        assert!(limiter.allow(1, Source::Bell, t0), "the bell's bucket is apart");
+        assert_eq!(allowed, AGENT_PER_TAB.capacity as usize);
+        assert_eq!(allowed, 3);
+        assert!(!limiter.allow(1, Source::Agent, t0 + Duration::from_millis(1900)));
+        assert!(limiter.allow(1, Source::Agent, t0 + Duration::from_secs(2)));
+        assert!(!limiter.allow(1, Source::Agent, t0 + Duration::from_secs(2)));
+        assert!(limiter.allow(2, Source::Agent, t0), "another tab's agent has its own");
+    }
+
+    /// The global cap charges every class: ten mixed notifications across
+    /// tabs, then an agent's in a fresh tab is refused.
+    #[test]
+    fn every_class_counts_against_the_global_cap() {
+        let mut limiter = RateLimiter::new();
+        let t0 = Instant::now();
+        let sources = [Source::Bell, Source::Osc9, Source::Agent];
+        let allowed = (0..10u64).filter(|n| limiter.allow(*n / 3, sources[(*n % 3) as usize], t0)).count();
+        assert_eq!(allowed, 10);
+        assert!(!limiter.allow(99, Source::Agent, t0), "over the global cap");
+    }
+
+    /// Every source has its class, listed exhaustively.
+    #[test]
+    fn every_source_has_a_limit_class() {
+        let table = [
+            (Source::Bell, LimitClass::Bell),
+            (Source::Osc9, LimitClass::Program),
+            (Source::Osc777, LimitClass::Program),
+            (Source::Osc99, LimitClass::Program),
+            (Source::Osc7501, LimitClass::Program),
+            (Source::Agent, LimitClass::Agent),
+        ];
+        for (source, class) in table {
+            // A new source fails to compile here until it is listed.
+            match source {
+                Source::Bell | Source::Osc9 | Source::Osc777 | Source::Osc99 | Source::Osc7501 | Source::Agent => {}
+            }
+            assert_eq!(LimitClass::of(source), class, "{source:?}");
+        }
+        assert_eq!(LimitClass::Bell.limit().capacity, BELL_PER_TAB.capacity);
+        assert_eq!(LimitClass::Program.limit().capacity, OSC_PER_TAB.capacity);
+        assert_eq!(LimitClass::Agent.limit().capacity, AGENT_PER_TAB.capacity);
     }
 
     #[test]

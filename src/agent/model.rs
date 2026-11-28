@@ -202,6 +202,20 @@ pub struct Splice {
     pub count: usize,
 }
 
+/// The list's change for the working row (OpenSpec change
+/// `agents-zone-attention`, decision 2), the item after the model's `len`
+/// blocks: inserted when it appears (`before` it didn't show, `after` it
+/// does), removed when it goes, nothing otherwise. `ChatModel::finish`
+/// puts it after the blocks' splices, which all fall within the blocks
+/// (`agents-zone-focus-and-scroll`, decision 5).
+fn working_splice(before: bool, after: bool, len: usize) -> Option<Splice> {
+    match (before, after) {
+        (false, true) => Some(Splice { range: len..len, count: 1 }),
+        (true, false) => Some(Splice { range: len..len + 1, count: 0 }),
+        (false, false) | (true, true) => None,
+    }
+}
+
 /// The byte ranges of `text` its parts cover, from `from` (the start of a
 /// part) on: a part ends at a blank line, or, once it is past
 /// [`BLOCK_LIMIT`], at the next line break. Line breaks between parts
@@ -1277,9 +1291,6 @@ pub struct Absorbed {
     pub queue_changed: bool,
     /// The launch's first prompt, when it is sent or left as a draft now.
     pub first: Option<First>,
-    /// The working row ([`ChatModel::working_row`]), when it changed: the
-    /// view applies it after `splices` ([`crate::agent::view::working_splice`]).
-    pub working: Option<Option<WorkingRow>>,
     /// The launch's agent is choosing for the first time: what its launch
     /// asked for (OpenSpec change `agents-session-list`).
     pub choosing: Option<OnChoosing>,
@@ -1293,7 +1304,8 @@ struct Before {
     status: Option<State>,
     title: String,
     queue: QueueRow,
-    working: Option<WorkingRow>,
+    /// Whether the working row showed.
+    working: bool,
 }
 
 /// An agent zone's model.
@@ -1664,6 +1676,13 @@ impl ChatModel {
         &self.blocks
     }
 
+    /// The conversation list's items: the blocks, then the working row
+    /// while it shows (OpenSpec change `agents-zone-focus-and-scroll`,
+    /// decision 5).
+    pub fn item_count(&self) -> usize {
+        self.blocks.len() + usize::from(self.working_row().is_some())
+    }
+
     pub fn queue(&self) -> &QueueRow {
         &self.queue
     }
@@ -1738,7 +1757,7 @@ impl ChatModel {
     }
 
     fn before(&self) -> Before {
-        Before { status: self.shown_status(), title: self.title(), queue: self.queue.clone(), working: self.working_row() }
+        Before { status: self.shown_status(), title: self.title(), queue: self.queue.clone(), working: self.working_row().is_some() }
     }
 
     /// The working row at the end of the conversation (decision 2): none
@@ -2504,7 +2523,9 @@ impl ChatModel {
     /// same ids (decision 9). The new session isn't running until its
     /// thread says so.
     pub fn respawning(&mut self) -> Absorbed {
-        let mut absorbed = self.life_event(|model| {
+        let before = self.before();
+        {
+            let model = &mut *self;
             model.phase = AgentPhase::Connecting;
             model.life = SessionLife::Open;
             model.link = Link::Up;
@@ -2518,11 +2539,14 @@ impl ChatModel {
             model.toggled.clear();
             model.by_hand.clear();
             model.auto_open = None;
-        });
-        // The old conversation's thoughts, still shown, drawn as the policy
-        // says, as its rows are.
-        absorbed.splices.extend(self.update_thoughts(true));
-        absorbed
+        }
+        // The idle turn finishes the tool calls that ran, and the old
+        // conversation's thoughts, still shown, are drawn as the policy
+        // says, as its rows are; the working row's splice comes last
+        // (`finish`).
+        let mut splices = self.refresh_rows();
+        splices.extend(self.update_thoughts(true));
+        self.finish(before, splices, StatusFrom::Unchanged)
     }
 
     /// The link to the endpoint went down or came back.
@@ -2533,7 +2557,7 @@ impl ChatModel {
     fn life_event(&mut self, change: impl FnOnce(&mut Self)) -> Absorbed {
         let before = self.before();
         change(self);
-        // A respawn's idle turn finishes the tool calls that ran.
+        // A tool row's state can follow the phase and the session's life.
         let splices = self.refresh_rows();
         self.finish(before, splices, StatusFrom::Unchanged)
     }
@@ -2542,7 +2566,7 @@ impl ChatModel {
     /// turn or agent-state event of the change was folded (decision 8): one
     /// from a replay raises nothing, sends no first prompt and starts no
     /// launch's choice.
-    fn finish(&mut self, before: Before, splices: Vec<Splice>, status_from: StatusFrom) -> Absorbed {
+    fn finish(&mut self, before: Before, mut splices: Vec<Splice>, status_from: StatusFrom) -> Absorbed {
         let replayed = status_from == StatusFrom::Replay;
         let running = self.handle == SessionHandle::Running;
         self.queue = queue_row(&self.slot, &self.phase, self.life);
@@ -2554,7 +2578,10 @@ impl ChatModel {
         }
         let status = self.shown_status();
         let changed = status != before.status;
-        let working = self.working_row();
+        // The working row is the list's item after the blocks: its insert or
+        // removal comes after the blocks' splices, at the count they left
+        // (OpenSpec change `agents-zone-focus-and-scroll`, decision 5).
+        splices.extend(working_splice(before.working, self.working_row().is_some(), self.blocks.len()));
         // A conversation started: the session is an ordinary one now.
         if matches!(self.phase, AgentPhase::Live(AgentState::Ready { .. })) {
             self.choosing.started = false;
@@ -2573,7 +2600,6 @@ impl ChatModel {
         };
         Absorbed {
             choosing,
-            working: (working != before.working).then_some(working),
             splices,
             status: changed.then_some(status),
             notice: if changed { self.notice(before.status, status, replayed) } else { None },
@@ -3341,6 +3367,24 @@ impl ChatModel {
                 | BlockBody::Notice { .. } => None,
             })
             .collect()
+    }
+
+    /// The block a pending permission request's buttons are drawn in, or
+    /// `None` when `entry` is no pending request (OpenSpec change
+    /// `agents-zone-focus-and-scroll` decision 4).
+    pub fn permission_block(&self, entry: EntryId) -> Option<usize> {
+        self.blocks.iter().position(|block| {
+            block.entry == entry
+                && match &block.body {
+                    BlockBody::Permission { outcome, .. } => outcome.is_none(),
+                    BlockBody::UserText { .. }
+                    | BlockBody::AgentPart { .. }
+                    | BlockBody::Thought { .. }
+                    | BlockBody::Tool { .. }
+                    | BlockBody::ToolDetail(_)
+                    | BlockBody::Notice { .. } => false,
+                }
+        })
     }
 
     /// `copy_last_agent_message`: the latest agent message's text.
@@ -4584,6 +4628,27 @@ mod tests {
         assert!(zone.model.describe(1, true, &found(&zone.model), &linux).contains("outcome=selected:allow-once"));
     }
 
+    /// OpenSpec change `agents-zone-focus-and-scroll` decision 4: a pending
+    /// request names the block its buttons are drawn in, and none once
+    /// answered.
+    #[test]
+    fn a_pending_permission_names_its_block() {
+        let mut zone = Zone::ready();
+        zone.feed(&[
+            turn(TurnState::Working),
+            added(1, Entry::User { text: "go".into() }),
+            added(2, thought("hmm")),
+            added(3, permission("Run cargo test?")),
+        ]);
+        let ix = zone.model.permission_block(EntryId(3)).expect("pending");
+        assert_eq!(zone.model.blocks()[ix].entry, EntryId(3));
+        assert!(matches!(zone.model.blocks()[ix].body, BlockBody::Permission { outcome: None, .. }));
+        assert_eq!(zone.model.permission_block(EntryId(2)), None, "a thought isn't a request");
+        assert_eq!(zone.model.permission_block(EntryId(9)), None, "no such entry");
+        zone.feed(&[Event::Answered { id: EntryId(3), outcome: PermissionOutcome::Selected { option: "allow-once".into() } }]);
+        assert_eq!(zone.model.permission_block(EntryId(3)), None, "answered");
+    }
+
     /// Decision 10: the shown status is the activity's while live, with
     /// `done` and `error` dropped once the user types, until it changes.
     #[test]
@@ -4652,41 +4717,53 @@ mod tests {
         let tool = |id: u64, call: &str, title: &str, status| {
             added(id, Entry::tool(call.into(), title.into(), ToolKind::Read, status))
         };
+        // The row after `feed`, and whether the feed's last splice is the
+        // row's (at the block count): `Some(true)` inserted, `Some(false)`
+        // removed.
+        let fed = |zone: &mut Zone, events: &[Event]| {
+            let absorbed = zone.feed(events);
+            let len = zone.model.blocks().len();
+            let splice = match absorbed.splices.last() {
+                Some(Splice { range, count: 1 }) if *range == (len..len) => Some(true),
+                Some(Splice { range, count: 0 }) if *range == (len..len + 1) => Some(false),
+                Some(_) | None => None,
+            };
+            (zone.model.working_row(), splice)
+        };
         let mut zone = Zone::ready();
         assert_eq!(zone.model.working_row(), None, "idle");
-        let absorbed = zone.feed(&[added(1, user("hi")), turn(TurnState::Working)]);
-        assert_eq!(absorbed.working, Some(Some(WorkingRow::Working)));
+        assert_eq!(fed(&mut zone, &[added(1, user("hi")), turn(TurnState::Working)]), (Some(WorkingRow::Working), Some(true)));
         assert_eq!(WorkingRow::Working.text(), "Working…");
-        let absorbed = zone.feed(&[tool(2, "c1", "Read main.rs", ToolStatus::InProgress)]);
-        assert_eq!(absorbed.working, Some(Some(WorkingRow::Tool { title: "Read main.rs".into() })));
+        let row = fed(&mut zone, &[tool(2, "c1", "Read main.rs", ToolStatus::InProgress)]);
+        assert_eq!(row, (Some(WorkingRow::Tool { title: "Read main.rs".into() }), None), "its words, not its place");
         assert_eq!(zone.model.working_row().unwrap().text(), "Read main.rs");
-        let absorbed = zone.feed(&[tool_completed(2)]);
-        assert_eq!(absorbed.working, Some(Some(WorkingRow::Working)), "a completed call");
+        assert_eq!(fed(&mut zone, &[tool_completed(2)]).0, Some(WorkingRow::Working), "a completed call");
         // The newest of two in progress.
         zone.feed(&[tool(3, "c2", "First", ToolStatus::InProgress), tool(4, "c3", "Second", ToolStatus::InProgress)]);
         assert_eq!(zone.model.working_row(), Some(WorkingRow::Tool { title: "Second".into() }));
-        let absorbed = zone.feed(&[turn(TurnState::Blocked)]);
-        assert_eq!(absorbed.working, Some(None), "a permission waits");
-        assert_eq!(zone.feed(&[turn(TurnState::Working)]).working, Some(Some(WorkingRow::Tool { title: "Second".into() })));
-        assert_eq!(zone.feed(&[turn(TurnState::Cancelling)]).working, Some(Some(WorkingRow::Stopping)));
+        assert_eq!(fed(&mut zone, &[turn(TurnState::Blocked)]), (None, Some(false)), "a permission waits");
+        let row = fed(&mut zone, &[turn(TurnState::Working)]);
+        assert_eq!(row, (Some(WorkingRow::Tool { title: "Second".into() }), Some(true)));
+        assert_eq!(fed(&mut zone, &[turn(TurnState::Cancelling)]), (Some(WorkingRow::Stopping), None));
         assert_eq!(WorkingRow::Stopping.text(), "Stopping…");
-        let absorbed = zone.feed(&[turn(TurnState::Ended { stop: StopReason::Cancelled })]);
-        assert_eq!(absorbed.working, Some(None), "the turn ended");
-        assert_eq!(zone.feed(&[turn(TurnState::Ended { stop: StopReason::EndTurn })]).working, None, "unchanged");
+        let row = fed(&mut zone, &[turn(TurnState::Ended { stop: StopReason::Cancelled })]);
+        assert_eq!(row, (None, Some(false)), "the turn ended");
+        assert_eq!(fed(&mut zone, &[turn(TurnState::Ended { stop: StopReason::EndTurn })]), (None, None), "unchanged");
 
         // A call in progress before the latest user message isn't this
         // turn's.
         let mut next = Zone::ready();
         next.feed(&[tool(1, "c1", "Old", ToolStatus::InProgress), added(2, user("again")), turn(TurnState::Working)]);
         assert_eq!(next.model.working_row(), Some(WorkingRow::Working));
-        assert_eq!(next.feed(&[turn(TurnState::Failed { message: "x".into() })]).working, Some(None), "failed");
+        assert_eq!(fed(&mut next, &[turn(TurnState::Failed { message: "x".into() })]), (None, Some(false)), "failed");
         next.feed(&[turn(TurnState::Idle)]);
         assert_eq!(next.model.working_row(), None);
 
         // Working, but the session ended or the agent isn't ready.
         let mut ended = Zone::ready();
         ended.feed(&[turn(TurnState::Working)]);
-        assert_eq!(ended.model.ended().working, Some(None), "an ended session");
+        assert_eq!(ended.model.ended().splices, [Splice { range: 0..1, count: 0 }], "an ended session");
+        assert_eq!(ended.model.working_row(), None);
         for phase in every_phase() {
             let mut model = ChatModel::new("Fake", None);
             model.turn = TurnState::Working;
@@ -4694,6 +4771,39 @@ mod tests {
             model.phase = phase.clone();
             assert_eq!(model.working_row().is_some(), ready, "{phase:?}");
         }
+    }
+
+    /// `agents-zone-attention` decision 2: the working row is inserted after
+    /// the blocks when it appears, removed from there when it goes, and left
+    /// alone otherwise.
+    #[test]
+    fn the_working_rows_splice_inserts_removes_or_leaves_it() {
+        assert_eq!(working_splice(false, true, 4), Some(Splice { range: 4..4, count: 1 }));
+        assert_eq!(working_splice(true, false, 4), Some(Splice { range: 4..5, count: 0 }));
+        assert_eq!(working_splice(false, true, 0), Some(Splice { range: 0..0, count: 1 }));
+        assert_eq!(working_splice(true, true, 4), None, "its text may change, its place doesn't");
+        assert_eq!(working_splice(false, false, 4), None);
+    }
+
+    /// OpenSpec change `agents-zone-focus-and-scroll` decision 5: the
+    /// working row's insert or removal ends the absorb's splices, at the
+    /// block count as the absorb left it; a change of its words alone
+    /// splices nothing; the list's items are the blocks and the row.
+    #[test]
+    fn the_working_rows_splice_follows_the_blocks_splices() {
+        let mut zone = Zone::ready();
+        assert_eq!(zone.model.item_count(), 0);
+        let absorbed = zone.feed(&[added(1, user("hi")), turn(TurnState::Working)]);
+        assert_eq!(absorbed.splices, [Splice { range: 0..0, count: 1 }, Splice { range: 1..1, count: 1 }]);
+        assert_eq!(zone.model.item_count(), 2, "the block and the row");
+        let tool = Entry::tool("c1".into(), "Read main.rs".into(), ToolKind::Read, ToolStatus::InProgress);
+        let absorbed = zone.feed(&[added(2, tool)]);
+        assert_eq!(absorbed.splices, [Splice { range: 1..1, count: 1 }], "the row's words changed, its place didn't");
+        assert_eq!(zone.model.working_row(), Some(WorkingRow::Tool { title: "Read main.rs".into() }));
+        assert_eq!(zone.model.item_count(), 3);
+        let absorbed = zone.model.ended();
+        assert_eq!(absorbed.splices, [Splice { range: 2..3, count: 0 }], "the row goes from after the blocks");
+        assert_eq!(zone.model.item_count(), 2);
     }
 
     /// `agents-zone-attention` decision 6: the words of a notification's
@@ -5390,10 +5500,12 @@ mod tests {
         let after = parts_of(&zone.model, 1);
         assert!(thought_before.iter().zip(&after).all(|(a, b)| Arc::ptr_eq(&a.block, &b.block)), "another entry kept");
 
-        // An absorb that changes nothing leaves the cache and the list alone.
+        // An absorb that changes no block leaves the cache and the blocks
+        // alone: its one splice is the working row's, after them.
         let before = parts_of(&zone.model, 2);
         let absorbed = zone.feed(&[appended(2, ""), turn(TurnState::Working)]);
-        assert!(absorbed.splices.is_empty(), "{:?}", absorbed.splices);
+        let len = zone.model.blocks().len();
+        assert_eq!(absorbed.splices, [Splice { range: len..len, count: 1 }]);
         let kept = parts_of(&zone.model, 2);
         assert!(before.len() == kept.len() && before.iter().zip(&kept).all(|(a, b)| Arc::ptr_eq(&a.block, &b.block)));
         in_step(&zone.model);
@@ -6149,14 +6261,19 @@ mod tests {
         let mut zone = paged(&server);
         assert_eq!(zone.model.working_row(), Some(WorkingRow::Working));
         let mut request = 1;
-        let mut working = None;
+        let mut rows = Vec::new();
         while let Some(fetch) = zone.model.fetch_due(true, true) {
             zone.model.fetching(request);
             let absorbed = answer_fetch(&mut zone, &server, fetch, request);
-            working = absorbed.working.or(working);
+            let len = zone.model.blocks().len();
+            assert!(
+                absorbed.splices.iter().all(|splice| splice.range.end <= len),
+                "the row shows throughout: no splice reaches past the blocks"
+            );
+            rows.push(zone.model.working_row());
             request += 1;
         }
-        assert_eq!(working, Some(Some(WorkingRow::Tool { title: "cargo build".into() })));
+        assert!(rows.contains(&Some(WorkingRow::Tool { title: "cargo build".into() })), "{rows:?}");
         assert_eq!(zone.model.working_row(), Some(WorkingRow::Tool { title: "cargo build".into() }));
     }
 

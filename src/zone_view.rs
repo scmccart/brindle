@@ -2064,11 +2064,12 @@ impl ZoneTreeView {
         };
         let view = match &zone.content {
             ZoneContent::Terminal(_) => zone.content.element(),
-            // A terminal focuses itself on a press; the agent zone's
-            // conversation has nothing focusable outside its buttons, so a
-            // press anywhere in an inactive agent zone makes it the active
-            // one first (focusing its prompt), before a button it reached
-            // takes focus for itself.
+            // A terminal focuses itself on a press. A press anywhere in an
+            // inactive agent zone makes it the active one first (`active`,
+            // `last_focused`, its title), before a button it reached takes
+            // focus for itself; the zone's own press rule (`AgentView`'s
+            // root) then keeps focus in its prompt when nothing under the
+            // press took it, so this tree's tracked focus never takes it.
             ZoneContent::Agent(_) => div()
                 .id(("agent-zone", id.0 as usize))
                 .size_full()
@@ -3131,5 +3132,225 @@ mod tests {
         let mut tree = ZoneTree::Leaf(ZoneId(1));
         assert!(tree.split(ZoneId(1), login_axis(true), ZoneId(2)));
         assert_eq!(recorded_leaves(tree.leaves(), &[ZoneId(2)]), [ZoneId(1)]);
+    }
+
+    // OpenSpec change `agents-zone-focus-and-scroll`, task 8.1: one press
+    // rule for an agent zone.
+
+    use crate::agent::test_support::{Call, Zone as AgentZone, added, agent as agent_entry, ready, settle, user};
+    use crate::agent::transcript::{Entry, Event, PermissionKind, PermissionOption, TurnState};
+    use gpui::{ClipboardItem, Modifiers, MouseButton};
+
+    /// A tab of one agent zone fed `events`, its prompt focused.
+    fn agent_tab(app: &mut gpui::TestAppContext, events: &[Event]) -> (AgentZone, Tab, Entity<AgentView>) {
+        let mut zone = AgentZone::new(None, app);
+        let agent = zone.agent.clone();
+        let tab = Tab::new(app, Profile::default_shell(), |_| ZoneStart::Agent(agent));
+        zone.feed(events);
+        settle(tab.cx);
+        let view = tab.view.read_with(tab.cx, |view, _| view.active_content().and_then(ZoneContent::agent_view).cloned());
+        let view = view.expect("an agent zone");
+        let prompt = view.read_with(tab.cx, |view, cx| view.focus_handle(cx));
+        tab.cx.update(|window, _| window.focus(&prompt));
+        settle(tab.cx);
+        (zone, tab, view)
+    }
+
+    /// The agent zone's stop with focus, as the dump's focus line names it
+    /// (`--- focus agent stop=…`); `None` reads `--- focus other` there.
+    fn stop(tab: &mut Tab, view: &Entity<AgentView>) -> Option<String> {
+        let view = view.clone();
+        tab.cx.update(|window, cx| view.read(cx).focused_stop(window, cx))
+    }
+
+    fn click(tab: &mut Tab, selector: &'static str) {
+        let at = tab.cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
+        tab.cx.simulate_click(at, Modifiers::none());
+        settle(tab.cx);
+    }
+
+    fn type_text(tab: &mut Tab, text: &str) {
+        tab.cx.simulate_input(text);
+        settle(tab.cx);
+    }
+
+    fn draft(tab: &mut Tab, view: &Entity<AgentView>) -> String {
+        let view = view.clone();
+        tab.cx.update(|_, cx| view.read(cx).prompt().read(cx).text(cx).to_string())
+    }
+
+    fn conversation() -> Vec<Event> {
+        vec![ready(), added(1, user("hi")), added(2, agent_entry("Hello there."))]
+    }
+
+    fn request() -> Entry {
+        let option = |id: &str, name: &str, kind| PermissionOption { id: id.into(), name: name.into(), kind };
+        Entry::Permission {
+            call: None,
+            title: "Run cargo test?".into(),
+            options: vec![
+                option("reject-once", "Reject", PermissionKind::RejectOnce),
+                option("allow-once", "Allow once", PermissionKind::AllowOnce),
+            ],
+            outcome: None,
+        }
+    }
+
+    #[test]
+    fn a_press_on_a_messages_text_keeps_the_prompt_focused() {
+        let mut app = crate::agent::test_support::app();
+        let (_zone, mut tab, view) = agent_tab(&mut app, &conversation());
+        click(&mut tab, "agent-message-content");
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+        type_text(&mut tab, "more");
+        assert_eq!(draft(&mut tab, &view), "more", "typing reaches the draft");
+    }
+
+    #[test]
+    fn a_press_on_a_thoughts_label_opens_it_and_keeps_the_prompt_focused() {
+        let mut app = crate::agent::test_support::app();
+        let mut events = conversation();
+        events.push(added(3, Entry::Thought { text: "hmm".into() }));
+        let (zone, mut tab, view) = agent_tab(&mut app, &events);
+        click(&mut tab, "reasoning-trigger");
+        let open = zone.agent.read_with(tab.cx, |agent, _| {
+            agent.model().blocks().iter().any(|b| matches!(b.body, crate::agent::model::BlockBody::Thought { open: true, .. }))
+        });
+        assert!(open, "the press opened it");
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn a_press_on_a_tool_rows_line_opens_it_and_keeps_the_prompt_focused() {
+        use crate::agent::transcript::{ToolKind, ToolStatus};
+        let mut app = crate::agent::test_support::app();
+        let mut tool = Entry::tool("c1".into(), "Run".into(), ToolKind::Execute, ToolStatus::Completed);
+        if let Entry::Tool { input, .. } = &mut tool {
+            *input = Some("ls".into());
+        }
+        let mut events = conversation();
+        events.push(added(3, tool));
+        let (zone, mut tab, view) = agent_tab(&mut app, &events);
+        click(&mut tab, "tool-title");
+        let open = zone.agent.read_with(tab.cx, |agent, _| {
+            agent.model().blocks().iter().any(|b| {
+                matches!(&b.body, crate::agent::model::BlockBody::Tool { state, .. } if state.open() == Some(true))
+            })
+        });
+        assert!(open, "the press opened it");
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn a_press_on_a_messages_copy_button_copies_and_keeps_the_prompt_focused() {
+        let mut app = crate::agent::test_support::app();
+        let (_zone, mut tab, view) = agent_tab(&mut app, &conversation());
+        tab.cx.write_to_clipboard(ClipboardItem::new_string("before".into()));
+        // Over the agent's message (the last one drawn), its copy button shows.
+        let message = tab.cx.debug_bounds("agent-message-content").expect("drawn");
+        tab.cx.simulate_mouse_move(message.center(), None, Modifiers::none());
+        tab.cx.update(|window, _| window.refresh());
+        settle(tab.cx);
+        click(&mut tab, "agent-message-copy");
+        let copied = tab.cx.read_from_clipboard().and_then(|item| item.text());
+        assert_eq!(copied.as_deref(), Some("Hello there."));
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn a_press_on_the_earlier_row_keeps_the_prompt_focused() {
+        use crate::agent::transcript::{PAGE_BYTES, StopReason, Transcript};
+        let mut app = crate::agent::test_support::app();
+        let (mut zone, mut tab, view) = agent_tab(&mut app, &[]);
+        let mut server = Transcript::new();
+        let mut events = vec![ready(), added(1, user("go"))];
+        for n in 0..40u64 {
+            events.push(added(n + 2, Entry::Thought { text: format!("{n} {}", "x".repeat(100 * 1024)) }));
+        }
+        events.push(Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } });
+        for event in &events {
+            server.apply(event).unwrap();
+        }
+        zone.sink.replay(true);
+        zone.sink.transcript(server.page(PAGE_BYTES).iter().map(Event::to_value).collect()).unwrap();
+        zone.sink.replay(false);
+        settle(tab.cx);
+        click(&mut tab, "agent-earlier");
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn a_right_press_on_a_message_keeps_the_prompt_focused() {
+        let mut app = crate::agent::test_support::app();
+        let (_zone, mut tab, view) = agent_tab(&mut app, &conversation());
+        let at = tab.cx.debug_bounds("agent-message-content").expect("drawn").center();
+        tab.cx.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+        tab.cx.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+        settle(tab.cx);
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn a_press_from_a_permission_button_to_a_message_focuses_the_prompt() {
+        let mut app = crate::agent::test_support::app();
+        let mut events = conversation();
+        events.extend([Event::Turn { state: TurnState::Working }, added(3, request())]);
+        let (_zone, mut tab, view) = agent_tab(&mut app, &events);
+        let reject = view.read_with(tab.cx, |view, _| view.permission_handle(crate::agent::transcript::EntryId(3), "reject-once").cloned());
+        tab.cx.update(|window, _| window.focus(&reject.expect("pending")));
+        settle(tab.cx);
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("permission:3:reject-once"));
+        click(&mut tab, "agent-message-content");
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("prompt"));
+    }
+
+    #[test]
+    fn escape_after_a_press_cancels_the_turn() {
+        let mut app = crate::agent::test_support::app();
+        let mut events = conversation();
+        events.push(Event::Turn { state: TurnState::Working });
+        let (zone, mut tab, _view) = agent_tab(&mut app, &events);
+        zone.take_calls();
+        click(&mut tab, "agent-message-content");
+        tab.cx.simulate_keystrokes("escape");
+        settle(tab.cx);
+        assert_eq!(zone.take_calls(), [Call::Cancel]);
+    }
+
+    #[test]
+    fn a_press_on_a_permission_button_answers_it() {
+        let mut app = crate::agent::test_support::app();
+        let mut events = conversation();
+        events.extend([Event::Turn { state: TurnState::Working }, added(3, request())]);
+        let (zone, mut tab, view) = agent_tab(&mut app, &events);
+        zone.take_calls();
+        click(&mut tab, "confirmation-button-0");
+        assert_eq!(zone.take_calls(), [Call::Answer(3, Some("reject-once".into()))]);
+        assert_eq!(stop(&mut tab, &view).as_deref(), Some("permission:3:reject-once"), "the button took focus");
+    }
+
+    #[test]
+    fn a_press_into_an_inactive_agent_zone_focuses_its_prompt() {
+        let mut app = crate::agent::test_support::app();
+        let mut zone = AgentZone::new(None, &mut app);
+        let agent = zone.agent.clone();
+        let terminal = app.update(|cx| {
+            let config = Settings::get(cx).config.clone();
+            cx.new(|cx| Terminal::message("", Theme::default(), &config, cx))
+        });
+        let (z1, z2) = (ZoneId(1), ZoneId(2));
+        let mut tree = ZoneTree::new(z1);
+        tree.split(z1, SplitAxis::Horizontal, z2);
+        let spec = || ZoneSpec { profile: Profile::default_shell(), host: Host::Local, theme: Theme::default(), font_size: None };
+        let zones = vec![(z1, spec(), ZoneStart::Terminal(terminal)), (z2, spec(), ZoneStart::Agent(agent))];
+        let (tree_view, cx) = app.add_window_view(|window, cx| ZoneTreeView::from_restored(tree, zones, z1, window, cx));
+        zone.feed(&conversation());
+        settle(cx);
+        let at = cx.debug_bounds("agent-message-content").expect("drawn").center();
+        cx.simulate_click(at, Modifiers::none());
+        settle(cx);
+        let view = tree_view.read_with(cx, |view, _| view.zones[&z2].content.agent_view().cloned()).expect("an agent zone");
+        assert_eq!(tree_view.read_with(cx, |view, _| view.active), z2, "the press made it the active zone");
+        assert_eq!(cx.update(|window, cx| view.read(cx).focused_stop(window, cx)).as_deref(), Some("prompt"));
     }
 }

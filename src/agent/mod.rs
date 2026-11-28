@@ -62,7 +62,7 @@ use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
     Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Link, ListDone, ListFor,
     Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit,
-    Unqueue, WorkingRow,
+    Unqueue,
 };
 use crate::agent::commands::CompletionKey;
 use crate::agent::spawn::AgentSpawnRequest;
@@ -196,12 +196,10 @@ impl Requests for crate::remote::AgentLink {
 /// reads from the model when the agent notifies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentUpdate {
-    /// The conversation's blocks changed, in order (`MessageScroller::splice`).
+    /// The conversation's list changed, in order (`MessageScroller::splice`):
+    /// its blocks, then the working row after them (OpenSpec change
+    /// `agents-zone-focus-and-scroll`, decision 5).
     Splices(Vec<Splice>),
-    /// The working row at the conversation's end changed (OpenSpec change
-    /// `agents-zone-attention`, decision 2), after any splices: the view
-    /// adds, keeps or drops its last item ([`view::working_splice`]).
-    Working(Option<WorkingRow>),
     /// A prompt was taken: the input empties.
     ClearDraft,
     /// Text the user didn't type goes into the input: a first prompt that
@@ -790,8 +788,7 @@ impl Agent {
     /// Hands what the model decided on: the view's splices, the status and
     /// title events, the first prompt's send.
     fn apply_absorbed(&mut self, absorbed: Absorbed, cx: &mut Context<Self>) {
-        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, working, choosing, replied } =
-            absorbed;
+        let Absorbed { splices, status, notice, title_changed, queue_changed: _, first, choosing, replied } = absorbed;
         if let Some(replied) = replied {
             self.apply_replied(replied, cx);
         }
@@ -802,9 +799,6 @@ impl Agent {
         }
         if !splices.is_empty() {
             cx.emit(AgentUpdate::Splices(splices));
-        }
-        if let Some(working) = working {
-            cx.emit(AgentUpdate::Working(working));
         }
         if status.is_some() {
             let notice = notice.map(|notice| Notice { source: Source::Agent, title: notice.title, body: notice.body });

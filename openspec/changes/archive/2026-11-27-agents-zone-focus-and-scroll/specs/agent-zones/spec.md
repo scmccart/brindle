@@ -90,7 +90,7 @@ The conversation SHALL scroll, and SHALL stay at its end while new text arrives 
 - **THEN** the entry that was at the top of the view is still at its top, at the same place in its text, and nothing jumps as other entries scroll into view
 
 ### Requirement: Earlier messages
-When an agent session has entries before the oldest one its zone holds, the conversation SHALL start with an "Earlier messages" item, which takes no focus. When it scrolls into view, the zone SHALL fetch the entries before its oldest one, showing a spinner on the item until they arrive, then add them above. Fetched entries SHALL stay in the zone until it closes or its session is replayed again. When nothing earlier remains, the item SHALL go.
+When an agent session has entries before the oldest one its zone holds, the conversation SHALL start with an "Earlier messages" item, which takes no focus. When it scrolls into view, the zone SHALL fetch the entries before its oldest one, showing a spinner on the item until they arrive, then add them above. Fetched entries SHALL stay in the zone until it closes or its session is replayed again. When nothing earlier remains, the item SHALL go. A fetch SHALL belong to the connection it was asked on: a fetch not yet answered when the link drops SHALL fail, and SHALL NOT be sent on the next link or change what the zone shows after the reconnect. The spinner SHALL show only while a fetch is on its way.
 
 #### Scenario: Scrolling to the top loads more
 - **WHEN** an agent zone shows the newest page of a long conversation and the user scrolls to its top
@@ -111,6 +111,14 @@ When an agent session has entries before the oldest one its zone holds, the conv
 #### Scenario: A fetch that fails
 - **WHEN** fetching earlier entries is refused, or the link to the endpoint goes down while it waits
 - **THEN** the item says the earlier messages couldn't be loaded and why, with nothing else in the conversation changed, and the fetch is tried again the next time the item scrolls into view or is pressed
+
+#### Scenario: A fetch not yet sent when the link drops
+- **WHEN** a zone that holds two fetched pages asks for a third, and the link drops before the request is written, then comes back
+- **THEN** the fetch fails, the zone shows the newest page again with the "Earlier messages" item, the session is still shown and not reported broken, and scrolling up fetches the earlier entries again
+
+#### Scenario: A new session while a fetch is on its way
+- **WHEN** an agent zone's agent has exited, a fetch of earlier entries is on its way, and the user continues the conversation in a new session that fails to start
+- **THEN** the "Earlier messages" item shows no spinner, and the zone says why the new session didn't start
 
 #### Scenario: Reattached
 - **WHEN** a zone that had fetched earlier entries is restored after Brindle restarts

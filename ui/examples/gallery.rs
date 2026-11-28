@@ -3473,6 +3473,8 @@ mod check {
         c.run_check("confirmation-destructive-answered-draws-in-the-default-tone", check).await;
         let check = scroller_keeps_the_view_while_away(&mut c).await;
         c.run_check("message-scroller-item-added-while-away-keeps-the-view", check).await;
+        let check = scroller_top_item_grows(&mut c).await;
+        c.run_check("message-scroller-top-item-that-grows-keeps-the-view", check).await;
         let check = scroller_pages_up_to_the_top_row(&mut c).await;
         c.run_check("message-scroller-page-up-reaches-the-top-row", check).await;
         let check = response_paints(&mut c).await;
@@ -6228,6 +6230,46 @@ mod check {
         c.tick().await;
         let end = top(c)?;
         ensure!(end.0 == Follow::AtEnd, "scrolling to the end didn't follow it ({end:?})");
+        Ok(())
+    }
+
+    /// The spec's "The item at the top grows": scrolled away with an item's
+    /// middle at the view's top, that item replaced by a longer one keeps
+    /// the view where it was (the same item, the same offset into it).
+    async fn scroller_top_item_grows(c: &mut Checker) -> Check {
+        let top = |c: &mut Checker| {
+            c.with(|gallery, _, cx| {
+                let s = gallery.conversation.read(cx);
+                let top = s.scroll_top();
+                (s.follow(), top.item_ix, top.offset_in_item)
+            })
+        };
+        let mut before = top(c)?;
+        for _ in 0..20 {
+            if before.0 == Follow::Away && before.2 > px(0.) && before.1 > 0 {
+                break;
+            }
+            c.with(|gallery, _, cx| gallery.conversation.update(cx, |s, cx| s.scroll_page(PageDirection::Up, cx)))?;
+            c.tick().await;
+            before = top(c)?;
+        }
+        ensure!(before.0 == Follow::Away && before.2 > px(0.) && before.1 > 0, "no item's middle at the top: {before:?}");
+        c.with(|gallery, _, cx| {
+            // The list's item 0 is the top row: the owner's index is one less.
+            let ix = before.1 - 1;
+            gallery.conversation_items.borrow_mut()[ix] = super::DemoItem::Message(
+                brindle_ui::MessageFrom::Assistant,
+                brindle_ui::BubblePart::Whole,
+                "A message that grew while it was read, ".repeat(40).into(),
+            );
+            gallery.conversation.update(cx, |s, cx| s.splice(ix..ix + 1, 1, cx));
+        })?;
+        c.tick().await;
+        c.tick().await;
+        let after = top(c)?;
+        ensure!(after == before, "the item at the top grew and the view moved from {before:?} to {after:?}");
+        c.with(|gallery, _, cx| gallery.conversation.update(cx, |s, cx| s.scroll_to_end(cx)))?;
+        c.tick().await;
         Ok(())
     }
 

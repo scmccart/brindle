@@ -16,6 +16,7 @@
 //! changes, the stop button when the turn ends, a permission answered, the
 //! Continue button once pressed), focus goes back to the prompt.
 
+use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
@@ -43,7 +44,7 @@ use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
     AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow,
-    Resend, ShownPart, Splice, WorkingRow, ZoneChoice,
+    Resend, ShownPart, WorkingRow, ZoneChoice,
 };
 use crate::agent::tool::{self, DetailPart};
 use crate::motion::{self, Motion};
@@ -69,6 +70,22 @@ pub struct ConfirmLink {
 /// [`link_action`] says of `target` with its `plan`.
 pub fn link_press(target: &str, modifiers: &Modifiers, plan: impl FnOnce(&str) -> Plan) -> Option<LinkAction> {
     links::wants_links(modifiers).then(|| link_action(target, plan(target)))
+}
+
+/// The link gesture's new state when `modifiers` change it from `was`
+/// ([`links::wants_links`]: ctrl held, alt not), else `None`: only a flip
+/// changes what a link's pointer shows (OpenSpec change
+/// `agents-zone-focus-and-scroll` decision 6).
+pub fn link_gesture_flip(was: bool, modifiers: &Modifiers) -> Option<bool> {
+    let now = links::wants_links(modifiers);
+    (now != was).then_some(now)
+}
+
+/// Whether a focused permission button gives focus to the prompt after a
+/// frame whose items in view are `in_view`: its block (`None` when the
+/// request is no longer pending) isn't among them (decision 4).
+pub fn gives_back(block: Option<usize>, in_view: &Range<usize>) -> bool {
+    block.is_none_or(|block| !in_view.contains(&block))
 }
 
 /// What an agent zone does with a link pressed with the gesture.
@@ -281,23 +298,33 @@ fn allows(kind: PermissionKind) -> bool {
     }
 }
 
-/// The scroller's change for the working row (OpenSpec change
-/// `agents-zone-attention`, decision 2), the conversation's last item after
-/// the model's `len` blocks: inserted when it appears, removed when it
-/// goes, nothing otherwise. Applied after the model's splices, which all
-/// fall within the blocks.
-pub fn working_splice(before: bool, after: bool, len: usize) -> Option<Splice> {
-    match (before, after) {
-        (false, true) => Some(Splice { range: len..len, count: 1 }),
-        (true, false) => Some(Splice { range: len..len + 1, count: 0 }),
-        (false, false) | (true, true) => None,
-    }
-}
-
 /// A permission option's button: an allow option is destructive while
 /// the request is pending, a reject option an outline (decision 4).
 pub fn permission_variant(kind: PermissionKind) -> ButtonVariant {
     if allows(kind) { ButtonVariant::Destructive } else { ButtonVariant::Outline }
+}
+
+/// What a conversation item's height depends on besides its text and the
+/// width (which the list follows itself): the text size and the two
+/// families (OpenSpec change `agents-zone-focus-and-scroll` decision 3).
+/// The zone doesn't read the terminal's line height; a change that makes
+/// it do so adds it here.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Measure {
+    pub size: Pixels,
+    pub ui_family: SharedString,
+    pub code_family: SharedString,
+}
+
+/// The measure in effect: the profile's size, else the terminal size in
+/// effect (zoom included), and the UI and code families.
+fn measure_of(font_size_override: Option<f32>, cx: &App) -> Measure {
+    let settings = Settings::get(cx);
+    Measure {
+        size: settings.font_size(font_size_override),
+        ui_family: settings.ui_font_family(),
+        code_family: settings.font().family,
+    }
 }
 
 /// An agent zone's view.
@@ -318,13 +345,15 @@ pub struct AgentView {
     theme: Theme,
     /// The profile's font size, else the terminal size in effect.
     font_size_override: Option<f32>,
-    /// The working row while it shows, the scroller's last item; the view
-    /// wants the motion clock meanwhile.
-    working: Option<WorkingRow>,
     /// The Earlier row as the model last gave it (OpenSpec change
     /// `agents-log-paging` decision 11): the scroller's top row while there
     /// is one; the view wants the motion clock while it loads.
     earlier: Earlier,
+    /// What the items were last measured at; `remeasure_if_changed`, from
+    /// `set_profile` and the Settings observer, refreshes it.
+    measure: Measure,
+    /// Whether the modifiers held last made the link gesture.
+    link_gesture: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -368,10 +397,10 @@ impl AgentView {
             prompt.set_placeholder("Message the agent", cx);
             prompt.set_held_color(theme.ansi[3].hsla(), cx);
         });
-        let working = agent.read(cx).model().working_row();
-        let count = agent.read(cx).model().blocks().len() + usize::from(working.is_some());
+        let count = agent.read(cx).model().item_count();
         let view = cx.weak_entity();
-        let (top, told) = (view.clone(), view.clone());
+        let (top, told, gave) = (view.clone(), view.clone(), view.clone());
+        let window_handle = window.window_handle();
         let scroller = cx.new(|cx| {
             MessageScroller::new(count, move |ix, _, cx| render_block(&view, ix, cx), cx)
                 .with_top_row(move |_, cx| earlier_row(&top, cx))
@@ -382,14 +411,24 @@ impl AgentView {
                     })
                     .ok();
                 })
+                // A focused permission's block may have left the view.
+                .on_items_view(move |in_view, cx| {
+                    window_handle
+                        .update(cx, |_, window, cx| gave.update(cx, |this, cx| this.give_back(in_view, window, cx)))
+                        .ok();
+                })
         });
         let area = prompt.read(cx).area().clone();
         let subscriptions = vec![
             cx.subscribe_in(&agent, window, |this, _, update: &AgentUpdate, _, cx| this.on_update(update, cx)),
             cx.observe_in(&agent, window, |this, _, window, cx| this.sync(window, cx)),
             // The continue offer reads the config's profiles: an edit can
-            // take the button away or bring it back.
-            cx.observe_global_in::<Settings>(window, |this, window, cx| this.sync(window, cx)),
+            // take the button away or bring it back. A zoom, a font
+            // preview or a reload may change what the items measure at.
+            cx.observe_global_in::<Settings>(window, |this, window, cx| {
+                this.remeasure_if_changed(cx);
+                this.sync(window, cx);
+            }),
             cx.subscribe(&prompt, |this, _, event: &PromptInputEvent, cx| this.on_prompt(event, cx)),
             cx.subscribe(&area, |this, _, _: &TextAreaEvent, cx| {
                 this.agent.update(cx, |agent, cx| agent.seen(cx));
@@ -417,8 +456,9 @@ impl AgentView {
             cancel_login: cx.focus_handle(),
             theme,
             font_size_override,
-            working,
             earlier: Earlier::None,
+            measure: measure_of(font_size_override, cx),
+            link_gesture: false,
             _subscriptions: subscriptions,
         };
         this.refresh(cx);
@@ -434,7 +474,8 @@ impl AgentView {
             Earlier::Loading { .. } => true,
             Earlier::None | Earlier::Available { .. } | Earlier::Failed { .. } => false,
         };
-        Motion::want(cx.entity_id(), self.working.is_some() || loading, cx);
+        let working = self.agent.read(cx).model().working_row().is_some();
+        Motion::want(cx.entity_id(), working || loading, cx);
     }
 
     /// The model's Earlier row: the scroller shows it while there is one
@@ -532,12 +573,19 @@ impl AgentView {
         self.prompt.update(cx, |prompt, cx| prompt.set_held_color(held, cx));
         self.theme = theme;
         self.font_size_override = font_size_override;
-        // Every block is measured again at the new size.
-        self.scroller.update(cx, |scroller, cx| {
-            let count = scroller.item_count();
-            scroller.splice(0..count, count, cx);
-        });
+        // A theme changes colours only; a size may change the heights.
+        self.remeasure_if_changed(cx);
         cx.notify();
+    }
+
+    /// Measures every item again, keeping the view's place, when what they
+    /// measure at changed; otherwise nothing (decision 3).
+    fn remeasure_if_changed(&mut self, cx: &mut Context<Self>) {
+        let measure = measure_of(self.font_size_override, cx);
+        if measure != self.measure {
+            self.measure = measure;
+            self.scroller.update(cx, |scroller, cx| scroller.remeasure_all(cx));
+        }
     }
 
     /// The size the conversation and the prompt are drawn at: the
@@ -554,15 +602,6 @@ impl AgentView {
                     scroller.splice(splice.range.clone(), splice.count, cx);
                 }
             }),
-            AgentUpdate::Working(after) => {
-                let len = self.agent.read(cx).model().blocks().len();
-                if let Some(splice) = working_splice(self.working.is_some(), after.is_some(), len) {
-                    self.scroller.update(cx, |scroller, cx| scroller.splice(splice.range, splice.count, cx));
-                }
-                self.working = after.clone();
-                self.refresh_motion(cx);
-                cx.notify();
-            }
             AgentUpdate::ClearDraft => self.prompt.update(cx, |prompt, cx| prompt.set_text("", cx)),
             AgentUpdate::SetDraft(text) => self.prompt.update(cx, |prompt, cx| prompt.set_text(text, cx)),
             AgentUpdate::SetDraftAt(text, cursor) => {
@@ -619,6 +658,8 @@ impl AgentView {
         let before = self.stops(cx);
         self.refresh(cx);
         self.follow_earlier(cx);
+        // The working row came or went.
+        self.refresh_motion(cx);
         let after = self.stops(cx);
         let focused = window.focused(cx);
         if focused.as_ref().is_some_and(|focused| before.contains(focused) && !after.contains(focused)) {
@@ -664,6 +705,33 @@ impl AgentView {
                 };
                 self.permissions.push((key, handle));
             }
+        }
+    }
+
+    /// The pending request whose button `handle` is, if it is one.
+    fn permission_of(&self, handle: &FocusHandle) -> Option<EntryId> {
+        self.permissions.iter().find(|(_, own)| own == handle).map(|((entry, _), _)| *entry)
+    }
+
+    /// Brings the block of the permission button Tab just focused into
+    /// view; any other stop is in the prompt area, always shown.
+    fn reveal_permission(&mut self, handle: &FocusHandle, cx: &mut Context<Self>) {
+        let Some(entry) = self.permission_of(handle) else { return };
+        if let Some(block) = self.agent.read(cx).model().permission_block(entry) {
+            self.scroller.update(cx, |scroller, cx| scroller.reveal(block, cx));
+        }
+    }
+
+    /// A frame changed the items in view to `in_view`: a focused permission
+    /// button whose block left the view gives focus to the prompt, as a
+    /// stop that left the model does (`sync`). Nothing is answered.
+    fn give_back(&mut self, in_view: Range<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(focused) = window.focused(cx) else { return };
+        let Some(entry) = self.permission_of(&focused) else { return };
+        let block = self.agent.read(cx).model().permission_block(entry);
+        if gives_back(block, &in_view) {
+            let prompt = self.prompt.read(cx).focus_handle(cx);
+            window.focus(&prompt);
         }
     }
 
@@ -858,9 +926,9 @@ fn render_block(view: &WeakEntity<AgentView>, ix: usize, cx: &mut App) -> gpui::
     let this = entity.read(cx);
     let blocks = this.agent.read(cx).model().blocks().len();
     if ix == blocks
-        && let Some(row) = &this.working
+        && let Some(row) = this.agent.read(cx).model().working_row()
     {
-        return working_row(row, Motion::step(cx));
+        return working_row(&row, Motion::step(cx));
     }
     let Some(block) = this.agent.read(cx).model().blocks().get(ix).cloned() else { return div().into_any_element() };
     let handles: Vec<(SharedString, FocusHandle)> = this
@@ -1059,8 +1127,13 @@ fn block_element(
             });
         Message::new(id("message"), from)
             .part(bubble_part(block.part, block.last))
-            .child(div().when(block.part > 0, |d| d.pt_3()).child(content))
-            .action(copy)
+            .child(
+                div()
+                    .debug_selector(|| "agent-message-content".into())
+                    .when(block.part > 0, |d| d.pt_3())
+                    .child(content),
+            )
+            .action(div().debug_selector(|| "agent-message-copy".into()).child(copy))
             .into_any_element()
     };
     match &block.body {
@@ -1231,8 +1304,23 @@ impl Render for AgentView {
         // components inside.
         let tokens = cx.ui_theme();
         let (bg, fg) = (tokens.background, tokens.foreground);
+        let prompt_handle = self.prompt.read(cx).focus_handle(cx);
         let content = div()
             .key_context("AgentZone")
+            // The zone's press rule (OpenSpec change
+            // `agents-zone-focus-and-scroll` decision 1): a press, of any
+            // button, that no control under it took focuses the prompt. A
+            // control that takes focus (the text area, a permission's,
+            // the login row's or the queue row's buttons, stop, Continue)
+            // has already focused itself and prevented the default, so
+            // this does nothing for it; bubble listeners run child first.
+            // Without this, the zone tree's tracked focus would take the
+            // press and leave the keyboard in no stop.
+            .on_any_mouse_down(move |_, window, cx| {
+                if !window.default_prevented() {
+                    brindle_ui::focus_from_pointer(&prompt_handle, window, cx);
+                }
+            })
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::unqueue))
@@ -1249,8 +1337,14 @@ impl Render for AgentView {
             // A link shows the pointing hand only while ctrl is held: a
             // modifiers change with the pointer still reaches only the
             // focused path (the prompt input, inside this), so the frame is
-            // drawn again here for the links' pointer to follow it.
-            .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
+            // drawn again here for the links' pointer to follow it, when
+            // the gesture flipped and only then (decision 6).
+            .on_modifiers_changed(cx.listener(|this, event: &gpui::ModifiersChangedEvent, _, cx| {
+                if let Some(now) = link_gesture_flip(this.link_gesture, &event.modifiers) {
+                    this.link_gesture = now;
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &AgentScrollToBottom, _, cx| this.scroll_to_end(cx)))
             .on_action(cx.listener(|this, _: &ScrollToBottom, _, cx| this.scroll_to_end(cx)))
             .on_action(cx.listener(|this, _: &ScrollPageUp, _, cx| this.page(PageDirection::Up, cx)))
@@ -1263,6 +1357,14 @@ impl Render for AgentView {
             .font_family(family)
             .child(
                 FocusScope::new(&cx.entity())
+                    // Tab onto a permission button brings its block into
+                    // view (decision 4).
+                    .on_step({
+                        let view = cx.weak_entity();
+                        move |handle, _, cx| {
+                            view.update(cx, |this, cx| this.reveal_permission(handle, cx)).ok();
+                        }
+                    })
                     .size_full()
                     .min_h_0()
                     .flex()

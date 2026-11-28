@@ -65,7 +65,9 @@ rule, not a convenience.
     `Response`'s links). `TooltipFor` on a plain element can't, and keeps
     the window's set.
   - `FocusScope` and `FocusStops`: Tab and shift-Tab cycle through the stops a
-    view lists, and never leave it.
+    view lists, and never leave it. `on_step(callback)` tells the owner
+    which stop Tab or shift-Tab just focused (not a focus a press moved),
+    so it can bring a stop in a scrolled list into view.
   - `Anchored` and `place`: a box against its trigger on a side, aligned to
     its start, centre or end, flipping and clamping to stay in the window,
     or in a region of it given to `Anchored::within` (`place_within`).
@@ -339,12 +341,34 @@ rule, not a convenience.
     the list's first item, which the owner's indices don't count, so a page
     up from the first item's top scrolls it into view.
     `top_row_in_view()` says whether the last frame showed it, and
-    `on_top_row_view(callback)` is told when that changes. Items spliced in
-    at the owner's start leave every item in view where it was, except while
-    the row itself is in view: then the item that was first goes to the
-    view's top, moving up by what showed of the row. (GPUI's list draws its
-    top padding above whichever item is at its scroll position, so the row
-    can't live in the padding.)
+    `on_top_row_view(callback)` is told when that changes. (GPUI's list
+    draws its top padding above whichever item is at its scroll position,
+    so the row can't live in the padding.) Where the view is as items
+    change, its rules (OpenSpec change `agents-zone-focus-and-scroll`):
+    (1) following, the end stays in view whatever changes; away, (2) a
+    splice before the item at the top shifts its index and keeps its
+    offset, (3) one after it leaves it, (4) one that replaces it keeps its
+    index (or the last new item) and its offset, so an item growing at the
+    top keeps its lines in view, and (5) one that removes it puts the next
+    item at the top; (6) an insert at the owner's start leaves whether the
+    row is in view to the next frame, and away with the row the first item
+    in view puts the item that was first at the view's top, moving up by
+    what showed of the row; (7) an item at the top that shrank to its
+    offset or less gives the top to the next one; (8) `remeasure_all()`
+    measures every item again (a text size or font the owner changed),
+    keeping the item at the top at the same fraction of its height. Rules 7
+    and 8 settle after the frame that measured the item, one frame late.
+    The pure parts are `top_after_splice`, `settle_anchor` and
+    `inserts_at_start`. `reveal(ix)` scrolls the least distance that shows
+    an item whole, or its top when it is taller than the view, from what
+    the last frame showed (the pure `reveal_plan`), following the end again
+    when that shows the end; an item drawn whole stays put. An item the
+    last frame didn't draw takes a second frame when it is below the view,
+    since gpui knows its height only once it is drawn (the pure
+    `end_at_bottom`).
+    `on_items_view(callback)` tells the owner its items with any part in
+    view, after each frame that changed them (not while a reveal is still
+    moving the view).
   - `Message` and `Bubble`: one turn's text, the person's (`MessageFrom::User`)
     at the end on `muted`, as wide as its text up to four fifths of the
     row, the other side's (`Assistant`) at the start on the card with a
