@@ -295,7 +295,15 @@ impl serde::Serialize for ReplayRef<'_> {
 /// from its items, grouped by [`item_pieces`].
 fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
     match entry {
-        Entry::User { text } => replay_text(id, text, |text| Entry::User { text }, events),
+        Entry::User { text, attachments } => replay_text(
+            id,
+            text,
+            |text| Entry::User {
+                text,
+                attachments: attachments.clone(),
+            },
+            events,
+        ),
         Entry::Agent { text } => replay_text(id, text, |text| Entry::Agent { text }, events),
         Entry::Thought { text } => replay_text(id, text, |text| Entry::Thought { text }, events),
         Entry::Permission {
@@ -368,7 +376,12 @@ fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
 
 /// A text entry's `Added`, made by `entry` from its first piece, and an
 /// `Appended` for each piece after it.
-fn replay_text(id: EntryId, text: &str, entry: fn(String) -> Entry, events: &mut Vec<Event>) {
+fn replay_text(
+    id: EntryId,
+    text: &str,
+    entry: impl FnOnce(String) -> Entry,
+    events: &mut Vec<Event>,
+) {
     let mut pieces = chunks(text);
     let first = pieces.next().unwrap_or_default().to_string();
     events.push(Event::Added {
@@ -441,7 +454,7 @@ mod tests {
             let replay = transcript.replay();
             for event in &replay {
                 if let Event::Added { entry, .. } = event
-                    && let Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } =
+                    && let Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text } =
                         entry
                 {
                     assert!(text.len() <= TEXT_CHUNK);
@@ -540,10 +553,7 @@ mod tests {
 
     #[test]
     fn a_replay_carries_the_conversation_right_before_the_turn_and_the_agent() {
-        let held = Slot::Held {
-            text: "next".into(),
-            reason: HoldReason::AgentStopped,
-        };
+        let held = Slot::held("next", HoldReason::AgentStopped);
         let kept = conversation("s1", Continuation::Resume);
         let lost = AgentState::Lost {
             message: "its holder ended".into(),
@@ -595,10 +605,7 @@ mod tests {
 
     #[test]
     fn a_replay_holds_the_trim_the_entries_the_slot_the_turn_and_the_agent() {
-        let held = Slot::Held {
-            text: "again".into(),
-            reason: HoldReason::Failed,
-        };
+        let held = Slot::held("again", HoldReason::Failed);
         let transcript = fold(&[
             added(1, agent("old")),
             added(2, permission()),
@@ -742,7 +749,7 @@ mod tests {
         );
         // State events aren't entries: unchanged.
         copy.apply(&Event::Queue {
-            slot: Slot::Waiting { text: "next".into() },
+            slot: Slot::waiting("next"),
         })
         .unwrap();
         copy.apply(&Event::Turn { state: TurnState::Working }).unwrap();
@@ -801,10 +808,7 @@ mod tests {
     #[test]
     fn a_long_log_pages_its_newest_whole_entries_within_the_budget_then_its_state() {
         let mut server = long(10, 100);
-        let held = Slot::Held {
-            text: "again".into(),
-            reason: HoldReason::Failed,
-        };
+        let held = Slot::held("again", HoldReason::Failed);
         let titled = Conversation {
             title: Some("Hello.txt file creation".into()),
             ..conversation("s1", Continuation::Resume)

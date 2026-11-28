@@ -160,10 +160,7 @@ mod tests {
         let session = &adopted.session;
         assert_eq!(
             *session.transcript.slot(),
-            Slot::Held {
-                text: "second".into(),
-                reason: HoldReason::OutputLost
-            }
+            Slot::held("second", HoldReason::OutputLost)
         );
         assert_eq!(
             *session.transcript.turn(),

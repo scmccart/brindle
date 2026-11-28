@@ -2402,7 +2402,7 @@ mod tests {
             "content": {"type": "text", "text": text}}}}));
         let mut added: u64 = 0;
         for _ in 0..64 {
-            let out = core.step(Input::Command(Command::Prompt { text: "go on".into() }));
+            let out = core.step(Input::Command(Command::prompt("go on")));
             assert_eq!(out.reply, Some(Ok(())));
             let sent: brindle_remote_protocol::serde_json::Value =
                 brindle_remote_protocol::serde_json::from_slice(
@@ -2455,7 +2455,7 @@ mod tests {
         let text = "y".repeat(200);
         let mut call = 0u64;
         for _ in 0..500 {
-            let out = core.step(Input::Command(Command::Prompt { text: "go on".into() }));
+            let out = core.step(Input::Command(Command::prompt("go on")));
             assert_eq!(out.reply, Some(Ok(())));
             let sent: Value = brindle_remote_protocol::serde_json::from_slice(
                 out.stdin.split(|b| *b == b'\n').next().expect("a line"),

@@ -553,7 +553,7 @@ mod tests {
         let now = Instant::now();
         let out = step(
             &mut session,
-            Input::Command(Command::Prompt { text: "hi".into() }),
+            Input::Command(Command::prompt("hi")),
             now,
         );
         assert_eq!(

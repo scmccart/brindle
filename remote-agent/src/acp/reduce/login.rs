@@ -686,10 +686,7 @@ mod tests {
         assert_eq!(agent.entries().len(), log + 1);
         assert_eq!(
             *agent.s.transcript().slot(),
-            Slot::Held {
-                text: "two".into(),
-                reason: HoldReason::LoginRequired
-            }
+            Slot::held("two", HoldReason::LoginRequired)
         );
         assert_eq!(agent.cmd(Command::Resend).reply, Some(Ok(())));
         assert_eq!(agent.last("session/prompt")["params"]["sessionId"], json!("s1"));

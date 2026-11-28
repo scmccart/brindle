@@ -105,11 +105,11 @@ pub enum Taken {
 pub fn taken(prompt: &PromptSent, entries: &[(EntryId, Entry)], window: Option<Window>, slot: &Slot) -> Taken {
     let kept = crate::agent::transcript::clean(&prompt.text);
     let queued = match slot {
-        Slot::Waiting { text } | Slot::Held { text, .. } => *text == kept,
+        Slot::Waiting { text, .. } | Slot::Held { text, .. } => *text == kept,
         Slot::Empty => false,
     };
     let logged = entries.iter().any(|(id, entry)| {
-        prompt.after.is_none_or(|after| *id > after) && matches!(entry, Entry::User { text } if *text == kept)
+        prompt.after.is_none_or(|after| *id > after) && matches!(entry, Entry::User { text, .. } if *text == kept)
     });
     if queued || logged {
         return Taken::Yes;
@@ -593,7 +593,7 @@ mod tests {
         let mut zone = Zone::ready();
         zone.feed(&[added(1, user("hi")), turn(TurnState::Working)]);
         lose_prompt(&mut zone, "next", false);
-        let absorbed = zone.replay(&[ready(), added(1, user("hi")), turn(TurnState::Working), queue(Slot::Waiting { text: "next".into() })]);
+        let absorbed = zone.replay(&[ready(), added(1, user("hi")), turn(TurnState::Working), queue(Slot::waiting("next"))]);
         assert_eq!((absorbed.replied, zone.model.refusal()), (Some(Replied::ClearDraft), None));
     }
 

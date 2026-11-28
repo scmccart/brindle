@@ -196,7 +196,7 @@ pub(super) fn user_blocks(id: EntryId, text: &str, part: usize, from: usize) -> 
 pub(super) fn blocks_of(id: EntryId, entry: &Entry, rendered: &[Part], thought_open: bool, draw: ToolDraw) -> Vec<Block> {
     let one = |body| vec![Block { entry: id, part: 0, start: 0, last: true, body }];
     match entry {
-        Entry::User { text } => user_blocks(id, text, 0, 0),
+        Entry::User { text, .. } => user_blocks(id, text, 0, 0),
         Entry::Agent { .. } => rendered
             .iter()
             .enumerate()
@@ -601,7 +601,7 @@ impl ChatModel {
     pub fn message_text(&self, id: EntryId) -> Option<&str> {
         let index = self.entries.binary_search_by_key(&id, |(own, _)| *own).ok()?;
         match &self.entries[index].1 {
-            Entry::Agent { text } | Entry::User { text } => Some(text),
+            Entry::Agent { text } | Entry::User { text, .. } => Some(text),
             Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
         }
     }
@@ -615,7 +615,7 @@ impl ChatModel {
         let mut held = HeldText::default();
         for (_, entry) in &self.entries {
             held.entries += match entry {
-                Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
+                Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
                 Entry::Tool { content, .. } => content
                     .iter()
                     .map(|item| match item {
@@ -785,7 +785,7 @@ mod tests {
         let mut zone = Zone::ready();
         zone.feed(&[
             turn(TurnState::Working),
-            added(1, Entry::User { text: "go".into() }),
+            added(1, Entry::user("go")),
             added(2, thought("hmm")),
             added(3, permission("Run cargo test?")),
         ]);

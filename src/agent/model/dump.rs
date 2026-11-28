@@ -366,7 +366,7 @@ impl ChatModel {
 
     pub(super) fn entry_line(&self, id: EntryId, entry: &Entry) -> String {
         match entry {
-            Entry::User { text } => format!("user {text:?}"),
+            Entry::User { text, .. } => format!("user {text:?}"),
             Entry::Agent { text } => format!("agent {text:?}"),
             Entry::Thought { text } => format!("thought open={} {text:?}", self.thought_open(id)),
             Entry::Tool { call, title, kind, status, content, more, .. } => {

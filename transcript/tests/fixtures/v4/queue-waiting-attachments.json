@@ -1,0 +1,1 @@
+{"event":"queue","slot":{"attachments":[{"bytes":262144,"id":1,"kind":"text","name":"cargo test"},{"kind":"link","name":"main.rs","path":"src/main.rs"}],"slot":"waiting","text":"and then the tests"}}

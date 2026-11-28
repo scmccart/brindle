@@ -344,10 +344,10 @@ fn an_agent_sessions_frames_pass_through_a_relay_unchanged() {
         .find_map(|(entry, kind)| matches!(kind, Entry::Permission { .. }).then_some(entry.0))
         .expect("the permission request is in the log");
     client.prompt(id, "two").unwrap();
-    client.transcript_until(id, "has the prompt waiting", |log| *log.slot() == Slot::Waiting { text: "two".into() });
+    client.transcript_until(id, "has the prompt waiting", |log| *log.slot() == Slot::waiting("two"));
     client.answer(id, entry, Some("allow-once")).unwrap();
     let user_two = |log: &Transcript| {
-        log.entries().any(|(_, kind)| matches!(kind, Entry::User { text } if text == "two"))
+        log.entries().any(|(_, kind)| matches!(kind, Entry::User { text, .. } if text == "two"))
     };
     client.transcript_until(id, "runs the waiting prompt's turn", |log| {
         user_two(log) && *log.slot() == Slot::Empty && *log.turn() == TurnState::Working
@@ -359,7 +359,7 @@ fn an_agent_sessions_frames_pass_through_a_relay_unchanged() {
     client.transcript_until(id, "has the slot empty", |log| *log.slot() == Slot::Empty);
     client.prompt(id, "three").unwrap();
     client.cancel(id);
-    let held = Slot::Held { text: "three".into(), reason: HoldReason::Cancelled };
+    let held = Slot::held("three", HoldReason::Cancelled);
     client.transcript_until(id, "holds the prompt", |log| {
         *log.slot() == held && *log.turn() == TurnState::Ended { stop: StopReason::Cancelled }
     });

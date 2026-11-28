@@ -1587,7 +1587,7 @@ mod tests {
 
         fn start_turn(&mut self, text: &str) -> Vec<Event> {
             self.running = true;
-            let mut events = vec![self.added(Entry::User { text: text.into() }), Event::Turn { state: TurnState::Working }];
+            let mut events = vec![self.added(Entry::user(text)), Event::Turn { state: TurnState::Working }];
             match text {
                 "hi" => {
                     events.push(self.added(Entry::Agent { text: "hello back".into() }));
@@ -1624,22 +1624,22 @@ mod tests {
                 }
                 ToCore::AgentPrompt(prompt) if self.slot == Slot::Empty => {
                     ok(stream, prompt.req);
-                    let event = self.set_slot(Slot::Waiting { text: prompt.text.clone() });
+                    let event = self.set_slot(Slot::waiting(prompt.text.clone()));
                     transcript(stream, &[event]);
                 }
                 ToCore::AgentPrompt(prompt) => refuse(stream, prompt.req, "a prompt is already queued"),
                 ToCore::AgentCancel(_) if self.running => {
                     self.running = false;
                     let mut events = vec![Event::Turn { state: TurnState::Ended { stop: StopReason::Cancelled } }];
-                    if let Slot::Waiting { text } = self.slot.clone() {
-                        events.push(self.set_slot(Slot::Held { text, reason: HoldReason::Cancelled }));
+                    if let Slot::Waiting { text, attachments } = self.slot.clone() {
+                        events.push(self.set_slot(Slot::Held { text, reason: HoldReason::Cancelled, attachments }));
                     }
                     transcript(stream, &events);
                 }
                 ToCore::AgentResend(request) => match self.slot.clone() {
-                    Slot::Held { text, .. } if self.running => {
+                    Slot::Held { text, attachments, .. } if self.running => {
                         ok(stream, request.req);
-                        let event = self.set_slot(Slot::Waiting { text });
+                        let event = self.set_slot(Slot::Waiting { text, attachments });
                         transcript(stream, &[event]);
                     }
                     Slot::Held { text, .. } => {
@@ -1701,7 +1701,7 @@ mod tests {
     fn says(log: &Transcript) -> Vec<String> {
         log.entries()
             .filter_map(|(_, entry)| match entry {
-                Entry::User { text } => Some(format!("user: {text}")),
+                Entry::User { text, .. } => Some(format!("user: {text}")),
                 Entry::Agent { text } => Some(format!("agent: {text}")),
                 Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
             })
@@ -1984,7 +1984,7 @@ mod tests {
         let working = |log: &Transcript| *log.turn() == TurnState::Working;
         assert_eq!(shows(&mut agent.feed, "the turn", working), [reply(first)]);
         let second = agent.session.prompt("next").unwrap();
-        let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
+        let waiting = |log: &Transcript| *log.slot() == Slot::waiting("next");
         assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(second)]);
         let third = agent.session.prompt("third").unwrap();
         let refused = AgentEvent::Reply { request: third, outcome: Err("a prompt is already queued".into()) };
@@ -2011,10 +2011,10 @@ mod tests {
     #[test]
     fn a_cancel_holds_the_queued_prompt_which_is_resent_or_discarded() {
         let mut agent = agent_session("agent-held");
-        let held = |text: &str| Slot::Held { text: text.into(), reason: HoldReason::Cancelled };
+        let held = |text: &str| Slot::held(text, HoldReason::Cancelled);
         let first = agent.session.prompt("long").unwrap();
         let second = agent.session.prompt("next").unwrap();
-        let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
+        let waiting = |log: &Transcript| *log.slot() == Slot::waiting("next");
         assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(first), reply(second)]);
 
         assert_eq!(agent.session.cancel(), Ok(()));
@@ -2044,7 +2044,7 @@ mod tests {
 
         // A held prompt discarded.
         let more = agent.session.prompt("more").unwrap();
-        let queued = |log: &Transcript| *log.slot() == Slot::Waiting { text: "more".into() };
+        let queued = |log: &Transcript| *log.slot() == Slot::waiting("more");
         assert_eq!(shows(&mut agent.feed, "another queued", queued), [reply(more)]);
         assert_eq!(agent.session.cancel(), Ok(()));
         shows(&mut agent.feed, "it held", |log| *log.slot() == held("more"));

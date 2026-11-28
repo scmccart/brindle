@@ -106,7 +106,7 @@ impl Agent {
     }
 
     pub(super) fn prompt(&mut self, text: &str) -> Output {
-        self.cmd(Command::Prompt { text: text.into() })
+        self.cmd(Command::prompt(text))
     }
 
     /// The id of the last `session/prompt` written.
@@ -250,14 +250,11 @@ pub(super) const ALLOW_REJECT: [(&str, &str); 2] =
     [("allow-once", "allow_once"), ("reject-once", "reject_once")];
 
 pub(super) fn waiting(text: &str) -> Slot {
-    Slot::Waiting { text: text.into() }
+    Slot::waiting(text)
 }
 
 pub(super) fn held(text: &str, reason: HoldReason) -> Slot {
-    Slot::Held {
-        text: text.into(),
-        reason,
-    }
+    Slot::held(text, reason)
 }
 
 pub(super) fn ended(stop: StopReason) -> TurnState {

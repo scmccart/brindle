@@ -25,7 +25,7 @@ use std::path::PathBuf;
 use std::sync::Once;
 
 use brindle_transcript::{
-    AgentState, Continuation, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange,
+    AgentState, Attachment, AttachmentId, Continuation, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange,
     FileOp, HoldReason, Hunk, Location, LoginKind, LoginMethod, NoticeLevel, OptionCategory,
     OptionChoice, OptionControl, Output, PermissionKind, PermissionOption, PermissionOutcome,
     SessionOption, SlashCommand, Slot, StopReason, ToolItem, ToolKind, ToolStatus, TurnState,
@@ -79,6 +79,7 @@ forms!(agent_form, AGENT_FORMS, AgentState, "AgentState::":
 forms!(continuation_form, CONTINUATION_FORMS, Continuation, "Continuation::":
     ResumeAndLoad, Resume, Load, Neither);
 forms!(login_kind_form, LOGIN_KIND_FORMS, LoginKind, "LoginKind::": Agent, Terminal);
+forms!(attachment_form, ATTACHMENT_FORMS, Attachment, "Attachment::": Link, Text);
 
 fn expected_forms() -> Vec<&'static str> {
     [
@@ -102,6 +103,7 @@ fn expected_forms() -> Vec<&'static str> {
         EXIT_FORMS,
         CATEGORY_FORMS,
         CONTROL_FORMS,
+        ATTACHMENT_FORMS,
     ]
     .concat()
 }
@@ -154,7 +156,8 @@ fn entry_forms(entry: &Entry, forms: &mut Vec<&'static str>) {
             forms.extend(outcome.iter().map(outcome_form));
         }
         Entry::Notice { level, .. } => forms.push(notice_level_form(level)),
-        Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. } => {}
+        Entry::User { attachments, .. } => forms.extend(attachments.iter().map(attachment_form)),
+        Entry::Agent { .. } | Entry::Thought { .. } => {}
     }
 }
 
@@ -176,6 +179,7 @@ fn forms(event: &Event) -> Vec<&'static str> {
         Event::Answered { outcome, .. } => forms.push(outcome_form(outcome)),
         Event::Queue { slot } => {
             forms.push(slot_form(slot));
+            forms.extend(slot.attachments().iter().map(attachment_form));
             if let Slot::Held { reason, .. } = slot {
                 forms.push(hold_form(reason));
                 if let HoldReason::Stopped { stop } = reason {
@@ -285,11 +289,23 @@ fn tool_items(from: u32, items: Vec<ToolItem>) -> Event {
 
 fn held(reason: HoldReason) -> Event {
     Event::Queue {
-        slot: Slot::Held {
-            text: "and then the tests".into(),
-            reason,
-        },
+        slot: Slot::held("and then the tests", reason),
     }
+}
+
+/// A kept text and a link, in that order.
+fn attachments() -> Vec<Attachment> {
+    vec![
+        Attachment::Text {
+            id: AttachmentId(1),
+            name: "cargo test".into(),
+            bytes: 262_144,
+        },
+        Attachment::Link {
+            path: "src/main.rs".into(),
+            name: "main.rs".into(),
+        },
+    ]
 }
 
 fn turn(state: TurnState) -> Event {
@@ -319,9 +335,7 @@ fn fixtures() -> Vec<(&'static str, Event)> {
             "added-user",
             added(
                 1,
-                Entry::User {
-                    text: "Write notes.md\nwith a \"title\"\tand é".into(),
-                },
+                Entry::user("Write notes.md\nwith a \"title\"\tand é"),
             ),
         ),
         ("added-agent", added(2, Entry::Agent { text: "Hel".into() })),
@@ -483,8 +497,37 @@ fn fixtures() -> Vec<(&'static str, Event)> {
         (
             "queue-waiting",
             Event::Queue {
+                slot: Slot::waiting("and then the tests"),
+            },
+        ),
+        // OpenSpec change `agents-prompt-context`: a prompt's attachments,
+        // in an entry and in both slots that hold a prompt.
+        (
+            "added-user-attachments",
+            added(
+                1,
+                Entry::User {
+                    text: "why does this fail?".into(),
+                    attachments: attachments(),
+                },
+            ),
+        ),
+        (
+            "queue-waiting-attachments",
+            Event::Queue {
                 slot: Slot::Waiting {
                     text: "and then the tests".into(),
+                    attachments: attachments(),
+                },
+            },
+        ),
+        (
+            "queue-held-attachments",
+            Event::Queue {
+                slot: Slot::Held {
+                    text: "and then the tests".into(),
+                    reason: HoldReason::Cancelled,
+                    attachments: attachments(),
                 },
             },
         ),

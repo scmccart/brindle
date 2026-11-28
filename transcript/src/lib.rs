@@ -53,7 +53,8 @@ mod fuzz;
 mod harness;
 
 pub use event::{
-    AgentState, CALL_LIMIT, ContentBudget, Continuation, Conversation, DecodeError, DiffLine,
+    ATTACHMENT_TEXT, AgentState, Attachment, AttachmentId, MAX_ATTACHMENT_NAME, MAX_ATTACHMENTS,
+    CALL_LIMIT, ContentBudget, Continuation, Conversation, DecodeError, DiffLine,
     ENTRY_FRAMING, Entry, EntryId, Event, Exit, FileChange, FileOp, HUNK_FRAMING, HoldReason, Hunk,
     ITEM_LIMIT, LINE_FRAMING, Location, LoginKind, LoginMethod, MAX_CHOICES, MAX_COMMANDS,
     MAX_EVENT, MAX_ITEMS, MAX_LOCATIONS, MAX_OPTIONS, MAX_PATH, NoticeLevel, OptionCategory,
