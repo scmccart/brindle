@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::time::{Duration, Instant};
 
-use crate::cases::spawn_with;
+use crate::cases::{spawn_env, spawn_with};
 use crate::common::fake_agent;
 use crate::report::StreamResult;
 use crate::{Ctx, Measured, Result, ensure};
@@ -158,6 +158,48 @@ pub fn script(record: &Path, gate: &Path, pieces: &[&str]) -> String {
     lines.join("\n") + "\n"
 }
 
+/// The trickled run's spacing of the agent's writes (OpenSpec change
+/// `agents-absorb-cost`, decision 5): 2,048 chunks take about 20.5 s.
+pub const TRICKLE_MS: u64 = 10;
+
+/// `script` with a `pace ms` step right after its gate, so the sends after
+/// it trickle.
+pub fn paced(script: &str, ms: u64) -> String {
+    let mut out = String::with_capacity(script.len() + 16);
+    for line in script.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if line.starts_with("wait-file ") {
+            out.push_str(&format!("pace {ms}\n"));
+        }
+    }
+    out
+}
+
+/// `script` writing a file at `done` once its last send has gone, before
+/// the turn's end (`record-env`, the one step that writes a file).
+pub fn marking_done(script: &str, done: &Path) -> String {
+    let mut lines: Vec<String> = script.lines().map(String::from).collect();
+    let end = lines.iter().rposition(|line| line.starts_with("respond ")).unwrap_or(lines.len());
+    lines.insert(end, format!("record-env {}", done.display()));
+    lines.join("\n") + "\n"
+}
+
+/// Brindle's log line (`Agent::log_renders`) when the agent zone was left:
+/// its renders and the bytes they were given; the last one when there are
+/// several.
+pub fn render_counts(log: &str) -> Option<(u64, u64)> {
+    let line = log.lines().rev().find_map(|line| line.split_once("agent renders=").map(|(_, rest)| rest))?;
+    let mut fields = line.split_whitespace();
+    let renders = fields.next()?.parse().ok()?;
+    let bytes = fields.next()?.strip_prefix("bytes=")?.parse().ok()?;
+    Some((renders, bytes))
+}
+
+/// The filter the stream case's Brindle logs with, so the render counts are
+/// in its log.
+const RENDER_LOG: (&str, &str) = ("RUST_LOG", "brindle=debug,warn");
+
 /// The config: the perf suite's shell settings and an agent profile
 /// `Fake` running the fake agent `agent` on `script`.
 fn config(agent: &Path, script: &Path) -> String {
@@ -193,6 +235,18 @@ fn end(mut child: Child) {
 /// before the next run, its logs kept in `LABEL/`. Returns the time from
 /// the gate to the exit.
 fn run(ctx: &Ctx, agent: &Path, label: &str, last: &str, make: &dyn Fn(&Path, &Path) -> String) -> Result<Duration> {
+    run_env(ctx, agent, label, last, make, &[])
+}
+
+/// [`run`], with `env` set for Brindle.
+fn run_env(
+    ctx: &Ctx,
+    agent: &Path,
+    label: &str,
+    last: &str,
+    make: &dyn Fn(&Path, &Path) -> String,
+    env: &[(&str, &str)],
+) -> Result<Duration> {
     let record = ctx.dir.join(format!("{label}.jsonl"));
     let gate = ctx.dir.join(format!("{label}.gate"));
     let script_path = ctx.dir.join(format!("{label}.script"));
@@ -200,7 +254,7 @@ fn run(ctx: &Ctx, agent: &Path, label: &str, last: &str, make: &dyn Fn(&Path, &P
     let interval = STEP_INTERVAL.as_secs_f64().to_string();
     let args =
         ["agent", "Fake", "--no-restore", "-p", "go", "--step-interval", &interval, "--wait-for", last, "--action", "quit"];
-    let mut child = spawn_with(ctx, label, &config(agent, &script_path), &args)?;
+    let mut child = spawn_env(ctx, label, &config(agent, &script_path), &args, env)?;
 
     let asked = Instant::now();
     loop {
@@ -244,8 +298,17 @@ pub fn markdown_stream(ctx: &Ctx) -> Result<Measured> {
     }
     let text = answer();
     let streamed = chunks(&text, CHUNK_BYTES);
-    let streamed_time = run(ctx, &agent.path, "streamed", LAST_LINE, &|record, gate| script(record, gate, &streamed))?;
-    let whole_time = run(ctx, &agent.path, "whole", LAST_LINE, &|record, gate| script(record, gate, &[text.as_str()]))?;
+    let env = [RENDER_LOG];
+    let streamed_time =
+        run_env(ctx, &agent.path, "streamed", LAST_LINE, &|record, gate| script(record, gate, &streamed), &env)?;
+    let streamed_counts = logged_counts(ctx, "streamed")?;
+    let whole_time =
+        run_env(ctx, &agent.path, "whole", LAST_LINE, &|record, gate| script(record, gate, &[text.as_str()]), &env)?;
+    // The same chunks, about TRICKLE_MS apart, as a real agent writes them
+    // (OpenSpec change `agents-absorb-cost`, decision 5).
+    let trickled = |record: &Path, gate: &Path| paced(&script(record, gate, &streamed), TRICKLE_MS);
+    let trickled_time = run_env(ctx, &agent.path, "trickled", LAST_LINE, &trickled, &env)?;
+    let trickled_counts = logged_counts(ctx, "trickled")?;
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     Ok(Measured::Stream(StreamResult {
         bytes: text.len() as u64,
@@ -255,7 +318,18 @@ pub fn markdown_stream(ctx: &Ctx) -> Result<Measured> {
         difference_ms: ms(streamed_time) - ms(whole_time),
         small_ms: None,
         step_interval_ms: ms(STEP_INTERVAL),
+        trickled_ms: Some(ms(trickled_time)),
+        streamed_renders: Some(streamed_counts.0),
+        streamed_render_bytes: Some(streamed_counts.1),
+        trickled_renders: Some(trickled_counts.0),
+        trickled_render_bytes: Some(trickled_counts.1),
     }))
+}
+
+/// The render counts run `label`'s Brindle logged as it quit.
+fn logged_counts(ctx: &Ctx, label: &str) -> Result<(u64, u64)> {
+    let log = std::fs::read_to_string(ctx.dir.join(format!("{label}.log"))).unwrap_or_default();
+    render_counts(&log).ok_or_else(|| format!("{label}: no `agent renders=` line; see {label}.log"))
 }
 
 /// The reply, its chunks, the script and the run's readers (`--self-test`).
@@ -302,6 +376,25 @@ pub fn self_test() -> Result {
     let gave_up = "[2026-11-25T10:00:00Z WARN  brindle] --wait-for: \"End\" didn't appear within 30s";
     ensure!(wait_gave_up(&format!("info\n{gave_up}\n")), "a wait that gave up isn't seen");
     ensure!(!wait_gave_up("[INFO brindle] ready\n"), "a quiet log reads as a wait that gave up");
+
+    // a_render_count_line_reads_back: the zone's line as env_logger writes
+    // it, the last of several kept.
+    let logged = "[2026-11-28T10:00:00Z DEBUG brindle::agent] agent renders=12 bytes=3456\n\
+                  [2026-11-28T10:00:01Z DEBUG brindle::agent] agent renders=2049 bytes=67108864\n";
+    ensure!(render_counts(logged) == Some((2049, 67_108_864)), "read {:?}", render_counts(logged));
+    ensure!(render_counts("[INFO brindle] ready\n").is_none(), "a log without the line reads as counts");
+    ensure!(render_counts("agent renders=x bytes=1").is_none(), "a bad count reads");
+
+    // The trickled script paces the sends after the gate, and the latency
+    // case's marks its last send.
+    let base = script(record, &gate, &["a", "b"]);
+    let trickled: Vec<String> = paced(&base, TRICKLE_MS).lines().map(String::from).collect();
+    let at = trickled.iter().position(|l| l == "wait-file /case/g").ok_or("no gate")?;
+    ensure!(trickled[at + 1] == format!("pace {TRICKLE_MS}"), "no pace after the gate: {trickled:?}");
+    ensure!(trickled.len() == base.lines().count() + 1, "{trickled:?}");
+    let marked: Vec<String> = marking_done(&base, Path::new("/case/done")).lines().map(String::from).collect();
+    let n = marked.len();
+    ensure!(marked[n - 2] == "record-env /case/done" && marked[n - 3].starts_with("send "), "{marked:?}");
     Ok(())
 }
 
@@ -537,6 +630,7 @@ pub fn tool_output(ctx: &Ctx) -> Result<Measured> {
         difference_ms: ms(streamed_time) - ms(whole_time),
         small_ms: Some(ms(small_time)),
         step_interval_ms: ms(STEP_INTERVAL),
+        ..StreamResult::default()
     }))
 }
 
@@ -696,5 +790,93 @@ pub fn self_test_tool_output() -> Result {
     ensure!(delta["terminal_id"] == "t1" && delta["data"] == "a\"\n", "the first delta: {}", sends[0]);
     ensure!(sends[2].contains(r#""terminal_exit""#) && sends[2].contains(r#""status":"completed""#), "no exit: {}", sends[2]);
     ensure!(lines.last().is_some_and(|l| l == r#"respond {"stopReason":"end_turn"}"#), "no end of turn: {lines:?}");
+    Ok(())
+}
+
+// `agent-latency-quiet` and `agent-latency-trickle` (OpenSpec change
+// `agents-absorb-cost`, design.md decision 9): a shell's key echo beside an
+// agent zone that is idle, and beside one whose long reply trickles in
+// while the bench types. One reader thread serves both zones' sessions, so
+// this is what holding the fold's lock across a render costs a shell.
+
+/// The quiet case's reply, and what its `--wait-for` waits for before the
+/// bench.
+pub const QUIET_REPLY: &str = "A short reply, done.";
+
+/// What the agent zone shows once its session takes prompts.
+const ZONE_READY: &str = "--- prompt status=ready";
+
+/// The latency cases' Brindle arguments: a `Shell` tab, the agent split
+/// beside it, `go` sent once its prompt takes it, `wait` (if any) waited
+/// for in the agent zone, then focus back in the shell and the bench.
+pub fn latency_args(log: &str, samples: &str, wait: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = ["terminal", "Shell", "--no-restore", "--action", "split_agent_right", "--wait-for", ZONE_READY]
+        .map(String::from)
+        .to_vec();
+    args.extend(["--send", "go", "--key", "enter"].map(String::from));
+    if let Some(text) = wait {
+        args.extend(["--wait-for".to_string(), text.to_string()]);
+    }
+    args.extend(["--action", "focus_zone_left", "--latency-log", log, "--latency-bench", samples].map(String::from));
+    args
+}
+
+/// One latency run beside an agent zone whose agent plays `script` (its
+/// gate already open); `done` is the file the agent writes once its last
+/// chunk is sent, when it marks one.
+fn agent_latency(ctx: &Ctx, script_text: &str, wait: Option<&str>, done: Option<&Path>) -> Result<Measured> {
+    let agent = fake_agent::find(&ctx.default_bin);
+    if let Err(why) = fake_agent::check(&agent, &ctx.default_bin) {
+        return Ok(Measured::Skip(why));
+    }
+    let script_path = ctx.dir.join("agent.script");
+    std::fs::write(&script_path, script_text).map_err(|e| format!("writing the script: {e}"))?;
+    let log = ctx.dir.join("latency.jsonl");
+    let samples = ctx.samples.to_string();
+    let args = latency_args(log.to_str().ok_or("a non-UTF-8 path")?, &samples, wait);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let child = spawn_with(ctx, "brindle", &config(&agent.path, &script_path), &args)?;
+    // The steps, then each keystroke at most 1 s for its echo and a gap.
+    let limit = Duration::from_secs(120) + Duration::from_millis(1050) * (ctx.samples as u32 + 10);
+    let stdout = crate::cases::wait(child, "brindle", limit)?;
+    // Read as Brindle exits, the bench's end: still missing, the stream
+    // outlasted it.
+    let outlasted = done.map(|done| !done.exists());
+    ctx.save("brindle.out", &stdout);
+    let mut result = crate::report::parse_latency(&stdout).map_err(|e| format!("{e}; see brindle.log"))?;
+    ensure!(result.samples == ctx.samples as u64, "{} samples, expected {}", result.samples, ctx.samples);
+    if outlasted == Some(false) {
+        println!("         the reply ended before the bench did: part of it ran beside an idle zone");
+    }
+    result.stream_outlasted = outlasted;
+    Ok(Measured::Latency(result))
+}
+
+pub fn latency_quiet(ctx: &Ctx) -> Result<Measured> {
+    let (record, gate) = (ctx.dir.join("agent.jsonl"), ctx.dir.join("agent.gate"));
+    std::fs::write(&gate, b"").map_err(|e| format!("opening the gate: {e}"))?;
+    agent_latency(ctx, &script(&record, &gate, &[QUIET_REPLY]), Some(QUIET_REPLY), None)
+}
+
+pub fn latency_trickle(ctx: &Ctx) -> Result<Measured> {
+    let (record, gate, done) = (ctx.dir.join("agent.jsonl"), ctx.dir.join("agent.gate"), ctx.dir.join("stream.done"));
+    std::fs::write(&gate, b"").map_err(|e| format!("opening the gate: {e}"))?;
+    let text = answer();
+    let pieces = chunks(&text, CHUNK_BYTES);
+    let script_text = marking_done(&paced(&script(&record, &gate, &pieces), TRICKLE_MS), &done);
+    agent_latency(ctx, &script_text, None, Some(&done))
+}
+
+/// The latency cases' arguments (`--self-test`).
+pub fn self_test_latency() -> Result {
+    let args = latency_args("/case/l.jsonl", "500", Some(QUIET_REPLY));
+    let at = |word: &str| args.iter().position(|a| a == word).ok_or(format!("no {word}: {args:?}"));
+    ensure!(args[..3] == ["terminal", "Shell", "--no-restore"], "{args:?}");
+    ensure!(at("split_agent_right")? < at(ZONE_READY)?, "the wait for the zone comes after the split: {args:?}");
+    ensure!(at(ZONE_READY)? < at("go")? && at("go")? < at("enter")?, "the prompt is sent once the zone is ready");
+    ensure!(at("enter")? < at(QUIET_REPLY)? && at(QUIET_REPLY)? < at("focus_zone_left")?, "{args:?}");
+    ensure!(args.ends_with(&["--latency-log", "/case/l.jsonl", "--latency-bench", "500"].map(String::from)), "{args:?}");
+    let trickle = latency_args("/l", "5", None);
+    ensure!(!trickle.contains(&QUIET_REPLY.to_string()) && trickle.len() == args.len() - 2, "{trickle:?}");
     Ok(())
 }

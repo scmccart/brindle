@@ -18,6 +18,12 @@ pub struct LatencyResult {
     pub output: Percentiles,
     pub paint: Percentiles,
     pub frame: Percentiles,
+    /// Whether the agent's reply was still streaming when the bench ended
+    /// (`agent-latency-trickle`, OpenSpec change `agents-absorb-cost`): a
+    /// run whose stream ended first measured part of the bench beside an
+    /// idle zone. Absent from the other cases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_outlasted: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -51,6 +57,22 @@ pub struct StreamResult {
     /// The step interval Brindle waits between seeing the last line and
     /// quitting, part of both times.
     pub step_interval_ms: f64,
+    /// Gate to exit, the streamed run's chunks about 10 ms apart
+    /// (`agent-markdown-stream`'s third run, OpenSpec change
+    /// `agents-absorb-cost`); absent from the other cases and older runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trickled_ms: Option<f64>,
+    /// The Markdown renders the zone made in the streamed run, and the
+    /// bytes they were given (Brindle's `agent renders=` log line).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streamed_renders: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streamed_render_bytes: Option<u64>,
+    /// The same for the trickled run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trickled_renders: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trickled_render_bytes: Option<u64>,
 }
 
 /// A tool-heavy agent turn (OpenSpec change `agents-checkpoint-deltas`,
@@ -254,6 +276,11 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
         if small {
             header.push("32 B pieces".into());
         }
+        // The trickled run's columns, likewise.
+        let trickled = summary.stream.values().any(|result| result.trickled_ms.is_some());
+        if trickled {
+            header.extend(["trickled", "renders", "trickled renders"].map(String::from));
+        }
         let mut rows = vec![header];
         for (case, result) in &summary.stream {
             let base = baseline.and_then(|b| b.stream.get(case));
@@ -269,6 +296,15 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
                     Some(ms) => cell(ms, base.and_then(|b| b.small_ms), false),
                     None => "-".into(),
                 });
+            }
+            if trickled {
+                let count = |n: Option<u64>| n.map_or_else(|| "-".to_string(), |n| n.to_string());
+                row.push(match result.trickled_ms {
+                    Some(ms) => cell(ms, base.and_then(|b| b.trickled_ms), false),
+                    None => "-".into(),
+                });
+                row.push(count(result.streamed_renders));
+                row.push(count(result.trickled_renders));
             }
             rows.push(row);
         }

@@ -377,7 +377,6 @@ impl ChatModel {
     }
 
     /// How much the zone has rendered so far.
-    #[cfg(test)]
     pub fn render_stats(&self) -> RenderStats {
         self.stats
     }
