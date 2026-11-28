@@ -2135,7 +2135,9 @@ fn a_paused_pipe_sessions_stderr_is_still_read() {
         eventually(TIMEOUT, || !alive(pid)),
         "the program blocked writing its stderr"
     );
-    core.send(ToHolder::Resume(h1::SessionRef { session: 1 }));
+    // No `Resume`: the reaped session drains past the pause (OpenSpec change
+    // `agents-process-lifecycle`, decision 9) and ends, and with no session
+    // left the holder closes its connection, so a send would fail.
     let (_, stderr, code) = core.pipes_end(1);
     assert!(counted(COUNT).ends_with(&stderr) && !stderr.is_empty());
     assert_eq!(code, Some(0));
@@ -2185,7 +2187,11 @@ fn a_paused_pipe_session_whose_child_keeps_writing_ends_within_the_drain_limit()
     let (output, _, code) = core.pipes_end(1);
     assert_eq!(code, Some(0));
     assert!(output.len() <= BOUND, "{} bytes read past the pause", output.len());
-    assert!(output.iter().all(|&byte| matches!(byte, b'y' | b'\n' | b'\r')), "only the child's output");
+    // `cmd`'s `echo` keeps the space before its line end (`y…y \r\n`).
+    assert!(
+        output.iter().all(|&byte| matches!(byte, b'y' | b' ' | b'\n' | b'\r')),
+        "only the child's output"
+    );
     let child = until("the child's pid", TIMEOUT, || {
         std::fs::read_to_string(&child).ok().and_then(|pid| pid.trim().parse::<u32>().ok())
     });
