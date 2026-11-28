@@ -1250,6 +1250,57 @@ fn folding_a_tool_calls_pieces_equals_folding_their_concatenation_past_the_bound
     }
 }
 
+/// The zone's use (OpenSpec change `agents-absorb-cost`, decision 6): an
+/// output folded from `ToolOutput` events equals its first copy with the
+/// same deltas appended through the public [`Output::append`], past the
+/// limit, `omitted` and `partial` included.
+#[test]
+fn appending_through_the_public_append_matches_the_fold() {
+    let mut rng = XorShift::new(0xab_5c05);
+    for _ in 0..200 {
+        let header = Event::Added {
+            id: EntryId(1),
+            entry: Entry::tool("call_1".into(), "t".into(), ToolKind::Execute, ToolStatus::InProgress),
+        };
+        let mut transcript = Transcript::new();
+        transcript.apply(&header).unwrap();
+        transcript
+            .apply(&Event::ToolItems {
+                id: EntryId(1),
+                from: 0,
+                items: vec![ToolItem::Output(Output::default())],
+            })
+            .unwrap();
+        let mut copy: Option<Output> = None;
+        let count = 1 + rng.below(4);
+        for _ in 0..count {
+            let text = long_text(&mut rng, 0, ITEM_LIMIT / 2);
+            transcript
+                .apply(&Event::ToolOutput {
+                    id: EntryId(1),
+                    item: 0,
+                    text: text.clone(),
+                    exit: None,
+                })
+                .unwrap();
+            let Some(Entry::Tool { content, .. }) = transcript.entry(EntryId(1)) else {
+                panic!("the tool entry")
+            };
+            let [ToolItem::Output(folded)] = &content[..] else {
+                panic!("one output")
+            };
+            match &mut copy {
+                // The zone's first copy is the item itself.
+                None => copy = Some(folded.clone()),
+                Some(own) => {
+                    own.append(&text);
+                    assert_eq!(own, folded);
+                }
+            }
+        }
+    }
+}
+
 /// A hunk value near 0 or `u32::MAX`, with random lines, decodes to a hunk
 /// whose every line number fits, or is a decode error, never a panic.
 #[test]
