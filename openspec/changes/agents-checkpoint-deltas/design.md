@@ -324,6 +324,18 @@ Each includes the 1 s step interval before the quit.
 
 Decision 7's test (task 5.1), release build, at `877ffa0b`: it passes all three assertions. **32,264,203 bytes written** for 13,072,007 added, in 11,018 records, no trims: 2.5x what was added and half the bound of 63,570,460, against 2,123,919,660 before (66x less).
 
+The perf cases (task 7.4), release build at `eed667c6`, headless under `scripts/with-xvfb`, run `target-cd/tmp/perf/20261128T090343Z` against 1.3's `20261128T071449Z`. Each includes the 1 s step interval:
+
+| case | before (ms) | after (ms) |
+| --- | --- | --- |
+| `agent-attach-long` | 2,594 | 2,594 |
+| `agent-tool-output` streamed (256 × 4 KiB) | 2,258 | 2,251 |
+| `agent-tool-output` whole | 2,254 | 2,253 |
+| `agent-tool-output` small (32,768 × 32 B) | 2,211 | 2,207 |
+| `agent-tool-heavy` (3,000 calls, an 8 MiB line) | 4,237 | 2,248 |
+
+The tool-heavy turn takes 2 s less (47%), and now takes about what the other cases take (`agent-markdown-stream`: 2,270 against 2,268 before), mostly the step interval and the window's start. The others don't move: the attach is bounded by the page it replays, and the output runs by the client's fold, which `OutputText` makes O(delta) but which was never the limit at these sizes in a release build.
+
 ### Flags
 
 1. **The base is #157's head, not `main`.** Task 1.1 asks for `main` after changes 3 to 5 merged; this branch starts at #157's head before its merge, so the sites were read there.

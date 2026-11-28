@@ -129,16 +129,21 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 7. Docs and checks
 
-- [ ] 7.1 Update the docs:
+- [x] 7.1 Update the docs:
   - `docs/code-map.md`: the checkpoint's delta shape and tool epoch, the core's `Written` in `Stored`, the encode-once and sliced frames, `OutputText`, the diff memo.
   - `CLAUDE.md`: the perf suite's case list, adding `agent-tool-heavy` and `agent-tool-output`'s `small` run.
   - `docs/architecture/process-architecture.md`'s "How it applies here", if it describes segments as whole state.
 
   No architecture rule or exception changes. Verify by reading each changed paragraph against the code.
-- [ ] 7.2 Run the workspace checks: `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, and `cargo test -p brindle --test architecture`.
-- [ ] 7.3 Run the agent e2e cases headless, outside Brindle's scope: `systemd-run --user --scope scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent`. No case changes; they pin that nothing a user sees moved.
-- [ ] 7.4 Run the perf cases after, against 1.3's baseline: `cargo build --release && scripts/with-xvfb env BRINDLE_PERF=1 BRINDLE_PERF_BASELINE=<1.3's run dir> cargo test --test perf -- agent-`. Record `agent-attach-long`, `agent-tool-output` (`streamed`, `whole`, `small`) and `agent-tool-heavy` before and after in `design.md`'s As built. They report; they don't pass or fail (`testing R14`).
-- [ ] 7.5 Run `openspec validate agents-checkpoint-deltas --strict`.
+  Done: eed667c6; `process-architecture.md` already describes the stored checkpoint as a base and its segments, so it doesn't change.
+- [x] 7.2 Run the workspace checks: `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, and `cargo test -p brindle --test architecture`.
+  Done: every test passes (no flake this run), clippy is clean, and the architecture test's 53 pass.
+- [x] 7.3 Run the agent e2e cases headless, outside Brindle's scope: `systemd-run --user --scope scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent`. No case changes; they pin that nothing a user sees moved.
+  Done: 83 passed, 0 failed, 2 skipped (`remote-agent-ssh` and `remote-agent-login-terminal`: no static musl fake agent built here).
+- [x] 7.4 Run the perf cases after, against 1.3's baseline: `cargo build --release && scripts/with-xvfb env BRINDLE_PERF=1 BRINDLE_PERF_BASELINE=<1.3's run dir> cargo test --test perf -- agent-`. Record `agent-attach-long`, `agent-tool-output` (`streamed`, `whole`, `small`) and `agent-tool-heavy` before and after in `design.md`'s As built. They report; they don't pass or fail (`testing R14`).
+  Done: `agent-tool-heavy` 4,237 → 2,248 ms; the rest unchanged within 10 ms (As built (after)).
+- [x] 7.5 Run `openspec validate agents-checkpoint-deltas --strict`.
+  Done: valid.
 
 ## Workflow follow-up
 
