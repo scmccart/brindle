@@ -12,6 +12,12 @@ With STRIP_DIRS=1 it deletes `params.additionalDirectories` from
 them (what is logged is what the agent received), to show an agent as it
 behaved before Brindle named the attachment directory.
 
+With SET_OPTIONS="id=value;id=value" it sets those session config options
+itself (`session/set_config_option`) as soon as `session/new` answers, and
+keeps the answers from Brindle. The requests and answers are logged, with
+ids that start with `capture-`. That is how a run picks its permission
+mode.
+
 It is used as a profile's `command`, so it never writes to stdout itself.
 """
 
@@ -43,11 +49,19 @@ def main():
         sys.exit("usage: acp-log-wrapper.py --log FILE -- AGENT [ARGS...]")
     log_path, command = args[1], args[3:]
     strip = os.environ.get("STRIP_DIRS") == "1"
+    options = [
+        pair.split("=", 1)
+        for pair in os.environ.get("SET_OPTIONS", "").split(";")
+        if "=" in pair
+    ]
+    new_ids = set()
+    injected = set()
     log = open(log_path, "ab", buffering=0)
-    lock = threading.Lock()
+    log_lock = threading.Lock()
+    write_lock = threading.Lock()
 
     def record(direction, line):
-        with lock:
+        with log_lock:
             log.write(direction.encode() + b"\t" + line.rstrip(b"\r\n") + b"\n")
 
     child = subprocess.Popen(
@@ -58,13 +72,24 @@ def main():
         bufsize=0,
     )
 
+    def send(line):
+        with write_lock:
+            child.stdin.write(line.rstrip(b"\r\n") + b"\n")
+
     def to_agent():
         for line in iter(sys.stdin.buffer.readline, b""):
             if strip:
                 line = strip_dirs(line.decode("utf-8")).encode("utf-8")
             record("c>a", line)
+            if options:
+                try:
+                    message = json.loads(line)
+                    if message.get("method") == "session/new":
+                        new_ids.add(message.get("id"))
+                except ValueError:
+                    pass
             try:
-                child.stdin.write(line.rstrip(b"\r\n") + b"\n")
+                send(line)
             except OSError:
                 break
         try:
@@ -76,6 +101,30 @@ def main():
     out = sys.stdout.buffer
     for line in iter(child.stdout.readline, b""):
         record("a>c", line)
+        if options:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                message = {}
+            if message.get("id") in injected:
+                continue
+            session = (message.get("result") or {}).get("sessionId")
+            if session and message.get("id") in new_ids:
+                new_ids.discard(message.get("id"))
+                for number, (config, value) in enumerate(options):
+                    request_id = "capture-%d" % number
+                    injected.add(request_id)
+                    request = json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": request_id,
+                            "method": "session/set_config_option",
+                            "params": {"sessionId": session, "configId": config, "value": value},
+                        },
+                        separators=(",", ":"),
+                    ).encode()
+                    record("c>a", request)
+                    send(request)
         out.write(line)
         out.flush()
     sys.exit(child.wait())

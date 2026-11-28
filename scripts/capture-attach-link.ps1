@@ -17,9 +17,11 @@
 # Each run opens a Brindle window (it takes focus: don't type elsewhere) on a
 # private state, server and cache directory, with the agent behind
 # scripts/acp-log-wrapper.py, which writes the fixtures' `c>a`/`a>c` log. The
-# logs are named <agent>-<version>-attach-<run>.log in -OutDir (default
-# target\capture), with the screen dump (<agent>-<run>.dump.txt) beside them
-# and a summary.txt of what each agent's screen shows.
+# logs are named <agent>-<version>-attach-<run>[-perm-<value>][-at-<location>].log
+# in -OutDir (default target\capture), with the screen dump (<same>.dump.txt)
+# beside them and a summary.txt of what each agent's screen shows.
+#
+# The summary.txt in -OutDir collects each run's screen lines, run after run.
 #
 # The binary is $env:BRINDLE_BIN, else target\release\brindle.exe, else
 # target\debug\brindle.exe.
@@ -29,6 +31,22 @@ param(
     [string[]]$Agent = @('claude', 'codex', 'copilot', 'agy'),
     [ValidateSet('link', 'no-dirs', 'embedded')]
     [string[]]$Run = @('link', 'no-dirs', 'embedded'),
+    # Where the run's files sit (the agent's cwd and Brindle's attachments
+    # directory, which is what the link points into):
+    #   temp     both under %TEMP%, side by side (the default, and what the
+    #            first captures used)
+    #   appdata  the cwd under the profile directory, the attachments under
+    #            %LOCALAPPDATA%: two separate trees, as in a real install
+    #   home     both under the profile directory, side by side
+    [ValidateSet('temp', 'appdata', 'home')]
+    [string[]]$Location = @('temp'),
+    # The agent's permission setting for the run, set through its mode option
+    # (Copilot: its Permissions option) as soon as the session exists:
+    # `untouched` leaves the agent's own, `all` is every other value it offers,
+    # or name values (claude: default acceptEdits plan auto bypassPermissions,
+    # codex: read-only workspace-write agent agent-full-access, copilot: off
+    # auto on, agy: default accept-edits auto plan).
+    [string[]]$Perm = @('untouched'),
     [string]$OutDir,
     # Seconds a run waits for the agent's answer before it dumps the screen.
     [int]$Settle = 75,
@@ -61,30 +79,47 @@ $wrapper = Join-Path $PSScriptRoot 'acp-log-wrapper.py'
 # What each agent runs. `dirs` is whether its `initialize` advertises
 # sessionCapabilities.additionalDirectories, so `no-dirs` means something.
 $agents = @{
-    claude  = @{ command = @('cmd', '/c', 'npx', '-y', '@agentclientprotocol/claude-agent-acp'); dirs = $true }
-    codex   = @{ command = @('cmd', '/c', 'npx', '-y', '@agentclientprotocol/codex-acp'); dirs = $true }
-    copilot = @{ command = @('copilot', '--acp', '--model', 'auto'); dirs = $false }
-    agy     = @{ command = @('agy', 'acp'); dirs = $true }
+    claude  = @{ command = @('cmd', '/c', 'npx', '-y', '@agentclientprotocol/claude-agent-acp'); dirs = $true
+                 option = 'mode'; initial = 'auto'; values = @('default', 'acceptEdits', 'plan', 'auto', 'bypassPermissions') }
+    codex   = @{ command = @('cmd', '/c', 'npx', '-y', '@agentclientprotocol/codex-acp'); dirs = $true
+                 option = 'mode'; initial = 'agent'; values = @('read-only', 'workspace-write', 'agent', 'agent-full-access') }
+    copilot = @{ command = @('copilot', '--acp', '--model', 'auto'); dirs = $false
+                 option = 'allow_all'; initial = 'off'; values = @('off', 'auto', 'on') }
+    agy     = @{ command = @('agy', 'acp'); dirs = $true
+                 option = 'mode'; initial = 'default'; values = @('default', 'accept-edits', 'auto', 'plan') }
 }
 
 function ConvertTo-Toml([string]$Text) { '"' + ($Text -replace '\\', '\\' -replace '"', '\"') + '"' }
 
-function Invoke-Capture([string]$Name, [string]$Kind) {
+function Invoke-Capture([string]$Name, [string]$Kind, [string]$Where, [string]$Setting) {
     $spec = $agents[$Name]
     if ($Kind -eq 'no-dirs' -and -not $spec.dirs) {
         Write-Host "capture: $Name advertises no additionalDirectories: skipping no-dirs"
         return
     }
     $stem = "$Name-$Kind"
-    $dir = Join-Path ([System.IO.Path]::GetTempPath()) "brindle-capture-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $project = Join-Path $dir 'project'
-    foreach ($sub in 'state', 'server', 'cache', 'project') {
-        New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null
+    if ($Setting -ne 'untouched') { $stem += "-perm-$Setting" }
+    if ($Where -ne 'temp') { $stem += "-at-$Where" }
+    $id = "brindle-capture-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $dir = Join-Path ([System.IO.Path]::GetTempPath()) $id
+    $home_ = Join-Path $env:USERPROFILE $id
+    $local = Join-Path $env:LOCALAPPDATA $id
+    # Where the agent's cwd and the attachments directory sit.
+    switch ($Where) {
+        'temp'    { $project = Join-Path $dir 'project'; $cache = Join-Path $dir 'cache' }
+        'appdata' { $project = Join-Path $home_ 'project'; $cache = Join-Path $local 'cache' }
+        'home'    { $project = Join-Path $home_ 'project'; $cache = Join-Path $home_ 'cache' }
+    }
+    foreach ($path in (Join-Path $dir 'state'), (Join-Path $dir 'server'), $project, $cache) {
+        New-Item -ItemType Directory -Path $path -Force | Out-Null
     }
     $log = Join-Path $dir 'raw.log'
     $args = @($wrapper, '--log', $log, '--') + $spec.command
     $argsToml = ($args | ForEach-Object { ConvertTo-Toml $_ }) -join ', '
-    $env_ = if ($Kind -eq 'no-dirs') { 'env = { STRIP_DIRS = "1" }' } else { '' }
+    $vars = @()
+    if ($Kind -eq 'no-dirs') { $vars += 'STRIP_DIRS = "1"' }
+    if ($Setting -ne 'untouched') { $vars += "SET_OPTIONS = $(ConvertTo-Toml "$($spec.option)=$Setting")" }
+    $env_ = if ($vars) { "env = { $($vars -join ', ') }" } else { '' }
     $config = @"
 default_profile = "PowerShell"
 scrollback_lines = 100000
@@ -128,11 +163,11 @@ $env_
     $names = 'BRINDLE_CONFIG', 'BRINDLE_STATE_DIR', 'BRINDLE_SERVER_DIR', 'BRINDLE_CACHE_DIR', 'BRINDLE_SERVER_HELPER'
     foreach ($n in $names) { $previous[$n] = [Environment]::GetEnvironmentVariable($n) }
     try {
-        Write-Host "capture: $stem (window opens; $Settle s)"
+        Write-Host "capture: $stem (window opens; $Settle s; files in $project and $cache)"
         $env:BRINDLE_CONFIG = $configPath
         $env:BRINDLE_STATE_DIR = Join-Path $dir 'state'
         $env:BRINDLE_SERVER_DIR = Join-Path $dir 'server'
-        $env:BRINDLE_CACHE_DIR = Join-Path $dir 'cache'
+        $env:BRINDLE_CACHE_DIR = $cache
         if (Test-Path -LiteralPath $helper) { $env:BRINDLE_SERVER_HELPER = $helper }
         $quoted = ($argList | ForEach-Object {
             if ($_ -ne '' -and $_ -notmatch '[\s"]') { $_ } else { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }
@@ -151,7 +186,7 @@ $env_
     }
 
     $summary = Join-Path $OutDir 'summary.txt'
-    Add-Content -LiteralPath $summary -Value "=== $stem"
+    Add-Content -LiteralPath $summary -Value "=== $stem (location $Where; permission $Setting; attachments $cache)"
     if (Test-Path -LiteralPath $dump) {
         Get-Content -LiteralPath $dump |
             Where-Object { $_ -match '^--- (agent zone|entry \d+ (user|agent|tool|permission|notice)|attached|location|permission|item entry=\d+ index=\d+ kind=text|wait-for)' } |
@@ -165,19 +200,29 @@ $env_
     if (Test-Path -LiteralPath $log) {
         $init = Get-Content -LiteralPath $log | Where-Object { $_ -match 'agentInfo' } | Select-Object -First 1
         if ($init -match '"agentInfo":\{[^}]*"version":"([^"]*)"') { $version = $Matches[1] }
-        Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir "$Name-$version-attach-$Kind.log") -Force
+        Copy-Item -LiteralPath $log -Destination (Join-Path $OutDir ("$Name-$version-attach-" + $stem.Substring($Name.Length + 1) + '.log')) -Force
     } else {
         Write-Warning "capture: $stem wrote no log"
     }
-    Copy-Item -LiteralPath (Join-Path $dir 'cache') -Destination (Join-Path $OutDir "$stem.cache") -Recurse -Force -ErrorAction SilentlyContinue
-    for ($try = 0; $try -lt 20 -and (Test-Path -LiteralPath $dir); $try++) {
-        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $dir) { Start-Sleep -Milliseconds 250 }
+    foreach ($path in $dir, $home_, $local) {
+        for ($try = 0; $try -lt 20 -and (Test-Path -LiteralPath $path); $try++) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $path) { Start-Sleep -Milliseconds 250 }
+        }
     }
 }
 
-Remove-Item -LiteralPath (Join-Path $OutDir 'summary.txt') -ErrorAction SilentlyContinue
 foreach ($name in $Agent) {
-    foreach ($kind in $Run) { Invoke-Capture $name $kind }
+    $spec = $agents[$name]
+    $settings = foreach ($value in $Perm) {
+        if ($value -eq 'all') { $spec.values | Where-Object { $_ -ne $spec.initial } }
+        elseif ($value -eq 'untouched' -or $spec.values -contains $value) { $value }
+        else { Write-Warning "capture: $name has no permission value '$value' (it offers $($spec.values -join ', '))" }
+    }
+    foreach ($where in $Location) {
+        foreach ($setting in $settings) {
+            foreach ($kind in $Run) { Invoke-Capture $name $kind $where $setting }
+        }
+    }
 }
 Write-Host "capture: logs and dumps in $OutDir"
