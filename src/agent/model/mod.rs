@@ -102,6 +102,31 @@ pub struct Absorbed {
     pub replied: Option<Replied>,
 }
 
+/// How much Markdown the zone rendered (OpenSpec change
+/// `agents-absorb-cost`, decision 4): each render of an agent message, a
+/// thought or a tool's text item, and the bytes each was given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    pub renders: u64,
+    pub bytes: u64,
+}
+
+impl RenderStats {
+    /// One render of `source`.
+    fn rendered(&mut self, source: &str) {
+        self.renders += 1;
+        self.bytes += source.len() as u64;
+    }
+
+    /// One render of `entry`, when it is Markdown.
+    fn rendered_entry(&mut self, entry: &Entry) {
+        match entry {
+            Entry::Agent { text } | Entry::Thought { text } => self.rendered(text),
+            Entry::User { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => {}
+        }
+    }
+}
+
 /// What a change compares against.
 struct Before {
     status: Option<State>,
@@ -135,6 +160,8 @@ pub struct ChatModel {
     rendered: BTreeMap<EntryId, Vec<Part>>,
     /// The renderer panicked once (logged once).
     render_failed: bool,
+    /// How much the zone rendered, logged when it is left.
+    stats: RenderStats,
     blocks: Vec<Block>,
     /// Thoughts the user opened or closed.
     toggled: BTreeMap<EntryId, bool>,
@@ -228,6 +255,7 @@ impl ChatModel {
             entries: Vec::new(),
             rendered: BTreeMap::new(),
             render_failed: false,
+            stats: RenderStats::default(),
             blocks: Vec::new(),
             toggled: BTreeMap::new(),
             auto_open: None,
@@ -348,6 +376,12 @@ impl ChatModel {
         self.agent_name.clone().unwrap_or_else(|| self.profile.clone())
     }
 
+    /// How much the zone has rendered so far.
+    #[cfg(test)]
+    pub fn render_stats(&self) -> RenderStats {
+        self.stats
+    }
+
     fn before(&self) -> Before {
         Before { status: self.shown_status(), title: self.title(), queue: self.queue.clone(), working: self.working_row().is_some() }
     }
@@ -365,6 +399,9 @@ impl ChatModel {
             self.texts.clear();
             let renders: Vec<_> =
                 self.entries.iter().map(|(id, entry)| (*id, render_entry(entry), text_items(entry))).collect();
+            for (_, entry) in &self.entries {
+                self.stats.rendered_entry(entry);
+            }
             for (id, render, items) in renders {
                 self.keep_render(id, render);
                 self.keep_texts(id, items);
@@ -404,6 +441,7 @@ impl ChatModel {
                     if matches!(entry, Entry::User { .. }) {
                         self.last_user = Some(id);
                     }
+                    self.stats.rendered_entry(entry);
                     self.keep_render(id, render_entry(entry));
                     self.keep_texts(id, text_items(entry));
                     let fresh = self.draw(id, entry, false);
@@ -584,6 +622,45 @@ mod tests {
         let absorbed = zone.feed(&[conversation_event(Continuation::Resume), ready()]);
         assert!(absorbed.title_changed);
         assert_eq!(zone.model.title(), "Fake");
+    }
+
+    /// OpenSpec change `agents-absorb-cost` decision 5's guard: the frames
+    /// one drained update takes render a growing message once, however
+    /// many of them appended to it.
+    #[test]
+    #[ignore = "agents-absorb-cost 5.4"]
+    fn a_batch_of_appends_absorbed_in_one_update_renders_the_message_once() {
+        use crate::agent::transcript::Event;
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("hi")), added(2, agent("Hel"))]);
+        let before = zone.model.render_stats().renders;
+        let append = |text: &str| [Event::Appended { id: EntryId(2), text: text.into() }];
+        zone.feed_batch(&[&append("lo"), &append(" the"), &append("re")]);
+        assert_eq!(zone.model.render_stats().renders - before, 1);
+        assert_eq!(zone.model.message_text(EntryId(2)), Some("Hello there"));
+    }
+
+    /// Decision 8's table on a fixed conversation: a tool's text item is
+    /// held once beside its entry and once rendered, however its row is
+    /// drawn.
+    #[test]
+    #[ignore = "agents-absorb-cost 5.7"]
+    fn held_text_counts_the_copies() {
+        use crate::agent::tool::RowState;
+        use crate::agent::transcript::ToolItem;
+        let mut zone = Zone::ready();
+        let tool = in_progress("c1", vec![ToolItem::Text { text: "abcdefgh".repeat(512), cut: false }]);
+        zone.feed(&[
+            added(1, user(&"u".repeat(2048))),
+            turn(TurnState::Working),
+            added(2, agent(&"a".repeat(10 * 1024))),
+            added(3, tool),
+        ]);
+        assert_eq!(row(&zone.model, 3).0, RowState::Open);
+        let held = zone.model.held_text();
+        assert_eq!(held.entries, 2048 + 10 * 1024 + 4096, "{held:?}");
+        assert_eq!((held.user_parts, held.rendered, held.text_renders), (2048, 10 * 1024, 4096), "{held:?}");
+        assert_eq!((held.text_sources, held.detail_sources), (0, 0), "the tool text held once beside its entry: {held:?}");
     }
 
     /// The end of a replay brings a reconnecting link back up, and does

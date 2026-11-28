@@ -41,6 +41,19 @@ impl Zone {
         self.absorb()
     }
 
+    /// One drained update: each slice folded as one `TRANSCRIPT` frame and
+    /// absorbed, in order.
+    pub(super) fn feed_batch(&mut self, frames: &[&[Event]]) -> Vec<Absorbed> {
+        frames
+            .iter()
+            .map(|events| {
+                let values: Vec<_> = events.iter().map(Event::to_value).collect();
+                self.shared.apply(&values).unwrap();
+                self.absorb()
+            })
+            .collect()
+    }
+
     pub(super) fn absorb(&mut self) -> Absorbed {
         let changes = self.shared.take_changes();
         self.model.absorb(self.shared.transcript(), changes)
