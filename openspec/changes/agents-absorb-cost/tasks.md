@@ -92,7 +92,11 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 11. Checks
 
-- [ ] 11.1 `cargo test --workspace` passes.
-- [ ] 11.2 `cargo clippy --locked --workspace --all-targets -- -D warnings` passes.
-- [ ] 11.3 `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent` passes (every agent case), run outside Brindle's scope (`systemd-run --user --scope`) as the suite's scope check needs.
-- [ ] 11.4 `BRINDLE_PERF=1 cargo test --test perf -- --self-test` passes, and group 9's numbers are recorded.
+- [x] 11.1 `cargo test --workspace` passes.
+  - Done at 35e6772c: every target passes (brindle unit 1345 with the base's 2 env-gated ignored); no known flake fired.
+- [x] 11.2 `cargo clippy --locked --workspace --all-targets -- -D warnings` passes.
+  - Done at 35e6772c.
+- [x] 11.3 `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent` passes (every agent case), run outside Brindle's scope (`systemd-run --user --scope`) as the suite's scope check needs.
+  - Done at 35e6772c: 83 passed, 0 failed, 2 skipped (`remote-agent-ssh` and `remote-agent-login-terminal`: the static musl fake agent wasn't built in this run's target directory).
+- [x] 11.4 `BRINDLE_PERF=1 cargo test --test perf -- --self-test` passes, and group 9's numbers are recorded.
+  - Done: 12 self-tests ok; group 9's numbers are in design.md's "After (task 9.1)".
