@@ -14,7 +14,7 @@ use brindle_transcript::EntryId;
 
 use super::dialect::Dialect;
 use super::envelope::Id;
-use super::forms::{Continued, OptionKey, Request};
+use super::forms::{Continued, OptionKey, PromptPart, Request};
 
 /// The most permission requests an agent may have waiting at once; one
 /// past it is answered `cancelled` at once, with a notice (decision 4).
@@ -154,22 +154,28 @@ impl Rpc {
         self.dialect.encode(Request::Authenticate { id, method })
     }
 
-    /// A new conversation in `cwd` (already absolute), with no MCP servers.
-    pub fn new_session(&mut self, cwd: &str) -> Vec<u8> {
+    /// A new conversation in `cwd` (already absolute), with no MCP servers,
+    /// and `directories` in its scope beside it.
+    pub fn new_session(&mut self, cwd: &str, directories: &[String]) -> Vec<u8> {
         let id = self.request(Purpose::NewSession);
-        self.dialect.encode(Request::NewSession { id, cwd })
+        self.dialect.encode(Request::NewSession {
+            id,
+            cwd,
+            directories,
+        })
     }
 
     /// Continues conversation `session` in `cwd` (its own directory) with
-    /// no replay, with no MCP servers.
-    pub fn resume(&mut self, session: &str, cwd: &str) -> Vec<u8> {
-        self.continuing(Purpose::Resume, Continued::Resume, session, cwd)
+    /// no replay, with no MCP servers, and `directories` as
+    /// [`new_session`](Self::new_session) has them.
+    pub fn resume(&mut self, session: &str, cwd: &str, directories: &[String]) -> Vec<u8> {
+        self.continuing(Purpose::Resume, Continued::Resume, session, cwd, directories)
     }
 
     /// Continues conversation `session` in `cwd`, replayed first, as
     /// [`resume`](Self::resume).
-    pub fn load(&mut self, session: &str, cwd: &str) -> Vec<u8> {
-        self.continuing(Purpose::Load, Continued::Load, session, cwd)
+    pub fn load(&mut self, session: &str, cwd: &str, directories: &[String]) -> Vec<u8> {
+        self.continuing(Purpose::Load, Continued::Load, session, cwd, directories)
     }
 
     fn continuing(
@@ -178,6 +184,7 @@ impl Rpc {
         how: Continued,
         session: &str,
         cwd: &str,
+        directories: &[String],
     ) -> Vec<u8> {
         let id = self.request(purpose);
         self.dialect.encode(Request::Continue {
@@ -185,6 +192,7 @@ impl Rpc {
             how,
             session,
             cwd,
+            directories,
         })
     }
 
@@ -250,10 +258,10 @@ impl Rpc {
         Some(req)
     }
 
-    /// A prompt of one text block.
-    pub fn prompt(&mut self, session: &str, text: &str) -> Vec<u8> {
+    /// A prompt of `parts`, the user's text first.
+    pub fn prompt(&mut self, session: &str, parts: &[PromptPart<'_>]) -> Vec<u8> {
         let id = self.request(Purpose::Prompt);
-        self.dialect.encode(Request::Prompt { id, session, text })
+        self.dialect.encode(Request::Prompt { id, session, parts })
     }
 
     /// The request a response or error answers, which is then no longer
@@ -502,7 +510,7 @@ mod tests {
         let mut rpc = Rpc::new();
         rpc.initialize("0.3.0");
         assert_eq!(
-            text(&rpc.new_session("/home/user/scratch")),
+            text(&rpc.new_session("/home/user/scratch", &[])),
             captured(CLAUDE, r#"{"jsonrpc":"2.0","id":2,"method":"session/new""#)
         );
     }
@@ -512,12 +520,12 @@ mod tests {
         let mut rpc = Rpc::from_parts(7, BTreeMap::new(), BTreeMap::new())
             .unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(
-            text(&rpc.resume("sess-1", "/home/u/src")),
+            text(&rpc.resume("sess-1", "/home/u/src", &[])),
             "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"session/resume\",\"params\":\
              {\"sessionId\":\"sess-1\",\"cwd\":\"/home/u/src\",\"mcpServers\":[]}}\n"
         );
         assert_eq!(
-            text(&rpc.load("sess-1", "C:\\Users\\u \"x\"")),
+            text(&rpc.load("sess-1", "C:\\Users\\u \"x\"", &[])),
             "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"session/load\",\"params\":\
              {\"sessionId\":\"sess-1\",\"cwd\":\"C:\\\\Users\\\\u \\\"x\\\"\",\"mcpServers\":[]}}\n"
         );
@@ -543,13 +551,18 @@ mod tests {
         let prompt = params["prompt"][0]["text"].as_str().unwrap_or_default();
         let mut rpc = Rpc::from_parts(4, BTreeMap::new(), BTreeMap::new())
             .unwrap_or_else(|e| panic!("{e:?}"));
-        assert_eq!(text(&rpc.prompt(session, prompt)), want);
+        assert_eq!(text(&say(&mut rpc, session, prompt)), want);
+    }
+
+    /// A prompt of `text` alone.
+    fn say(rpc: &mut Rpc, session: &str, text: &str) -> Vec<u8> {
+        rpc.prompt(session, &[PromptPart::Text(text)])
     }
 
     #[test]
     fn text_with_newlines_quotes_and_controls_stays_on_one_line() {
         let awkward = "line one\nline \"two\"\t\u{1b}[31m\u{2028}é";
-        let bytes = Rpc::new().prompt("s\n", awkward);
+        let bytes = say(&mut Rpc::new(), "s\n", awkward);
         assert_eq!(bytes.iter().filter(|b| **b == b'\n').count(), 1);
         assert_eq!(bytes.last(), Some(&b'\n'));
         let Ok(Message::Request { params, .. }) = decode(&bytes[..bytes.len() - 1]) else {
@@ -616,10 +629,19 @@ mod tests {
         let mut rpc = Rpc::new();
         for bytes in [
             rpc.initialize("0.3.0"),
-            rpc.new_session("/"),
-            rpc.resume("s\n", "/"),
-            rpc.load("s", "/\n"),
-            rpc.prompt("s", "hi"),
+            rpc.new_session("/", &[]),
+            rpc.new_session("/", &["/c\n".to_owned()]),
+            rpc.resume("s\n", "/", &[]),
+            rpc.load("s", "/\n", &["/c".to_owned()]),
+            say(&mut rpc, "s", "hi"),
+            rpc.prompt(
+                "s",
+                &[
+                    PromptPart::Text("hi"),
+                    PromptPart::Link { uri: "file:///a\n", name: "a\"" },
+                    PromptPart::Embedded { uri: "file:///c/1", name: "n", text: "x\n\u{1b}" },
+                ],
+            ),
             rpc.authenticate("m\n"),
             cancel("s"),
             cancel_request(9),
@@ -641,8 +663,8 @@ mod tests {
     fn requests_get_ids_from_1_up_each_with_its_purpose() {
         let mut rpc = Rpc::new();
         rpc.initialize("0.3.0");
-        rpc.new_session("/");
-        rpc.prompt("s", "hi");
+        rpc.new_session("/", &[]);
+        say(&mut rpc, "s", "hi");
         assert_eq!(rpc.next_id(), 4);
         assert_eq!(
             rpc.outgoing()
@@ -679,8 +701,8 @@ mod tests {
     #[test]
     fn forgetting_a_purpose_drops_only_its_requests() {
         let mut rpc = Rpc::new();
-        rpc.new_session("/");
-        rpc.prompt("s", "hi");
+        rpc.new_session("/", &[]);
+        say(&mut rpc, "s", "hi");
         assert!(rpc.forget(Purpose::Prompt));
         assert!(!rpc.forget(Purpose::Prompt));
         assert_eq!(
@@ -744,7 +766,7 @@ mod tests {
     fn closing_forgets_every_request_and_keeps_counting() {
         let mut rpc = Rpc::new();
         rpc.initialize("0.3.0");
-        rpc.prompt("s", "hi");
+        say(&mut rpc, "s", "hi");
         let string = Id::parse(&json!("p4")).unwrap_or_else(|| panic!("not an id"));
         assert_eq!(rpc.hold_permission(EntryId(4), string.clone()), Ok(()));
         assert_eq!(rpc.hold_permission(EntryId(1), Id::number(0)), Ok(()));

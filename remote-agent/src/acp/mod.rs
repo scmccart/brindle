@@ -41,4 +41,5 @@ pub mod lines;
 pub mod plain;
 pub mod reduce;
 pub mod rpc;
+pub mod uri;
 pub mod v1;

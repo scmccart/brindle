@@ -4,18 +4,18 @@ use std::time::Instant;
 
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 use brindle_transcript::{
-    Continuation, Conversation, Entry, EntryId, Event, ITEM_LIMIT, LoginMethod, ReplayRef,
-    TEXT_CHUNK, ToolItem, Transcript,
+    Attachment, Continuation, Conversation, Entry, EntryId, Event, ITEM_LIMIT, LoginMethod,
+    ReplayRef, TEXT_CHUNK, ToolItem, Transcript,
 };
 
 use crate::acp::dialect::{Dialect, Unsupported};
 use crate::acp::envelope::Id;
-use crate::acp::forms::OptionKey;
+use crate::acp::forms::{OptionKey, PromptSupport};
 use crate::acp::lines::{Lines, Partial};
 use crate::acp::plain::{self, Mode};
 use crate::acp::reduce::{
     AfterLogin, AgentSession, BadRun, Greeting, Log, Login, OpenOutput, Phase, Replay, Run,
-    Process, RunKind, Start, ToolBook, tool_index,
+    Process, RunKind, Start, Store, ToolBook, tool_index,
 };
 use crate::acp::rpc::{Purpose, Rpc};
 
@@ -202,6 +202,25 @@ pub(super) fn write_state(
     }
     if !session.modes.is_empty() {
         state.value("modes", &json!(session.modes))?;
+    }
+    // Where the session keeps attached text, and what its agent takes in a
+    // prompt (OpenSpec change `agents-prompt-context`, design decision 3):
+    // small and bounded, so whole in every record (`agents-checkpoint-
+    // deltas` decision 4), and left out when unset, so a state written
+    // before reads as a session with no store and an agent that takes
+    // text alone.
+    if session.store != Store::default() {
+        state.value("store", &store_value(&session.store))?;
+    }
+    if session.prompts != PromptSupport::default() || session.directories {
+        state.value(
+            "prompts",
+            &json!({
+                "embedded": session.prompts.embedded,
+                "images": session.prompts.images,
+                "directories": session.directories,
+            }),
+        )?;
     }
     match body {
         Body::Log(log) => serde_json::to_writer(state.key("log")?, &log),
@@ -594,6 +613,31 @@ pub(super) fn restore(
         Some(modes) => serde_json::from_value(modes.clone())
             .map_err(|_| Unreadable::Field { name: "modes" })?,
     };
+    let store = match state.get("store") {
+        None => Store::default(),
+        Some(store) => restore_store(store).ok_or(Unreadable::Field { name: "store" })?,
+    };
+    let (prompts, directories) = match state.get("prompts") {
+        None => (PromptSupport::default(), false),
+        Some(prompts) => {
+            let flag = |name| prompts.get(name).and_then(Value::as_bool);
+            match (flag("embedded"), flag("images"), flag("directories")) {
+                (Some(embedded), Some(images), Some(directories)) => {
+                    (PromptSupport { embedded, images }, directories)
+                }
+                _ => return Err(Unreadable::Field { name: "prompts" }),
+            }
+        }
+    };
+    // Each kept text the log and the slot name is one the store gave out.
+    let named = transcript
+        .entries()
+        .flat_map(|(_, entry)| entry.attachments().iter())
+        .chain(transcript.slot().attachments())
+        .filter_map(Attachment::kept);
+    if named.into_iter().any(|id| id.0 == 0 || id.0 >= store.next) {
+        return Err(Unreadable::Field { name: "store" });
+    }
     // Each key is a held option's.
     if keys.len() != transcript.options().len()
         || transcript
@@ -689,6 +733,40 @@ pub(super) fn restore(
         chose,
         keys,
         modes,
+        store,
+        prompts,
+        directories,
+        texts: BTreeMap::new(),
+    })
+}
+
+/// The session's store as the state's `store` object.
+fn store_value(store: &Store) -> Value {
+    json!({
+        "root": store.root,
+        "name": store.name,
+        "next": store.next,
+        "keep_days": store.keep_days,
+        "home": store.home,
+        "windows": store.windows,
+    })
+}
+
+/// A `store` object read back; `None` when a field is missing or of the
+/// wrong type.
+fn restore_store(value: &Value) -> Option<Store> {
+    let text = |name| value.get(name).and_then(Value::as_str).map(str::to_owned);
+    let home = match value.get("home") {
+        None | Some(Value::Null) => None,
+        Some(home) => Some(home.as_str()?.to_owned()),
+    };
+    Some(Store {
+        root: text("root")?,
+        name: text("name")?,
+        next: value.get("next")?.as_u64()?,
+        keep_days: u32::try_from(value.get("keep_days")?.as_u64()?).ok()?,
+        home,
+        windows: value.get("windows")?.as_bool()?,
     })
 }
 
@@ -1221,6 +1299,78 @@ mod tests {
             decode(&rebuild(&state, &partial), agent.now),
             Err(Unreadable::Field { name: "lists" })
         );
+    }
+
+    /// OpenSpec change `agents-prompt-context`, decision 3: the store and
+    /// the agent's prompt support round-trip whole; the kept texts don't;
+    /// a state from before reads as no store and text alone.
+    #[test]
+    fn the_store_and_prompt_support_round_trip_and_kept_texts_do_not() {
+        let mut agent = Agent {
+            s: AgentSession::new("/w".into(), "0.3.0".into()),
+            now: Instant::now(),
+        };
+        *agent.s.store_mut() = Store {
+            root: "/home/u/.cache/brindle/attachments".into(),
+            name: "20261128-ab12".into(),
+            next: 1,
+            keep_days: 14,
+            home: Some("/home/u".into()),
+            windows: false,
+        };
+        agent.step(Input::Spawned);
+        agent.feed(&result(
+            1,
+            json!({"protocolVersion": 1, "agentCapabilities": {
+                "promptCapabilities": {"embeddedContext": true},
+                "sessionCapabilities": {"additionalDirectories": {}}}}),
+        ));
+        agent.feed(&result(2, json!({"sessionId": "s1"})));
+        let id = agent.s.store_mut().take_id();
+        agent.s.texts.insert(id, "ok".into());
+        agent.step(Input::Command(Command::Prompt {
+            text: "t".into(),
+            attachments: vec![Attachment::Text {
+                id,
+                name: "n".into(),
+                bytes: 2,
+            }],
+        }));
+        let restored = agent.round_trip();
+        assert_eq!(restored.store(), agent.s.store());
+        assert!(restored.prompts.embedded && restored.directories);
+        assert!(restored.texts.is_empty(), "kept texts aren't checkpointed");
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
+        assert_eq!(state["store"]["next"], json!(2));
+        assert_eq!(
+            state["prompts"],
+            json!({"embedded": true, "images": false, "directories": true})
+        );
+        // A log naming an id the store never gave out is unreadable.
+        state["store"]["next"] = json!(1);
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field { name: "store" })
+        );
+        state["store"]["windows"] = json!("no");
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field { name: "store" })
+        );
+        state["prompts"] = json!({"embedded": true});
+        state["store"] = json!({"root": "/r", "name": "s", "next": 2, "keep_days": 1, "home": null, "windows": false});
+        assert_eq!(
+            decode(&rebuild(&state, &partial), agent.now),
+            Err(Unreadable::Field { name: "prompts" })
+        );
+        // A state from before: no store, no prompt support (and so no
+        // attachment it could name).
+        let plain = creating();
+        let (mut state, partial) = state_of(&encode(&plain.s).expect("it fits").bytes);
+        assert!(state.get("store").is_none() && state.get("prompts").is_none());
+        state.as_object_mut().unwrap().remove("store");
+        let decoded = decode(&rebuild(&state, &partial), plain.now).unwrap();
+        assert_eq!((decoded.store(), decoded.prompts, decoded.directories), (&Store::default(), PromptSupport::default(), false));
     }
 
     #[test]

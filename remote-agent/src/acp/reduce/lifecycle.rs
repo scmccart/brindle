@@ -478,6 +478,17 @@ impl Step<'_> {
         }
     }
 
+    /// The directories a session's start names beside its own (OpenSpec
+    /// change `agents-prompt-context`, decision 6, by its conservative
+    /// reading until task 1.1's captures say which agents need it): the
+    /// store's, for every agent that takes more directories.
+    fn directories(&self) -> Vec<String> {
+        match self.s.store.dir() {
+            Some(dir) if self.s.directories => vec![dir],
+            Some(_) | None => Vec::new(),
+        }
+    }
+
     /// `initialize`'s answer, read in the version it names.
     fn speaking(&mut self, dialect: Dialect, start: Start, result: Value) {
         self.s.rpc.speak(dialect);
@@ -494,6 +505,8 @@ impl Step<'_> {
                     continuation: initialized.continuation,
                 };
                 self.s.lists = initialized.lists;
+                self.s.prompts = initialized.prompts;
+                self.s.directories = initialized.directories;
                 self.keep_methods(methods);
                 self.start(start, greeting);
             }
@@ -507,9 +520,10 @@ impl Step<'_> {
     /// replay's notice first), or a refusal when neither is offered. No
     /// continue falls back to `session/new`.
     pub(super) fn start(&mut self, start: Start, greeting: Greeting) {
+        let directories = self.directories();
         let (conversation, log) = match start {
             Start::New => {
-                let line = self.s.rpc.new_session(&self.s.cwd);
+                let line = self.s.rpc.new_session(&self.s.cwd, &directories);
                 self.s.phase = Phase::Creating { greeting };
                 self.out.stdin.extend(line);
                 self.mark(Moment::BeforeRequest);
@@ -520,7 +534,7 @@ impl Step<'_> {
         };
         let line = match choose(log, greeting.continuation) {
             Choice::Resume => {
-                let line = self.s.rpc.resume(&conversation.id, &conversation.cwd);
+                let line = self.s.rpc.resume(&conversation.id, &conversation.cwd, &directories);
                 self.s.phase = Phase::Resuming {
                     greeting,
                     conversation: conversation.id,
@@ -532,7 +546,7 @@ impl Step<'_> {
                 if replay == Replay::Shown {
                     self.notice(NoticeLevel::Info, REPLAY_SHOWN.to_owned());
                 }
-                let line = self.s.rpc.load(&conversation.id, &conversation.cwd);
+                let line = self.s.rpc.load(&conversation.id, &conversation.cwd, &directories);
                 self.s.phase = Phase::Loading {
                     greeting,
                     conversation: conversation.id,

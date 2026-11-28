@@ -130,7 +130,9 @@ pub const MAX_SESSION_ID: usize = 1024;
 /// What a whole checkpoint holds beside the log, the partial line, the
 /// login methods and the open outputs: the state events, the phase with its
 /// greeting, login and conversation, the pending permissions' ids, the run,
-/// the lines' state, the option keys and modes, the headers.
+/// the lines' state, the option keys and modes, the attachment store (three
+/// paths of at most `MAX_PATH` bytes, set at the spawn) and the prompt
+/// support, the headers.
 pub const STATE_SLACK: usize = 3 * 1024 * 1024;
 
 /// An event's tag, id and field names, at most.

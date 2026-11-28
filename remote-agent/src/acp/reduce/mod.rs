@@ -53,14 +53,15 @@ use brindle_remote_protocol::RequestId;
 use brindle_remote_protocol::client::OptionValue;
 use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::{
-    AgentState, Attachment, Conversation, Entry, EntryId, Event, LoginMethod, NoticeLevel, Slot,
-    Transcript, TurnState, chunks, clean,
+    AgentState, Attachment, AttachmentId, Conversation, Entry, EntryId, Event, LoginMethod,
+    NoticeLevel, Slot, Transcript, TurnState, chunks, clean,
 };
 use brindle_transcript::{HoldReason, MAX_EVENT};
 
 use super::envelope::{self, Malformed, Message, RpcError};
 use super::forms::{
-    self, Content, NotificationKind, OptionKey, Patch, Refusal, Request, RequestKind, Update,
+    self, Content, NotificationKind, OptionKey, Patch, PromptSupport, Refusal, Request,
+    RequestKind, Update,
 };
 use super::limits::{ENTRY_LIMIT, LOG_LIMIT, LOG_TRIM_TO, MAX_PROMPT};
 use super::lines::{Lines, Piece};
@@ -69,6 +70,9 @@ use super::rpc::{Purpose, Rpc};
 use text::bound;
 use tools::placeholder;
 
+pub use attach::Store;
+
+pub mod attach;
 mod lifecycle;
 mod list;
 mod login;
@@ -187,6 +191,20 @@ pub struct AgentSession {
     /// kept across a stop (decision 12), so a run whose first list is in
     /// another mode says so.
     pub(super) modes: BTreeMap<String, String>,
+    /// Where the session keeps attached text (OpenSpec change
+    /// `agents-prompt-context`): set by the core's shell at the spawn,
+    /// checkpointed whole.
+    pub(super) store: Store,
+    /// What the agent takes in a prompt, from its `initialize`: read again
+    /// from each agent a continue starts (design decision 13).
+    pub(super) prompts: PromptSupport,
+    /// Whether the agent takes the store's directory into its session's
+    /// scope (`sessionCapabilities.additionalDirectories`, decision 6).
+    pub(super) directories: bool,
+    /// The kept texts the session's prompts name, read by the core's shell
+    /// before each step that may send one (decision 6); never
+    /// checkpointed. One missing here is missing from the store.
+    pub texts: BTreeMap<AttachmentId, String>,
 }
 
 impl AgentSession {
@@ -227,11 +245,32 @@ impl AgentSession {
             chose: false,
             keys: BTreeMap::new(),
             modes: BTreeMap::new(),
+            store: Store::default(),
+            prompts: PromptSupport::default(),
+            directories: false,
+            texts: BTreeMap::new(),
         }
     }
 
     pub fn transcript(&self) -> &Transcript {
         &self.transcript
+    }
+
+    /// Where the session keeps attached text.
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    /// The store, for the core's shell to set at the spawn and take ids
+    /// from at an attach.
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
+    /// The kept texts the queue slot's prompt names: what the core's shell
+    /// keeps read in [`AgentSession::texts`] beside a prompt's own.
+    pub fn slot_texts(&self) -> Vec<AttachmentId> {
+        attach::kept_ids(self.transcript.slot().attachments()).collect()
     }
 
     /// Whether the agent has ended (exited, or lost with its holder) and
@@ -455,6 +494,11 @@ pub enum Refused {
     /// one hung up is closed (OpenSpec change `agents-process-lifecycle`,
     /// decision 1).
     Restarted,
+    /// A prompt with more than `MAX_ATTACHMENTS` attachments (OpenSpec
+    /// change `agents-prompt-context`).
+    TooManyAttachments { count: usize },
+    /// A prompt linking a path past `MAX_PATH` bytes, which can't be cut.
+    PathTooLong { len: usize },
 }
 
 impl fmt::Display for Refused {
@@ -509,6 +553,16 @@ impl fmt::Display for Refused {
                 f.write_str("an earlier change of an option hasn't been answered yet")
             }
             Self::Restarted => f.write_str("the agent is started again after its login"),
+            Self::TooManyAttachments { count } => write!(
+                f,
+                "a prompt takes at most {} attachments, not {count}",
+                brindle_transcript::MAX_ATTACHMENTS
+            ),
+            Self::PathTooLong { len } => write!(
+                f,
+                "an attached path is {len} bytes, over the limit of {}",
+                brindle_transcript::MAX_PATH
+            ),
         }
     }
 }
