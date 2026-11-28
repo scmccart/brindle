@@ -4760,10 +4760,6 @@ fn each_attachment_refusal_says_why_and_a_refused_prompt_leaves_no_file() {
         refusal(client.attach_text(id, 1, "b", "two\n")),
         format!("session {id}: upload 1 is already on this connection")
     );
-    assert_eq!(
-        refusal(client.prompt_with(id, "hi", vec![text(1), text(7)])),
-        format!("session {id}: this connection holds no upload 7")
-    );
     let nine = (0..9).map(|n| link(&format!("f{n}"))).collect();
     assert_eq!(
         refusal(client.prompt_with(id, "hi", nine)),
@@ -4780,22 +4776,28 @@ fn each_attachment_refusal_says_why_and_a_refused_prompt_leaves_no_file() {
     );
     assert_eq!(files_in(&store), ["1"], "nothing refused was kept");
 
-    // A refused prompt's uploads go, files and all.
+    // A refused prompt's uploads go, files and all, whatever refused it.
     assert_eq!(refusal(client.prompt_with(id, "hi", vec![text(1)])), format!("session {id}: the agent isn't ready"));
     assert_eq!(files_in(&store), Vec::<String>::new());
     assert_eq!(
         refusal(client.prompt_with(id, "hi", vec![text(1)])),
         format!("session {id}: this connection holds no upload 1")
     );
+    client.attach_text(id, 2, "b", "two\n").unwrap();
+    assert_eq!(
+        refusal(client.prompt_with(id, "hi", vec![text(2), text(7)])),
+        format!("session {id}: this connection holds no upload 7")
+    );
+    assert_eq!(files_in(&store), Vec::<String>::new());
 
     gate.open();
     client.transcript_until(id, "is ready", ready);
-    client.attach_text(id, 2, "c", "three\n").unwrap();
-    client.prompt_with(id, "now", vec![text(2)]).unwrap();
+    client.attach_text(id, 3, "c", "three\n").unwrap();
+    client.prompt_with(id, "now", vec![text(3)]).unwrap();
     let log = client.transcript_until(id, "has the turn's end", ended(1));
-    // Ids are never reused: the refused prompt's 1 stays taken.
-    assert_eq!(user_attachments(&log, 0), [kept_text(2, "c", "three\n")]);
-    assert_eq!(files_in(&store), ["2"]);
+    // Ids are never reused: the refused prompts' 1 and 2 stay taken.
+    assert_eq!(user_attachments(&log, 0), [kept_text(3, "c", "three\n")]);
+    assert_eq!(files_in(&store), ["3"]);
     assert_eq!(prompts(&record), ["now"]);
 }
 
