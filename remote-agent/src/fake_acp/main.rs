@@ -172,6 +172,7 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
             }
             Step::Send { line } => write_line(&mut output, line)?,
             Step::SendRaw { text } => write_line(&mut output, text)?,
+            Step::SendPart { text } => write_text(&mut output, text)?,
             Step::Respond { result } => {
                 let id = answering(last.as_ref())?;
                 write_text(&mut output, &script::result_line(id, result))?;

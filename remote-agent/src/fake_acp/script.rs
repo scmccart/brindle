@@ -33,6 +33,11 @@
 //!   written.
 //! - `send-raw <text>`: write the text as a line, whatever it is (lines
 //!   that aren't JSON, unknown variants).
+//! - `send-part <text>`: write the text with no line end and flush, so a
+//!   run of them and a `send-raw` after make one long line arriving in
+//!   pieces (OpenSpec change `agents-checkpoint-deltas`). The text is
+//!   trimmed, as every step's argument is, so a piece neither starts nor
+//!   ends with a space.
 //! - `respond <json>`: answer the last request an `expect` matched with
 //!   that `result`; a notification matched since (`session/cancel`)
 //!   doesn't change which.
@@ -90,6 +95,10 @@ pub enum Step {
         line: String,
     },
     SendRaw {
+        text: String,
+    },
+    /// Written with no line end, so pieces make one long line.
+    SendPart {
         text: String,
     },
     Respond {
@@ -256,6 +265,7 @@ pub fn parse(text: &str) -> Result<Script, BadScript> {
             | Step::ExpectResponse { .. }
             | Step::Send { .. }
             | Step::SendRaw { .. }
+            | Step::SendPart { .. }
             | Step::Respond { .. }
             | Step::RespondError { .. }
             | Step::RespondTo { .. }
@@ -304,6 +314,9 @@ fn step(word: &str, rest: &str) -> Result<Step, Problem> {
         }
         "send-raw" => Step::SendRaw {
             text: rest.to_owned(),
+        },
+        "send-part" => Step::SendPart {
+            text: needed("send-part", "some text")?,
         },
         "respond" => Step::Respond {
             result: json_value("respond", &needed("respond", "a JSON result")?)?,
@@ -619,6 +632,17 @@ mod tests {
                 text: String::new()
             }
         );
+    }
+
+    #[test]
+    fn send_part_keeps_its_text_and_needs_some() {
+        assert_eq!(
+            one(r#"send-part {"jsonrpc":"2.0","#),
+            Step::SendPart {
+                text: r#"{"jsonrpc":"2.0","#.into()
+            }
+        );
+        assert!(parse("send-part\n").is_err());
     }
 
     #[test]

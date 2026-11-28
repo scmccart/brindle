@@ -253,6 +253,7 @@ pub fn markdown_stream(ctx: &Ctx) -> Result<Measured> {
         streamed_ms: ms(streamed_time),
         whole_ms: ms(whole_time),
         difference_ms: ms(streamed_time) - ms(whole_time),
+        small_ms: None,
         step_interval_ms: ms(STEP_INTERVAL),
     }))
 }
@@ -522,6 +523,11 @@ pub fn tool_output(ctx: &Ctx) -> Result<Measured> {
         run(ctx, &agent.path, "streamed", OUTPUT_LAST_LINE, &|record, gate| output_script(record, gate, &deltas))?;
     let whole_time =
         run(ctx, &agent.path, "whole", OUTPUT_LAST_LINE, &|record, gate| output_script(record, gate, &[text.as_str()]))?;
+    // A-4 of the agent review: past the kept 64 KiB, each small delta once
+    // moved the whole kept text (OpenSpec change `agents-checkpoint-deltas`).
+    let small = chunks(&text, SMALL_DELTA_BYTES);
+    let small_time =
+        run(ctx, &agent.path, "small", OUTPUT_LAST_LINE, &|record, gate| output_script(record, gate, &small))?;
     let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     Ok(Measured::Stream(StreamResult {
         bytes: text.len() as u64,
@@ -529,8 +535,132 @@ pub fn tool_output(ctx: &Ctx) -> Result<Measured> {
         streamed_ms: ms(streamed_time),
         whole_ms: ms(whole_time),
         difference_ms: ms(streamed_time) - ms(whole_time),
+        small_ms: Some(ms(small_time)),
         step_interval_ms: ms(STEP_INTERVAL),
     }))
+}
+
+/// The `small` run's delta size.
+pub const SMALL_DELTA_BYTES: usize = 32;
+
+// `agent-tool-heavy` (OpenSpec change `agents-checkpoint-deltas`, design.md
+// decision 15): a turn of permission-gated tool calls and one long line,
+// the conversation whose checkpoints once grew with every call.
+
+/// The turn's tool calls.
+pub const HEAVY_CALLS: usize = 3_000;
+/// The long line's length, without its line end: the longest line the
+/// server keeps (`acp::lines::MAX_LINE`).
+pub const HEAVY_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// The pieces the long line is written in.
+pub const HEAVY_PIECE_BYTES: usize = 64 * 1024;
+/// The turn's last message, and what Brindle's `--wait-for` waits for.
+pub const HEAVY_LAST: &str = "End of the tool-heavy turn.";
+
+/// One `session/update` line of `update` (JSON), as the agent writes it.
+fn update_line(update: &str) -> String {
+    format!(r#"{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"s1","update":{update}}}}}"#)
+}
+
+/// The long line: a completed `tool_call_update` of a new call whose diff
+/// item's new text fills it to exactly [`HEAVY_LINE_BYTES`]. Compact JSON
+/// of `z`s, so no piece starts or ends with a space.
+pub fn heavy_line() -> String {
+    let around = |fill: &str| {
+        update_line(&format!(
+            r#"{{"sessionUpdate":"tool_call_update","toolCallId":"toolu_big","status":"completed","content":[{{"type":"diff","path":"/w/big.txt","oldText":null,"newText":"{fill}"}}]}}"#
+        ))
+    };
+    around(&"z".repeat(HEAVY_LINE_BYTES - around("").len()))
+}
+
+/// The fake agent's script: ready at once, recording what it is sent in
+/// `record`; on the prompt it waits for `gate`, then makes
+/// [`HEAVY_CALLS`] tool calls, each a `tool_call`, a
+/// `session/request_permission`, a `$/cancel_request` withdrawing it and
+/// a completing `tool_call_update`; then writes [`heavy_line`] in pieces
+/// of [`HEAVY_PIECE_BYTES`] (`send-part`) and its line end; then sends
+/// [`HEAVY_LAST`] and ends the turn.
+pub fn tool_heavy_script(record: &Path, gate: &Path) -> String {
+    let mut lines = vec![
+        format!("record {}", record.display()),
+        "expect initialize".to_string(),
+        r#"respond {"protocolVersion":1,"agentInfo":{"name":"Fake Agent","version":"1.0"}}"#.to_string(),
+        "expect session/new".to_string(),
+        r#"respond {"sessionId":"s1"}"#.to_string(),
+        "expect session/prompt".to_string(),
+        format!("wait-file {}", gate.display()),
+    ];
+    for n in 0..HEAVY_CALLS {
+        let call = format!("toolu_{n:024x}");
+        lines.push(send_update(&format!(
+            r#"{{"sessionUpdate":"tool_call","toolCallId":"{call}","title":"Run","kind":"execute","status":"pending"}}"#
+        )));
+        lines.push(format!(
+            r#"send {{"jsonrpc":"2.0","id":"p{n}","method":"session/request_permission","params":{{"sessionId":"s1","toolCall":{{"toolCallId":"{call}"}},"options":[{{"optionId":"allow","name":"Allow","kind":"allow_once"}},{{"optionId":"reject","name":"Reject","kind":"reject_once"}}]}}}}"#
+        ));
+        lines.push(format!(r#"send {{"jsonrpc":"2.0","method":"$/cancel_request","params":{{"requestId":"p{n}"}}}}"#));
+        lines.push(send_update(&format!(
+            r#"{{"sessionUpdate":"tool_call_update","toolCallId":"{call}","status":"completed","content":[{{"type":"content","content":{{"type":"text","text":"done {n}"}}}}]}}"#
+        )));
+    }
+    let line = heavy_line();
+    lines.extend(chunks(&line, HEAVY_PIECE_BYTES).into_iter().map(|piece| format!("send-part {piece}")));
+    lines.push("send-raw".to_string());
+    lines.push(send_update(&format!(
+        r#"{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":"{HEAVY_LAST}"}}}}"#
+    )));
+    lines.push(r#"respond {"stopReason":"end_turn"}"#.to_string());
+    lines.join("\n") + "\n"
+}
+
+pub fn tool_heavy(ctx: &Ctx) -> Result<Measured> {
+    let agent = fake_agent::find(&ctx.default_bin);
+    if let Err(why) = fake_agent::check(&agent, &ctx.default_bin) {
+        return Ok(Measured::Skip(why));
+    }
+    let took = run(ctx, &agent.path, "heavy", HEAVY_LAST, &tool_heavy_script)?;
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    Ok(Measured::ToolHeavy(crate::report::ToolHeavyResult {
+        calls: HEAVY_CALLS as u64,
+        line_bytes: HEAVY_LINE_BYTES as u64,
+        turn_ms: ms(took),
+        step_interval_ms: ms(STEP_INTERVAL),
+    }))
+}
+
+/// The tool-heavy script (`--self-test`): its step count, and that its
+/// pieces join to one line of the long update.
+pub fn self_test_tool_heavy() -> Result {
+    let line = heavy_line();
+    ensure!(line.len() == HEAVY_LINE_BYTES, "the long line is {} bytes", line.len());
+    ensure!(!line.contains('\n'), "the long line holds a line break");
+    let value: serde_json::Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
+    ensure!(value["params"]["update"]["toolCallId"] == "toolu_big", "the long line's call");
+
+    let (record, gate) = (Path::new("/case/r.jsonl"), PathBuf::from("/case/g"));
+    let script = tool_heavy_script(record, &gate);
+    let lines: Vec<&str> = script.lines().collect();
+    let pieces = HEAVY_LINE_BYTES / HEAVY_PIECE_BYTES;
+    // Seven steps before the calls, four per call, the pieces, the line
+    // end, the last message and the turn's end.
+    ensure!(lines.len() == 7 + 4 * HEAVY_CALLS + pieces + 3, "{} steps", lines.len());
+    ensure!(lines[6] == "wait-file /case/g", "the gate doesn't follow the prompt: {:?}", &lines[..7]);
+    let call: Vec<&str> = lines[7..11].to_vec();
+    ensure!(call[0].contains(r#""sessionUpdate":"tool_call""#), "{}", call[0]);
+    ensure!(call[1].contains(r#""id":"p0","method":"session/request_permission""#), "{}", call[1]);
+    ensure!(call[2].contains(r#""$/cancel_request","params":{"requestId":"p0"}"#), "{}", call[2]);
+    ensure!(call[3].contains(r#""status":"completed""#), "{}", call[3]);
+    let start = 7 + 4 * HEAVY_CALLS;
+    let parts: Vec<&str> = lines[start..start + pieces].iter().map(|l| l.strip_prefix("send-part ").unwrap_or("")).collect();
+    ensure!(parts.iter().all(|part| part.len() == HEAVY_PIECE_BYTES), "a piece isn't {HEAVY_PIECE_BYTES} bytes");
+    ensure!(parts.iter().all(|part| part.trim() == *part), "a piece would lose a space to the parser");
+    ensure!(parts.concat() == line, "the pieces don't join to the long line");
+    ensure!(lines[start + pieces] == "send-raw", "no line end after the pieces");
+    ensure!(lines[start + pieces + 1].contains(HEAVY_LAST), "no last message");
+    ensure!(lines.last().is_some_and(|l| *l == r#"respond {"stopReason":"end_turn"}"#), "no end of turn");
+    ensure!(script.matches(HEAVY_LAST).count() == 1, "the last message shows twice");
+    Ok(())
 }
 
 /// The output, its deltas and the script (`--self-test`).
@@ -545,6 +675,9 @@ pub fn self_test_tool_output() -> Result {
     let deltas = chunks(&text, DELTA_BYTES);
     ensure!(deltas.len() == OUTPUT_BYTES / DELTA_BYTES, "{} deltas", deltas.len());
     ensure!(deltas.concat() == text, "the deltas don't make the output");
+    let small = chunks(&text, SMALL_DELTA_BYTES);
+    ensure!(small.len() == OUTPUT_BYTES / SMALL_DELTA_BYTES, "{} small deltas", small.len());
+    ensure!(small.concat() == text, "the small deltas don't make the output");
     let before_last = &text[..text.len() - deltas[deltas.len() - 1].len()];
     ensure!(!before_last.contains(OUTPUT_LAST_LINE), "the last line is whole before the last delta");
 
