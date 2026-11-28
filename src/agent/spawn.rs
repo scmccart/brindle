@@ -71,14 +71,21 @@ pub struct Keeping {
 }
 
 impl Keeping {
-    /// A profile's: a remote profile's directory is its remote's
-    /// `attachments_dir` (none is the remote user's cache), never `[agent]
-    /// attachments_dir`, which names a local directory; a local one's is
-    /// `[agent] attachments_dir`. The keep time is `[agent]`'s for both.
-    pub fn of(host: &Host, agent: &AgentConfig) -> Self {
+    /// A zone's on `host`, running `profile`: on a remote, `profile`'s
+    /// remote's `attachments_dir` while that remote is still `host` (none is
+    /// the remote user's cache), never `[agent] attachments_dir`, which
+    /// names a local directory; here, `[agent] attachments_dir`. The keep
+    /// time is `[agent]`'s for both. The zone's host is its endpoint, which
+    /// keeps no directory, so the profile names it.
+    pub fn of(host: &Host, profile: &Profile, agent: &AgentConfig) -> Self {
         let dir = match host {
             Host::Local => agent.attachments_dir.clone(),
-            Host::Remote(target) => target.attachments_dir().map(str::to_owned),
+            Host::Remote(_) => profile
+                .remote
+                .as_ref()
+                .filter(|remote| Host::Remote((*remote).clone()) == *host)
+                .and_then(|remote| remote.attachments_dir())
+                .map(str::to_owned),
         };
         Self { dir, keep_days: Some(agent.keep_days()) }
     }
@@ -248,15 +255,20 @@ mod tests {
         )
         .unwrap()
         .config;
-        let remote = |i: usize| Host::Remote(config.profiles[i].remote.clone().unwrap());
+        // A zone's host is its profile's endpoint, without the directory.
+        let remote = |i: usize| Host::Remote(config.profiles[i].remote.as_ref().unwrap().endpoint());
+        let of = |host: &Host, i: usize| Keeping::of(host, &config.profiles[i], &config.agent);
         let keeping = |dir: Option<&str>| Keeping { dir: dir.map(str::to_owned), keep_days: Some(3) };
-        assert_eq!(Keeping::of(&Host::Local, &config.agent), keeping(Some("~/local-att")));
-        assert_eq!(Keeping::of(&remote(0), &config.agent), keeping(Some("/srv/att")));
+        assert_eq!(of(&Host::Local, 1), keeping(Some("~/local-att")));
+        assert_eq!(of(&remote(0), 0), keeping(Some("/srv/att")));
         // Never the local directory for a remote.
-        assert_eq!(Keeping::of(&remote(1), &config.agent), keeping(None));
-        assert_eq!(Keeping::of(&remote(2), &config.agent), keeping(Some("~/c")));
+        assert_eq!(of(&remote(1), 1), keeping(None));
+        assert_eq!(of(&remote(2), 2), keeping(Some("~/c")));
+        // A profile now on another remote names nothing for a zone left on
+        // the old one.
+        assert_eq!(of(&remote(2), 0), keeping(None));
         let defaults = AgentConfig::default();
-        assert_eq!(Keeping::of(&Host::Local, &defaults), Keeping { dir: None, keep_days: Some(14) });
+        assert_eq!(Keeping::of(&Host::Local, &config.profiles[1], &defaults), Keeping { dir: None, keep_days: Some(14) });
         let request = request(&agent(""), &Host::Local, None, &OpenedBy::Window);
         assert_eq!(request.keeping, Keeping::default(), "kept only when asked");
         assert_eq!(request.keeping(keeping(None)).keeping, keeping(None));

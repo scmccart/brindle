@@ -14,7 +14,7 @@ use crate::brindle::{Output, Run};
 use crate::{Ctx, Outcome, Result, ensure};
 
 /// An agent that takes embedded context, as every captured agent does.
-const EMBEDS: &str = r#"{"promptCapabilities":{"embeddedContext":true}}"#;
+pub(super) const EMBEDS: &str = r#"{"promptCapabilities":{"embeddedContext":true}}"#;
 
 /// An agent named `name` that records what it is sent in `received`,
 /// takes embedded context and is ready at once.
@@ -56,7 +56,7 @@ fn integrated(ctx: &Ctx) -> String {
 /// A new Shell tab (tab `tab` once open) with integration, running
 /// `command` until its output shows `shown`; then Send Last Command Output
 /// to Agent.
-fn send_output<'a>(ctx: &Ctx, run: Run<'a>, first: bool, tab: usize, command: &str, shown: &str) -> Run<'a> {
+pub(super) fn send_output<'a>(ctx: &Ctx, run: Run<'a>, first: bool, tab: usize, command: &str, shown: &str) -> Run<'a> {
     let run = if first { run.action("new_tab").send(&integrated(ctx)) } else { run.action(&format!("activate_tab_{tab}")) };
     run.send(&format!("{command}\r")).wait_for(shown).action("send_last_output_to_agent")
 }
