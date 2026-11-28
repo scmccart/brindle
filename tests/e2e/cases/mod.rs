@@ -364,6 +364,7 @@ fn unix() -> Vec<Case> {
         display("agent-conversations-failures", conversations::failures).needs_fake_agent(),
         display("terminal-to-agent-output", attach::output).needs_fake_agent(),
         display("terminal-to-agent-choose", attach::choose).needs_fake_agent(),
+        display("terminal-to-agent-nothing", attach::nothing).needs_fake_agent(),
         display("agent-attach-file", attach::file).needs_fake_agent(),
         display("agent-attach-bounds", attach::bounds).needs_fake_agent(),
         display("agent-attach-queue", attach::queue).needs_fake_agent(),

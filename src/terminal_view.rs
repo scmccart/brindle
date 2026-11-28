@@ -22,7 +22,7 @@ use crate::find_bar::{FindBar, LastFind};
 use crate::latency::Latency;
 use crate::terminal::feedback::{FeedbackKind, FeedbackSlot, Phase};
 use crate::terminal::mouse::{self, Button};
-use crate::terminal::{Link, Terminal, keys, links, pointer, report_focus};
+use crate::terminal::{Link, NoOutput, Terminal, keys, links, pointer, report_focus};
 use crate::terminal_element::TerminalElement;
 
 /// Geometry of the last painted frame, used for hit-testing.
@@ -224,12 +224,12 @@ impl EventEmitter<LinkFailed> for TerminalView {}
 
 /// The last command's output, for an agent zone's next prompt (OpenSpec
 /// change `agents-prompt-context`, Send Last Command Output to Agent): the
-/// text, and the command line that made it when the shell reported one.
-/// The window picks the zone.
+/// text, and the command line that made it when the shell reported one, or
+/// why there is none. The window picks the zone, or says why.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SendOutput {
-    pub command: Option<String>,
-    pub text: String,
+pub enum SendOutput {
+    Output { command: Option<String>, text: String },
+    Nothing(NoOutput),
 }
 
 impl EventEmitter<SendOutput> for TerminalView {}
@@ -496,12 +496,13 @@ impl TerminalView {
         }
     }
 
-    /// `send_last_output_to_agent`: nothing when Copy Last Command Output
-    /// would copy nothing.
+    /// `send_last_output_to_agent`: the window says why when Copy Last
+    /// Command Output would copy nothing.
     fn send_last_output(&mut self, _: &SendLastOutputToAgent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some((text, command)) = self.terminal.read(cx).last_output_to_send() {
-            cx.emit(SendOutput { command, text });
-        }
+        cx.emit(match self.terminal.read(cx).last_output_to_send() {
+            Ok((text, command)) => SendOutput::Output { command, text },
+            Err(why) => SendOutput::Nothing(why),
+        });
     }
 
     fn copy_last_command(&mut self, _: &CopyLastCommand, _: &mut Window, cx: &mut Context<Self>) {

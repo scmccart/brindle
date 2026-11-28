@@ -239,6 +239,56 @@ pub fn choose(ctx: &Ctx) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
+/// The notice line when the last command's output isn't in the scrollback
+/// (`terminal::NoOutput::NotInScrollback`).
+const NOT_IN_SCROLLBACK: &str =
+    "no command output to send: the last command's output has left the scrollback, or it printed nothing";
+
+/// The notice line when the shell sends no prompt marks
+/// (`terminal::NoOutput::NoPromptMarks`).
+const NO_PROMPT_MARKS: &str = "no command output to send: the shell sends no prompt marks (no shell integration)";
+
+/// The spec's "Output that has scrolled away" and "A shell without prompt
+/// marks": with no output to send, the notice line says why, the terminal
+/// keeps focus and the agent zone gets nothing. 200 lines in one write
+/// under 50 lines of scrollback leave it at once, as `1..20000` did under
+/// 10,000 in task 1.1's captures, which forgets the command's marks.
+pub fn nothing(ctx: &Ctx) -> Result<Outcome> {
+    let config = profile(ctx, "Fake", "scrolled", ready(&ctx.dir.join("scrolled.jsonl"), "Fake Agent"))?;
+    let run = Run::new(ctx, "scrolled").top("scrollback_lines = 50").config(&config).agent("Fake").wait_for(READY);
+    let out = send_output(ctx, run, true, 2, "printf '%s\\n' $(seq 1 200) seq-$((1+1))", "seq-2").dump_at(10.0).run()?;
+    waited(&out)?;
+    ensure!(out.dump.config.as_deref() == Some(NOT_IN_SCROLLBACK), "scrolled: config line {:?}", out.dump.config);
+    ensure!(
+        active_tab(&out) == Some(2) && out.dump.focus.as_deref() == Some("terminal"),
+        "scrolled: tabs {:?} focus {:?}",
+        out.dump.tabs,
+        out.dump.focus
+    );
+
+    // A shell without integration, the action run as a bound key would run
+    // it; the agent's tab, shown afterwards, has no draft.
+    let config = profile(ctx, "Fake", "unmarked", ready(&ctx.dir.join("unmarked.jsonl"), "Fake Agent"))?;
+    let run = Run::new(ctx, "unmarked").config(&config).agent("Fake").wait_for(READY);
+    let out = run
+        .action("new_tab")
+        .send("echo out-$((40+2))\r")
+        .wait_for("out-42")
+        .action("send_last_output_to_agent")
+        .action("activate_tab_1")
+        .dump_at(8.0)
+        .run()?;
+    waited(&out)?;
+    ensure!(out.dump.config.as_deref() == Some(NO_PROMPT_MARKS), "unmarked: config line {:?}", out.dump.config);
+    ensure!(
+        active_tab(&out) == Some(1) && out.dump.agent_draft().is_empty(),
+        "unmarked: tabs {:?} agent {:?}",
+        out.dump.tabs,
+        out.dump.agent
+    );
+    Ok(Outcome::Pass)
+}
+
 /// The spec's "Attach a file": Attach File… with a relative path drafts a
 /// link, which the agent receives resolved against its directory; escape
 /// attaches nothing; backspace at the start of the text removes the last

@@ -1216,28 +1216,25 @@ impl Terminal {
         last_output_string(&term, &self.marks.lock()).map(|text| copied_text(&text, process::LOCAL_LINE_END))
     }
 
+    /// The last command's output for an agent's prompt (OpenSpec change
+    /// `agents-prompt-context`, decision 8): the text Copy Last Command
+    /// Output copies, with its lines joined by `\n` on every platform, and
+    /// the command line that made it; else why there is none
+    /// ([`output_to_send`]).
+    pub fn last_output_to_send(&self) -> Result<(String, Option<String>), NoOutput> {
+        let text = {
+            let term = self.term.lock();
+            output_to_send(&term, &self.marks.lock())?
+        };
+        let command = self.last_command_line_text().map(|line| line.trim().to_string()).filter(|line| !line.is_empty());
+        Ok((text, command))
+    }
+
     /// The last command's line as text: the line its shell reported (OSC
     /// 633 `E`), else what is between its `B` and `C` marks
     /// ([`Marks::last_command_line`]), as text to copy ([`copied_text`]).
     /// `None` until a prompt mark has been seen ([`Self::has_prompt_marks`]):
     /// without one, a program's stray `B`/`E` marks aren't a shell's.
-    /// The last command's output for an agent's prompt (OpenSpec change
-    /// `agents-prompt-context`, decision 8): the text Copy Last Command
-    /// Output copies, with its lines joined by `\n` on every platform, and
-    /// the command line that made it; `None` when there is no output to
-    /// send (no prompt mark, none left in the scrollback, or empty).
-    pub fn last_output_to_send(&self) -> Option<(String, Option<String>)> {
-        let text = {
-            let term = self.term.lock();
-            last_output_string(&term, &self.marks.lock()).map(|text| copied_text(&text, LineEnd::Lf))?
-        };
-        if text.is_empty() || !self.has_prompt_marks() {
-            return None;
-        }
-        let command = self.last_command_line_text().map(|line| line.trim().to_string()).filter(|line| !line.is_empty());
-        Some((text, command))
-    }
-
     pub fn last_command_line_text(&self) -> Option<String> {
         let term = self.term.lock();
         let marks = self.marks.lock();
@@ -2101,6 +2098,44 @@ fn last_output_string<T>(term: &Term<T>, marks: &Marks) -> Option<String> {
     Some(term.bounds_to_string(start, end)).filter(|s| !s.is_empty())
 }
 
+/// Why Send Last Command Output to Agent has nothing to send (OpenSpec
+/// change `agents-prompt-context`): the notice line says which.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoOutput {
+    /// No prompt mark has arrived: the shell runs no integration script, so
+    /// nothing says where a command's output starts.
+    NoPromptMarks,
+    /// No output of the last command is left: it scrolled out of the
+    /// scrollback (more lines at once than it holds forget the marks with
+    /// them), the screen was cleared, or the command printed nothing.
+    NotInScrollback,
+}
+
+impl NoOutput {
+    /// The notice line's words.
+    pub fn notice(self) -> &'static str {
+        match self {
+            NoOutput::NoPromptMarks => "no command output to send: the shell sends no prompt marks (no shell integration)",
+            NoOutput::NotInScrollback => {
+                "no command output to send: the last command's output has left the scrollback, or it printed nothing"
+            }
+        }
+    }
+}
+
+/// The last command's output as Send Last Command Output to Agent sends it
+/// (the text [`last_output_string`] reads, its lines joined by `\n`), or why
+/// there is none.
+fn output_to_send<T>(term: &Term<T>, marks: &Marks) -> Result<String, NoOutput> {
+    if !marks.prompt_seen() {
+        return Err(NoOutput::NoPromptMarks);
+    }
+    last_output_string(term, marks)
+        .map(|text| copied_text(&text, LineEnd::Lf))
+        .filter(|text| !text.is_empty())
+        .ok_or(NoOutput::NotInScrollback)
+}
+
 /// Prepares clipboard text for the PTY.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     if bracketed {
@@ -2617,6 +2652,46 @@ mod tests {
         assert!(marks.prompt_seen());
         assert!(last_output_span(&term, &marks).is_some());
         assert_eq!(last_output_string(&term, &marks).as_deref(), Some("one\ntwo"));
+    }
+
+    /// Send Last Command Output to Agent says why it has nothing to send
+    /// (`agents-prompt-context` design, As built flag 25): a shell with no
+    /// prompt marks, a command whose output left the scrollback in one
+    /// burst (as `1..20000` did under 10,000 lines of scrollback, which
+    /// cleared the marks), and one that printed nothing.
+    #[test]
+    fn the_output_to_send_says_why_there_is_none() {
+        let fed = |history: usize, bytes: &[u8]| {
+            let size = GridSize { cols: 20, rows: 5, ..Default::default() };
+            let config = term::Config { scrolling_history: history, ..Default::default() };
+            let mut term = Term::new(config, &size, alacritty_terminal::event::VoidListener);
+            let marks = Mutex::new(Marks::default());
+            Parser::new(process::LOCAL_PATH_STYLE).advance(&mut term, &marks, bytes);
+            output_to_send(&term, &marks.into_inner())
+        };
+        let run = |output: &[u8]| {
+            let mut bytes = b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07".to_vec();
+            bytes.extend_from_slice(output);
+            bytes.extend_from_slice(b"\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+            bytes
+        };
+        assert_eq!(fed(100, &run(b"one\r\ntwo\r\n")), Ok("one\ntwo".to_string()));
+        // No prompt mark: a program's own marks aren't a shell's.
+        assert_eq!(
+            fed(100, b"\x1b]133;B\x07ls\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07"),
+            Err(NoOutput::NoPromptMarks)
+        );
+        assert_eq!(fed(100, b"$ ls\r\none\r\n"), Err(NoOutput::NoPromptMarks));
+        // More lines than the scrollback holds, in one burst.
+        let flood: Vec<u8> = (1..=300).flat_map(|n| format!("{n}\r\n").into_bytes()).collect();
+        assert_eq!(fed(100, &run(&flood)), Err(NoOutput::NotInScrollback));
+        // The same with room for it is sent, its start kept.
+        assert!(fed(1000, &run(&flood)).is_ok_and(|text| text.starts_with("1\n2\n") && text.ends_with("\n300")));
+        // A command that printed nothing.
+        assert_eq!(fed(100, &run(b"")), Err(NoOutput::NotInScrollback));
+        // The notice line's words name each reason.
+        assert!(NoOutput::NoPromptMarks.notice().contains("prompt marks"));
+        assert!(NoOutput::NotInScrollback.notice().contains("scrollback"));
     }
 
     #[test]

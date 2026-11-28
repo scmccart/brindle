@@ -892,7 +892,10 @@ as a command's output.
   takes what Copy Last Command Output would copy, named by its command line,
   to the window's agent zone: the only one, or the one you choose from a
   list, the most recently used first. That zone is shown with its input
-  focused, and nothing is sent until you send the prompt.
+  focused, and nothing is sent until you send the prompt. When there is no
+  output to take, the notice line says why: the shell sends no prompt marks,
+  or the output has left the scrollback (a command that prints more lines
+  at once than `scrollback_lines` holds loses its marks with them).
 - **Attach File…** (`agent_attach_file`) asks for a path on the agent's host,
   relative to the agent's directory or absolute.
 - **Dropping files** on an agent zone attaches them: as links for an agent on

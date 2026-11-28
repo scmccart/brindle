@@ -48,10 +48,15 @@ impl Workspace {
 
     /// Send Last Command Output to Agent from a terminal of tab `tab`: the
     /// only agent zone takes it, or the window asks which, or the notice
-    /// line says there is none.
+    /// line says there is none; or, with no output to send, the notice line
+    /// says why.
     pub(super) fn send_output(&mut self, tab: TabId, send: &SendOutput, window: &mut Window, cx: &mut Context<Self>) {
+        let (command, text) = match send {
+            SendOutput::Output { command, text } => (command, text),
+            SendOutput::Nothing(why) => return self.show_notice(why.notice().into(), cx),
+        };
         let title = self.tabs.iter().find(|t| t.id == tab).map(|t| t.title.to_string()).unwrap_or_default();
-        let output = Output { name: output_name(send.command.as_deref(), &title), text: send.text.clone() };
+        let output = Output { name: output_name(command.as_deref(), &title), text: text.clone() };
         match target_plan(self.agent_targets(cx)) {
             Target::None => self.show_notice(NO_AGENT_ZONE.into(), cx),
             Target::One(at) => self.attach_output(at, output, window, cx),
