@@ -134,7 +134,7 @@ fn permission() -> Entry {
 
 /// `agents-zone-attention` decision 4: an allow option is destructive, a
 /// reject an outline. (The working row's splice is the model's now,
-/// `model.rs`'s `the_working_rows_splice_inserts_removes_or_leaves_it`.)
+/// `model/blocks.rs`' `the_working_rows_splice_inserts_removes_or_leaves_it`.)
 #[test]
 fn the_permission_variants() {
     assert_eq!(permission_variant(PermissionKind::AllowOnce), ButtonVariant::Destructive);

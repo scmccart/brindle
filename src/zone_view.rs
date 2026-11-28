@@ -1,5 +1,5 @@
-//! A local tab's binary split tree of zones, normalized geometry, and
-//! native GPUI zone chrome.
+//! A local tab's zones (the tree itself is `zone_tree.rs`'s) and their
+//! native GPUI chrome.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
