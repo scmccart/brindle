@@ -55,6 +55,7 @@
 //!   directory for its life.
 
 mod agents;
+mod attachments;
 mod clients;
 mod holders;
 mod manage;

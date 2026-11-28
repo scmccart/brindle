@@ -16,7 +16,11 @@
 //!   neutral module below), sharing `pty`'s `Program` and `Group` (on
 //!   Windows a pipe session's group is its job);
 //! - `dir`: finding and securing the server directory;
-//! - `sys`: the running binary and random numbers.
+//! - `sys`: the running binary and random numbers;
+//! - `store`: the attachment store's files (OpenSpec change
+//!   `agents-prompt-context`): private directories, texts written once
+//!   and read-only, reads, removals and listings ([`Listed`]), and
+//!   `WINDOWS`, whether this host's paths are Windows paths.
 //!
 //! Both platforms implement every module. On Windows, `listen`'s paths are
 //! pipe names.
@@ -74,6 +78,18 @@ mod wait;
     )
 )]
 pub mod piped;
+
+/// A file or directory a store listing found (`store::list`), with its
+/// size and when it was last written, in seconds since the epoch (`None`
+/// when the system doesn't say). Neutral, so the core's store plan reads
+/// it on every platform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub name: String,
+    pub dir: bool,
+    pub bytes: u64,
+    pub modified: Option<u64>,
+}
 
 #[cfg(unix)]
 mod unix;

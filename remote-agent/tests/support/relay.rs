@@ -62,6 +62,7 @@ impl Relay {
         }
         command
             .env("BRINDLE_SERVER_DIR", dir)
+            .env("BRINDLE_CACHE_DIR", dir.join("cache"))
             .env("BRINDLE_NO_SCOPE", "1")
             .env("BRINDLE_TEST_HOLDER_CORE_ARGS", "--version")
             .envs(env.iter().copied())
