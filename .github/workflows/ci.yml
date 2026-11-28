@@ -294,7 +294,7 @@ jobs:
             sh < "$release/install.sh"
           ls -l "$RUNNER_TEMP/prefix/bin"
       - name: Local-server, remote and agent cases from the installed archive
-        run: scripts/with-xvfb target/debug/brindle-e2e-suite local-server remote- agent-
+        run: scripts/with-xvfb target/debug/brindle-e2e-suite local-server remote- agent- terminal-to-agent-
         env:
           BRINDLE_E2E: "1"
           BRINDLE_E2E_SLOW: "2"
