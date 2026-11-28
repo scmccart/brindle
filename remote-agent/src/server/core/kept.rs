@@ -229,7 +229,8 @@ impl<L: EventLoop> Core<L> {
         let mut taken = match self.uploads.take(client, id, &uploads) {
             Ok(taken) => taken.into_iter(),
             Err(refusal) => {
-                return self.send_client(client, error(Some(req), Some(id), format!("session {id}: {refusal}")));
+                self.send_client(client, error(Some(req), Some(id), format!("session {id}: {refusal}")));
+                return self.store_changed(id);
             }
         };
         let attachments: Vec<Attachment> = attachments

@@ -180,13 +180,17 @@ impl<C: Ord + Copy> Uploads<C> {
     }
 
     /// The uploads a prompt of `session` names, in its order, taken from
-    /// `client`: all of them, or none when one is missing (or another
-    /// session's). A number named twice is missing the second time.
+    /// `client`: all of them; or, when one is missing (or another
+    /// session's), the refusal, with the session's others it names gone,
+    /// as any refused prompt's are (decision 3). A number named twice is
+    /// missing the second time.
     pub fn take(&mut self, client: C, session: u32, uploads: &[u64]) -> Result<Vec<Upload>, UploadRefusal> {
         let mut seen = BTreeSet::new();
         for upload in uploads {
             let held = self.held.get(&(client, *upload)).filter(|held| held.session == session);
             if held.is_none() || !seen.insert(*upload) {
+                self.held
+                    .retain(|(holder, number), held| !(*holder == client && held.session == session && uploads.contains(number)));
                 return Err(UploadRefusal::Missing { upload: *upload });
             }
         }
@@ -575,16 +579,22 @@ mod tests {
         assert_eq!(uploads.refusal(1, 1), Some(UploadRefusal::Taken { upload: 1 }));
         assert_eq!(UploadRefusal::Taken { upload: 1 }.to_string(), "upload 1 is already on this connection");
         assert_eq!(uploads.refusal(1, 3), None);
-        // One missing: none is taken.
-        assert_eq!(uploads.take(1, 5, &[1, 7]), Err(UploadRefusal::Missing { upload: 7 }));
-        assert_eq!(UploadRefusal::Missing { upload: 7 }.to_string(), "this connection holds no upload 7");
-        // Another session's, or one named twice, is missing too.
+        // Another session's is missing, and that one is left alone.
         assert_eq!(uploads.take(1, 6, &[1]), Err(UploadRefusal::Missing { upload: 1 }));
-        assert_eq!(uploads.take(1, 5, &[1, 1]), Err(UploadRefusal::Missing { upload: 1 }));
         assert_eq!(uploads.of_session(5).count(), 3);
         // In the prompt's order.
         assert_eq!(uploads.take(1, 5, &[2, 1]), Ok(vec![upload(5, 2), upload(5, 1)]));
         assert_eq!(uploads.take(1, 5, &[1]), Err(UploadRefusal::Missing { upload: 1 }));
+        assert_eq!(uploads.of_session(5).collect::<Vec<_>>(), [AttachmentId(3)]);
+
+        // One missing: the prompt is refused, and its others go with it.
+        uploads.add(1, 4, upload(5, 4));
+        uploads.add(1, 5, upload(5, 5));
+        assert_eq!(uploads.take(1, 5, &[4, 7]), Err(UploadRefusal::Missing { upload: 7 }));
+        assert_eq!(UploadRefusal::Missing { upload: 7 }.to_string(), "this connection holds no upload 7");
+        assert_eq!(uploads.of_session(5).collect::<BTreeSet<_>>(), BTreeSet::from([AttachmentId(3), AttachmentId(5)]));
+        // So does one named twice.
+        assert_eq!(uploads.take(1, 5, &[5, 5]), Err(UploadRefusal::Missing { upload: 5 }));
         assert_eq!(uploads.of_session(5).collect::<Vec<_>>(), [AttachmentId(3)]);
     }
 
