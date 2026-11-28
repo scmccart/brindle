@@ -73,7 +73,7 @@ A client SHALL be able to start a session with a command, arguments, working dir
 - **THEN** the server replies with an error naming the program and the OS error, and no session is listed
 
 ### Requirement: Session I/O
-For an attached session, the server SHALL carry the client's input and resizes to the PTY, stream its output to the client in order, and report the program's exit with its exit status. One session's slow or stalled client SHALL NOT delay other sessions.
+For an attached session, the server SHALL carry the client's input and resizes to the PTY, stream its output to the client in order, and report the program's exit with its exit status. One session's slow or stalled client SHALL NOT delay other sessions. For a session whose program runs on pipes (an agent session), the output the program wrote before it exited SHALL be read and passed on before its exit is reported, even while the session's reads are paused for a slow client, up to a bound of 1 MiB read past the pause after the exit; output written after the exit by a process the program left running is read within the same bound and the existing two-second drain limit.
 
 #### Scenario: Exit status
 - **WHEN** the program in an attached session runs `exit 3`
@@ -82,6 +82,14 @@ For an attached session, the server SHALL carry the client's input and resizes t
 #### Scenario: A stalled client
 - **WHEN** one client stops reading while its program floods output
 - **THEN** sessions of other clients keep streaming output without delay
+
+#### Scenario: Last output of a paused pipe session
+- **WHEN** a pipe session's reads are paused, and its program writes 48 KiB of lines to its standard output and exits
+- **THEN** every line reaches the core, in order, before the session's exit
+
+#### Scenario: A process left writing after the exit
+- **WHEN** a paused pipe session's program exits, leaving a process it started that holds its standard output and writes without end
+- **THEN** the session's exit is reported within the drain limit, and at most 1 MiB was read past the pause
 
 ### Requirement: Close policies
 Each session SHALL have a close policy, chosen when it is started. With `kill`, the session SHALL end, hanging up its program and the processes under it, when its client closes it, or when its client is gone: its connection ended and it didn't reconnect within the reconnect grace period after a core restart. With `detach`, the session SHALL keep running unattached when its client is gone. A client that explicitly detaches a session SHALL leave it running unattached whatever its policy, and a `kill` session detached that way SHALL become a `detach` session.

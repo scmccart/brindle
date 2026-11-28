@@ -227,11 +227,11 @@ Each task names the command that verifies it. Every new test is named as a sente
 - [x] 7.3 Write design.md's "As built" notes: 1.9's results, the C-1 test's home (harness or real process), and any site that moved. Verify: `openspec validate agents-process-lifecycle --strict`.
 
   Done: valid. The delta's "Permission requests wait for the client's choice" now carries `agents-event-bounds`' option bounds and its two scenarios, merged by hand.
-- [ ] 7.4 Run the checks:
+- [x] 7.4 Run the checks:
   - `cargo test --workspace --locked`;
   - `cargo clippy --locked --workspace --all-targets -- -D warnings`;
   - `cargo test -p brindle-remote-agent --bin brindle-fake-acp-agent` (if the fake agent's script steps changed);
   - CI's `windows` job (cargo test and clippy on Windows);
   - the e2e run in 6.1.
 
-  Partly done, on Linux: the workspace tests pass (brindle 1311, the helper's 696 unit tests, agents 116, core 59, holder 43, manage 14, relay 16, upgrade 18, the fake agent 31, architecture 51, and the shared crates'); clippy is clean; the e2e self-test passes; 6.1's run passes. Left unticked until CI's `windows` job has run, which this branch hasn't reached yet: it is the first run of 1.8's and 5.3's Windows programs.
+  Done. On Linux: the workspace tests pass (brindle 1311, the helper's 696 unit tests, agents 116, core 59, holder 43, manage 14, relay 16, upgrade 18, the fake agent 31, architecture 51, and the shared crates'); clippy is clean; the e2e self-test passes; 6.1's run passes. On Windows: the first run of 1.8's and 5.3's Windows programs failed on two test faults (a `Resume` sent after the holder had closed the drained session's connection, and cmd's `echo` putting a space before the line end), fixed in the tests alone by 165296e; then CI's `windows` job, `windows-e2e` and `windows-e2e-archive` passed on 165296e, and the holder tests passed 5 of 5 runs on a Windows machine.
