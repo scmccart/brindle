@@ -189,6 +189,17 @@ With `agents-process-lifecycle`'s fault rule, the faulted step writes nothing it
 
 **Cost.** One counting serialization an event, O(its size), on the core's loop thread. Every event is already serialized once for the client (`to_value`) and once into `unsaved`. The perf cases `agent-markdown-stream` (2,048 32-byte chunks, then one) and `agent-tool-output` (256 4 KiB deltas, then one) report their `[stream]` times before and after (`testing R10`); the change is accepted if they stay within the runs' noise. If they don't, the measure is skipped for `Appended` and `ToolOutput`, whose text is at most one `TEXT_CHUNK` piece by construction.
 
+**As run (task 8.1, 2026-11-27, release builds under `scripts/with-xvfb`, private servers):** before, at `486f6e6` with only the tests of section 1 added (`target-eb/tmp/perf/20261127T235917Z`); after, at `b7ce15b`, tasks 2 to 4.5 in (`20261128T002956Z`, run with `BRINDLE_PERF_BASELINE` set to the first).
+
+| `[stream]` | streamed (ms) | one chunk (ms) | difference (ms) | chunks |
+| --- | --- | --- | --- | --- |
+| `agent-markdown-stream` before | 2265.60 | 2260.01 | 5.59 | 2048 |
+| `agent-markdown-stream` after | 2259.29 (−6.30) | 2258.37 (−1.64) | 0.92 | 2048 |
+| `agent-tool-output` before | 2252.12 | 2254.38 | −2.25 | 256 |
+| `agent-tool-output` after | 2252.91 (+0.79) | 2256.78 (+2.40) | −3.87 | 256 |
+
+Each time includes one step interval (1 s) and the gate, so the runs' noise is several milliseconds; both changes are within it, one of them faster. The guard measures every event, and the fallback isn't needed.
+
 ### 5. Raw values are formatted only up to their bound (B-2)
 
 `v1/decode.rs`'s `raw` writes `serde_json::to_writer_pretty(value)` into `Capped { bytes: Vec<u8>, limit }`, a `std::io::Write` whose `write` takes bytes up to `limit` and then returns an error (`ErrorKind::WriteZero`). serde_json stops at the first failed write, so neither the time nor the memory goes past the limit, beyond what decoding the line already took. The kept bytes are cut back to the last whole UTF-8 character. A JSON string value is cut the same way, without copying the rest. `limit` = `RAW_LIMIT + 4`, so a longer value comes out longer than `RAW_LIMIT`, and the reducer marks it cut. `raw_text` then cuts at `RAW_LIMIT` first, cleans the kept prefix (at most 3 × `RAW_LIMIT`), and cuts again to `RAW_LIMIT − "…".len()` with `…`, so the result is what today's order gives for every value whose cleaned prefix fits.
@@ -312,3 +323,37 @@ In `acp/limits.rs`'s test module:
 
 1. **Should the client join consecutive entries of one reply split at `ENTRY_LIMIT` into one bubble?** Recommendation: no, per C1. A split is rare, and joining would need the model to tell a split from two messages, which the log doesn't record.
 2. **Should the emit guard measure every event, or skip `Appended` and `ToolOutput`, which are bounded by construction?** Recommendation: measure every event unless the perf cases show a cost past their noise (decision 4). A guard that skips kinds would miss a future mistake in them.
+
+## As built
+
+Both open questions were decided as recommended: entries split at `ENTRY_LIMIT` stay two bubbles (flag 7 says where the cut falls), and the guard measures every event (decision 4's numbers below).
+
+Flags, numbered for review:
+
+1. **The permission bounds are `MAX_PERMISSION_OPTIONS`, `MAX_PERMISSION_ID` and `MAX_PERMISSION_NAME`** (16, 1 KiB, 4 KiB) in `acp/limits.rs`, not decision 3's `MAX_OPTIONS`, `MAX_OPTION_ID` and `MAX_OPTION_NAME`: `agents-commands` already uses those names for session options (`brindle_transcript::MAX_OPTIONS`, `reduce.rs`'s `MAX_OPTION_ID`, `MAX_OPTION_NAME`, `MAX_OPTION_DESCRIPTION`).
+2. **`cleaned_len` is in `brindle-transcript`, beside `clean`,** not in `reduce.rs`: `diff.rs` measures with it and the fold's clamp counts what it counts, so it sits where `clean` is. Its test is the transcript's `cleaned_text_escapes_to_at_most_twice_its_bytes_and_cleaned_len_is_cleans`.
+3. **The fold raises `more` by the number it drops** (decision 6 says "at least"). On the reducer's events the clamp drops nothing, so `more` is the reducer's. A producer past the bounds that replaces a call's content again and again would count its dropped items each time; only a pre-release core can be one.
+4. **An empty hunk counts `HUNK_FRAMING` in the fold's clamp and is kept** while it fits. The reducer never makes one (`Keep::done` removes them), and the fold keeps what it is sent within the bounds.
+5. **`FileOp::Other { name }` counts in `wire_len` and is cut at `MAX_PATH`**, as a move's or copy's source is.
+6. **An output's clamp is `Output::append("")`,** the suffix rule itself, so it is the identity on any output the fold made. `ToolOutput`'s exit is clamped in the fold too (its signal name at `SIGNAL_RESERVE`), as the reducer cuts it.
+7. **A chunk that fits whole is appended whole.** An entry can therefore reach exactly `ENTRY_LIMIT` mid-line (32 chunks of 32 KiB fill 1 MiB), and the next text starts a new entry at its start. The cut at the last line break applies to the chunk that crosses the limit. `a_long_reply_continues_in_new_entries_cut_at_line_breaks` runs both: 32 KiB chunks, and 30,000-byte ones that cross.
+8. **A run whose entry holds no text appends anyway,** so the fold refuses it and the handling fails, as before (`a_fold_error_from_the_reducers_own_events_fails_the_handling` builds that bug). `text_run` reads the run's length as 0 there.
+9. **The guard's message takes "an" before a vowel:** `an added (tool) event for entry 2 is L bytes; …`, `an appended event …`, `a tool_items event …`. Decision 4 and task 4.5 wrote `a {kind}`, which reads "a added". The kind is the event's own name, underscores kept.
+10. **A terminal item whose id is past `MAX_TERMINAL_ID` is counted in `more`,** as an item left out, and its `_meta` forms are dropped before anything else reads them.
+11. **The session id check also refuses an empty id,** with the same message, as decision 3 lists; a control character is refused too, since the conversation's event carries the id uncleaned.
+12. **The unknown-kind option names** a permission notice lists are at most 16, each cut at `MAX_PERMISSION_NAME`; the notice itself is `bound`, as every notice is.
+13. **The core's failure log is a pure `failure_line(id, events)`** in `server/core/agents.rs`, called by `agent_apply` before it sends the events, and tested there (`a_failure_in_a_steps_events_reaches_the_log`), since `log!` writes the core's stderr.
+14. **The guard's test seam** is `Step::event_limit`, set by a private `run(session, input, now, limit)`: `step` passes `MAX_EVENT`, the tests' `Agent` its `event_limit` field.
+15. **The diff's fallback stops at the first line that doesn't fit** and counts the rest with one `count()`, neither cleaned nor copied; `Keep::cleaned` counts the lines cleaned, which the 300,000-line test compares with the lines kept.
+16. **`checkpoint.rs` keeps no fixture files,** so task 2.3's old-form checkpoint is built in the test: the session's base with each grouped `tool_items` split one item an event, which decodes to the same session.
+17. **The piece split's fault was shown at the base, not on this branch:** `33cd838` renamed `text_len` to `wire_len`, which the fold's clamp needed and which already fixed the split. `the_piece_split_counts_an_outputs_command_and_directory`, run at `486f6e6` in a scratch checkout, gave one piece (`[2]`); here it gives two.
+18. **The real-role test `a_log_past_16_mib_drops_its_oldest_entries`** sent messages of 1 MiB and 3 bytes, which now split in two entries each. Its messages are now exactly 1 MiB, so the test checks what it did.
+19. **The derivation's `Conversation` row** keeps decision 1's argument for its directory (the agent was started in it, so it is within the platform's path limit); nothing in `acp::limits` bounds it, and the row says so.
+20. **`raw` cuts a string at `RAW_CAP` = `RAW_LIMIT + 4`, not only a formatted value,** and the old test's assertion that a 9 MiB raw string reads whole was removed: the bound replaces it. `Capped` keeps what it took before the refused write and cuts it back to a whole character (`a_capped_value_keeps_whole_characters`); serde_json's error is the cap reached and isn't reported. `raw_text` still cuts at the ellipsis when its prefix was cut, so a value cut by `raw` always ends with `…`.
+21. **The adversarial property runs 300 steps, not 2,000** (110 s in a debug build; 300 take about 20 s), with three more departures from decision 8, each in the test's doc:
+    - the replay, pages and fetch are walked every 40 steps, since each walk takes about 0.4 s;
+    - the bound checks on tool entries cover the entries the step's events changed, since the others were checked when they last changed;
+    - one move in eight is an extreme one, every size and count at its generator's largest.
+
+    The extreme moves and mostly sendable option ids came after undoing the option names' cut wasn't caught; with them it is, at step 55. A prompt move answers the oldest waiting permission or lets a held prompt go before it prompts, so the turns keep coming: before that, the first unanswered permission blocked every later turn. The test ends by asserting that the run produced each event kind it exists for. A long `session/new` id stays with `reduce.rs`'s `a_session_id_past_its_bound_fails_the_start`, since it ends the session.
+22. **The derivation test's I2 session** holds a log of empty user entries up to `LOG_LIMIT` with 20-digit ids, 64 open outputs with full held lines and 1 KiB terminal ids, methods near `MAX_LOGIN_METHODS_LEN`, an 8 MiB partial line, and the largest slot, conversation (a 96 KiB directory) and turn. Its checkpoint is compared with `LARGEST_CHECKPOINT`, not only with `MAX_CHECKPOINT_LEN`.

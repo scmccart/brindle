@@ -87,21 +87,25 @@ Tests come first in each group, written as sentences (`testing R15`). No test sl
 
   Then add the measure to `emit` (design decision 4): an oversized event sets `fault` with its reason and isn't applied. `emit`'s and `add`'s signatures don't change. In `server/core/agents.rs`, make `agent_apply` log `session {id}: {message}` when a step's events hold `AgentState::Failed`, with a core test that a fold error's reason reaches the log. Verify: `cargo test -p brindle-remote-agent acp::reduce server::core`.
   - The seam is `Step::event_limit`, set by a private `run(session, input, now, limit)` that `step` calls with `MAX_EVENT` and the test `Agent` with its `event_limit` (flag 14). `an_added_event_past_the_limit_fails_the_session_naming_it`, `an_appended_event_past_the_limit_fails_the_session_naming_it` and `a_queue_event_past_the_limit_fails_the_session_naming_it` compare the whole message and the step's shape (`turn failed`, `agent failed`; the test `Agent` checks every step's client fold against the log). The message takes "an" before a vowel (`an added (tool) event`, flag 9). They failed (the events applied) and pass. The log line is a pure `failure_line` in `agents.rs` (flag 13), tested by `a_failure_in_a_steps_events_reaches_the_log`, which failed to compile before it existed. `acp::reduce` and `server::core` pass.
-- [ ] 4.6 (B-2) Tests first, in `v1/decode.rs`:
+- [x] 4.6 (B-2) Tests first, in `v1/decode.rs`:
   - "a `rawInput` of 120 nested arrays around 200,000 zeros decodes to at most `RAW_LIMIT + 4` bytes, and the capped writer is offered at most its limit plus one write";
   - "a 1 MiB raw string is cut at `RAW_LIMIT + 4` at a character boundary";
   - "a raw value within the limit decodes exactly as before" (the existing raw tests, unchanged).
 
   In `reduce.rs`: "`raw_text` of a long value holding controls ends with `…` within `RAW_LIMIT`". Then write `Capped` and change `raw` and `raw_text`. Verify: `cargo test -p brindle-remote-agent acp::v1` and `acp::reduce`.
+  - Shown failing first (`t4.6-before.log`): `a_deep_raw_value_decodes_to_at_most_its_bound` (the 120-deep value decoded to 49,029,522 bytes) and `a_long_raw_string_is_cut_at_its_bound_at_a_character_boundary`. With `Capped`, `raw` and `raw_text` changed, `acp::` passes, 421 tests (`t4.6-after.log`), with `a_capped_value_keeps_whole_characters` added. The existing raw tests are unchanged except the 9 MiB "reads whole" assertion, which the bound replaces (flag 20). `raw_text_cuts_a_long_value_with_an_ellipsis_within_its_limit` compares the new order with the old one, so it passes on both: the fault it guards is the cost of cleaning the whole value, which no assertion sees.
 
 ## 5. The invariants' tests
 
-- [ ] 5.1 In `acp/limits.rs`'s tests, write `the_frame_and_checkpoint_bounds_follow_from_the_constants` (design.md decision 8: each event at its largest, `"`-filled, within `MAX_EVENT`; the largest session's `checkpoint::encode` is `Ok`; replay plus map at most twice `encoded_len()` for each entry kind's smallest form). Verify: `cargo test -p brindle-remote-agent acp::limits`.
-- [ ] 5.2 In the same module, write `every_event_fits_a_frame_over_adversarial_agent_output`: 2,000 seeded steps over design.md decision 8's generators, asserting its seven properties after every step and `checkpoint::encode` every 100 steps. Verify: `cargo test -p brindle-remote-agent acp::limits`. It must run within the debug test suite's usual time (under 30 s); if not, cut the step count and say so in the test's doc.
+- [x] 5.1 In `acp/limits.rs`'s tests, write `the_frame_and_checkpoint_bounds_follow_from_the_constants` (design.md decision 8: each event at its largest, `"`-filled, within `MAX_EVENT`; the largest session's `checkpoint::encode` is `Ok`; replay plus map at most twice `encoded_len()` for each entry kind's smallest form). Verify: `cargo test -p brindle-remote-agent acp::limits`.
+  - Passes (`t5-run4.log`). Every row of decision 1's table at its largest, the login state with methods near `MAX_LOGIN_METHODS_LEN`, I2's session (checkpoint within `LARGEST_CHECKPOINT`) and the ratio over seven smallest entry forms, a tool entry with 32 empty items among them.
+- [x] 5.2 In the same module, write `every_event_fits_a_frame_over_adversarial_agent_output`: 2,000 seeded steps over design.md decision 8's generators, asserting its seven properties after every step and `checkpoint::encode` every 100 steps. Verify: `cargo test -p brindle-remote-agent acp::limits`. It must run within the debug test suite's usual time (under 30 s); if not, cut the step count and say so in the test's doc.
+  - 2,000 steps took 110 s in a debug build, so the test runs `STEPS` = 300 (about 20 s), as its doc says; the log is still trimmed, and the test asserts that `trimmed`, `tool_items`, `tool_output`, `answered`, `turn` and `queue` events all occurred (flag 21). Undoing the option names' cut (`MAX_PERMISSION_NAME * 16`) made it fail at step 55 with the guard's message, `an added (permission) event for entry 51 is 1313201 bytes; …` (`t5.2-mutation-option-name.log`). Undoing the entry split didn't (`t5.2-mutation-within-room.log`): no run of one kind reaches `LOG_TRIM_TO` in 300 steps, and `a_long_reply_continues_in_new_entries_cut_at_line_breaks` covers it.
 
 ## 6. The core's comments and send sites (shell)
 
-- [ ] 6.1 Rewrite the comments that claimed the invariants so they cite `acp::limits` I1 and I2: `Agent.unstorable` and `agent_checkpoint` (`server/core/agents.rs`), `send_transcript`, `pack_events`, `checkpoint.rs`'s **Bounds** paragraph, `replay_entry`, `ITEM_LIMIT`. No behaviour changes. Verify: `cargo test -p brindle-remote-agent` and `cargo clippy --locked --workspace --all-targets -- -D warnings`.
+- [x] 6.1 Rewrite the comments that claimed the invariants so they cite `acp::limits` I1 and I2: `Agent.unstorable` and `agent_checkpoint` (`server/core/agents.rs`), `send_transcript`, `pack_events`, `checkpoint.rs`'s **Bounds** paragraph, `replay_entry`, `ITEM_LIMIT`. No behaviour changes. Verify: `cargo test -p brindle-remote-agent` and `cargo clippy --locked --workspace --all-targets -- -D warnings`.
+  - All seven rewritten, comments only (`ITEM_LIMIT`'s in the first commit, with the constant's other changes). The workspace tests and clippy pass (`check-c3.log`).
 
 ## 7. The client (`brindle`)
 
@@ -110,14 +114,17 @@ Tests come first in each group, written as sentences (`testing R15`). No test sl
 
 ## 8. Cost and the whole
 
-- [ ] 8.1 Before task 4.5, run `cargo build --release && BRINDLE_PERF=1 scripts/with-xvfb cargo test --test perf -- agent-markdown-stream agent-tool-output` and keep the run directory. Run it again after task 4.5 with `BRINDLE_PERF_BASELINE=<that dir>`. Record both `[stream]` tables' times in design.md decision 4 (`testing R10`). If the change is past the runs' noise, apply decision 4's fallback and run again.
-- [ ] 8.2 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent` (under `systemd-run --user --scope`). Verify: all pass, and the fixtures under `transcript/tests/fixtures/v4/` and `remote-protocol/tests/fixtures/` are unchanged (`git diff --stat` shows none).
+- [x] 8.1 Before task 4.5, run `cargo build --release && BRINDLE_PERF=1 scripts/with-xvfb cargo test --test perf -- agent-markdown-stream agent-tool-output` and keep the run directory. Run it again after task 4.5 with `BRINDLE_PERF_BASELINE=<that dir>`. Record both `[stream]` tables' times in design.md decision 4 (`testing R10`). If the change is past the runs' noise, apply decision 4's fallback and run again.
+  - Both runs (under `systemd-run --user --scope`) are in decision 4's "As run": −6.30 ms and +0.79 ms streamed, within the noise, so no fallback. Logs: `~/.cache/claude-tasks/brindle/agents-event-bounds/perf-after.log` and the first run's `perf-before-summary.toml`.
+- [x] 8.2 Run `cargo test --workspace --locked`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `scripts/with-xvfb env BRINDLE_E2E=1 cargo test --test e2e -- agent` (under `systemd-run --user --scope`). Verify: all pass, and the fixtures under `transcript/tests/fixtures/v4/` and `remote-protocol/tests/fixtures/` are unchanged (`git diff --stat` shows none).
+  - At `9ffd4cd`: the workspace tests all pass (`brindle` 1311 with 2 ignored, `brindle-remote-agent` 669, the architecture test 51, every other target passing), clippy is clean, the e2e self-test gives 16 ok, and the e2e `agent` filter gives 83 ok, none failed or skipped (`e2e-agent.log`). `git diff --stat 486f6e6..HEAD` over both fixture directories shows nothing, and none is untracked.
 
 ## 9. Docs
 
-- [ ] 9.1 Update `docs/code-map.md`: the transcript entry (the fold's clamps, `MAX_EVENT`, `wire_len`, `ContentBudget`, the grouped replay, `ENTRY_FRAMING`); the reducer entry (`acp/limits.rs`, `text_run`, the emit guard, the option and id bounds, `Capped`).
-- [ ] 9.2 Update `.claude/rules/transcript.md`: which bounds the fold enforces (the tool content bounds) and which the producer does (entry size, ids, options, other fields).
-- [ ] 9.3 Verify: `openspec validate agents-event-bounds --strict` passes, and each task above is checked.
+- [x] 9.1 Update `docs/code-map.md`: the transcript entry (the fold's clamps, `MAX_EVENT`, `wire_len`, `ContentBudget`, the grouped replay, `ENTRY_FRAMING`); the reducer entry (`acp/limits.rs`, `text_run`, the emit guard, the option and id bounds, `Capped`).
+- [x] 9.2 Update `.claude/rules/transcript.md`: which bounds the fold enforces (the tool content bounds) and which the producer does (entry size, ids, options, other fields).
+- [x] 9.3 Verify: `openspec validate agents-event-bounds --strict` passes, and each task above is checked.
+  - "Change 'agents-event-bounds' is valid"; every numbered task is checked.
 
 ## Workflow follow-up
 
