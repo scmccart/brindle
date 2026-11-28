@@ -48,7 +48,7 @@ mod harness;
 
 pub use attention::WorkingRow;
 pub use blocks::{Block, BlockBody, ShownPart, Splice};
-pub use choosing::{Choose, LaunchChoice, ListDone, ListFor, ListerState, OnChoosing, ZoneChoice};
+pub use choosing::{Choose, LaunchChoice, Leaving, ListDone, ListFor, ListerState, OnChoosing, ZoneChoice};
 pub use ledger::{LINK_DOWN, NotSent, Replied, ReplyError, Sent};
 pub use login::{AfterLogin, CancelLogin, LoginChoice, LoginRow, LoginZoneEnd, MethodChoice};
 pub use options::KeyOutcome;
@@ -283,6 +283,9 @@ impl ChatModel {
         &self.phase
     }
 
+    /// The link, which only tests read: the entity's replay end goes through
+    /// [`replay_ended`](Self::replay_ended).
+    #[cfg(test)]
     pub fn link(&self) -> Link {
         self.link
     }
@@ -458,6 +461,15 @@ impl ChatModel {
         self.life_event(|model| model.link = link)
     }
 
+    /// A replay ended: it ends a reconnect, bringing the link back up; a
+    /// replay on a link already up (an attach's) changes nothing.
+    pub fn replay_ended(&mut self) -> Option<Absorbed> {
+        match self.link {
+            Link::Reconnecting => Some(self.set_link(Link::Up)),
+            Link::Up => None,
+        }
+    }
+
     fn life_event(&mut self, change: impl FnOnce(&mut Self)) -> Absorbed {
         let before = self.before();
         change(self);
@@ -572,5 +584,18 @@ mod tests {
         let absorbed = zone.feed(&[conversation_event(Continuation::Resume), ready()]);
         assert!(absorbed.title_changed);
         assert_eq!(zone.model.title(), "Fake");
+    }
+
+    /// The end of a replay brings a reconnecting link back up, and does
+    /// nothing on a link that is up.
+    #[test]
+    fn a_replay_ends_a_reconnect_and_nothing_else() {
+        let mut zone = Zone::ready();
+        assert_eq!(zone.model.replay_ended(), None, "an attach's replay");
+        assert_eq!(zone.model.link(), Link::Up);
+        zone.model.set_link(Link::Reconnecting);
+        assert!(zone.model.replay_ended().is_some(), "a reconnect's replay");
+        assert_eq!(zone.model.link(), Link::Up);
+        assert_eq!(zone.model.replay_ended(), None);
     }
 }

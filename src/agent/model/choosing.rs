@@ -67,6 +67,15 @@ pub enum ListDone {
     Nothing,
 }
 
+/// What a quit does to a zone's session ([`ChatModel::leave_on_quit`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Leaving {
+    /// The session ends.
+    Close,
+    /// The session is left running, detached with its tab's layout.
+    Detach,
+}
+
 /// Where the agent a conversations palette lists through is
 /// ([`ChatModel::lister_state`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +165,13 @@ impl ChatModel {
     /// started in it.
     pub fn started_choosing(&self) -> bool {
         self.choosing.started
+    }
+
+    /// What a quit does to the zone's session: a session still choosing
+    /// has nothing to bring back, so it ends (OpenSpec change
+    /// `agents-session-list` decision 12); any other is left detached.
+    pub fn leave_on_quit(&self) -> Leaving {
+        if self.started_choosing() || self.is_choosing() { Leaving::Close } else { Leaving::Detach }
     }
 
     /// The reason a choosing zone shows: the agent's message for a refused
@@ -530,5 +546,21 @@ mod tests {
         assert_eq!(starting.model.choosing_reason(), STARTING);
         starting.model.session_running();
         assert_eq!(starting.model.choose(), Choose::Send);
+    }
+
+    /// `agents-session-list` decision 12: a quit ends a session started to
+    /// choose, and one whose agent is choosing again; any other is left
+    /// detached.
+    #[test]
+    fn a_zone_still_choosing_closes_its_session_on_quit_and_others_detach() {
+        let mut zone = chooser(None);
+        assert_eq!(zone.model.leave_on_quit(), Leaving::Close, "started to choose");
+        zone.feed(&[agent_state(AgentState::Starting), choosing(None)]);
+        assert_eq!(zone.model.leave_on_quit(), Leaving::Close, "still choosing");
+        zone.feed(&[ready()]);
+        assert_eq!(zone.model.leave_on_quit(), Leaving::Detach, "a conversation started");
+        zone.feed(&[choosing(None)]);
+        assert_eq!(zone.model.leave_on_quit(), Leaving::Close, "choosing again");
+        assert_eq!(Zone::ready().model.leave_on_quit(), Leaving::Detach);
     }
 }

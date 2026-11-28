@@ -60,9 +60,9 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Link, ListDone, ListFor,
-    Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit,
-    Unqueue,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Leaving, Link, ListDone,
+    ListFor, Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice,
+    Submit, Unqueue,
 };
 use crate::agent::commands::CompletionKey;
 use crate::agent::spawn::AgentSpawnRequest;
@@ -752,9 +752,9 @@ impl Agent {
                 self.model.absorb(shared.transcript(), changes)
             }
             AgentEvent::Replay(true) => return,
-            AgentEvent::Replay(false) => match self.model.link() {
-                Link::Reconnecting => self.model.set_link(Link::Up),
-                Link::Up => return,
+            AgentEvent::Replay(false) => match self.model.replay_ended() {
+                Some(absorbed) => absorbed,
+                None => return,
             },
             AgentEvent::LinkDown => self.model.set_link(Link::Reconnecting),
             AgentEvent::SessionRunning => self.model.session_running(),
@@ -1156,12 +1156,9 @@ impl Agent {
     /// `-e`). Done explicitly, never in a drop (`process R16`).
     pub fn quit_with(&mut self, layout: Option<serde_json::Value>) {
         if let (Held::Holding, Some(requests)) = (self.held, &self.requests) {
-            // A session still choosing has nothing to bring back: it ends
-            // (OpenSpec change `agents-session-list` decision 12).
-            if self.model.started_choosing() || self.model.is_choosing() {
-                requests.close();
-            } else {
-                requests.detach_with(layout);
+            match self.model.leave_on_quit() {
+                Leaving::Close => requests.close(),
+                Leaving::Detach => requests.detach_with(layout),
             }
         }
         self.held = Held::Left;
