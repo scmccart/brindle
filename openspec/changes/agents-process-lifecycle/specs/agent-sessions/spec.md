@@ -16,7 +16,7 @@ The server SHALL answer every request the agent sends. A request for a method th
 - **THEN** after a new core adopts the session, the agent has received exactly one answer for id 7, error `-32601`
 
 ### Requirement: Permission requests wait for the client's choice
-A permission request from the agent SHALL be added to the log with its options and mark the turn blocked. The server SHALL answer it only with the option an attached client chose, or `cancelled` on a cancel, never on its own. With no client attached it SHALL wait, however long. An answer to a request already answered, or naming an option the request does not offer, SHALL be refused with an error. When the agent process that asked can no longer receive a choice, because it exited, was lost with its holder, was hung up to be started again, or its session's ACP handling failed, the request SHALL be recorded as cancelled in the log at that moment, and the agent SHALL receive `cancelled` for it if it is still running. The log's pending permission requests SHALL always be exactly the ones the agent is waiting on.
+A permission request from the agent SHALL be added to the log with its options and mark the turn blocked. The server SHALL answer it only with the option an attached client chose, or `cancelled` on a cancel, never on its own. With no client attached it SHALL wait, however long. An answer to a request already answered, or naming an option the request does not offer, SHALL be refused with an error. A request SHALL keep at most its first 16 options; an option whose id is empty, longer than 1 KiB or holds a control character SHALL be left out, since its id must be sent back unchanged; an option's name SHALL be cut at 4 KiB. When options were left out the log SHALL say how many, and a request left with no option is answered `cancelled`, as one offering none is. When the agent process that asked can no longer receive a choice, because it exited, was lost with its holder, was hung up to be started again, or its session's ACP handling failed, the request SHALL be recorded as cancelled in the log at that moment, and the agent SHALL receive `cancelled` for it if it is still running. The log's pending permission requests SHALL always be exactly the ones the agent is waiting on.
 
 #### Scenario: Allowed by the client
 - **WHEN** the agent asks permission with options `allow-once` and `reject-once`, and the attached client chooses `allow-once`
@@ -33,6 +33,14 @@ A permission request from the agent SHALL be added to the log with its options a
 #### Scenario: Answered twice
 - **WHEN** a client answers a permission request that was already answered
 - **THEN** it gets an error naming the request, and the agent receives nothing more
+
+#### Scenario: Too many options
+- **WHEN** the agent asks permission with 20 options, each named with 64 KiB of text
+- **THEN** the attached client is shown the request with its first 16 options, each name cut at 4 KiB, the log says 4 options were left out, and choosing one sends the agent that option's id
+
+#### Scenario: An option id too long to send back
+- **WHEN** the agent asks permission with options `allow-once` and a second option whose id is 2 KiB
+- **THEN** the request is shown with `allow-once` only, and the log says one option was left out
 
 #### Scenario: Pending at a restart for a login
 - **WHEN** a permission request waits as entry 7, the agent then answers the turn's prompt with `-32000`, and the client restarts the agent after a terminal login
