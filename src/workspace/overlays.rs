@@ -21,6 +21,9 @@ pub enum PaletteRole {
     /// An agent zone's session options, or one option's choices (OpenSpec
     /// change `agents-commands`).
     AgentOptions,
+    /// Which agent zone takes a terminal's output (OpenSpec change
+    /// `agents-prompt-context`).
+    AgentTarget,
 }
 
 /// An overlay the window shows.
@@ -76,7 +79,7 @@ pub fn toggle(open: Option<OverlayKind>, wanted: OverlayKind, how: Opens) -> Tog
 mod tests {
     use super::*;
 
-    const KINDS: [OverlayKind; 12] = [
+    const KINDS: [OverlayKind; 13] = [
         OverlayKind::Palette(PaletteRole::NewTab),
         OverlayKind::Palette(PaletteRole::Commands),
         OverlayKind::Palette(PaletteRole::Prompt),
@@ -84,6 +87,7 @@ mod tests {
         OverlayKind::Palette(PaletteRole::SplitProfile),
         OverlayKind::Palette(PaletteRole::Conversations),
         OverlayKind::Palette(PaletteRole::AgentOptions),
+        OverlayKind::Palette(PaletteRole::AgentTarget),
         OverlayKind::Settings,
         OverlayKind::ProfileMenu,
         OverlayKind::ContextMenu,

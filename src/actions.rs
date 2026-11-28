@@ -37,6 +37,10 @@ actions!(
         SelectLastOutput,
         CopyLastOutput,
         CopyLastCommand,
+        /// Attaches the last command's output to an agent zone's next
+        /// prompt (OpenSpec change `agents-prompt-context`), asking which
+        /// zone when the window has several.
+        SendLastOutputToAgent,
         Find,
         FindNext,
         FindPrevious,
@@ -134,6 +138,11 @@ actions!(
         /// Lists an agent profile's earlier conversations in the pane's
         /// directory, asking which profile when the config has several.
         AgentContinueConversation,
+        /// Asks for a path on the agent's host and attaches it to the next
+        /// prompt as a link (OpenSpec change `agents-prompt-context`).
+        AgentAttachFile,
+        /// Removes every attachment of the next prompt.
+        AgentClearAttachments,
         /// Copies the queued prompt's text, waiting or held.
         CopyQueuedPrompt,
         /// Copies the agent's latest message.
@@ -199,6 +208,7 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("select_last_output", Some("Select Last Command Output"), || Box::new(SelectLastOutput)),
     ("copy_last_output", Some("Copy Last Command Output"), || Box::new(CopyLastOutput)),
     ("copy_last_command", Some("Copy Last Command Line"), || Box::new(CopyLastCommand)),
+    ("send_last_output_to_agent", Some("Send Last Command Output to Agent"), || Box::new(SendLastOutputToAgent)),
     ("find", Some("Find"), || Box::new(Find)),
     // The find bar's own actions act on an open bar, so they stay out of
     // the palette.
@@ -237,6 +247,8 @@ const ACTIONS: &[(&str, Option<&str>, ActionBuilder)] = &[
     ("agent_conversations", Some("Agent Conversations…"), || Box::new(AgentConversations)),
     ("agent_options", Some("Agent Options…"), || Box::new(AgentOptions)),
     ("agent_next_mode", Some("Next Agent Mode"), || Box::new(AgentNextMode)),
+    ("agent_attach_file", Some("Attach File…"), || Box::new(AgentAttachFile)),
+    ("agent_clear_attachments", Some("Clear Attachments"), || Box::new(AgentClearAttachments)),
     ("copy_queued_prompt", Some("Copy Queued Prompt"), || Box::new(CopyQueuedPrompt)),
     ("copy_last_agent_message", Some("Copy Last Agent Message"), || Box::new(CopyLastAgentMessage)),
     ("copy_last_code_block", Some("Copy Last Code Block"), || Box::new(CopyLastCodeBlock)),
@@ -373,6 +385,10 @@ pub struct PaletteFacts {
     /// 8): Agent Options… and Next Agent Mode are listed only then.
     pub agent_options: bool,
     pub agent_modes: bool,
+    /// The active agent zone's next prompt has attachments (OpenSpec
+    /// change `agents-prompt-context`): Clear Attachments is listed only
+    /// then.
+    pub agent_attachments: bool,
 }
 
 /// The kind of profile a split command asks for, or `None` for any other
@@ -402,7 +418,7 @@ pub enum PaletteZone {
 /// scrolling ones (its own keys reach them), but the palette lists the
 /// agent's own commands there instead.
 fn acts_on_terminal(action: &dyn Action) -> bool {
-    let terminal: [&dyn Action; 18] = [
+    let terminal: [&dyn Action; 19] = [
         &Copy,
         &Paste,
         &PastePrimary,
@@ -420,6 +436,7 @@ fn acts_on_terminal(action: &dyn Action) -> bool {
         &SelectLastOutput,
         &CopyLastOutput,
         &CopyLastCommand,
+        &SendLastOutputToAgent,
         &Find,
     ];
     terminal.iter().any(|t| action.partial_eq(*t))
@@ -429,7 +446,10 @@ fn acts_on_terminal(action: &dyn Action) -> bool {
 /// nothing without them: the commands on the last command's line and output.
 /// The jump-to-prompt actions aren't among them: they scroll a line instead.
 fn needs_prompt_marks(action: &dyn Action) -> bool {
-    action.partial_eq(&CopyLastCommand) || action.partial_eq(&SelectLastOutput) || action.partial_eq(&CopyLastOutput)
+    action.partial_eq(&CopyLastCommand)
+        || action.partial_eq(&SelectLastOutput)
+        || action.partial_eq(&CopyLastOutput)
+        || action.partial_eq(&SendLastOutputToAgent)
 }
 
 /// Whether the palette lists `action` for a zone with these `facts`. In a
@@ -450,6 +470,7 @@ pub fn palette_lists(action: &dyn Action, facts: PaletteFacts) -> bool {
         // The session's options (OpenSpec change `agents-commands`).
         None if action.partial_eq(&AgentOptions) => facts.agent_options,
         None if action.partial_eq(&AgentNextMode) => facts.agent_modes,
+        None if action.partial_eq(&AgentClearAttachments) => facts.agent_attachments,
         None => true,
     };
     kind_listed
@@ -712,6 +733,38 @@ mod tests {
             agent_profiles: true,
             agent_options: true,
             agent_modes: true,
+            agent_attachments: true,
+        }
+    }
+
+    /// `agents-prompt-context` 6.2 and 6.4: Attach File… is an agent
+    /// zone's, Clear Attachments is listed only with attachments, and Send
+    /// Last Command Output to Agent is a terminal's once it has a prompt
+    /// mark, as Copy Last Command Output is; none has a default key.
+    #[test]
+    fn the_attachment_commands_are_listed_where_they_act() {
+        use std::any::TypeId;
+        let listed = |facts: PaletteFacts, available: &[TypeId]| -> Vec<&'static str> {
+            palette_commands()
+                .into_iter()
+                .filter(|(_, a)| palette_lists(&**a, facts))
+                .filter(|(_, a)| available.contains(&a.as_any().type_id()))
+                .map(|(l, _)| l)
+                .collect()
+        };
+        let agent_zone = [TypeId::of::<AgentAttachFile>(), TypeId::of::<AgentClearAttachments>()];
+        let agent = PaletteFacts { agent_attachments: false, ..both_kinds(PaletteZone::Agent) };
+        assert_eq!(listed(agent, &agent_zone), ["Attach File…"]);
+        let attached = PaletteFacts { agent_attachments: true, ..agent };
+        assert_eq!(listed(attached, &agent_zone), ["Attach File…", "Clear Attachments"]);
+        let terminal = [TypeId::of::<SendLastOutputToAgent>()];
+        let marked = PaletteFacts { prompt_marks: true, ..both_kinds(PaletteZone::Terminal) };
+        assert_eq!(listed(marked, &terminal), ["Send Last Command Output to Agent"]);
+        assert!(listed(PaletteFacts { prompt_marks: false, ..marked }, &terminal).is_empty(), "no prompt mark");
+        assert!(listed(both_kinds(PaletteZone::Agent), &terminal).is_empty(), "an agent zone's palette");
+        let bindings = default_bindings();
+        for action in [&AgentAttachFile as &dyn Action, &AgentClearAttachments, &SendLastOutputToAgent] {
+            assert!(bindings.iter().all(|b| !b.action().partial_eq(action)), "{} has no default key", action.name());
         }
     }
 
@@ -1083,7 +1136,12 @@ mod tests {
         let listed = |facts| -> Vec<&'static str> {
             palette_commands().into_iter().filter(|(_, a)| palette_lists(&**a, facts)).map(|(l, _)| l).collect()
         };
-        let hidden = ["Copy Last Command Line", "Select Last Command Output", "Copy Last Command Output"];
+        let hidden = [
+            "Copy Last Command Line",
+            "Select Last Command Output",
+            "Copy Last Command Output",
+            "Send Last Command Output to Agent",
+        ];
         for label in hidden {
             assert!(!listed(without).contains(&label), "{label} without a prompt mark");
             assert!(listed(with).contains(&label), "{label} with one");

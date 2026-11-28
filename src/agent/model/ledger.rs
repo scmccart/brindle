@@ -226,7 +226,7 @@ impl ChatModel {
     /// is searched after if its answer is lost (decision 5).
     pub fn sent_prompt(&self, text: impl Into<String>, first: bool) -> Sent {
         // A launch's first prompt has none: `-p` takes no attachments.
-        let attachments = if first { Vec::new() } else { self.attached.clone() };
+        let attachments = if first { Vec::new() } else { self.drafts() };
         let sent = PromptSent { text: text.into(), attachments, after: self.entries.last().map(|(id, _)| *id) };
         if first { Sent::FirstPrompt(sent) } else { Sent::Prompt(sent) }
     }

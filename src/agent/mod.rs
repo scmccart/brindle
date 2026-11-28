@@ -254,7 +254,15 @@ pub enum AgentAsk {
     /// `option`'s choices (a press under the input, an option command
     /// alone).
     Options { option: Option<String> },
+    /// Ask for a path on the agent's host to attach (OpenSpec change
+    /// `agents-prompt-context`, Attach File…).
+    AttachFile,
 }
+
+/// An attachment the zone refused (OpenSpec change `agents-prompt-context`):
+/// its words, for the window's notice line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachRefused(pub String);
 
 /// A set the server refused (OpenSpec change `agents-commands`, flag 11):
 /// its words, for the window's notice line.
@@ -264,6 +272,34 @@ pub struct OptionRefused(pub String);
 /// A list the palette asked for was answered: the page, or why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentListed(pub Result<conversations::Page, String>);
+
+/// What dropping `paths` attaches, read on a background task: each file's
+/// draft, or its refusal's words. A directory is looked up and a remote
+/// agent's file read here, at most an attachment's limit and a byte.
+fn read_dropped(paths: &[PathBuf], local: bool) -> Vec<Result<model::Draft, String>> {
+    use std::io::Read as _;
+    let dropped: Vec<model::Dropped> = paths.iter().map(|path| model::Dropped { path: path.clone(), dir: path.is_dir() }).collect();
+    model::drop_plan(&dropped, local)
+        .into_iter()
+        .map(|step| match step {
+            model::DropStep::Attach(draft) => Ok(draft),
+            model::DropStep::Refuse { name, why } => Err(why.text(&name)),
+            model::DropStep::Read { path, name } => {
+                let read = std::fs::File::open(&path).and_then(|file| {
+                    let size = file.metadata()?.len();
+                    let mut bytes = Vec::new();
+                    file.take(transcript::ATTACHMENT_TEXT as u64 + 1).read_to_end(&mut bytes)?;
+                    Ok((size, bytes))
+                });
+                let (size, read) = match read {
+                    Ok((size, bytes)) => (size, Ok(bytes)),
+                    Err(error) => (0, Err(error.to_string())),
+                };
+                model::dropped_text(&name, size, read).map_err(|why| why.text(&name))
+            }
+        })
+        .collect()
+}
 
 /// `profile`'s command on `host`, which a terminal login runs again: its
 /// variable names ignore case where this machine's do, on this machine.
@@ -332,6 +368,7 @@ impl EventEmitter<LoginZone> for Agent {}
 impl EventEmitter<AgentAsk> for Agent {}
 impl EventEmitter<AgentListed> for Agent {}
 impl EventEmitter<OptionRefused> for Agent {}
+impl EventEmitter<AttachRefused> for Agent {}
 
 impl Agent {
     /// Starts an agent of `profile` in a new session of `host`'s terminal
@@ -1070,12 +1107,74 @@ impl Agent {
         self.send(sent, |requests| requests.prompt(&text, attachments), cx);
     }
 
-    /// Adds `draft` to the next prompt's attachments; the refusal, in the
-    /// notice line's words for `what`, when it isn't.
-    pub fn attach_draft(&mut self, draft: model::Draft, what: &str, cx: &mut Context<Self>) -> Result<(), String> {
-        let attached = self.model.attach(draft).map_err(|refusal| refusal.text(what));
+    /// Adds `draft` to the next prompt's attachments, whether it was; a
+    /// refusal goes to the window's notice line ([`AttachRefused`]), in
+    /// its words for `what`.
+    pub fn attach_draft(&mut self, draft: model::Draft, what: &str, cx: &mut Context<Self>) -> bool {
+        match self.model.attach(draft) {
+            Ok(()) => {
+                cx.notify();
+                true
+            }
+            Err(refusal) => {
+                cx.emit(AttachRefused(refusal.text(what)));
+                false
+            }
+        }
+    }
+
+    /// Files dropped on the zone (decision 8): for an agent on this
+    /// machine each is a link; for one on another host or in a container
+    /// each is read on a background task (`process R13`) and sent as text.
+    /// Each refusal names its file on the notice line; the others are
+    /// attached, in the drop's order.
+    pub fn drop_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let local = self.host.is_local();
+        let read = cx.background_executor().spawn(async move { read_dropped(&paths, local) });
+        cx.spawn(async move |this, cx| {
+            let outcomes = read.await;
+            this.update(cx, |agent, cx| {
+                for outcome in outcomes {
+                    match outcome {
+                        Ok(draft) => {
+                            let name = draft.name().to_string();
+                            agent.attach_draft(draft, &name, cx);
+                        }
+                        Err(refusal) => cx.emit(AttachRefused(refusal)),
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The remove mark of the attachment keyed `key`.
+    pub fn remove_attachment(&mut self, key: model::DraftKey, cx: &mut Context<Self>) {
+        self.model.remove_attachment(key);
         cx.notify();
-        attached
+    }
+
+    /// `agent_clear_attachments`.
+    pub fn clear_attachments(&mut self, cx: &mut Context<Self>) {
+        self.model.clear_attachments();
+        cx.notify();
+    }
+
+    /// Backspace in the prompt input, the cursor `at_start` and nothing
+    /// `selected`: whether it removed the last attachment, which keeps the
+    /// key from the input.
+    pub fn backspace_at_start(&mut self, at_start: bool, selected: bool, cx: &mut Context<Self>) -> bool {
+        let removed = self.model.backspace_at_start(at_start, selected);
+        if removed {
+            cx.notify();
+        }
+        removed
+    }
+
+    /// `agent_attach_file`: the window asks for a path.
+    pub fn ask_attach_file(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AgentAsk::AttachFile);
     }
 
     /// A press on user entry `entry`'s attachment row `index`: its text

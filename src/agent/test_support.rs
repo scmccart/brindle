@@ -176,7 +176,7 @@ impl Requests for FakeRequests {
 fn fake_connect(calls: Calls, refuse: Rc<Cell<Option<NotSent>>>, starts: Starts, sinks: Sinks) -> Connect {
     Box::new(move |_host, start, mut sink| {
         let start = match start {
-            AgentStart::Spawn(request) => Start::Spawn(request()),
+            AgentStart::Spawn(request) => Start::Spawn(Box::new(request())),
             AgentStart::Attach { session, .. } => Start::Attach(session),
         };
         starts.borrow_mut().push(start);
@@ -191,7 +191,7 @@ fn fake_connect(calls: Calls, refuse: Rc<Cell<Option<NotSent>>>, starts: Starts,
 /// What the fake connect was asked to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Start {
-    Spawn(AgentSpawnRequest),
+    Spawn(Box<AgentSpawnRequest>),
     Attach(SessionId),
 }
 

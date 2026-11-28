@@ -779,7 +779,7 @@ impl PromptInput {
                 .rounded(radius)
                 .border_1()
                 .border_color(border)
-                .child(IconElement::new(item.icon.clone()).size(rems(0.875)).color(muted))
+                .child(IconElement::new(item.icon).size(rems(0.875)).color(muted))
                 .child(trigger_label(item.name.clone()).min_w(rems(2.)))
                 .when_some(item.detail.clone(), |chip, detail| {
                     chip.child(div().flex_none().whitespace_nowrap().text_color(muted).child(detail))
