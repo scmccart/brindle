@@ -412,8 +412,9 @@ mod tests {
         fresh.start_over();
         fresh.apply(&[agent_state(AgentState::Starting).to_value()]).unwrap();
         let changes = fresh.take_changes();
-        let absorbed = zone.model.absorb(fresh.transcript(), changes);
-        assert_eq!(absorbed.splices, [Splice { range: 0..2, count: 0 }]);
+        let taken = zone.model.copy_changes(fresh.transcript(), changes);
+        zone.model.absorb(taken);
+        assert_eq!(zone.model.draw(Due::All), [Splice { range: 0..2, count: 0 }]);
         assert_eq!(zone.model.phase(), &AgentPhase::Live(AgentState::Starting));
         assert_eq!(zone.model.conversation().map(|c| c.id.as_str()), Some("sess-1"), "known until replaced");
 
@@ -435,7 +436,9 @@ mod tests {
         .collect();
         fresh.apply(&values).unwrap();
         let changes = fresh.take_changes();
-        zone.model.absorb(fresh.transcript(), changes);
+        let taken = zone.model.copy_changes(fresh.transcript(), changes);
+        zone.model.absorb(taken);
+        zone.model.draw(Due::All);
         assert_eq!(texts(&zone.model).len(), 3);
         assert_eq!(zone.model.conversation().map(|c| c.continuation), Some(Continuation::Resume), "the new one's");
         assert_eq!(zone.model.prompt_status(), PromptStatus::Ready);

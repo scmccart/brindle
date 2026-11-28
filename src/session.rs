@@ -1739,7 +1739,8 @@ mod tests {
             for state in states {
                 shared.apply(&[Event::Agent { state: state.clone() }.to_value()]).unwrap();
                 let changes = shared.take_changes();
-                model.absorb(shared.transcript(), changes);
+                let taken = model.copy_changes(shared.transcript(), changes);
+                model.absorb(taken);
             }
             model
         };
