@@ -19,7 +19,7 @@ use brindle_remote_protocol::SessionId;
 use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
 use brindle_remote_protocol::serde_json::{self, Value, json};
 use brindle_transcript::{
-    AgentState, DiffLine, Entry, EntryId, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, LoginKind,
+    AgentState, Attachment, AttachmentId, DiffLine, Entry, EntryId, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, LoginKind,
     LoginMethod, OptionControl, Output, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind,
     ToolStatus, TurnState,
 };
@@ -4579,4 +4579,222 @@ fn a_restarts_first_checkpoint_is_whole_after_a_partial_line() {
         says(log).last().map(String::as_str) == Some("user: three")
     });
     assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: second", "user: three"]);
+}
+
+// OpenSpec change `agents-prompt-context`, tasks 3.1–3.3: a prompt's
+// attachments through the core.
+
+/// An agent that takes embedded context in prompts.
+const EMBEDS: &str = r#"{"promptCapabilities":{"embeddedContext":true}}"#;
+
+/// A fake agent offering `capabilities` that takes session `s1` and
+/// answers one prompt per entry of `answers`, as [`agent_script`]'s.
+fn attaching_agent(dir: &TempDir, name: &str, capabilities: &str, answers: &[&str]) -> (PathBuf, PathBuf) {
+    let (mut script, record) = initialized(&dir.path, name, capabilities);
+    script.step("expect session/new").step(r#"respond {"sessionId":"s1"}"#);
+    for answer in answers {
+        script.step("expect session/prompt").step(said(answer)).step(stop("end_turn"));
+    }
+    (script.write(), record)
+}
+
+/// The parts of each prompt the agent was sent.
+fn prompt_parts(record: &Path) -> Vec<Vec<Value>> {
+    recorded(record)
+        .into_iter()
+        .filter(|value| value["method"] == "session/prompt")
+        .map(|value| value["params"]["prompt"].as_array().cloned().unwrap_or_default())
+        .collect()
+}
+
+/// The core's attachments directory, in its `BRINDLE_CACHE_DIR`.
+fn attachments_root(dir: &TempDir) -> PathBuf {
+    dir.path.join("cache").join("attachments")
+}
+
+/// The store directories in `root`, sorted.
+fn stores_in(root: &Path) -> Vec<PathBuf> {
+    let mut stores: Vec<PathBuf> = std::fs::read_dir(root)
+        .map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()).filter(|path| path.is_dir()).collect())
+        .unwrap_or_default();
+    stores.sort();
+    stores
+}
+
+/// The one store the core made.
+fn the_store(dir: &TempDir) -> PathBuf {
+    match &stores_in(&attachments_root(dir))[..] {
+        [store] => store.clone(),
+        other => panic!("expected one store, found {other:?}"),
+    }
+}
+
+/// The names of the files in `store`, sorted, its marker included.
+fn files_in(store: &Path) -> Vec<String> {
+    let mut files: Vec<String> = std::fs::read_dir(store)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+/// The attachments of the log's `n`th user entry.
+fn user_attachments(log: &Transcript, n: usize) -> Vec<Attachment> {
+    log.entries()
+        .filter(|(_, entry)| matches!(entry, Entry::User { .. }))
+        .nth(n)
+        .map(|(_, entry)| entry.attachments().to_vec())
+        .unwrap_or_default()
+}
+
+fn text(upload: u64) -> client::PromptAttachment {
+    client::PromptAttachment::Text { upload }
+}
+
+fn link(path: &str) -> client::PromptAttachment {
+    client::PromptAttachment::Link { path: path.into(), name: path.into() }
+}
+
+fn kept_text(id: u64, name: &str, text: &str) -> Attachment {
+    Attachment::Text { id: AttachmentId(id), name: name.into(), bytes: text.len() as u64 }
+}
+
+/// A part's URI ends in the store's file for `id`.
+fn names_kept(part: &Value, store: &Path, id: u64) -> bool {
+    let name = store.file_name().map(|name| name.to_string_lossy().into_owned()).unwrap_or_default();
+    part["uri"].as_str().or(part["resource"]["uri"].as_str()).is_some_and(|uri| {
+        uri.starts_with("file:///") && uri.ends_with(&format!("/{name}/{id}"))
+    })
+}
+
+#[test]
+fn an_attached_text_is_embedded_when_small_and_linked_to_its_kept_file_when_large() {
+    let (mut dir, mut client) = agent_core("attach-embed", &[]);
+    let (script, record) = attaching_agent(&dir, "embed", EMBEDS, &["read them"]);
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script));
+    client.transcript_until(id, "is ready", ready);
+    let small = "fn main() {}\n";
+    // One byte over what is embedded (64 KiB).
+    let large = format!("{}\n", "x".repeat(64 * 1024));
+    client.attach_text(id, 1, "main.rs", small).unwrap();
+    client.attach_text(id, 2, "cargo test", &large).unwrap();
+    client.prompt_with(id, "look", vec![text(1), text(2), link("notes.md")]).unwrap();
+    let log = client.transcript_until(id, "has the turn's end", ended(1));
+    assert_eq!(
+        user_attachments(&log, 0),
+        [
+            kept_text(1, "main.rs", small),
+            kept_text(2, "cargo test", &large),
+            Attachment::Link { path: "notes.md".into(), name: "notes.md".into() },
+        ]
+    );
+
+    let store = the_store(&dir);
+    assert_eq!(files_in(&store), ["1", "2"]);
+    assert_eq!(std::fs::read_to_string(store.join("2")).unwrap(), large);
+    let parts = &prompt_parts(&record)[0];
+    assert_eq!(parts.len(), 4, "{parts:?}");
+    assert_eq!(parts[0], json!({"type": "text", "text": "look"}));
+    assert_eq!(parts[1]["type"], "resource");
+    assert_eq!(parts[1]["resource"]["mimeType"], "text/plain");
+    assert_eq!(parts[1]["resource"]["text"], small);
+    assert!(names_kept(&parts[1], &store, 1), "{}", parts[1]);
+    assert_eq!(parts[2]["type"], "resource_link");
+    assert_eq!(parts[2]["name"], "cargo test");
+    assert!(names_kept(&parts[2], &store, 2), "{}", parts[2]);
+    // A link's relative path is the agent's directory's.
+    assert_eq!(parts[3]["type"], "resource_link");
+    assert!(parts[3]["uri"].as_str().is_some_and(|uri| uri.starts_with("file:///") && uri.ends_with("/notes.md")), "{}", parts[3]);
+
+    // Each reads back, from its attacher and after another attach.
+    assert_eq!(client.read_attachment(id, 1).unwrap(), small);
+    client.detach(id);
+    let mut later = TestClient::hello(&dir.path, "later");
+    later.attach_agent(id).unwrap();
+    assert_eq!(user_attachments(&later.transcript(id), 0).len(), 3);
+    assert_eq!(later.read_attachment(id, 2).unwrap(), large);
+    assert_eq!(later.read_attachment(id, 1).unwrap(), small);
+}
+
+#[test]
+fn an_agent_without_embedded_context_is_sent_a_link_to_the_kept_text() {
+    let (mut dir, mut client) = agent_core("attach-no-embed", &[]);
+    let (script, record) = agent_script(&dir, "no-embed", &["ok"]);
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 1, "output", "hello\n").unwrap();
+    client.prompt_with(id, "see", vec![text(1)]).unwrap();
+    client.transcript_until(id, "has the turn's end", ended(1));
+    let store = the_store(&dir);
+    let parts = &prompt_parts(&record)[0];
+    assert_eq!(parts.len(), 2, "{parts:?}");
+    assert_eq!(parts[1]["type"], "resource_link");
+    assert_eq!(parts[1]["name"], "output");
+    assert!(names_kept(&parts[1], &store, 1), "{}", parts[1]);
+}
+
+#[test]
+fn each_attachment_refusal_says_why_and_a_refused_prompt_leaves_no_file() {
+    let (mut dir, mut client) = agent_core("attach-refusals", &[]);
+    // The agent isn't ready until the test opens the gate.
+    let (mut script, record) = initialized(&dir.path, "refusals", "{}");
+    script.step("expect session/new");
+    let gate = script.gate();
+    script
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(said("ok"))
+        .step(stop("end_turn"));
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    let refusal = |result: Result<(), client::ErrorMessage>| result.unwrap_err().message;
+
+    client.attach_text(id, 1, "a", "one\n").unwrap();
+    let store = the_store(&dir);
+    assert_eq!(files_in(&store), ["1"]);
+    assert_eq!(
+        refusal(client.attach_text(id, 1, "b", "two\n")),
+        format!("session {id}: upload 1 is already on this connection")
+    );
+    assert_eq!(
+        refusal(client.prompt_with(id, "hi", vec![text(1), text(7)])),
+        format!("session {id}: this connection holds no upload 7")
+    );
+    let nine = (0..9).map(|n| link(&format!("f{n}"))).collect();
+    assert_eq!(
+        refusal(client.prompt_with(id, "hi", nine)),
+        format!("session {id}: a prompt takes at most 8 attachments, not 9")
+    );
+    let over = "x".repeat(256 * 1024 + 1);
+    assert_eq!(
+        refusal(client.attach_text(id, 2, "big", &over)),
+        format!("session {id}: the attached text is 262145 bytes, over the limit of 262144")
+    );
+    assert_eq!(
+        client.read_attachment(id, 3).unwrap_err().message,
+        format!("session {id}: the session keeps no attachment 3")
+    );
+    assert_eq!(files_in(&store), ["1"], "nothing refused was kept");
+
+    // A refused prompt's uploads go, files and all.
+    assert_eq!(refusal(client.prompt_with(id, "hi", vec![text(1)])), format!("session {id}: the agent isn't ready"));
+    assert_eq!(files_in(&store), Vec::<String>::new());
+    assert_eq!(
+        refusal(client.prompt_with(id, "hi", vec![text(1)])),
+        format!("session {id}: this connection holds no upload 1")
+    );
+
+    gate.open();
+    client.transcript_until(id, "is ready", ready);
+    client.attach_text(id, 2, "c", "three\n").unwrap();
+    client.prompt_with(id, "now", vec![text(2)]).unwrap();
+    let log = client.transcript_until(id, "has the turn's end", ended(1));
+    // Ids are never reused: the refused prompt's 1 stays taken.
+    assert_eq!(user_attachments(&log, 0), [kept_text(2, "c", "three\n")]);
+    assert_eq!(files_in(&store), ["2"]);
+    assert_eq!(prompts(&record), ["now"]);
 }

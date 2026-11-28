@@ -273,6 +273,7 @@ impl<L: EventLoop> Core<L> {
             }
             self.drop_source(old);
             self.client_replaced(old, Instant::now());
+            self.drop_uploads(old, None);
         }
     }
 
@@ -344,9 +345,7 @@ impl<L: EventLoop> Core<L> {
             // Client protocol 4's agent sessions (`agents.rs`), past the
             // gate above.
             ToCore::SpawnAgent(spawn) => self.client_spawn_agent(client, spawn),
-            ToCore::AgentPrompt(prompt) => {
-                self.client_agent_command(client, AgentCommand::prompt(prompt))
-            }
+            ToCore::AgentPrompt(prompt) => self.client_agent_prompt(client, prompt),
             ToCore::AgentCancel(target) => {
                 self.client_agent_command(client, AgentCommand::cancel(target))
             }
@@ -484,6 +483,7 @@ impl<L: EventLoop> Core<L> {
             self.sessions_of(client).len()
         );
         self.client_gone(client, entry.linger, Instant::now());
+        self.drop_uploads(client, None);
     }
 
     /// The token of a connected client, if its `HELLO` named one.

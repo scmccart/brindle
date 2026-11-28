@@ -273,6 +273,16 @@ impl AgentSession {
         attach::kept_ids(self.transcript.slot().attachments()).collect()
     }
 
+    /// Every kept text the log's entries and the queue slot name: what the
+    /// store keeps while the session lives (decision 4).
+    pub fn referenced(&self) -> std::collections::BTreeSet<AttachmentId> {
+        self.transcript
+            .entries()
+            .flat_map(|(_, entry)| attach::kept_ids(entry.attachments()))
+            .chain(self.slot_texts())
+            .collect()
+    }
+
     /// Whether the agent has ended (exited, or lost with its holder) and
     /// its conversation can be continued: the agent gave an ACP session,
     /// offered `session/load` or `session/resume`, and didn't fail its
@@ -418,6 +428,7 @@ pub enum Command {
 
 impl Command {
     /// A prompt of `text` alone.
+    #[cfg(test)]
     pub fn prompt(text: impl Into<String>) -> Self {
         Self::Prompt {
             text: text.into(),

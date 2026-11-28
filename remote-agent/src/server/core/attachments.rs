@@ -196,11 +196,12 @@ impl<C: Ord + Copy> Uploads<C> {
             .collect())
     }
 
-    /// What `client` held, now that it closed or detached.
-    pub fn drop_client(&mut self, client: C) -> Vec<Upload> {
+    /// What `client` held (of `session` alone, when given), now that it
+    /// closed or detached.
+    pub fn drop_client(&mut self, client: C, session: Option<u32>) -> Vec<Upload> {
         let (gone, kept) = std::mem::take(&mut self.held)
             .into_iter()
-            .partition(|((holder, _), _)| *holder == client);
+            .partition(|((holder, _), held)| *holder == client && session.is_none_or(|session| held.session == session));
         self.held = kept;
         gone.into_values().collect()
     }
@@ -593,8 +594,10 @@ mod tests {
         uploads.add(1, 1, upload(5, 1));
         uploads.add(2, 1, upload(5, 2));
         uploads.add(2, 2, upload(6, 3));
-        assert_eq!(uploads.drop_client(2), [upload(5, 2), upload(6, 3)]);
-        assert_eq!(uploads.drop_client(2), []);
+        uploads.add(2, 3, upload(7, 4));
+        assert_eq!(uploads.drop_client(2, Some(7)), [upload(7, 4)]);
+        assert_eq!(uploads.drop_client(2, None), [upload(5, 2), upload(6, 3)]);
+        assert_eq!(uploads.drop_client(2, None), []);
         assert_eq!(uploads.drop_session(5), [upload(5, 1)]);
         assert_eq!(uploads.of_session(5).count(), 0);
     }
