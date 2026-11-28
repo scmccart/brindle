@@ -97,7 +97,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
+use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, Exit, ToClient};
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
 use brindle_remote_protocol::serde_json::Value;
 use brindle_remote_protocol::{RequestId, SessionId};
@@ -109,7 +109,7 @@ use super::clients::error;
 use super::policy::{
     self, AgentCheckpoint, AgentRequest, CheckpointForm, FetchView, Stored,
 };
-use super::sessions::{Life, PendingReplay, Restart, SpawnRequest};
+use super::sessions::{Life, PendingReplay, Restart, RestartStage, SpawnRequest, command_line};
 use super::{Core, log};
 use crate::acp::checkpoint;
 use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused};
@@ -1151,6 +1151,115 @@ impl<L: EventLoop> Core<L> {
             .collect();
         for id in due {
             self.agent_step(id, Input::Tick);
+        }
+    }
+
+    /// Places a waiting `AGENT_RESTART` on `holder`: the ended session runs
+    /// its new agent there under its own id, with its meta (the new command
+    /// in it) in the `SPAWN_PIPES`. Its state is stored right after, so a
+    /// core that adopts the agent before its `SPAWNED` continues the
+    /// conversation ([`checkpoint::adopt`](crate::acp::checkpoint::adopt)).
+    /// Nothing for a session that isn't a waiting restart.
+    pub(super) fn send_restart(&mut self, holder: Token, id: SessionId) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Life::Restarting {
+            restart,
+            stage: stage @ RestartStage::Waiting,
+        } = &mut session.life
+        else {
+            return log!("session {id}: isn't a restart waiting for a holder");
+        };
+        *stage = RestartStage::Placed { hung_up: false };
+        let Restart { restart, cwd } = restart.clone();
+        session.holder = holder;
+        session.paused = false;
+        let meta = session.stored_meta().to_value();
+        let message = ToHolder::SpawnPipes(h1::SpawnPipes {
+            session: id,
+            command: restart.command,
+            args: restart.args,
+            cwd: Some(cwd),
+            env: restart.env,
+            meta,
+        });
+        if self.send_holder(holder, message) {
+            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: restarted
+        }
+    }
+
+    /// An ended agent session starts again from `restart` (an
+    /// `AGENT_RESTART`'s): waiting for a holder, listed with its new
+    /// `command` and `args`, which its holder gets in the spawn's meta.
+    pub(super) fn start_again(
+        &mut self,
+        id: SessionId,
+        command: &str,
+        args: &[String],
+        restart: Restart,
+    ) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        session.meta.command = command_line(Some(command), args);
+        session.paused = false;
+        session.life = Life::Restarting {
+            restart,
+            stage: RestartStage::Waiting,
+        };
+        if let Some(agent) = session.agent() {
+            agent.restarted();
+        }
+    }
+
+    /// A restart that couldn't start (`SPAWN_FAILED`, or no holder for it):
+    /// its agent ends as an exit with no code whose standard error is
+    /// `message`, which keeps the session ended for another try.
+    pub(super) fn restart_failed(&mut self, id: SessionId, message: &str) {
+        self.agent_ended(
+            id,
+            None,
+            Input::Exited {
+                code: None,
+                stderr: message.as_bytes(),
+            },
+        );
+    }
+
+    /// A restart still waiting for a holder is hung up (`CLOSE`, `KILL`,
+    /// `STOP`, its client gone): it never starts, and the session ends, as
+    /// a hung-up session's end does, whoever wanted it kept.
+    pub(super) fn abandon_restart(&mut self, id: SessionId) {
+        log!("session {id}: its restart ends before it was placed");
+        self.agent_step(
+            id,
+            Input::Exited {
+                code: None,
+                stderr: b"",
+            },
+        );
+        self.end_reported(id, None);
+    }
+
+    /// An agent session's agent ended as `input` says (an exit with no
+    /// code, or a loss), outside of its holder's `EXITED`: stepped, then
+    /// kept or ended as [`policy::end_fate`] says.
+    pub(super) fn agent_ended(&mut self, id: SessionId, code: Option<i32>, input: Input<'_>) {
+        self.agent_step(id, input);
+        self.ended(id, code);
+    }
+
+    /// Ends an ended agent session: it is gone, and a client that has it
+    /// gets its `EXIT` (after a replay it still waits for).
+    pub(super) fn end_ended(&mut self, id: SessionId, code: Option<i32>) {
+        log!("session {id}: its ended agent's session ends");
+        self.send_waiting_replay(id);
+        let Some(session) = self.sessions.remove(&id) else {
+            return;
+        };
+        if let Some(client) = session.ownership.client() {
+            self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
         }
     }
 }
