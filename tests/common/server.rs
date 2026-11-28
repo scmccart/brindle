@@ -477,6 +477,15 @@ pub fn self_test() -> Result {
     ] {
         ensure!(unit(other).is_none(), "{other:?} taken for a role's scope: {:?}", unit(other));
     }
+
+    // Every launch gets the case's own cache directory, in its server
+    // directory (`agents-prompt-context`, task 3.3).
+    let mut command = Command::new("brindle");
+    let server = case.join("server");
+    let run = Isolation { config: Path::new("config.toml"), state_dir: Path::new("state"), server_dir: &server, display: ":9" };
+    isolate(&mut command, &run);
+    let cache = command.get_envs().find(|(name, _)| *name == "BRINDLE_CACHE_DIR").and_then(|(_, value)| value);
+    ensure!(cache == Some(server.join("cache").as_os_str()), "the cache directory given is {cache:?}");
     self_test_helpers()
 }
 

@@ -713,6 +713,48 @@ fn an_upgrade_keeps_a_tool_calls_file_change_and_its_open_output() {
     );
 }
 
+/// OpenSpec change `agents-prompt-context`, task 3.2: a held prompt keeps
+/// its attached text across an upgrade, and the next core sends it again
+/// with the text read back from the store.
+#[test]
+fn a_held_prompt_keeps_its_attachment_across_an_upgrade() {
+    let (mut dir, mut client) = agent_core("agent-upgrade-attach");
+    let (mut script, record) = initialized(&dir.path, "attach", r#"{"promptCapabilities":{"embeddedContext":true}}"#);
+    script.step("expect session/new").step(r#"respond {"sessionId":"s1"}"#).step("expect session/prompt");
+    let gate = script.gate();
+    script
+        .step(stop("max_tokens"))
+        .step("expect session/prompt")
+        .step(said("done"))
+        .step(stop("end_turn"));
+    let (id, pid) = client.spawn_agent(client_agent(&script.write()));
+    dir.track(pid);
+    client.transcript_until(id, "is ready", agent_ready);
+    client.prompt(id, "one").unwrap();
+    client.attach_text(id, 1, "notes", "held across\n").unwrap();
+    client.prompt_with(id, "two", vec![client::PromptAttachment::Text { upload: 1 }]).unwrap();
+    gate.open();
+    let held = Slot::Held {
+        text: "two".into(),
+        reason: HoldReason::Stopped { stop: StopReason::MaxTokens },
+        attachments: vec![brindle_transcript::Attachment::Text {
+            id: brindle_transcript::AttachmentId(1),
+            name: "notes".into(),
+            bytes: 12,
+        }],
+    };
+    client.transcript_until(id, "has the prompt held", |log| *log.slot() == held);
+
+    let mut client = upgraded(&mut dir, &mut client, id, pid);
+    assert_eq!(*client.transcript(id).slot(), held);
+    client.resend(id).unwrap();
+    client.transcript_until(id, "has the resent prompt's turn", |log| says(log).contains(&"agent: done".to_owned()));
+    let sent: Vec<_> = recorded(&record).into_iter().filter(|value| value["method"] == "session/prompt").collect();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1]["params"]["prompt"][0]["text"], "two");
+    assert_eq!(sent[1]["params"]["prompt"][1]["resource"]["text"], "held across\n");
+}
+
 #[test]
 fn a_pending_permission_survives_an_upgrade_and_is_answered_with_the_agents_id() {
     let (mut dir, mut client) = agent_core("agent-upgrade-permission");
