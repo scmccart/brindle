@@ -286,12 +286,14 @@ impl Rpc {
             .find_map(|(id, awaited)| (*awaited == purpose).then_some(*id))
     }
 
-    /// Forgets every request awaited and every permission request waiting,
-    /// keeping the next id: for an agent started again, to which the ended
-    /// agent's requests mean nothing, and whose ids must not repeat them.
-    pub fn restart(&mut self) {
+    /// Forgets every request awaited and takes every permission request
+    /// waiting, in entry order, each with its `cancelled` answer's bytes;
+    /// the next id is kept. For an agent process this session is done with
+    /// (OpenSpec change `agents-process-lifecycle`, decision 1): its
+    /// requests mean nothing to a new one, whose ids must not repeat them.
+    pub fn close(&mut self) -> Vec<(EntryId, Vec<u8>)> {
         self.outgoing.clear();
-        self.permissions.clear();
+        self.cancel_permissions()
     }
 
     /// Keeps a permission request, shown as `entry`, until it is answered.
@@ -329,6 +331,14 @@ impl Rpc {
                 (entry, answer)
             })
             .collect()
+    }
+
+    /// The entries of the permission requests waiting, in entry order: one
+    /// side of the reducer's invariant that the log's pending permission
+    /// requests are exactly these (`agents-process-lifecycle` decision 3).
+    #[cfg(test)]
+    pub fn waiting_permissions(&self) -> Vec<EntryId> {
+        self.permissions.keys().copied().collect()
     }
 
     /// The agent's `$/cancel_request` for one of its permission requests:
@@ -731,13 +741,24 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_forgets_every_request_and_keeps_counting() {
+    fn closing_forgets_every_request_and_keeps_counting() {
         let mut rpc = Rpc::new();
         rpc.initialize("0.3.0");
         rpc.prompt("s", "hi");
+        let string = Id::parse(&json!("p4")).unwrap_or_else(|| panic!("not an id"));
+        assert_eq!(rpc.hold_permission(EntryId(4), string.clone()), Ok(()));
         assert_eq!(rpc.hold_permission(EntryId(1), Id::number(0)), Ok(()));
-        rpc.restart();
+        // The waiting permissions come back in entry order, each with its
+        // cancelled answer.
+        assert_eq!(
+            rpc.close(),
+            [
+                (EntryId(1), permission_answer(&Id::number(0), None)),
+                (EntryId(4), permission_answer(&string, None)),
+            ]
+        );
         assert!(rpc.outgoing().is_empty() && rpc.permissions().is_empty());
+        assert!(rpc.close().is_empty(), "nothing is closed twice");
         assert_eq!(rpc.answered(&Id::number(2)), None);
         assert_eq!(rpc.next_id(), 3);
         rpc.initialize("0.3.0");

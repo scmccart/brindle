@@ -19,9 +19,12 @@
 //!   (up to [`DEAD_CORE_READ_LIMIT`]).
 //! - **Backpressure:** from [`CORE_QUEUE_HIGH`] queued to the core until
 //!   less than [`CORE_QUEUE_LOW`] is, it doesn't read PTYs, and it doesn't
-//!   read a session the core has paused (`read_limit`). With no core, it
-//!   reads a session until its tail is full, so the program blocks instead
-//!   of losing output. Input past `INPUT_QUEUE_LIMIT` (4 MiB) waiting for
+//!   read a session the core has paused (`read_limit`), except that a
+//!   reaped pipe session, draining, is read past both up to
+//!   [`DRAIN_PAST_HOLD`] (OpenSpec change `agents-process-lifecycle`,
+//!   decision 9), so an agent's last output reaches the core before its
+//!   exit. With no core, it reads a session until its tail is full, so
+//!   the program blocks instead of losing output. Input past `INPUT_QUEUE_LIMIT` (4 MiB) waiting for
 //!   one session is dropped with an `ERROR`: lossy by design, since
 //!   Brindle's own budget in front of it is the same size.
 //! - **Faults:** each message from the core is handled under
@@ -287,8 +290,14 @@ impl StderrRing {
 enum Life {
     Running,
     /// Reaped `at`, with its exit code (`None` for a signal); its output
-    /// may still be draining ([`policy::drained`]).
-    Reaped { code: Option<i32>, at: Instant },
+    /// may still be draining ([`policy::drained`]). A pipe session's
+    /// output read past the core's pause or marks since is `held` bytes
+    /// ([`Reads::Draining`]).
+    Reaped {
+        code: Option<i32>,
+        at: Instant,
+        held: usize,
+    },
     /// Its output is drained, and `held.exit` says how it ended: the
     /// connected core is sent `EXITED`, or the next core's `WELCOME`
     /// reports it.
@@ -1394,7 +1403,7 @@ impl<L: EventLoop> Holder<L> {
                     room: session.tail.room(),
                 },
             };
-            let limit = read_limit(dest, session.paused, buffer.len());
+            let limit = read_limit(dest, session.paused, reads(mode, session.life), buffer.len());
             if limit == 0 {
                 break;
             }
@@ -1405,6 +1414,20 @@ impl<L: EventLoop> Holder<L> {
                     break;
                 }
                 Ok(read) => {
+                    // A draining session's read past a pause or mark
+                    // counts toward its bound.
+                    if let Life::Reaped { held, .. } = &mut session.life
+                        && mode == SpawnMode::Pipes
+                        && held_back(dest, session.paused)
+                    {
+                        let before = *held;
+                        *held = held.saturating_add(read);
+                        if before < DRAIN_PAST_HOLD && *held >= DRAIN_PAST_HOLD {
+                            log!(
+                                "session {id}: read {DRAIN_PAST_HOLD} bytes past its core's pause or marks while draining; it reads no more of them"
+                            );
+                        }
+                    }
                     let bytes = &buffer[..read];
                     session.tail.push(bytes);
                     session.last_output = Instant::now();
@@ -1539,12 +1562,17 @@ impl<L: EventLoop> Holder<L> {
                     session.life = Life::Reaped {
                         code: exit.code,
                         at: now,
+                        held: 0,
                     };
                 }
                 Ok(None) => {}
                 Err(error) => {
                     log!("session {id}: can't wait for its program: {error}");
-                    session.life = Life::Reaped { code: None, at: now };
+                    session.life = Life::Reaped {
+                        code: None,
+                        at: now,
+                        held: 0,
+                    };
                 }
             }
         }
@@ -1557,7 +1585,7 @@ impl<L: EventLoop> Holder<L> {
         let mut finished = Vec::new();
         for (&id, session) in &mut self.sessions {
             let (code, reaped_at) = match session.life {
-                Life::Reaped { code, at } => (code, at),
+                Life::Reaped { code, at, .. } => (code, at),
                 Life::Running | Life::Finished => continue,
             };
             // A hang-up, which closes the PTY, closes its output too. A
@@ -1693,8 +1721,9 @@ impl<L: EventLoop> Holder<L> {
                     false
                 }
             };
+            let reads = reads(session.held.mode, session.life);
             let readable = match session.output {
-                Output::Open => read_limit(dest, session.paused, 1) > 0,
+                Output::Open => read_limit(dest, session.paused, reads, 1) > 0,
                 Output::Closed => false,
             };
             let want = Interest {
@@ -1821,16 +1850,56 @@ enum Dest {
     Tail { room: usize },
 }
 
+/// The most a draining pipe session reads past the core's pause or marks
+/// (OpenSpec change `agents-process-lifecycle`, decision 9): what an exited
+/// program can leave in its pipe (Linux's default `pipe-max-size`; the
+/// Windows holder's pipes buffer 64 KiB), so all of it is read, while a
+/// process it left behind writing to the pipe adds at most this much.
+const DRAIN_PAST_HOLD: usize = 1 << 20;
+
+/// Whether a session's reads follow the core's pause and marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reads {
+    /// Running, or a PTY session at any time.
+    Following,
+    /// A reaped pipe session; `held` bytes were read past a pause or mark.
+    Draining { held: usize },
+}
+
+/// A session's [`Reads`]: only a reaped pipe session drains, since every
+/// byte of its stdout is a protocol message, and one left in the pipe
+/// leaves its log wrong.
+fn reads(mode: SpawnMode, life: Life) -> Reads {
+    match (mode, life) {
+        (SpawnMode::Pipes, Life::Reaped { held, .. }) => Reads::Draining { held },
+        (SpawnMode::Pipes, Life::Running | Life::Finished)
+        | (SpawnMode::Pty, Life::Running | Life::Reaped { .. } | Life::Finished) => Reads::Following,
+    }
+}
+
 /// How much of a session's output to read now, in reads of at most `chunk`
 /// bytes: nothing for a core whose queue is over its marks or that paused
 /// the session, at most the tail's room without a core. Past those, the
-/// program blocks on its output instead of losing it.
-fn read_limit(dest: Dest, paused: bool, chunk: usize) -> usize {
-    match dest {
-        Dest::Core { over } if over || paused => 0,
-        Dest::Core { .. } => chunk,
+/// program blocks on its output instead of losing it. A draining session
+/// reads past the core's pause and marks, up to [`DRAIN_PAST_HOLD`] in
+/// all.
+fn read_limit(dest: Dest, paused: bool, reads: Reads, chunk: usize) -> usize {
+    match (dest, reads) {
+        (Dest::Core { over }, Reads::Following) if over || paused => 0,
+        (Dest::Core { over }, Reads::Draining { held }) if over || paused => {
+            DRAIN_PAST_HOLD.saturating_sub(held).min(chunk)
+        }
+        (Dest::Core { .. }, Reads::Following | Reads::Draining { .. }) => chunk,
         // Only a core pauses, and the pause goes with it.
-        Dest::Tail { room } => room.min(chunk),
+        (Dest::Tail { room }, Reads::Following | Reads::Draining { .. }) => room.min(chunk),
+    }
+}
+
+/// Whether a read toward `dest` happens past the core's pause or marks.
+fn held_back(dest: Dest, paused: bool) -> bool {
+    match dest {
+        Dest::Core { over } => over || paused,
+        Dest::Tail { .. } => false,
     }
 }
 
@@ -2013,24 +2082,105 @@ mod tests {
         assert!(!core_backlog(false, CORE_QUEUE_LOW));
     }
 
+    const FOLLOWING: Reads = Reads::Following;
+
     #[test]
     fn read_limit_is_zero_for_a_core_over_its_mark_or_a_paused_session() {
         let chunk = 4096;
-        assert_eq!(read_limit(Dest::Core { over: false }, false, chunk), chunk);
-        assert_eq!(read_limit(Dest::Core { over: true }, false, chunk), 0);
-        assert_eq!(read_limit(Dest::Core { over: false }, true, chunk), 0);
-        assert_eq!(read_limit(Dest::Core { over: true }, true, chunk), 0);
+        assert_eq!(read_limit(Dest::Core { over: false }, false, FOLLOWING, chunk), chunk);
+        assert_eq!(read_limit(Dest::Core { over: true }, false, FOLLOWING, chunk), 0);
+        assert_eq!(read_limit(Dest::Core { over: false }, true, FOLLOWING, chunk), 0);
+        assert_eq!(read_limit(Dest::Core { over: true }, true, FOLLOWING, chunk), 0);
     }
 
     #[test]
     fn read_limit_without_a_core_is_the_tails_room() {
         let chunk = 4096;
-        assert_eq!(read_limit(Dest::Tail { room: 100 }, false, chunk), 100);
+        assert_eq!(read_limit(Dest::Tail { room: 100 }, false, FOLLOWING, chunk), 100);
         let roomy = Dest::Tail { room: 1 << 20 };
-        assert_eq!(read_limit(roomy, false, chunk), chunk);
-        assert_eq!(read_limit(Dest::Tail { room: 0 }, false, chunk), 0);
+        assert_eq!(read_limit(roomy, false, FOLLOWING, chunk), chunk);
+        assert_eq!(read_limit(Dest::Tail { room: 0 }, false, FOLLOWING, chunk), 0);
         // A pause is the core's, so it means nothing without one.
-        assert_eq!(read_limit(Dest::Tail { room: 100 }, true, chunk), 100);
+        assert_eq!(read_limit(Dest::Tail { room: 100 }, true, FOLLOWING, chunk), 100);
+    }
+
+    // OpenSpec change `agents-process-lifecycle`, task 5.1 (decision 9).
+
+    #[test]
+    fn read_limit_lets_a_draining_pipe_session_read_past_a_pause_up_to_its_bound() {
+        let chunk = 4096;
+        let core = Dest::Core { over: false };
+        assert_eq!(read_limit(core, true, Reads::Draining { held: 0 }, chunk), chunk);
+        let near = Reads::Draining {
+            held: DRAIN_PAST_HOLD - 100,
+        };
+        assert_eq!(read_limit(core, true, near, chunk), 100);
+        let spent = Reads::Draining {
+            held: DRAIN_PAST_HOLD,
+        };
+        assert_eq!(read_limit(core, true, spent, chunk), 0);
+    }
+
+    #[test]
+    fn read_limit_lets_a_draining_pipe_session_read_past_the_cores_mark_up_to_its_bound() {
+        let chunk = 4096;
+        let over = Dest::Core { over: true };
+        assert_eq!(read_limit(over, false, Reads::Draining { held: 0 }, chunk), chunk);
+        let near = Reads::Draining {
+            held: DRAIN_PAST_HOLD - 1,
+        };
+        assert_eq!(read_limit(over, true, near, chunk), 1);
+        let spent = Reads::Draining {
+            held: DRAIN_PAST_HOLD,
+        };
+        assert_eq!(read_limit(over, false, spent, chunk), 0);
+        // Under its marks and unpaused it reads as any session does,
+        // whatever its count.
+        assert_eq!(read_limit(Dest::Core { over: false }, false, spent, chunk), chunk);
+    }
+
+    #[test]
+    fn read_limit_keeps_the_tails_room_while_draining() {
+        let chunk = 4096;
+        for held in [0, DRAIN_PAST_HOLD] {
+            let draining = Reads::Draining { held };
+            assert_eq!(read_limit(Dest::Tail { room: 100 }, true, draining, chunk), 100);
+            assert_eq!(read_limit(Dest::Tail { room: 0 }, false, draining, chunk), 0);
+        }
+    }
+
+    #[test]
+    fn read_limit_is_unchanged_for_a_following_session() {
+        let chunk = 4096;
+        for (dest, paused) in [
+            (Dest::Core { over: false }, false),
+            (Dest::Core { over: true }, false),
+            (Dest::Core { over: false }, true),
+            (Dest::Tail { room: 10 }, true),
+        ] {
+            let before = match dest {
+                Dest::Core { over } if over || paused => 0,
+                Dest::Core { .. } => chunk,
+                Dest::Tail { room } => room.min(chunk),
+            };
+            assert_eq!(read_limit(dest, paused, FOLLOWING, chunk), before, "{dest:?} {paused}");
+        }
+    }
+
+    #[test]
+    fn only_a_reaped_pipe_session_drains() {
+        let at = Instant::now();
+        let reaped = Life::Reaped {
+            code: Some(0),
+            at,
+            held: 7,
+        };
+        assert_eq!(reads(SpawnMode::Pipes, reaped), Reads::Draining { held: 7 });
+        assert_eq!(reads(SpawnMode::Pty, reaped), Reads::Following);
+        for life in [Life::Running, Life::Finished] {
+            assert_eq!(reads(SpawnMode::Pipes, life), Reads::Following);
+            assert_eq!(reads(SpawnMode::Pty, life), Reads::Following);
+        }
     }
 
     #[test]

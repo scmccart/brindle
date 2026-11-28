@@ -415,3 +415,53 @@ No data migration and no wire change. Holders of the older build keep today's dr
 
 1. **A hung-up `Starting` spawn is requeued when its holder is lost** (`lost_fate`'s `Requeue` row keeps today's behaviour). Recommendation: refuse it with an error instead, since the client already asked for it to end. That is behaviour outside these findings, so it is left as today.
 2. **Drain PTY sessions too?** Recommendation: not without a finding (decision 9). Revisit if a terminal shows lost last output under a pause.
+
+Both were left as recommended: no behaviour outside the findings changed for them.
+
+## As built
+
+### The sites, re-read (task 1.1)
+
+The notes were taken on `origin/main` at `677dffd` (after #151, `agents-commands`), with `agents-event-bounds` below this branch (its last commit `02fd25c`, the base every "failed on `main`" below was run on).
+- **Lines that moved since `5f335dc`:** in `acp/reduce.rs`, `finish` 773 → 1004 and `end` 1067 → 1367, with `respawn` (1465), `restart_for_login` (1483), `refuse` (1512), `fail` (1556), `line`'s `Malformed::InvalidRequest` (1612) and `message`'s `RequestKind::Unoffered` (1638) after them, all pushed down by event-bounds' `Step::emit` and its bounds and by #151's option sets; `guarded_step` 328 → 334 (`agents.rs`). The core's `session_lost` (1037), `reattach` (1333), `hang_up` (1558), `replay` (1929), `place_waiting` (627), `fail_waiting` (660) and the holder's `read_output` (1372), `tick` (1555), `update_interests` (1660) and `read_limit` (1828) had not moved.
+- **Shapes that changed:** `Rpc` gained option sets (`Purpose::SetOption`, `set_option`, `forget_sets`, #151). They are in `outgoing`, so `Rpc::close` forgets them with the rest, and `clear_lists` already forgot them wherever an agent stops; a set is answered `OK` at once, so no client waits on one. `agent_apply` gained `failure_line` (event-bounds), which the `Delivery::Replay` path keeps. Nothing else the design cites changed shape.
+
+### What failed on `main` (task 1.9)
+
+Every finding's test failed on the base, so decision 14 dropped no fix. Logs are kept outside the repo (`~/.cache/claude-tasks/brindle/agents-process-lifecycle/`).
+
+| Finding | Test | On the base |
+| --- | --- | --- |
+| A-3 | `a_permission_waiting_at_a_login_restart_is_recorded_cancelled_before_the_agent_starts`, `a_list_out_at_a_login_restart_is_refused_saying_the_agent_is_started_again` | failed (shape and refusal) |
+| Observation 6 | `a_fold_error_writes_nothing_the_faulted_step_asked_for` | failed (`stdin` held the prompt) |
+| C-1 | `restart_unplaced::a_continue_whose_kill_client_drops_before_placement_ends_and_a_stop_is_answered` | failed (the session stayed listed, `STOP` unanswered) |
+| C-3 | `a_late_panic_in_acp_handling_replays_the_log_and_survives_a_core_kill` | failed (no replay; the client's fold had no user entry) |
+| C-4 | `an_owner_returning_to_an_exited_agent_is_replayed_its_exit_before_the_session_exit`, `an_owner_returning_after_a_core_kill_is_replayed_the_adopted_exit` | failed (only `EXIT` arrived) |
+| C-5 | `a_refused_request_is_answered_once_across_a_core_kill` | failed (two answers for id 7) |
+| C-7 | `a_paused_pipe_sessions_last_output_reaches_the_core_before_its_exit` | failed (lines missing; Linux only here) |
+| A-3 (process) | `a_permission_waiting_at_a_handling_fault_is_answered_cancelled`, `a_permission_waiting_at_a_login_restart_is_cancelled_and_refused_afterwards`, `a_list_out_at_a_login_restart_is_refused_and_the_next_goes_to_the_new_agent` | failed |
+| C-1 (detached) | `a_detached_continue_whose_client_drops_before_placement_runs_and_is_attached_ready` | failed (no agent started) |
+| Decision 3 | `a_checkpoint_with_a_pending_permission_rpc_doesnt_await_is_unreadable` | failed (it read) |
+| Decision 8 | `an_unoffered_request_is_checkpointed_before_its_answer`, `an_invalid_request_is_checkpointed_before_its_answer` | didn't compile (no `Moment::Answered`) |
+
+Two checks were mutations instead: the random checkpoint test fails when `close_process` is skipped in `restart_for_login` (2.5), and the late-panic test fails when `agent_faulted` doesn't forget what the holder stores (4.3). Both were restored.
+
+### Flags
+
+1. **`lost_fate` has no `queued` parameter.** A session exists only once its spawn is sent to a holder (`send_spawn`), and with restarts out of `Core.waiting` (decision 4) nothing waiting names a session. So a session a holder loses is never queued, and the parameter could only be false. Its row and the test `a_queued_spawn_is_untouched_by_a_holders_loss` went with it.
+2. **`Life::ExitedAwaitingOwner` is `LostFate::KeepExit`, for both kinds,** where the table said `AgentLost`, `ReportLost` or `Exited`. C-4's test found it: a holder whose last session exited ends right after, and its loss, handled as the table said, replaced the kept exit's status with none. A holder's loss now leaves a kept exit as it is, except that an adopted agent exit whose `STDERR_TAIL` hasn't come is stepped then, without it, and its waiting replay sent. This also changes terminals: a terminal's kept exit is no longer reported lost when its holder ends. Test: `an_exit_kept_for_its_owner_outlives_its_holder`.
+3. **A hang-up of a waiting restart ends the session** (`abandon_restart`: `Exited { None }` stepped, then `end_reported`, which sends a waiting replay or removes the session with `EXIT`), rather than going back to ended through `restart_failed`. Every hang-up (`CLOSE`, `KILL`, `STOP`, a takeover, a gone `kill` client) asked for the session to end, and that is what today's hung-up path reported. `restart_failed` stays for `SPAWN_FAILED` and `fail_waiting`.
+4. **`restart_after_login` lost its `client` parameter**: the restart is the session's, and so is its client.
+5. **C-1's test runs in the core's in-process harness** (`server/core.rs`, `restart_unplaced`), as 1.4 allows: from outside, nothing holds placement while a holder of the core's build runs. The `STOP`'s `OK` is written by `shutdown()`, so the test checks `ending() == Ending::Stopping { sessions_left: false }` and `should_exit`, runs `shutdown`, then reads it.
+6. **The detached-continue test can't force the drop into the `Waiting` stage from outside.** It waits for the agent's holder to exit, so the restart must start a holder, and drops the client right after the `OK`. It failed on the base all the same.
+7. **The fake agent gained `record-all <path>`**: every message read from then on, the ones an `expect` skips included. 1.7's and the permission tests need the agent's view of answers no step expected.
+8. **The late-panic test kills the core while the agent still runs**, compares the adopted log with the one before, and only then opens the gate for the exit: an `AgentEnded` session lives in the core's memory only (decision 5), so a kill after the exit has nothing to adopt. It can't observe "no `session/prompt` in the agent's record" either, since the agent reads nothing after the fault; the pure test of 1.3 covers that.
+9. **`Unreadable::Entry`'s `Display` was reworded**, from "its checkpoint's {name} names entry {entry}, which the log doesn't hold" to "its checkpoint's {name} and its log disagree about entry {entry}", so it reads for both sides of the invariant: a request waiting for an entry the log doesn't hold pending, and an entry pending with no request waiting.
+10. **The invariant is stronger than decision 3 says:** besides the log's pending permissions equalling `Rpc`'s waiting ones, a closed phase (`Restarting`, `Refused`, `Broken`, `Exited`, `Lost`) holds none and no list out.
+11. **A chosen conversation's refused load** (`continue_refused` with `chose`) goes back to choosing with the agent still running, so a permission it asked during the muted load stays waiting. That process can still be answered, and the invariant holds, so it is left as it is.
+12. **2.1's tests were written with 2.2**, not run failing on the base alone. 1.2's tests, on the same closing step, did fail there, and 2.5's mutation shows the random test guards it.
+13. **5.3's test can't fail before the fix**: on the base a paused session reads nothing, so nothing passes the bound. It guards the bound instead, shown by mutation (`DRAIN_PAST_HOLD = usize::MAX`: 6,113,165,312 bytes read past the pause before the test's check). Its Windows program (PowerShell starting a `cmd /d /c for /l` writer, its pid written with `[IO.File]::WriteAllText`) has not been run; CI's `windows` job runs it first.
+14. **Log lines:** "session N: restart dropped, its client is gone", "session N: its restart ends before it was placed", "session N: its client is sent the log again after the fault", "session N: read 1048576 bytes past its core's pause or marks while draining; it reads no more of them".
+15. **The login-restart permission test's tag is `agent-login-perm`**: a longer one put the holder's socket path past `sun_path`'s 108 bytes.
+
+No wire or checkpoint change: client protocol 4, H1 3 and checkpoint format 2 are as they were, and a checkpoint the new core refuses (flag 10's invariant) is one no core of either build writes.

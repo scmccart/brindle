@@ -1848,6 +1848,34 @@ mod pipe_programs {
         )
     }
 
+    /// Waits until `go` exists (a release before the program starts isn't
+    /// lost, and it writes nothing first), writes `lines` whole and exits
+    /// with 0.
+    pub fn writes_when_released(session: SessionId, go: &Path, lines: &Path) -> SpawnPipes {
+        sh(
+            session,
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.02; done; cat '{}'; exit 0",
+                go.display(),
+                lines.display()
+            ),
+        )
+    }
+
+    /// Waits until `go` exists, writing nothing first, then starts a child
+    /// that inherits its stdout and writes to it without end (`yes`),
+    /// writes the child's pid to `child`, and exits with 0.
+    pub fn leaves_a_writer_when_released(session: SessionId, go: &Path, child: &Path) -> SpawnPipes {
+        sh(
+            session,
+            &format!(
+                "while [ ! -e '{}' ]; do sleep 0.02; done; yes & echo $! > '{}'; exit 0",
+                go.display(),
+                child.display()
+            ),
+        )
+    }
+
     pub fn release(go: &Path) {
         super::programs::release(go);
     }
@@ -1942,6 +1970,38 @@ mod pipe_programs {
                  while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 20 }}; \
                  [Console]::Error.Write('bye'); exit 3",
                 go.display()
+            ),
+        )
+    }
+
+    /// Waits until `go` exists, writing nothing first, then writes `lines`
+    /// whole and exits with 0.
+    pub fn writes_when_released(session: SessionId, go: &Path, lines: &Path) -> SpawnPipes {
+        powershell(
+            session,
+            &format!(
+                "while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 20 }}; \
+                 [Console]::Out.Write([IO.File]::ReadAllText('{}')); [Console]::Out.Flush(); exit 0",
+                go.display(),
+                lines.display()
+            ),
+        )
+    }
+
+    /// Waits until `go` exists, writing nothing first, then starts a child
+    /// that inherits its standard handles and writes to stdout without end
+    /// (`cmd`'s endless `for /l`), writes the child's pid to `child`, and
+    /// exits with 0.
+    pub fn leaves_a_writer_when_released(session: SessionId, go: &Path, child: &Path) -> SpawnPipes {
+        powershell(
+            session,
+            &format!(
+                "while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 20 }}; \
+                 $p = Start-Process -FilePath cmd.exe -NoNewWindow -PassThru \
+                 -ArgumentList '/d','/c','for /l %i in (0,0,1) do @echo yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'; \
+                 [IO.File]::WriteAllText('{}', [string]$p.Id); exit 0",
+                go.display(),
+                child.display()
             ),
         )
     }
@@ -2075,10 +2135,71 @@ fn a_paused_pipe_sessions_stderr_is_still_read() {
         eventually(TIMEOUT, || !alive(pid)),
         "the program blocked writing its stderr"
     );
-    core.send(ToHolder::Resume(h1::SessionRef { session: 1 }));
+    // No `Resume`: the reaped session drains past the pause (OpenSpec change
+    // `agents-process-lifecycle`, decision 9) and ends, and with no session
+    // left the holder closes its connection, so a send would fail.
     let (_, stderr, code) = core.pipes_end(1);
     assert!(counted(COUNT).ends_with(&stderr) && !stderr.is_empty());
     assert_eq!(code, Some(0));
+}
+
+/// C-7 (OpenSpec change `agents-process-lifecycle`): a paused pipe
+/// session's program writes its last output and exits; the holder reads
+/// its stdout past the pause once it is reaped, so every byte reaches the
+/// core before `EXITED`.
+#[test]
+fn a_paused_pipe_sessions_last_output_reaches_the_core_before_its_exit() {
+    // About 48 KiB: less than the pipe holds, so the program exits whether
+    // or not its stdout is read.
+    const LINES: usize = 700;
+    let (dir, mut core, _) = holder("pipes-paused-end");
+    let go = dir.path.join("go");
+    let lines = numbered_lines(&dir.path, LINES);
+    core.spawn_pipes(pipe_programs::writes_when_released(1, &go, &lines));
+    core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
+    // The holder handles its messages in order: once the second session's
+    // SPAWNED is here, the first is paused.
+    core.spawn_pipes(pipe_programs::copies(2));
+    std::fs::write(&go, b"").unwrap();
+    let (output, _, code) = core.pipes_end(1);
+    check_lines(&output, LINES);
+    assert_eq!(code, Some(0));
+    core.hang_up(2);
+    core.pipes_end(2);
+}
+
+/// Task 5.3: a paused pipe session's program leaves a child writing to its
+/// stdout without end, and exits. The holder reads past the pause only up
+/// to its drain bound (`DRAIN_PAST_HOLD`, 1 MiB) and then stops, so the
+/// session still ends and the core's queue grows by no more than that.
+#[test]
+fn a_paused_pipe_session_whose_child_keeps_writing_ends_within_the_drain_limit() {
+    /// `holder::DRAIN_PAST_HOLD`, and one read (`pty::OUTPUT_CHUNK_SIZE`).
+    const BOUND: usize = (1 << 20) + 32 * 1024;
+    let (dir, mut core, _) = holder("pipes-paused-writer");
+    let go = dir.path.join("go");
+    let child = dir.path.join("child");
+    core.spawn_pipes(pipe_programs::leaves_a_writer_when_released(1, &go, &child));
+    core.send(ToHolder::Pause(h1::SessionRef { session: 1 }));
+    // Once the second session's SPAWNED is here, the first is paused.
+    core.spawn_pipes(pipe_programs::copies(2));
+    std::fs::write(&go, b"").unwrap();
+    let (output, _, code) = core.pipes_end(1);
+    assert_eq!(code, Some(0));
+    assert!(output.len() <= BOUND, "{} bytes read past the pause", output.len());
+    // `cmd`'s `echo` keeps the space before its line end (`y…y \r\n`).
+    assert!(
+        output.iter().all(|&byte| matches!(byte, b'y' | b' ' | b'\n' | b'\r')),
+        "only the child's output"
+    );
+    let child = until("the child's pid", TIMEOUT, || {
+        std::fs::read_to_string(&child).ok().and_then(|pid| pid.trim().parse::<u32>().ok())
+    });
+    if alive(child) {
+        kill(child);
+    }
+    core.hang_up(2);
+    core.pipes_end(2);
 }
 
 #[test]

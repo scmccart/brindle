@@ -3940,3 +3940,367 @@ fn an_attach_to_a_conversation_longer_than_a_page_gets_both_lists() {
     assert_eq!(page.options(), live.options());
     assert_eq!(page.commands(), live.commands());
 }
+
+// OpenSpec change `agents-process-lifecycle`: what a process left open is
+// closed, and what the core wrote is what it kept.
+
+/// C-3: a panic after the reducer applied a step's events leaves them in
+/// the server's log only. The client is given that log again by an
+/// unrequested replay, and the checkpoint written after the fault is whole,
+/// so a core killed afterwards adopts the same log.
+#[test]
+fn a_late_panic_in_acp_handling_replays_the_log_and_survives_a_core_kill() {
+    const SWITCH: &str = "BRINDLE_TEST_ACP_PANIC_LATE";
+    if skip_without_switch(SWITCH) {
+        return;
+    }
+    let marker = "acp-late-panic-marker";
+    let token = "token-agent-late-panic";
+    let (mut dir, mut client) = agent_core("agent-late-panic", &[(SWITCH, marker)]);
+    let (mut script, _) = continuable(&dir.path, "late-panic", RESUME_AND_LOAD);
+    let gate = script.gate();
+    script.step("stderr fatal: late").step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+
+    let text = format!("say {marker}");
+    let refusal = client.prompt(id, &text).unwrap_err();
+    assert_eq!(refusal.message, format!("session {id}: the terminal server's ACP handling failed"));
+    let failed = |log: &Transcript| {
+        matches!(log.agent(), AgentState::Failed { message } if message.contains(&format!("{SWITCH} matched")))
+    };
+    let before = client.transcript_until(id, "says its handling failed", failed);
+    // The prompt's entry, applied before the panic, reached the client.
+    assert_eq!(says(&before), [format!("user: {text}")]);
+
+    // The agent runs on in its holder; a new core adopts the log the
+    // checkpoint after the fault holds.
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    let (start, _) = client.reconnect_replay();
+    assert_eq!(start.session, id);
+    let adopted = client.transcript(id);
+    assert_eq!(says(&adopted), says(&before));
+    assert_eq!(adopted.agent(), before.agent());
+
+    gate.open();
+    let log = kept(&mut client, id, "has the agent's exit", agent_exited);
+    assert_eq!(says(&log), [format!("user: {text}")]);
+    match log.agent() {
+        AgentState::Exited { code: Some(1), stderr } => assert!(stderr.contains("fatal: late"), "{stderr:?}"),
+        other => panic!("the agent is {other:?}"),
+    }
+}
+
+/// A-3: a handling fault leaves the agent running, and no client can answer
+/// what it asked; the permission waiting then is answered `cancelled` to
+/// the agent, as the log records it.
+#[test]
+fn a_permission_waiting_at_a_handling_fault_is_answered_cancelled() {
+    const SWITCH: &str = "BRINDLE_TEST_ACP_PANIC";
+    if skip_without_switch(SWITCH) {
+        return;
+    }
+    let marker = "acp-fault-permission-marker";
+    let (mut dir, mut client) = agent_core("agent-fault-perm", &[(SWITCH, marker)]);
+    let (mut script, record) = started(&dir.path, "fault-permission");
+    script
+        .step("expect session/prompt")
+        .step(ask("perm-1"));
+    // The marker comes in a read of its own: the request is stepped first.
+    let gate = script.gate();
+    script.step(said(marker)).step(r#"expect-response "perm-1""#);
+    let answered_then = script.reached();
+    let (id, pid) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "write").unwrap();
+    client.transcript_until(id, "waits on the permission", blocked);
+    gate.open();
+
+    let failed = |log: &Transcript| {
+        matches!(log.agent(), AgentState::Failed { message } if message.contains(&format!("{SWITCH} matched")))
+    };
+    let log = client.transcript_until(id, "says its handling failed", failed);
+    let asked = permissions(&log);
+    let [(entry, Entry::Permission { outcome, .. })] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(*outcome, Some(PermissionOutcome::Cancelled));
+    assert!(eventually(TIMEOUT, || answered_then.exists()), "the agent was never answered");
+    let answers = answered(&record, 1);
+    assert_eq!(outcome_sent(&answers[0], "perm-1"), json!({"outcome": "cancelled"}));
+    // A failed session takes no command, a late choice included.
+    let late = client.answer(id, *entry, Some("allow-once")).unwrap_err();
+    assert!(late.message.contains("ACP handling failed"), "{}", late.message);
+    assert_eq!(answered(&record, 1).len(), 1, "one answer, the cancel");
+    assert!(alive(pid), "the agent runs on");
+}
+
+/// Reads until the session's `EXIT`, and says whether an unrequested
+/// replay of it started before it.
+fn replayed_before_exit(client: &mut TestClient, id: SessionId) -> (bool, client::Exit) {
+    let mut replayed = false;
+    loop {
+        match client.recv() {
+            ToClient::ReplayStart(start) if start.session == id && start.req.is_none() => replayed = true,
+            ToClient::Exit(exit) if exit.session == id => return (replayed, exit),
+            _ => {}
+        }
+    }
+}
+
+/// A script that takes a prompt, waits on its gate, then ends the turn,
+/// writes `fatal: gone` to its standard error and exits with status 1. It
+/// offers no continue, so its session ends with its agent.
+fn finishes_after_the_gate(dir: &TempDir, name: &str) -> (PathBuf, Gate) {
+    let (mut script, _) = started(&dir.path, name);
+    script.step("expect session/prompt");
+    let gate = script.gate();
+    script.step(said("finished")).step(stop("end_turn")).step("stderr fatal: gone").step("exit 1");
+    (script.write(), gate)
+}
+
+/// What a returning owner is replayed of an agent that exited without it:
+/// the turn's end, then the exit with its status and standard error.
+fn replays_the_exit(client: &mut TestClient, id: SessionId) {
+    let (replayed, exit) = replayed_before_exit(client, id);
+    assert!(replayed, "only EXIT came");
+    assert_eq!(exit.code, Some(1));
+    let log = client.transcript(id);
+    assert_eq!(says(&log), ["user: go", "agent: finished"]);
+    assert_eq!(*log.turn(), end(StopReason::EndTurn));
+    match log.agent() {
+        AgentState::Exited { code: Some(1), stderr } => assert!(stderr.contains("fatal: gone"), "{stderr:?}"),
+        other => panic!("the agent is {other:?}"),
+    }
+}
+
+/// C-4: a `kill` session's owner left, lingering; its agent ended the turn
+/// and exited while it was away. The owner comes back to the exit's replay
+/// before the session's `EXIT`.
+#[test]
+fn an_owner_returning_to_an_exited_agent_is_replayed_its_exit_before_the_session_exit() {
+    let token = "token-agent-owner-back";
+    let mut dir = TempDir::new("agent-owner-back");
+    start_core(&dir.path, &[]).unwrap();
+    // Long enough that a loaded machine comes back within it.
+    const LINGER: u32 = 30;
+    let lingering = |hello: &mut client::Hello| hello.linger_secs = LINGER;
+    let mut client = TestClient::hello_with(&dir.path, token, lingering);
+    dir.track(client.core_pid());
+    let (script, gate) = finishes_after_the_gate(&dir, "owner-back");
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "is working", turn_is(TurnState::Working));
+    drop(client);
+    core_logged(&dir, id, Decision::Lingers(LINGER));
+
+    gate.open();
+    let exited = format!("session {id}: exited (Some(1))");
+    assert!(
+        eventually(TIMEOUT, || core_messages(&dir).contains(&exited)),
+        "the core never logged {exited:?}; its log:\n{}",
+        core_messages(&dir).join("\n")
+    );
+    let mut client = TestClient::hello_with(&dir.path, token, lingering);
+    replays_the_exit(&mut client, id);
+}
+
+/// C-4: the agent exits while no core runs; the new core adopts the exit,
+/// and the returning owner is replayed it before the session's `EXIT`.
+#[test]
+fn an_owner_returning_after_a_core_kill_is_replayed_the_adopted_exit() {
+    let token = "token-agent-exit-adopted";
+    let (mut dir, mut client) = agent_core("agent-exit-adopted", &[]);
+    let (script, gate) = finishes_after_the_gate(&dir, "exit-adopted");
+    let (id, pid) = spawned(&mut client, &mut dir, client_agent(&script));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "go").unwrap();
+    client.transcript_until(id, "is working", turn_is(TurnState::Working));
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {
+        gate.open();
+        assert!(gone(pid), "the agent didn't exit");
+    });
+    replays_the_exit(&mut client, id);
+}
+
+/// C-5: the core answers an agent's unoffered request itself. The line is
+/// checkpointed as read before the answer is written, so a new core
+/// doesn't read it again from the holder's tail and answer it twice.
+#[test]
+fn a_refused_request_is_answered_once_across_a_core_kill() {
+    let token = "token-agent-refused-once";
+    let (mut dir, mut client) = agent_core("agent-refused-once", &[]);
+    let (mut script, _) = started(&dir.path, "refused-once");
+    let all = dir.path.join("refused-once.all.jsonl");
+    let read = |id: u64| {
+        json!({"jsonrpc": "2.0", "id": id, "method": "fs/read_text_file",
+               "params": {"sessionId": "s1", "path": "/etc/hostname"}})
+    };
+    script
+        .step(format!("record-all {}", all.display()))
+        .step("expect session/prompt")
+        .step(format!("send {}", read(7)))
+        .step("expect-response 7");
+    let gate = script.gate();
+    // A second request after the kill: its answer comes after any second
+    // answer to the first, which `record-all` keeps.
+    script.step(format!("send {}", read(8))).step("expect-response 8");
+    let finished = script.reached();
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "read it").unwrap();
+    let answers_to = |n: u64| responses(&all).into_iter().filter(|answer| answer["id"] == json!(n)).count();
+    assert!(eventually(TIMEOUT, || answers_to(7) == 1), "{:?}", responses(&all));
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    let (start, _) = client.reconnect_replay();
+    assert_eq!(start.session, id);
+    gate.open();
+    assert!(eventually(TIMEOUT, || finished.exists()), "the agent never got its second answer");
+    let answers = responses(&all);
+    assert_eq!((answers_to(7), answers_to(8)), (1, 1), "{answers:?}");
+    for answer in &answers {
+        assert_eq!(answer["error"]["code"], json!(-32601), "{answer}");
+    }
+}
+
+// OpenSpec change `agents-process-lifecycle`, task 4.2: the spec's
+// remaining scenarios against real processes.
+
+/// Whether the core has seen a holder go (`holder … left (…)` or
+/// `… closed its connection with no sessions (…)`).
+fn a_holder_went(dir: &TempDir) -> bool {
+    core_messages(dir)
+        .iter()
+        .any(|message| message.starts_with("holder ") && (message.contains(" left (") || message.contains("closed its connection")))
+}
+
+/// C-1: a `detach` client continues an ended agent and leaves before a
+/// holder takes the restart: the agent's holder exited with it, so the
+/// core starts another, and the client's departure is read meanwhile. The
+/// restart is placed all the same, runs with no client, and its owner
+/// coming back is given it, ready.
+#[test]
+fn a_detached_continue_whose_client_drops_before_placement_runs_and_is_attached_ready() {
+    let tag = "agent-continue-detached";
+    let (mut dir, mut client) = agent_core(tag, &[]);
+    let (mut script, _) = continuable(&dir.path, "detached", RESUME_AND_LOAD);
+    script.step("expect session/prompt").step(said("first")).step(stop("end_turn"));
+    let gate = script.gate();
+    script.step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", ended(1));
+    gate.open();
+    kept(&mut client, id, "has the agent's exit", agent_exited);
+    // No holder is left for the restart to go to at once.
+    assert!(eventually(TIMEOUT, || a_holder_went(&dir)), "{}", core_messages(&dir).join("\n"));
+
+    let (mut again, record) = initialized(&dir.path, "detached-again", RESUME_ONLY);
+    again.step("expect session/resume").step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    drop(client);
+    left(&dir, 1);
+
+    let continued = || methods(&record) == ["initialize", "session/resume"];
+    assert!(eventually(TIMEOUT, continued), "the continue never ran: {:?}", methods(&record));
+    let mut client = TestClient::hello(&dir.path, &format!("token-{tag}"));
+    let (start, _) = client.reconnect_replay();
+    assert_eq!(start.session, id);
+    dir.track(start.pid);
+    let log = client.transcript_until(id, "is ready", ready);
+    assert_eq!(says(&log), ["user: one", "agent: first"]);
+}
+
+/// A-3: a permission the agent asked for when a prompt's login demand came
+/// is recorded cancelled at the login restart, before the new agent
+/// starts; the old agent is sent no answer, and a late choice is refused.
+#[test]
+fn a_permission_waiting_at_a_login_restart_is_cancelled_and_refused_afterwards() {
+    // A short tag: the holders' socket paths are under the directory.
+    let (mut dir, mut client) = agent_core("agent-login-perm", &[]);
+    let (mut script, first) = offering_logins(&dir.path, "restart-permission", RESUME_AND_LOAD, TERMINAL_LOGIN);
+    script
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/prompt")
+        .step(ask("perm-1"))
+        .step(r#"respond-error -32000 "session expired""#);
+    let (id, old) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "write").unwrap();
+    let before = client.transcript_until(id, "needs a login", needs_any_login);
+    let asked = permissions(&before);
+    let [(entry, Entry::Permission { outcome: None, .. })] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+    let entry = *entry;
+
+    let (mut again, record) = initialized(&dir.path, "restart-permission-again", RESUME_ONLY);
+    again.step("expect session/resume").step("respond {}");
+    client.restart(id, &again.write()).unwrap();
+    let log = ready_again(&mut client, &mut dir, id);
+    assert!(gone(old), "the old agent was hung up");
+    let asked = permissions(&log);
+    let [(_, Entry::Permission { outcome, .. })] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+    assert_eq!(*outcome, Some(PermissionOutcome::Cancelled));
+    assert_in_order(&client.events(id), &[
+        "state LoginRequired",
+        "answered Cancelled",
+        &format!("notice {RESTARTED_AFTER_LOGIN}"),
+        "state Starting",
+        "state Ready",
+    ]);
+
+    let late = client.answer(id, entry, Some("allow-once")).unwrap_err();
+    assert_eq!(late.message, format!("session {id}: permission request {entry} was already answered"));
+    assert!(responses(&first).is_empty(), "{:?}", responses(&first));
+    assert!(responses(&record).is_empty(), "{:?}", responses(&record));
+}
+
+/// A-3: a list of conversations out to the agent hung up for its login
+/// restart is refused saying so, and the next goes to the new agent.
+#[test]
+fn a_list_out_at_a_login_restart_is_refused_and_the_next_goes_to_the_new_agent() {
+    let (mut dir, mut client) = agent_core("agent-login-restart-list", &[]);
+    let (mut script, first) = offering_logins(&dir.path, "restart-list", LISTS, TERMINAL_LOGIN);
+    // The list is never answered; the prompt after it is, with the login
+    // demand.
+    script
+        .step("expect session/new")
+        .step(r#"respond {"sessionId":"s1"}"#)
+        .step("expect session/list")
+        .step("expect session/prompt")
+        .step(r#"respond-error -32000 "session expired""#);
+    let (id, old) = spawned(&mut client, &mut dir, client_agent(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    // A list shows the conversations in the session's own directory.
+    let cwd = listed(&mut client, id).and_then(|info| info.cwd).expect("its directory");
+    let req = 9_000;
+    client.send(client::ToCore::AgentList(client::AgentList { req, session: id, cursor: None }));
+    until("the agent gets session/list", TIMEOUT, || methods(&first).contains(&"session/list".to_owned()).then_some(()));
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "needs a login", needs_any_login);
+
+    let (mut again, record) = initialized(&dir.path, "restart-list-again", LISTS);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/list")
+        .step(list_answer(json!([{"sessionId": "s1", "cwd": cwd}]), None));
+    client.restart(id, &again.write()).unwrap();
+    match client.reply(req) {
+        ToClient::Error(error) => assert_eq!(error.message, format!("session {id}: {RESTARTED_AFTER_LOGIN}")),
+        other => panic!("expected the list's ERROR, got {other:?}"),
+    }
+    ready_again(&mut client, &mut dir, id);
+    assert!(gone(old), "the old agent was hung up");
+    let listed = client.list_conversations(id, None).unwrap();
+    assert_eq!(conversation_ids(&listed), ["s1"]);
+    assert_eq!(methods(&record), ["initialize", "session/resume", "session/list"]);
+    assert_eq!(methods(&first), ["initialize", "session/new", "session/list", "session/prompt"]);
+}

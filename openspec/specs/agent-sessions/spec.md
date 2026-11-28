@@ -55,7 +55,7 @@ When the agent rejects `initialize` (`-32022` or another error) or answers with 
 - **THEN** the client receives the agent's state as failed with a message saying the agent speaks ACP version 2 and the server speaks 1, the agent receives no `session/new`, and the session ends once the agent has exited
 
 ### Requirement: The server answers the agent's requests
-The server SHALL answer every request the agent sends. A request for a method the server did not offer (file system, terminal, elicitation, or any other) SHALL get JSON-RPC error `-32601`. A notification the server does not know SHALL be ignored. A permission request SHALL be answered only as "Permission requests wait for the client's choice" says.
+The server SHALL answer every request the agent sends. A request for a method the server did not offer (file system, terminal, elicitation, or any other) SHALL get JSON-RPC error `-32601`. A notification the server does not know SHALL be ignored. A permission request SHALL be answered only as "Permission requests wait for the client's choice" says. Each request SHALL be answered once, even when the core restarts or is upgraded between reading the request and the agent's next message.
 
 #### Scenario: File read refused
 - **WHEN** the agent sends `fs/read_text_file`
@@ -64,6 +64,10 @@ The server SHALL answer every request the agent sends. A request for a method th
 #### Scenario: Unknown notification
 - **WHEN** the agent sends a notification `_vendor/ping`
 - **THEN** nothing is added to the transcript and the session carries on
+
+#### Scenario: Refused request across a core restart
+- **WHEN** the agent sends `fs/read_text_file` with id 7, and the core is killed with SIGKILL right after it answers, before anything else happens in the session
+- **THEN** after a new core adopts the session, the agent has received exactly one answer for id 7, error `-32601`
 
 ### Requirement: The transcript log
 The server SHALL keep each agent session's conversation as a log of entries, whether or not a client is attached: user messages, agent messages, thoughts, tool calls, permission requests with their outcome, and notices, each with an id that stays the same for the session's life, plus the turn state and the agent's state. Streamed chunks SHALL merge into one entry, and a tool call's updates SHALL change its entry.
@@ -191,7 +195,7 @@ On a connection that negotiated client protocol 4, the server SHALL send only th
 - **THEN** each decodes as one of protocol 4's event forms
 
 ### Requirement: Permission requests wait for the client's choice
-A permission request from the agent SHALL be added to the log with its options and mark the turn blocked. The server SHALL answer it only with the option an attached client chose, or `cancelled` on a cancel, never on its own. With no client attached it SHALL wait, however long. An answer to a request already answered, or naming an option the request does not offer, SHALL be refused with an error. A request SHALL keep at most its first 16 options; an option whose id is empty, longer than 1 KiB or holds a control character SHALL be left out, since its id must be sent back unchanged; an option's name SHALL be cut at 4 KiB. When options were left out the log SHALL say how many, and a request left with no option is answered `cancelled`, as one offering none is.
+A permission request from the agent SHALL be added to the log with its options and mark the turn blocked. The server SHALL answer it only with the option an attached client chose, or `cancelled` on a cancel, never on its own. With no client attached it SHALL wait, however long. An answer to a request already answered, or naming an option the request does not offer, SHALL be refused with an error. A request SHALL keep at most its first 16 options; an option whose id is empty, longer than 1 KiB or holds a control character SHALL be left out, since its id must be sent back unchanged; an option's name SHALL be cut at 4 KiB. When options were left out the log SHALL say how many, and a request left with no option is answered `cancelled`, as one offering none is. When the agent process that asked can no longer receive a choice, because it exited, was lost with its holder, was hung up to be started again, or its session's ACP handling failed, the request SHALL be recorded as cancelled in the log at that moment, and the agent SHALL receive `cancelled` for it if it is still running. The log's pending permission requests SHALL always be exactly the ones the agent is waiting on.
 
 #### Scenario: Allowed by the client
 - **WHEN** the agent asks permission with options `allow-once` and `reject-once`, and the attached client chooses `allow-once`
@@ -216,6 +220,14 @@ A permission request from the agent SHALL be added to the log with its options a
 #### Scenario: An option id too long to send back
 - **WHEN** the agent asks permission with options `allow-once` and a second option whose id is 2 KiB
 - **THEN** the request is shown with `allow-once` only, and the log says one option was left out
+
+#### Scenario: Pending at a restart for a login
+- **WHEN** a permission request waits as entry 7, the agent then answers the turn's prompt with `-32000`, and the client restarts the agent after a terminal login
+- **THEN** entry 7 is recorded as cancelled before the agent is shown starting, the new agent receives no answer to it, and a client attaching afterwards gets a replay that starts at the newest page, not at entry 7
+
+#### Scenario: Pending at a handling fault
+- **WHEN** a permission request waits and the session's ACP handling fails
+- **THEN** the request is recorded as cancelled, and the agent, which still runs, receives outcome `cancelled` for it
 
 ### Requirement: Attach replays the transcript
 A client on protocol 4 SHALL be able to attach a detached agent session. Before any live event the server SHALL send a delimited replay of a page of the log, the queue slot, the conversation, the turn state and the agent's state as transcript events. The page SHALL hold the newest whole entries up to the page budget (256 KiB of encoded entries, or less when the client's `ATTACH` asks for less), and always at least the newest entry, every entry from the oldest permission request still waiting for an answer, and every entry from the tool call each such request names. When older entries exist, the replay SHALL say from which entry the page starts and how many entries before it can be fetched. After the replay the client's copy SHALL equal the server's log from the page's first entry on, tool call content included. Attaching follows the ownership and close policy rules of terminal sessions.
@@ -294,7 +306,7 @@ Agent sessions SHALL have the close policies of terminal sessions: with `kill` t
 - **THEN** within a few seconds the agent and the processes it started are gone, and the session is no longer listed
 
 ### Requirement: The agent's exit is reported
-When an agent exits, the client SHALL receive a transcript event with its exit status and the last 16 KiB of its standard error; after a version mismatch the standard error is added as a notice instead, and the failed state stays. When the conversation can be continued (see "A session whose agent ended is kept for its conversation") the session SHALL stay; otherwise the session's exit SHALL follow, after which the session SHALL no longer be listed, except as a detached session's exit kept for its owner as for terminals.
+When an agent exits, the client SHALL receive a transcript event with its exit status and the last 16 KiB of its standard error; after a version mismatch the standard error is added as a notice instead, and the failed state stays. When the conversation can be continued (see "A session whose agent ended is kept for its conversation") the session SHALL stay; otherwise the session's exit SHALL follow, after which the session SHALL no longer be listed, except as a detached session's exit kept for its owner as for terminals. An owner that returns to such a kept exit SHALL first receive the session's replay, which ends with the agent's exit and its standard error, and then the session's exit.
 
 #### Scenario: Agent crashes
 - **WHEN** an attached agent that never offered `session/load` or `session/resume` writes `fatal: no model` to its standard error and exits with status 1
@@ -303,6 +315,14 @@ When an agent exits, the client SHALL receive a transcript event with its exit s
 #### Scenario: Agent that can continue crashes
 - **WHEN** an attached agent that offered `session/resume` and had a ready ACP session exits with status 1
 - **THEN** the client receives the agent's exit with status 1, receives no session exit, and the session is still listed
+
+#### Scenario: Owner returns to an exit it missed
+- **WHEN** an agent that never offered `session/load` or `session/resume` ends its turn and exits with status 1 while its owner's connection is gone and lingering, and the owner reconnects with its token in time
+- **THEN** the owner receives a replay holding the turn's end and the agent's exit with status 1 and its standard error, then the session's exit, and the session is no longer listed
+
+#### Scenario: Owner returns to an exit a new core adopted
+- **WHEN** an agent that can't be continued exits while no core runs, a new core adopts its holder, and the owner reconnects
+- **THEN** the owner's replay ends with the agent's exit and its standard error, then the session's exit follows
 
 ### Requirement: The session list shows agent sessions
 On protocol 4 the session list SHALL mark each agent session with its activity (`idle`, `working`, `blocked`, `done` or `error`, the names of program status) and the name the agent gave in `initialize`. `working` covers starting, logging in and a running turn, `blocked` a pending permission request, `done` a turn that ended with `end_turn`, `idle` a cancelled turn or a new session, and `error` everything that stopped the agent or a turn, a login demand included.
@@ -350,7 +370,7 @@ A core restart or an upgrade SHALL keep every agent session with its agent's pid
 - **THEN** a client attaching afterwards is shown the same held prompt, and can send it again
 
 ### Requirement: A faulty agent is confined to its session
-Output from an agent SHALL NOT end the core, the holder or another session. A line that is not a JSON-RPC message SHALL be skipped and counted in a notice. A line over 8 MiB SHALL be dropped up to its end, with a notice. Control characters other than newline and tab SHALL be replaced in transcript text. A failure while handling one agent's output SHALL stop only that session's ACP handling, with its reason in the transcript.
+Output from an agent SHALL NOT end the core, the holder or another session. A line that is not a JSON-RPC message SHALL be skipped and counted in a notice. A line over 8 MiB SHALL be dropped up to its end, with a notice. Control characters other than newline and tab SHALL be replaced in transcript text. A failure while handling one agent's output SHALL stop only that session's ACP handling, with its reason in the transcript. Nothing the failed handling asked to send SHALL reach the agent: the only messages the agent receives from then on are `cancelled` answers to its waiting permission requests. After such a failure, the attached client's log and the server's stored state SHALL hold the same entries as the server's log.
 
 #### Scenario: Not JSON
 - **WHEN** an agent writes `hello world` on its own line, then a valid agent message chunk
@@ -363,6 +383,14 @@ Output from an agent SHALL NOT end the core, the holder or another session. A li
 #### Scenario: Handling fault
 - **WHEN** handling one agent session's output fails inside the core
 - **THEN** that session's agent state says ACP handling failed and why, its prompts are refused from then on, its agent runs until the session is closed, and other sessions are unaffected
+
+#### Scenario: A fault after part of a step was applied
+- **WHEN** handling a prompt fails after the prompt's user entry was added to the log
+- **THEN** the attached client receives a fresh replay that holds the user entry and the failed state, the agent never receives the prompt, and a core that adopts the session after a SIGKILL has the same log
+
+#### Scenario: Events after a fault
+- **WHEN** a session's handling failed after part of a step was applied, and its agent then exits
+- **THEN** the attached client shows the agent's exit after the failure, with every entry the server's log holds
 
 ### Requirement: The fake ACP agent is a test binary that is never shipped
 The build SHALL produce `brindle-fake-acp-agent`, a program that plays an ACP agent from a script, in debug and release builds alike. No release archive, installer or package SHALL contain it.
@@ -436,7 +464,7 @@ When the holder running an agent session ends while the core runs, a session who
 - **THEN** the client receives the agent's state as lost with its holder, receives no session exit, and the session is still listed
 
 ### Requirement: Continuing a conversation
-The client that has an ended agent session attached SHALL be able to continue it, giving the agent's command, arguments and environment. The server SHALL start that command in the session's directory, keeping the session's id, log and slot, then send `initialize`, then `session/resume` for the conversation when offered, else `session/load`, with the directory and no MCP servers. The session SHALL be ready once that succeeds; new entries' ids follow the log's last.
+The client that has an ended agent session attached SHALL be able to continue it, giving the agent's command, arguments and environment. The server SHALL start that command in the session's directory, keeping the session's id, log and slot, then send `initialize`, then `session/resume` for the conversation when offered, else `session/load`, with the directory and no MCP servers. The session SHALL be ready once that succeeds; new entries' ids follow the log's last. Until the new agent has started, a continue SHALL follow the session's close policy as a starting session does: when its client is gone, a `kill` session's continue SHALL be dropped and the session SHALL end, and a `detach` session's continue SHALL go ahead unattached.
 
 #### Scenario: Resumed
 - **WHEN** an attached agent that offered `session/resume` exits, the client continues the session, and the agent started again offers `session/resume`
@@ -453,6 +481,14 @@ The client that has an ended agent session attached SHALL be able to continue it
 #### Scenario: A changed command
 - **WHEN** a client continues an ended agent session with arguments other than those the session was started with
 - **THEN** the agent is started with the new arguments, and the session is listed with the new command
+
+#### Scenario: Client gone before the continue starts
+- **WHEN** a client continues a `kill` agent session, and its connection ends before the new agent has started
+- **THEN** no agent is started for it, the session is no longer listed, and a `STOP` sent afterwards is answered at once
+
+#### Scenario: Detached client gone before the continue starts
+- **WHEN** a client continues a `detach` agent session, and its connection ends before the new agent has started
+- **THEN** the agent is started, the session is listed as detached, and a client that attaches it later sees the agent ready with the conversation
 
 ### Requirement: A conversation continued by loading keeps its log
 When an ended session is continued with `session/load`, the server SHALL NOT add the conversation the agent replays before answering to the log, and SHALL add a notice saying the conversation continued and how many of the agent's replayed updates weren't shown.
@@ -614,11 +650,15 @@ The server SHALL advertise `clientCapabilities.auth.terminal: true` in `initiali
 - **THEN** it gets an error saying the client runs that method, and the agent receives no `authenticate`
 
 ### Requirement: An agent that needs a login can be restarted
-A client's restart request while the agent needs a login SHALL hang up the running agent and start it again with the command, arguments and environment the request gives, keeping the log, the slot and any ACP session, then make the session ready as a recovery does: with `session/new` when no ACP session was made, else by taking up that session.
+A client's restart request while the agent needs a login SHALL hang up the running agent and start it again with the command, arguments and environment the request gives, keeping the log, the slot and any ACP session, then make the session ready as a recovery does: with `session/new` when no ACP session was made, else by taking up that session. The restart SHALL close what the old agent process left open: its waiting permission requests are recorded as cancelled, and a list request out to it is refused saying the agent is started again. Until the new agent has started, the restart SHALL follow the close policy as a continue does.
 
 #### Scenario: Restarted after a terminal login
 - **WHEN** a ready agent answered a prompt with `-32000`, and the client asks to restart it with its command, arguments and environment
 - **THEN** the old agent is hung up, a new agent process is sent `initialize` with `auth.terminal`, the conversation and the held prompt are kept, and the session becomes ready in the same ACP session
+
+#### Scenario: A permission waiting at the restart
+- **WHEN** a permission request waits when a ready agent answers a prompt with `-32000`, and the client restarts the agent after a terminal login
+- **THEN** the request is recorded as cancelled, and the client's answer to it afterwards gets an error naming the request, and the new agent receives nothing for it
 
 ### Requirement: The agent names the conversation
 When the agent sends `session_info_update` with a string `title`, the server SHALL keep it as the conversation's title, its control characters dropped, each run of whitespace made one space, trimmed, and cut at 256 characters with `…`, and SHALL send the conversation with it to attached clients. A `null` or blank `title` SHALL clear the title; an update without `title`, or a title equal to the one kept, SHALL send nothing.
@@ -947,7 +987,7 @@ A client attached to an agent session whose agent is ready or choosing SHALL be 
 - **THEN** the client receives an empty list, with nothing more to ask for
 
 ### Requirement: Refusing a list
-A request for an agent's conversations SHALL be refused with an error saying why when the agent doesn't offer a list, when the agent is neither ready nor choosing, when an earlier list for the session hasn't been answered, and when the agent answers with an error, whose message SHALL be given. An agent that needs a login to list SHALL be shown as needing one, as for any request that does, and SHALL return to what it was doing after the login.
+A request for an agent's conversations SHALL be refused with an error saying why when the agent doesn't offer a list, when the agent is neither ready nor choosing, when an earlier list for the session hasn't been answered, and when the agent answers with an error, whose message SHALL be given. An agent that needs a login to list SHALL be shown as needing one, as for any request that does, and SHALL return to what it was doing after the login. A list out when the agent process it was sent to stops (it exits, is lost with its holder, is hung up to be started again, or its session's ACP handling fails) SHALL be refused at that moment saying why, and a later list request SHALL NOT be refused as one in progress.
 
 #### Scenario: An agent without a list
 - **WHEN** a client asks for the conversations of an agent that doesn't offer `session/list`
@@ -964,6 +1004,10 @@ A request for an agent's conversations SHALL be refused with an error saying why
 #### Scenario: A login to list
 - **WHEN** a choosing agent answers `session/list` with the error that a login is needed, and the user logs in
 - **THEN** the session says a login is needed, and is choosing again once the login succeeds
+
+#### Scenario: A list out at a restart
+- **WHEN** a list request is out to an agent that needs a login, and the client restarts the agent after a terminal login
+- **THEN** the list request gets an error saying the agent is started again, and a list asked for once the new agent is ready goes to it
 
 ### Requirement: Listed conversations are bounded
 A reply SHALL hold at most 256 conversations, with titles made one line and cut at 256 characters, and ids and times bounded as other agent text is. A conversation the server can't read SHALL be left out without losing the others.

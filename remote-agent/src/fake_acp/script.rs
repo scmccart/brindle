@@ -19,6 +19,10 @@
 //! - `record <path>`: each message a later `expect` matches is appended to
 //!   this file, as the line it came in, so the test reads what the agent
 //!   was sent.
+//! - `record-all <path>`: from then on, every message read from stdin is
+//!   appended to this file, the ones an `expect` skips included, so a test
+//!   counts what the agent was sent however the steps after it matched
+//!   (OpenSpec change `agents-process-lifecycle`: an answer written twice).
 //! - `expect <method>`: read lines from stdin until a message with that
 //!   method comes (lines before it are skipped).
 //! - `expect-response <id>`: read lines from stdin until the response to
@@ -68,6 +72,10 @@ use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
     Record {
+        path: String,
+    },
+    /// Every message read from then on goes to `path`.
+    RecordAll {
         path: String,
     },
     Expect {
@@ -244,6 +252,7 @@ pub fn parse(text: &str) -> Result<Script, BadScript> {
                 }));
             }
             Step::Record { .. }
+            | Step::RecordAll { .. }
             | Step::ExpectResponse { .. }
             | Step::Send { .. }
             | Step::SendRaw { .. }
@@ -275,6 +284,9 @@ fn step(word: &str, rest: &str) -> Result<Step, Problem> {
     Ok(match word {
         "record" => Step::Record {
             path: needed("record", "a file")?,
+        },
+        "record-all" => Step::RecordAll {
+            path: needed("record-all", "a file")?,
         },
         "expect" => Step::Expect {
             method: needed("expect", "a method")?,
@@ -530,6 +542,23 @@ mod tests {
             one("record /tmp/case dir/got.jsonl"),
             Step::Record {
                 path: "/tmp/case dir/got.jsonl".into()
+            }
+        );
+    }
+
+    #[test]
+    fn record_all_names_the_file_every_message_goes_to() {
+        assert_eq!(
+            one("record-all /tmp/case/all.jsonl"),
+            Step::RecordAll {
+                path: "/tmp/case/all.jsonl".into()
+            }
+        );
+        assert_eq!(
+            problem("record-all").problem,
+            Problem::Missing {
+                step: "record-all",
+                what: "a file"
             }
         );
     }

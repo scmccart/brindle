@@ -726,17 +726,17 @@ mod tests {
 
         /// The other end of one of the core's connections, read and written
         /// without blocking, since the test turns the core's loop itself.
-        struct Peer(conn::Conn);
+        pub(super) struct Peer(pub(super) conn::Conn);
 
         impl Peer {
-            fn send(&mut self, frame: io::Result<Frame>) {
+            pub(super) fn send(&mut self, frame: io::Result<Frame>) {
                 self.0.queue(&frame.unwrap());
                 self.0.flush().unwrap();
                 assert_eq!(self.0.queued(), 0, "the core's socket was full");
             }
 
             /// The next frame the core has sent, if one is there.
-            fn frame(&mut self) -> Option<Frame> {
+            pub(super) fn frame(&mut self) -> Option<Frame> {
                 if let Some(frame) = self.0.next_frame().unwrap() {
                     return Some(frame);
                 }
@@ -744,7 +744,7 @@ mod tests {
                 self.0.next_frame().unwrap()
             }
 
-            fn message(&mut self) -> Option<ToClient> {
+            pub(super) fn message(&mut self) -> Option<ToClient> {
                 self.frame().map(|frame| ToClient::decode(&frame).unwrap())
             }
         }
@@ -1001,6 +1001,239 @@ mod tests {
                 other => panic!("{other:?}"),
             }
             assert!(test.core.sessions.is_empty());
+        }
+    }
+
+    /// A continue that waits for a holder when its client goes (OpenSpec
+    /// change `agents-process-lifecycle`, C-1). Linux only, as
+    /// `stored_before_told`: the stand-in holders are locked files and Unix
+    /// sockets, and the core turned here never starts a holder of its own,
+    /// which would run the test binary.
+    #[cfg(unix)]
+    mod restart_unplaced {
+        use std::fs::File;
+        use std::os::fd::AsRawFd as _;
+        use std::path::Path;
+
+        use super::stored_before_told::Peer;
+        use super::*;
+
+        use crate::acp::checkpoint;
+        use crate::acp::reduce::{self, AgentSession, Input};
+        use crate::server::core::sessions::Life;
+
+        use brindle_remote_protocol::client as c1;
+        use brindle_remote_protocol::holder::{self as h1, SessionMeta, ToHolder};
+
+        const SESSION: SessionId = 1;
+
+        /// What makes a live holder named `holder-test-N` for the core: its
+        /// lock held and its socket listening.
+        fn holder_files(dir: &Path, n: u32) -> (File, Listener) {
+            let lock = File::create(dir.join(format!("holder-test-{n}.lock"))).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let listener =
+                Listener::bind(&dir.join(format!("holder-test-{n}.sock")), Identity::own()).unwrap();
+            (lock, listener)
+        }
+
+        /// A ready agent session in ACP session `s1` whose agent offers
+        /// resume, so its conversation can be continued once it ends.
+        fn continuable_checkpoint() -> Vec<u8> {
+            let now = Instant::now();
+            let mut acp = AgentSession::new("/w".into(), "test".into());
+            reduce::step(&mut acp, Input::Spawned, now);
+            let lines = [
+                r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"resume":{}}}}}"#,
+                r#"{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s1"}}"#,
+            ];
+            for line in lines {
+                reduce::step(&mut acp, Input::Stdout(format!("{line}\n").as_bytes()), now);
+            }
+            assert!(
+                matches!(acp.transcript().agent(), brindle_transcript::AgentState::Ready { .. }),
+                "{:?}",
+                acp.transcript().agent()
+            );
+            checkpoint::encode(&acp).unwrap()
+        }
+
+        struct Test {
+            temp: TempDir,
+            core: Core<Loop>,
+            events: Vec<Event>,
+        }
+
+        impl Test {
+            fn turn(&mut self) {
+                self.core
+                    .turn(&mut self.events, Duration::from_millis(5))
+                    .unwrap();
+            }
+
+            /// Turns the core until `done`, for a few seconds at most.
+            fn turn_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !done(self) {
+                    assert!(Instant::now() < deadline, "never happened: {what}");
+                    self.turn();
+                }
+            }
+
+            /// A client connected with `token`, welcomed.
+            fn client(&mut self, token: &str) -> Peer {
+                let socket = listen::connect(&self.temp.0.join("core.sock")).unwrap();
+                let mut client = Peer(conn::Conn::new(socket).unwrap());
+                client.send(
+                    c1::ToCore::Hello(c1::Hello {
+                        min: c1::PROTOCOLS.min,
+                        max: c1::PROTOCOLS.max,
+                        client_version: "test".into(),
+                        client_token: token.into(),
+                        ..Default::default()
+                    })
+                    .encode(),
+                );
+                self.read_until(&mut client, "the client's WELCOME", |message| {
+                    matches!(message, ToClient::Welcome(_))
+                });
+                client
+            }
+
+            /// Turns the core until `client` has been sent a message `done`
+            /// takes; the messages before it are dropped.
+            fn read_until(
+                &mut self,
+                client: &mut Peer,
+                what: &str,
+                mut done: impl FnMut(&ToClient) -> bool,
+            ) {
+                self.turn_until(what, |_| {
+                    std::iter::from_fn(|| client.message()).any(|message| done(&message))
+                });
+            }
+        }
+
+        #[test]
+        fn a_continue_whose_kill_client_drops_before_placement_ends_and_a_stop_is_answered() {
+            let temp = TempDir::new("core-restart-unplaced");
+            let first = holder_files(&temp.0, 0);
+            let core = core_as(&temp, Identity::own());
+            let mut test = Test {
+                temp,
+                core,
+                events: Vec::new(),
+            };
+            test.core.discover(true);
+            let accepted = first.1.accept().unwrap().expect("the core's connection");
+            let mut holder = Peer(conn::Conn::new(accepted).unwrap());
+            test.turn_until("the core's HELLO", |_| holder.frame().is_some());
+
+            // The holder welcomes the core with A's `kill` agent session, its
+            // conversation one that can be continued.
+            let meta = SessionMeta {
+                command: "agent".into(),
+                cwd: Some("/w".into()),
+                key: "key".into(),
+                owner: "a".into(),
+                policy: c1::Policy::Kill,
+                ..SessionMeta::default()
+            };
+            holder.send(
+                h1::ToCore::Welcome(h1::Welcome {
+                    protocol: h1::PROTOCOLS.max,
+                    build: "test".into(),
+                    pid: std::process::id(),
+                    previous: h1::Previous::Crash,
+                    sessions: vec![h1::HeldSession {
+                        session: SESSION,
+                        pid: 4242,
+                        cols: 0,
+                        rows: 0,
+                        exit: None,
+                        meta: meta.to_value(),
+                        truncated: false,
+                        mode: h1::SpawnMode::Pipes,
+                    }],
+                })
+                .encode(),
+            );
+            let blobs = h1::ToCore::checkpoint(SESSION, &continuable_checkpoint())
+                .into_iter()
+                .chain(h1::ToCore::tail(SESSION, b""));
+            for message in blobs {
+                holder.send(message.encode());
+            }
+            test.turn_until("accepting clients", |test| test.core.lifecycle.accepting());
+
+            // A comes back to it.
+            let mut a = test.client("a");
+            test.read_until(&mut a, "A's replay", |message| {
+                matches!(message, ToClient::ReplayEnd(end) if end.session == SESSION)
+            });
+
+            // The holder goes: the agent is lost with it, its conversation
+            // kept for a continue.
+            drop(holder);
+            drop(first);
+            test.turn_until("the agent's loss", |test| {
+                matches!(test.core.sessions[&SESSION].life, Life::AgentEnded { .. })
+            });
+
+            // Another holder of the core's build is there, but hasn't
+            // welcomed it: a spawn waits for it.
+            let second = holder_files(&test.temp.0, 1);
+            test.core.discover(false);
+            a.send(
+                c1::ToCore::AgentRestart(c1::AgentRestart {
+                    req: 9,
+                    session: SESSION,
+                    command: "agent".into(),
+                    ..Default::default()
+                })
+                .encode(),
+            );
+            test.read_until(&mut a, "the continue's OK", |message| {
+                matches!(message, ToClient::Ok(ok) if ok.req == 9)
+            });
+            assert_eq!(test.core.waiting_restarts(), [SESSION], "the continue waits");
+
+            // A goes before the continue is placed.
+            drop(a);
+            test.turn_until("A's departure", |test| test.core.clients.is_empty());
+            assert!(
+                !test.core.sessions.contains_key(&SESSION),
+                "the session outlived its kill client: {:?}",
+                test.core.sessions[&SESSION].life
+            );
+            assert!(test.core.waiting.is_empty() && test.core.waiting_restarts().is_empty());
+
+            // A stop is answered, with nothing left to end: the core exits
+            // at once, and its exit answers it.
+            let mut b = test.client("b");
+            b.send(c1::ToCore::Stop(c1::Request { req: 11 }).encode());
+            test.turn_until("the STOP", |test| test.core.stopping.is_some());
+            assert_eq!(test.core.ending(), Ending::Stopping { sessions_left: false });
+            assert!(test.core.should_exit(Instant::now()));
+            let Test { temp: _temp, core, .. } = test;
+            core.shutdown();
+            let stopped = std::iter::from_fn(|| b.message())
+                .any(|message| matches!(message, ToClient::Ok(ok) if ok.req == 11));
+            assert!(stopped, "the STOP's OK");
+
+            // The holder that never welcomed the core was sent no spawn.
+            let accepted = second.1.accept().unwrap().expect("the core's connection");
+            let mut never = Peer(conn::Conn::new(accepted).unwrap());
+            while let Some(frame) = never.frame() {
+                let message = ToHolder::decode(&frame).unwrap();
+                assert!(
+                    !matches!(message, ToHolder::SpawnPipes(_) | ToHolder::Spawn(_)),
+                    "{message:?}"
+                );
+            }
         }
     }
 }

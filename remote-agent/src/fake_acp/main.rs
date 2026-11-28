@@ -139,21 +139,20 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
     let mut record: Option<File> = None;
+    let mut all: Option<File> = None;
     let mut last: Option<Last> = None;
     let mut line = Vec::new();
     for step in steps {
         match step {
-            Step::Record { path } => {
-                let file = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                    .map_err(Fault::io(format!("opening {path}")))?;
-                record = Some(file);
-            }
+            Step::Record { path } => record = Some(appending(path)?),
+            Step::RecordAll { path } => all = Some(appending(path)?),
             Step::Expect { method } => {
                 let wanted = |received: &Received| received.method.as_deref() == Some(method);
-                let id = expect(&mut input, &mut line, method, wanted, record.as_mut())?;
+                let records = Records {
+                    matched: record.as_mut(),
+                    all: all.as_mut(),
+                };
+                let id = expect(&mut input, &mut line, method, wanted, records)?;
                 // A notification leaves the request a response answers.
                 if id.is_some() || last.is_none() {
                     last = Some(Last {
@@ -165,7 +164,11 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
             Step::ExpectResponse { id } => {
                 let what = format!("the response to {id}");
                 let wanted = |received: &Received| received.answers(id);
-                expect(&mut input, &mut line, &what, wanted, record.as_mut())?;
+                let records = Records {
+                    matched: record.as_mut(),
+                    all: all.as_mut(),
+                };
+                expect(&mut input, &mut line, &what, wanted, records)?;
             }
             Step::Send { line } => write_line(&mut output, line)?,
             Step::SendRaw { text } => write_line(&mut output, text)?,
@@ -229,8 +232,9 @@ fn expect(
     line: &mut Vec<u8>,
     method: &str,
     wanted: impl Fn(&Received) -> bool,
-    record: Option<&mut File>,
+    records: Records<'_>,
 ) -> Result<Option<Value>, Fault> {
+    let Records { matched, mut all } = records;
     loop {
         line.clear();
         let read = input
@@ -244,19 +248,39 @@ fn expect(
         let Some(received) = Received::parse(line) else {
             continue;
         };
+        // One write per message, so a reader sees whole lines.
+        if line.last() != Some(&b'\n') {
+            line.push(b'\n');
+        }
+        if let Some(file) = all.as_deref_mut() {
+            file.write_all(line)
+                .map_err(Fault::io("writing the record of every message"))?;
+        }
         if !wanted(&received) {
             continue;
         }
-        if let Some(file) = record {
-            // One write per message, so a reader sees whole lines.
-            if line.last() != Some(&b'\n') {
-                line.push(b'\n');
-            }
+        if let Some(file) = matched {
             file.write_all(line)
                 .map_err(Fault::io("writing the record"))?;
         }
         return Ok(received.id);
     }
+}
+
+/// The files an `expect` appends to: the message it matched (`record`'s),
+/// and every message it read (`record-all`'s).
+struct Records<'a> {
+    matched: Option<&'a mut File>,
+    all: Option<&'a mut File>,
+}
+
+/// `path` opened for appending, created if it isn't there.
+fn appending(path: &str) -> Result<File, Fault> {
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(Fault::io(format!("opening {path}")))
 }
 
 /// The `id` a response answers: the last expected message's.

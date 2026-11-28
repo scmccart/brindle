@@ -162,7 +162,8 @@ pub enum Unreadable {
     /// The request bookkeeping doesn't hold together.
     Rpc { parts: BadParts },
     /// The state names an entry the log doesn't have, or has of another
-    /// kind.
+    /// kind; or the log has a pending permission request the state's
+    /// `permissions` doesn't await.
     Entry { name: &'static str, entry: EntryId },
     /// Partial line bytes come with a partial that isn't being collected.
     StrayBytes { len: usize },
@@ -204,7 +205,7 @@ impl fmt::Display for Unreadable {
             Self::Entry { name, entry } => {
                 write!(
                     f,
-                    "its checkpoint's {name} names entry {entry}, which the log doesn't hold"
+                    "its checkpoint's {name} and its log disagree about entry {entry}"
                 )
             }
             Self::StrayBytes { len } => {
@@ -881,6 +882,19 @@ fn restore(
             return Err(Unreadable::Entry {
                 name: "permissions",
                 entry: *entry,
+            });
+        }
+    }
+    // The converse (`agents-process-lifecycle` decision 3): a pending
+    // request the log shows is one `Rpc` awaits, or no answer to it could
+    // ever be sent.
+    for (entry, kept) in transcript.entries() {
+        if matches!(kept, Entry::Permission { outcome: None, .. })
+            && !rpc.permissions().contains_key(&entry)
+        {
+            return Err(Unreadable::Entry {
+                name: "permissions",
+                entry,
             });
         }
     }
@@ -2346,6 +2360,29 @@ mod tests {
         }
     }
 
+    /// The converse of the check above (`agents-process-lifecycle`
+    /// decision 3): a pending permission request in the log that `Rpc`
+    /// doesn't await could never be answered, so the checkpoint is refused.
+    #[test]
+    fn a_checkpoint_with_a_pending_permission_rpc_doesnt_await_is_unreadable() {
+        let agent = Agent::busy();
+        let entry = *agent.s.rpc.permissions().keys().next().expect("a request");
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        state["rpc"]["permissions"] = json!([]);
+        let refused = decode(&rebuild(&state, &partial), agent.now);
+        assert_eq!(
+            refused,
+            Err(Unreadable::Entry {
+                name: "permissions",
+                entry
+            })
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            format!("its checkpoint's permissions and its log disagree about entry {entry}")
+        );
+    }
+
     #[test]
     fn another_acp_version_is_unreadable() {
         let agent = Agent::ready();
@@ -2914,17 +2951,105 @@ mod tests {
         "74617465223a7b226167656e74223a227374617274696e67227d7d5d7d00000000",
     );
 
+    fn error(id: u64, code: i64, message: &str) -> Vec<u8> {
+        line(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}))
+    }
+
+    /// The log's pending permission requests are the ones `Rpc` awaits
+    /// (`agents-process-lifecycle` decision 3), and a process the session
+    /// is done with has nothing out: no permission and no list.
+    fn invariant(session: &AgentSession) {
+        assert_eq!(
+            reduce::pending_permissions(session.transcript()),
+            session.rpc.waiting_permissions(),
+            "the log's pending permission requests aren't the ones awaited"
+        );
+        let closed = match session.phase {
+            Phase::Restarting { .. } | Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost => true,
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
+            | Phase::Ready { .. }
+            | Phase::Choosing { .. }
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. } => false,
+        };
+        if closed {
+            assert!(
+                session.rpc.waiting_permissions().is_empty() && session.rpc.listing().is_none(),
+                "{:?} left requests out: {:?}",
+                session.phase,
+                session.rpc
+            );
+        }
+    }
+
+    /// `Input::Restart` as the core steps it: after a login demand the old
+    /// agent is hung up and the start is made again; once placed, the new
+    /// agent's `SPAWNED`, and the answers that bring it to ready. Every
+    /// output but the last is noted in `stored`; the last is returned.
+    fn restarted(agent: &mut Agent, stored: &mut Stored) -> Output {
+        let out = agent.step(Input::Restart);
+        if out.reply != Some(Ok(())) {
+            return out;
+        }
+        invariant(&agent.s);
+        let mut outs = vec![out];
+        if matches!(agent.s.phase, Phase::Restarting { .. }) {
+            outs.push(agent.step(Input::Restart));
+            invariant(&agent.s);
+        }
+        outs.push(agent.step(Input::Spawned));
+        invariant(&agent.s);
+        let request = |out: &Output| {
+            sent(&out.stdin)
+                .into_iter()
+                .find_map(|m| Some((m["method"].as_str()?.to_owned(), m["id"].as_u64()?)))
+        };
+        if let Some((_, id)) = outs.last().and_then(request) {
+            outs.push(agent.feed(&result(
+                id,
+                json!({"protocolVersion": 1,
+                "agentCapabilities": {"loadSession": true, "sessionCapabilities": {"resume": {}}},
+                "agentInfo": {"name": "fake", "version": "1.0"}}),
+            )));
+        }
+        match outs.last().and_then(request) {
+            Some((method, id)) if method == "session/new" => {
+                outs.push(agent.feed(&result(id, json!({"sessionId": "s1"}))));
+            }
+            Some((_, id)) => outs.push(agent.feed(&result(id, json!({})))),
+            None => {}
+        }
+        let last = outs.pop().unwrap_or_default();
+        for out in outs {
+            stored.saw(out);
+            invariant(&agent.s);
+        }
+        last
+    }
+
     /// Random reducer steps checkpointed at random points, whole or
-    /// appended: what the holder stores always decodes to the live session.
+    /// appended: what the holder stores always decodes to the live session,
+    /// and the log's pending permission requests are always the ones
+    /// awaited. The steps include the ends of an agent process: a login
+    /// demand and its restart, an exit and the restart after it, a fault,
+    /// answers and withdrawals of permissions, and a list out.
     #[test]
     fn random_steps_checkpointed_whole_or_appended_decode_to_the_live_session() {
         let mut rng = XorShift(0x5eed_5e9e_0000_0002);
         for _ in 0..300 {
             let mut agent = Agent::ready();
+            // It offers lists too, so a list can be out when it stops.
+            agent.s.lists = true;
             let mut stored = Stored::whole(&agent.s);
             let mut prompt_id = None;
+            let mut list_id = None;
+            let mut req = 0;
             for _ in 0..40 {
-                let out = match rng.below(12) {
+                let out = match rng.below(20) {
                     0 => {
                         let out = agent.prompt("go on");
                         if let Some(id) = sent(&out.stdin).first().and_then(|m| m["id"].as_u64()) {
@@ -2959,14 +3084,67 @@ mod tests {
                         agent.feed(&line[..at])
                     }
                     10 => agent.feed(b"not json\n"),
-                    _ => agent.step(Input::Command(Command::Unqueue)),
+                    11 => agent.step(Input::Command(Command::Unqueue)),
+                    // A login demand for the prompt out.
+                    12 => match prompt_id.take() {
+                        Some(id) => agent.feed(&error(id, crate::acp::forms::AUTH_REQUIRED, "log in")),
+                        None => agent.step(Input::Tick),
+                    },
+                    // A restart: after a login demand or an exit, the agent
+                    // is started again and brought to ready if it can be.
+                    13 => {
+                        let out = restarted(&mut agent, &mut stored);
+                        // A refused restart leaves what was out.
+                        prompt_id = prompt_id.filter(|id| agent.s.rpc.outgoing().contains_key(id));
+                        list_id = list_id.filter(|id| agent.s.rpc.outgoing().contains_key(id));
+                        out
+                    }
+                    14 => {
+                        prompt_id = None;
+                        list_id = None;
+                        agent.step(Input::Exited {
+                            code: Some(1),
+                            stderr: b"gone",
+                        })
+                    }
+                    15 => agent.step(Input::Fault {
+                        reason: "random fault".into(),
+                    }),
+                    16 => match agent.s.rpc.waiting_permissions().first() {
+                        Some(&entry) => agent.step(Input::Command(Command::Answer {
+                            entry,
+                            option: Some("allow".into()),
+                        })),
+                        None => agent.step(Input::Tick),
+                    },
+                    17 => agent.feed(&line(json!({"jsonrpc": "2.0", "method": "$/cancel_request",
+                        "params": {"requestId": format!("p{}", rng.below(100))}}))),
+                    18 => {
+                        req += 1;
+                        let out = agent.step(Input::Command(Command::List { req, cursor: None }));
+                        if let Some(id) = sent(&out.stdin).first().and_then(|m| m["id"].as_u64()) {
+                            list_id = Some(id);
+                        }
+                        out
+                    }
+                    _ => match list_id.take() {
+                        Some(id) => agent.feed(&result(id, json!({"sessions": []}))),
+                        None => agent.step(Input::Tick),
+                    },
                 };
                 stored.saw(out);
+                invariant(&agent.s);
                 match rng.below(5) {
                     0 => stored = Stored::whole(&agent.s),
                     1 | 2 => stored.append(&agent.s),
                     _ => {}
                 }
+            }
+            // A list out isn't checkpointed (`agents-session-list` flag
+            // 4): it is answered before the comparison.
+            if let Some(id) = list_id {
+                stored.saw(agent.feed(&result(id, json!({"sessions": []}))));
+                invariant(&agent.s);
             }
             stored.append(&agent.s);
             assert_eq!(stored.decode(agent.now), agent.s);
