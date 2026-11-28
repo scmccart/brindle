@@ -1,6 +1,6 @@
 [package]
 name = "brindle-remote-protocol"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Framed protocols between Brindle, its terminal server and the brindle-remote relay"
 license = "MIT OR Apache-2.0"
