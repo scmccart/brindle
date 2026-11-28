@@ -334,7 +334,10 @@ pub(super) fn activity(activity: Activity) -> AgentActivity {
 fn guarded_step(id: SessionId, acp: &mut AgentSession, input: Input<'_>, now: Instant) -> Output {
     let stepped = panic::catch_unwind(AssertUnwindSafe(|| {
         inject_fault(&input);
-        reduce::step(acp, input, now)
+        let late = late_fault(&input);
+        let output = reduce::step(acp, input, now);
+        inject_late(late, &output);
+        output
     }));
     let reason = match stepped {
         Ok(output) => return output,
@@ -357,8 +360,32 @@ fn guarded_step(id: SessionId, acp: &mut AgentSession, input: Input<'_>, now: In
 /// `BRINDLE_TEST_ACP_PANIC`'s marker (debug builds only).
 fn inject_fault(input: &Input<'_>) {
     static MARKER: OnceLock<Option<Vec<u8>>> = OnceLock::new();
-    let Some(marker) = fault::marker(fault::ACP_PANIC, &MARKER) else {
-        return;
+    if marked(input, fault::marker(fault::ACP_PANIC, &MARKER)) {
+        panic!("{} matched", fault::ACP_PANIC);
+    }
+}
+
+/// Whether the agent's stdout or a prompt holds
+/// `BRINDLE_TEST_ACP_PANIC_LATE`'s marker (debug builds only), read before
+/// the step takes the input.
+fn late_fault(input: &Input<'_>) -> bool {
+    static MARKER: OnceLock<Option<Vec<u8>>> = OnceLock::new();
+    marked(input, fault::marker(fault::ACP_PANIC_LATE, &MARKER))
+}
+
+/// Panics after a step whose input held the late switch's marker applied
+/// events: the session's log then has events its `Output` takes with it.
+fn inject_late(late: bool, output: &Output) {
+    if late && !output.events.is_empty() {
+        panic!("{} matched", fault::ACP_PANIC_LATE);
+    }
+}
+
+/// Whether `input`'s bytes a fault switch looks at (the agent's stdout, a
+/// prompt's text) hold `marker`; never without one.
+fn marked(input: &Input<'_>, marker: Option<&[u8]>) -> bool {
+    let Some(marker) = marker else {
+        return false;
     };
     let bytes: &[u8] = match input {
         Input::Stdout(bytes) => bytes,
@@ -379,11 +406,9 @@ fn inject_fault(input: &Input<'_>) {
             | Command::SetOption { .. },
         )
         | Input::Fault { .. }
-        | Input::Tick => return,
+        | Input::Tick => return false,
     };
-    if fault::holds(bytes, marker) {
-        panic!("{} matched", fault::ACP_PANIC);
-    }
+    fault::holds(bytes, marker)
 }
 
 /// A protocol 4 client's command for an agent session.

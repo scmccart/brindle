@@ -629,6 +629,10 @@ pub enum Refused {
     ChoiceNotOffered { id: String, value: String },
     /// An `AGENT_SET_OPTION` while an earlier set awaits its answer.
     OptionBusy,
+    /// The agent is started again after its login: what was out to the
+    /// one hung up is closed (OpenSpec change `agents-process-lifecycle`,
+    /// decision 1).
+    Restarted,
 }
 
 impl fmt::Display for Refused {
@@ -682,6 +686,7 @@ impl fmt::Display for Refused {
             Self::OptionBusy => {
                 f.write_str("an earlier change of an option hasn't been answered yet")
             }
+            Self::Restarted => f.write_str("the agent is started again after its login"),
         }
     }
 }
@@ -704,6 +709,10 @@ pub enum Moment {
     /// A login's state changed: it succeeded, failed or was cancelled
     /// (`agents-login` decision 15).
     Login,
+    /// The server answered one of the agent's requests itself: the line it
+    /// read reaches the holder, as consumed, ahead of the answer's bytes
+    /// (`agents-process-lifecycle` decision 8).
+    Answered,
 }
 
 /// What the core does after a step, in this order: send `events` to the
@@ -989,6 +998,16 @@ impl Ending {
     }
 }
 
+/// Whether the agent process whose requests are closed still runs
+/// (`Step::close_process`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closing {
+    /// It is gone or hung up: nothing more can be written to it.
+    Gone,
+    /// It runs on, but this session can no longer serve it (`fail`).
+    LeftRunning,
+}
+
 struct Step<'s> {
     s: &'s mut AgentSession,
     out: Output,
@@ -1003,6 +1022,10 @@ struct Step<'s> {
 impl Step<'_> {
     fn finish(mut self) -> Output {
         if let Some(reason) = self.fault.take() {
+            // Decision 2 of `agents-process-lifecycle`: a faulted step
+            // writes nothing it asked for; `fail`'s answers are all the
+            // agent gets.
+            self.out.stdin.clear();
             self.fail(&reason);
         }
         self.trim();
@@ -1040,7 +1063,8 @@ impl Step<'_> {
                 | Moment::QueueChanged
                 | Moment::Permission
                 | Moment::Stopped
-                | Moment::Login,
+                | Moment::Login
+                | Moment::Answered,
             )
             | None => Some(moment),
         };
@@ -1374,14 +1398,8 @@ impl Step<'_> {
         self.clear_lists();
         // A login out when the agent ended is never answered, nor is a
         // list, whose client is told.
-        self.s.rpc.forget(Purpose::Authenticate);
-        self.drop_list(if lost { Refused::Lost } else { Refused::Exited }.to_string());
-        for (entry, _) in self.s.rpc.cancel_permissions() {
-            self.emit(Event::Answered {
-                id: entry,
-                outcome: PermissionOutcome::Cancelled,
-            });
-        }
+        let why = if lost { Refused::Lost } else { Refused::Exited };
+        self.close_process(why.to_string(), Closing::Gone);
         if refused {
             // Decision 4: the version message stays the last agent state.
             match &state {
@@ -1463,7 +1481,9 @@ impl Step<'_> {
     /// requests are dead with it, its stdout's line is gone (the new
     /// agent's holder session counts from 0), and the request ids go on.
     fn respawn(&mut self, start: Start) {
-        self.s.rpc.restart();
+        // Normally a no-op: `end` or `restart_for_login` closed the old
+        // process. No path resets `Rpc` without closing it.
+        self.close_process(Refused::Restarted.to_string(), Closing::Gone);
         self.s.lines = Lines::new();
         self.s.run = None;
         self.s.tools.clear();
@@ -1500,6 +1520,9 @@ impl Step<'_> {
             }
         };
         self.s.phase = Phase::Restarting { start };
+        // The turn is already failed (`prompt_needs_login`), or there is
+        // none (a start's demand): nothing to unblock.
+        self.close_process(Refused::Restarted.to_string(), Closing::Gone);
         self.clear_lists();
         self.notice(NoticeLevel::Info, RESTARTED_AFTER_LOGIN.to_owned());
         self.agent(AgentState::Starting);
@@ -1511,8 +1534,10 @@ impl Step<'_> {
     /// sent nothing more and is hung up.
     fn refuse(&mut self, message: String) {
         self.s.phase = Phase::Refused;
+        self.close_process(message.clone(), Closing::Gone);
+        // A permission asked during a muted load left the turn blocked.
+        self.unblock();
         self.clear_lists();
-        self.drop_list(message.clone());
         self.hold_waiting(HoldReason::AgentStopped);
         self.agent(AgentState::Failed {
             message: bound(message),
@@ -1540,6 +1565,26 @@ impl Step<'_> {
         self.s.rpc.forget_sets();
     }
 
+    /// This session is done with its agent process (OpenSpec change
+    /// `agents-process-lifecycle`, decision 1): a list out to it is
+    /// answered `why`, every request awaited is forgotten, and each
+    /// permission request waiting is recorded `cancelled`, and answered so
+    /// too when the process runs on. The ids keep counting. The turn is
+    /// each caller's to decide.
+    fn close_process(&mut self, why: String, closing: Closing) {
+        self.drop_list(why);
+        for (entry, answer) in self.s.rpc.close() {
+            self.emit(Event::Answered {
+                id: entry,
+                outcome: PermissionOutcome::Cancelled,
+            });
+            match closing {
+                Closing::Gone => {}
+                Closing::LeftRunning => self.out.stdin.extend(answer),
+            }
+        }
+    }
+
     /// A list out when the agent stops being read is never answered: its
     /// client is told `why` (`agents-session-list` decision 11).
     fn drop_list(&mut self, why: String) {
@@ -1558,7 +1603,12 @@ impl Step<'_> {
         if self.ended() {
             return;
         }
-        self.drop_list("the terminal server's ACP handling failed".to_owned());
+        // The agent runs on, and a request of its could never get a choice
+        // now: it is answered `cancelled` (`process R19`).
+        self.close_process(
+            "the terminal server's ACP handling failed".to_owned(),
+            Closing::LeftRunning,
+        );
         self.s.phase = Phase::Broken;
         self.clear_lists();
         self.s.run = None;
@@ -1617,6 +1667,7 @@ impl Step<'_> {
                         id: None,
                         refusal: Refusal::InvalidRequest,
                     }));
+                self.mark(Moment::Answered);
             }
             // A batch is skipped and counted, never answered.
             Err(
@@ -1641,7 +1692,8 @@ impl Step<'_> {
                             .extend(self.s.rpc.dialect().encode(Request::Error {
                                 id: Some(&id),
                                 refusal: Refusal::MethodNotFound,
-                            }))
+                            }));
+                        self.mark(Moment::Answered);
                     }
                 }
             }
@@ -3842,6 +3894,19 @@ struct ToolFields {
     more: Option<u32>,
 }
 
+/// The log's permission requests still waiting for an answer, in entry
+/// order: the other side of the invariant `Rpc::waiting_permissions` is
+/// checked against after every step (`agents-process-lifecycle` decision
+/// 3).
+#[cfg(test)]
+pub(super) fn pending_permissions(transcript: &Transcript) -> Vec<EntryId> {
+    transcript
+        .entries()
+        .filter(|(_, entry)| matches!(entry, Entry::Permission { outcome: None, .. }))
+        .map(|(id, _)| id)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::limits::FIELD_LIMIT;
@@ -3910,6 +3975,21 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{event:?}: {e}"));
             }
             assert_eq!(self.client, self.s.transcript, "the client's fold differs");
+            assert_eq!(
+                pending_permissions(&self.s.transcript),
+                self.s.rpc.waiting_permissions(),
+                "the log's pending permission requests aren't the ones awaited"
+            );
+            if matches!(
+                self.s.phase,
+                Phase::Restarting { .. } | Phase::Refused | Phase::Broken | Phase::Exited | Phase::Lost
+            ) {
+                assert!(
+                    self.s.rpc.permissions().is_empty() && self.s.rpc.listing().is_none(),
+                    "a process the session is done with has requests out: {:?}",
+                    self.s.rpc
+                );
+            }
             for line in out.stdin.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
                 self.sent
                     .push(serde_json::from_slice(line).expect("a JSON line"));
@@ -6052,6 +6132,25 @@ mod tests {
             b"{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}\n"
         );
         assert!(out.wake.is_some());
+    }
+
+    /// C-5 (`agents-process-lifecycle` decision 8): the line read reaches
+    /// the holder, as consumed, ahead of the server's own answer, so a new
+    /// core doesn't read it again and answer twice.
+    #[test]
+    fn an_unoffered_request_is_checkpointed_before_its_answer() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(r#"{"jsonrpc":"2.0","id":4,"method":"fs/read_text_file","params":{"path":"/etc/passwd"}}"#);
+        assert_eq!(out.checkpoint, Some(Moment::Answered));
+        assert!(String::from_utf8_lossy(&out.stdin).contains("-32601"));
+    }
+
+    #[test]
+    fn an_invalid_request_is_checkpointed_before_its_answer() {
+        let mut agent = Agent::ready();
+        let out = agent.feed(r#"{"jsonrpc":"2.0","id":null,"method":"fs/read_text_file"}"#);
+        assert_eq!(out.checkpoint, Some(Moment::Answered));
+        assert!(String::from_utf8_lossy(&out.stdin).contains("-32600"));
     }
 
     #[test]
@@ -8568,6 +8667,172 @@ mod tests {
             AgentState::Exited { code: Some(1), .. }
         ));
         assert!(agent.s.continuable(), "its conversation can be continued");
+    }
+
+    // --- closing what a process left open (agents-process-lifecycle) -----
+
+    /// A-3: the restart after a terminal login hangs the old agent up, so
+    /// the permission it asked is closed before the new one is shown
+    /// starting, and no answer to it ever reaches either agent.
+    #[test]
+    fn a_permission_waiting_at_a_login_restart_is_recorded_cancelled_before_the_agent_starts() {
+        let mut agent = Agent::ready_with_methods();
+        let id = agent.turn("one");
+        agent.feed(&said("Working"));
+        let entry = agent.ask(json!("p7"), &ALLOW_REJECT);
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["answered", "added notice", "agent starting"]);
+        assert_eq!(
+            out.events.first(),
+            Some(&Event::Answered {
+                id: entry,
+                outcome: PermissionOutcome::Cancelled
+            })
+        );
+        assert!(out.stdin.is_empty(), "nothing goes to an agent being hung up");
+        assert!(out.hang_up);
+
+        // The new agent takes up the session, is sent nothing for the
+        // request, and a late answer to it is refused naming it.
+        let sent = agent.sent.len();
+        let id = agent.restart();
+        agent.feed(&initialized(id, resume_only()));
+        let resume = agent.last("session/resume")["id"].as_u64().expect("an id");
+        agent.feed(&result(resume, json!({})));
+        assert_eq!(*agent.s.phase(), Phase::Ready { session: "s1".into() });
+        assert_eq!(
+            agent
+                .cmd(Command::Answer {
+                    entry,
+                    option: Some("allow-once".into())
+                })
+                .reply,
+            Some(Err(Refused::AlreadyAnswered { entry }))
+        );
+        assert!(
+            agent.sent_since(sent).iter().all(|line| line["id"] != json!("p7")),
+            "{:?}",
+            agent.sent_since(sent)
+        );
+    }
+
+    /// A-3: a list out to the agent being hung up for its login restart is
+    /// refused there, and the next goes to the new agent.
+    #[test]
+    fn a_list_out_at_a_login_restart_is_refused_saying_the_agent_is_started_again() {
+        let mut agent = Agent::ready_with_methods();
+        agent.s.lists = true;
+        let id = agent.turn("one");
+        assert_eq!(agent.list(3, None).reply, Some(Ok(())));
+        agent.feed(&error(id, AUTH_REQUIRED, "expired"));
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(
+            out.listed,
+            Some(ListAnswer {
+                req: 3,
+                result: Err("the agent is started again after its login".into())
+            })
+        );
+        assert!(agent.s.rpc.listing().is_none());
+        let id = agent.restart();
+        agent.feed(&initialized(id, json!({"sessionCapabilities": {"resume": {}, "list": {}}})));
+        let resume = agent.last("session/resume")["id"].as_u64().expect("an id");
+        agent.feed(&result(resume, json!({})));
+        assert_eq!(agent.list(4, None).reply, Some(Ok(())));
+    }
+
+    /// Observation 6: a step that faults sends nothing it asked for; the
+    /// prompt here is never written, though its id was taken.
+    #[test]
+    fn a_fold_error_writes_nothing_the_faulted_step_asked_for() {
+        let mut agent = Agent::ready();
+        agent.event_limit = 1024;
+        let out = agent.prompt(&"x".repeat(4096));
+        assert!(
+            matches!(agent.agent_state(), AgentState::Failed { .. }),
+            "{:?}",
+            agent.agent_state()
+        );
+        assert!(out.stdin.is_empty(), "{} bytes written", out.stdin.len());
+        assert!(!agent.sent_methods().contains(&"session/prompt"));
+    }
+
+    /// A-3: after a handling fault the agent runs on, and no choice can
+    /// come for what it asked; it is answered `cancelled`, as the log says.
+    #[test]
+    fn a_handling_fault_cancels_and_answers_the_waiting_permissions() {
+        let mut agent = Agent::ready();
+        agent.turn("one");
+        let entry = agent.ask(json!("p1"), &ALLOW_REJECT);
+        let sent = agent.sent.len();
+        let out = agent.step(Input::Fault {
+            reason: "panicked at reduce.rs".into(),
+        });
+        assert!(!out.hang_up);
+        assert_eq!(shape(&out.events), ["answered", "turn failed", "agent failed"]);
+        assert_eq!(
+            agent.s.transcript.entry(entry).and_then(|entry| match entry {
+                Entry::Permission { outcome, .. } => outcome.clone(),
+                _ => None,
+            }),
+            Some(PermissionOutcome::Cancelled)
+        );
+        let answers = agent.sent_since(sent);
+        assert_eq!(answers.len(), 1, "{answers:?}");
+        assert_eq!(answers[0]["id"], json!("p1"));
+        assert_eq!(answers[0]["result"]["outcome"]["outcome"], json!("cancelled"));
+    }
+
+    /// A-3: a load the new agent refuses closes a permission it asked
+    /// during the muted replay, and the turn it blocked is no longer
+    /// blocked.
+    #[test]
+    fn a_refused_load_cancels_a_permission_asked_during_it_and_unblocks_the_turn() {
+        let mut agent = Agent::ended();
+        let id = agent.restart();
+        agent.feed(&initialized(id, load_only()));
+        let entry = agent.ask(json!("p9"), &ALLOW_REJECT);
+        assert_eq!(*agent.turn_state(), TurnState::Blocked);
+        let sent = agent.sent.len();
+        let out = agent.feed(&error(id + 1, -32603, "no such session"));
+        assert!(out.hang_up);
+        assert_eq!(shape(&out.events)[..2], ["answered", "turn idle"]);
+        assert!(matches!(
+            agent.s.transcript.entry(entry),
+            Some(Entry::Permission {
+                outcome: Some(PermissionOutcome::Cancelled),
+                ..
+            })
+        ));
+        assert!(agent.sent_since(sent).is_empty(), "nothing goes to a refused agent");
+        assert!(matches!(agent.agent_state(), AgentState::Failed { .. }));
+    }
+
+    /// A-3: the exit closed what the agent had out; the restart after it
+    /// has nothing left to close.
+    #[test]
+    fn a_restart_after_an_exit_answers_nothing_already_closed() {
+        let mut agent = Agent::ready_offering(both());
+        agent.turn("one");
+        agent.ask(json!("p2"), &ALLOW_REJECT);
+        let out = agent.exit();
+        assert_eq!(shape(&out.events), ["answered", "turn failed", "agent exited"]);
+        let out = agent.step(Input::Restart);
+        assert_eq!(out.reply, Some(Ok(())));
+        assert_eq!(shape(&out.events), ["added notice", "agent starting"]);
+        let sent = agent.sent.len();
+        agent.step(Input::Spawned);
+        assert_eq!(
+            agent
+                .sent_since(sent)
+                .iter()
+                .filter_map(|line| line["method"].as_str())
+                .collect::<Vec<_>>(),
+            ["initialize"]
+        );
     }
 
     // --- choosing and listing (agents-session-list) ----------------------

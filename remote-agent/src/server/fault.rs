@@ -21,12 +21,22 @@ pub const FEED_PANIC: &str = "BRINDLE_TEST_FEED_PANIC";
 /// `core/agents.rs` panics, inside the guarded call to the ACP reducer, on
 /// agent output or a prompt holding its marker.
 pub const ACP_PANIC: &str = "BRINDLE_TEST_ACP_PANIC";
+/// The core's switch for a panic part way through an agent session's step
+/// (OpenSpec change `agents-process-lifecycle`, decision 6): `inject_late`
+/// in `core/agents.rs` panics inside the guarded call, after the reducer
+/// applied the step's events, when its input held the marker. The log then
+/// has events no client and no checkpoint has.
+pub const ACP_PANIC_LATE: &str = "BRINDLE_TEST_ACP_PANIC_LATE";
 
 /// The switches this build honours, as `--list-fault-switches` prints
 /// them: all in a debug build, none in a release build, which never reads
 /// them (`process R20`).
 pub fn honoured() -> &'static [&'static str] {
-    if cfg!(debug_assertions) { &[HOLDER_PANIC, FEED_PANIC, ACP_PANIC] } else { &[] }
+    if cfg!(debug_assertions) {
+        &[HOLDER_PANIC, FEED_PANIC, ACP_PANIC, ACP_PANIC_LATE]
+    } else {
+        &[]
+    }
 }
 
 /// What a caught panic said: its message, or "no message".
@@ -70,7 +80,12 @@ mod tests {
         if cfg!(debug_assertions) {
             assert_eq!(
                 honoured(),
-                ["BRINDLE_TEST_HOLDER_PANIC", "BRINDLE_TEST_FEED_PANIC", "BRINDLE_TEST_ACP_PANIC"]
+                [
+                    "BRINDLE_TEST_HOLDER_PANIC",
+                    "BRINDLE_TEST_FEED_PANIC",
+                    "BRINDLE_TEST_ACP_PANIC",
+                    "BRINDLE_TEST_ACP_PANIC_LATE"
+                ]
             );
         } else {
             assert!(honoured().is_empty(), "{:?}", honoured());

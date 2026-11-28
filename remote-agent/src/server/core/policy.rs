@@ -570,7 +570,8 @@ pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
             | Moment::QueueChanged
             | Moment::Permission
             | Moment::Stopped
-            | Moment::Login,
+            | Moment::Login
+            | Moment::Answered,
         ))
         | AgentCheckpoint::StepDown
         | AgentCheckpoint::Detach => true,
@@ -1571,6 +1572,7 @@ mod tests {
             Moment::Permission,
             Moment::Stopped,
             Moment::Login,
+            Moment::Answered,
         ];
         for moment in moments {
             assert!(agent_checkpoint_due(AgentCheckpoint::Stepped(Some(moment)), 0), "{moment:?}");
