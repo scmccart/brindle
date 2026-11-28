@@ -2038,7 +2038,9 @@ fn a_log_past_16_mib_drops_its_oldest_entries() {
     const MESSAGES: usize = 17;
     let (mut dir, mut client) = agent_core("agent-trim", &[]);
     let (mut script, _) = started(&dir.path, "trim");
-    let text = |n: usize| format!("{n:02}:{}", "x".repeat(1024 * 1024));
+    // Each message exactly 1 MiB, the most one entry holds
+    // (`agents-event-bounds` decision 2), so each stays one entry.
+    let text = |n: usize| format!("{n:02}:{}", "x".repeat(1024 * 1024 - 3));
     script.step("expect session/prompt");
     for n in 0..MESSAGES {
         // A thought between two messages makes each its own entry.

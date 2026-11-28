@@ -813,6 +813,9 @@ impl<L: EventLoop> Core<L> {
         if let Some(answer) = listed {
             self.send_listed(id, answer);
         }
+        if let Some(line) = failure_line(id, &events) {
+            log!("{line}");
+        }
         let session = self.sessions.get_mut(&id)?;
         let client = session
             .ownership
@@ -1051,9 +1054,62 @@ impl<L: EventLoop> Core<L> {
     }
 }
 
+/// The line the core logs for a step whose events fail session `id`'s
+/// agent: its message, which names a fold error or an event too large to
+/// send (`agents-event-bounds` decision 4), so the cause isn't only in the
+/// client's view.
+fn failure_line(id: SessionId, events: &[Event]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if let Event::Agent {
+            state: AgentState::Failed { message },
+        } = event
+        {
+            Some(format!("session {id}: {message}"))
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step whose events fail the agent, a fold error or an event too
+    /// large to send among them, logs why, naming the session
+    /// (`agents-event-bounds` task 4.5); one that doesn't logs nothing.
+    #[test]
+    fn a_failure_in_a_steps_events_reaches_the_log() {
+        let message = "ACP handling failed: an added (tool) event for entry 2 is 2000000 bytes; one transcript event may be at most 1047552";
+        let events = [
+            Event::Turn {
+                state: brindle_transcript::TurnState::Failed {
+                    message: "ACP handling failed".into(),
+                },
+            },
+            Event::Agent {
+                state: AgentState::Failed {
+                    message: message.into(),
+                },
+            },
+        ];
+        assert_eq!(failure_line(7, &events), Some(format!("session 7: {message}")));
+        assert_eq!(failure_line(7, &events[..1]), None);
+        let mut session = AgentSession::new("/w".into(), "0.3.0".into());
+        let output = reduce::step(
+            &mut session,
+            Input::Fault {
+                reason: "has no text to append to".into(),
+            },
+            Instant::now(),
+        );
+        assert!(
+            failure_line(3, &output.events).is_some_and(|line| line.starts_with("session 3: ACP handling failed: ")
+                && line.contains("has no text to append to")),
+            "{:?}",
+            output.events
+        );
+    }
 
     #[test]
     fn each_activity_is_listed_by_its_own_name() {
