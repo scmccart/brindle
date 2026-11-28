@@ -78,7 +78,8 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 4. Pure checkpoint: the delta shape, earlier checkpoints refused, one buffer
 
-- [ ] 4.1 Write the tests first in `remote-agent/src/acp/checkpoint.rs` (or `checkpoint/`) and watch them fail (`cargo test -p brindle-remote-agent acp::checkpoint`). The `Stored` test helper carries `Written`.
+- [x] 4.1 Write the tests first in `remote-agent/src/acp/checkpoint.rs` (or `checkpoint/`) and watch them fail (`cargo test -p brindle-remote-agent acp::checkpoint`). The `Stored` test helper carries `Written`.
+  Done: in `checkpoint/mod.rs` with the harness's `Stored` carrying `Written` and `rebuild` writing a format-2 base; they failed to build on the old API (`encode` returning bytes, no `Written`, `PartialGap` or `Limited`). The random steps gain long lines fed in pieces; the fuzz test a delta-shaped chain.
   - `a_segment_carries_no_tool_index_and_its_size_doesnt_grow_with_the_tool_calls`: segments at the 10th and the 2,000th tool call differ only by their events.
   - `a_long_line_is_written_once_across_its_segments_and_decodes_whole`.
   - `a_partial_line_that_ended_or_was_cut_resets_its_delta`: `Collecting`, then a newline and a new line, then `TooLong`, then `Resyncing`.
@@ -95,7 +96,7 @@ Each group writes its tests first and watches them fail before the code they che
   - `a_full_log_a_full_partial_line_and_a_full_prompt_fit_in_64_mib`, which already exists, must keep passing.
   - `random_steps_checkpointed_whole_or_appended_decode_to_the_live_session` and the tool-content round trips must keep passing with the new API, and gain restarts and long split lines among their random steps.
   - `fuzz_decoding_never_panics_on_random_or_mutated_checkpoints` gains a delta-shaped chain with a long partial line and an outputs patch to mutate.
-- [ ] 4.2 Implement design 1 to 6 and 8 in `checkpoint.rs`:
+- [x] 4.2 Implement design 1 to 6 and 8 in `checkpoint.rs`:
   - `Written`, `LineMark`, `WrittenChanges`, `Encoded` and `Segment`;
   - `encode` and `encode_segment(session, events: Vec<Event>, seq, &Written)`;
   - `StateOut` streaming `ReplayRef` or the merged events through `Limited` into `out`;
@@ -103,10 +104,12 @@ Each group writes its tests first and watches them fail before the code they che
   - `decode_1`, `FORMAT_1` and their tests removed, and `Unreadable`'s format message naming format 2 alone.
 
   Rewrite the module doc's format section: the delta shape, that earlier checkpoints are refused, decision 4's table and its rule for new fields, and the `lines.from` delta. Verify with `cargo test -p brindle-remote-agent acp::`.
+  Done: 877ffa0b, with 5.1 and the core's write path (it wouldn't build apart); the state is written field by field, not through a derived `StateOut` (flag 7). 461 `acp::` tests pass.
 
 ## 5. Pure policy: one fact for what is stored, the bound asserted
 
-- [ ] 5.1 Change `policy::Stored::Known` to carry `written: Written` (no longer `Copy`): `Stored::whole(len, written)`, `Stored::appended(self, len, changes)`, and `agent_appendable` and `agent_checkpoint_form` taking `&Stored` (design 5). Update the policy tests that build `Stored` (`Written::default()` where the content doesn't matter), and `Checkpointing` in the tests. Verify that 1.2's test now passes with its three assertions, and that `checkpoints_of_a_64_mib_conversation_write_a_small_multiple_of_what_it_added` and every `agent_checkpoint_form` test pass (`cargo test -p brindle-remote-agent server::core::policy`). Record the printed after numbers in `design.md`'s As built.
+- [x] 5.1 Change `policy::Stored::Known` to carry `written: Written` (no longer `Copy`): `Stored::whole(len, written)`, `Stored::appended(self, len, changes)`, and `agent_appendable` and `agent_checkpoint_form` taking `&Stored` (design 5). Update the policy tests that build `Stored` (`Written::default()` where the content doesn't matter), and `Checkpointing` in the tests. Verify that 1.2's test now passes with its three assertions, and that `checkpoints_of_a_64_mib_conversation_write_a_small_multiple_of_what_it_added` and every `agent_checkpoint_form` test pass (`cargo test -p brindle-remote-agent server::core::policy`). Record the printed after numbers in `design.md`'s As built.
+  Done: 877ffa0b; 1.2's test passes: 32,264,203 bytes written for 13,072,007 added in 11,018 records, against 2,123,919,660 before (As built (after)).
 
 ## 6. Shell: the core encodes once and queues slices
 
