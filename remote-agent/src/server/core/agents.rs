@@ -24,15 +24,22 @@
 //!   (unless it waits for its replay, which has them), then a checkpoint
 //!   when [`policy::agent_checkpoint_due`] says so, then the bytes for the
 //!   agent's stdin as `INPUT`, then the hang-up: so a prompt's checkpoint
-//!   is in the holder's connection before its bytes.
+//!   is in the holder's connection before its bytes. Each event is
+//!   encoded once ([`encoded_events`]) and packed as those bytes
+//!   ([`client::transcript_frames`]), then moved into `unsaved`.
 //! - **Checkpoints** are `acp::checkpoint`'s encoding; `covers` is the
 //!   stdout fed since the last one ([`crate::acp::lines::Lines::covers`]).
 //!   With change `agents-log-paging` (decision 9) each [`Agent`] keeps
 //!   what its holder stores ([`Stored`]) and the events applied since its
 //!   last checkpoint (`unsaved`), and [`policy::agent_checkpoint_form`]
-//!   says whether the next is whole (`CHECKPOINT_BEGIN`) or a segment of
-//!   those events appended to what is stored (`CHECKPOINT_APPEND`). What
-//!   is stored starts again as unknown, so the next is whole, on an
+//!   says whether the next is whole (`CHECKPOINT_BEGIN`) or a segment
+//!   appended to what is stored (`CHECKPOINT_APPEND`). A segment carries
+//!   deltas (change `agents-checkpoint-deltas`): those events, the partial
+//!   line's bytes since the last record, and the login methods and open
+//!   outputs only where they changed, against the `Written` that
+//!   [`Stored`] keeps. Either is encoded into one buffer and queued to
+//!   the holder from slices of it ([`h1::checkpoint_frames`]). What is
+//!   stored starts again as unknown, so the next is whole, on an
 //!   adoption, a restart and any holder `ERROR` naming the session.
 //! - **Pages** (decision 5): a replay sends the newest page of the log
 //!   ([`Agent::replay`]), and the attached client's `AGENT_FETCH`es get
@@ -93,13 +100,14 @@
 //!   asked for the current value), and the agent's answer reaches every
 //!   attached client as an `Options` event or a notice.
 
+use std::io;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, Exit, ToClient};
+use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, Exit, JsonObject, ToClient};
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
-use brindle_remote_protocol::serde_json::Value;
+use brindle_remote_protocol::serde_json;
 use brindle_remote_protocol::{RequestId, SessionId};
 use brindle_transcript::{
     Activity, AgentState, Continuation, Conversation, EntryId, Event, Fetched,
@@ -307,16 +315,11 @@ impl Agent {
 
     /// The events that rebuild the newest page of its log within `budget`
     /// bytes of entries ([`brindle_transcript::Transcript::page`]),
-    /// encoded for `TRANSCRIPT`.
-    pub(super) fn replay(&self, budget: usize) -> Vec<Value> {
+    /// encoded once for `TRANSCRIPT`.
+    pub(super) fn replay(&self, budget: usize) -> io::Result<Vec<JsonObject>> {
         match &self.acp {
-            Acp::Adopting { .. } => Vec::new(),
-            Acp::Running(acp) => acp
-                .transcript()
-                .page(budget)
-                .iter()
-                .map(Event::to_value)
-                .collect(),
+            Acp::Adopting { .. } => Ok(Vec::new()),
+            Acp::Running(acp) => encoded_events(&acp.transcript().page(budget)),
         }
     }
 
@@ -332,6 +335,19 @@ impl Agent {
             Acp::Running(acp) => acp.transcript().fetch(before, budget),
         }
     }
+}
+
+/// Each of `events` encoded once, as `TRANSCRIPT` and `AGENT_PAGE` carry
+/// it (OpenSpec change `agents-checkpoint-deltas`, decision 9): the bytes
+/// [`Event::encoded_len`] counts.
+pub(super) fn encoded_events(events: &[Event]) -> io::Result<Vec<JsonObject>> {
+    events
+        .iter()
+        .map(|event| {
+            let bytes = serde_json::to_vec(event)?;
+            JsonObject::new(bytes).map_err(|refused| io::Error::new(io::ErrorKind::InvalidData, refused.to_string()))
+        })
+        .collect()
 }
 
 /// The listing's activity for the log's (decision 15): the same five
@@ -774,11 +790,11 @@ impl<L: EventLoop> Core<L> {
         else {
             return;
         };
-        let events = events.iter().map(Event::to_value).collect();
-        match client::pack_page(req, id, events, more) {
+        let frames = encoded_events(&events).and_then(|events| client::page_frames(req, id, &events, more));
+        match frames {
             Ok(frames) => {
-                for frame in frames {
-                    self.send_client(client, ToClient::AgentPage(frame));
+                for frame in &frames {
+                    self.send_client_frame(client, frame);
                 }
             }
             Err(failure) => {
@@ -899,17 +915,20 @@ impl<L: EventLoop> Core<L> {
         let holder = session.holder;
         let agent = session.agent()?;
         agent.wake = wake;
+        // Each event is encoded once, for the client, then moved into what
+        // the next checkpoint holds.
+        let sent = client
+            .filter(|_| !events.is_empty())
+            .map(|client| (client, encoded_events(&events)));
         if !agent.unstorable && delivered {
-            agent.unsaved.extend(events.iter().cloned());
+            agent.unsaved.extend(events);
         }
         let since = match &agent.acp {
             Acp::Running(acp) => acp.lines().covers().saturating_sub(agent.checkpointed),
             Acp::Adopting { .. } => 0,
         };
-        if let Some(client) = client
-            && !events.is_empty()
-        {
-            self.send_transcript(client, id, events.iter().map(Event::to_value).collect());
+        if let Some((client, events)) = sent {
+            self.send_transcript(client, id, events);
         }
         let at = AgentCheckpoint::Stepped(checkpoint);
         if policy::agent_checkpoint_due(at, since) {
@@ -935,12 +954,13 @@ impl<L: EventLoop> Core<L> {
     /// whole events. One that can't fit a frame is reported to the client
     /// and logged; `acp::limits`' I1 rules it out, since every event the
     /// reducer emits, replays or pages encodes within `MAX_EVENT`, which
-    /// leaves `TRANSCRIPT_ENVELOPE` of the frame for the batch.
-    pub(super) fn send_transcript(&mut self, client: Token, id: SessionId, events: Vec<Value>) {
-        match client::pack_transcript(id, events) {
-            Ok(messages) => {
-                for message in messages {
-                    self.send_client(client, ToClient::Transcript(message));
+    /// leaves `TRANSCRIPT_ENVELOPE` of the frame for the batch. The events
+    /// come encoded once ([`encoded_events`]), and are packed as they are.
+    pub(super) fn send_transcript(&mut self, client: Token, id: SessionId, events: io::Result<Vec<JsonObject>>) {
+        match events.and_then(|events| client::transcript_frames(id, &events)) {
+            Ok(frames) => {
+                for frame in &frames {
+                    self.send_client_frame(client, frame);
                 }
             }
             Err(failure) => {
@@ -1013,30 +1033,29 @@ impl<L: EventLoop> Core<L> {
                 let covers = acp.lines().covers();
                 let since = covers.saturating_sub(agent.checkpointed);
                 agent.checkpointed = covers;
-                let stored = std::mem::replace(&mut agent.stored, Stored::Unknown);
-                let messages = match to_store {
-                    ToStore::Whole(encoded) => {
-                        agent.stored = Stored::whole(encoded.bytes.len() as u64, encoded.written);
-                        ToHolder::checkpoint(id, &encoded.bytes, since)
-                    }
-                    ToStore::Append(segment) => {
-                        let len = segment.bytes.len() as u64;
-                        agent.stored = stored.appended(len, segment.changes);
-                        ToHolder::checkpoint_append(id, &segment.bytes, since)
-                    }
-                };
                 // Only a line longer than a checkpoint's spacing, or a
                 // moment met while one arrives, is held: rare enough to say.
                 let held = match acp.lines().partial() {
                     Partial::Collecting(line) => line.len(),
                     Partial::TooLong { .. } | Partial::Resyncing { .. } => 0,
                 };
+                let stored = std::mem::replace(&mut agent.stored, Stored::Unknown);
+                let (bytes, form) = match to_store {
+                    ToStore::Whole(encoded) => {
+                        agent.stored = Stored::whole(encoded.bytes.len() as u64, encoded.written);
+                        (encoded.bytes, h1::BlobForm::Whole)
+                    }
+                    ToStore::Append(segment) => {
+                        let len = segment.bytes.len() as u64;
+                        agent.stored = stored.appended(len, segment.changes);
+                        (segment.bytes, h1::BlobForm::Append)
+                    }
+                };
                 if held > 0 {
                     log!("session {id}: checkpointed with {held} bytes of a line still arriving");
                 }
-                for message in messages {
-                    self.send_holder(holder, message);
-                }
+                // Queued from slices of the one buffer it was encoded into.
+                self.send_holder_sliced(holder, h1::checkpoint_frames(id, &bytes, since, form));
             }
             Err(too_large) => {
                 log!("session {id}: {too_large}; failing its ACP handling");
@@ -1360,8 +1379,9 @@ mod tests {
         );
         let events: Vec<Event> = agent
             .replay(brindle_transcript::PAGE_BYTES)
+            .unwrap()
             .iter()
-            .map(|value| Event::from_value(value).unwrap())
+            .map(|object| Event::from_value(&serde_json::from_slice(object.as_bytes()).unwrap()).unwrap())
             .collect();
         assert!(
             events.iter().any(|event| matches!(event, Event::Agent { state: AgentState::Starting })),
@@ -1370,7 +1390,7 @@ mod tests {
 
         let adopting = Agent::adopting();
         assert_eq!(adopting.info().activity, AgentActivity::Working);
-        assert!(adopting.replay(brindle_transcript::PAGE_BYTES).is_empty());
+        assert!(adopting.replay(brindle_transcript::PAGE_BYTES).unwrap().is_empty());
     }
 
     #[test]

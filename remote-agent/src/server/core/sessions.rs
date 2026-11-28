@@ -432,8 +432,8 @@ pub(super) struct Session {
 enum Replay {
     /// A terminal's screen, as `DATA`.
     Screen(Vec<u8>),
-    /// An agent's log, as `TRANSCRIPT` events.
-    Transcript(Vec<brindle_remote_protocol::serde_json::Value>),
+    /// An agent's log, as `TRANSCRIPT` events, each encoded once.
+    Transcript(std::io::Result<Vec<brindle_remote_protocol::client::JsonObject>>),
 }
 
 pub(super) struct PendingReplay {

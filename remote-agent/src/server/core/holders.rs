@@ -371,6 +371,23 @@ impl<L: EventLoop> Core<L> {
         false
     }
 
+    /// Queues `frames` for a holder from the slices they borrow, a
+    /// checkpoint's ([`h1::checkpoint_frames`]); false when the holder is
+    /// gone. Each fits a frame by construction, so nothing is refused.
+    pub(super) fn send_holder_sliced<'a>(
+        &mut self,
+        token: Token,
+        frames: impl Iterator<Item = h1::SlicedFrame<'a>>,
+    ) -> bool {
+        let Some(holder) = self.holders.get_mut(&token) else {
+            return false;
+        };
+        for frame in frames {
+            holder.conn.queue_sliced(&frame);
+        }
+        true
+    }
+
     /// Where what is queued for the holder so far ends, as a count of the
     /// bytes written to its connection ([`Core::holder_has`]). `None`
     /// without the holder.

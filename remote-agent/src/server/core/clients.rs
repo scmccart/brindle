@@ -8,7 +8,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCore, Welcome};
-use brindle_remote_protocol::{RequestId, SessionId};
+use brindle_remote_protocol::{Frame, RequestId, SessionId};
 
 use super::agents::AgentCommand;
 use super::policy::{self, ClientOptions, Gated, Mark};
@@ -393,6 +393,29 @@ impl<L: EventLoop> Core<L> {
                 log!("client {client}: {}", unsendable_text(&replacement, &failure));
             }
         }
+        self.queued_for_client(client);
+    }
+
+    /// Queues a frame already encoded for a client, such as a `TRANSCRIPT`
+    /// [`client::transcript_frames`] packed from events encoded once; as
+    /// [`Core::send_client`] queues a message.
+    pub(super) fn send_client_frame(&mut self, client: Token, frame: &Frame) {
+        let Some(entry) = self.clients.get_mut(&client) else {
+            return;
+        };
+        if entry.failed {
+            return;
+        }
+        entry.conn.queue(frame);
+        self.queued_for_client(client);
+    }
+
+    /// After a queue for `client`: an eager flush past [`EAGER_FLUSH`],
+    /// and its sessions paused past the high mark.
+    fn queued_for_client(&mut self, client: Token) {
+        let Some(entry) = self.clients.get_mut(&client) else {
+            return;
+        };
         if entry.conn.queued() >= EAGER_FLUSH {
             // A failure shows again in the loop's own flush, which drops
             // the client there.
