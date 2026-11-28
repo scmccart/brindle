@@ -51,15 +51,41 @@ pub enum Removed {
     Active(TabId),
 }
 
-/// The strip's active tab, by id.
+/// The strip's active tab, by id, and the order tabs were last active in.
 #[derive(Debug, Default)]
 pub struct Tabs {
     active: Option<TabId>,
+    /// Each tab that has been active, the most recent last (OpenSpec
+    /// change `agents-prompt-context`: which agent zone a terminal's
+    /// output is offered to first).
+    shown: Vec<TabId>,
 }
 
 impl Tabs {
+    /// A strip whose active tab is `active`, as a test sets one up.
+    #[cfg(test)]
+    fn with(active: Option<TabId>) -> Self {
+        let mut tabs = Self::default();
+        tabs.set_active(active);
+        tabs
+    }
+
     pub fn active(&self) -> Option<TabId> {
         self.active
+    }
+
+    fn set_active(&mut self, active: Option<TabId>) {
+        self.active = active;
+        if let Some(tab) = active {
+            self.shown.retain(|shown| *shown != tab);
+            self.shown.push(tab);
+        }
+    }
+
+    /// How recently `tab` was the active one: larger is more recent, the
+    /// active tab the largest, and 0 for one never active.
+    pub fn recency(&self, tab: TabId) -> u64 {
+        self.shown.iter().position(|shown| *shown == tab).map_or(0, |at| at as u64 + 1)
     }
 
     /// The active tab's place in `order`; `None` with no tabs.
@@ -75,7 +101,7 @@ impl Tabs {
     pub fn insert_at(&mut self, order: &[TabId], tab: TabId, requested: Option<usize>) -> usize {
         let after_active = self.active_in(order).map_or(0, |at| at + 1);
         if self.active.is_none() {
-            self.active = Some(tab);
+            self.set_active(Some(tab));
         }
         requested.unwrap_or(after_active).min(order.len())
     }
@@ -86,15 +112,16 @@ impl Tabs {
     pub fn removed(&mut self, order_before: &[TabId], removed: TabId) -> Removed {
         let at = order_before.iter().position(|id| *id == removed).unwrap_or(0);
         let after: Vec<TabId> = order_before.iter().copied().filter(|id| *id != removed).collect();
+        self.shown.retain(|shown| *shown != removed);
         let Some(last) = after.len().checked_sub(1) else {
-            self.active = None;
+            self.set_active(None);
             return Removed::Last;
         };
         let active = match self.active.filter(|active| after.contains(active)) {
             Some(active) => active,
             None => after[at.min(last)],
         };
-        self.active = Some(active);
+        self.set_active(Some(active));
         Removed::Active(active)
     }
 
@@ -111,7 +138,7 @@ impl Tabs {
             Pick::Prev => (len > 0).then(|| self.active_in(order).map_or(0, |at| (at + len - 1) % len)),
         }?;
         let tab = *order.get(at)?;
-        self.active = Some(tab);
+        self.set_active(Some(tab));
         Some(tab)
     }
 
@@ -240,7 +267,7 @@ mod tests {
             let ids: Vec<u64> = (10..10 + len).collect();
             for active in 0..(len as usize).max(1) {
                 let before = Before { ids: ids.clone(), active };
-                let tabs = Tabs { active: before.active_id() };
+                let tabs = Tabs::with(before.active_id());
                 strips.push((before, tabs));
             }
         }
@@ -254,7 +281,7 @@ mod tests {
     fn a_tab_is_inserted_where_it_was() {
         for (before, tabs) in strips() {
             for requested in [None, Some(0), Some(1), Some(2), Some(4), Some(9)] {
-                let (mut was, mut now, new) = (before.clone(), Tabs { active: tabs.active }, TabId(99));
+                let (mut was, mut now, new) = (before.clone(), Tabs::with(tabs.active), TabId(99));
                 let order = was.order();
                 let at = now.insert_at(&order, new, requested);
                 assert_eq!(at, was.insert_inactive(99, requested), "{before:?} at {requested:?}");
@@ -268,7 +295,7 @@ mod tests {
         }
         // The table's rows, spelled out.
         let order = [TabId(10), TabId(11), TabId(12)];
-        let mut tabs = Tabs { active: Some(TabId(11)) };
+        let mut tabs = Tabs::with(Some(TabId(11)));
         assert_eq!(tabs.insert_at(&order, TabId(99), None), 2, "after the active tab");
         assert_eq!(tabs.insert_at(&order, TabId(99), Some(3)), 3, "at the end");
         assert_eq!(tabs.insert_at(&order, TabId(99), Some(7)), 3, "clamped to the end");
@@ -284,7 +311,7 @@ mod tests {
     fn the_active_tab_after_a_removal_is_the_one_it_was() {
         for (before, tabs) in strips() {
             for ix in 0..before.ids.len() {
-                let (mut was, mut now) = (before.clone(), Tabs { active: tabs.active });
+                let (mut was, mut now) = (before.clone(), Tabs::with(tabs.active));
                 let order = was.order();
                 let removed = now.removed(&order, order[ix]);
                 let expected = match was.remove(ix) {
@@ -296,12 +323,12 @@ mod tests {
             }
         }
         let order = [TabId(10), TabId(11), TabId(12)];
-        let removing = |active: u64, removed: u64| Tabs { active: Some(TabId(active)) }.removed(&order, TabId(removed));
+        let removing = |active: u64, removed: u64| Tabs::with(Some(TabId(active))).removed(&order, TabId(removed));
         assert_eq!(removing(11, 11), Removed::Active(TabId(12)), "the one after");
         assert_eq!(removing(12, 12), Removed::Active(TabId(11)), "the last: the one before");
         assert_eq!(removing(10, 12), Removed::Active(TabId(10)), "another's removal leaves it");
         assert_eq!(removing(12, 10), Removed::Active(TabId(12)));
-        let mut lone = Tabs { active: Some(TabId(10)) };
+        let mut lone = Tabs::with(Some(TabId(10)));
         assert_eq!(lone.removed(&[TabId(10)], TabId(10)), Removed::Last);
         assert_eq!(lone.active(), None);
     }
@@ -314,7 +341,7 @@ mod tests {
         for (before, tabs) in strips() {
             let order = before.order();
             let check = |pick: Pick, was: &dyn Fn(&mut Before)| {
-                let (mut was_strip, mut now) = (before.clone(), Tabs { active: tabs.active });
+                let (mut was_strip, mut now) = (before.clone(), Tabs::with(tabs.active));
                 was(&mut was_strip);
                 let picked = now.pick(&order, pick);
                 assert_eq!(now.active(), was_strip.active_id(), "{before:?}: {pick:?}");
@@ -335,7 +362,7 @@ mod tests {
             }
         }
         let order = [TabId(10), TabId(11), TabId(12)];
-        let mut tabs = Tabs { active: Some(TabId(12)) };
+        let mut tabs = Tabs::with(Some(TabId(12)));
         assert_eq!(tabs.pick(&order, Pick::Next), Some(TabId(10)), "wraps to the first");
         assert_eq!(tabs.pick(&order, Pick::Prev), Some(TabId(12)), "wraps to the last");
         assert_eq!(tabs.pick(&order, Pick::Target(TabTarget::Nth(3))), None, "no fourth tab");
@@ -379,7 +406,7 @@ mod tests {
             }
         }
         let order = [TabId(10), TabId(11), TabId(12)];
-        let tabs = Tabs { active: Some(TabId(12)) };
+        let tabs = Tabs::with(Some(TabId(12)));
         assert_eq!(tabs.shift(&order, TabId(12), Shift::Wrapping(1)), Some((2, 0)), "the last comes in first");
         assert_eq!(tabs.shift(&order, TabId(10), Shift::Wrapping(-1)), Some((0, 2)));
         assert_eq!(tabs.shift(&order, TabId(12), Shift::Within(1)), None, "not past the end");
@@ -389,11 +416,31 @@ mod tests {
         assert_eq!(tabs.shift(&order, TabId(77), Shift::Within(1)), None, "a tab gone meanwhile");
     }
 
+    /// Recency follows activation: the active tab the most recent, a tab
+    /// never active 0, and a removed tab forgotten.
+    #[test]
+    fn tabs_are_ranked_by_when_they_were_last_active() {
+        let order = [TabId(10), TabId(11), TabId(12)];
+        let mut tabs = Tabs::default();
+        tabs.insert_at(&[], TabId(10), None);
+        assert_eq!(tabs.recency(TabId(10)), 1);
+        assert_eq!(tabs.recency(TabId(11)), 0, "never active");
+        tabs.pick(&order, Pick::Tab(TabId(12)));
+        tabs.pick(&order, Pick::Tab(TabId(11)));
+        tabs.pick(&order, Pick::Tab(TabId(10)));
+        let ranked = |tabs: &Tabs| order.map(|tab| tabs.recency(tab));
+        assert_eq!(ranked(&tabs), [3, 2, 1]);
+        tabs.pick(&order, Pick::Tab(TabId(12)));
+        assert_eq!(ranked(&tabs), [2, 1, 3]);
+        assert_eq!(tabs.removed(&order, TabId(12)), Removed::Active(TabId(11)), "the one before the last");
+        assert_eq!(ranked(&tabs), [1, 2, 0]);
+    }
+
     #[test]
     fn the_active_tab_is_found_by_id() {
         let order = [TabId(10), TabId(11), TabId(12)];
-        assert_eq!(Tabs { active: Some(TabId(11)) }.active_in(&order), Some(1));
-        assert_eq!(Tabs { active: Some(TabId(77)) }.active_in(&order), None);
+        assert_eq!(Tabs::with(Some(TabId(11))).active_in(&order), Some(1));
+        assert_eq!(Tabs::with(Some(TabId(77))).active_in(&order), None);
         assert_eq!(Tabs::default().active_in(&order), None);
         assert_eq!(Tabs::default().active_in(&[]), None);
     }

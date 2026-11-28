@@ -402,6 +402,7 @@ fn self_test() -> i32 {
         ("clipboard helpers", cases::self_test_clipboard),
         ("agent capture measures", cases::self_test_agent_layout),
         ("agent long conversation", cases::self_test_agent_long_turn),
+        ("agent attachment lines", cases::self_test_attach),
         ("server helpers", common::server::self_test),
         ("fake agent lookup", fake_agent::self_test),
         ("fake agent selection", self_test_wants_fake_agent),
