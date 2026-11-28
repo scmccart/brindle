@@ -1311,6 +1311,7 @@ fn merge(earlier: &mut Output, later: Output) {
 mod tests {
     use super::*;
     use brindle_transcript::{Exit, HoldReason, Slot, TurnState};
+    use crate::acp::limits;
     use reduce::{Command, Refused, step};
 
     /// A fixed-seed xorshift, so the fuzz run is the same every time.
@@ -2181,14 +2182,14 @@ mod tests {
         let piece = "\"".repeat(32 * 1024);
         let thought = update(json!({"sessionUpdate": "agent_thought_chunk",
             "content": {"type": "text", "text": piece}}));
-        while agent.s.transcript.encoded_len() <= reduce::LOG_LIMIT - 300 * 1024 {
+        while agent.s.transcript.encoded_len() <= limits::LOG_LIMIT - 300 * 1024 {
             agent.feed(&chunk(&piece));
             agent.feed(&thought);
         }
         assert_eq!(agent.s.transcript.dropped(), 0, "no trim yet");
-        assert!(agent.s.transcript.encoded_len() <= reduce::LOG_LIMIT);
-        assert!(agent.s.transcript.encoded_len() > reduce::LOG_LIMIT - 512 * 1024);
-        agent.prompt(&"q".repeat(reduce::MAX_PROMPT));
+        assert!(agent.s.transcript.encoded_len() <= limits::LOG_LIMIT);
+        assert!(agent.s.transcript.encoded_len() > limits::LOG_LIMIT - 512 * 1024);
+        agent.prompt(&"q".repeat(limits::MAX_PROMPT));
         assert!(matches!(agent.s.transcript.slot(), Slot::Waiting { .. }));
         agent.s.lines = Lines::restore(
             Partial::Collecting(vec![b'"'; super::super::lines::MAX_LINE + 1]),

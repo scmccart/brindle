@@ -2067,7 +2067,8 @@ mod tests {
     #[test]
     fn checkpoints_of_a_64_mib_conversation_write_a_small_multiple_of_what_it_added() {
         use brindle_remote_protocol::serde_json::json;
-        use crate::acp::reduce::{AgentSession, Command, Input, LOG_LIMIT};
+        use crate::acp::limits::LOG_LIMIT;
+        use crate::acp::reduce::{AgentSession, Command, Input};
         let mut core = Checkpointing {
             session: AgentSession::new("/w".into(), "0.3.0".into()),
             stored: Stored::Unknown,

@@ -62,7 +62,7 @@ use super::envelope::{self, Malformed, Message, RpcError};
 use super::forms::{
     self, Content, NotificationKind, OptionKey, Patch, Refusal, Request, RequestKind, Update,
 };
-use super::limits::ENTRY_LIMIT;
+use super::limits::{ENTRY_LIMIT, LOG_LIMIT, LOG_TRIM_TO, MAX_PROMPT};
 use super::lines::{Lines, Piece};
 use super::rpc::{Purpose, Rpc};
 
@@ -89,10 +89,6 @@ pub use tools::{MAX_OPEN_OUTPUTS, OpenOutput};
 
 #[cfg(test)]
 pub(super) use permission::pending_permissions;
-
-// The log's bounds and the prompt's live with every other bound, in
-// `acp::limits`; re-exported here, where their readers have found them.
-pub use super::limits::{LOG_LIMIT, LOG_TRIM_TO, MAX_PROMPT};
 
 /// How long a run of lines that aren't ACP messages may go without another
 /// before its notice is written.

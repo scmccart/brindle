@@ -3,10 +3,11 @@ use brindle_transcript::{Event, HoldReason, PermissionOutcome, Slot, StopReason,
 
 use crate::acp::envelope::RpcError;
 use crate::acp::forms::{AUTH_REQUIRED, Request};
+use crate::acp::limits::MAX_PROMPT;
 
 use super::lifecycle::{Ending, Phase};
 use super::text::bound;
-use super::{MAX_PROMPT, Moment, Refused, RunKind, Step};
+use super::{Moment, Refused, RunKind, Step};
 
 impl Step<'_> {
     pub(super) fn prompted(&mut self, result: Result<&Value, &RpcError>) {
