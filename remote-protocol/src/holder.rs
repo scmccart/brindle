@@ -63,6 +63,12 @@
 //! reads none of it. Adopting sends the stored checkpoint, whole and
 //! appended parts as one blob. A connection below version 3 is refused it.
 //!
+//! The core may queue a checkpoint's frames from slices of its bytes
+//! ([`checkpoint_frames`], [`SlicedFrame`]; OpenSpec change
+//! `agents-checkpoint-deltas`) instead of building [`ToHolder`] messages:
+//! the frames are the same bytes, which a test pins against
+//! [`ToHolder::checkpoint`] and [`ToHolder::checkpoint_append`].
+//!
 //! **Checkpoints and tails are chunked.** A checkpoint (the core's replay
 //! stream for a session) can pass the 1 MiB frame limit, and a full tail
 //! plus its session id does too. Each is sent as `*_BEGIN` with the total
@@ -636,6 +642,82 @@ fn decode_end(name: &str, frame: &Frame) -> io::Result<BlobEnd> {
     Ok(BlobEnd { session })
 }
 
+/// Which marker a checkpoint's frames open with ([`checkpoint_frames`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobForm {
+    /// `CHECKPOINT_BEGIN`: the blob replaces what is stored.
+    Whole,
+    /// `CHECKPOINT_APPEND`: the blob is appended to what is stored (H1 3).
+    Append,
+}
+
+/// One frame of a checkpoint, its payload `head()` then `body`, so a
+/// connection queues it from a slice of the checkpoint's bytes without a
+/// copy of its own (OpenSpec change `agents-checkpoint-deltas`, decision
+/// 8). The head is the session id, then a begin's length or an end's
+/// `covers`; a chunk's body is at most [`CHUNK_LEN`] bytes, so the frame
+/// always fits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlicedFrame<'a> {
+    pub msg_type: u8,
+    head: [u8; 12],
+    head_len: usize,
+    pub body: &'a [u8],
+}
+
+impl SlicedFrame<'_> {
+    pub fn head(&self) -> &[u8] {
+        self.head.get(..self.head_len).unwrap_or_default()
+    }
+
+    pub fn payload_len(&self) -> usize {
+        self.head_len + self.body.len()
+    }
+}
+
+/// A frame of `msg_type` whose payload is `session`'s id, then `extra`
+/// (big-endian) when there is one, then `body`.
+fn sliced(msg_type: u8, session: SessionId, extra: Option<u64>, body: &[u8]) -> SlicedFrame<'_> {
+    let mut head = [0u8; 12];
+    head[..4].copy_from_slice(&session.to_be_bytes());
+    let head_len = match extra {
+        Some(value) => {
+            head[4..].copy_from_slice(&value.to_be_bytes());
+            12
+        }
+        None => 4,
+    };
+    SlicedFrame {
+        msg_type,
+        head,
+        head_len,
+        body,
+    }
+}
+
+/// The frames of [`ToHolder::checkpoint`] (`form` [`BlobForm::Whole`]) or
+/// [`ToHolder::checkpoint_append`] ([`BlobForm::Append`]) for `bytes`,
+/// covering `covers` bytes of the tail, each borrowing its chunk: the same
+/// bytes as those messages' `encode()`, which H1 3 keeps.
+pub fn checkpoint_frames(
+    session: SessionId,
+    bytes: &[u8],
+    covers: u64,
+    form: BlobForm,
+) -> impl Iterator<Item = SlicedFrame<'_>> {
+    let begin_type = match form {
+        BlobForm::Whole => MSG_CHECKPOINT_BEGIN,
+        BlobForm::Append => MSG_CHECKPOINT_APPEND,
+    };
+    std::iter::once(sliced(begin_type, session, Some(bytes.len() as u64), &[]))
+        .chain(
+            bytes
+                .chunks(CHUNK_LEN)
+                .map(move |chunk| sliced(MSG_CHECKPOINT_CHUNK, session, None, chunk)),
+        )
+        .chain(std::iter::once(sliced(MSG_CHECKPOINT_END, session, Some(covers), &[])))
+}
+
 /// Cuts a blob into its begin marker, chunks of at most `chunk_len` bytes
 /// (clamped to `1..=`[`MAX_CHUNK_LEN`]), and end marker. An empty blob has
 /// no chunks.
@@ -1076,6 +1158,30 @@ mod tests {
             (MSG_CHECKPOINT_BEGIN..=MSG_CHECKPOINT_END).chain(MSG_WELCOME..=MSG_STDERR_TAIL)
         {
             assert!(types.contains(&expected), "no sample of type {expected}");
+        }
+    }
+
+    /// `agents-checkpoint-deltas` decision 8: the frames queued from slices
+    /// of a checkpoint are, byte for byte, the encoded messages of
+    /// `ToHolder::checkpoint` or `checkpoint_append`.
+    #[test]
+    fn sliced_checkpoint_frames_are_the_bytes_of_the_checkpoint_messages() {
+        for len in [0, 1, CHUNK_LEN, 3 * CHUNK_LEN + 7] {
+            let bytes: Vec<u8> = (0..len).map(|at| (at * 31 % 251) as u8).collect();
+            for (form, messages) in [
+                (BlobForm::Whole, ToHolder::checkpoint(0x0102_0304, &bytes, 77)),
+                (BlobForm::Append, ToHolder::checkpoint_append(0x0102_0304, &bytes, 77)),
+            ] {
+                let sliced: Vec<SlicedFrame<'_>> =
+                    checkpoint_frames(0x0102_0304, &bytes, 77, form).collect();
+                assert_eq!(sliced.len(), messages.len(), "{len} bytes, {form:?}");
+                for (frame, message) in sliced.iter().zip(&messages) {
+                    let encoded = message.encode().unwrap();
+                    assert_eq!(frame.msg_type, encoded.msg_type, "{len} bytes, {form:?}");
+                    assert_eq!(frame.payload_len(), encoded.payload.len());
+                    assert_eq!([frame.head(), frame.body].concat(), encoded.payload);
+                }
+            }
         }
     }
 

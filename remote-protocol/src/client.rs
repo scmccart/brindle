@@ -132,7 +132,10 @@
 //! - `TRANSCRIPT` carries a session's transcript events, each a JSON object
 //!   this crate doesn't read: `brindle-transcript` encodes and decodes them
 //!   on both sides. It is checked only to be an array of objects, and a
-//!   frame holds whole events ([`pack_transcript`]). `ATTACH` of an agent
+//!   frame holds whole events ([`pack_transcript`]). Events the server
+//!   encoded once are packed from their bytes without being read
+//!   ([`JsonObject`], [`transcript_frames`], [`page_frames`]; OpenSpec
+//!   change `agents-checkpoint-deltas`), into the same frames. `ATTACH` of an agent
 //!   session is answered with `REPLAY_START`, `TRANSCRIPT`…, `REPLAY_END`,
 //!   then live `TRANSCRIPT`s; its `cols` and `rows` are ignored.
 //! - Paging (OpenSpec change `agents-log-paging`, amending protocol 4
@@ -174,6 +177,7 @@
 //! protocol 3.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::io;
 
 use serde::{Deserialize, Serialize};
@@ -819,17 +823,38 @@ fn pack_events(
     events: Vec<serde_json::Value>,
     envelope: usize,
 ) -> io::Result<Vec<Vec<serde_json::Value>>> {
-    let mut groups = Vec::new();
-    let mut current = Vec::new();
-    let mut size = envelope;
-    for (index, event) in events.into_iter().enumerate() {
+    let mut lens = Vec::with_capacity(events.len());
+    for (index, event) in events.iter().enumerate() {
         if !event.is_object() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("transcript event {index} of session {session} isn't a JSON object"),
             ));
         }
-        let len = serde_json::to_vec(&event).map_or(usize::MAX, |bytes| bytes.len());
+        lens.push(serde_json::to_vec(event).map_or(usize::MAX, |bytes| bytes.len()));
+    }
+    let groups = group_events(session, &lens, envelope)?;
+    let mut events = events.into_iter();
+    Ok(groups
+        .into_iter()
+        .map(|group| events.by_ref().take(group.len()).collect())
+        .collect())
+}
+
+/// The groups of consecutive events, by index, whose encoded lengths
+/// `lens` fit a frame each with an `envelope` around them and a comma
+/// between two: what [`pack_events`] and the packers of encoded events
+/// share. One event too large for a frame alone is an `InvalidInput`
+/// error naming it.
+fn group_events(
+    session: SessionId,
+    lens: &[usize],
+    envelope: usize,
+) -> io::Result<Vec<std::ops::Range<usize>>> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    let mut size = envelope;
+    for (index, &len) in lens.iter().enumerate() {
         if envelope.saturating_add(len) > crate::MAX_FRAME_PAYLOAD_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -839,17 +864,116 @@ fn pack_events(
                 ),
             ));
         }
-        if !current.is_empty() && size + 1 + len > crate::MAX_FRAME_PAYLOAD_SIZE {
-            groups.push(std::mem::take(&mut current));
+        if index > start && size + 1 + len > crate::MAX_FRAME_PAYLOAD_SIZE {
+            groups.push(start..index);
+            start = index;
             size = envelope;
         }
-        size += len + usize::from(!current.is_empty());
-        current.push(event);
+        size += len + usize::from(index > start);
     }
-    if !current.is_empty() {
-        groups.push(current);
+    if start < lens.len() {
+        groups.push(start..lens.len());
     }
     Ok(groups)
+}
+
+/// The bytes of one encoded JSON object, a transcript event the server
+/// encoded once (OpenSpec change `agents-checkpoint-deltas`, decision 9):
+/// packed into frames as they are, never read again here. Only its first
+/// and last bytes are checked; what is between is its encoder's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonObject(Vec<u8>);
+
+/// Bytes [`JsonObject::new`] refused: they don't start with `{` and end
+/// with `}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotAnObject;
+
+impl fmt::Display for NotAnObject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the encoded event isn't a JSON object")
+    }
+}
+
+impl JsonObject {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, NotAnObject> {
+        match (bytes.first(), bytes.last()) {
+            (Some(b'{'), Some(b'}')) if bytes.len() >= 2 => Ok(Self(bytes)),
+            _ => Err(NotAnObject),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// The `TRANSCRIPT` frames [`pack_transcript`] would make for the events
+/// `events` encode, from their bytes: the same grouping and the same
+/// payload, `{"session":N,"events":[…]}`, refused as it refuses.
+pub fn transcript_frames(session: SessionId, events: &[JsonObject]) -> io::Result<Vec<Frame>> {
+    let lens: Vec<usize> = events.iter().map(JsonObject::len).collect();
+    group_events(session, &lens, TRANSCRIPT_ENVELOPE)?
+        .into_iter()
+        .map(|group| {
+            let head = format!("{{\"session\":{session},\"events\":[");
+            frame_of(MSG_TRANSCRIPT, &head, &events[group], "]}")
+        })
+        .collect()
+}
+
+/// The `AGENT_PAGE` frames [`pack_page`] would make for fetch `req`'s
+/// events `events`, from their bytes: `last` on the final one, and one
+/// frame with no events for an empty page.
+pub fn page_frames(
+    req: RequestId,
+    session: SessionId,
+    events: &[JsonObject],
+    more: bool,
+) -> io::Result<Vec<Frame>> {
+    let lens: Vec<usize> = events.iter().map(JsonObject::len).collect();
+    let mut groups = group_events(session, &lens, AGENT_PAGE_ENVELOPE)?;
+    if groups.is_empty() {
+        groups.push(0..0);
+    }
+    let last = groups.len() - 1;
+    let head = format!("{{\"req\":{req},\"session\":{session},\"events\":[");
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(index, group)| {
+            let tail = if index == last {
+                format!("],\"last\":{{\"more\":{more}}}}}")
+            } else {
+                "]}".to_owned()
+            };
+            frame_of(MSG_AGENT_PAGE, &head, &events[group], &tail)
+        })
+        .collect()
+}
+
+/// A frame of `msg_type` whose payload is `head`, the objects joined by
+/// commas, then `tail`.
+fn frame_of(msg_type: u8, head: &str, objects: &[JsonObject], tail: &str) -> io::Result<Frame> {
+    let len = head.len() + tail.len() + objects.iter().map(|o| o.len() + 1).sum::<usize>();
+    let mut payload = Vec::with_capacity(len);
+    payload.extend_from_slice(head.as_bytes());
+    for (index, object) in objects.iter().enumerate() {
+        if index > 0 {
+            payload.push(b',');
+        }
+        payload.extend_from_slice(object.as_bytes());
+    }
+    payload.extend_from_slice(tail.as_bytes());
+    Frame::new(msg_type, payload)
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -2095,6 +2219,75 @@ mod tests {
         let largest = serde_json::json!({"t": "x".repeat(fill)});
         let packed = pack_transcript(u32::MAX, vec![largest]).unwrap();
         assert!(ToClient::Transcript(packed[0].clone()).encode().is_ok());
+    }
+
+    // `agents-checkpoint-deltas` decision 9: events encoded once are
+    // packed without being read, into the frames the value packers make.
+
+    /// Events as `serde_json::Value`s and as their encoded objects.
+    fn encoded(events: &[serde_json::Value]) -> Vec<JsonObject> {
+        events
+            .iter()
+            .map(|event| JsonObject::new(serde_json::to_vec(event).unwrap()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn transcript_frames_of_encoded_events_are_the_bytes_of_pack_transcript() {
+        let event = |n: usize| serde_json::json!({"event": "appended", "id": n, "text": "x\"".repeat(70 * 1024 + n)});
+        for count in [0, 1, 2, 30] {
+            let events: Vec<serde_json::Value> = (0..count).map(event).collect();
+            let frames = transcript_frames(u32::MAX, &encoded(&events)).unwrap();
+            let packed: Vec<Frame> = pack_transcript(u32::MAX, events)
+                .unwrap()
+                .into_iter()
+                .map(|message| ToClient::Transcript(message).encode().unwrap())
+                .collect();
+            assert_eq!(frames, packed, "{count} events");
+        }
+    }
+
+    #[test]
+    fn page_frames_of_encoded_events_are_the_bytes_of_pack_page() {
+        let event = |n: usize| serde_json::json!({"event": "appended", "id": n, "text": "y".repeat(64 * 1024)});
+        for (count, more) in [(0, false), (0, true), (1, true), (48, false)] {
+            let events: Vec<serde_json::Value> = (0..count).map(event).collect();
+            let frames = page_frames(u64::MAX, 7, &encoded(&events), more).unwrap();
+            let packed: Vec<Frame> = pack_page(u64::MAX, 7, events, more)
+                .unwrap()
+                .into_iter()
+                .map(|page| ToClient::AgentPage(page).encode().unwrap())
+                .collect();
+            assert!(count < 48 || frames.len() >= 3, "a multi-frame page");
+            assert_eq!(frames, packed, "{count} events, more {more}");
+        }
+    }
+
+    #[test]
+    fn an_encoded_event_past_a_frame_is_refused_as_pack_transcript_refuses_it() {
+        let huge = serde_json::json!({"text": "x".repeat(crate::MAX_FRAME_PAYLOAD_SIZE)});
+        let refused = transcript_frames(4, &encoded(std::slice::from_ref(&huge))).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            refused.to_string(),
+            pack_transcript(4, vec![huge.clone()]).unwrap_err().to_string()
+        );
+        let refused = page_frames(1, 4, &encoded(std::slice::from_ref(&huge)), false).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        // The largest that fits does, as with the value packers.
+        let fill = crate::MAX_FRAME_PAYLOAD_SIZE - br#"{"session":4294967295,"events":[{"t":""}]}"#.len();
+        let largest = serde_json::json!({"t": "x".repeat(fill)});
+        assert_eq!(transcript_frames(u32::MAX, &encoded(&[largest])).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn json_object_refuses_bytes_that_dont_start_and_end_as_an_object() {
+        for bytes in [&b""[..], b"{", b"}", b"[]", b"\"x\"", b" {}", b"{} ", b"null"] {
+            assert_eq!(JsonObject::new(bytes.to_vec()), Err(NotAnObject), "{bytes:?}");
+        }
+        let object = JsonObject::new(b"{}".to_vec()).unwrap();
+        assert_eq!((object.len(), object.as_bytes()), (2, &b"{}"[..]));
+        assert!(JsonObject::new(br#"{"a":1}"#.to_vec()).is_ok());
     }
 
     /// Each envelope constant equals the encoded length of an empty batch
