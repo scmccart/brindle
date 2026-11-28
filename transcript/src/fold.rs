@@ -430,6 +430,17 @@ impl Transcript {
         self.entries.iter().map(|kept| (kept.id, &kept.entry))
     }
 
+    /// The kept entries from `id` on, oldest first: from `id` when it is
+    /// held, else from the first held one after it (OpenSpec change
+    /// `agents-absorb-cost`: what a change added, found by search rather
+    /// than a walk from the start).
+    pub fn entries_from(&self, id: EntryId) -> impl Iterator<Item = (EntryId, &Entry)> {
+        let start = self.entries.partition_point(|kept| kept.id < id);
+        self.entries
+            .range(start..)
+            .map(|kept| (kept.id, &kept.entry))
+    }
+
     pub fn entry(&self, id: EntryId) -> Option<&Entry> {
         let index = self.index(id).ok()?;
         self.entries.get(index).map(|kept| &kept.entry)
@@ -587,6 +598,33 @@ mod tests {
         let entries: Vec<_> = transcript.entries().collect();
         assert_eq!(entries, [(EntryId(1), &agent("Hello!"))]);
         assert_eq!(transcript.next_id(), EntryId(2));
+    }
+
+    /// OpenSpec change `agents-absorb-cost`: the zone copies the entries a
+    /// change added from the first of them on. Held ids are contiguous, so
+    /// an id between two held ones can't be made; an id below what is held
+    /// starts at the first, and one past the end gives nothing.
+    #[test]
+    fn entries_from_starts_at_the_id_or_the_next_held_one() {
+        let mut events: Vec<Event> = (1..=6).map(|n| added(n, agent(&n.to_string()))).collect();
+        events.push(Event::Trimmed {
+            through: EntryId(2),
+            dropped: 2,
+        });
+        let transcript = fold(&events).unwrap();
+        let ids = |from: u64| -> Vec<u64> { transcript.entries_from(EntryId(from)).map(|(id, _)| id.0).collect() };
+        assert_eq!(ids(4), [4, 5, 6], "an id held");
+        assert_eq!(ids(3), [3, 4, 5, 6], "the first held");
+        assert_eq!(ids(1), [3, 4, 5, 6], "an id trimmed away");
+        assert_eq!(ids(0), [3, 4, 5, 6], "an id below everything");
+        assert_eq!(ids(6), [6], "the last");
+        assert!(ids(7).is_empty(), "past the end");
+        let (_, entry) = transcript.entries_from(EntryId(5)).next().unwrap();
+        assert_eq!(entry, &agent("5"));
+
+        let paged = fold(&[window(10, 9), added(10, agent("a")), added(11, agent("b"))]).unwrap();
+        let ids: Vec<u64> = paged.entries_from(EntryId(4)).map(|(id, _)| id.0).collect();
+        assert_eq!(ids, [10, 11], "an id below the window");
     }
 
     #[test]

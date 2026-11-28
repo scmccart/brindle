@@ -613,3 +613,108 @@ fn a_choice_while_reconnecting_says_why() {
         assert!(reason.contains("connection to the terminal server"), "{reason}");
     });
 }
+
+/// What the entity emitted, in order, across the event types the test
+/// watches.
+fn emitted(zone: &Zone, cx: &mut gpui::TestAppContext) -> (std::rc::Rc<std::cell::RefCell<Vec<String>>>, [gpui::Subscription; 2]) {
+    let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let subscriptions = cx.update(|cx| {
+        let (statuses, updates) = (log.clone(), log.clone());
+        [
+            cx.subscribe(&zone.agent, move |_, event: &TerminalEvent, _| {
+                if let TerminalEvent::Status(_) = event {
+                    statuses.borrow_mut().push("status".to_string());
+                }
+            }),
+            cx.subscribe(&zone.agent, move |_, event: &AgentUpdate, _| {
+                updates.borrow_mut().push(match event {
+                    AgentUpdate::Splices(_) => "splices".to_string(),
+                    AgentUpdate::ClearDraft => "clear-draft".to_string(),
+                    other => format!("{other:?}"),
+                })
+            }),
+        ]
+    });
+    (log, subscriptions)
+}
+
+/// OpenSpec change `agents-absorb-cost` decision 4: a drained update's
+/// statuses and draft changes come in event order, and its splices once,
+/// after them. (The sink's gate folds every change it holds into one
+/// pending `Changed`, so a chunk holds one; the `Reply` after it is the
+/// update's second event.)
+#[test]
+fn an_update_emits_its_statuses_in_order_and_its_splices_once_after_them() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    zone.feed(&[ready()]);
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("go", false, cx));
+    assert_eq!(zone.take_calls(), [Call::Prompt("go".into())]);
+    let (log, _subscriptions) = emitted(&zone, &mut cx);
+    zone.feed(&[added(1, user("go")), Event::Turn { state: TurnState::Working }, added(2, agent("Hi"))]);
+    zone.sink.reply(1, Ok(()));
+    zone.feed(&[Event::Appended { id: EntryId(2), text: " there".into() }]);
+    settle(&cx);
+    assert_eq!(log.borrow().as_slice(), ["status", "clear-draft", "splices"]);
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().message_text(EntryId(2)), Some("Hi there")));
+}
+
+/// Decision 2: `AgentShared`'s lock is free whenever the zone renders, so
+/// the reader thread never waits on a render.
+#[test]
+fn the_lock_is_free_while_the_zone_renders() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    let free = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (shared, seen) = (zone.shared.clone(), free.clone());
+    crate::agent::model::RENDER_PROBE.with(|probe| {
+        *probe.borrow_mut() = Some(Box::new(move || seen.borrow_mut().push(shared.try_lock().is_some())));
+    });
+    zone.feed(&[ready(), added(1, user("go")), added(2, agent("**Hi**"))]);
+    settle(&cx);
+    zone.feed(&[Event::Appended { id: EntryId(2), text: " there".into() }]);
+    settle(&cx);
+    crate::agent::model::RENDER_PROBE.with(|probe| *probe.borrow_mut() = None);
+    let free = free.borrow();
+    assert!(free.len() >= 2, "the zone rendered: {free:?}");
+    assert!(free.iter().all(|free| *free), "the lock was held across a render: {free:?}");
+}
+
+/// Decision 5's frame gate: a message growing in updates less than a
+/// frame apart is rendered once per frame, its last text drawn when the
+/// frame ends; one that grows after a quiet frame is drawn at once.
+#[test]
+fn a_growing_message_is_drawn_once_per_frame() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    zone.feed(&[ready(), added(1, user("go")), added(2, agent("a"))]);
+    settle(&cx);
+    let entity = zone.agent.clone();
+    let renders = |cx: &gpui::TestAppContext| entity.read_with(cx, |agent, _| agent.model().render_stats().renders);
+    let blocks = |cx: &gpui::TestAppContext| entity.read_with(cx, |agent, _| agent.model().blocks().to_vec());
+    let executor = cx.executor();
+
+    // A frame after the last draw: drawn at once.
+    let before = renders(&cx);
+    zone.feed(&[Event::Appended { id: EntryId(2), text: " b".into() }]);
+    executor.run_until_parked();
+    assert_eq!(renders(&cx), before + 1, "after a quiet frame");
+
+    // Within the frame: left for its end.
+    let drawn = blocks(&cx);
+    for text in [" c", " d"] {
+        zone.feed(&[Event::Appended { id: EntryId(2), text: text.into() }]);
+        executor.run_until_parked();
+    }
+    assert_eq!(renders(&cx), before + 1, "within the frame");
+    assert_eq!(blocks(&cx), drawn, "drawn as it was");
+    executor.advance_clock(crate::terminal::pace::FRAME);
+    executor.run_until_parked();
+    assert_eq!(renders(&cx), before + 2, "once, at the frame's end");
+    zone.agent.read_with(&cx, |agent, _| {
+        let model = agent.model();
+        assert_ne!(model.blocks(), drawn.as_slice());
+        assert_eq!(model.message_text(EntryId(2)), Some("a b c d"));
+    });
+}

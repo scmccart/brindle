@@ -197,8 +197,9 @@ impl Raw {
 /// its lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetailPart {
-    /// A text item's Markdown source (rendered by the model).
-    Text { item: usize, source: SharedString },
+    /// Text item `item`, its Markdown rendered by the model; its source
+    /// stays in the entry (OpenSpec change `agents-absorb-cost`, decision 8).
+    Text { item: usize },
     /// Up to [`DETAIL_LINES`] lines of diff item `item`.
     Diff { item: usize, head: Option<DiffHead>, rows: Arc<[DiffRow]> },
     /// Up to [`DETAIL_LINES`] lines of output item `item`, whole lines with
@@ -246,14 +247,14 @@ pub fn detail(entry: &Entry) -> Vec<DetailPart> {
     let mut parts = Vec::new();
     for (item, content) in content.iter().enumerate() {
         match content {
-            ToolItem::Text { text, cut } => {
-                parts.push(DetailPart::Text { item, source: text.clone().into() });
+            ToolItem::Text { cut, .. } => {
+                parts.push(DetailPart::Text { item });
                 if *cut {
                     parts.push(DetailPart::Mark { text: "The rest of this text isn't kept".into() });
                 }
             }
             ToolItem::Diff(change) => diff_parts(item, change, &mut parts),
-            ToolItem::Output(output) => output_parts(item, output, &mut parts),
+            ToolItem::Output(output) => parts.extend(output_parts(item, output)),
         }
     }
     if *more > 0 {
@@ -339,7 +340,12 @@ fn diff_parts(item: usize, change: &FileChange, parts: &mut Vec<DetailPart>) {
     }
 }
 
-fn output_parts(item: usize, output: &Output, parts: &mut Vec<DetailPart>) {
+/// Output item `item`'s parts, as [`detail`] holds them: the mark for its
+/// dropped start, then its lines [`DETAIL_LINES`] at a time, the first
+/// with its header. Built on their own, so a delta redraws one output
+/// alone (OpenSpec change `agents-absorb-cost`, decision 6).
+pub fn output_parts(item: usize, output: &Output) -> Vec<DetailPart> {
+    let mut parts = Vec::new();
     if output.omitted > 0 {
         let mut text = format!("The first {} of output aren't kept", plural(output.omitted, "byte", "bytes"));
         if output.partial {
@@ -364,6 +370,7 @@ fn output_parts(item: usize, output: &Output, parts: &mut Vec<DetailPart>) {
             break;
         }
     }
+    parts
 }
 
 /// The summary on a tool call's line: the lines added and removed over
@@ -539,7 +546,7 @@ mod tests {
             })
         };
         let parts = detail(&raw(tool(vec![ToolItem::Text { text: "**hi**".into(), cut: false }, main_rs()])));
-        assert!(matches!(&parts[0], DetailPart::Text { item: 0, source } if source.as_ref() == "**hi**"));
+        assert_eq!(parts[0], DetailPart::Text { item: 0 });
         assert!(matches!(&parts[1], DetailPart::Diff { item: 1, head: Some(_), .. }));
         let DetailPart::Locations { lines } = &parts[2] else { panic!("{parts:?}") };
         assert_eq!(lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(), ["/p/main.rs:10", "/p/lib.rs"]);
@@ -551,6 +558,41 @@ mod tests {
         assert_eq!(parts[2], DetailPart::Raw { which: Raw::Result, text: "done".into() });
         assert!(detail(&tool(Vec::new())).is_empty());
         assert!(detail(&Entry::Agent { text: "x".into() }).is_empty());
+    }
+
+    /// OpenSpec change `agents-absorb-cost` decision 6: one output's parts
+    /// are what the whole detail holds for it, so a delta redraws them
+    /// alone.
+    #[test]
+    fn an_outputs_parts_are_built_on_their_own() {
+        let long: String = (0..(DETAIL_LINES * 2 + 5)).map(|n| format!("line {n}\n")).collect();
+        let dropped = ToolItem::Output(Output { text: "tail\n".into(), omitted: 10, partial: true, ..Output::default() });
+        let entry = tool(vec![
+            ToolItem::Text { text: "a".into(), cut: true },
+            output(&long, Some(Exit::Code { code: 0 })),
+            main_rs(),
+            dropped,
+        ]);
+        let whole = detail(&entry);
+        let Entry::Tool { content, .. } = &entry else { unreachable!() };
+        for (item, content) in content.iter().enumerate() {
+            let ToolItem::Output(output) = content else { continue };
+            let own = output_parts(item, output);
+            let at = whole
+                .iter()
+                .position(|part| matches!(part, DetailPart::Output { item: own, .. } if *own == item))
+                .expect("its parts")
+                - usize::from(output.omitted > 0);
+            assert_eq!(whole[at..at + own.len()], own[..], "item {item}");
+        }
+    }
+
+    /// Decision 8: a text item's part names its item; the source stays in
+    /// the entry.
+    #[test]
+    fn a_text_parts_detail_holds_no_source() {
+        let parts = detail(&tool(vec![ToolItem::Text { text: "**hi**".into(), cut: false }]));
+        assert_eq!(parts, [DetailPart::Text { item: 0 }]);
     }
 
     #[test]

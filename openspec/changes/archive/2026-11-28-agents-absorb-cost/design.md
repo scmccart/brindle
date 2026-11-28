@@ -279,3 +279,72 @@ Nothing to migrate: no stored state changes. The change lands after `agents-modu
 
 1. **Should rendered text be capped?** An agent can make the render larger than its text with images and short emphasized runs. *Recommendation:* count it in `held_text` on an adversarial message in this change's tests, and propose a cap only if it passes a few times the source; a cap would be a visible change (an image shown as `[image: ALT]` alone past it) and needs its own spec.
 2. **`FRAME` is 16 ms whatever the display's rate.** *Recommendation:* keep it equal to `BUDGET`; a 120 Hz display then draws a growing message every other frame, which reads the same.
+
+## As built
+
+Read and built on commit 33cca684, the head of `perf/agents-checkpoint-deltas` (PR #158) before it merged, on `main` at 2bdbeec6; the branch is rebased onto `main` once #158 lands.
+
+### Before (task 2.6)
+
+Release build of dcbb88b7 (groups 1–2 only), under `scripts/with-xvfb`, run `target/tmp/perf/20261128T091937Z` (its `summary.toml` kept with the implementation report):
+
+| | |
+|---|---|
+| `agent-markdown-stream` streamed / one chunk | 2266.75 / 2263.58 ms, `streamed_renders` 6 (234,976 bytes) |
+| trickled (2,048 chunks, `pace 10`) | 21,549.87 ms, `trickled_renders` 1,861 (62,159,232 bytes rendered for 64 KiB) against 60 × 21.55 = 1,293 frames |
+| `agent-tool-output` streamed / one chunk / 32 B | 2256.89 / 2257.22 / 2209.77 ms |
+
+| latency (ms) | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| quiet: paint | 7.01 | 9.11 | 9.26 | 17.25 |
+| quiet: frame | 21.94 | 24.05 | 32.04 | 36.72 |
+| trickle: paint | 6.37 | 17.95 | 22.79 | 32.80 |
+| trickle: frame | 20.57 | 35.88 | 46.53 | 56.05 |
+
+The output column (bytes into the shell) stays at 0.20 ms p50 in both. At 10 ms a chunk is its own update, so the trickled run renders about once per chunk: 1.44 renders per frame, and each render takes the whole growing fence (33 KiB on average).
+
+### After (task 9.1)
+
+Release build of a7d27374 (groups 2–8, frame gate included), under `scripts/with-xvfb`, run `target/tmp/perf/20261128T100136Z` with `BRINDLE_PERF_BASELINE` set to the before run:
+
+| | before | after |
+|---|---|---|
+| streamed: renders (bytes rendered) | 6 (234,976) | 2 (127,456) |
+| trickled: renders (bytes rendered) | 1,861 (62,159,232) | 1,100 (36,373,824) |
+| trickled time | 21,549.87 ms | 21,516.12 ms |
+| streamed / one chunk | 2266.75 / 2263.58 ms | 2258.85 / 2261.69 ms |
+| `agent-tool-output` streamed / one chunk / 32 B | 2256.89 / 2257.22 / 2209.77 ms | 2253.49 / 2252.18 / 2213.66 ms |
+| `agent-attach-long` | 2594 ms (change 6's run, `target-cd/tmp/perf/20261128T071449Z`; the before run here didn't take it) | 2593.19 ms |
+
+| latency (ms), before → after | p50 | p95 | p99 |
+|---|---|---|---|
+| quiet: paint | 7.01 → 8.04 | 9.11 → 9.13 | 9.26 → 9.28 |
+| quiet: frame | 21.94 → 22.99 | 24.05 → 24.05 | 32.04 → 24.13 |
+| trickle: paint | 6.37 → 6.31 | 17.95 → 18.33 | 22.79 → 22.70 |
+| trickle: frame | 20.57 → 20.59 | 35.88 → 35.19 | 46.53 → 45.39 |
+
+The trickled run renders 1,100 times in 21.5 s, under the 1,291 frames of 60 a second, and renders 42% fewer bytes; the run just after 7.3 (`20261128T095930Z`) gave 991, so the count moves by about a tenth run to run. `agent-tool-output` and `agent-attach-long` didn't get slower. The latency cases moved within run-to-run noise: the quiet case runs beside an idle zone, which this change doesn't touch (its p50's +1 ms is that noise), and in the trickle case the reply again ended before the bench (`stream_outlasted = false`, flag 3), so its tail is partly an idle zone's. The shell's latency beside a streaming zone wasn't shown to change either way. Both runs' notes say `X11 :0`: that was `with-xvfb`'s own Xvfb, which took `:0` because no X server held it.
+
+### Flags
+
+1. The base was #158's head before it merged (above).
+2. The latency report gives p50, p95 and p99, not p90 (task 2.6 names p90): `LatencyResult` has no p90, and adding one would change every case's table. The numbers above are p95.
+3. The trickle case's agent marks its last chunk with `record-env FILE` before its `respond` (the fake agent writes the file when it runs the step), and the case reads whether the file exists when Brindle exits, recorded as `stream_outlasted` in `summary.toml`. At the default 500 samples the bench outlasts the 20 s stream (`stream_outlasted = false`): the trickle case's tail runs beside an idle zone, so its p95 and p99 understate the stream's effect rather than overstate it. The case says so in its output; lengthening the stream was left alone, since design 9 fixes it at 64 KiB.
+4. GPUI's `SharedString` has no `ptr_eq`; `a_reference_used_many_times_shares_one_target` compares `as_ptr()` of the targets and tooltips, which is the same check.
+5. `entries_from_starts_at_the_id_or_the_next_held_one` lives in `fold.rs`'s tests (`lib.rs` has none). Held ids are contiguous, so "an id between two held ones" can't be built; the test covers an id held, the first held, ids trimmed away and below a window, and one past the end.
+6. `HeldText` drops its `detail_sources` count with `DetailPart::Text`'s `source`: no drawn part can hold a source any more, so the count is unrepresentable rather than zero, and `held_text_counts_the_copies` asserts `text_sources` alone.
+7. `copy_text_is_a_unified_diff_the_output_or_the_source` already read a text item's source from the `ToolItem`, so 4.3 left it as it was.
+8. `Copied::Items` carries the entry's `more` (the count of items left out) beside `from` and the items: a `ToolItems` change moves it too, and without it the zone's copy would differ from the transcript's.
+9. `an_output_delta_appended_to_the_zones_copy_equals_the_transcripts` splits the output at every 997th byte and at the edges (each side of the limit and of a line end) rather than at every byte, which kept it to well under a second.
+10. Group 5's tests name the new API (`copy_changes`, `ChangeCopy`, `draw`, `Facts`, `Rows`), so before it they failed to build rather than failing an assertion. What they guard was shown failing as an assertion where it could be: 2.1 and 2.2 (the render counts) against the old absorb, 6.1's two tests against the absorb and draw put back under the lock, and the two faults below against group 5's own first version.
+11. An output whose front was dropped (`an_output_whose_front_was_dropped_redraws_all_its_parts_and_no_other_items`): neither the row's line nor the text part before it is spliced and nothing is rendered, but when the output's count of parts changes the splice runs to the entry's end, because a block's `part` is its place in the entry and the later blocks are renumbered; their bodies are unchanged (the test compares the diff's).
+12. A tool change redrew only the first pending permission showing the call (`Facts::shown_by_permission` took the first); several can name one call. `rows_refreshed_by_cause_equal_rows_refreshed_whole` failed on it (permission 21 kept stale detail), and `Facts::showing` gives them all.
+13. `ChatModel::pending_permissions` reads `Facts`, so a permission absorbed but not drawn yet is in it; every draw, the frame gate's settled one included, draws new entries, so its block comes with its handles.
+14. A trim (`Changes::trimmed_through`) is applied before the copies, and a copy at or below `through` is skipped: the first half copies before it knows the trim's effect on the zone.
+15. 6.1's update test: the sink's gate folds every change it holds into one pending `Changed`, so a drained chunk holds one `Changed` per take, not two. The test's update holds changes, a `Reply`, then more changes, and asserts the status and the draft change before one `Splices`.
+16. The render seam for `the_lock_is_free_while_the_zone_renders` is a `#[cfg(test)]` thread-local probe (`model::RENDER_PROBE`) that `render_marked`, `render_text` and a reset's renders call first; it records `try_lock().is_some()`.
+17. **The frame gate was built (task 7.1).** Release build of ba3f7f0e (groups 2–6), run `target/tmp/perf/20261128T094828Z`: streamed 2268.02 ms with 6 renders (199,328 bytes); trickled 21,563.09 ms with 1,844 renders (61,712,320 bytes), against the criterion's 1.2 × 60 × 21.56 = 1,552. At 10 ms a chunk is its own update, so one render per draw was still about one per chunk.
+18. A settled draw keeps back a grown entry's row with it (`Rows::All` expanded to the held ids, the grown ones moved to the next draw's rows): a row redrawn whole while its output's delta waits would have the delta drawn over parts it no longer has. A grown tool call a pending permission shows isn't kept back. `settled_draws_between_whole_ones_reach_the_same_blocks` (generated sequences, a third of the events ending with a settled draw and a third with none) checks it against the whole draw.
+19. That test found a fault of group 5 reachable without the gate: a tool call's change and a new permission showing it in one update drew the permission twice, the tool's redraw of the permissions showing it inserting the new one's block before its own insert. `a_tool_change_and_a_new_permission_showing_it_draw_the_permission_once` failed with 2 blocks; a permission with no blocks yet is now left to its insert.
+20. The gate's clock is `background_executor().now()`, which GPUI's test executor advances, so `a_growing_message_is_drawn_once_per_frame` needs no sleep. `last_draw` is set by whole draws only, the timer is armed only when the settled draw left entries (`ChatModel::draw_left`), and a whole draw drops an armed timer.
+21. After group 5, `AgentView::sync` already read the pending set from `Facts` and scanned no blocks; 8.1 adds the rest: `refresh` rebuilds the handles only when the set differs from the one it last built them from.

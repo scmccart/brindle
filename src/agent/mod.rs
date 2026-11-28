@@ -52,6 +52,7 @@ pub mod view;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures::StreamExt as _;
 use gpui::{App, Context, EventEmitter, Subscription, Task};
@@ -60,7 +61,7 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Leaving, Link, ListDone,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Due, Fetch, First, KeyOutcome, LaunchChoice, Leaving, Link, ListDone,
     ListFor, Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice,
     Submit, Unqueue,
 };
@@ -299,6 +300,11 @@ pub struct Agent {
     /// one up. `None`: the zone's own, following a rename.
     session_profile: Option<String>,
     connect: Connect,
+    /// When the last whole draw was, for the frame gate (`pace::draw_wait`).
+    last_draw: Option<Instant>,
+    /// The timer that draws the growing entries a settled draw left, when
+    /// their frame ends; dropped with the zone.
+    draw_timer: Option<Task<()>>,
     _events: Task<()>,
     /// Hands the model `[agent]`'s tool policy on every config reload.
     _settings: Subscription,
@@ -493,6 +499,8 @@ impl Agent {
             directory,
             session_profile: None,
             connect,
+            last_draw: None,
+            draw_timer: None,
             _events: Self::drain(events, taker, cx),
         }
     }
@@ -749,6 +757,8 @@ impl Agent {
                             this.apply(event, cx);
                         }
                     });
+                    // What the update's changes marked, drawn once.
+                    this.draw(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -764,13 +774,18 @@ impl Agent {
         let absorbed = match event {
             AgentEvent::Changed => {
                 // The fold is the reader thread's: the zone copies what
-                // changed and lets go.
-                let mut shared = self.shared.lock();
-                let changes = shared.take_changes();
-                if changes.is_empty() {
-                    return;
-                }
-                self.model.absorb(shared.transcript(), changes)
+                // changed under the lock, and lets go before it applies the
+                // copy and renders (OpenSpec change `agents-absorb-cost`,
+                // decision 2).
+                let taken = {
+                    let mut shared = self.shared.lock();
+                    let changes = shared.take_changes();
+                    if changes.is_empty() {
+                        return;
+                    }
+                    self.model.copy_changes(shared.transcript(), changes)
+                };
+                self.model.absorb(taken)
             }
             AgentEvent::Replay(true) => return,
             AgentEvent::Replay(false) => match self.model.replay_ended() {
@@ -804,6 +819,49 @@ impl Agent {
             }
         };
         self.apply_absorbed(absorbed, cx);
+    }
+
+    /// Draws what the update's changes marked (OpenSpec change
+    /// `agents-absorb-cost`, decision 4): each growing message rendered
+    /// once, whatever number of frames appended to it, and the splices
+    /// emitted after the update's statuses.
+    ///
+    /// Within a frame of the last whole draw (`pace::draw_wait`, decision
+    /// 5) the growing entries wait: the draw is `Due::Settled`, and one
+    /// timer draws them when the frame ends. The clock is the executor's,
+    /// which tests advance.
+    fn draw(&mut self, cx: &mut Context<Self>) {
+        let now = cx.background_executor().now();
+        match pace::draw_wait(self.last_draw, now) {
+            None => self.draw_all(cx),
+            Some(wait) => {
+                self.emit_splices(Due::Settled, cx);
+                if self.model.draw_left() && self.draw_timer.is_none() {
+                    self.draw_timer = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor().timer(wait).await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.draw_all(cx);
+                            cx.notify();
+                        });
+                    }));
+                }
+            }
+        }
+    }
+
+    /// Draws everything marked, the growing entries included, and drops
+    /// the frame's timer.
+    fn draw_all(&mut self, cx: &mut Context<Self>) {
+        self.draw_timer = None;
+        self.last_draw = Some(cx.background_executor().now());
+        self.emit_splices(Due::All, cx);
+    }
+
+    fn emit_splices(&mut self, due: Due, cx: &mut Context<Self>) {
+        let splices = self.model.draw(due);
+        if !splices.is_empty() {
+            cx.emit(AgentUpdate::Splices(splices));
+        }
     }
 
     /// Hands what the model decided on: the view's splices, the status and
@@ -1166,6 +1224,7 @@ impl Agent {
     /// The user closed the zone: the session ends (`CLOSE`). Once is
     /// enough.
     pub fn close(&mut self) {
+        self.log_renders();
         if let Hold::Open(requests) = std::mem::replace(&mut self.hold, Hold::Left) {
             requests.close();
         }
@@ -1175,11 +1234,22 @@ impl Agent {
     /// tab's `layout` (every agent session is kept: there is no agent
     /// `-e`). Done explicitly, never in a drop (`process R16`).
     pub fn quit_with(&mut self, layout: Option<serde_json::Value>) {
+        self.log_renders();
         if let Hold::Open(requests) = std::mem::replace(&mut self.hold, Hold::Left) {
             match self.model.leave_on_quit() {
                 Leaving::Close => requests.close(),
                 Leaving::Detach => requests.detach_with(layout),
             }
+        }
+    }
+
+    /// Logs how much the zone rendered (OpenSpec change
+    /// `agents-absorb-cost`, decision 4), once, when it is left: the perf
+    /// suite reads the line.
+    fn log_renders(&self) {
+        if !matches!(self.hold, Hold::Left) {
+            let stats = self.model.render_stats();
+            log::debug!("agent renders={} bytes={}", stats.renders, stats.bytes);
         }
     }
 

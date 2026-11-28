@@ -5,12 +5,12 @@ use gpui::SharedString;
 
 use crate::agent::close::AgentBusy;
 use crate::agent::transcript::{
-    AgentState, Entry, EntryId, PermissionOption, ToolKind, ToolStatus, TurnState, status_of,
+    AgentState, Entry, EntryId, ToolKind, ToolStatus, TurnState, status_of,
 };
 use crate::terminal::status::State;
 
 use super::ChatModel;
-use super::blocks::{BlockBody, PermissionButton, buttons};
+use super::blocks::{PermissionButton, buttons};
 use super::phase::{AgentPhase, Link, SessionLife};
 use super::queue::stop_word;
 
@@ -185,38 +185,15 @@ impl ChatModel {
     /// Whether choosing `option` answers permission request `entry`: it
     /// must be pending and offer that option.
     pub fn answer(&self, entry: EntryId, option: &str) -> bool {
-        let pending = self.entries.binary_search_by_key(&entry, |(id, _)| *id).ok().is_some_and(|index| {
-            match &self.entries[index].1 {
-                Entry::Permission { options, outcome: None, .. } => options.iter().any(|o| o.id == option),
-                Entry::Permission { outcome: Some(_), .. }
-                | Entry::User { .. }
-                | Entry::Agent { .. }
-                | Entry::Thought { .. }
-                | Entry::Tool { .. }
-                | Entry::Notice { .. } => false,
-            }
-        });
+        let pending = self.facts.pending.get(&entry).is_some_and(|pending| pending.buttons.iter().any(|id| id == option));
         pending && self.can_send()
     }
 
     /// The pending permission requests' buttons, in order, for the zone's
-    /// focus stops.
+    /// focus stops: the pending set (OpenSpec change `agents-absorb-cost`,
+    /// decision 7), at most the helper's 16.
     pub fn pending_permissions(&self) -> Vec<(EntryId, Vec<SharedString>)> {
-        self.blocks
-            .iter()
-            .filter_map(|block| match &block.body {
-                BlockBody::Permission { options, outcome: None, .. } => {
-                    Some((block.entry, options.iter().map(|o| o.id.clone()).collect()))
-                }
-                BlockBody::Permission { outcome: Some(_), .. }
-                | BlockBody::UserText { .. }
-                | BlockBody::AgentPart { .. }
-                | BlockBody::Thought { .. }
-                | BlockBody::Tool { .. }
-                | BlockBody::ToolDetail(_)
-                | BlockBody::Notice { .. } => None,
-            })
-            .collect()
+        self.facts.pending.iter().map(|(id, pending)| (*id, pending.buttons.clone())).collect()
     }
 
     /// The reconnecting banner over the conversation.
@@ -256,22 +233,21 @@ impl ChatModel {
     /// zone still holds that call, and how many others wait; `Waiting for
     /// permission` when none is pending.
     fn pending_body(&self) -> String {
-        let pending: Vec<(&Option<String>, &str, &[PermissionOption])> = self
-            .entries
-            .iter()
-            .filter_map(|(_, entry)| match entry {
-                Entry::Permission { call, title, options, outcome: None } => Some((call, title.as_str(), options.as_slice())),
+        let latest = self.facts.pending.keys().next_back().and_then(|id| match self.held(*id) {
+            Some(Entry::Permission { call, title, options, outcome: None }) => Some((call, title.as_str(), options.as_slice())),
+            Some(
                 Entry::Permission { outcome: Some(_), .. }
                 | Entry::User { .. }
                 | Entry::Agent { .. }
                 | Entry::Thought { .. }
                 | Entry::Tool { .. }
-                | Entry::Notice { .. } => None,
-            })
-            .collect();
-        let Some((call, title, options)) = pending.last() else { return "Waiting for permission".into() };
+                | Entry::Notice { .. },
+            )
+            | None => None,
+        });
+        let Some((call, title, options)) = latest else { return "Waiting for permission".into() };
         let kind = call.as_deref().and_then(|call| self.tool_kind(call));
-        permission_body(title, kind, &buttons(options), pending.len() - 1)
+        permission_body(title, kind, &buttons(options), self.facts.pending.len() - 1)
     }
 
     /// The kind of tool call `call`, while the zone holds its entry.

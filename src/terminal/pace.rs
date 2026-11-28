@@ -72,6 +72,17 @@ pub fn step(last_update: Option<Instant>, quick: u32, now: Instant) -> (u32, Opt
     }
 }
 
+/// The least time between two draws of a growing agent message (OpenSpec
+/// change `agents-absorb-cost`, decision 5): a frame.
+pub const FRAME: Duration = BUDGET;
+
+/// How long an agent zone's draw at `now` waits for its growing messages
+/// when the last draw that rendered them was at `last_draw`: `None` once a
+/// [`FRAME`] has passed (or there was none), else the rest of it.
+pub fn draw_wait(last_draw: Option<Instant>, now: Instant) -> Option<Duration> {
+    last_draw.and_then(|last| FRAME.checked_sub(now.saturating_duration_since(last))).filter(|left| !left.is_zero())
+}
+
 /// One loop's pacing state.
 #[derive(Default)]
 pub struct Pace {
@@ -185,6 +196,26 @@ mod tests {
         assert!(seen.len() == ITEMS + 1 || most >= BUDGET, "stopped {most:?} in, after {seen:?}");
         // On this clock two items fill the budget: `first`, then one more.
         assert_eq!(seen, [0, 1]);
+    }
+
+    #[test]
+    fn a_draw_waits_out_the_rest_of_a_frame() {
+        let now = Instant::now();
+        assert_eq!(draw_wait(Some(now), now + 6 * MS), Some(FRAME - 6 * MS));
+        assert_eq!(draw_wait(Some(now), now), Some(FRAME));
+        assert_eq!(draw_wait(Some(now), now + FRAME - MS), Some(MS));
+    }
+
+    #[test]
+    fn a_draw_after_a_quiet_frame_goes_at_once() {
+        let now = Instant::now();
+        assert_eq!(draw_wait(Some(now), now + FRAME), None);
+        assert_eq!(draw_wait(Some(now), now + 3 * FRAME), None);
+    }
+
+    #[test]
+    fn the_first_draw_goes_at_once() {
+        assert_eq!(draw_wait(None, Instant::now()), None);
     }
 
     #[test]

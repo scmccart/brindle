@@ -5,7 +5,8 @@
 use crate::agent::shared::StatusFrom;
 use crate::agent::transcript::{AgentState, Slot, TurnState};
 
-use super::{AGENT_PROTOCOL, Absorbed, ChatModel, RequestId, SessionHandle, running};
+use super::facts::Rows;
+use super::{AGENT_PROTOCOL, Absorbed, ChatModel, Due, RequestId, SessionHandle, running};
 use super::ledger::{Sent, Taken};
 use super::queue::{CHOOSING, EXITED, LOGGING_IN, NEEDS_LOGIN};
 
@@ -316,6 +317,9 @@ impl ChatModel {
     /// thread says so.
     pub fn respawning(&mut self) -> Absorbed {
         let before = self.before();
+        // What the updates marked is drawn first (OpenSpec change
+        // `agents-absorb-cost`, decision 4).
+        let mut splices = self.draw(Due::All);
         {
             let model = &mut *self;
             model.phase = AgentPhase::Connecting;
@@ -334,10 +338,10 @@ impl ChatModel {
         }
         // The idle turn finishes the tool calls that ran, and the old
         // conversation's thoughts, still shown, are drawn as the policy
-        // says, as its rows are; the working row's splice comes last
-        // (`finish`).
-        let mut splices = self.refresh_rows();
+        // says, as its rows are; the working row's splice comes last.
+        splices.extend(self.refresh_rows(Rows::All));
         splices.extend(self.update_thoughts(true));
+        splices.extend(self.working());
         self.finish(before, splices, StatusFrom::Unchanged)
     }
 

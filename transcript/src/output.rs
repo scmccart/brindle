@@ -138,7 +138,12 @@ impl Output {
     /// the entry's size. The dropped bytes stay in the buffer until they
     /// pass the limit ([`OutputText`]), so an append costs amortized
     /// O(its length).
-    pub(crate) fn append(&mut self, text: &str) -> usize {
+    ///
+    /// This is the fold's own append, public so a client's copy of an
+    /// output takes a `ToolOutput`'s text the same way (OpenSpec change
+    /// `agents-absorb-cost`): it keeps `omitted` and `partial` as the fold
+    /// does, and leaves `exit` alone.
+    pub fn append(&mut self, text: &str) -> usize {
         self.text.buf.push_str(text);
         let cut = self.cut();
         if cut == 0 {

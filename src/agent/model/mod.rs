@@ -15,16 +15,22 @@ use crate::FirstPrompt;
 use crate::agent::commands::Completion;
 use crate::agent::login::AgentCommand;
 use crate::agent::markdown::Part;
-use crate::agent::shared::{Changes, StatusFrom};
+use crate::agent::shared::StatusFrom;
 use crate::agent::tool::{Shown, ToolPolicy};
 use crate::agent::transcript::{
-    Activity, AgentState, Conversation, Entry, EntryId, SessionOption, Slot, SlashCommand, Transcript, TurnState, Window,
+    Activity, AgentState, Conversation, Entry, EntryId, SessionOption, Slot, SlashCommand, TurnState, Window,
 };
 use crate::terminal::status::State;
 
 use attention::AgentNotice;
-use blocks::{RenderedText, render_entry, text_items, working_splice};
+use blocks::Rich;
+use change::Undrawn;
 use choosing::Choosing;
+use facts::{Facts, Rows};
+#[cfg(test)]
+use crate::agent::transcript::Transcript;
+#[cfg(test)]
+use blocks::render_entry;
 use ledger::Uncertain;
 use paging::Paging;
 use phase::SessionLife;
@@ -33,8 +39,10 @@ use queue::queue_row;
 
 mod attention;
 mod blocks;
+mod change;
 mod choosing;
 mod dump;
+mod facts;
 mod ledger;
 mod login;
 mod options;
@@ -48,6 +56,9 @@ mod harness;
 
 pub use attention::WorkingRow;
 pub use blocks::{Block, BlockBody, ShownPart, Splice};
+pub use change::Due;
+#[cfg(test)]
+pub(crate) use change::RENDER_PROBE;
 pub use choosing::{Choose, LaunchChoice, Leaving, ListDone, ListFor, ListerState, OnChoosing, ZoneChoice};
 pub use ledger::{LINK_DOWN, NotSent, Replied, ReplyError, Sent};
 pub use login::{AfterLogin, CancelLogin, LoginChoice, LoginRow, LoginZoneEnd, MethodChoice};
@@ -102,13 +113,36 @@ pub struct Absorbed {
     pub replied: Option<Replied>,
 }
 
+/// How much Markdown the zone rendered (OpenSpec change
+/// `agents-absorb-cost`, decision 4): each render of an agent message, a
+/// thought or a tool's text item, and the bytes each was given.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    pub renders: u64,
+    pub bytes: u64,
+}
+
+impl RenderStats {
+    /// One render of `source`.
+    fn rendered(&mut self, source: &str) {
+        self.renders += 1;
+        self.bytes += source.len() as u64;
+    }
+
+    /// One render of `entry`, when it is Markdown.
+    fn rendered_entry(&mut self, entry: &Entry) {
+        match entry {
+            Entry::Agent { text } | Entry::Thought { text } => self.rendered(text),
+            Entry::User { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => {}
+        }
+    }
+}
+
 /// What a change compares against.
 struct Before {
     status: Option<State>,
     title: String,
     queue: QueueRow,
-    /// Whether the working row showed.
-    working: bool,
 }
 
 /// An agent zone's model.
@@ -135,6 +169,8 @@ pub struct ChatModel {
     rendered: BTreeMap<EntryId, Vec<Part>>,
     /// The renderer panicked once (logged once).
     render_failed: bool,
+    /// How much the zone rendered, logged when it is left.
+    stats: RenderStats,
     blocks: Vec<Block>,
     /// Thoughts the user opened or closed.
     toggled: BTreeMap<EntryId, bool>,
@@ -179,14 +215,17 @@ pub struct ChatModel {
     policy: ToolPolicy,
     /// Tool call rows the user opened or closed.
     by_hand: BTreeMap<EntryId, Shown>,
-    /// The rendered Markdown of tool calls' text items, by entry and item,
-    /// with the source it was rendered from.
-    texts: BTreeMap<(EntryId, usize), RenderedText>,
-    /// The latest user message held: a tool call after it can be running.
-    last_user: Option<EntryId>,
-    /// Each pending permission's tool entry, when the zone holds it (the
-    /// newest with the call the permission names, before it).
-    permission_tools: BTreeMap<EntryId, EntryId>,
+    /// The rendered Markdown of tool calls' text items, by entry and item;
+    /// the source stays in the entry (OpenSpec change `agents-absorb-cost`,
+    /// decision 8).
+    texts: BTreeMap<(EntryId, usize), Rich>,
+    /// The latest user message, the pending permissions and the tool calls
+    /// still running, kept as copies are applied (decision 7).
+    facts: Facts,
+    /// What the updates since the last draw changed (decision 4).
+    undrawn: Undrawn,
+    /// Whether the list holds the working row, as the last draw left it.
+    drawn_working: bool,
     /// What the zone knows of choosing (OpenSpec change
     /// `agents-session-list`).
     choosing: Choosing,
@@ -228,6 +267,7 @@ impl ChatModel {
             entries: Vec::new(),
             rendered: BTreeMap::new(),
             render_failed: false,
+            stats: RenderStats::default(),
             blocks: Vec::new(),
             toggled: BTreeMap::new(),
             auto_open: None,
@@ -248,8 +288,9 @@ impl ChatModel {
             policy: ToolPolicy::default(),
             by_hand: BTreeMap::new(),
             texts: BTreeMap::new(),
-            last_user: None,
-            permission_tools: BTreeMap::new(),
+            facts: Facts::default(),
+            undrawn: Undrawn::default(),
+            drawn_working: false,
             choosing: Choosing::default(),
             commands: Vec::new(),
             options: Vec::new(),
@@ -348,105 +389,13 @@ impl ChatModel {
         self.agent_name.clone().unwrap_or_else(|| self.profile.clone())
     }
 
-    fn before(&self) -> Before {
-        Before { status: self.shown_status(), title: self.title(), queue: self.queue.clone(), working: self.working_row().is_some() }
+    /// How much the zone has rendered so far.
+    pub fn render_stats(&self) -> RenderStats {
+        self.stats
     }
 
-    /// Folds what changed in the shared transcript into the zone's copy.
-    pub fn absorb(&mut self, transcript: &Transcript, changes: Changes) -> Absorbed {
-        let before = self.before();
-        let mut splices = Vec::new();
-        if changes.reset {
-            // A fetch in flight belongs to the copy that is gone.
-            self.pending.retain(|_, sent| *sent != Sent::Fetch);
-            self.entries = transcript.entries().map(|(id, entry)| (id, entry.clone())).collect();
-            self.auto_open = None;
-            self.rendered.clear();
-            self.texts.clear();
-            let renders: Vec<_> =
-                self.entries.iter().map(|(id, entry)| (*id, render_entry(entry), text_items(entry))).collect();
-            for (id, render, items) in renders {
-                self.keep_render(id, render);
-                self.keep_texts(id, items);
-            }
-            // The turn decides which tool calls run, so it is read first.
-            self.turn = transcript.turn().clone();
-            self.refresh_facts();
-            let old = self.blocks.len();
-            self.blocks = self.entries.iter().flat_map(|(id, entry)| self.draw(*id, entry, false)).collect();
-            splices.push(Splice { range: 0..old, count: self.blocks.len() });
-        } else {
-            if changes.prepended.is_some_and(|added| added > 0) {
-                splices.extend(self.prepend_entries(transcript, changes.added_from));
-            }
-            if let Some(through) = changes.trimmed_through {
-                self.entries.retain(|(id, _)| *id > through);
-                self.rendered.retain(|id, _| *id > through);
-                self.texts.retain(|(id, _), _| *id > through);
-                self.by_hand.retain(|id, _| *id > through);
-                self.toggled.retain(|id, _| *id > through);
-                let gone = self.blocks.partition_point(|block| block.entry <= through);
-                self.blocks.drain(..gone);
-                if gone > 0 {
-                    splices.push(Splice { range: 0..gone, count: 0 });
-                }
-            }
-            for (id, dirty) in changes.changed {
-                splices.extend(self.update_entry(transcript, id, dirty));
-            }
-            if let Some(from) = changes.added_from {
-                let at = self.blocks.len();
-                for (id, entry) in transcript.entries().filter(|(id, _)| *id >= from) {
-                    if self.entries.last().is_some_and(|(last, _)| *last >= id) {
-                        continue;
-                    }
-                    self.entries.push((id, entry.clone()));
-                    if matches!(entry, Entry::User { .. }) {
-                        self.last_user = Some(id);
-                    }
-                    self.keep_render(id, render_entry(entry));
-                    self.keep_texts(id, text_items(entry));
-                    let fresh = self.draw(id, entry, false);
-                    self.blocks.extend(fresh);
-                }
-                if self.blocks.len() > at {
-                    splices.push(Splice { range: at..at, count: self.blocks.len() - at });
-                }
-            }
-        }
-        if changes.reset || changes.turn_or_agent || changes.added_from.is_some() {
-            self.turn = transcript.turn().clone();
-            let activity = transcript.activity();
-            if activity != self.activity {
-                self.seen = false;
-            }
-            self.activity = activity;
-            match &self.phase {
-                AgentPhase::Connecting | AgentPhase::Live(_) => self.phase = AgentPhase::Live(transcript.agent().clone()),
-                AgentPhase::NotStarted(_) | AgentPhase::Lost { .. } | AgentPhase::Broken { .. } => {}
-            }
-            if let AgentPhase::Live(AgentState::Ready { name: Some(name), .. }) = &self.phase {
-                self.agent_name = Some(name.clone());
-            }
-            if let Some(conversation) = transcript.conversation() {
-                self.conversation = Some(conversation.clone());
-            }
-        }
-        if changes.reset || changes.slot_changed {
-            self.slot = transcript.slot().clone();
-        }
-        if changes.reset || changes.lists_changed {
-            self.commands = transcript.commands().to_vec();
-            self.options = transcript.options().to_vec();
-            self.refresh_completion();
-        }
-        splices.extend(self.update_thoughts(changes.reset));
-        splices.extend(self.refresh_rows());
-        self.follow_window(transcript.window(), changes.reset, changes.prepended.is_some());
-        // The reconnect's replay says whether a prompt whose answer was
-        // lost with the link was taken (decision 5).
-        let replied = if changes.reset { self.uncertain.take().map(|uncertain| self.settle_uncertain(uncertain, None)) } else { None };
-        Absorbed { replied, ..self.finish(before, splices, changes.status_from) }
+    fn before(&self) -> Before {
+        Before { status: self.shown_status(), title: self.title(), queue: self.queue.clone() }
     }
 
     /// The session's thread handed over the running session
@@ -470,11 +419,15 @@ impl ChatModel {
         }
     }
 
+    /// A change from outside the transcript: what an update marked is
+    /// drawn first, so its splices come before the change's.
     fn life_event(&mut self, change: impl FnOnce(&mut Self)) -> Absorbed {
         let before = self.before();
+        let mut splices = self.draw(Due::All);
         change(self);
         // A tool row's state can follow the phase and the session's life.
-        let splices = self.refresh_rows();
+        splices.extend(self.refresh_rows(Rows::All));
+        splices.extend(self.working());
         self.finish(before, splices, StatusFrom::Unchanged)
     }
 
@@ -482,7 +435,7 @@ impl ChatModel {
     /// turn or agent-state event of the change was folded (decision 8): one
     /// from a replay raises nothing, sends no first prompt and starts no
     /// launch's choice.
-    fn finish(&mut self, before: Before, mut splices: Vec<Splice>, status_from: StatusFrom) -> Absorbed {
+    fn finish(&mut self, before: Before, splices: Vec<Splice>, status_from: StatusFrom) -> Absorbed {
         let replayed = status_from == StatusFrom::Replay;
         let running = self.handle == SessionHandle::Running;
         self.queue = queue_row(&self.slot, &self.phase, self.life);
@@ -494,10 +447,8 @@ impl ChatModel {
         }
         let status = self.shown_status();
         let changed = status != before.status;
-        // The working row is the list's item after the blocks: its insert or
-        // removal comes after the blocks' splices, at the count they left
-        // (OpenSpec change `agents-zone-focus-and-scroll`, decision 5).
-        splices.extend(working_splice(before.working, self.working_row().is_some(), self.blocks.len()));
+        // The working row's splice comes with the draw (`ChatModel::working`,
+        // OpenSpec change `agents-absorb-cost` decision 4).
         // A conversation started: the session is an ordinary one now.
         if matches!(self.phase, AgentPhase::Live(AgentState::Ready { .. })) {
             self.choosing.started = false;
@@ -584,6 +535,45 @@ mod tests {
         let absorbed = zone.feed(&[conversation_event(Continuation::Resume), ready()]);
         assert!(absorbed.title_changed);
         assert_eq!(zone.model.title(), "Fake");
+    }
+
+    /// OpenSpec change `agents-absorb-cost` decision 5's guard: the frames
+    /// one drained update takes render a growing message once, however
+    /// many of them appended to it.
+    #[test]
+    fn a_batch_of_appends_absorbed_in_one_update_renders_the_message_once() {
+        use crate::agent::transcript::Event;
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("hi")), added(2, agent("Hel"))]);
+        let before = zone.model.render_stats().renders;
+        let append = |text: &str| [Event::Appended { id: EntryId(2), text: text.into() }];
+        zone.feed_batch(&[&append("lo"), &append(" the"), &append("re")]);
+        assert_eq!(zone.model.render_stats().renders - before, 1);
+        assert_eq!(zone.model.message_text(EntryId(2)), Some("Hello there"));
+    }
+
+    /// Decision 8's table on a fixed conversation: a tool's text item is
+    /// held once beside its entry and once rendered, however its row is
+    /// drawn.
+    #[test]
+    fn held_text_counts_the_copies() {
+        use crate::agent::tool::RowState;
+        use crate::agent::transcript::ToolItem;
+        let mut zone = Zone::ready();
+        let tool = in_progress("c1", vec![ToolItem::Text { text: "abcdefgh".repeat(512), cut: false }]);
+        zone.feed(&[
+            added(1, user(&"u".repeat(2048))),
+            turn(TurnState::Working),
+            added(2, agent(&"a".repeat(10 * 1024))),
+            added(3, tool),
+        ]);
+        assert_eq!(row(&zone.model, 3).0, RowState::Open);
+        let held = zone.model.held_text();
+        assert_eq!(held.entries, 2048 + 10 * 1024 + 4096, "{held:?}");
+        // The tool text is held once beside its entry, and once rendered:
+        // the renders' cache and the drawn part keep no source (their types
+        // hold none since 4.3 and 5.7).
+        assert_eq!((held.user_parts, held.rendered, held.text_renders), (2048, 10 * 1024, 4096), "{held:?}");
     }
 
     /// The end of a replay brings a reconnecting link back up, and does
