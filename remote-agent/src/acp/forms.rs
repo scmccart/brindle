@@ -64,6 +64,12 @@ pub struct Initialized {
     /// (`agentCapabilities.sessionCapabilities.list`; OpenSpec change
     /// `agents-session-list`). A malformed capability reads as not offered.
     pub lists: bool,
+    /// What the agent takes in a prompt (`agentCapabilities
+    /// .promptCapabilities`; OpenSpec change `agents-prompt-context`).
+    pub prompts: PromptSupport,
+    /// Whether the agent takes more directories than its working one into
+    /// a session's scope (`sessionCapabilities.additionalDirectories`).
+    pub directories: bool,
 }
 
 /// A page of the agent's conversations, as its answer to a list gave them,
@@ -467,6 +473,33 @@ impl Refusal {
     }
 }
 
+/// What an agent takes in a prompt beside text, from `initialize`
+/// (OpenSpec change `agents-prompt-context`, decision 6): embedded text
+/// resources, and images (read for `agents-prompt-images`). A malformed
+/// capability reads as not offered. Every agent takes text and links.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptSupport {
+    pub embedded: bool,
+    pub images: bool,
+}
+
+/// One part of a prompt (`agents-prompt-context`, decision 6): the user's
+/// text, a link to a file by its `file://` URI, or a text given whole with
+/// the URI of the file that keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptPart<'a> {
+    Text(&'a str),
+    Link {
+        uri: &'a str,
+        name: &'a str,
+    },
+    Embedded {
+        uri: &'a str,
+        name: &'a str,
+        text: &'a str,
+    },
+}
+
 /// A line the reducer asks to be written to the agent, which the session's
 /// dialect encodes: one of the core's requests by its id (from `Rpc`), a
 /// notification, or an answer to one of the agent's requests.
@@ -478,21 +511,32 @@ pub enum Request<'a> {
     Initialize { id: u64, version: &'a str },
     /// Logs in with the login method `method` (`agents-login`).
     Authenticate { id: u64, method: &'a str },
-    /// A new conversation in `cwd` (already absolute), with no MCP servers.
-    NewSession { id: u64, cwd: &'a str },
+    /// A new conversation in `cwd` (already absolute), with no MCP servers,
+    /// and `directories` (absolute) as more roots of its file system scope
+    /// when there are any: the session's attachments directory, for an
+    /// agent that offers them (OpenSpec change `agents-prompt-context`,
+    /// decision 6).
+    NewSession {
+        id: u64,
+        cwd: &'a str,
+        directories: &'a [String],
+    },
     /// Continues conversation `session` in `cwd` (its own directory), with
-    /// no MCP servers, as [`Continued`] says.
+    /// no MCP servers, as [`Continued`] says, and `directories` as
+    /// [`Request::NewSession`] has them.
     Continue {
         id: u64,
         how: Continued,
         session: &'a str,
         cwd: &'a str,
+        directories: &'a [String],
     },
-    /// One text block for conversation `session`.
+    /// A prompt for conversation `session`: its parts in order, the user's
+    /// text first (`agents-prompt-context`, decision 6).
     Prompt {
         id: u64,
         session: &'a str,
-        text: &'a str,
+        parts: &'a [PromptPart<'a>],
     },
     /// A page of the agent's conversations in `cwd`, after `cursor`
     /// (`agents-session-list`).

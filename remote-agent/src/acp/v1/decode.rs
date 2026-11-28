@@ -50,7 +50,7 @@ use crate::acp::forms::{
     AgentInfo, Content, ContentKind, Continued, Initialized, Listed, Listing, MAX_LOGIN_ARG,
     MAX_LOGIN_ARGS,
     MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
-    NewSession, NotificationKind, Offered, OfferedOption, OptionKey, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
+    NewSession, NotificationKind, Offered, OfferedOption, OptionKey, OptionKind, OutputForm, Patch, PermissionRequest, PromptSupport, RequestKind,
     RequestedOption, SessionUpdate, ToolCall, ToolChange, ToolDetail, ToolItemForm,
     Failure, Update,
 };
@@ -88,6 +88,11 @@ pub fn initialize_result(mut result: Value) -> Result<Initialized, BadParams> {
             capabilities.session_capabilities.resume.is_some(),
         ),
         lists: capabilities.session_capabilities.list.is_some(),
+        prompts: PromptSupport {
+            embedded: capabilities.prompt_capabilities.embedded_context,
+            images: capabilities.prompt_capabilities.image,
+        },
+        directories: capabilities.session_capabilities.additional_directories.is_some(),
         agent: response.agent_info.map(|info| AgentInfo {
             name: info.name,
             title: info.title,
@@ -2098,6 +2103,43 @@ mod tests {
             }
         }
         assert_eq!(seen.len(), 18, "{seen:?}");
+    }
+
+    /// Design facts of `agents-prompt-context`: every captured agent takes
+    /// embedded context; Claude, Codex and Antigravity take more
+    /// directories, Copilot doesn't.
+    #[test]
+    fn every_captured_initialize_answer_gives_its_prompt_support_and_directories() {
+        let mut seen = 0;
+        for (name, bytes) in CAPTURES.iter().chain(AUTH_CAPTURES.iter()) {
+            for answer in initialize_answers(bytes) {
+                let read = initialize_result(answer).unwrap();
+                assert!(read.prompts.embedded, "{name}");
+                let directories = match *name {
+                    n if n.starts_with("copilot") => false,
+                    // The old Claude adapter predates the capability.
+                    n if n.starts_with("claude-code-acp") => read.directories,
+                    _ => true,
+                };
+                assert_eq!(read.directories, directories, "{name}");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 18);
+        let read = |capabilities: Value| {
+            initialize_result(json!({"protocolVersion": 1, "agentCapabilities": capabilities})).unwrap()
+        };
+        assert_eq!(read(json!({})).prompts, PromptSupport::default());
+        assert!(!read(json!({})).directories);
+        assert_eq!(
+            read(json!({"promptCapabilities": {"embeddedContext": true, "image": true}})).prompts,
+            PromptSupport { embedded: true, images: true }
+        );
+        // A malformed capability reads as not offered.
+        assert_eq!(read(json!({"promptCapabilities": {"embeddedContext": "yes"}})).prompts, PromptSupport::default());
+        assert_eq!(read(json!({"promptCapabilities": 3})).prompts, PromptSupport::default());
+        assert!(read(json!({"sessionCapabilities": {"additionalDirectories": {}}})).directories);
+        assert!(!read(json!({"sessionCapabilities": {"additionalDirectories": 4}})).directories);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::{
-    Attachment, Event, HoldReason, PermissionOutcome, Slot, StopReason, TurnState, clean,
+    Attachment, Event, HoldReason, MAX_ATTACHMENTS, NoticeLevel, PermissionOutcome, Slot,
+    StopReason, TurnState, clean,
 };
 
 use crate::acp::envelope::RpcError;
@@ -9,7 +10,7 @@ use crate::acp::limits::MAX_PROMPT;
 
 use super::lifecycle::{Ending, Phase};
 use super::text::bound;
-use super::{Moment, Refused, Step};
+use super::{Moment, Refused, Step, attach};
 
 impl Step<'_> {
     pub(super) fn prompted(&mut self, result: Result<Value, &RpcError>) {
@@ -63,21 +64,46 @@ impl Step<'_> {
             return;
         };
         let session = session.clone();
+        // The parts are built at send time (OpenSpec change
+        // `agents-prompt-context`, decision 6): a queued prompt may go long
+        // after it was attached, to another agent than the one it was
+        // queued for.
+        let (parts, missing) = attach::parts(
+            &text,
+            &attachments,
+            &self.s.texts,
+            &self.s.store,
+            &self.s.cwd,
+            self.s.prompts,
+        );
         self.add_prompt(&text, attachments);
+        for name in missing {
+            self.notice(
+                NoticeLevel::Warning,
+                format!("the attached text {name:?} is no longer kept, so the prompt went without it"),
+            );
+        }
         // A prompt is no run the agent's chunks extend.
         self.s.process.run = None;
         self.turn(TurnState::Working);
-        let line = self.s.rpc.prompt(&session, &text);
+        let forms: Vec<_> = parts.iter().map(attach::Part::form).collect();
+        let line = self.s.rpc.prompt(&session, &forms);
         self.out.stdin.extend(line);
         self.mark(Moment::BeforeRequest);
     }
 
     pub(super) fn prompt(&mut self, text: &str, attachments: Vec<Attachment>) -> Result<(), Refused> {
+        if attachments.len() > MAX_ATTACHMENTS {
+            return Err(Refused::TooManyAttachments {
+                count: attachments.len(),
+            });
+        }
         self.readiness()?;
         let text = clean(text);
         if text.len() > MAX_PROMPT {
             return Err(Refused::TooLong { len: text.len() });
         }
+        let attachments = attach::cleaned(attachments)?;
         if !self.running() {
             // A held prompt stays held, untouched (decision 10).
             self.send_prompt(text, attachments);
