@@ -34,7 +34,7 @@ use brindle_ui::{
 use brindle_ui::{FooterItem, Suggestion, SuggestionKey, Suggestions};
 
 use crate::agent::commands::{Completion, CompletionKey, OptionItem};
-use brindle_ui::{Code, CodeBlock, Diff};
+use brindle_ui::{Code, CodeBlock, Diff, IconElement};
 
 use crate::actions::{
     AgentCancel, AgentContinue, AgentConversations, AgentNextMode, AgentOptions, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
@@ -43,12 +43,14 @@ use crate::actions::{
 use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
-    AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus, QueueRow,
-    Resend, ShownPart, WorkingRow, ZoneChoice,
+    self as model, AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus,
+    QueueRow, Resend, ShownPart, TextState, WorkingRow, ZoneChoice,
 };
 use crate::agent::tool::{self, DetailPart};
 use crate::motion::{self, Motion};
-use crate::agent::transcript::{EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus};
+use crate::agent::transcript::{
+    Attachment, EntryId, NoticeLevel, PermissionKind, PermissionOutcome, ToolKind, ToolStatus,
+};
 use crate::agent::{Agent, AgentUpdate};
 use crate::settings::Settings;
 use crate::terminal::links::{self, OpenError, Plan};
@@ -114,7 +116,7 @@ pub fn link_step(target: &str, action: LinkAction) -> LinkStep {
 /// is padded on both.
 pub fn item_padding(block: &Block) -> (bool, bool) {
     match &block.body {
-        BlockBody::UserText { .. } | BlockBody::AgentPart { .. } => {
+        BlockBody::UserText { .. } | BlockBody::AgentPart { .. } | BlockBody::Attached { .. } => {
             let edges = bubble_part(block.part, block.last).edges();
             (edges.top, edges.bottom)
         }
@@ -240,13 +242,22 @@ pub fn completion_key_of(key: SuggestionKey) -> CompletionKey {
     }
 }
 
+/// A queued prompt's text as its row shows it, its attachments counted
+/// after it (`next · 2 attachments`).
+fn counted(text: &SharedString, attachments: usize) -> SharedString {
+    match model::attachment_count(attachments) {
+        Some(count) => format!("{text} · {count}").into(),
+        None => text.clone(),
+    }
+}
+
 /// The prompt input's queue row for the model's [`QueueRow`].
 pub fn queued_of(row: &QueueRow) -> Option<Queued> {
     match row {
         QueueRow::None => None,
-        QueueRow::Waiting { text } => Some(Queued::Waiting { text: text.clone() }),
-        QueueRow::Held { text, why, resend, reason: _ } => Some(Queued::Held {
-            text: text.clone(),
+        QueueRow::Waiting { text, attachments } => Some(Queued::Waiting { text: counted(text, *attachments) }),
+        QueueRow::Held { text, attachments, why, resend, reason: _ } => Some(Queued::Held {
+            text: counted(text, *attachments),
             reason: why.clone(),
             resend: match resend {
                 Resend::Available => UiResend::Available,
@@ -1235,6 +1246,67 @@ fn block_element(
                 .when_some(color, |d, color| d.text_color(color))
                 .child(text.clone())
                 .into_any_element()
+        }
+        BlockBody::Attached { index, attachment, state } => {
+            let content = attached_element(view.clone(), entry, *index, attachment, state, &code_font, muted);
+            message(view, MessageFrom::User, content)
+        }
+    }
+}
+
+/// A user message's attachment, inside its bubble under its text (OpenSpec
+/// change `agents-prompt-context`, decision 9): a link as its path; a kept
+/// text as a row with its name and size, which a press opens and closes,
+/// and under it the text as code, in words while it loads, or why it is
+/// gone. Nothing in it moves, and the row is no keyboard stop.
+fn attached_element(
+    view: WeakEntity<AgentView>,
+    entry: EntryId,
+    index: usize,
+    attachment: &Attachment,
+    state: &TextState,
+    code_font: &SharedString,
+    muted: gpui::Hsla,
+) -> gpui::AnyElement {
+    let id = |what: &str| ElementId::Name(format!("agent-attached-{what}-{}-{index}", entry.0).into());
+    let line = |icon: Icon, name: String, detail: String| {
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(gpui::rems(0.75))
+            .child(IconElement::new(icon).size(gpui::rems(0.875)).color(muted))
+            .child(div().min_w_0().truncate().child(name))
+            .child(div().flex_none().text_color(muted).child(detail))
+    };
+    match attachment {
+        Attachment::Link { path, name } => {
+            line(Icon::FileText, name.clone(), path.clone()).debug_selector(|| "agent-attached-link".into()).into_any_element()
+        }
+        Attachment::Text { name, bytes, .. } => {
+            let open = matches!(state, TextState::Loading | TextState::Shown(_));
+            let row = line(Icon::Terminal, name.clone(), model::size(*bytes))
+                .id(id("row"))
+                .debug_selector(|| "agent-attached-text".into())
+                .cursor_pointer()
+                .child(IconElement::new(Icon::ChevronDown).size(gpui::rems(0.75)).color(muted).turn(if open { 0.5 } else { 0. }))
+                .on_click(move |_, _, cx| {
+                    view.update(cx, |view, cx| view.agent.update(cx, |agent, cx| agent.press_row(entry, index, cx))).ok();
+                });
+            let below = match state {
+                TextState::Closed => None,
+                TextState::Loading => Some(div().text_size(gpui::rems(0.75)).text_color(muted).child("Loading…").into_any_element()),
+                TextState::Shown(text) => Some(
+                    CodeBlock::new(id("code"), Code { label: Some(name.clone().into()), text: text.clone().into() })
+                        .font(code_font.clone())
+                        .on_copy(|text, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.to_string())))
+                        .into_any_element(),
+                ),
+                TextState::Gone(why) => {
+                    Some(div().text_size(gpui::rems(0.75)).text_color(muted).child(why.clone()).into_any_element())
+                }
+            };
+            div().flex().flex_col().gap_1().child(row).children(below).into_any_element()
         }
     }
 }

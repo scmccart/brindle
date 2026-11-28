@@ -334,6 +334,7 @@ impl ChatModel {
             // A new conversation reuses the old one's ids (decision 9).
             model.toggled.clear();
             model.by_hand.clear();
+            model.rows.clear();
             model.auto_open = None;
         }
         // The idle turn finishes the tool calls that ran, and the old

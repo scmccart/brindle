@@ -561,7 +561,9 @@ fn the_prompt_state_follows_the_model() {
     assert_eq!(bubble_part(0, false), BubblePart::First);
     assert_eq!(bubble_part(1, false), BubblePart::Middle);
     assert_eq!(bubble_part(2, true), BubblePart::Last);
-    assert_eq!(queued_of(&QueueRow::Waiting { text: "a".into() }), Some(Queued::Waiting { text: "a".into() }));
+    assert_eq!(queued_of(&QueueRow::Waiting { text: "a".into(), attachments: 0 }), Some(Queued::Waiting { text: "a".into() }));
+    let counted = queued_of(&QueueRow::Waiting { text: "next".into(), attachments: 2 });
+    assert_eq!(counted, Some(Queued::Waiting { text: "next · 2 attachments".into() }));
     assert_eq!(tool_status(ToolStatus::InProgress), UiToolStatus::Running);
     assert_eq!(tool_icon(ToolKind::Execute), Icon::Terminal);
 }
