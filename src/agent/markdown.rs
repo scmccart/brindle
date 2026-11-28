@@ -11,6 +11,7 @@
 //! bounded ([`MAX_DEPTH`], [`MAX_COLUMNS`]), and an [`Inline`] the walk
 //! somehow builds wrong falls back to its plain text (`railway R5`).
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -190,6 +191,9 @@ struct Walk<'a> {
     /// Where text goes that has no inline to go to (never, from the
     /// parser): dropped rather than a panic.
     spare: InlineBuf,
+    /// Each link target made so far, so a reference used many times holds
+    /// one (OpenSpec change `agents-absorb-cost`, decision 8).
+    targets: HashMap<String, SharedString>,
 }
 
 fn heading_level(level: pulldown_cmark::HeadingLevel) -> HeadingLevel {
@@ -256,7 +260,18 @@ impl<'a> Walk<'a> {
             inner_links: 0,
             image: None,
             spare: InlineBuf::default(),
+            targets: HashMap::new(),
         }
+    }
+
+    /// `target` as this render's one string for it.
+    fn shared(&mut self, target: String) -> SharedString {
+        if let Some(shared) = self.targets.get(&target) {
+            return shared.clone();
+        }
+        let shared = SharedString::from(target.clone());
+        self.targets.insert(target, shared.clone());
+        shared
     }
 
     fn event(&mut self, event: Event<'_>, range: Range<usize>) {
@@ -513,21 +528,22 @@ impl<'a> Walk<'a> {
         if start > end {
             start = end;
         }
-        let shown = buf.text.get(start..end).unwrap_or_default();
-        let tooltip = (shown != link.target).then(|| SharedString::from(link.target.clone()));
-        buf.links.push(InlineLink { range: start..end, target: link.target.into(), tooltip });
+        let differs = buf.text.get(start..end).unwrap_or_default() != link.target;
+        let target = self.shared(link.target);
+        let tooltip = differs.then(|| target.clone());
+        self.buf().links.push(InlineLink { range: start..end, target, tooltip });
     }
 
     fn close_image(&mut self, image: OpenImage) {
         let text = image_text(&image.alt, &image.target);
         let style = RunStyle { muted: true, ..self.style() };
         let linked = self.link.is_none();
+        let target = self.shared(image.target);
         let buf = self.buf();
         let start = buf.text.len();
         buf.push(&text, style, false);
         if linked {
             let end = buf.text.len();
-            let target: SharedString = image.target.into();
             buf.links.push(InlineLink { range: start..end, target: target.clone(), tooltip: Some(target) });
         }
     }
@@ -1203,6 +1219,23 @@ mod tests {
             "*a **b *c* d** e*".into(),
             "- a\n- b\n\n\n- c\n  1. d\n     - [x] e".into(),
         ]
+    }
+
+    /// OpenSpec change `agents-absorb-cost` decision 8: a reference used
+    /// many times holds one target, which its tooltip shares.
+    #[test]
+    fn a_reference_used_many_times_shares_one_target() {
+        let source = format!("{}\n\n[d]: https://example.com/docs", "[a][d] ".repeat(100));
+        let inline = para(&source);
+        let links = inline.links();
+        assert_eq!(links.len(), 100);
+        let first = links[0].target.as_ptr();
+        for link in links {
+            assert_eq!(link.target.as_ref(), "https://example.com/docs");
+            assert_eq!(link.target.as_ptr(), first, "one target");
+            let tooltip = link.tooltip.as_ref().expect("its text differs from its target");
+            assert_eq!(tooltip.as_ptr(), first, "the tooltip is the target");
+        }
     }
 
     #[test]
