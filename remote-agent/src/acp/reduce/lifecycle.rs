@@ -331,9 +331,9 @@ impl Step<'_> {
         self.close_process(Refused::Restarted.to_string(), Closing::Gone);
         self.s.lines = Lines::new();
         self.s.run = None;
-        self.s.tools.clear();
-        // The old agent's terminals are gone with it; their text stays.
-        self.s.outputs.clear();
+        // The old agent's calls and terminals are gone with it; their
+        // entries and text stay.
+        self.s.book.clear();
         self.s.bad = None;
         self.s.phase = Phase::Spawning { start };
     }
@@ -1416,7 +1416,7 @@ mod tests {
             assert!(agent.feed(&line).events.is_empty(), "{line}");
         }
         assert_eq!(agent.entries(), kept);
-        assert!(agent.s.outputs.is_empty());
+        assert!(agent.s.book.outputs.is_empty());
     }
 
     // The title across restarts (agents-session-title decision 3).

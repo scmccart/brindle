@@ -373,7 +373,7 @@ mod tests {
             log.apply(event).unwrap_or_else(|e| panic!("{name}: {e}"));
         }
         for n in 0..MAX_OPEN_OUTPUTS {
-            session.outputs.insert(
+            session.book.outputs.insert(
                 format!("{n:0>width$}", width = MAX_TERMINAL_ID),
                 OpenOutput {
                     entry: EntryId(u64::MAX),
@@ -741,7 +741,7 @@ mod tests {
                     assert!([input, result].into_iter().flatten().all(|raw| raw.len() <= RAW_LIMIT));
                 }
             }
-            for (terminal, open) in &s.outputs {
+            for (terminal, open) in &s.book.outputs {
                 assert!(terminal.len() <= MAX_TERMINAL_ID);
                 assert!(
                     matches!(log.entry(open.entry), Some(Entry::Tool { content, .. })

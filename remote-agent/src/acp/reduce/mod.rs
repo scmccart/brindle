@@ -86,6 +86,7 @@ pub use list::ListAnswer;
 pub use login::{AfterLogin, Login};
 pub use text::session_title;
 pub use tools::{MAX_OPEN_OUTPUTS, OpenOutput};
+pub(super) use tools::ToolBook;
 
 #[cfg(test)]
 pub(super) use permission::pending_permissions;
@@ -138,11 +139,8 @@ pub struct AgentSession {
     /// Brindle's version, for `initialize`'s `clientInfo`.
     pub(super) version: String,
     pub(super) run: Option<Run>,
-    /// The tool entries by the agent's call id; trimmed entries leave it.
-    pub(super) tools: BTreeMap<String, EntryId>,
-    /// The outputs still appended to, by the agent's terminal id
-    /// (`agents-tool-content` decision 6); at most [`MAX_OPEN_OUTPUTS`].
-    pub(super) outputs: BTreeMap<String, OpenOutput>,
+    /// The tool calls and open outputs by the agent's ids.
+    pub(super) book: ToolBook,
     pub(super) bad: Option<BadRun>,
     /// The login methods the agent's `initialize` advertised, in its order
     /// (`agents-login` decision 3), sent with every `LoginRequired`.
@@ -197,8 +195,7 @@ impl AgentSession {
             cwd,
             version,
             run: None,
-            tools: BTreeMap::new(),
-            outputs: BTreeMap::new(),
+            book: ToolBook::default(),
             bad: None,
             methods: Vec::new(),
             lists: false,
@@ -1230,8 +1227,7 @@ impl Step<'_> {
             | Event::Window { .. } => return,
         };
         self.out.events.push(event);
-        self.s.tools.retain(|_, entry| *entry > through);
-        self.s.outputs.retain(|_, open| open.entry > through);
+        self.s.book.forget_through(through);
         if self.s.run.is_some_and(|run| run.entry <= through) {
             self.s.run = None;
         }
@@ -1692,7 +1688,7 @@ mod tests {
             b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
         );
         assert!(agent.s.rpc().permissions().is_empty());
-        assert!(agent.s.tools.is_empty());
+        assert!(agent.s.book.tools.is_empty());
         assert_eq!(*agent.turn_state(), TurnState::Working);
     }
 
@@ -2696,7 +2692,7 @@ mod tests {
             "c1",
             json!({"terminal_output_delta": {"terminal_id": terminal, "data": "out\n"}}),
         ));
-        assert!(agent.s.outputs.is_empty());
+        assert!(agent.s.book.outputs.is_empty());
         let Entry::Tool { content, more, .. } = tool_entry(&agent, "c1") else {
             panic!("a tool entry");
         };
@@ -2737,13 +2733,13 @@ mod tests {
         };
         assert_eq!(content.len(), 3);
         assert_eq!(more, 1);
-        assert!(!agent.s.outputs.contains_key("t3"));
+        assert!(!agent.s.book.outputs.contains_key("t3"));
         // Nor does output for a terminal nothing opened open past it.
         agent.feed(&meta(
             "c1",
             json!({"terminal_output_delta": {"terminal_id": "t9", "data": "x"}}),
         ));
-        assert!(!agent.s.outputs.contains_key("t9"));
+        assert!(!agent.s.book.outputs.contains_key("t9"));
         assert_eq!(content_of(&tool_entry(&agent, "c1")).len(), 3);
     }
 

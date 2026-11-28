@@ -14,7 +14,7 @@ use crate::acp::lines::{Lines, Partial};
 use crate::acp::plain::{self, Mode};
 use crate::acp::reduce::{
     AfterLogin, AgentSession, BadRun, Greeting, Log, Login, OpenOutput, Phase, Replay, Run,
-    RunKind, Start,
+    RunKind, Start, ToolBook,
 };
 use crate::acp::rpc::{Purpose, Rpc};
 
@@ -89,6 +89,7 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
         "tools".into(),
         Value::Object(
             session
+                .book
                 .tools
                 .iter()
                 .map(|(call, entry)| (call.clone(), Value::from(entry.0)))
@@ -97,11 +98,12 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
     );
     // The open outputs (`agents-tool-content` decision 8), left out when
     // there are none, as a checkpoint from before them has none.
-    if !session.outputs.is_empty() {
+    if !session.book.outputs.is_empty() {
         state.insert(
             "outputs".into(),
             Value::Object(
                 session
+                    .book
                     .outputs
                     .iter()
                     .map(|(terminal, open)| (terminal.clone(), open_output_value(open)))
@@ -508,8 +510,7 @@ pub(super) fn restore(
         cwd,
         version,
         run,
-        tools,
-        outputs,
+        book: ToolBook { tools, outputs },
         bad: (bad_lines > 0).then_some(BadRun {
             lines: bad_lines,
             last: now,
@@ -1491,7 +1492,7 @@ mod tests {
     #[test]
     fn a_session_with_tool_content_round_trips_whole_and_as_segments() {
         let agent = with_tool_content(None);
-        let open = agent.s.outputs.get("t1").expect("open");
+        let open = agent.s.book.outputs.get("t1").expect("open");
         assert_eq!(open.filter.line, "bold");
         let decoded = agent.round_trip();
         assert_eq!(decoded, agent.s);
@@ -1501,7 +1502,7 @@ mod tests {
             json!({"terminal_output_delta": {"terminal_id": "t1", "data": "\u{1b}[3"}}),
             Value::Null,
         ));
-        assert_eq!(agent.s.outputs["t1"].filter.mode, Mode::Csi);
+        assert_eq!(agent.s.book.outputs["t1"].filter.mode, Mode::Csi);
         let mut restored = Agent {
             s: agent.round_trip(),
             now: agent.now,

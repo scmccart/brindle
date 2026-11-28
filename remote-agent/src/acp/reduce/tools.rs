@@ -28,10 +28,37 @@ pub struct OpenOutput {
     pub filter: plain::State,
 }
 
+/// What a session knows of its agent's tool calls by the agent's ids: the
+/// tool entries by call id and the outputs still appended to by terminal
+/// id. The two are trimmed and reset together.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(in crate::acp) struct ToolBook {
+    /// The tool entries by the agent's call id; trimmed entries leave it.
+    pub(in crate::acp) tools: BTreeMap<String, EntryId>,
+    /// The outputs still appended to, by the agent's terminal id
+    /// (`agents-tool-content` decision 6); at most [`MAX_OPEN_OUTPUTS`].
+    pub(in crate::acp) outputs: BTreeMap<String, OpenOutput>,
+}
+
+impl ToolBook {
+    /// Forgets the calls and outputs whose entries are `through` or
+    /// earlier, as the log's trim drops them.
+    pub(super) fn forget_through(&mut self, through: EntryId) {
+        self.tools.retain(|_, entry| *entry > through);
+        self.outputs.retain(|_, open| open.entry > through);
+    }
+
+    /// Forgets every call and output: the agent that named them is gone.
+    pub(super) fn clear(&mut self) {
+        self.tools.clear();
+        self.outputs.clear();
+    }
+}
+
 impl Step<'_> {
     /// The tool entry for the agent's call id, when the log still has it.
     pub(super) fn tool(&self, call: &str) -> Option<EntryId> {
-        let id = *self.s.tools.get(call)?;
+        let id = *self.s.book.tools.get(call)?;
         self.s.transcript.entry(id).map(|_| id)
     }
 
@@ -88,7 +115,7 @@ impl Step<'_> {
         status: ToolStatus,
     ) -> EntryId {
         let entry = self.add(Entry::tool(call.clone(), title, kind, status));
-        self.s.tools.insert(call, entry);
+        self.s.book.tools.insert(call, entry);
         entry
     }
 
@@ -209,7 +236,7 @@ impl Step<'_> {
                 } => {
                     let command = command.map(|command| bound(clean(&command)));
                     let cwd = cwd.as_deref().map(path_text);
-                    match self.s.outputs.get(&terminal) {
+                    match self.s.book.outputs.get(&terminal) {
                         None => {
                             let output = ToolOutputItem {
                                 command,
@@ -243,7 +270,7 @@ impl Step<'_> {
                 }
                 OutputForm::Exited { terminal, exit } => {
                     if self.output(entry, &terminal).is_some()
-                        && let Some(mut open) = self.s.outputs.remove(&terminal)
+                        && let Some(mut open) = self.s.book.outputs.remove(&terminal)
                     {
                         let text = plain::finish(&mut open.filter);
                         self.emit(Event::ToolOutput {
@@ -267,10 +294,10 @@ impl Step<'_> {
     /// content when none is (Codex's file read sends output for a terminal
     /// nothing opened, flag 16). `None` when the entry has no room.
     fn output(&mut self, entry: EntryId, terminal: &str) -> Option<&mut OpenOutput> {
-        if !self.s.outputs.contains_key(terminal) {
+        if !self.s.book.outputs.contains_key(terminal) {
             self.open_output(entry, terminal.to_owned(), ToolOutputItem::default());
         }
-        self.s.outputs.get_mut(terminal)
+        self.s.book.outputs.get_mut(terminal)
     }
 
     /// A terminal's description arriving after its output opened (a
@@ -344,9 +371,10 @@ impl Step<'_> {
 
     /// Keeps an output open, closing the oldest past [`MAX_OPEN_OUTPUTS`].
     fn keep_open(&mut self, terminal: String, open: OpenOutput) {
-        while self.s.outputs.len() >= MAX_OPEN_OUTPUTS {
+        while self.s.book.outputs.len() >= MAX_OPEN_OUTPUTS {
             let oldest = self
                 .s
+                .book
                 .outputs
                 .iter()
                 .min_by_key(|(_, open)| (open.entry, open.item))
@@ -354,9 +382,9 @@ impl Step<'_> {
             let Some(oldest) = oldest else {
                 break;
             };
-            self.s.outputs.remove(&oldest);
+            self.s.book.outputs.remove(&oldest);
         }
-        self.s.outputs.insert(terminal, open);
+        self.s.book.outputs.insert(terminal, open);
     }
 
     /// Replaces `entry`'s content with `items`, bounded, when they differ,
@@ -405,6 +433,7 @@ impl Step<'_> {
                 ToolItemForm::Terminal { terminal } => {
                     let open = self
                         .s
+                        .book
                         .outputs
                         .get(&terminal)
                         .filter(|open| open.entry == entry)
@@ -442,6 +471,7 @@ impl Step<'_> {
             .map(|(terminal, _)| terminal.as_str())
             .collect();
         self.s
+            .book
             .outputs
             .retain(|terminal, open| open.entry != entry || named.contains(&terminal.as_str()));
         let from = old
@@ -469,7 +499,7 @@ impl Step<'_> {
             at += items.len();
         }
         for (terminal, item) in terminals {
-            match self.s.outputs.get_mut(&terminal) {
+            match self.s.book.outputs.get_mut(&terminal) {
                 Some(open) if open.entry == entry => open.item = item,
                 Some(_) => {}
                 None => self.keep_open(
@@ -733,7 +763,7 @@ mod tests {
                 ..ToolOutputItem::default()
             })]
         );
-        assert!(agent.s.outputs.is_empty(), "closed at its exit");
+        assert!(agent.s.book.outputs.is_empty(), "closed at its exit");
         // Output for a terminal nothing opened opens one on its call (flag 16).
         agent.feed(&tool_call("c2", "Read", "in_progress"));
         agent.feed(&meta(
@@ -750,7 +780,7 @@ mod tests {
         assert!(matches!(&content_of(&tool_entry(&agent, "c2"))[..],
             [ToolItem::Output(ToolOutputItem { text, .. })] if text == "an apple a day\n"));
         // A restart closes the open outputs.
-        assert!(agent.s.outputs.contains_key("t2"));
+        assert!(agent.s.book.outputs.contains_key("t2"));
         let mut step = Step {
             s: &mut agent.s,
             out: Output::default(),
@@ -759,7 +789,7 @@ mod tests {
             event_limit: MAX_EVENT,
         };
         step.respawn(Start::New);
-        assert!(agent.s.outputs.is_empty());
+        assert!(agent.s.book.outputs.is_empty());
     }
 
     #[test]
@@ -851,7 +881,7 @@ mod tests {
             "c0",
             json!({"terminal_output_delta": {"terminal_id": "t0", "data": "x"}}),
         ));
-        assert!(agent.s.outputs.contains_key("t0"));
+        assert!(agent.s.book.outputs.contains_key("t0"));
         let mut step = Step {
             s: &mut agent.s,
             out: Output::default(),
@@ -864,7 +894,7 @@ mod tests {
             step.add_text(RunKind::Agent, &filler);
         }
         step.trim();
-        assert!(agent.s.outputs.is_empty());
+        assert!(agent.s.book.outputs.is_empty());
     }
 
     // --- tool calls -----------------------------------------------------
@@ -987,5 +1017,42 @@ mod tests {
                 ToolStatus::InProgress
             )
         );
+    }
+
+    // --- the tool book ----------------------------------------------------
+
+    /// A book of calls and outputs at entries 1 to 4.
+    fn book() -> ToolBook {
+        let mut book = ToolBook::default();
+        for n in 1..=4 {
+            book.tools.insert(format!("c{n}"), EntryId(n));
+            let open = OpenOutput {
+                entry: EntryId(n),
+                item: 0,
+                filter: plain::State::default(),
+            };
+            book.outputs.insert(format!("t{n}"), open);
+        }
+        book
+    }
+
+    #[test]
+    fn forget_through_keeps_only_later_calls_and_outputs() {
+        let mut book = book();
+        book.forget_through(EntryId(2));
+        let calls: Vec<&str> = book.tools.keys().map(String::as_str).collect();
+        let terminals: Vec<&str> = book.outputs.keys().map(String::as_str).collect();
+        assert_eq!(calls, ["c3", "c4"]);
+        assert_eq!(terminals, ["t3", "t4"]);
+        book.forget_through(EntryId(4));
+        assert_eq!(book, ToolBook::default());
+    }
+
+    #[test]
+    fn clear_empties_both_indexes() {
+        let mut book = book();
+        book.clear();
+        assert!(book.tools.is_empty());
+        assert!(book.outputs.is_empty());
     }
 }
