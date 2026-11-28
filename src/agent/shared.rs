@@ -2,8 +2,11 @@
 //! decision 8): the session's [`Transcript`], folded from the events the
 //! terminal server sends, and what changed since the zone last looked
 //! ([`Changes`]). It sits behind a mutex the sink and the entity share, a
-//! leaf lock: nothing is taken under it. The zone copies what changed
-//! into its model and never reads the lock while drawing (`process R14`).
+//! leaf lock: nothing is taken under it. The UI thread holds it only to
+//! take the changes and copy what changed (`ChatModel::copy_changes`,
+//! OpenSpec change `agents-absorb-cost` decision 2), never across a
+//! render: the zone applies the copy and renders after letting go, and
+//! `render` and `prepaint` never take it (`process R14`).
 //!
 //! Pure: values in, values out.
 

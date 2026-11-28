@@ -143,6 +143,24 @@ impl Undrawn {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Run before each render (OpenSpec change `agents-absorb-cost`, task
+    /// 6.1): the entity's test checks that `AgentShared`'s lock is free
+    /// while the zone renders.
+    pub(crate) static RENDER_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The render seam's probe, in tests.
+fn probe() {
+    #[cfg(test)]
+    RENDER_PROBE.with(|probe| {
+        if let Some(probe) = &*probe.borrow() {
+            probe();
+        }
+    });
+}
+
 /// The text items of a tool entry's content, by index.
 fn text_indices(content: &[ToolItem]) -> impl Iterator<Item = usize> + '_ {
     content.iter().enumerate().filter_map(|(item, content)| match content {
@@ -505,6 +523,7 @@ impl ChatModel {
             self.render_text(id, item);
         }
         if undrawn.all {
+            probe();
             for index in 0..self.entries.len() {
                 let id = self.entries[index].0;
                 self.stats.rendered_entry(&self.entries[index].1);
@@ -570,6 +589,7 @@ impl ChatModel {
     /// Renders marked entry `id`'s Markdown, keeping the parts that didn't
     /// change of one drawn before.
     fn render_marked(&mut self, id: EntryId, index: usize, mark: Mark) {
+        probe();
         self.stats.rendered_entry(&self.entries[index].1);
         let render = render_entry(&self.entries[index].1);
         let render = match mark {
@@ -598,6 +618,7 @@ impl ChatModel {
             self.texts.remove(&(id, item));
             return;
         };
+        probe();
         self.stats.rendered(&source);
         let blocks: Arc<[Arc<RichBlock>]> = match std::panic::catch_unwind(|| markdown::render(&source)) {
             Ok(parts) => parts.into_iter().map(|part| part.block).collect(),
