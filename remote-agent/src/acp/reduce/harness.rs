@@ -70,6 +70,11 @@ impl Agent {
         }
         assert_eq!(self.client, self.s.transcript, "the client's fold differs");
         assert_eq!(
+            self.s.process.book.tools,
+            tool_index(&self.s.transcript, self.s.process.book.tool_epoch),
+            "the tool book isn't the log's tool entries from its epoch"
+        );
+        assert_eq!(
             pending_permissions(&self.s.transcript),
             self.s.rpc.waiting_permissions(),
             "the log's pending permission requests aren't the ones awaited"

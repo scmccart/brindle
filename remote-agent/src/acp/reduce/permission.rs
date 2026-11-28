@@ -93,15 +93,19 @@ impl Step<'_> {
         // The request's tool call is applied first, so the entry its row
         // points at holds what the agent sent in either place
         // (`agents-tool-content` decision 7).
-        if let Some(call) = &request.call {
-            self.permission_tool(call.clone());
-        }
+        // Its id and title are read first, so the call itself moves to the
+        // entry with no copy of its content (`agents-checkpoint-deltas`
+        // decision 11).
         let call = request.call.as_ref().map(|call| bound(clean(&call.call)));
-        let title = request
+        let call_title = request
             .call
             .as_ref()
             .and_then(|call| call.title.value())
-            .map(|title| bound(clean(title)))
+            .map(|title| bound(clean(title)));
+        if let Some(change) = request.call {
+            self.permission_tool(change);
+        }
+        let title = call_title
             .or_else(|| {
                 let entry = self.tool(call.as_deref()?)?;
                 match self.s.transcript.entry(entry)? {

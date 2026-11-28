@@ -86,7 +86,7 @@ pub use list::ListAnswer;
 pub use login::{AfterLogin, Login};
 pub use text::session_title;
 pub use tools::{MAX_OPEN_OUTPUTS, OpenOutput};
-pub(super) use tools::ToolBook;
+pub(super) use tools::{ToolBook, tool_index};
 
 #[cfg(test)]
 pub(super) use permission::pending_permissions;
@@ -139,13 +139,20 @@ pub(in crate::acp) struct Process {
 }
 
 impl Process {
-    /// A process whose stdout hasn't been read yet.
+    /// A new session's process, whose stdout hasn't been read yet.
     pub(in crate::acp) fn new() -> Self {
+        Self::starting_at(EntryId::FIRST)
+    }
+
+    /// A process whose first entry will be `epoch` (OpenSpec change
+    /// `agents-checkpoint-deltas`, decision 2): the log's next id when it
+    /// is respawned.
+    pub(in crate::acp) fn starting_at(epoch: EntryId) -> Self {
         Self {
             lines: Lines::new(),
             run: None,
             bad: None,
-            book: ToolBook::default(),
+            book: ToolBook::starting_at(epoch),
         }
     }
 }

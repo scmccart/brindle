@@ -14,7 +14,7 @@ use crate::acp::lines::{Lines, Partial};
 use crate::acp::plain::{self, Mode};
 use crate::acp::reduce::{
     AfterLogin, AgentSession, BadRun, Greeting, Log, Login, OpenOutput, Phase, Replay, Run,
-    Process, RunKind, Start, ToolBook,
+    Process, RunKind, Start, ToolBook, tool_index,
 };
 use crate::acp::rpc::{Purpose, Rpc};
 
@@ -85,6 +85,9 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
             json!({ "kind": run_kind_name(run.kind), "entry": run.entry.0 })
         }),
     );
+    if session.process.book.tool_epoch != EntryId::FIRST {
+        state.insert("tool_epoch".into(), session.process.book.tool_epoch.0.into());
+    }
     state.insert(
         "tools".into(),
         Value::Object(
@@ -394,6 +397,10 @@ pub(super) fn restore(
     } else {
         Some(restore_run(object(run, "run")?)?)
     };
+    let tool_epoch = match state.get("tool_epoch") {
+        None => EntryId::FIRST,
+        Some(epoch) => EntryId(epoch.as_u64().ok_or(Unreadable::Field { name: "tool_epoch" })?),
+    };
     let mut tools = BTreeMap::new();
     for (call, entry) in object(field(state, "tools")?, "tools")? {
         let entry = EntryId(entry.as_u64().ok_or(Unreadable::Field { name: "tools" })?);
@@ -466,6 +473,11 @@ pub(super) fn restore(
             });
         }
     }
+    // And they are the log's tool entries from the epoch on (OpenSpec
+    // change `agents-checkpoint-deltas`, decision 2).
+    if tools != tool_index(&transcript, tool_epoch) {
+        return Err(Unreadable::Field { name: "tools" });
+    }
     for open in outputs.values() {
         let holds = match transcript.entry(open.entry) {
             Some(Entry::Tool { content, .. }) => {
@@ -514,7 +526,11 @@ pub(super) fn restore(
                 lines: bad_lines,
                 last: now,
             }),
-            book: ToolBook { tools, outputs },
+            book: ToolBook {
+                tools,
+                outputs,
+                ..ToolBook::starting_at(tool_epoch)
+            },
         },
         phase,
         cwd,

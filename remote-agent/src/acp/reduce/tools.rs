@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use brindle_transcript::{
     ContentBudget, Entry, EntryId, Event, Exit, FileChange, FileOp, Location, MAX_LOCATIONS,
-    NoticeLevel, Output as ToolOutputItem, SIGNAL_RESERVE, ToolItem, ToolKind, ToolStatus, chunks,
-    clean, item_pieces,
+    NoticeLevel, Output as ToolOutputItem, SIGNAL_RESERVE, ToolItem, ToolKind, ToolStatus,
+    Transcript, chunks, clean, item_pieces,
 };
 
 use crate::acp::forms::{
@@ -30,22 +30,138 @@ pub struct OpenOutput {
 
 /// What a session knows of its agent's tool calls by the agent's ids: the
 /// tool entries by call id and the outputs still appended to by terminal
-/// id. The two are trimmed and reset together.
-#[derive(Debug, Clone, PartialEq, Default)]
+/// id, from the first entry of the running agent process on. They are
+/// trimmed and reset together.
+#[derive(Debug, Clone, PartialEq)]
 pub(in crate::acp) struct ToolBook {
-    /// The tool entries by the agent's call id; trimmed entries leave it.
+    /// The first entry id of the running agent process (OpenSpec change
+    /// `agents-checkpoint-deltas`, decision 2): the calls of an earlier
+    /// process are never this one's.
+    pub(in crate::acp) tool_epoch: EntryId,
+    /// The tool entries by the agent's call id: always
+    /// [`tool_index`]`(log, tool_epoch)`, so a checkpoint writes the epoch
+    /// and rebuilds the map from the log. Trimmed entries leave it.
     pub(in crate::acp) tools: BTreeMap<String, EntryId>,
     /// The outputs still appended to, by the agent's terminal id
     /// (`agents-tool-content` decision 6); at most [`MAX_OPEN_OUTPUTS`].
     pub(in crate::acp) outputs: BTreeMap<String, OpenOutput>,
+    /// The diffs the kept tool items were made from (decision 11).
+    pub(in crate::acp) diffs: DiffMemo,
+}
+
+impl Default for ToolBook {
+    fn default() -> Self {
+        Self::starting_at(EntryId::FIRST)
+    }
 }
 
 impl ToolBook {
-    /// Forgets the calls and outputs whose entries are `through` or
+    /// The book of an agent process whose first entry is `epoch`.
+    pub(in crate::acp) fn starting_at(epoch: EntryId) -> Self {
+        Self {
+            tool_epoch: epoch,
+            tools: BTreeMap::new(),
+            outputs: BTreeMap::new(),
+            diffs: DiffMemo::default(),
+        }
+    }
+
+    /// Forgets the calls, outputs and diffs whose entries are `through` or
     /// earlier, as the log's trim drops them.
     pub(super) fn forget_through(&mut self, through: EntryId) {
         self.tools.retain(|_, entry| *entry > through);
         self.outputs.retain(|_, open| open.entry > through);
+        self.diffs.forget_through(through);
+    }
+}
+
+/// The tool entries the log keeps from `epoch` on, by their call ids: what
+/// [`ToolBook::tools`] always equals (OpenSpec change
+/// `agents-checkpoint-deltas`, decision 2), and how a restored session
+/// rebuilds it.
+pub(in crate::acp) fn tool_index(transcript: &Transcript, epoch: EntryId) -> BTreeMap<String, EntryId> {
+    transcript
+        .entries()
+        .filter(|(id, _)| *id >= epoch)
+        .filter_map(|(id, entry)| match entry {
+            Entry::Tool { call, .. } => Some((call.clone(), id)),
+            Entry::User { .. }
+            | Entry::Agent { .. }
+            | Entry::Thought { .. }
+            | Entry::Permission { .. }
+            | Entry::Notice { .. } => None,
+        })
+        .collect()
+}
+
+/// The digests of the `(path, old, new)` texts each kept diff item was made
+/// from, by its tool entry and item index (OpenSpec change
+/// `agents-checkpoint-deltas`, decision 11), so a diff the agent sends
+/// again unchanged reuses its item instead of being diffed again. A cache
+/// of a pure function's result: never in the log or a checkpoint, pruned
+/// with the tool entries, emptied with the agent process.
+#[derive(Debug, Clone, Default)]
+pub(in crate::acp) struct DiffMemo {
+    digests: BTreeMap<(EntryId, u32), u64>,
+}
+
+/// Always equal: the memo only spares recomputing what the entry already
+/// holds, so two sessions that differ in it alone behave the same, and a
+/// restored session (whose memo is empty) equals the live one it came from.
+impl PartialEq for DiffMemo {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl DiffMemo {
+    /// The digest of a diff's path and texts. `DefaultHasher::new()` has
+    /// fixed keys, so it is the same in every process and reads nothing
+    /// ambient.
+    pub(in crate::acp) fn digest(path: &str, old: Option<&str>, new: &str) -> u64 {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        (path, old, new).hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `old`'s item `index`, a diff, when it was made from the texts whose
+    /// digest is `digest` at that item of `entry`.
+    pub(in crate::acp) fn reused(
+        &self,
+        entry: EntryId,
+        index: u32,
+        digest: u64,
+        old: &[ToolItem],
+    ) -> Option<ToolItem> {
+        if self.digests.get(&(entry, index)) != Some(&digest) {
+            return None;
+        }
+        match old.get(index as usize)? {
+            item @ ToolItem::Diff(_) => Some(item.clone()),
+            ToolItem::Text { .. } | ToolItem::Output(_) => None,
+        }
+    }
+
+    /// Replaces `entry`'s digests with `kept`'s, by item index.
+    pub(in crate::acp) fn keep(&mut self, entry: EntryId, kept: Vec<(u32, u64)>) {
+        self.digests.retain(|(id, _), _| *id != entry);
+        self.digests
+            .extend(kept.into_iter().map(|(index, digest)| ((entry, index), digest)));
+    }
+
+    fn forget_through(&mut self, through: EntryId) {
+        self.digests.retain(|(entry, _), _| *entry > through);
+    }
+
+    #[cfg(test)]
+    pub(in crate::acp) fn digest_at(&self, entry: EntryId, index: u32) -> Option<u64> {
+        self.digests.get(&(entry, index)).copied()
+    }
+
+    #[cfg(test)]
+    pub(in crate::acp) fn is_empty(&self) -> bool {
+        self.digests.is_empty()
     }
 }
 
@@ -109,7 +225,11 @@ impl Step<'_> {
         status: ToolStatus,
     ) -> EntryId {
         let entry = self.add(Entry::tool(call.clone(), title, kind, status));
-        self.s.process.book.tools.insert(call, entry);
+        // Only an entry the log took (a faulted step adds none), so the
+        // book stays the log's index (decision 2).
+        if self.s.transcript.entry(entry).is_some() {
+            self.s.process.book.tools.insert(call, entry);
+        }
         entry
     }
 
@@ -398,26 +518,39 @@ impl Step<'_> {
         let (old, title) = (content.clone(), title.clone());
         let mut kept: Vec<ToolItem> = Vec::new();
         let mut terminals: Vec<(String, u32)> = Vec::new();
+        let mut digests: Vec<(u32, u64)> = Vec::new();
         let mut budget = ContentBudget::new();
         for form in items {
+            let at = u32::try_from(kept.len()).unwrap_or(u32::MAX);
             let item = match form {
                 ToolItemForm::Content(Content::Text(text)) => text_item(&text),
                 ToolItemForm::Content(Content::Other(kind)) => text_item(placeholder(kind)),
                 ToolItemForm::Unknown { kind } => {
                     text_item(&format!("[content Brindle doesn't show: {kind}]"))
                 }
-                ToolItemForm::RawDiff { path, old, new } => {
-                    let diffed = diff::hunks(old.as_deref().unwrap_or_default(), &new);
-                    ToolItem::Diff(FileChange {
-                        op: match old {
-                            None => FileOp::Add,
-                            Some(_) => FileOp::Modify,
-                        },
-                        path: path_text(&path),
-                        // Cleaned as `diff::hunks` keeps them.
-                        hunks: diffed.hunks,
-                        omitted: diffed.omitted,
-                    })
+                ToolItemForm::RawDiff { path, old: was, new } => {
+                    // The same texts at the same item reuse the kept diff
+                    // rather than diffing them again (decision 11).
+                    let digest = DiffMemo::digest(&path, was.as_deref(), &new);
+                    let reused = self.s.process.book.diffs.reused(entry, at, digest, &old);
+                    let item = reused.unwrap_or_else(|| {
+                        let diffed = diff::hunks(was.as_deref().unwrap_or_default(), &new);
+                        ToolItem::Diff(FileChange {
+                            op: match was {
+                                None => FileOp::Add,
+                                Some(_) => FileOp::Modify,
+                            },
+                            path: path_text(&path),
+                            // Cleaned as `diff::hunks` keeps them.
+                            hunks: diffed.hunks,
+                            omitted: diffed.omitted,
+                        })
+                    });
+                    if budget.take(&item) {
+                        digests.push((at, digest));
+                        kept.push(item);
+                    }
+                    continue;
                 }
                 ToolItemForm::Terminal { terminal } if terminal.len() > MAX_TERMINAL_ID => {
                     // Ignored, as its output is (`tool_detail`), and
@@ -445,7 +578,6 @@ impl Step<'_> {
                             })
                         }
                     };
-                    let at = u32::try_from(kept.len()).unwrap_or(u32::MAX);
                     terminals.push((terminal, at));
                     output
                 }
@@ -461,6 +593,7 @@ impl Step<'_> {
             kept.push(item);
         }
         let more = budget.left_out();
+        self.s.process.book.diffs.keep(entry, digests);
         // The outputs of this entry the new list no longer names close.
         let named: Vec<&str> = terminals
             .iter()
@@ -1014,6 +1147,265 @@ mod tests {
                 ToolStatus::InProgress
             )
         );
+    }
+
+    // --- the tool epoch and the diff memo (agents-checkpoint-deltas) ------
+
+    /// A seeded xorshift for the property below.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn below(&mut self, n: u64) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x % n
+        }
+    }
+
+    /// Writes past the log's bound and trims, as a long reply does, the
+    /// client's copy folding the same events.
+    fn fill_and_trim(agent: &mut Agent) {
+        let mut step = Step {
+            s: &mut agent.s,
+            out: Output::default(),
+            fault: None,
+            now: agent.now,
+            event_limit: MAX_EVENT,
+        };
+        let filler = "f".repeat(TEXT_CHUNK);
+        while step.s.transcript.encoded_len() <= LOG_LIMIT {
+            step.add_text(RunKind::Agent, &filler);
+        }
+        let out = step.finish();
+        assert!(out.events.iter().any(|event| matches!(event, Event::Trimmed { .. })));
+        for event in &out.events {
+            agent.client.apply(event).expect("the client folds");
+        }
+    }
+
+    /// The agent exits and is continued by resume, ready again.
+    fn exit_and_resume(agent: &mut Agent) {
+        agent.exit();
+        let id = agent.restart();
+        agent.feed(&initialized(id, both()));
+        let resume = agent.last("session/resume")["id"].as_u64().expect("an id");
+        agent.feed(&result(resume, json!({})));
+        assert!(matches!(agent.s.phase(), Phase::Ready { .. }), "{:?}", agent.s.phase());
+    }
+
+    fn assert_indexed(agent: &Agent, after: &str) {
+        let book = &agent.s.process.book;
+        assert_eq!(
+            book.tools,
+            tool_index(&agent.s.transcript, book.tool_epoch),
+            "after {after}"
+        );
+    }
+
+    fn diff_update(call: &str, old: &str, new: &str) -> String {
+        update(json!({"sessionUpdate": "tool_call_update", "toolCallId": call,
+            "content": [diff_item("/w/notes.txt", old, new)]}))
+    }
+
+    /// Design 2's invariant over random steps: tool calls with repeated
+    /// ids, updates, permissions, answers, turns, trims and restarts.
+    #[test]
+    fn the_tool_index_is_always_the_logs_tool_entries_from_the_epoch() {
+        let (mut trims, mut restarts) = (0, 0);
+        for run in 0..300u64 {
+            let mut rng = Seeded(0x9e37_79b9_7f4a_7c15 ^ (run + 1).wrapping_mul(0x2545_f491));
+            let mut agent = Agent::ready_offering(both());
+            let fill_at = (run % 25 == 0).then(|| rng.below(60));
+            for (n, asked) in (0..60u64).zip(1000u64..) {
+                let call = format!("c{}", rng.below(5));
+                let what = match rng.below(8) {
+                    _ if fill_at == Some(n) => {
+                        fill_and_trim(&mut agent);
+                        trims += 1;
+                        "a trim"
+                    }
+                    0 | 1 => {
+                        agent.feed(&tool_call(&call, "Edit", "pending"));
+                        "a tool call"
+                    }
+                    2 => {
+                        agent.feed(&tool_update(&call, "completed"));
+                        "an update"
+                    }
+                    3 => {
+                        agent.feed(&permission(json!(asked), &call, &ALLOW_REJECT));
+                        "a permission"
+                    }
+                    4 => {
+                        let waiting = agent.s.rpc.permissions().keys().last().copied();
+                        if let Some(entry) = waiting {
+                            agent.cmd(Command::Answer {
+                                entry,
+                                option: Some("allow-once".into()),
+                            });
+                        }
+                        "an answer"
+                    }
+                    5 => {
+                        if *agent.turn_state() == TurnState::Working {
+                            let id = agent.prompt_id();
+                            agent.end(id, "end_turn");
+                        } else {
+                            agent.prompt("go");
+                        }
+                        "a turn"
+                    }
+                    6 => {
+                        agent.feed(&diff_update(&call, "a\n", &format!("b{n}\n")));
+                        "a diff"
+                    }
+                    _ => {
+                        exit_and_resume(&mut agent);
+                        restarts += 1;
+                        "a restart"
+                    }
+                };
+                assert_indexed(&agent, what);
+            }
+        }
+        assert!(trims >= 10 && restarts > 300, "{trims} trims, {restarts} restarts");
+    }
+
+    #[test]
+    fn a_restart_moves_the_tool_epoch_past_the_earlier_agents_entries() {
+        let mut agent = Agent::ready_offering(both());
+        assert_eq!(agent.s.process.book.tool_epoch, EntryId::FIRST);
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit", "completed"));
+        let (first, _) = agent.last_entry();
+        exit_and_resume(&mut agent);
+        let epoch = agent.s.process.book.tool_epoch;
+        assert!(epoch > first, "{epoch:?} after {first:?}");
+        assert!(agent.s.process.book.tools.is_empty());
+        // The new agent's `c1` is a call of its own, not the earlier one.
+        agent.feed(&tool_call("c1", "Edit again", "pending"));
+        let (second, entry) = agent.last_entry();
+        assert!(second >= epoch && matches!(entry, Entry::Tool { .. }));
+        assert_eq!(agent.s.process.book.tools, BTreeMap::from([("c1".to_owned(), second)]));
+        assert!(matches!(
+            agent.s.transcript.entry(first),
+            Some(Entry::Tool { title, .. }) if title == "Edit"
+        ));
+    }
+
+    #[test]
+    fn the_memo_hands_back_the_kept_diff_only_for_the_same_path_and_texts_at_the_same_item() {
+        let digest = DiffMemo::digest("/w/a", Some("a\n"), "b\n");
+        for other in [
+            DiffMemo::digest("/w/b", Some("a\n"), "b\n"),
+            DiffMemo::digest("/w/a", None, "b\n"),
+            DiffMemo::digest("/w/a", Some(""), "b\n"),
+            DiffMemo::digest("/w/a", Some("a\n"), "c\n"),
+            DiffMemo::digest("/w/a", Some("a"), "\nb\n"),
+        ] {
+            assert_ne!(digest, other);
+        }
+        assert_eq!(digest, DiffMemo::digest("/w/a", Some("a\n"), "b\n"), "fixed keys");
+        let change = ToolItem::Diff(FileChange {
+            op: FileOp::Modify,
+            path: "/w/a".into(),
+            hunks: Vec::new(),
+            omitted: 0,
+        });
+        let old = vec![text_item("first"), change.clone()];
+        let mut memo = DiffMemo::default();
+        memo.keep(EntryId(3), vec![(1, digest)]);
+        assert_eq!(memo.reused(EntryId(3), 1, digest, &old), Some(change));
+        assert_eq!(memo.reused(EntryId(3), 1, digest ^ 1, &old), None, "other texts");
+        assert_eq!(memo.reused(EntryId(3), 0, digest, &old), None, "another item");
+        assert_eq!(memo.reused(EntryId(4), 1, digest, &old), None, "another entry");
+        memo.keep(EntryId(3), vec![(0, digest), (2, digest)]);
+        assert_eq!(memo.reused(EntryId(3), 1, digest, &old), None, "keep replaces");
+        assert_eq!(memo.reused(EntryId(3), 0, digest, &old), None, "the item isn't a diff");
+        assert_eq!(memo.reused(EntryId(3), 2, digest, &old), None, "past the items");
+        assert_eq!(memo, DiffMemo::default(), "equal whatever it holds");
+    }
+
+    #[test]
+    fn a_diff_repeated_unchanged_records_its_digest_and_emits_nothing() {
+        let mut agent = Agent::ready();
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit", "in_progress"));
+        let out = agent.feed(&diff_update("c1", "apple\n", "banana\n"));
+        assert_eq!(shape(&out.events), ["tool items"]);
+        let entry = agent.s.process.book.tools["c1"];
+        let digest = DiffMemo::digest("/w/notes.txt", Some("apple\n"), "banana\n");
+        assert_eq!(agent.s.process.book.diffs.digest_at(entry, 0), Some(digest));
+        let out = agent.feed(&diff_update("c1", "apple\n", "banana\n"));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        let request = json!({"jsonrpc": "2.0", "id": 0, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "options": [{"optionId": "a", "name": "Allow", "kind": "allow_once"}],
+                "toolCall": {"toolCallId": "c1",
+                    "content": [diff_item("/w/notes.txt", "apple\n", "banana\n")]}}});
+        let out = agent.feed(&request.to_string());
+        assert_eq!(shape(&out.events), ["added permission", "turn blocked"]);
+        assert_eq!(agent.s.process.book.diffs.digest_at(entry, 0), Some(digest));
+    }
+
+    #[test]
+    fn a_diff_whose_text_changed_is_diffed_again() {
+        let mut agent = Agent::ready();
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit", "in_progress"));
+        agent.feed(&diff_update("c1", "apple\n", "banana\n"));
+        let out = agent.feed(&diff_update("c1", "apple\n", "cherry\n"));
+        assert_eq!(shape(&out.events), ["tool items"]);
+        let Ok::<[ToolItem; 1], _>([ToolItem::Diff(change)]) =
+            content_of(&tool_entry(&agent, "c1")).try_into()
+        else {
+            panic!("not a diff");
+        };
+        assert_eq!(
+            change.hunks[0].lines,
+            [DiffLine::Removed("apple".into()), DiffLine::Added("cherry".into())]
+        );
+        let entry = agent.s.process.book.tools["c1"];
+        assert_eq!(
+            agent.s.process.book.diffs.digest_at(entry, 0),
+            Some(DiffMemo::digest("/w/notes.txt", Some("apple\n"), "cherry\n"))
+        );
+    }
+
+    #[test]
+    fn the_diff_memo_forgets_trimmed_entries_and_everything_at_a_restart() {
+        let mut agent = Agent::ready_offering(both());
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit", "in_progress"));
+        agent.feed(&diff_update("c1", "apple\n", "banana\n"));
+        let first = agent.s.process.book.tools["c1"];
+        assert!(agent.s.process.book.diffs.digest_at(first, 0).is_some());
+        fill_and_trim(&mut agent);
+        assert_eq!(agent.s.transcript.entry(first), None, "trimmed");
+        assert_eq!(agent.s.process.book.diffs.digest_at(first, 0), None);
+        agent.feed(&tool_call("c2", "Edit", "in_progress"));
+        agent.feed(&diff_update("c2", "apple\n", "banana\n"));
+        let second = agent.s.process.book.tools["c2"];
+        assert!(agent.s.process.book.diffs.digest_at(second, 0).is_some());
+        exit_and_resume(&mut agent);
+        assert!(agent.s.process.book.diffs.is_empty());
+    }
+
+    #[test]
+    fn a_restored_session_repeating_a_diff_emits_nothing() {
+        let mut agent = Agent::ready();
+        agent.turn("edit");
+        agent.feed(&tool_call("c1", "Edit", "in_progress"));
+        agent.feed(&diff_update("c1", "apple\n", "banana\n"));
+        let bytes = crate::acp::checkpoint::encode(&agent.s).expect("it fits");
+        agent.s = crate::acp::checkpoint::decode(&bytes, agent.now).expect("it decodes");
+        assert!(agent.s.process.book.diffs.is_empty());
+        let out = agent.feed(&diff_update("c1", "apple\n", "banana\n"));
+        assert!(out.events.is_empty(), "{:?}", out.events);
+        let entry = agent.s.process.book.tools["c1"];
+        assert!(agent.s.process.book.diffs.digest_at(entry, 0).is_some());
     }
 
     // --- the tool book ----------------------------------------------------

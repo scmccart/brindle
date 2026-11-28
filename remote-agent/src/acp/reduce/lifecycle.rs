@@ -329,8 +329,8 @@ impl Step<'_> {
         // process. No path resets `Rpc` without closing it.
         self.close_process(Refused::Restarted.to_string(), Closing::Gone);
         // The old agent's calls and terminals are gone with it; their
-        // entries and text stay.
-        self.s.process = Process::new();
+        // entries and text stay, before the new process's tool epoch.
+        self.s.process = Process::starting_at(self.s.transcript.next_id());
         self.s.phase = Phase::Spawning { start };
     }
 
@@ -2140,7 +2140,9 @@ mod tests {
             now: agent.now,
             event_limit: MAX_EVENT,
         };
+        let next = step.s.transcript.next_id();
         step.respawn(Start::New);
-        assert_eq!(agent.s.process, Process::new());
+        assert_eq!(agent.s.process, Process::starting_at(next));
+        assert_eq!(agent.s.process.book.tool_epoch, next);
     }
 }
