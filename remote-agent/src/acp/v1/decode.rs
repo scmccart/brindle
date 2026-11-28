@@ -74,8 +74,7 @@ pub fn notification_kind(method: &str) -> NotificationKind {
 /// `initialize`'s answer, read through the schema crate. `authMethods` is
 /// left to [`auth_methods`], which reads it one method at a time, so a bad
 /// method never costs the answer.
-pub fn initialize_result(result: &Value) -> Result<Initialized, BadParams> {
-    let mut result = result.clone();
+pub fn initialize_result(mut result: Value) -> Result<Initialized, BadParams> {
     if let Some(object) = result.as_object_mut() {
         object.remove("authMethods");
     }
@@ -262,12 +261,13 @@ fn supported_versions(error: &RpcError) -> Option<Vec<u16>> {
     (!versions.is_empty()).then_some(versions)
 }
 
-pub fn new_session_result(result: &Value) -> Result<NewSession, BadParams> {
+pub fn new_session_result(result: Value) -> Result<NewSession, BadParams> {
+    let offered = start_options(&result);
     let response: acp::NewSessionResponse =
-        serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(result).map_err(|e| BadParams::from_serde(&e))?;
     Ok(NewSession {
         session_id: response.session_id.0.to_string(),
-        offered: start_options(result),
+        offered,
     })
 }
 
@@ -304,17 +304,17 @@ pub fn list_result(result: &Value) -> Result<Listing, BadParams> {
 
 /// That `session/resume` succeeded: its result has nothing the reducer
 /// reads, but must be an object the schema crate accepts.
-fn resume_result(result: &Value) -> Result<(), BadParams> {
+fn resume_result(result: Value) -> Result<(), BadParams> {
     let _: acp::ResumeSessionResponse =
-        serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(result).map_err(|e| BadParams::from_serde(&e))?;
     Ok(())
 }
 
 /// That `session/load` succeeded, as [`resume_result`] for `session/resume`.
 /// The replay came before it, as `session/update` notifications.
-fn load_result(result: &Value) -> Result<(), BadParams> {
+fn load_result(result: Value) -> Result<(), BadParams> {
     let _: acp::LoadSessionResponse =
-        serde_json::from_value(result.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(result).map_err(|e| BadParams::from_serde(&e))?;
     Ok(())
 }
 
@@ -337,35 +337,35 @@ pub fn prompt_result(result: &Value) -> Result<StopReason, BadParams> {
     })
 }
 
-pub fn session_update(params: &Value) -> Result<SessionUpdate, BadParams> {
+pub fn session_update(mut params: Value) -> Result<SessionUpdate, BadParams> {
     let session_id = params
         .get("sessionId")
         .and_then(Value::as_str)
         .ok_or_else(|| BadParams::missing("sessionId"))?
         .to_owned();
     let update = params
-        .get("update")
+        .get_mut("update")
         .filter(|update| update.is_object())
+        .map(Value::take)
         .ok_or_else(|| BadParams::missing("update"))?;
     let kind = update
         .get("sessionUpdate")
         .and_then(Value::as_str)
-        .ok_or_else(|| BadParams::missing("sessionUpdate"))?;
-    let update = match kind {
+        .ok_or_else(|| BadParams::missing("sessionUpdate"))?
+        .to_owned();
+    let update = match kind.as_str() {
         "user_message_chunk" => Update::UserChunk(chunk(update)?),
         "agent_message_chunk" => Update::AgentChunk(chunk(update)?),
         "agent_thought_chunk" => Update::ThoughtChunk(chunk(update)?),
         "tool_call" => Update::ToolCall(tool_call(update)?),
         "tool_call_update" => Update::ToolChanged(tool_change(update)?),
         "session_info_update" => Update::SessionInfo {
-            title: session_title(update),
+            title: session_title(&update),
         },
-        "available_commands_update" => commands(update)?,
-        "config_option_update" => options_update(update)?,
-        "current_mode_update" => current_mode(update)?,
-        other => Update::Ignored {
-            kind: other.to_owned(),
-        },
+        "available_commands_update" => commands(&update)?,
+        "config_option_update" => options_update(&update)?,
+        "current_mode_update" => current_mode(&update)?,
+        _ => Update::Ignored { kind },
     };
     Ok(SessionUpdate { session_id, update })
 }
@@ -382,9 +382,9 @@ fn session_title(update: &Value) -> Patch<String> {
     }
 }
 
-fn chunk(update: &Value) -> Result<Content, BadParams> {
+fn chunk(update: Value) -> Result<Content, BadParams> {
     let chunk: acp::ContentChunk =
-        serde_json::from_value(update.clone()).map_err(|e| BadParams::from_serde(&e))?;
+        serde_json::from_value(update).map_err(|e| BadParams::from_serde(&e))?;
     Ok(content(chunk.content))
 }
 
@@ -409,8 +409,7 @@ fn content(block: acp::ContentBlock) -> Content {
 const BY_HAND: [&str; 5] = ["content", "locations", "rawInput", "rawOutput", "_meta"];
 
 /// The update without [`BY_HAND`]'s fields, and those fields.
-fn split(update: &Value) -> (Value, Map<String, Value>) {
-    let mut rest = update.clone();
+fn split(mut rest: Value) -> (Value, Map<String, Value>) {
     let mut taken = Map::new();
     if let Some(object) = rest.as_object_mut() {
         for key in BY_HAND {
@@ -422,11 +421,11 @@ fn split(update: &Value) -> (Value, Map<String, Value>) {
     (rest, taken)
 }
 
-fn tool_call(update: &Value) -> Result<ToolCall, BadParams> {
+fn tool_call(update: Value) -> Result<ToolCall, BadParams> {
     let (rest, taken) = split(update);
     let call: acp::ToolCall =
         serde_json::from_value(rest).map_err(|e| BadParams::from_serde(&e))?;
-    let mut detail = tool_detail(&taken);
+    let mut detail = tool_detail(taken);
     // A new call with no content has none.
     if detail.content == Patch::Keep {
         detail.content = Patch::Set(Vec::new());
@@ -440,7 +439,7 @@ fn tool_call(update: &Value) -> Result<ToolCall, BadParams> {
     })
 }
 
-fn tool_change(update: &Value) -> Result<ToolChange, BadParams> {
+fn tool_change(update: Value) -> Result<ToolChange, BadParams> {
     let (rest, taken) = split(update);
     let update: acp::ToolCallUpdate =
         serde_json::from_value(rest).map_err(|e| BadParams::from_serde(&e))?;
@@ -450,16 +449,16 @@ fn tool_change(update: &Value) -> Result<ToolChange, BadParams> {
         title: Patch::kept_or_set(update.fields.title),
         kind: Patch::kept_or_set(update.fields.kind.map(tool_kind)),
         status: Patch::kept_or_set(update.fields.status.and_then(tool_status)),
-        detail: tool_detail(&taken),
+        detail: tool_detail(taken),
     })
 }
 
 /// [`BY_HAND`]'s fields, read one at a time. A field that is absent or
 /// `null` is kept (v1 can't clear one); `content` that isn't a list counts
 /// as one unreadable item.
-fn tool_detail(taken: &Map<String, Value>) -> ToolDetail {
+fn tool_detail(mut taken: Map<String, Value>) -> ToolDetail {
     let mut detail = ToolDetail::default();
-    match taken.get("content") {
+    match taken.remove("content") {
         None | Some(Value::Null) => {}
         Some(Value::Array(items)) => {
             let mut kept = Vec::new();
@@ -473,12 +472,11 @@ fn tool_detail(taken: &Map<String, Value>) -> ToolDetail {
         }
         Some(_) => detail.unreadable = 1,
     }
-    if let Some(Value::Array(list)) = taken.get("locations") {
+    if let Some(Value::Array(list)) = taken.remove("locations") {
         detail.locations = Patch::Set(
-            list.iter()
+            list.into_iter()
                 .filter_map(|location| {
-                    let location: acp::ToolCallLocation =
-                        serde_json::from_value(location.clone()).ok()?;
+                    let location: acp::ToolCallLocation = serde_json::from_value(location).ok()?;
                     Some(Location {
                         path: location.path.to_string_lossy().into_owned(),
                         line: location.line,
@@ -487,8 +485,8 @@ fn tool_detail(taken: &Map<String, Value>) -> ToolDetail {
                 .collect(),
         );
     }
-    detail.input = raw(taken.get("rawInput"));
-    detail.result = raw(taken.get("rawOutput"));
+    detail.input = raw(taken.remove("rawInput"));
+    detail.result = raw(taken.remove("rawOutput"));
     if let Some(meta) = taken.get("_meta") {
         detail.outputs = terminal_meta(meta);
     }
@@ -502,14 +500,12 @@ fn tool_detail(taken: &Map<String, Value>) -> ToolDetail {
     clippy::wildcard_enum_match_arm,
     reason = "foreign enum: ToolCallContent, which is non_exhaustive"
 )]
-fn tool_item(item: &Value) -> Option<ToolItemForm> {
-    let kind = item.get("type")?.as_str()?;
-    if !matches!(kind, "content" | "diff" | "terminal") {
-        return Some(ToolItemForm::Unknown {
-            kind: kind.to_owned(),
-        });
+fn tool_item(item: Value) -> Option<ToolItemForm> {
+    let kind = item.get("type")?.as_str()?.to_owned();
+    if !matches!(kind.as_str(), "content" | "diff" | "terminal") {
+        return Some(ToolItemForm::Unknown { kind });
     }
-    let item: acp::ToolCallContent = serde_json::from_value(item.clone()).ok()?;
+    let item: acp::ToolCallContent = serde_json::from_value(item).ok()?;
     Some(match item {
         acp::ToolCallContent::Content(block) => ToolItemForm::Content(content(block.content)),
         acp::ToolCallContent::Diff(diff) => ToolItemForm::RawDiff {
@@ -520,9 +516,7 @@ fn tool_item(item: &Value) -> Option<ToolItemForm> {
         acp::ToolCallContent::Terminal(terminal) => ToolItemForm::Terminal {
             terminal: terminal.terminal_id.0.to_string(),
         },
-        _ => ToolItemForm::Unknown {
-            kind: kind.to_owned(),
-        },
+        _ => ToolItemForm::Unknown { kind },
     })
 }
 
@@ -532,11 +526,15 @@ fn tool_item(item: &Value) -> Option<ToolItemForm> {
 /// decision 5), so a value whose indented form is huge costs no more than
 /// its bound; one longer than [`RAW_LIMIT`] comes out longer than it, and
 /// the reducer marks it cut.
-fn raw(value: Option<&Value>) -> Patch<String> {
+fn raw(value: Option<Value>) -> Patch<String> {
     match value {
         None | Some(Value::Null) => Patch::Keep,
-        Some(Value::String(text)) => Patch::Set(within(text, RAW_CAP).to_owned()),
-        Some(value) => Patch::Set(pretty_capped(value, RAW_CAP).text()),
+        Some(Value::String(mut text)) => {
+            let kept = within(&text, RAW_CAP).len();
+            text.truncate(kept);
+            Patch::Set(text)
+        }
+        Some(value) => Patch::Set(pretty_capped(&value, RAW_CAP).text()),
     }
 }
 
@@ -700,7 +698,7 @@ fn tool_status(status: acp::ToolCallStatus) -> Option<ToolStatus> {
 /// know doesn't lose the request (the crate rejects it whole). An option
 /// missing its id, name or kind is left out; `options` that isn't a list
 /// fails the decode.
-pub fn permission_request(params: &Value) -> Result<PermissionRequest, BadParams> {
+pub fn permission_request(mut params: Value) -> Result<PermissionRequest, BadParams> {
     let session_id = params
         .get("sessionId")
         .and_then(Value::as_str)
@@ -714,7 +712,8 @@ pub fn permission_request(params: &Value) -> Result<PermissionRequest, BadParams
         .filter_map(requested_option)
         .collect();
     let call = params
-        .get("toolCall")
+        .get_mut("toolCall")
+        .map(Value::take)
         .and_then(|call| tool_change(call).ok());
     Ok(PermissionRequest {
         session_id,
@@ -751,12 +750,13 @@ pub fn cancel_request(params: &Value) -> Result<Id, BadParams> {
 /// result has nothing the reducer reads, but must be an object the schema
 /// crate accepts. A load's replay came before it, as `session/update`
 /// notifications.
-pub fn continued_result(how: Continued, result: &Value) -> Result<Offered, BadParams> {
+pub fn continued_result(how: Continued, result: Value) -> Result<Offered, BadParams> {
+    let offered = start_options(&result);
     match how {
         Continued::Resume => resume_result(result)?,
         Continued::Load => load_result(result)?,
     }
-    Ok(start_options(result))
+    Ok(offered)
 }
 
 /// The options a start's answer (`session/new`, `session/resume`,
@@ -1159,7 +1159,7 @@ mod tests {
 
     #[test]
     fn an_unknown_update_kind_is_ignored_not_rejected() {
-        let update = session_update(&json!({
+        let update = session_update(json!({
             "sessionId": "s",
             "update": {"sessionUpdate": "brand_new_kind", "payload": 1}
         }));
@@ -1193,7 +1193,7 @@ mod tests {
                 update[key] = value.clone();
             }
             assert_eq!(
-                session_update(&json!({"sessionId": "s", "update": update})).map(|u| u.update),
+                session_update(json!({"sessionId": "s", "update": update})).map(|u| u.update),
                 Ok(Update::SessionInfo { title }),
                 "{fields}"
             );
@@ -1205,7 +1205,7 @@ mod tests {
         let Ok(SessionUpdate {
             update: Update::ToolChanged(change),
             ..
-        }) = session_update(&json!({
+        }) = session_update(json!({
             "sessionId": "s",
             "update": {"sessionUpdate": "tool_call_update", "toolCallId": "c", "kind": "teleport", "status": "paused"}
         }))
@@ -1219,7 +1219,7 @@ mod tests {
 
     #[test]
     fn a_non_text_chunk_is_other_content() {
-        let update = session_update(&json!({
+        let update = session_update(json!({
             "sessionId": "s",
             "update": {"sessionUpdate": "agent_message_chunk",
                        "content": {"type": "image", "data": "", "mimeType": "image/png"}}
@@ -1232,7 +1232,7 @@ mod tests {
 
     #[test]
     fn a_permission_option_kind_brindle_does_not_know_is_kept_as_text() {
-        let request = permission_request(&json!({
+        let request = permission_request(json!({
             "sessionId": "s",
             "toolCall": {"toolCallId": "c", "title": "T"},
             "options": [
@@ -1270,7 +1270,7 @@ mod tests {
         let Message::Request { id, params, .. } = ok(line) else {
             panic!("not a request");
         };
-        assert!(permission_request(&params).is_err());
+        assert!(permission_request(params).is_err());
         assert_eq!(id.encode(), r#""7""#);
     }
 
@@ -1323,7 +1323,7 @@ mod tests {
                     continue;
                 }
                 if value["id"] == json!(1) {
-                    let initialized = initialize_result(&value["result"]).unwrap();
+                    let initialized = initialize_result(value["result"].clone()).unwrap();
                     assert!(initialized.lists, "{name}: lists");
                 }
                 if lists.contains(&value["id"]) {
@@ -1394,7 +1394,7 @@ mod tests {
     #[test]
     fn a_list_capability_is_read_from_initialize() {
         let lists = |caps: Value| {
-            initialize_result(&json!({"protocolVersion": 1, "agentCapabilities": {"sessionCapabilities": caps}}))
+            initialize_result(json!({"protocolVersion": 1, "agentCapabilities": {"sessionCapabilities": caps}}))
                 .unwrap()
                 .lists
         };
@@ -1529,21 +1529,21 @@ mod tests {
             decoded.push(message.map(|message| {
                 match message {
                     Message::Notification { method, params } => match notification_kind(&method) {
-                        NotificationKind::SessionUpdate => session_update(&params)
+                        NotificationKind::SessionUpdate => session_update(params)
                             .map_or_else(|e| Decoded::Bad(e.0), |u| Decoded::Update(u.update)),
                         NotificationKind::CancelRequest => Decoded::Ignored,
                         NotificationKind::Other => Decoded::Ignored,
                     },
                     Message::Request { method, params, .. } => match request_kind(&method) {
-                        RequestKind::Permission => permission_request(&params)
+                        RequestKind::Permission => permission_request(params)
                             .map_or_else(|e| Decoded::Bad(e.0), Decoded::Permission),
                         RequestKind::Unoffered => Decoded::Ignored,
                     },
                     Message::Response { id, result } => {
                         match sent.get(&id.encode()).map(String::as_str) {
-                            Some("initialize") => initialize_result(&result)
+                            Some("initialize") => initialize_result(result)
                                 .map_or_else(|e| Decoded::Bad(e.0), Decoded::Initialized),
-                            Some("session/new") => new_session_result(&result)
+                            Some("session/new") => new_session_result(result)
                                 .map_or_else(|e| Decoded::Bad(e.0), |_| Decoded::NewSession),
                             Some("session/prompt") => prompt_result(&result)
                                 .map_or_else(|e| Decoded::Bad(e.0), Decoded::Stopped),
@@ -1623,7 +1623,7 @@ mod tests {
                     }
                 }
                 if line["method"] == "session/update" {
-                    match session_update(&line["params"]).map(|update| update.update) {
+                    match session_update(line["params"].clone()).map(|update| update.update) {
                         Ok(Update::Commands { unreadable, .. }) => {
                             assert_eq!(unreadable, 0, "{name}");
                             counts[1] += 1;
@@ -1795,16 +1795,16 @@ mod tests {
     fn a_mode_update_is_keyed_to_the_modes_and_a_set_answer_read_by_key() {
         let update = json!({"sessionId": "s", "update": {"sessionUpdate": "current_mode_update", "currentModeId": "plan"}});
         assert_eq!(
-            session_update(&update).map(|update| update.update),
+            session_update(update).map(|update| update.update),
             Ok(Update::Current {
                 key: OptionKey::Modes,
                 value: "plan".into()
             })
         );
         let bad = json!({"sessionId": "s", "update": {"sessionUpdate": "current_mode_update"}});
-        assert!(session_update(&bad).is_err());
+        assert!(session_update(bad).is_err());
         let bad = json!({"sessionId": "s", "update": {"sessionUpdate": "config_option_update"}});
-        assert!(session_update(&bad).is_err());
+        assert!(session_update(bad).is_err());
         let config = OptionKey::Config { id: "model".into() };
         let answer = json!({"configOptions": [select("model", "model", "opus", &["opus"])]});
         assert_eq!(
@@ -1946,7 +1946,7 @@ mod tests {
     #[test]
     fn initialize_reads_load_and_resume_and_a_malformed_one_as_not_offered() {
         let offer = |capabilities: Value| {
-            initialize_result(&json!({"protocolVersion": 1, "agentCapabilities": capabilities}))
+            initialize_result(json!({"protocolVersion": 1, "agentCapabilities": capabilities}))
                 .map(|init| init.continuation)
         };
         assert_eq!(
@@ -1971,7 +1971,7 @@ mod tests {
             Ok(Continuation::Load)
         );
         assert_eq!(
-            initialize_result(&json!({"protocolVersion": 1})).map(|init| init.continuation),
+            initialize_result(json!({"protocolVersion": 1})).map(|init| init.continuation),
             Ok(Continuation::Neither)
         );
     }
@@ -2092,7 +2092,7 @@ mod tests {
                         "{name} ({advertised})"
                     );
                     // `initialize` itself still reads.
-                    assert!(initialize_result(&answer).is_ok(), "{name}");
+                    assert!(initialize_result(answer.clone()).is_ok(), "{name}");
                 }
                 seen.push(*name);
             }
@@ -2179,7 +2179,7 @@ mod tests {
         );
         // `initialize` reads whatever the methods are.
         assert!(
-            initialize_result(&json!({"protocolVersion": 1, "authMethods": [{"type": 1}, 3]}))
+            initialize_result(json!({"protocolVersion": 1, "authMethods": [{"type": 1}, 3]}))
                 .is_ok()
         );
     }
@@ -2326,12 +2326,12 @@ mod tests {
             json!({"configOptions": [1]}),
             Value::Null,
         ] {
-            assert_eq!(resume_result(&result), Ok(()), "{result}");
-            assert_eq!(load_result(&result), Ok(()), "{result}");
+            assert_eq!(resume_result(result.clone()), Ok(()), "{result}");
+            assert_eq!(load_result(result.clone()), Ok(()), "{result}");
         }
         for result in [json!("ok"), json!(7), json!(true)] {
-            assert!(resume_result(&result).is_err(), "{result}");
-            assert!(load_result(&result).is_err(), "{result}");
+            assert!(resume_result(result.clone()).is_err(), "{result}");
+            assert!(load_result(result.clone()).is_err(), "{result}");
         }
     }
 
@@ -2576,7 +2576,7 @@ mod tests {
         };
         assert_eq!(id, &Id::number(1));
         assert_eq!(
-            initialize_result(result).map(|init| init.protocol_version),
+            initialize_result(result.clone()).map(|init| init.protocol_version),
             Ok(2)
         );
     }
@@ -2634,12 +2634,12 @@ mod tests {
                     Message::Response { result, .. } => result,
                     Message::Error { error, .. } => error.data.unwrap_or(Value::Null),
                 };
-                let _ = session_update(&value);
-                let _ = permission_request(&value);
-                let _ = initialize_result(&value);
-                let _ = new_session_result(&value);
-                let _ = resume_result(&value);
-                let _ = load_result(&value);
+                let _ = session_update(value.clone());
+                let _ = permission_request(value.clone());
+                let _ = initialize_result(value.clone());
+                let _ = new_session_result(value.clone());
+                let _ = resume_result(value.clone());
+                let _ = load_result(value.clone());
                 let _ = prompt_result(&value);
                 let _ = cancel_request(&value);
             }
@@ -2760,7 +2760,7 @@ mod tests {
         if let (Some(params), Some(update)) = (params.as_object_mut(), update.as_object()) {
             params.extend(update.clone());
         }
-        match session_update(&json!({"sessionId": "s", "update": params})) {
+        match session_update(json!({"sessionId": "s", "update": params})) {
             Ok(SessionUpdate {
                 update: Update::ToolChanged(change),
                 ..
@@ -2895,14 +2895,14 @@ mod tests {
         let Ok(SessionUpdate {
             update: Update::ToolCall(call),
             ..
-        }) = session_update(&json!({"sessionId": "s", "update":
+        }) = session_update(json!({"sessionId": "s", "update":
             {"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Run"}}))
         else {
             panic!("didn't decode");
         };
         assert_eq!(call.detail.content, Patch::Set(Vec::new()));
         // A permission request's toolCall reads the same way.
-        let Ok(request) = permission_request(&json!({"sessionId": "s", "options": [],
+        let Ok(request) = permission_request(json!({"sessionId": "s", "options": [],
             "toolCall": {"toolCallId": "c1", "rawInput": {"command": "rm"},
                 "content": [{"type": "diff", "path": "/a", "oldText": "1", "newText": "2"}]}}))
         else {
@@ -2914,5 +2914,133 @@ mod tests {
             Patch::Set("{\n  \"command\": \"rm\"\n}".into())
         );
         assert!(matches!(&detail.content, Patch::Set(items) if items.len() == 1));
+    }
+
+    /// A tool call update with every field the decoder reads, by hand or
+    /// through the crate.
+    fn every_field_update() -> Value {
+        json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "title": "Edit a.txt",
+            "kind": "edit", "status": "in_progress",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "plan"}},
+                {"type": "diff", "path": "/w/a.txt", "oldText": "1\n", "newText": "2\n"},
+                {"type": "diff", "path": "/w/b.txt", "newText": "new\n"},
+                {"type": "terminal", "terminalId": "t1"},
+                {"type": "hologram"},
+                {"type": "diff"}
+            ],
+            "locations": [{"path": "/w/a.txt", "line": 3}, {"path": "/w/b.txt"}, {"line": 1}],
+            "rawInput": {"path": "a.txt"}, "rawOutput": "done",
+            "_meta": {"terminal_output_delta": {"terminal_id": "t1", "data": "ok\n"}}})
+    }
+
+    fn every_field_change() -> ToolChange {
+        ToolChange {
+            call: "c1".into(),
+            title: Patch::Set("Edit a.txt".into()),
+            kind: Patch::Set(ToolKind::Edit),
+            status: Patch::Set(ToolStatus::InProgress),
+            detail: ToolDetail {
+                content: Patch::Set(vec![
+                    ToolItemForm::Content(Content::Text("plan".into())),
+                    ToolItemForm::RawDiff {
+                        path: "/w/a.txt".into(),
+                        old: Some("1\n".into()),
+                        new: "2\n".into(),
+                    },
+                    ToolItemForm::RawDiff {
+                        path: "/w/b.txt".into(),
+                        old: None,
+                        new: "new\n".into(),
+                    },
+                    ToolItemForm::Terminal {
+                        terminal: "t1".into(),
+                    },
+                    ToolItemForm::Unknown {
+                        kind: "hologram".into(),
+                    },
+                ]),
+                unreadable: 1,
+                locations: Patch::Set(vec![
+                    Location {
+                        path: "/w/a.txt".into(),
+                        line: Some(3),
+                    },
+                    Location {
+                        path: "/w/b.txt".into(),
+                        line: None,
+                    },
+                ]),
+                input: Patch::Set("{\n  \"path\": \"a.txt\"\n}".into()),
+                result: Patch::Set("done".into()),
+                outputs: vec![OutputForm::Appended {
+                    terminal: "t1".into(),
+                    bytes: b"ok\n".to_vec(),
+                }],
+            },
+        }
+    }
+
+    /// `agents-checkpoint-deltas` decision 12: an update moved into the
+    /// decoder, its fields taken out of it, reads as it did borrowed.
+    #[test]
+    fn a_tool_update_moved_into_the_decoder_keeps_every_field() {
+        let decoded = session_update(json!({"sessionId": "s", "update": every_field_update()}));
+        assert_eq!(
+            decoded,
+            Ok(SessionUpdate {
+                session_id: "s".into(),
+                update: Update::ToolChanged(every_field_change()),
+            })
+        );
+        let mut call = every_field_update();
+        call["sessionUpdate"] = json!("tool_call");
+        let Ok(SessionUpdate {
+            update: Update::ToolCall(call),
+            ..
+        }) = session_update(json!({"sessionId": "s", "update": call}))
+        else {
+            panic!("didn't decode");
+        };
+        let change = every_field_change();
+        assert_eq!(
+            (call.call, call.title, call.kind, call.status, call.detail),
+            (
+                change.call,
+                "Edit a.txt".into(),
+                ToolKind::Edit,
+                ToolStatus::InProgress,
+                change.detail
+            )
+        );
+    }
+
+    #[test]
+    fn a_permission_request_moved_into_the_decoder_keeps_its_call_and_options() {
+        let request = permission_request(json!({"sessionId": "s",
+            "options": [
+                {"optionId": "a", "name": "Allow", "kind": "allow_once"},
+                {"optionId": "r", "name": "Reject", "kind": "reject_always"}
+            ],
+            "toolCall": every_field_update()}));
+        assert_eq!(
+            request,
+            Ok(PermissionRequest {
+                session_id: "s".into(),
+                call: Some(every_field_change()),
+                options: vec![
+                    RequestedOption {
+                        id: "a".into(),
+                        name: "Allow".into(),
+                        kind: OptionKind::Known(PermissionKind::AllowOnce),
+                    },
+                    RequestedOption {
+                        id: "r".into(),
+                        name: "Reject".into(),
+                        kind: OptionKind::Known(PermissionKind::RejectAlways),
+                    },
+                ],
+            })
+        );
     }
 }

@@ -425,13 +425,13 @@ impl Step<'_> {
     /// The answer to a set of option `id` to `value`: the agent's list, or
     /// for an empty answer by design the value set; the agent's error, or
     /// an answer Brindle can't read, is a notice and changes nothing.
-    pub(super) fn option_set(&mut self, id: &str, value: &OptionValue, result: Result<&Value, &RpcError>) {
+    pub(super) fn option_set(&mut self, id: &str, value: &OptionValue, result: Result<Value, &RpcError>) {
         // The options went with the agent that was asked.
         let Some(key) = self.s.keys.get(id).cloned() else {
             return;
         };
         let why = match result {
-            Ok(result) => match self.s.rpc.dialect().set_option_result(&key, result) {
+            Ok(result) => match self.s.rpc.dialect().set_option_result(&key, &result) {
                 Ok(Some(offered)) => {
                     let merged = self.s.rpc.dialect().merge_options(&self.held_options(), offered);
                     return self.offer_options(merged, self.comparing());

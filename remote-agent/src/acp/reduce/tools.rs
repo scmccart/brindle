@@ -743,7 +743,7 @@ mod tests {
             if let (Some(update), Some(fields)) = (update.as_object_mut(), fields.as_object()) {
                 update.extend(fields.clone());
             }
-            Dialect::newest().session_update(&json!({"sessionId": "s1", "update": update}))
+            Dialect::newest().session_update(json!({"sessionId": "s1", "update": update}))
         };
         for fields in [
             json!({}),

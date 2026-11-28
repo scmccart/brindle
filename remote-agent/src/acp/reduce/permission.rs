@@ -47,7 +47,7 @@ impl Step<'_> {
         self.tool_detail(entry, detail);
     }
 
-    pub(super) fn permission(&mut self, id: Id, params: &Value) {
+    pub(super) fn permission(&mut self, id: Id, params: Value) {
         let Ok(request) = self.s.rpc.dialect().permission_request(params) else {
             // Answered by its envelope id, never left waiting (decision 5).
             self.out

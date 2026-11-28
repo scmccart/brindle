@@ -1034,7 +1034,7 @@ impl Step<'_> {
             Message::Request { id, method, params } => {
                 self.flush_bad();
                 match self.s.rpc.dialect().request_kind(&method) {
-                    RequestKind::Permission => self.permission(id, &params),
+                    RequestKind::Permission => self.permission(id, params),
                     RequestKind::Unoffered => {
                         self.out
                             .stdin
@@ -1049,7 +1049,7 @@ impl Step<'_> {
             Message::Notification { method, params } => {
                 match self.s.rpc.dialect().notification_kind(&method) {
                     NotificationKind::SessionUpdate => {
-                        match self.s.rpc.dialect().session_update(&params) {
+                        match self.s.rpc.dialect().session_update(params) {
                             Ok(update) => {
                                 self.flush_bad();
                                 self.update(update);
@@ -1075,7 +1075,7 @@ impl Step<'_> {
             Message::Response { id, result } => {
                 self.flush_bad();
                 if let Some(purpose) = self.s.rpc.answered(&id) {
-                    self.response(purpose, Ok(&result));
+                    self.response(purpose, Ok(result));
                 }
             }
             Message::Error { id, error } => {
@@ -1224,7 +1224,9 @@ impl Step<'_> {
 
     // --- answers to the core's requests ---------------------------------
 
-    fn response(&mut self, purpose: Purpose, result: Result<&Value, &RpcError>) {
+    /// An answer to a request of ours, owned, so a decoder moves it
+    /// (`agents-checkpoint-deltas` decision 12).
+    fn response(&mut self, purpose: Purpose, result: Result<Value, &RpcError>) {
         match purpose {
             Purpose::Initialize => self.initialized(result),
             Purpose::NewSession => self.created(result),

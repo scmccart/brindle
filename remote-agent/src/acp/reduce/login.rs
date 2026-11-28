@@ -78,7 +78,7 @@ impl Step<'_> {
     /// `authenticate`'s answer (`agents-login` decision 4): a result, of
     /// whatever shape, is a login, and the session goes on (`Starting`
     /// first); an error needs a login again, with its message.
-    pub(super) fn authenticated(&mut self, result: Result<&Value, &RpcError>) {
+    pub(super) fn authenticated(&mut self, result: Result<Value, &RpcError>) {
         let Phase::LoggingIn { login, .. } = &self.s.phase else {
             return;
         };
