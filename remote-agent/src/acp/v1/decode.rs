@@ -42,7 +42,7 @@ use agent_client_protocol_schema::v1 as acp;
 use brindle_remote_protocol::serde_json::{self, Map, Value};
 use brindle_transcript::{
     Exit, Location, LoginKind, LoginMethod, OptionCategory, OptionChoice, OptionControl,
-    PermissionKind, SessionOption, SlashCommand, StopReason, ToolKind, ToolStatus,
+    PermissionKind, RAW_LIMIT, SessionOption, SlashCommand, StopReason, ToolKind, ToolStatus,
 };
 
 use crate::acp::envelope::{BadParams, Id, RpcError};
@@ -514,12 +514,95 @@ fn tool_item(item: &Value) -> Option<ToolItemForm> {
 }
 
 /// `rawInput` or `rawOutput` as text: a string as itself, anything else as
-/// indented JSON; absent or `null` keeps it.
+/// indented JSON; absent or `null` keeps it. Either is made only up to
+/// [`RAW_CAP`] bytes, cut at a character boundary (`agents-event-bounds`
+/// decision 5), so a value whose indented form is huge costs no more than
+/// its bound; one longer than [`RAW_LIMIT`] comes out longer than it, and
+/// the reducer marks it cut.
 fn raw(value: Option<&Value>) -> Patch<String> {
     match value {
         None | Some(Value::Null) => Patch::Keep,
-        Some(Value::String(text)) => Patch::Set(text.clone()),
-        Some(value) => serde_json::to_string_pretty(value).map_or(Patch::Keep, Patch::Set),
+        Some(Value::String(text)) => Patch::Set(within(text, RAW_CAP).to_owned()),
+        Some(value) => Patch::Set(pretty_capped(value, RAW_CAP).text()),
+    }
+}
+
+/// The most of a raw value [`raw`] makes: past [`RAW_LIMIT`], so the
+/// reducer can tell a value that was cut.
+const RAW_CAP: usize = RAW_LIMIT + 4;
+
+/// `text` cut to at most `limit` bytes at a character boundary.
+fn within(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut cut = limit;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
+}
+
+/// `value`'s indented JSON written into a [`Capped`] of `limit`: the
+/// writer stops serde_json at its first refused write.
+fn pretty_capped(value: &Value, limit: usize) -> Capped {
+    let mut capped = Capped::new(limit);
+    // An error is the cap reached (or a value serde_json can't write),
+    // either way what was kept stands.
+    let _ = serde_json::to_writer_pretty(&mut capped, value);
+    capped
+}
+
+/// A writer that keeps at most `limit` bytes and refuses the write that
+/// would pass it (`WriteZero`), so its writer stops there.
+struct Capped {
+    bytes: Vec<u8>,
+    limit: usize,
+    /// The bytes offered, kept or not.
+    offered: usize,
+    /// The longest one write offered.
+    largest: usize,
+}
+
+impl Capped {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+            offered: 0,
+            largest: 0,
+        }
+    }
+
+    /// What was kept, cut back to its last whole UTF-8 character.
+    fn text(self) -> String {
+        match String::from_utf8(self.bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                let valid = error.utf8_error().valid_up_to();
+                let mut bytes = error.into_bytes();
+                bytes.truncate(valid);
+                String::from_utf8(bytes).unwrap_or_default()
+            }
+        }
+    }
+}
+
+impl std::io::Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.offered = self.offered.saturating_add(buf.len());
+        self.largest = self.largest.max(buf.len());
+        let room = self.limit.saturating_sub(self.bytes.len());
+        if buf.len() > room {
+            self.bytes.extend_from_slice(&buf[..room]);
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -2726,13 +2809,53 @@ mod tests {
                 },
             ])
         );
-        // A 9 MiB string reads whole; the reducer bounds it.
-        let huge = "r".repeat(9 * 1024 * 1024);
-        assert_eq!(
-            changed(json!({"rawInput": huge})).detail.input,
-            Patch::Set(huge)
-        );
         assert_eq!(changed(json!({"rawInput": null})).detail.input, Patch::Keep);
+    }
+
+    /// The raw input a change decodes to, as text.
+    fn raw_input(value: Value) -> String {
+        match changed(json!({ "rawInput": value })).detail.input {
+            Patch::Set(text) => text,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A `rawInput` of 120 nested arrays around 200,000 zeros, whose
+    /// indented form is about 50 MB, decodes to at most `RAW_LIMIT + 4`
+    /// bytes (`agents-event-bounds` B-2, task 4.6).
+    #[test]
+    fn a_deep_raw_value_decodes_to_at_most_its_bound() {
+        let mut value = Value::Array(vec![json!(0); 200_000]);
+        for _ in 0..120 {
+            value = Value::Array(vec![value]);
+        }
+        // The capped writer is offered at most its limit plus one write.
+        let capped = pretty_capped(&value, RAW_CAP);
+        assert!(capped.offered <= RAW_CAP + capped.largest, "{} offered", capped.offered);
+        let text = raw_input(value);
+        assert!(text.len() <= RAW_LIMIT + 4, "{}", text.len());
+        assert!(text.starts_with("[\n  [\n"), "{}", &text[..16]);
+    }
+
+    /// The capped writer keeps whole characters: a cut inside one drops
+    /// it.
+    #[test]
+    fn a_capped_value_keeps_whole_characters() {
+        let value = json!(["é".repeat(100)]);
+        // `[\n  "` is 5 bytes, so 10 bytes end inside the third `é`.
+        let capped = pretty_capped(&value, 10);
+        assert_eq!(capped.text(), "[\n  \"éé");
+        let whole = pretty_capped(&value, RAW_CAP).text();
+        assert_eq!(whole, serde_json::to_string_pretty(&value).unwrap());
+    }
+
+    /// A 1 MiB raw string is cut at `RAW_LIMIT + 4`, at a character
+    /// boundary.
+    #[test]
+    fn a_long_raw_string_is_cut_at_its_bound_at_a_character_boundary() {
+        let long = format!("a{}", "é".repeat(512 * 1024));
+        let text = raw_input(json!(long));
+        assert_eq!(text, format!("a{}", "é".repeat((RAW_LIMIT + 4 - 1) / 2)));
     }
 
     #[test]

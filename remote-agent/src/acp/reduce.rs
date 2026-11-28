@@ -3744,12 +3744,19 @@ fn text_item(text: &str) -> ToolItem {
 }
 
 /// A raw input or result, cleaned, its end dropped past [`RAW_LIMIT`] with
-/// `…`.
+/// `…`. Cut before it is cleaned, so a long one costs only its bound
+/// (`agents-event-bounds` decision 5); cleaning can lengthen the kept
+/// part, which is cut again.
 fn raw_text(text: &str) -> String {
     let ellipsis = "…";
-    match cut_at(clean(text), RAW_LIMIT) {
-        (text, false) => text,
-        (text, true) => {
+    let mut prefix = RAW_LIMIT.min(text.len());
+    while !text.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let was_cut = prefix < text.len();
+    match cut_at(clean(&text[..prefix]), RAW_LIMIT) {
+        (text, false) if !was_cut => text,
+        (text, _) => {
             let (mut text, _) = cut_at(text, RAW_LIMIT - ellipsis.len());
             text.push_str(ellipsis);
             text
@@ -9681,6 +9688,29 @@ mod tests {
             })
             .collect();
         assert_eq!(pieces, [1, 1]);
+    }
+
+    /// `raw_text` of a long value holding controls ends with `…` within
+    /// `RAW_LIMIT`, as it did when it cleaned the whole value first; one
+    /// within the limit is only cleaned (task 4.6).
+    #[test]
+    fn raw_text_cuts_a_long_value_with_an_ellipsis_within_its_limit() {
+        for long in [
+            "\u{1}".repeat(100_000),
+            format!("{}\u{1}", "r".repeat(RAW_LIMIT)),
+            "é".repeat(RAW_LIMIT),
+        ] {
+            let text = raw_text(&long);
+            assert!(text.len() <= RAW_LIMIT, "{}", text.len());
+            assert!(text.ends_with('…'));
+            let old = match cut_at(clean(&long), RAW_LIMIT) {
+                (text, false) => text,
+                (text, true) => format!("{}…", cut_at(text, RAW_LIMIT - "…".len()).0),
+            };
+            assert_eq!(text, old);
+        }
+        assert_eq!(raw_text("a\u{1}b"), "a\u{fffd}b");
+        assert_eq!(raw_text(&"r".repeat(RAW_LIMIT)), "r".repeat(RAW_LIMIT));
     }
 
     // --- the emit guard (task 4.5, design decision 4) -------------------

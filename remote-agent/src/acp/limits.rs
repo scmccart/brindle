@@ -189,3 +189,579 @@ const _: () = assert!(LARGEST_ENTRY <= LOG_TRIM_TO);
 const _: () = assert!(TOOL_HEADER_EVENT + 2 * 256 * 1024 + MAX_ITEMS * 192 <= LOG_TRIM_TO);
 const _: () = assert!(LOG_TRIM_TO < LOG_LIMIT);
 const _: () = assert!(LARGEST_CHECKPOINT <= MAX_CHECKPOINT_LEN);
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use brindle_remote_protocol::client::pack_transcript;
+    use brindle_remote_protocol::serde_json::{Value, json};
+    use brindle_transcript::{
+        AgentState, CALL_LIMIT, Continuation, Conversation, Entry, EntryId, Event, Exit,
+        HoldReason, Location, LoginKind, LoginMethod, NoticeLevel, Output, PAGE_BYTES,
+        PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind,
+        ToolStatus, Transcript, TurnState,
+    };
+
+    use super::super::checkpoint;
+    use super::super::lines::{Lines, Partial};
+    use super::super::plain;
+    use super::super::reduce::{AgentSession, Command, Input, OpenOutput, step};
+    use super::*;
+
+    /// `len` bytes of `"`, which escapes to twice its bytes.
+    fn quotes(len: usize) -> String {
+        "\"".repeat(len)
+    }
+
+    fn assert_fits(name: &str, event: &Event) {
+        let len = event.encoded_len();
+        assert!(len <= MAX_EVENT, "{name}: {len} bytes");
+    }
+
+    /// Design decision 8's derivation test: each row of decision 1's table
+    /// at its largest, every field at its bound and escaping to twice its
+    /// bytes, within `MAX_EVENT`; the session of I2's sum encodes; and a
+    /// log's stored form is at most twice its measure for each entry
+    /// kind's smallest form.
+    #[test]
+    fn the_frame_and_checkpoint_bounds_follow_from_the_constants() {
+        let id = EntryId(u64::MAX);
+        let text = quotes(TEXT_CHUNK);
+        let field = quotes(FIELD_LIMIT);
+        let locations: Vec<Location> = (0..MAX_LOCATIONS)
+            .map(|_| Location {
+                path: quotes(MAX_PATH),
+                line: Some(u32::MAX),
+            })
+            .collect();
+        let tool = Entry::Tool {
+            call: field.clone(),
+            title: field.clone(),
+            kind: ToolKind::Other,
+            status: ToolStatus::InProgress,
+            content: Vec::new(),
+            more: u32::MAX,
+            locations: locations.clone(),
+            input: Some(quotes(RAW_LIMIT)),
+            result: Some(quotes(RAW_LIMIT)),
+        };
+        let output = ToolItem::Output(Output {
+            command: Some(field.clone()),
+            cwd: Some(quotes(MAX_PATH)),
+            text: quotes(ITEM_LIMIT),
+            omitted: u64::MAX,
+            partial: true,
+            exit: Some(Exit::Signal {
+                name: quotes(SIGNAL_RESERVE),
+            }),
+        });
+        assert!(output.wire_len() <= LARGEST_ITEM);
+        let small: Vec<ToolItem> = (0..MAX_ITEMS)
+            .map(|_| ToolItem::Text {
+                text: quotes(TEXT_CHUNK / MAX_ITEMS),
+                cut: true,
+            })
+            .collect();
+        assert_eq!(brindle_transcript::item_pieces(&small).len(), 1);
+        let options: Vec<PermissionOption> = (0..MAX_PERMISSION_OPTIONS)
+            .map(|_| PermissionOption {
+                id: quotes(MAX_PERMISSION_ID),
+                name: quotes(MAX_PERMISSION_NAME),
+                kind: PermissionKind::RejectAlways,
+            })
+            .collect();
+        let events = [
+            ("agent text", Event::Added { id, entry: Entry::Agent { text: text.clone() } }),
+            ("appended", Event::Appended { id, text: text.clone() }),
+            ("notice", Event::Added { id, entry: Entry::Notice { level: NoticeLevel::Warning, text: field.clone() } }),
+            ("tool", Event::Added { id, entry: tool }),
+            ("tool changed", Event::ToolChanged {
+                id,
+                title: Some(field.clone()),
+                kind: Some(ToolKind::Other),
+                status: Some(ToolStatus::InProgress),
+                locations: Some(locations),
+                input: Some(Some(quotes(RAW_LIMIT))),
+                result: Some(Some(quotes(RAW_LIMIT))),
+                more: Some(u32::MAX),
+            }),
+            ("one output", Event::ToolItems { id, from: u32::MAX, items: vec![output] }),
+            ("small items", Event::ToolItems { id, from: u32::MAX, items: small }),
+            ("tool output", Event::ToolOutput {
+                id,
+                item: u32::MAX,
+                text: quotes(ITEM_LIMIT),
+                exit: Some(Exit::Signal { name: quotes(SIGNAL_RESERVE) }),
+            }),
+            ("permission", Event::Added {
+                id,
+                entry: Entry::Permission {
+                    call: Some(field.clone()),
+                    title: field.clone(),
+                    options,
+                    outcome: Some(PermissionOutcome::Selected { option: quotes(MAX_PERMISSION_ID) }),
+                },
+            }),
+            ("answered", Event::Answered {
+                id,
+                outcome: PermissionOutcome::Selected { option: quotes(MAX_PERMISSION_ID) },
+            }),
+            ("queue", Event::Queue {
+                slot: Slot::Held {
+                    text: quotes(MAX_PROMPT),
+                    reason: HoldReason::Stopped { stop: StopReason::Other { name: field.clone() } },
+                },
+            }),
+            ("turn", Event::Turn { state: TurnState::Failed { message: field.clone() } }),
+            ("refused", Event::Agent {
+                state: AgentState::Failed { message: "\u{1}".repeat(FIELD_LIMIT) },
+            }),
+            ("conversation", Event::Conversation {
+                conversation: Conversation {
+                    id: quotes(MAX_SESSION_ID),
+                    cwd: quotes(96 * 1024),
+                    continuation: Continuation::ResumeAndLoad,
+                    title: Some("\u{10ffff}".repeat(256)),
+                },
+            }),
+            ("trimmed", Event::Trimmed { through: id, dropped: u64::MAX }),
+            ("window", Event::Window { from: id, earlier: u64::MAX }),
+        ];
+        for (name, event) in &events {
+            assert_fits(name, event);
+        }
+        // The largest login state: methods at their encoded bound beside a
+        // full message.
+        let method = |n: usize| LoginMethod {
+            id: format!("m{n}"),
+            name: quotes(1024),
+            description: Some(quotes(4 * 1024)),
+            kind: LoginKind::Agent,
+        };
+        let mut methods = Vec::new();
+        while brindle_remote_protocol::serde_json::to_vec(&methods).map_or(0, |v| v.len())
+            < MAX_LOGIN_METHODS_LEN - 11 * 1024
+        {
+            methods.push(method(methods.len()));
+        }
+        let login = Event::Agent {
+            state: AgentState::LoginRequired {
+                message: field.clone(),
+                methods: methods.clone(),
+            },
+        };
+        assert_fits("login required", &login);
+
+        // I2's session: a log of `LOG_LIMIT` in empty user entries with
+        // 20-digit ids, 64 open outputs with full held lines, full methods
+        // and partial line, and the largest slot, conversation and agent
+        // state.
+        let mut session = AgentSession::new(quotes(96 * 1024), "0.3.0".into());
+        let log = &mut session.transcript;
+        log.apply(&Event::Trimmed {
+            through: EntryId(10_000_000_000_000_000_000),
+            dropped: 1,
+        })
+        .expect("a trim on an empty log");
+        while log.encoded_len() + 100 <= LOG_LIMIT {
+            let id = log.next_id();
+            log.apply(&Event::Added { id, entry: Entry::User { text: String::new() } })
+                .expect("an entry");
+        }
+        for (name, event) in &events[10..14] {
+            log.apply(event).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        for n in 0..MAX_OPEN_OUTPUTS {
+            session.outputs.insert(
+                format!("{n:0>width$}", width = MAX_TERMINAL_ID),
+                OpenOutput {
+                    entry: EntryId(u64::MAX),
+                    item: u32::MAX,
+                    filter: plain::State {
+                        line: quotes(ITEM_LIMIT),
+                        ..plain::State::default()
+                    },
+                },
+            );
+        }
+        session.methods = methods;
+        session.lines = Lines::restore(Partial::Collecting(vec![b'"'; MAX_LINE + 1]), u64::MAX);
+        let bytes = checkpoint::encode(&session).expect("the largest session fits");
+        assert!(bytes.len() as u64 <= LARGEST_CHECKPOINT, "{}", bytes.len());
+
+        // A stored log is at most twice its measure, for each entry kind's
+        // smallest form (decision 1, I2's second fact), at 20-digit ids.
+        let smallest = [
+            Entry::User { text: String::new() },
+            Entry::Agent { text: String::new() },
+            Entry::Thought { text: String::new() },
+            Entry::Notice { level: NoticeLevel::Info, text: String::new() },
+            Entry::tool(String::new(), String::new(), ToolKind::Other, ToolStatus::Pending),
+            Entry::Tool {
+                call: "c".into(),
+                title: String::new(),
+                kind: ToolKind::Other,
+                status: ToolStatus::Pending,
+                content: (0..MAX_ITEMS).map(|_| ToolItem::Text { text: String::new(), cut: false }).collect(),
+                more: 0,
+                locations: Vec::new(),
+                input: None,
+                result: None,
+            },
+            Entry::Permission {
+                call: None,
+                title: String::new(),
+                options: Vec::new(),
+                outcome: Some(PermissionOutcome::Cancelled),
+            },
+        ];
+        for entry in smallest {
+            let mut log = Transcript::new();
+            log.apply(&Event::Trimmed {
+                through: EntryId(10_000_000_000_000_000_000),
+                dropped: 1,
+            })
+            .expect("a trim");
+            for _ in 0..100 {
+                let id = log.next_id();
+                log.apply(&Event::Added { id, entry: entry.clone() }).expect("an entry");
+            }
+            let stored: usize = log.replay().iter().map(Event::encoded_len).sum::<usize>()
+                + log
+                    .entries()
+                    .map(|(_, entry)| match entry {
+                        Entry::Tool { call, .. } => call.len() + 24,
+                        Entry::User { .. }
+                        | Entry::Agent { .. }
+                        | Entry::Thought { .. }
+                        | Entry::Permission { .. }
+                        | Entry::Notice { .. } => 0,
+                    })
+                    .sum::<usize>();
+            assert!(stored <= 2 * log.encoded_len(), "{entry:?}: {stored} stored, {} measured", log.encoded_len());
+        }
+    }
+
+    // --- the adversarial property (design decision 8) -------------------
+
+    /// A seeded XorShift, and whether this move is an extreme one, whose
+    /// every size is its largest.
+    struct XorShift(u64, bool);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+
+        /// A count below `n`: in an extreme move `n - 1`.
+        fn count(&mut self, n: usize) -> usize {
+            if self.1 { n - 1 } else { self.below(n) }
+        }
+
+        /// A size: in an extreme move `large`, else mostly small and
+        /// sometimes up to `large`.
+        fn size(&mut self, large: usize) -> usize {
+            if self.1 {
+                return large;
+            }
+            match self.below(10) {
+                0 => self.below(large),
+                1..=3 => self.below(large.min(64 * 1024)),
+                _ => self.below(1024),
+            }
+        }
+
+        /// Quote-, backslash- and control-heavy text of `len` bytes or a
+        /// little more, built from a repeated piece so it costs little.
+        fn text(&mut self, len: usize) -> String {
+            const CHARS: [&str; 10] = ["\"", "\\", "\u{1}", "\n", "é", "a", "\t", "\r", "\u{7f}", "\u{1b}"];
+            let piece: String = (0..16).map(|_| CHARS[self.below(CHARS.len())]).collect();
+            piece.repeat(len / piece.len() + 1)
+        }
+
+        /// [`Self::text`] of a [`Self::size`] up to `large`.
+        fn sized(&mut self, large: usize) -> String {
+            let len = self.size(large);
+            self.text(len)
+        }
+
+        /// [`Self::text`] of up to `most` bytes.
+        fn upto(&mut self, most: usize) -> String {
+            let len = self.below(most);
+            self.text(len)
+        }
+    }
+
+    fn line(value: Value) -> Vec<u8> {
+        let mut line = value.to_string().into_bytes();
+        line.push(b'\n');
+        line
+    }
+
+    fn update(update: Value) -> Vec<u8> {
+        line(json!({"jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": "s1", "update": update}}))
+    }
+
+    /// One adversarial line from the agent, or a prompt, per decision 8's
+    /// generators.
+    enum Move {
+        Line(Vec<u8>),
+        Prompt(String),
+        Answer(Value),
+    }
+
+    fn terminal(rng: &mut XorShift) -> String {
+        if rng.below(10) == 0 {
+            "t".repeat(64 * 1024)
+        } else {
+            format!("t{}", rng.below(6))
+        }
+    }
+
+    fn content(rng: &mut XorShift) -> Value {
+        let items: Vec<Value> = (0..rng.count(41))
+            .map(|_| match rng.below(5) {
+                0 => json!({"type": "content", "content": {"type": "text", "text": rng.sized(200 * 1024)}}),
+                1 => json!({"type": "diff", "path": rng.sized(64 * 1024), "oldText": null,
+                    "newText": "\n".repeat(rng.count(300_001))}),
+                2 => {
+                    let lines = super::super::diff::MAX_DIFF_LINES / 2 + 1;
+                    json!({"type": "diff", "path": "/p", "oldText": "o\n".repeat(lines), "newText": "n\"\n".repeat(lines)})
+                }
+                _ => json!({"type": "terminal", "terminalId": terminal(rng)}),
+            })
+            .collect();
+        Value::Array(items)
+    }
+
+    fn raw(rng: &mut XorShift) -> Value {
+        let mut value = Value::Array(vec![json!(0); rng.count(20_001)]);
+        for _ in 0..rng.count(101) {
+            value = Value::Array(vec![value]);
+        }
+        if rng.below(2) == 0 {
+            json!(rng.sized(1024 * 1024))
+        } else {
+            value
+        }
+    }
+
+    fn adversarial(rng: &mut XorShift, prompt: Option<u64>, asked: &mut u64) -> Move {
+        rng.1 = rng.below(8) == 0;
+        let call = format!("c{}", rng.below(8));
+        match rng.below(12) {
+            0..=2 => {
+                let kind = ["agent_message_chunk", "agent_thought_chunk", "user_message_chunk"][rng.below(3)];
+                let text = rng.sized(2 * 1024 * 1024);
+                Move::Line(update(json!({"sessionUpdate": kind, "content": {"type": "text", "text": text}})))
+            }
+            3 | 4 => {
+                let kind = ["tool_call", "tool_call_update"][rng.below(2)];
+                let locations: Vec<Value> = (0..rng.count(41))
+                    .map(|_| json!({"path": rng.sized(64 * 1024), "line": rng.below(100)}))
+                    .collect();
+                Move::Line(update(json!({"sessionUpdate": kind, "toolCallId": call,
+                    "title": rng.sized(100 * 1024), "kind": "execute", "status": "in_progress",
+                    "content": content(rng), "locations": locations, "rawInput": raw(rng), "rawOutput": raw(rng)})))
+            }
+            5 | 6 => {
+                let id = terminal(rng);
+                let meta = match rng.below(3) {
+                    0 => json!({"terminal_info": {"terminal_id": id, "cwd": rng.sized(64 * 1024),
+                        "command": rng.sized(100 * 1024)}}),
+                    1 => json!({"terminal_output_delta": {"terminal_id": id, "data": rng.sized(256 * 1024)}}),
+                    _ => json!({"terminal_exit": {"terminal_id": id, "exit_code": null,
+                        "signal": rng.sized(64 * 1024)}}),
+                };
+                Move::Line(update(json!({"sessionUpdate": "tool_call_update", "toolCallId": call, "_meta": meta})))
+            }
+            7 => {
+                *asked += 1;
+                let options: Vec<Value> = (0..rng.count(41))
+                    .map(|n| {
+                        // Mostly ids Brindle can send back, so the kept
+                        // options reach their bound.
+                        let id = match rng.below(8) {
+                            0 => String::new(),
+                            1 => "i".repeat(2048),
+                            2 => format!("o{n}\u{1}"),
+                            3 => format!("{n:0>1024}"),
+                            _ => format!("o{n}"),
+                        };
+                        json!({"optionId": id, "name": rng.sized(64 * 1024), "kind": "allow_once"})
+                    })
+                    .collect();
+                Move::Line(line(json!({"jsonrpc": "2.0", "id": format!("p{asked}"), "method": "session/request_permission",
+                    "params": {"sessionId": "s1", "toolCall": {"toolCallId": call, "title": rng.sized(100 * 1024)},
+                        "options": options}})))
+            }
+            8 | 9 => match prompt {
+                Some(id) => {
+                    let stop = if rng.below(2) == 0 { "end_turn".to_owned() } else { "z".repeat(rng.size(100 * 1024)) };
+                    Move::Answer(json!({"jsonrpc": "2.0", "id": id, "result": {"stopReason": stop}}))
+                }
+                None => Move::Prompt(rng.upto(MAX_PROMPT / 2)),
+            },
+            _ => Move::Prompt(rng.upto(MAX_PROMPT / 2)),
+        }
+    }
+
+    /// The tool entry an event may change.
+    fn touched(event: &Event) -> Option<EntryId> {
+        match event {
+            Event::Added { id, .. }
+            | Event::ToolChanged { id, .. }
+            | Event::ToolItems { id, .. }
+            | Event::ToolOutput { id, .. } => Some(*id),
+            Event::Appended { .. }
+            | Event::Answered { .. }
+            | Event::Queue { .. }
+            | Event::Turn { .. }
+            | Event::Agent { .. }
+            | Event::Conversation { .. }
+            | Event::Trimmed { .. }
+            | Event::Window { .. }
+            | Event::Commands { .. }
+            | Event::Options { .. } => None,
+        }
+    }
+
+    /// Every event of `events` encodes within `MAX_EVENT`.
+    fn all_fit(what: &str, events: &[Event]) {
+        for event in events {
+            let len = event.encoded_len();
+            assert!(len <= MAX_EVENT, "{what}: a {} event of {len} bytes", event.kind());
+        }
+    }
+
+    /// How many steps [`every_event_fits_a_frame_over_adversarial_agent_output`]
+    /// takes. Design decision 8 asks for 2,000, which took 110 s in a
+    /// debug build (the reducer's own handling of the large lines alone
+    /// about 51 s) before one move in eight became an extreme one, past
+    /// the debug suite's 30 s (task 5.2), so it is cut to 300 (about 20 s
+    /// alone): the log still passes `LOG_LIMIT` and is trimmed, which the
+    /// test asserts.
+    const STEPS: usize = 300;
+
+    /// Design decision 8's property: [`STEPS`] seeded steps of
+    /// adversarial agent output, each step's events within `MAX_EVENT`
+    /// and packed, the log within `LOG_LIMIT`, the tool entries the step
+    /// changed within the fold's bounds, every open output an output
+    /// item, no fault; every 40 steps the replay, pages and a fetch within
+    /// `MAX_EVENT` (each a walk of the whole log, about 0.4 s in a debug
+    /// build, too slow for every step), and every 100 a whole checkpoint.
+    /// A waiting permission is answered and a held prompt let go in place
+    /// of a prompt, so turns keep coming. A long session id is `reduce`'s
+    /// own test's (`a_session_id_past_its_bound_fails_the_start`), since
+    /// it ends the session.
+    #[test]
+    fn every_event_fits_a_frame_over_adversarial_agent_output() {
+        let now = Instant::now();
+        let mut s = AgentSession::new("/w".into(), "0.3.0".into());
+        step(&mut s, Input::Spawned, now);
+        step(
+            &mut s,
+            Input::Stdout(&line(json!({"jsonrpc": "2.0", "id": 1,
+                "result": {"protocolVersion": 1, "agentInfo": {"name": "fake", "version": "1.0"}}}))),
+            now,
+        );
+        step(&mut s, Input::Stdout(&line(json!({"jsonrpc": "2.0", "id": 2, "result": {"sessionId": "s1"}}))), now);
+        let mut rng = XorShift(0xeb_0005_2000, false);
+        let mut prompt: Option<u64> = None;
+        let mut asked = 0;
+        // Events by kind, to show the run reached what it is for.
+        let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
+        for at in 0..STEPS {
+            let out = match adversarial(&mut rng, prompt, &mut asked) {
+                Move::Line(bytes) => step(&mut s, Input::Stdout(&bytes), now),
+                Move::Answer(answer) => {
+                    prompt = None;
+                    step(&mut s, Input::Stdout(&line(answer)), now)
+                }
+                // A permission still waiting is answered, and a prompt
+                // held by an unknown stop reason let go, so turns keep
+                // coming.
+                Move::Prompt(text) => {
+                    let waiting = s.transcript().entries().find_map(|(id, entry)| match entry {
+                        Entry::Permission { options, outcome: None, .. } => {
+                            Some((id, options.first().map(|option| option.id.clone())))
+                        }
+                        Entry::User { .. }
+                        | Entry::Agent { .. }
+                        | Entry::Thought { .. }
+                        | Entry::Tool { .. }
+                        | Entry::Permission { .. }
+                        | Entry::Notice { .. } => None,
+                    });
+                    let command = match (waiting, s.transcript().slot()) {
+                        (Some((entry, option)), _) => Command::Answer { entry, option },
+                        (None, Slot::Held { .. }) => Command::Unqueue,
+                        (None, Slot::Empty | Slot::Waiting { .. }) => Command::Prompt { text },
+                    };
+                    step(&mut s, Input::Command(command), now)
+                }
+            };
+            for sent in out.stdin.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+                let sent: Value = brindle_remote_protocol::serde_json::from_slice(sent).expect("a JSON line");
+                if sent["method"] == "session/prompt" {
+                    prompt = sent["id"].as_u64();
+                }
+            }
+            all_fit(&format!("step {at}"), &out.events);
+            for event in &out.events {
+                *kinds.entry(event.kind()).or_default() += 1;
+            }
+            let values: Vec<Value> = out.events.iter().map(Event::to_value).collect();
+            assert!(values.is_empty() || pack_transcript(1, values).is_ok(), "step {at}");
+            let log = s.transcript();
+            assert!(log.encoded_len() <= LOG_LIMIT, "step {at}: {}", log.encoded_len());
+            assert!(!matches!(log.agent(), AgentState::Failed { .. }), "step {at}: {:?}", log.agent());
+            // The entries this step changed; the others were checked when
+            // they last changed.
+            for id in out.events.iter().filter_map(touched) {
+                if let Some(Entry::Tool { content, locations, input, result, .. }) = log.entry(id) {
+                    assert!(content.len() <= MAX_ITEMS, "step {at}: {id}");
+                    assert!(content.iter().map(ToolItem::wire_len).sum::<usize>() <= CALL_LIMIT, "step {at}: {id}");
+                    for item in content {
+                        let mut bounded = item.clone();
+                        bounded.bound();
+                        assert_eq!(&bounded, item, "step {at}: {id}");
+                    }
+                    assert!(locations.len() <= MAX_LOCATIONS);
+                    assert!(locations.iter().all(|location| location.path.len() <= MAX_PATH));
+                    assert!([input, result].into_iter().flatten().all(|raw| raw.len() <= RAW_LIMIT));
+                }
+            }
+            for (terminal, open) in &s.outputs {
+                assert!(terminal.len() <= MAX_TERMINAL_ID);
+                assert!(
+                    matches!(log.entry(open.entry), Some(Entry::Tool { content, .. })
+                        if matches!(content.get(open.item as usize), Some(ToolItem::Output(_)))),
+                    "step {at}: {terminal:.16} names no output"
+                );
+            }
+            if at % 40 == 39 {
+                all_fit("replay", &log.replay());
+                for budget in [1, 16 * 1024, PAGE_BYTES] {
+                    all_fit("page", &log.page(budget));
+                }
+                all_fit("fetch", &log.fetch(log.next_id(), PAGE_BYTES).events);
+            }
+            if at % 100 == 99 {
+                assert!(checkpoint::encode(&s).is_ok(), "step {at}");
+            }
+        }
+        for kind in ["trimmed", "tool_items", "tool_output", "answered", "turn", "queue"] {
+            assert!(kinds.get(kind).is_some_and(|n| *n > 0), "no {kind} event in {kinds:?}");
+        }
+    }
+}
