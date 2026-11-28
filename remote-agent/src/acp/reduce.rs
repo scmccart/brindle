@@ -2175,7 +2175,7 @@ impl Step<'_> {
                     output
                 }
             };
-            let item_len = item.text_len();
+            let item_len = item.wire_len();
             if kept.len() >= MAX_ITEMS || len.saturating_add(item_len) > CALL_LIMIT {
                 more = more.saturating_add(1);
                 if let Some((_, at)) = terminals.last()
@@ -2208,7 +2208,7 @@ impl Step<'_> {
         let mut pieces = vec![Vec::new()];
         let mut piece_len = 0usize;
         for item in kept.into_iter().skip(from) {
-            let item_len = item.text_len();
+            let item_len = item.wire_len();
             if piece_len > 0 && piece_len.saturating_add(item_len) > TEXT_CHUNK {
                 pieces.push(Vec::new());
                 piece_len = 0;
@@ -6691,7 +6691,7 @@ mod tests {
                     ..
                 } = &entry
                 {
-                    let len: usize = content.iter().map(ToolItem::text_len).sum();
+                    let len: usize = content.iter().map(ToolItem::wire_len).sum();
                     assert!(content.len() <= MAX_ITEMS && len <= CALL_LIMIT, "{name}");
                     assert_eq!(*more, 0, "{name}");
                     assert!(locations.len() <= MAX_LOCATIONS, "{name}");

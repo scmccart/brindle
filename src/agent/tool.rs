@@ -284,23 +284,26 @@ pub fn detail(entry: &Entry) -> Vec<DetailPart> {
 pub fn diff_rows(change: &FileChange) -> Vec<DiffRow> {
     let mut rows = Vec::new();
     for (index, hunk) in change.hunks.iter().enumerate() {
-        let (mut old, mut new) = (hunk.old_start, hunk.new_start);
+        // Counted with `checked_add`: a side past `u32::MAX` goes
+        // unnumbered (`agents-event-bounds` decision 7), whatever the hunk.
+        let (mut old, mut new) = (Some(hunk.old_start), Some(hunk.new_start));
+        let next = |at: Option<u32>| at.and_then(|at| at.checked_add(1));
         for (at, line) in hunk.lines.iter().enumerate() {
             let (sign, old_line, new_line) = match line {
                 DiffLine::Context(_) => {
-                    let numbers = (Sign::Context, Some(old), Some(new));
-                    old += 1;
-                    new += 1;
+                    let numbers = (Sign::Context, old, new);
+                    old = next(old);
+                    new = next(new);
                     numbers
                 }
                 DiffLine::Removed(_) => {
-                    let numbers = (Sign::Removed, Some(old), None);
-                    old += 1;
+                    let numbers = (Sign::Removed, old, None);
+                    old = next(old);
                     numbers
                 }
                 DiffLine::Added(_) => {
-                    let numbers = (Sign::Added, None, Some(new));
-                    new += 1;
+                    let numbers = (Sign::Added, None, new);
+                    new = next(new);
                     numbers
                 }
             };
@@ -668,5 +671,16 @@ mod tests {
         assert!(copy_text(&ToolItem::Diff(added)).starts_with("--- /dev/null\n+++ /p/main.rs\n"));
         assert_eq!(copy_text(&output("ok\n", None)), "ok\n");
         assert_eq!(copy_text(&ToolItem::Text { text: "**hi**".into(), cut: false }), "**hi**");
+    }
+
+    /// The rows of a hunk starting at `u32::MAX` with two context lines
+    /// are drawn without a panic, the second line unnumbered (D-8, OpenSpec
+    /// change `agents-event-bounds`).
+    #[test]
+    fn a_hunk_at_the_last_line_number_draws_without_a_panic() {
+        let rows = diff_rows(&change(FileOp::Modify, vec![hunk(u32::MAX, u32::MAX, &[" a", " b"])]));
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].old, rows[0].new), (Some(u32::MAX), Some(u32::MAX)));
+        assert_eq!((rows[1].old, rows[1].new), (None, None));
     }
 }
