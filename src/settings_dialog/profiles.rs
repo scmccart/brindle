@@ -261,6 +261,9 @@ struct Values {
     /// The target's `connect_at_launch`, kept as it was: a profile saved
     /// from the editor keeps it, whichever kind of endpoint it is on now.
     connect_at_launch: bool,
+    /// The target's `attachments_dir`, kept as it was: the editor doesn't
+    /// show it, and a profile saved from it keeps it.
+    attachments_dir: Option<String>,
     default: bool,
 }
 
@@ -304,9 +307,10 @@ impl Values {
         let at = |field: Field| TEXT_FIELDS.iter().position(|f| *f == field).expect("text field");
         let mut engine = ENGINES[0].to_string();
         let connect_at_launch = p.remote.as_ref().is_some_and(RemoteTarget::connects_at_launch);
+        let attachments_dir = p.remote.as_ref().and_then(RemoteTarget::attachments_dir).map(str::to_owned);
         let kind = match &p.remote {
             None => RemoteKind::Local,
-            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _ }) => {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _, attachments_dir: _ }) => {
                 texts[at(Field::SshHost)] = host.clone();
                 texts[at(Field::SshUser)] = user.clone().unwrap_or_default();
                 texts[at(Field::SshPort)] = port.map(|p| p.to_string()).unwrap_or_default();
@@ -314,14 +318,14 @@ impl Values {
                 texts[at(Field::SshArgs)] = shown(Field::SshArgs, join_words(ssh_args), ssh_args.join(" "));
                 RemoteKind::Ssh
             }
-            Some(RemoteTarget::Container { engine: e, container, user, connect_at_launch: _ }) => {
+            Some(RemoteTarget::Container { engine: e, container, user, connect_at_launch: _, attachments_dir: _ }) => {
                 engine = e.clone();
                 texts[at(Field::Container)] = container.clone();
                 texts[at(Field::ContainerUser)] = user.clone().unwrap_or_default();
                 RemoteKind::Container
             }
         };
-        (Self { texts, theme: p.theme.clone(), remote: kind, engine, connect_at_launch, default }, unquotable)
+        (Self { texts, theme: p.theme.clone(), remote: kind, engine, connect_at_launch, attachments_dir, default }, unquotable)
     }
 
     fn text(&self, field: Field) -> &str {
@@ -612,6 +616,7 @@ impl ProfileEditor {
                     identity_file: optional(Field::SshIdentity),
                     ssh_args: words(Field::SshArgs, &mut errors),
                     connect_at_launch: self.values.connect_at_launch,
+                    attachments_dir: self.values.attachments_dir.clone(),
                 })
             }
             RemoteKind::Container => {
@@ -624,6 +629,7 @@ impl ProfileEditor {
                     container: container.to_string(),
                     user: optional(Field::ContainerUser),
                     connect_at_launch: self.values.connect_at_launch,
+                    attachments_dir: self.values.attachments_dir.clone(),
                 })
             }
         };
@@ -1897,7 +1903,7 @@ theme = "gone"
         editor.set_text(Field::SshArgs, "-J 'my bastion'");
         f.save(&mut state).unwrap();
         match &f.config().profiles[2].remote {
-            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch }) => {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch, attachments_dir: None }) => {
                 assert_eq!((host.as_str(), user.as_deref(), *port), ("A8", Some("ubuntu"), Some(2222)));
                 assert!(!connect_at_launch);
                 assert_eq!(identity_file, &None);
@@ -2045,7 +2051,8 @@ theme = "gone"
                 engine: "podman".into(),
                 container: "my-box".into(),
                 user: None,
-                connect_at_launch: false
+                connect_at_launch: false,
+                attachments_dir: None,
             })
         );
         let editor = edit(&mut state, "Work");

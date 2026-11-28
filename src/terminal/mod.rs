@@ -2207,7 +2207,7 @@ mod tests {
 
         use std::path::{Path, PathBuf};
 
-        let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false };
+        let a8 = RemoteTarget::Ssh { host: "A8".into(), user: None, port: None, identity_file: None, ssh_args: Vec::new(), connect_at_launch: false, attachments_dir: None };
         let profile = Profile {
             name: "htop".into(),
             command: Some("htop".into()),
@@ -2423,7 +2423,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         assert_eq!(reported(&remote, osc7).as_deref(), Some("/C:/src"));
         assert_eq!(reported(&remote, osc9), None);

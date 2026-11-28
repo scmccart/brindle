@@ -3847,7 +3847,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         }
     }
 
@@ -4188,7 +4188,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let before = Profile {
             name: "logs".into(),

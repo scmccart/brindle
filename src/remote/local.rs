@@ -986,7 +986,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let registry = Registry::default();
         let (dial, _plan) = fake::dialer("A8");
@@ -1119,7 +1119,7 @@ mod tests {
             port: Some(port),
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let profile = |name: &str, remote: RemoteTarget| Profile { name: name.into(), remote: Some(remote), ..Default::default() };
         let registry = Registry::default();
@@ -1168,7 +1168,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let idle = Duration::from_secs(1);
         let registry = Registry::default();
@@ -1270,7 +1270,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let registry = Registry::default();
         assert!(registry.existing(&host).is_none());
@@ -1301,7 +1301,7 @@ mod tests {
                 port: None,
                 identity_file: None,
                 ssh_args: Vec::new(),
-                connect_at_launch: false,
+                connect_at_launch: false, attachments_dir: None,
             })
         };
         let (a8, b9, c7) = (ssh("A8"), ssh("B9"), ssh("C7"));
@@ -1322,7 +1322,7 @@ mod tests {
                 port: None,
                 identity_file: None,
                 ssh_args: Vec::new(),
-                connect_at_launch: false,
+                connect_at_launch: false, attachments_dir: None,
             })
         };
         assert_eq!(host_token("t", &Host::Local), "t");

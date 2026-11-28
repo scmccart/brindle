@@ -73,7 +73,8 @@ impl Host {
         match self {
             Self::Local => Identity::Local,
             // Whether a profile connects at launch says nothing of where.
-            Self::Remote(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _ }) => {
+            // Nor where its agents keep attached text.
+            Self::Remote(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _, attachments_dir: _ }) => {
                 Identity::Ssh {
                     host,
                     user: user.as_deref(),
@@ -82,7 +83,7 @@ impl Host {
                     ssh_args,
                 }
             }
-            Self::Remote(RemoteTarget::Container { engine, container, user, connect_at_launch: _ }) => {
+            Self::Remote(RemoteTarget::Container { engine, container, user, connect_at_launch: _, attachments_dir: _ }) => {
                 Identity::Container { engine, container, user: user.as_deref() }
             }
         }
@@ -132,7 +133,7 @@ mod tests {
             port,
             identity_file: Some("~/.ssh/a8".into()),
             ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         }
     }
 
@@ -167,7 +168,7 @@ mod tests {
                 port: Some(22),
                 identity_file: Some("~/.ssh/a8".into()),
                 ssh_args: Vec::new(),
-                connect_at_launch: false,
+                connect_at_launch: false, attachments_dir: None,
             }),
             Host::Remote(RemoteTarget::Ssh {
                 host: "A8".into(),
@@ -175,7 +176,7 @@ mod tests {
                 port: Some(22),
                 identity_file: None,
                 ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
-                connect_at_launch: false,
+                connect_at_launch: false, attachments_dir: None,
             }),
         ];
         let mut hosts: HashSet<Host> = HashSet::from([base.clone()]);
@@ -192,7 +193,7 @@ mod tests {
                 engine: engine.into(),
                 container: container.into(),
                 user: user.map(Into::into),
-                connect_at_launch: false,
+                connect_at_launch: false, attachments_dir: None,
             })
         };
         let base = container("docker", "devbox", None);
@@ -207,7 +208,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         assert_ne!(base, ssh);
     }
@@ -218,15 +219,15 @@ mod tests {
     #[test]
     fn connecting_at_launch_is_no_part_of_the_endpoint() {
         let eager = |target: RemoteTarget| match target {
-            RemoteTarget::Ssh { connect_at_launch: _, host, user, port, identity_file, ssh_args } => {
-                RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: true }
+            RemoteTarget::Ssh { connect_at_launch: _, host, user, port, identity_file, ssh_args, attachments_dir } => {
+                RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: true, attachments_dir }
             }
-            RemoteTarget::Container { connect_at_launch: _, engine, container, user } => {
-                RemoteTarget::Container { engine, container, user, connect_at_launch: true }
+            RemoteTarget::Container { connect_at_launch: _, engine, container, user, attachments_dir } => {
+                RemoteTarget::Container { engine, container, user, connect_at_launch: true, attachments_dir }
             }
         };
         let container =
-            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false };
+            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false, attachments_dir: None };
         for target in [ssh(Some("dev"), Some(22)), container] {
             let on = profile("eager", Some(eager(target.clone())));
             let off = profile("lazy", Some(target.clone()));
@@ -247,7 +248,7 @@ mod tests {
     #[test]
     fn a_remote_host_reports_posix_paths() {
         let container =
-            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false };
+            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false, attachments_dir: None };
         for host in [Host::Remote(ssh(Some("dev"), Some(22))), Host::Remote(container)] {
             for local in [PathStyle::Posix, PathStyle::Windows] {
                 assert_eq!(host.path_style(local), PathStyle::Posix, "{host:?} from {local:?}");
@@ -260,7 +261,7 @@ mod tests {
         assert_eq!(Host::Remote(ssh(Some("dev"), Some(2222))).name(), "dev@A8:2222");
         assert_eq!(Host::Remote(ssh(None, None)).name(), "A8");
         let container =
-            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false };
+            RemoteTarget::Container { engine: "docker".into(), container: "devbox".into(), user: None, connect_at_launch: false, attachments_dir: None };
         assert_eq!(Host::Remote(container).name(), "devbox");
     }
 }

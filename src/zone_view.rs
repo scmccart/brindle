@@ -2125,13 +2125,13 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let devbox = Host::Remote(RemoteTarget::Container {
             engine: "docker".into(),
             container: "devbox".into(),
             user: None,
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let lines = |id: ZoneId| {
             Some(match id.0 {
@@ -2597,7 +2597,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let shell = Profile { name: "Shell".into(), ..Profile::default_shell() };
         let fake = Profile { name: "Fake".into(), ..Profile::default_shell() };

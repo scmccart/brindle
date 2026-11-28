@@ -1545,6 +1545,7 @@ mod tests {
             profile: "Claude".into(),
             conversation: None,
             start: None,
+            keeping: Default::default(),
         }
     }
 
@@ -2138,6 +2139,7 @@ mod tests {
             profile: "Fake".into(),
             conversation: None,
             start: None,
+            keeping: Default::default(),
         };
         let (sink, mut feed) = AgentSink::with_fault(Some(b"BRINDLE-FAULT-REAL".to_vec()));
         let session = Session::start_agent_with(move || Ok(starting), request, Box::new(sink));
