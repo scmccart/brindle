@@ -1,4 +1,5 @@
 use super::blocks::{ToolDraw, blocks_of};
+use super::change::ChangeCopy;
 use super::*;
 use crate::agent::markdown;
 use crate::agent::shared::AgentShared;
@@ -42,21 +43,43 @@ impl Zone {
     }
 
     /// One drained update: each slice folded as one `TRANSCRIPT` frame and
-    /// absorbed, in order.
+    /// absorbed, in order, then drawn once; the draw's splices end the last
+    /// one's.
     pub(super) fn feed_batch(&mut self, frames: &[&[Event]]) -> Vec<Absorbed> {
-        frames
+        let mut absorbed: Vec<Absorbed> = frames
             .iter()
             .map(|events| {
                 let values: Vec<_> = events.iter().map(Event::to_value).collect();
                 self.shared.apply(&values).unwrap();
-                self.absorb()
+                self.absorb_undrawn()
             })
-            .collect()
+            .collect();
+        let drawn = self.model.draw(Due::All);
+        if let Some(last) = absorbed.last_mut() {
+            last.splices.extend(drawn);
+        }
+        absorbed
     }
 
+    /// One update, as the entity runs it (OpenSpec change
+    /// `agents-absorb-cost`): the copy taken under the lock, absorbed after
+    /// it, then drawn; the absorb's splices, then the draw's.
     pub(super) fn absorb(&mut self) -> Absorbed {
+        let mut absorbed = self.absorb_undrawn();
+        absorbed.splices.extend(self.model.draw(Due::All));
+        absorbed
+    }
+
+    /// The copy and the absorb, with no draw.
+    pub(super) fn absorb_undrawn(&mut self) -> Absorbed {
+        let taken = self.copy();
+        self.model.absorb(taken)
+    }
+
+    /// The copy the first half takes of what changed.
+    pub(super) fn copy(&mut self) -> ChangeCopy {
         let changes = self.shared.take_changes();
-        self.model.absorb(self.shared.transcript(), changes)
+        self.model.copy_changes(self.shared.transcript(), changes)
     }
 
     pub(super) fn replay(&mut self, events: &[Event]) -> Absorbed {
@@ -370,7 +393,7 @@ pub(super) fn in_progress(call: &str, content: Vec<ToolItem>) -> Entry {
 /// splices kept the list right.
 pub(super) fn assert_drawn_afresh(model: &ChatModel) {
     let fresh: Vec<Block> =
-        model.entries.iter().flat_map(|(id, entry)| model.draw(*id, entry, model.thought_open(*id))).collect();
+        model.entries.iter().flat_map(|(id, entry)| model.draw_entry(*id, entry, model.thought_open(*id))).collect();
     assert_eq!(model.blocks(), fresh.as_slice());
 }
 

@@ -60,7 +60,7 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Leaving, Link, ListDone,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Due, Fetch, First, KeyOutcome, LaunchChoice, Leaving, Link, ListDone,
     ListFor, Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice,
     Submit, Unqueue,
 };
@@ -749,6 +749,8 @@ impl Agent {
                             this.apply(event, cx);
                         }
                     });
+                    // What the update's changes marked, drawn once.
+                    this.draw(cx);
                     cx.notify();
                 });
                 if alive.is_err() {
@@ -764,13 +766,18 @@ impl Agent {
         let absorbed = match event {
             AgentEvent::Changed => {
                 // The fold is the reader thread's: the zone copies what
-                // changed and lets go.
-                let mut shared = self.shared.lock();
-                let changes = shared.take_changes();
-                if changes.is_empty() {
-                    return;
-                }
-                self.model.absorb(shared.transcript(), changes)
+                // changed under the lock, and lets go before it applies the
+                // copy and renders (OpenSpec change `agents-absorb-cost`,
+                // decision 2).
+                let taken = {
+                    let mut shared = self.shared.lock();
+                    let changes = shared.take_changes();
+                    if changes.is_empty() {
+                        return;
+                    }
+                    self.model.copy_changes(shared.transcript(), changes)
+                };
+                self.model.absorb(taken)
             }
             AgentEvent::Replay(true) => return,
             AgentEvent::Replay(false) => match self.model.replay_ended() {
@@ -804,6 +811,17 @@ impl Agent {
             }
         };
         self.apply_absorbed(absorbed, cx);
+    }
+
+    /// Draws what the update's changes marked (OpenSpec change
+    /// `agents-absorb-cost`, decision 4): each growing message rendered
+    /// once, whatever number of frames appended to it, and the splices
+    /// emitted after the update's statuses.
+    fn draw(&mut self, cx: &mut Context<Self>) {
+        let splices = self.model.draw(Due::All);
+        if !splices.is_empty() {
+            cx.emit(AgentUpdate::Splices(splices));
+        }
     }
 
     /// Hands what the model decided on: the view's splices, the status and
