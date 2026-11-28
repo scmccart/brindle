@@ -2110,4 +2110,40 @@ mod tests {
         });
         assert!(!failed.s.has_ended());
     }
+
+    /// A respawn keeps nothing of the old process: its line in progress,
+    /// its chunk run, its bad-line run, and its tool calls and outputs.
+    #[test]
+    fn a_respawn_leaves_no_state_of_the_old_process() {
+        let mut agent = Agent::ready();
+        agent.step(Input::Stdout(b"{\"jsonrpc\": \"2.0\", \"method\": \"half"));
+        agent.s.run = Some(Run {
+            kind: RunKind::Agent,
+            entry: EntryId(1),
+        });
+        agent.s.bad = Some(BadRun {
+            lines: 3,
+            last: agent.now,
+        });
+        agent.s.book.tools.insert("c1".into(), EntryId(1));
+        let open = OpenOutput {
+            entry: EntryId(1),
+            item: 0,
+            filter: crate::acp::plain::State::default(),
+        };
+        agent.s.book.outputs.insert("t1".into(), open);
+        assert_ne!(agent.s.lines, Lines::new(), "a line in progress");
+        let mut step = Step {
+            s: &mut agent.s,
+            out: Output::default(),
+            fault: None,
+            now: agent.now,
+            event_limit: MAX_EVENT,
+        };
+        step.respawn(Start::New);
+        assert_eq!(agent.s.lines, Lines::new());
+        assert_eq!(agent.s.run, None);
+        assert_eq!(agent.s.bad, None);
+        assert_eq!(agent.s.book, ToolBook::default());
+    }
 }
