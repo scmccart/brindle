@@ -30,7 +30,10 @@ def strip_dirs(line):
         message = json.loads(line)
     except ValueError:
         return line
-    params = message.get("params") if isinstance(message, dict) else None
+    # A line that is JSON but no object (a batch, a number) passes as it is.
+    if not isinstance(message, dict):
+        return line
+    params = message.get("params")
     if message.get("method") in STRIPPED_METHODS and isinstance(params, dict):
         if params.pop("additionalDirectories", None) is not None:
             return json.dumps(message, separators=(",", ":"))

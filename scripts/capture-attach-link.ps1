@@ -82,8 +82,8 @@ function Invoke-Capture([string]$Name, [string]$Kind) {
         New-Item -ItemType Directory -Path (Join-Path $dir $sub) -Force | Out-Null
     }
     $log = Join-Path $dir 'raw.log'
-    $args = @($wrapper, '--log', $log, '--') + $spec.command
-    $argsToml = ($args | ForEach-Object { ConvertTo-Toml $_ }) -join ', '
+    $wrapped = @($wrapper, '--log', $log, '--') + $spec.command
+    $argsToml = ($wrapped | ForEach-Object { ConvertTo-Toml $_ }) -join ', '
     $env_ = if ($Kind -eq 'no-dirs') { 'env = { STRIP_DIRS = "1" }' } else { '' }
     $config = @"
 default_profile = "PowerShell"
