@@ -253,3 +253,16 @@ None is open.
 ## Migration Plan
 
 Nothing to migrate. Sessions, logs and queued prompts from before the change have no attachments and decode unchanged; the attachments directory is made when first needed.
+
+## As built (2026-11-28)
+
+Numbered flags for review; each is a decision taken while building, not a change of the specified behaviour.
+
+1. **Base.** Built on 7e29de6c, the head of `perf/agents-absorb-cost` (unpushed), which sits on `perf/agents-checkpoint-deltas` (PR #158, unmerged), on main 2bdbeec6. The branch lands after both.
+2. **Task 1.1 is owed.** No real agent was run. Decision 6 is applied by its conservative reading until the captures say otherwise: the session's attachment directory is named in `additionalDirectories` at `session/new`, `session/load` and `session/resume` for every agent that advertises `sessionCapabilities.additionalDirectories` (`reduce/lifecycle.rs`, `directories`), and to none that doesn't. Of the captured `initialize` answers, every agent takes embedded context, and all but Copilot (and one Claude ACP build) advertise additional directories.
+3. **Names that moved.** `acp/reduce.rs` is `acp/reduce/` (the attachment decisions in `reduce/attach.rs`), `acp/checkpoint.rs` is `acp/checkpoint/` (the fields in `state.rs`), the transcript crate's lib is `event.rs`, `fold.rs`, `page.rs` and `output.rs`, the client's `model.rs` is `src/agent/model/`, and `store::plan` is `server/core/attachments.rs`'s `plan`. The new events stay within `MAX_EVENT` with rows in `acp/limits.rs` (`PROMPT_ADDED_EVENT`, `ATTACHMENTS_LEN` in `QUEUE_EVENT`), and the store and prompt support are small and bounded, so every checkpoint record holds them whole (`agents-checkpoint-deltas` decision 4).
+4. **`ATTACHMENT` carries `session`**, as every other answer about a session does, so the client routes it to the zone without remembering the request.
+5. **`SPAWN_AGENT`'s two fields** landed with the protocol commit (task 1.4), and are filled by task 1.6c.
+6. **Cleaned before counted.** Brindle cleans an attachment's text and name (`brindle_transcript::clean`) before checking its size and sending it, and the server cleans again. Cleaned text escapes to at most twice its bytes in JSON, so `ATTACHMENT_TEXT` plus `ATTACH_ENVELOPE` fits one frame (pinned by `the_largest_attachment_fits_one_frame`).
+7. **An embedded text's name isn't sent.** ACP v1's `resource` (an `EmbeddedResource` of `TextResourceContents`) has no name field, so the agent gets the kept file's URI and the text; the name is in Brindle's log only. A link keeps its name.
+8. **A link's path past `MAX_PATH` is refused** (`Refused::PathTooLong`), not cut: a cut path names another file. A name is cut at a character boundary to `MAX_ATTACHMENT_NAME`.
