@@ -14,8 +14,8 @@ use crate::config::{Profile, ProfileKey};
 use crate::picker::PaletteRow;
 use crate::remote::Host;
 use crate::remote::protocol::client::{AgentConversations, ListedConversation};
-use crate::workspace::TabId;
-use crate::zone_view::{ZoneId, split_target};
+use crate::workspace::tabs::TabId;
+use crate::zone_tree::{ZoneId, split_target};
 
 /// One conversation an agent listed: its id, and its title and last
 /// activity when the agent gave them (`updated` as the agent's text).

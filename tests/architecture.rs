@@ -1222,7 +1222,7 @@ fn f() {
 ///
 /// A directory module joins file by file, so a file added to it can't skip
 /// the check; its test-only `harness.rs` is test code and stays out.
-const PURE_MODULES: [&str; 80] = [
+const PURE_MODULES: [&str; 81] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1247,6 +1247,7 @@ const PURE_MODULES: [&str; 80] = [
     "src/agent/conversations.rs",
     "src/agent/commands.rs",
     "src/layout.rs",
+    "src/zone_tree.rs",
     "src/reattach.rs",
     "src/workspace/tabs.rs",
     "src/workspace/launch.rs",

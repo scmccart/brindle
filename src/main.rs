@@ -36,6 +36,7 @@ mod theme;
 #[cfg(windows)]
 mod win;
 mod workspace;
+mod zone_tree;
 mod zone_view;
 
 use std::path::{Path, PathBuf};

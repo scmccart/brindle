@@ -19,7 +19,7 @@ pub mod mark;
 mod notices;
 mod overlays;
 mod previews;
-mod tabs;
+pub mod tabs;
 
 pub use tabs::{TabId, TabTarget};
 
