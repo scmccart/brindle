@@ -84,7 +84,7 @@ pub fn adopt(
         if truncated {
             output = reduce::step(&mut session, Input::OutputLost, now);
         }
-        merge(&mut output, reduce::step(&mut session, Input::Spawned, now));
+        output = output.then(reduce::step(&mut session, Input::Spawned, now));
         return Adopted {
             session,
             output,
@@ -104,7 +104,7 @@ pub fn adopt(
             // Stored with a continue's spawn, before its `SPAWNED`: the
             // agent was sent nothing, so it starts now, continuing.
             if let Phase::Spawning { .. } = session.phase {
-                merge(&mut output, reduce::step(&mut session, Input::Spawned, now));
+                output = output.then(reduce::step(&mut session, Input::Spawned, now));
             }
             Adopted {
                 session,
@@ -124,24 +124,6 @@ pub fn adopt(
             }
         }
     }
-}
-
-/// `later`'s output after `earlier`'s, as one.
-fn merge(earlier: &mut Output, later: Output) {
-    earlier.events.extend(later.events);
-    earlier.stdin.extend(later.stdin);
-    if later.reply.is_some() {
-        earlier.reply = later.reply;
-    }
-    earlier.checkpoint = match (earlier.checkpoint, later.checkpoint) {
-        (Some(reduce::Moment::BeforeRequest), _) | (_, Some(reduce::Moment::BeforeRequest)) => {
-            Some(reduce::Moment::BeforeRequest)
-        }
-        (first, None) => first,
-        (_, Some(moment)) => Some(moment),
-    };
-    earlier.hang_up |= later.hang_up;
-    earlier.wake = later.wake;
 }
 
 #[cfg(test)]

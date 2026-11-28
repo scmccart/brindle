@@ -515,6 +515,22 @@ pub enum Moment {
     Answered,
 }
 
+impl Moment {
+    /// The moment of two outputs taken as one, `later` after `earlier`:
+    /// [`Moment::BeforeRequest`] from either side, since a request's bytes
+    /// must not reach the agent before its checkpoint; else the later one,
+    /// else the earlier one.
+    pub fn wins(earlier: Option<Moment>, later: Option<Moment>) -> Option<Moment> {
+        match (earlier, later) {
+            (Some(Moment::BeforeRequest), _) | (_, Some(Moment::BeforeRequest)) => {
+                Some(Moment::BeforeRequest)
+            }
+            (earlier, None) => earlier,
+            (_, Some(later)) => Some(later),
+        }
+    }
+}
+
 /// What the core does after a step, in this order: send `events` to the
 /// attached client, checkpoint when `checkpoint` says so, then write
 /// `stdin` to the agent, then hang it up when `hang_up` says so.
@@ -534,6 +550,35 @@ pub struct Output {
     /// The answer to a client's list (`agents-session-list`), when the
     /// agent answered it or it can no longer be.
     pub listed: Option<ListAnswer>,
+}
+
+impl Output {
+    /// This output and then `later`'s, as one: the events and stdin
+    /// appended, the later reply, wake and list answer (the earlier reply
+    /// and list answer when the later has none), the checkpoint by
+    /// [`Moment::wins`], and a hang-up from either.
+    pub fn then(self, later: Output) -> Output {
+        let Output {
+            events,
+            stdin,
+            reply,
+            checkpoint,
+            hang_up,
+            wake,
+            listed,
+        } = later;
+        let mut both = self;
+        both.events.extend(events);
+        both.stdin.extend(stdin);
+        Output {
+            reply: reply.or(both.reply),
+            checkpoint: Moment::wins(both.checkpoint, checkpoint),
+            hang_up: both.hang_up || hang_up,
+            wake,
+            listed: listed.or(both.listed),
+            ..both
+        }
+    }
 }
 
 /// Steps `session` with one input.
@@ -631,19 +676,7 @@ impl Step<'_> {
     }
 
     fn mark(&mut self, moment: Moment) {
-        self.out.checkpoint = match self.out.checkpoint {
-            Some(Moment::BeforeRequest) => Some(Moment::BeforeRequest),
-            Some(
-                Moment::Started
-                | Moment::TurnEnded
-                | Moment::QueueChanged
-                | Moment::Permission
-                | Moment::Stopped
-                | Moment::Login
-                | Moment::Answered,
-            )
-            | None => Some(moment),
-        };
+        self.out.checkpoint = Moment::wins(self.out.checkpoint, Some(moment));
     }
 
     /// Adds an entry that isn't text, ending the chunk run.
@@ -2952,5 +2985,62 @@ mod tests {
         assert_eq!(texts.len(), 2);
         assert!(agent.entries()[1..].iter().all(|entry| matches!(entry, Entry::User { .. })));
         assert_eq!(texts.concat(), message);
+    }
+
+    // --- outputs taken as one (design decision 11) ------------------------
+
+    #[test]
+    fn before_request_wins_from_either_side() {
+        let before = Some(Moment::BeforeRequest);
+        let other = Some(Moment::TurnEnded);
+        assert_eq!(Moment::wins(before, other), before);
+        assert_eq!(Moment::wins(other, before), before);
+        assert_eq!(Moment::wins(before, None), before);
+        assert_eq!(Moment::wins(None, before), before);
+        // Else the later one, else the earlier one.
+        assert_eq!(Moment::wins(Some(Moment::Started), other), other);
+        assert_eq!(Moment::wins(other, None), other);
+        assert_eq!(Moment::wins(None, None), None);
+    }
+
+    #[test]
+    fn then_keeps_the_later_reply_and_wake() {
+        let now = Instant::now();
+        let earlier = Output {
+            events: vec![Event::Turn {
+                state: TurnState::Working,
+            }],
+            stdin: b"one\n".to_vec(),
+            reply: Some(Err(Refused::NotReady)),
+            checkpoint: Some(Moment::BeforeRequest),
+            hang_up: true,
+            wake: Some(now),
+            listed: Some(ListAnswer {
+                req: 4,
+                result: Err("gone".into()),
+            }),
+        };
+        let later = Output {
+            events: vec![Event::Turn {
+                state: TurnState::Idle,
+            }],
+            stdin: b"two\n".to_vec(),
+            reply: Some(Ok(())),
+            checkpoint: Some(Moment::Stopped),
+            hang_up: false,
+            wake: None,
+            listed: None,
+        };
+        let both = earlier.clone().then(later);
+        assert_eq!(both.events.len(), 2);
+        assert_eq!(both.stdin, b"one\ntwo\n");
+        assert_eq!(both.reply, Some(Ok(())));
+        assert_eq!(both.checkpoint, Some(Moment::BeforeRequest));
+        assert!(both.hang_up);
+        assert_eq!(both.wake, None, "the later wake, even none");
+        assert_eq!(both.listed, earlier.listed, "the earlier answer, the later having none");
+        // A later without a reply keeps the earlier's.
+        let kept = earlier.clone().then(Output::default());
+        assert_eq!(kept.reply, earlier.reply);
     }
 }
