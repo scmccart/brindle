@@ -2,7 +2,7 @@ use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::{Event, HoldReason, PermissionOutcome, Slot, StopReason, TurnState, clean};
 
 use crate::acp::envelope::RpcError;
-use crate::acp::forms::{AUTH_REQUIRED, Request};
+use crate::acp::forms::{Failure, Request};
 use crate::acp::limits::MAX_PROMPT;
 
 use super::lifecycle::{Ending, Phase};
@@ -21,7 +21,9 @@ impl Step<'_> {
                     "the agent's answer to the prompt isn't one Brindle can read".to_owned(),
                 )),
             },
-            Err(error) if error.code == AUTH_REQUIRED => self.prompt_needs_login(error),
+            Err(error) if self.s.rpc.dialect().failure(error) == Failure::AuthRequired => {
+                self.prompt_needs_login(error)
+            }
             Err(error) => self.end_turn(Ending::Failed(bound(clean(&error.message)))),
         }
     }

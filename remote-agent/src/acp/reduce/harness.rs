@@ -1,9 +1,12 @@
 use brindle_remote_protocol::serde_json::{self, json};
 use brindle_transcript::{Activity, Continuation, LoginKind, StopReason, ToolItem};
 
-use super::super::forms::AUTH_REQUIRED;
 use super::list::Page;
 use super::*;
+
+/// ACP v1's login demand, which the tests' agents answer with; the reducer
+/// reads it only through `Dialect::failure`.
+pub(super) const AUTH_REQUIRED: i64 = -32000;
 
 /// An agent session under test, with a client's copy of its log folded
 /// from every event `step` returned (checked equal to the session's

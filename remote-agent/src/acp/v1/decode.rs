@@ -52,7 +52,7 @@ use crate::acp::forms::{
     MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
     NewSession, NotificationKind, Offered, OfferedOption, OptionKey, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
     RequestedOption, SessionUpdate, ToolCall, ToolChange, ToolDetail, ToolItemForm,
-    UNSUPPORTED_VERSION, Update,
+    Failure, Update,
 };
 use brindle_transcript::Continuation;
 
@@ -234,13 +234,26 @@ fn cut_to(text: &str, limit: usize) -> String {
     text[..cut].to_owned()
 }
 
-/// The versions an `initialize` error `-32022` says the agent supports:
-/// `None` when the error isn't `-32022`, or its `data.supported` is missing,
-/// empty or not a list of versions.
-pub fn supported_versions(error: &RpcError) -> Option<Vec<u16>> {
-    if error.code != UNSUPPORTED_VERSION {
-        return None;
+/// ACP's error codes the core reads: authentication required (decision
+/// 17), and an `initialize` refused for its version (decision 4).
+const AUTH_REQUIRED: i64 = -32000;
+const UNSUPPORTED_VERSION: i64 = -32022;
+
+/// What an error answer means: `-32000` is a login demand, `-32022` a
+/// version refused, anything else another failure.
+pub fn failure(error: &RpcError) -> Failure {
+    match error.code {
+        AUTH_REQUIRED => Failure::AuthRequired,
+        UNSUPPORTED_VERSION => Failure::VersionRefused {
+            supported: supported_versions(error),
+        },
+        _ => Failure::Other,
     }
+}
+
+/// The versions a `-32022` says the agent supports: `None` when its
+/// `data.supported` is missing, empty or not a list of versions.
+fn supported_versions(error: &RpcError) -> Option<Vec<u16>> {
     let supported = error.data.as_ref()?.get("supported")?.as_array()?;
     let versions = supported
         .iter()
@@ -1042,7 +1055,6 @@ mod tests {
 
     use super::*;
     use crate::acp::envelope::{Malformed, Message, decode};
-    use crate::acp::forms::AUTH_REQUIRED;
 
     fn ok(line: &str) -> Message {
         decode(line.as_bytes()).unwrap_or_else(|e| panic!("{line}: {e:?}"))
@@ -1092,20 +1104,35 @@ mod tests {
         assert!(prompt_result(&json!({})).is_err());
     }
 
-    #[test]
-    fn supported_versions_need_a_32022_with_a_list() {
-        let error = |code, data: Option<Value>| RpcError {
+    fn rpc_error(code: i64, data: Option<Value>) -> RpcError {
+        RpcError {
             code,
             message: String::new(),
             data,
-        };
+        }
+    }
+
+    #[test]
+    fn minus_32000_is_a_login_demand() {
+        assert_eq!(failure(&rpc_error(-32000, None)), Failure::AuthRequired);
+        // A list of versions doesn't make it a version refused.
+        let data = Some(json!({"supported": [2]}));
+        assert_eq!(failure(&rpc_error(-32000, data)), Failure::AuthRequired);
+    }
+
+    #[test]
+    fn minus_32022_with_versions_names_them() {
+        let data = Some(json!({"requested": 1, "supported": [2, 3]}));
         assert_eq!(
-            supported_versions(&error(
-                -32022,
-                Some(json!({"requested": 1, "supported": [2, 3]}))
-            )),
-            Some(vec![2, 3])
+            failure(&rpc_error(-32022, data)),
+            Failure::VersionRefused {
+                supported: Some(vec![2, 3])
+            }
         );
+    }
+
+    #[test]
+    fn minus_32022_without_a_list_names_none() {
         for data in [
             None,
             Some(json!({})),
@@ -1115,15 +1142,19 @@ mod tests {
             Some(json!("2")),
         ] {
             assert_eq!(
-                supported_versions(&error(-32022, data.clone())),
-                None,
+                failure(&rpc_error(-32022, data.clone())),
+                Failure::VersionRefused { supported: None },
                 "{data:?}"
             );
         }
-        assert_eq!(
-            supported_versions(&error(-32000, Some(json!({"supported": [2]})))),
-            None
-        );
+    }
+
+    #[test]
+    fn any_other_code_is_another_failure() {
+        for code in [-32002, -32603, -32601, -32001, 1, 0] {
+            let data = Some(json!({"supported": [2]}));
+            assert_eq!(failure(&rpc_error(code, data)), Failure::Other, "{code}");
+        }
     }
 
     #[test]
@@ -2521,17 +2552,18 @@ mod tests {
         let messages = jsonl(include_bytes!(
             "../../../tests/fixtures/acp/initialize-32022.jsonl"
         ));
-        let versions: Vec<Option<Vec<u16>>> = messages
+        let failures: Vec<Failure> = messages
             .iter()
             .map(|message| match message {
                 Message::Error { id, error } => {
                     assert_eq!(id, &Some(Id::number(1)));
-                    supported_versions(error)
+                    failure(error)
                 }
                 other => panic!("not an error: {other:?}"),
             })
             .collect();
-        assert_eq!(versions, [Some(vec![2]), None]);
+        let refused = |supported| Failure::VersionRefused { supported };
+        assert_eq!(failures, [refused(Some(vec![2])), refused(None)]);
     }
 
     #[test]

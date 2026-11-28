@@ -785,10 +785,6 @@ mod tests {
         "74617465223a7b226167656e74223a227374617274696e67227d7d5d7d00000000",
     );
 
-    fn error(id: u64, code: i64, message: &str) -> Vec<u8> {
-        line(json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}))
-    }
-
     /// The log's pending permission requests are the ones `Rpc` awaits
     /// (`agents-process-lifecycle` decision 3), and a process the session
     /// is done with has nothing out: no permission and no list.
@@ -921,7 +917,7 @@ mod tests {
                     11 => agent.step(Input::Command(Command::Unqueue)),
                     // A login demand for the prompt out.
                     12 => match prompt_id.take() {
-                        Some(id) => agent.feed(&error(id, crate::acp::forms::AUTH_REQUIRED, "log in")),
+                        Some(id) => agent.feed(&auth_error(id, "log in")),
                         None => agent.step(Input::Tick),
                     },
                     // A restart: after a login demand or an exit, the agent

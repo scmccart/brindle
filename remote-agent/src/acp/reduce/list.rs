@@ -4,7 +4,7 @@ use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::clean;
 
 use crate::acp::envelope::RpcError;
-use crate::acp::forms::{AUTH_REQUIRED, Listing};
+use crate::acp::forms::{Failure, Listing};
 
 use super::lifecycle::{Phase, Start};
 use super::login::AfterLogin;
@@ -105,7 +105,7 @@ impl Step<'_> {
             // A choosing agent waits for the login, then chooses again
             // (decision 1); a ready one keeps its conversation, and its
             // next prompt finds the login needed as any prompt would.
-            Err(error) if error.code == AUTH_REQUIRED => {
+            Err(error) if self.s.rpc.dialect().failure(error) == Failure::AuthRequired => {
                 if let Phase::Choosing { greeting } = &self.s.phase {
                     let greeting = greeting.clone();
                     self.login_required(error, greeting, AfterLogin::Start(Start::Choose));

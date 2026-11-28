@@ -213,7 +213,6 @@ mod tests {
     use brindle_remote_protocol::serde_json::json;
     use brindle_transcript::{Activity, Continuation};
 
-    use crate::acp::forms::AUTH_REQUIRED;
 
     use super::super::harness::*;
     use super::super::lifecycle::RESTARTED_AFTER_LOGIN;

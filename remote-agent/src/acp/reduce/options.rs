@@ -457,7 +457,6 @@ mod tests {
     use brindle_remote_protocol::serde_json::{self, json};
     use brindle_transcript::Continuation;
 
-    use crate::acp::forms::AUTH_REQUIRED;
 
     use super::super::harness::*;
     use super::super::*;

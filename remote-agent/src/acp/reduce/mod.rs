@@ -1383,7 +1383,6 @@ mod tests {
     };
 
     use super::super::envelope::Id;
-    use super::super::forms::AUTH_REQUIRED;
     use super::super::limits::{FIELD_LIMIT, MAX_PERMISSION_NAME, MAX_PERMISSION_OPTIONS};
     use super::harness::*;
     use super::options::typeable;

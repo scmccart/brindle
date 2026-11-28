@@ -10,7 +10,7 @@ use brindle_remote_protocol::serde_json::Value;
 
 use super::envelope::{BadParams, Id, RpcError};
 use super::forms::{
-    Continued, Initialized, Listing, Methods, NewSession, NotificationKind, Offered, OfferedOption, OptionKey,
+    Continued, Failure, Initialized, Listing, Methods, NewSession, NotificationKind, Offered, OfferedOption, OptionKey,
     PermissionRequest, Request, RequestKind, SessionUpdate,
 };
 use super::v1;
@@ -82,9 +82,10 @@ impl Dialect {
         }
     }
 
-    pub fn supported_versions(self, error: &RpcError) -> Option<Vec<u16>> {
+    /// What the agent's error answer means, by this version's codes.
+    pub fn failure(self, error: &RpcError) -> Failure {
         match self {
-            Self::V1 => v1::decode::supported_versions(error),
+            Self::V1 => v1::decode::failure(error),
         }
     }
 

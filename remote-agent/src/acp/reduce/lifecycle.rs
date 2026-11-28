@@ -6,7 +6,7 @@ use brindle_transcript::{
 
 use crate::acp::dialect::{self, Dialect, Unsupported};
 use crate::acp::envelope::RpcError;
-use crate::acp::forms::{AUTH_REQUIRED, Continued, Offered, UNSUPPORTED_VERSION};
+use crate::acp::forms::{Continued, Failure, Offered};
 use crate::acp::limits::MAX_SESSION_ID;
 
 use super::list::MAX_LISTED_ID;
@@ -454,8 +454,10 @@ impl Step<'_> {
                 Some(Ok(dialect)) => self.speaking(dialect, start, result),
             },
             Err(error) => {
-                let message = match Dialect::newest().supported_versions(error) {
-                    Some(versions) => format!(
+                let message = match Dialect::newest().failure(error) {
+                    Failure::VersionRefused {
+                        supported: Some(versions),
+                    } => format!(
                         "the agent supports ACP version{} {}; Brindle speaks {newest}",
                         if versions.len() == 1 { "" } else { "s" },
                         versions
@@ -464,10 +466,12 @@ impl Step<'_> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     ),
-                    None if error.code == UNSUPPORTED_VERSION => {
+                    Failure::VersionRefused { supported: None } => {
                         format!("the agent supports no ACP version Brindle speaks ({newest})")
                     }
-                    None => format!("the agent couldn't start: {}", clean(&error.message)),
+                    Failure::AuthRequired | Failure::Other => {
+                        format!("the agent couldn't start: {}", clean(&error.message))
+                    }
                 };
                 self.refuse(message);
             }
@@ -624,7 +628,7 @@ impl Step<'_> {
                     "the agent's answer to session/new isn't one Brindle can read".to_owned(),
                 ),
             },
-            Err(error) if error.code == AUTH_REQUIRED => {
+            Err(error) if self.s.rpc.dialect().failure(error) == Failure::AuthRequired => {
                 self.login_required(error, greeting, AfterLogin::Start(Start::New));
             }
             Err(error) => self.refuse(format!(
@@ -682,7 +686,7 @@ impl Step<'_> {
             Ok(result) => self.s.rpc.dialect().continued_result(how, result).ok(),
             // After a login the same continue is sent again (the session's
             // directory is the conversation's).
-            Err(error) if error.code == AUTH_REQUIRED => {
+            Err(error) if self.s.rpc.dialect().failure(error) == Failure::AuthRequired => {
                 let start = Start::Continue {
                     conversation: Conversation {
                         id: conversation,
