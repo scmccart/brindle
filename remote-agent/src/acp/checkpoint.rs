@@ -55,9 +55,12 @@
 //! options themselves are log events. A set of an option out isn't kept.
 //!
 //! **Bounds.** A checkpoint is at most [`MAX_CHECKPOINT_LEN`] (64 MiB, what a
-//! holder keeps): the log's 16 MiB, an 8 MiB partial line, a 256 KiB prompt
-//! and the bookkeeping fit with room to spare (decision 14), and
-//! [`encode`] refuses one past it rather than send what the holder drops.
+//! holder keeps). That a whole one fits is `acp::limits`' invariant I2:
+//! the log's stored form is at most twice its 16 MiB measure, beside an
+//! 8 MiB partial line, the login methods, 64 open outputs and the rest of
+//! the state, `LARGEST_CHECKPOINT` in all, with about 12.7 MiB to spare
+//! (`agents-event-bounds` decision 1). [`encode`] still refuses one past
+//! it rather than send what the holder drops.
 //!
 //! **Reading one never panics** (`railway R5`). A checkpoint that isn't one,
 //! that a newer core wrote in a format this one doesn't know, or whose state
@@ -2184,6 +2187,47 @@ mod tests {
             bytes.len()
         );
         assert_eq!(decode(&bytes, agent.now).expect("it reads"), agent.s);
+    }
+
+    /// A format 2 checkpoint written before a replay grouped a tool entry's
+    /// items, one item a `tool_items` event, still decodes to the same
+    /// session (`agents-event-bounds` task 2.3).
+    #[test]
+    fn a_format_2_checkpoint_written_with_one_item_an_event_still_decodes() {
+        let mut agent = Agent::ready();
+        agent.prompt("go");
+        agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "Read", "kind": "read", "status": "completed",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "one"}},
+                {"type": "content", "content": {"type": "text", "text": "two"}},
+                {"type": "content", "content": {"type": "text", "text": "three"}},
+            ]})));
+        let bytes = encode(&agent.s).expect("it fits");
+        let (mut state, partial) = state_of(&bytes);
+        let log = state["log"].as_array().expect("a log").clone();
+        let mut split = Vec::new();
+        let mut grouped = 0;
+        for event in log {
+            match event["event"].as_str() {
+                Some("tool_items") if event["items"].as_array().is_some_and(|items| items.len() > 1) => {
+                    grouped += 1;
+                    let from = event["from"].as_u64().expect("from");
+                    for (at, item) in event["items"].as_array().expect("items").iter().enumerate() {
+                        let mut one = event.clone();
+                        one["from"] = json!(from + at as u64);
+                        one["items"] = json!([item]);
+                        split.push(one);
+                    }
+                }
+                Some(_) | None => split.push(event),
+            }
+        }
+        assert_eq!(grouped, 1, "the replay groups the three items");
+        state["log"] = Value::Array(split);
+        let mut old = bytes[..PREFIX_LEN].to_vec();
+        push_record(&mut old, BASE, 0, &state, &partial, MAX_CHECKPOINT_LEN).expect("it fits");
+        assert_eq!(decode(&old, agent.now).expect("it reads"), agent.s);
     }
 
     // --- checkpoints that don't read ------------------------------------

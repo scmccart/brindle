@@ -2,7 +2,7 @@
 
 ## Context
 
-Every site below was opened at `5f335dc`. Line numbers are from that commit; the first task re-opens them on `main` after `agents-commands` (PR #151) merges.
+Every site below was first opened at `5f335dc`, then re-opened (task 1.1) at `486f6e6`, this change's base: `main` with `agents-commands` (#151) and `agents-client-state-fixes` (#153) merged, under `agents-zone-focus-and-scroll` (#154). The line numbers are `486f6e6`'s.
 
 ### The bounds today, and where they live
 
@@ -10,41 +10,43 @@ Every site below was opened at `5f335dc`. Line numbers are from that commit; the
 | --- | --- | --- | --- |
 | `TEXT_CHUNK` | 64 KiB | `transcript/src/lib.rs:54` | the text of one `Added` or `Appended` (`chunks`) |
 | `ITEM_LIMIT` | 64 KiB (`= TEXT_CHUNK`) | `lib.rs:186` | a `Text`'s text, a diff's lines' *text* (`Keep::push`, `diff.rs:117-129`), an `Output`'s kept suffix (`Output::append`, `lib.rs:353`) |
-| `MAX_ITEMS` | 32 | `lib.rs:190` | items in a tool call (reducer only, `reduce.rs:1906`) |
-| `CALL_LIMIT` | 256 KiB | `lib.rs:194` | the items' `text_len` together, at listing time (`reduce.rs:1906`) |
-| `RAW_LIMIT` | 16 KiB | `lib.rs:197` | raw input and result (`raw_text`, `reduce.rs:3160`), after a whole pretty-print and a whole `clean` |
-| `MAX_LOCATIONS` | 32 | `lib.rs:200` | locations (reducer only, `reduce.rs:1674`); each path only `bound` (64 KiB) |
-| `PAGE_BYTES` | 256 KiB | `lib.rs:973` | a page's or fetch's entries, by `Kept.size` |
-| `LOG_LIMIT` / `LOG_TRIM_TO` | 16 / 12 MiB | `reduce.rs:93`, `:99` | the log, by `Kept.size` (each entry's own encoding) |
-| `MAX_PROMPT` | 256 KiB | `reduce.rs:102` | a prompt, after `clean` |
-| `MAX_SESSION_TITLE` | 256 chars | `reduce.rs:111` | a conversation's title |
-| `MAX_LISTED`, `MAX_LISTED_ID`, `MAX_LISTED_TIME`, `MAX_CURSOR` | 256, 1 KiB, 64 B, 1 KiB | `reduce.rs:198-205` | a list's page |
-| `bound` | 64 KiB (`TEXT_CHUNK`) | `reduce.rs:3127` | every other string: titles, call ids, paths, commands, notices, messages, option names, signal names |
-| `MAX_OPEN_OUTPUTS` | 64 | `reduce.rs:79` | outputs still appended to |
-| `MAX_LOGIN_METHODS`, `MAX_LOGIN_ID`, `MAX_LOGIN_DESCRIPTION`, `MAX_LOGIN_ARGS`, `MAX_LOGIN_ARG`, `MAX_LOGIN_METHODS_LEN` | 16, 1 KiB, 4 KiB, 32, 4 KiB, 256 KiB encoded | `acp/forms.rs:91-105` | login methods, at decode (`v1/decode.rs:108-134`) |
-| `MAX_PENDING_PERMISSIONS` | 16 | `acp/rpc.rs:20` | waiting permissions |
+| `MAX_ITEMS` | 32 | `lib.rs:190` | items in a tool call (reducer only, `reduce.rs:2179`) |
+| `CALL_LIMIT` | 256 KiB | `lib.rs:194` | the items' `text_len` together, at listing time (`reduce.rs:2179`) |
+| `RAW_LIMIT` | 16 KiB | `lib.rs:197` | raw input and result (`raw_text`, `reduce.rs:3646`), after a whole pretty-print and a whole `clean` |
+| `MAX_LOCATIONS` | 32 | `lib.rs:200` | locations (reducer only, `reduce.rs:1947`); each path only `bound` (64 KiB) |
+| `MAX_COMMANDS`, `MAX_OPTIONS`, `MAX_CHOICES` | 256, 32, 256 | `lib.rs:697-703` | the agent's slash commands and session options (`agents-commands`; reducer only, `bounded_commands` and `bounded_options`, `reduce.rs:826-921`, which also keep each list's encoding within `TEXT_CHUNK`) |
+| `MAX_OPTION_ID`, `MAX_OPTION_NAME`, `MAX_OPTION_DESCRIPTION` | 1 KiB, 256 B, 1 KiB | `reduce.rs:778-786` | a session option's id and choice values (left out past it), names and descriptions (cut) |
+| `PAGE_BYTES` | 256 KiB | `lib.rs:1054` | a page's or fetch's entries, by `Kept.size` |
+| `LOG_LIMIT` / `LOG_TRIM_TO` | 16 / 12 MiB | `reduce.rs:95`, `:101` | the log, by `Kept.size` (each entry's own encoding) |
+| `MAX_PROMPT` | 256 KiB | `reduce.rs:104` | a prompt, after `clean` |
+| `MAX_SESSION_TITLE` | 256 chars | `reduce.rs:113` | a conversation's title |
+| `MAX_LISTED`, `MAX_LISTED_ID`, `MAX_LISTED_TIME`, `MAX_CURSOR` | 256, 1 KiB, 64 B, 1 KiB | `reduce.rs:200-207` | a list's page |
+| `bound` | 64 KiB (`TEXT_CHUNK`) | `reduce.rs:3613` | every other string: titles, call ids, paths, commands, notices, messages, option names, signal names |
+| `MAX_OPEN_OUTPUTS` | 64 | `reduce.rs:81` | outputs still appended to |
+| `MAX_LOGIN_METHODS`, `MAX_LOGIN_ID`, `MAX_LOGIN_DESCRIPTION`, `MAX_LOGIN_ARGS`, `MAX_LOGIN_ARG`, `MAX_LOGIN_METHODS_LEN` | 16, 1 KiB, 4 KiB, 32, 4 KiB, 256 KiB encoded | `acp/forms.rs:94-108` | login methods, at decode (`v1/decode.rs:116-148`) |
+| `MAX_PENDING_PERMISSIONS` | 16 | `acp/rpc.rs:21` | waiting permissions |
 | `MAX_ID_LEN` | 1 KiB | `acp/envelope.rs:17` | JSON-RPC ids |
 | `MAX_LINE` | 8 MiB | `acp/lines.rs:13` | one line of agent stdout; the partial line is at most `MAX_LINE + 1` |
 | `MAX_DIFF_LINES` | 200,000 | `acp/diff.rs:17` | lines compared |
-| `plain::MAX_STRING` | 64 KiB | `acp/plain.rs:18` | an escape string skipped; the held line is at most `ITEM_LIMIT` (`plain.rs:188`) |
+| `plain::MAX_STRING` | 64 KiB | `acp/plain.rs:18` | an escape string skipped; the held line is at most `ITEM_LIMIT` (`plain.rs:187`) |
 | `MAX_FRAME_PAYLOAD_SIZE` | 1 MiB | `remote-protocol/src/lib.rs:56` | one frame |
-| `TRANSCRIPT` / `AGENT_PAGE` envelope | 34 / 83 bytes | `client.rs:733`, `:752` (private) | the bytes around a frame's events |
+| `TRANSCRIPT` / `AGENT_PAGE` envelope | 34 / 83 bytes | `client.rs:762`, `:781` (private) | the bytes around a frame's events |
 | `MAX_CHECKPOINT_LEN` | 64 MiB | `remote-protocol/src/holder.rs:162` | what a holder stores |
 | `TAIL_LIMIT` | 1 MiB | `holder.rs:160` | the stdout a holder keeps past its checkpoint |
 | `MAX_STDERR_TAIL` | 16 KiB | `holder.rs:151` | the stderr ring |
 
-Two invariants are stated only in comments: "any one event fits a frame" (`send_transcript`'s doc, `agents.rs:840`; `replay_entry`'s, `lib.rs:1678`; `ITEM_LIMIT`'s, `lib.rs:184`) and "the log and a partial line fit a checkpoint" (`checkpoint.rs:53-56`; `Agent.unstorable`'s "the bounds make this unreachable", `agents.rs:137`). Both are false today (A-1, A-2).
+Two invariants are stated only in comments: "any one event fits a frame" (`send_transcript`'s doc, `agents.rs:857-859`; `replay_entry`'s, `lib.rs:1794`; `ITEM_LIMIT`'s, `lib.rs:182-185`) and "the log and a partial line fit a checkpoint" (`checkpoint.rs:57-60`; `Agent.unstorable`'s "the bounds make this unreachable", `agents.rs:141`). Both are false today (A-1, A-2).
 
 ### Findings, traced
 
-- **A-1, traced.** `chunk` (`reduce.rs:1466-1487`) appends every piece to the run's entry with no size check; `trim_to` (`lib.rs:1575-1597`) never drops the newest entry. Confirmed as reported.
-- **A-2 / B-1, traced.** Each site holds: `Keep::push` counts `line.text().len()`; the fallback (`diff.rs:34-42`) allocates every line before `push` sees it; `FileChange::text_len` undercounts the same way; locations are 32 × `bound` paths; `requested_option` (`v1/decode.rs:618-632`) keeps any number of options with any id; the piece split (`reduce.rs:1937-1947`) ignores an output's command and directory; terminal ids are map keys at any length (`reduce.rs:1693`, `:1820-1834`, `:1882-1903`). Two more fields turned up while tracing every event's fields:
-  - the ACP session id `new_session_result` returns (`v1/decode.rs:244-250`) is unbounded; `ready` puts it in a `Conversation` event, the `Phase`, and every later request;
-  - `prompt_result`'s `StopReason::Other { name }` (`v1/decode.rs:312`) is unbounded and reaches `Turn` and a held slot (`HoldReason::Stopped`).
-  And one more fault in the same class: `CALL_LIMIT` is checked when items are listed (`reduce.rs:1905`), when a new output's text is empty; outputs then grow to `ITEM_LIMIT` each through `ToolOutput`, and `open_output` (`reduce.rs:1795`) adds outputs checking only `MAX_ITEMS`. A tool call can hold 32 full outputs, 2 MiB of text, against the spec's "256 KiB of items".
-- **B-2, traced.** `raw` (`v1/decode.rs:506-512`) pretty-prints whole; `raw_text` (`reduce.rs:3160`) cleans whole before `cut_at`. Confirmed.
-- **B-7, traced** (taken from the report without a second reading; read now). `apply`'s `ToolChanged` and `ToolItems` arms (`lib.rs:1076-1139`) copy what they are given; only `Output::append` bounds. `.claude/rules/transcript.md` and `docs/code-map.md` say the fold bounds. Confirmed; task 1.2 shows it with a failing test first.
-- **D-8, traced** (taken without a second reading; read now). `diff_rows` (`src/agent/tool.rs:284-305`) does `old += 1` / `new += 1` on the hunk's `u32` starts, and `Hunk` (`lib.rs:270-275`) derives `Deserialize` with no check. Confirmed; task 1.3 shows it first.
+- **A-1, traced.** `chunk` (`reduce.rs:1739-1760`) appends every piece to the run's entry with no size check; `trim_to` (`lib.rs:1689-1710`) never drops the newest entry. Confirmed as reported.
+- **A-2 / B-1, traced.** Each site holds: `Keep::push` counts `line.text().len()`; the fallback (`diff.rs:34-43`) allocates every line before `push` sees it; `FileChange::text_len` undercounts the same way; locations are 32 × `bound` paths; `requested_option` (`v1/decode.rs:630-644`) keeps any number of options with any id; the piece split (`reduce.rs:2207-2220`) ignores an output's command and directory; terminal ids are map keys at any length (`reduce.rs:1923-1940`, `:1957-1980`, `:2155-2176`). Two more fields turned up while tracing every event's fields:
+  - the ACP session id `new_session_result` returns (`v1/decode.rs:252-259`) is unbounded; `ready` (`reduce.rs:2759`) puts it in a `Conversation` event, the `Phase`, and every later request;
+  - `prompt_result`'s `StopReason::Other { name }` (`v1/decode.rs:321`) is unbounded and reaches `Turn` and a held slot (`HoldReason::Stopped`).
+  And one more fault in the same class: `CALL_LIMIT` is checked when items are listed (`reduce.rs:2179`), when a new output's text is empty; outputs then grow to `ITEM_LIMIT` each through `ToolOutput`, and `open_output` (`reduce.rs:2068`) adds outputs checking only `MAX_ITEMS`. A tool call can hold 32 full outputs, 2 MiB of text, against the spec's "256 KiB of items".
+- **B-2, traced.** `raw` (`v1/decode.rs:518-524`) pretty-prints whole; `raw_text` (`reduce.rs:3646`) cleans whole before `cut_at`. Confirmed.
+- **B-7, traced** (taken from the report without a second reading; read now). `apply`'s `ToolChanged` and `ToolItems` arms (`lib.rs:1163-1226`) copy what they are given; only `Output::append` bounds. `.claude/rules/transcript.md` and `docs/code-map.md` say the fold bounds. Confirmed; task 1.2 shows it with a failing test first.
+- **D-8, traced** (taken without a second reading; read now). `diff_rows` (`src/agent/tool.rs:284-317`) does `old += 1` / `new += 1` on the hunk's `u32` starts, and `Hunk` (`lib.rs:270-275`) derives `Deserialize` with no check. Confirmed; task 1.3 shows it first.
 
 ## Goals / Non-Goals
 
@@ -108,8 +110,9 @@ A new whole pure module, `remote-agent/src/acp/limits.rs`, is where the bounds m
 | `Agent` | `LoginRequired`: message 2T + methods `MAX_LOGIN_METHODS_LEN` (measured encoded at decode, and cleaning never lengthens an encoding); `Failed` from `refuse`: 6T | 393,344 |
 | `Conversation` | id 2 × `MAX_SESSION_ID`, directory (the agent was started in it: at most the platform's path limit, 96 KiB as UTF-8 on Windows) 2 × 98,304, title 2 × 4 × 256 | 201,344 + F |
 | `Trimmed`, `Window` | two integers | F |
+| `Commands`, `Options` (`agents-commands`, added at task 1.1) | the whole list, which `bounded_commands` and `bounded_options` keep within `TEXT_CHUNK` *encoded* (each item measured with `serde_json::to_vec`, `LIST_EVENT_ROOM` = 64 kept for the event's own fields) | T + F = 65,664 |
 
-The largest is `Queue`, 655,488, which leaves 392,064 bytes under `MAX_EVENT`. Replayed events are the same rows: a text entry replays in `chunks` pieces; a notice and a permission replay as their live `Added` (a permission's outcome as `Answered`); a tool call as its header `Added` and its items grouped as the live split groups them (decision 2); the slot, conversation, turn and agent as their latest event. `agents-commands`, `agents-plans` and `agents-prompt-images` each add a row when they land (proposal, Impact).
+The largest is `Queue`, 655,488, which leaves 392,064 bytes under `MAX_EVENT`. Replayed events are the same rows: a text entry replays in `chunks` pieces; a notice and a permission replay as their live `Added` (a permission's outcome as `Answered`); a tool call as its header `Added` and its items grouped as the live split groups them (decision 2); the slot, conversation, turn, agent, commands and options as their latest event. `agents-plans` and `agents-prompt-images` each add a row when they land (proposal, Impact); `agents-commands`' row is above. The table names every `Event` variant at `486f6e6`: `Added` (its five entry kinds), `Appended`, `ToolChanged`, `ToolItems`, `ToolOutput`, `Answered`, `Queue`, `Turn`, `Agent`, `Conversation`, `Trimmed`, `Window`, `Commands`, `Options`.
 
 **The derivation of I2.** Three facts:
 - **The log after a step is within `LOG_LIMIT`.** `trim` runs at every step's end (`Step::finish`) once the log passes `LOG_LIMIT`, and `trim_to(LOG_TRIM_TO)` drops oldest entries while the log is over `LOG_TRIM_TO`, keeping the newest. It reaches `LOG_TRIM_TO` if the newest entry alone is within it. After decision 2, an entry is at most: a text entry 2 × `ENTRY_LIMIT` + `ENTRY_FRAMING` + 64 = 2,097,280; a tool entry its header (591,328) plus its content (2 × `CALL_LIMIT` + 32 × 192 = 530,432); a permission 426,880; a notice 131,200. The largest, 2,097,280, is under `LOG_TRIM_TO` (12 MiB), so every trim makes progress and ends within `LOG_TRIM_TO`.
@@ -185,6 +188,17 @@ The bound is Brindle's policy, not a fact of ACP v1, so it belongs where every d
 With `agents-process-lifecycle`'s fault rule, the faulted step writes nothing it asked for to the agent, and the agent's waiting permissions are answered `cancelled`.
 
 **Cost.** One counting serialization an event, O(its size), on the core's loop thread. Every event is already serialized once for the client (`to_value`) and once into `unsaved`. The perf cases `agent-markdown-stream` (2,048 32-byte chunks, then one) and `agent-tool-output` (256 4 KiB deltas, then one) report their `[stream]` times before and after (`testing R10`); the change is accepted if they stay within the runs' noise. If they don't, the measure is skipped for `Appended` and `ToolOutput`, whose text is at most one `TEXT_CHUNK` piece by construction.
+
+**As run (task 8.1, 2026-11-27, release builds under `scripts/with-xvfb`, private servers):** before, at `486f6e6` with only the tests of section 1 added (`target-eb/tmp/perf/20261127T235917Z`); after, at `b7ce15b`, tasks 2 to 4.5 in (`20261128T002956Z`, run with `BRINDLE_PERF_BASELINE` set to the first).
+
+| `[stream]` | streamed (ms) | one chunk (ms) | difference (ms) | chunks |
+| --- | --- | --- | --- | --- |
+| `agent-markdown-stream` before | 2265.60 | 2260.01 | 5.59 | 2048 |
+| `agent-markdown-stream` after | 2259.29 (−6.30) | 2258.37 (−1.64) | 0.92 | 2048 |
+| `agent-tool-output` before | 2252.12 | 2254.38 | −2.25 | 256 |
+| `agent-tool-output` after | 2252.91 (+0.79) | 2256.78 (+2.40) | −3.87 | 256 |
+
+Each time includes one step interval (1 s) and the gate, so the runs' noise is several milliseconds; both changes are within it, one of them faster. The guard measures every event, and the fallback isn't needed.
 
 ### 5. Raw values are formatted only up to their bound (B-2)
 
@@ -309,3 +323,37 @@ In `acp/limits.rs`'s test module:
 
 1. **Should the client join consecutive entries of one reply split at `ENTRY_LIMIT` into one bubble?** Recommendation: no, per C1. A split is rare, and joining would need the model to tell a split from two messages, which the log doesn't record.
 2. **Should the emit guard measure every event, or skip `Appended` and `ToolOutput`, which are bounded by construction?** Recommendation: measure every event unless the perf cases show a cost past their noise (decision 4). A guard that skips kinds would miss a future mistake in them.
+
+## As built
+
+Both open questions were decided as recommended: entries split at `ENTRY_LIMIT` stay two bubbles (flag 7 says where the cut falls), and the guard measures every event (decision 4's numbers below).
+
+Flags, numbered for review:
+
+1. **The permission bounds are `MAX_PERMISSION_OPTIONS`, `MAX_PERMISSION_ID` and `MAX_PERMISSION_NAME`** (16, 1 KiB, 4 KiB) in `acp/limits.rs`, not decision 3's `MAX_OPTIONS`, `MAX_OPTION_ID` and `MAX_OPTION_NAME`: `agents-commands` already uses those names for session options (`brindle_transcript::MAX_OPTIONS`, `reduce.rs`'s `MAX_OPTION_ID`, `MAX_OPTION_NAME`, `MAX_OPTION_DESCRIPTION`).
+2. **`cleaned_len` is in `brindle-transcript`, beside `clean`,** not in `reduce.rs`: `diff.rs` measures with it and the fold's clamp counts what it counts, so it sits where `clean` is. Its test is the transcript's `cleaned_text_escapes_to_at_most_twice_its_bytes_and_cleaned_len_is_cleans`.
+3. **The fold raises `more` by the number it drops** (decision 6 says "at least"). On the reducer's events the clamp drops nothing, so `more` is the reducer's. A producer past the bounds that replaces a call's content again and again would count its dropped items each time; only a pre-release core can be one.
+4. **An empty hunk counts `HUNK_FRAMING` in the fold's clamp and is kept** while it fits. The reducer never makes one (`Keep::done` removes them), and the fold keeps what it is sent within the bounds.
+5. **`FileOp::Other { name }` counts in `wire_len` and is cut at `MAX_PATH`**, as a move's or copy's source is.
+6. **An output's clamp is `Output::append("")`,** the suffix rule itself, so it is the identity on any output the fold made. `ToolOutput`'s exit is clamped in the fold too (its signal name at `SIGNAL_RESERVE`), as the reducer cuts it.
+7. **A chunk that fits whole is appended whole.** An entry can therefore reach exactly `ENTRY_LIMIT` mid-line (32 chunks of 32 KiB fill 1 MiB), and the next text starts a new entry at its start. The cut at the last line break applies to the chunk that crosses the limit. `a_long_reply_continues_in_new_entries_cut_at_line_breaks` runs both: 32 KiB chunks, and 30,000-byte ones that cross.
+8. **A run whose entry holds no text appends anyway,** so the fold refuses it and the handling fails, as before (`a_fold_error_from_the_reducers_own_events_fails_the_handling` builds that bug). `text_run` reads the run's length as 0 there.
+9. **The guard's message takes "an" before a vowel:** `an added (tool) event for entry 2 is L bytes; …`, `an appended event …`, `a tool_items event …`. Decision 4 and task 4.5 wrote `a {kind}`, which reads "a added". The kind is the event's own name, underscores kept.
+10. **A terminal item whose id is past `MAX_TERMINAL_ID` is counted in `more`,** as an item left out, and its `_meta` forms are dropped before anything else reads them.
+11. **The session id check also refuses an empty id,** with the same message, as decision 3 lists; a control character is refused too, since the conversation's event carries the id uncleaned.
+12. **The unknown-kind option names** a permission notice lists are at most 16, each cut at `MAX_PERMISSION_NAME`; the notice itself is `bound`, as every notice is.
+13. **The core's failure log is a pure `failure_line(id, events)`** in `server/core/agents.rs`, called by `agent_apply` before it sends the events, and tested there (`a_failure_in_a_steps_events_reaches_the_log`), since `log!` writes the core's stderr.
+14. **The guard's test seam** is `Step::event_limit`, set by a private `run(session, input, now, limit)`: `step` passes `MAX_EVENT`, the tests' `Agent` its `event_limit` field.
+15. **The diff's fallback stops at the first line that doesn't fit** and counts the rest with one `count()`, neither cleaned nor copied; `Keep::cleaned` counts the lines cleaned, which the 300,000-line test compares with the lines kept.
+16. **`checkpoint.rs` keeps no fixture files,** so task 2.3's old-form checkpoint is built in the test: the session's base with each grouped `tool_items` split one item an event, which decodes to the same session.
+17. **The piece split's fault was shown at the base, not on this branch:** `33cd838` renamed `text_len` to `wire_len`, which the fold's clamp needed and which already fixed the split. `the_piece_split_counts_an_outputs_command_and_directory`, run at `486f6e6` in a scratch checkout, gave one piece (`[2]`); here it gives two.
+18. **The real-role test `a_log_past_16_mib_drops_its_oldest_entries`** sent messages of 1 MiB and 3 bytes, which now split in two entries each. Its messages are now exactly 1 MiB, so the test checks what it did.
+19. **The derivation's `Conversation` row** keeps decision 1's argument for its directory (the agent was started in it, so it is within the platform's path limit); nothing in `acp::limits` bounds it, and the row says so.
+20. **`raw` cuts a string at `RAW_CAP` = `RAW_LIMIT + 4`, not only a formatted value,** and the old test's assertion that a 9 MiB raw string reads whole was removed: the bound replaces it. `Capped` keeps what it took before the refused write and cuts it back to a whole character (`a_capped_value_keeps_whole_characters`); serde_json's error is the cap reached and isn't reported. `raw_text` still cuts at the ellipsis when its prefix was cut, so a value cut by `raw` always ends with `…`.
+21. **The adversarial property runs 300 steps, not 2,000** (110 s in a debug build; 300 take about 20 s), with three more departures from decision 8, each in the test's doc:
+    - the replay, pages and fetch are walked every 40 steps, since each walk takes about 0.4 s;
+    - the bound checks on tool entries cover the entries the step's events changed, since the others were checked when they last changed;
+    - one move in eight is an extreme one, every size and count at its generator's largest.
+
+    The extreme moves and mostly sendable option ids came after undoing the option names' cut wasn't caught; with them it is, at step 55. A prompt move answers the oldest waiting permission or lets a held prompt go before it prompts, so the turns keep coming: before that, the first unanswered permission blocked every later turn. The test ends by asserting that the run produced each event kind it exists for. A long `session/new` id stays with `reduce.rs`'s `a_session_id_past_its_bound_fails_the_start`, since it ends the session.
+22. **The derivation test's I2 session** holds a log of empty user entries up to `LOG_LIMIT` with 20-digit ids, 64 open outputs with full held lines and 1 KiB terminal ids, methods near `MAX_LOGIN_METHODS_LEN`, an 8 MiB partial line, and the largest slot, conversation (a 96 KiB directory) and turn. Its checkpoint is compared with `LARGEST_CHECKPOINT`, not only with `MAX_CHECKPOINT_LEN`.

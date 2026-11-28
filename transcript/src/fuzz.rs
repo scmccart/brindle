@@ -185,6 +185,13 @@ fn output_text(rng: &mut XorShift) -> String {
     text(rng)
 }
 
+/// A hunk's start, as the producer makes one (from 1), so the logs built
+/// from these items encode and decode; the starts the decoder refuses are
+/// `a_hunk_near_the_edges_decodes_numbered_within_u32_or_is_refused`'s.
+fn hunk_start(rng: &mut XorShift) -> u32 {
+    1 + rng.below(100) as u32
+}
+
 pub(crate) fn tool_item(rng: &mut XorShift) -> ToolItem {
     match rng.below(3) {
         0 => ToolItem::Text {
@@ -196,8 +203,8 @@ pub(crate) fn tool_item(rng: &mut XorShift) -> ToolItem {
             path: text(rng),
             hunks: (0..rng.below(3))
                 .map(|_| Hunk {
-                    old_start: rng.below(100) as u32,
-                    new_start: rng.below(100) as u32,
+                    old_start: hunk_start(rng),
+                    new_start: hunk_start(rng),
                     lines: (0..rng.below(5)).map(|_| diff_line(rng)).collect(),
                 })
                 .collect(),
@@ -434,6 +441,11 @@ fn event(rng: &mut XorShift, near: u64) -> Event {
             earlier: rng.below(4) as u64,
         },
     }
+}
+
+/// Any event, valid or not, near the first ids.
+pub(crate) fn any_event(rng: &mut XorShift) -> Event {
+    event(rng, 3)
 }
 
 /// A valid log, built only from events that apply: entries of every kind,
@@ -988,4 +1000,304 @@ fn a_trim_between_fetches_never_makes_a_fold_error() {
         assert_eq!(copy, log);
     }
     assert!(raced > LOGS / 2, "only {raced} trims raced a fetch");
+}
+
+// The fold's clamps (OpenSpec change `agents-event-bounds`, design decision
+// 6).
+
+/// A string of [`CHARS`] of `least` bytes and up to `spread` more, or a
+/// little past that.
+fn long_text(rng: &mut XorShift, least: usize, spread: usize) -> String {
+    let len = least + rng.below(spread);
+    let piece: String = (0..16).map(|_| CHARS[rng.below(CHARS.len())]).collect();
+    piece.repeat(len / piece.len().max(1) + 1)
+}
+
+/// A tool item now and then past every bound of its own: a long text, a
+/// diff of many short lines with long paths, an output with a long command,
+/// directory and signal name.
+fn big_tool_item(rng: &mut XorShift) -> ToolItem {
+    if rng.chance(2) {
+        return tool_item(rng);
+    }
+    match rng.below(3) {
+        0 => ToolItem::Text {
+            text: long_text(rng, ITEM_LIMIT, ITEM_LIMIT),
+            cut: rng.chance(4),
+        },
+        1 => {
+            let line = DiffLine::Added("x".repeat(rng.below(3)));
+            ToolItem::Diff(FileChange {
+                op: if rng.chance(2) {
+                    FileOp::Move {
+                        from: long_text(rng, MAX_PATH, MAX_PATH),
+                    }
+                } else {
+                    FileOp::Add
+                },
+                path: long_text(rng, 0, 3 * MAX_PATH),
+                hunks: (0..1 + rng.below(3))
+                    .map(|n| Hunk {
+                        old_start: 1 + n as u32,
+                        new_start: 1 + n as u32,
+                        lines: vec![line.clone(); rng.below(20_000)],
+                    })
+                    .collect(),
+                omitted: rng.below(3) as u32,
+            })
+        }
+        _ => {
+            let mut output = Output {
+                command: Some(long_text(rng, 0, 2 * TEXT_CHUNK)),
+                cwd: Some(long_text(rng, 0, 3 * MAX_PATH)),
+                ..Output::default()
+            };
+            output.append(&output_text(rng));
+            output.exit = Some(Exit::Signal {
+                name: long_text(rng, 0, 4 * SIGNAL_RESERVE),
+            });
+            ToolItem::Output(output)
+        }
+    }
+}
+
+fn big_items(rng: &mut XorShift) -> Vec<ToolItem> {
+    (0..rng.below(41)).map(|_| big_tool_item(rng)).collect()
+}
+
+fn big_locations(rng: &mut XorShift) -> Vec<Location> {
+    (0..rng.below(41))
+        .map(|_| Location {
+            path: long_text(rng, 0, 3 * MAX_PATH),
+            line: None,
+        })
+        .collect()
+}
+
+fn big_raw(rng: &mut XorShift) -> Option<String> {
+    rng.chance(2)
+        .then(|| long_text(rng, 0, 3 * RAW_LIMIT))
+}
+
+/// A tool entry's content, locations and raw values past their bounds, now
+/// and then.
+fn big_tool(rng: &mut XorShift) -> Entry {
+    Entry::Tool {
+        call: "call_1".into(),
+        title: text(rng),
+        kind: ToolKind::Edit,
+        status: ToolStatus::InProgress,
+        content: big_items(rng),
+        more: rng.below(3) as u32,
+        locations: big_locations(rng),
+        input: big_raw(rng),
+        result: big_raw(rng),
+    }
+}
+
+/// Whether a tool entry is within the tool content bounds; any other entry
+/// is.
+fn within_bounds(entry: &Entry) -> bool {
+    let Entry::Tool {
+        content,
+        locations,
+        input,
+        result,
+        ..
+    } = entry
+    else {
+        return true;
+    };
+    let total: usize = content.iter().map(ToolItem::wire_len).sum();
+    content.len() <= MAX_ITEMS
+        && total <= CALL_LIMIT
+        && content.iter().all(|item| {
+            let mut bounded = item.clone();
+            bounded.bound();
+            bounded == *item
+        })
+        && locations.len() <= MAX_LOCATIONS
+        && locations.iter().all(|location| location.path.len() <= MAX_PATH)
+        && [input, result]
+            .iter()
+            .all(|raw| raw.as_ref().is_none_or(|raw| raw.len() <= RAW_LIMIT))
+}
+
+#[test]
+fn the_fold_never_holds_tool_content_past_its_bounds() {
+    let mut rng = XorShift::new(0xeb_0101);
+    let mut clamped = 0usize;
+    for _ in 0..60 {
+        let mut transcript = Transcript::new();
+        for _ in 0..12 {
+            let next = transcript.next_id();
+            let tool = transcript
+                .entries()
+                .filter(|(_, entry)| matches!(entry, Entry::Tool { .. }))
+                .map(|(id, _)| id)
+                .last();
+            let event = match (rng.below(4), tool) {
+                (0, _) | (_, None) => {
+                    let entry = big_tool(&mut rng);
+                    clamped += usize::from(!within_bounds(&entry));
+                    Event::Added { id: next, entry }
+                }
+                (1, Some(id)) => Event::ToolChanged {
+                    id,
+                    title: None,
+                    kind: None,
+                    status: None,
+                    locations: rng.chance(2).then(|| big_locations(&mut rng)),
+                    input: rng.chance(2).then(|| big_raw(&mut rng)),
+                    result: rng.chance(2).then(|| big_raw(&mut rng)),
+                    more: None,
+                },
+                (2, Some(id)) => {
+                    let len = match transcript.entry(id) {
+                        Some(Entry::Tool { content, .. }) => content.len(),
+                        _ => 0,
+                    };
+                    Event::ToolItems {
+                        id,
+                        from: rng.below(len + 1) as u32,
+                        items: big_items(&mut rng),
+                    }
+                }
+                (_, Some(id)) => {
+                    let output = match transcript.entry(id) {
+                        Some(Entry::Tool { content, .. }) => content
+                            .iter()
+                            .position(|item| matches!(item, ToolItem::Output(_))),
+                        _ => None,
+                    };
+                    let Some(item) = output else { continue };
+                    Event::ToolOutput {
+                        id,
+                        item: item as u32,
+                        text: output_text(&mut rng),
+                        exit: Some(Exit::Signal {
+                            name: long_text(&mut rng, 4 * SIGNAL_RESERVE, 1),
+                        }),
+                    }
+                }
+            };
+            assert_eq!(transcript.apply(&event), Ok(()));
+            for (id, entry) in transcript.entries() {
+                assert!(within_bounds(entry), "entry {id} is past the bounds");
+            }
+        }
+    }
+    assert!(clamped > 20, "only {clamped} entries were past the bounds");
+}
+
+#[test]
+fn clamping_is_the_identity_within_the_bounds_and_idempotent() {
+    let mut rng = XorShift::new(0xeb_0102);
+    let mut within = 0usize;
+    for _ in 0..400 {
+        let entry = if rng.chance(2) { big_tool(&mut rng) } else { entry(&mut rng) };
+        let mut once = entry.clone();
+        once.bound_tool();
+        if within_bounds(&entry) {
+            assert_eq!(once, entry, "a clamp changed an entry within the bounds");
+            within += 1;
+        }
+        assert!(within_bounds(&once));
+        let mut twice = once.clone();
+        twice.bound_tool();
+        assert_eq!(twice, once, "a clamped entry clamps to something else");
+    }
+    assert!(within > 50, "only {within} entries were within the bounds");
+}
+
+#[test]
+fn folding_a_tool_calls_pieces_equals_folding_their_concatenation_past_the_bounds() {
+    let mut rng = XorShift::new(0xeb_0103);
+    for _ in 0..200 {
+        let items = big_items(&mut rng);
+        let header = Event::Added {
+            id: EntryId(1),
+            entry: Entry::tool("call_1".into(), "t".into(), ToolKind::Edit, ToolStatus::Pending),
+        };
+        let mut whole = Transcript::new();
+        whole.apply(&header).unwrap();
+        whole
+            .apply(&Event::ToolItems {
+                id: EntryId(1),
+                from: 0,
+                items: items.clone(),
+            })
+            .unwrap();
+        let mut pieces = Transcript::new();
+        pieces.apply(&header).unwrap();
+        let mut rest = &items[..];
+        while !rest.is_empty() {
+            let (piece, after) = rest.split_at(1 + rng.below(rest.len()));
+            let from = match pieces.entry(EntryId(1)) {
+                Some(Entry::Tool { content, .. }) => content.len() as u32,
+                _ => 0,
+            };
+            pieces
+                .apply(&Event::ToolItems {
+                    id: EntryId(1),
+                    from,
+                    items: piece.to_vec(),
+                })
+                .unwrap();
+            rest = after;
+        }
+        assert_eq!(pieces, whole);
+    }
+}
+
+/// A hunk value near 0 or `u32::MAX`, with random lines, decodes to a hunk
+/// whose every line number fits, or is a decode error, never a panic.
+#[test]
+fn a_hunk_near_the_edges_decodes_numbered_within_u32_or_is_refused() {
+    let mut rng = XorShift::new(0xeb_0104);
+    let signs = [" a", "+b", "-c"];
+    let (mut decoded, mut refused) = (0usize, 0usize);
+    for _ in 0..3000 {
+        let start = |rng: &mut XorShift| -> u64 {
+            match rng.below(3) {
+                0 => rng.below(3) as u64,
+                1 => u64::from(u32::MAX) - rng.below(4) as u64,
+                _ => 1 + rng.below(1000) as u64,
+            }
+        };
+        let lines: Vec<&str> = (0..rng.below(6)).map(|_| signs[rng.below(3)]).collect();
+        let value = json!({"event": "tool_items", "id": 1, "from": 0, "items": [{"item": "diff",
+            "op": "add", "path": "/p", "hunks": [{"old_start": start(&mut rng),
+            "new_start": start(&mut rng), "lines": lines}]}]});
+        match Event::from_value(&value) {
+            Ok(Event::ToolItems { items, .. }) => {
+                let [ToolItem::Diff(change)] = &items[..] else {
+                    panic!("not one diff")
+                };
+                for hunk in &change.hunks {
+                    let (mut old, mut new) = (Some(hunk.old_start), Some(hunk.new_start));
+                    assert!(hunk.old_start > 0 && hunk.new_start > 0);
+                    for line in &hunk.lines {
+                        let (o, n) = match line {
+                            DiffLine::Context(_) => (true, true),
+                            DiffLine::Removed(_) => (true, false),
+                            DiffLine::Added(_) => (false, true),
+                        };
+                        if o {
+                            assert!(old.is_some(), "an old line past u32::MAX");
+                            old = old.and_then(|at| at.checked_add(1));
+                        }
+                        if n {
+                            assert!(new.is_some(), "a new line past u32::MAX");
+                            new = new.and_then(|at| at.checked_add(1));
+                        }
+                    }
+                }
+                decoded += 1;
+            }
+            Ok(other) => panic!("{other:?}"),
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(decoded > 100 && refused > 100, "{decoded} decoded, {refused} refused");
 }

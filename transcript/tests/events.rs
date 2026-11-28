@@ -1054,6 +1054,20 @@ fn encoding_the_events_reproduces_the_fixtures() {
     }
 }
 
+/// `Event::encoded_len` equals `serde_json::to_vec(event).len()` for every
+/// fixture event (OpenSpec change `agents-event-bounds`; random events are
+/// `lib.rs`'s unit test).
+#[test]
+fn the_encoded_length_of_every_fixture_event_is_its_encodings() {
+    for (name, event, _) in read_fixtures() {
+        assert_eq!(
+            event.encoded_len(),
+            serde_json::to_vec(&event).unwrap().len(),
+            "{name}"
+        );
+    }
+}
+
 #[test]
 fn every_form_appears_in_a_fixture() {
     let seen: BTreeSet<&str> = fixtures()

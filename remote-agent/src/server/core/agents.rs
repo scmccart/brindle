@@ -138,7 +138,10 @@ pub(super) struct Agent {
     /// When the reducer asked to be stepped with [`Input::Tick`].
     wake: Option<Instant>,
     /// Its checkpoint came out too large to store, so its handling failed
-    /// and it isn't checkpointed again (the bounds make this unreachable).
+    /// and it isn't checkpointed again. `acp::limits`' I2 makes this
+    /// unreachable: a whole checkpoint is at most `LARGEST_CHECKPOINT`,
+    /// under `MAX_CHECKPOINT_LEN`, which its const assertions and
+    /// `the_frame_and_checkpoint_bounds_follow_from_the_constants` check.
     unstorable: bool,
     /// What its holder stores of its checkpoint (`agents-log-paging`
     /// decision 9).
@@ -813,6 +816,9 @@ impl<L: EventLoop> Core<L> {
         if let Some(answer) = listed {
             self.send_listed(id, answer);
         }
+        if let Some(line) = failure_line(id, &events) {
+            log!("{line}");
+        }
         let session = self.sessions.get_mut(&id)?;
         let client = session
             .ownership
@@ -855,8 +861,10 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Sends `events` of session `id` to `client` as `TRANSCRIPT` frames of
-    /// whole events. One that can't fit a frame (the log's bounds rule it
-    /// out) is reported to the client and logged.
+    /// whole events. One that can't fit a frame is reported to the client
+    /// and logged; `acp::limits`' I1 rules it out, since every event the
+    /// reducer emits, replays or pages encodes within `MAX_EVENT`, which
+    /// leaves `TRANSCRIPT_ENVELOPE` of the frame for the batch.
     pub(super) fn send_transcript(&mut self, client: Token, id: SessionId, events: Vec<Value>) {
         match client::pack_transcript(id, events) {
             Ok(messages) => {
@@ -877,7 +885,8 @@ impl<L: EventLoop> Core<L> {
     /// segment of the events since the last one appended to what its
     /// holder stores ([`policy::agent_checkpoint_form`]), covering the
     /// stdout fed since the last one. A state too large to store fails its
-    /// handling.
+    /// handling, which `acp::limits`' I2 makes unreachable for a whole
+    /// checkpoint; a segment too large is written whole instead.
     pub(super) fn agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
         let Some(holder) = self.sessions.get(&id).map(|session| session.holder) else {
             return;
@@ -1051,9 +1060,62 @@ impl<L: EventLoop> Core<L> {
     }
 }
 
+/// The line the core logs for a step whose events fail session `id`'s
+/// agent: its message, which names a fold error or an event too large to
+/// send (`agents-event-bounds` decision 4), so the cause isn't only in the
+/// client's view.
+fn failure_line(id: SessionId, events: &[Event]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        if let Event::Agent {
+            state: AgentState::Failed { message },
+        } = event
+        {
+            Some(format!("session {id}: {message}"))
+        } else {
+            None
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A step whose events fail the agent, a fold error or an event too
+    /// large to send among them, logs why, naming the session
+    /// (`agents-event-bounds` task 4.5); one that doesn't logs nothing.
+    #[test]
+    fn a_failure_in_a_steps_events_reaches_the_log() {
+        let message = "ACP handling failed: an added (tool) event for entry 2 is 2000000 bytes; one transcript event may be at most 1047552";
+        let events = [
+            Event::Turn {
+                state: brindle_transcript::TurnState::Failed {
+                    message: "ACP handling failed".into(),
+                },
+            },
+            Event::Agent {
+                state: AgentState::Failed {
+                    message: message.into(),
+                },
+            },
+        ];
+        assert_eq!(failure_line(7, &events), Some(format!("session 7: {message}")));
+        assert_eq!(failure_line(7, &events[..1]), None);
+        let mut session = AgentSession::new("/w".into(), "0.3.0".into());
+        let output = reduce::step(
+            &mut session,
+            Input::Fault {
+                reason: "has no text to append to".into(),
+            },
+            Instant::now(),
+        );
+        assert!(
+            failure_line(3, &output.events).is_some_and(|line| line.starts_with("session 3: ACP handling failed: ")
+                && line.contains("has no text to append to")),
+            "{:?}",
+            output.events
+        );
+    }
 
     #[test]
     fn each_activity_is_listed_by_its_own_name() {

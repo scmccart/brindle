@@ -53,6 +53,37 @@ mod fuzz;
 /// boundary, into more `Appended`s.
 pub const TEXT_CHUNK: usize = 64 * 1024;
 
+/// The most one event of protocol 4 encodes to ([`Event::encoded_len`];
+/// OpenSpec change `agents-event-bounds`, design decision 1): a frame's
+/// megabyte less room for any frame's envelope. It is the event's own
+/// contract, so it lives here; the producer (the core's reducer) keeps every
+/// event within it, and `brindle-remote-agent`'s `acp::limits` derives
+/// that from the bounds and asserts it fits a frame with its envelope.
+pub const MAX_EVENT: usize = 1024 * 1024 - 1024;
+
+/// The most a path keeps, in bytes, cut at a character boundary: a
+/// location's, a file change's and its source's, and an output's
+/// directory.
+pub const MAX_PATH: usize = 4 * 1024;
+
+/// What one kept diff line adds to its text on the wire: its sign, two
+/// quotes and a comma ([`ToolItem::wire_len`]).
+pub const LINE_FRAMING: usize = 4;
+
+/// What one hunk adds on the wire beside its lines:
+/// `{"old_start":4294967295,"new_start":4294967295,"lines":[]},` is 59.
+pub const HUNK_FRAMING: usize = 64;
+
+/// The most an output's exit signal name keeps, and what an output's
+/// measure keeps for its exit.
+pub const SIGNAL_RESERVE: usize = 64;
+
+/// What the log's measure counts for each entry beside its own encoding
+/// ([`Transcript::encoded_len`]): the most a replay and a checkpoint's
+/// tools map add around a small entry, so a stored log is at most twice
+/// its measure (design decision 2).
+pub const ENTRY_FRAMING: usize = 64;
+
 /// An entry's id: per session, from 1, never reused (`types R3`). Never an
 /// index: entries before the first kept one may have been trimmed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -146,9 +177,116 @@ impl Entry {
         }
     }
 
-    /// The encoded length of the entry, as the log's bound counts it.
-    fn encoded_len(&self) -> usize {
-        serde_json::to_vec(self).map_or(0, |bytes| bytes.len())
+    /// The encoded length of the entry with its [`ENTRY_FRAMING`], as the
+    /// log's bound counts it.
+    fn measure(&self) -> usize {
+        counted(self).saturating_add(ENTRY_FRAMING)
+    }
+
+    /// The entry's kind, as its encoding's `type` names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::User { .. } => "user",
+            Self::Agent { .. } => "agent",
+            Self::Thought { .. } => "thought",
+            Self::Tool { .. } => "tool",
+            Self::Permission { .. } => "permission",
+            Self::Notice { .. } => "notice",
+        }
+    }
+
+    /// A tool entry's content, locations and raw values held to the tool
+    /// content bounds (design decision 6): each item by [`ToolItem::bound`],
+    /// the list by [`ContentBudget`] with what it drops added to `more`,
+    /// at most [`MAX_LOCATIONS`] locations with paths of at most
+    /// [`MAX_PATH`], and raw values of at most [`RAW_LIMIT`] ending with
+    /// `…` when cut. The identity within the bounds, and idempotent; any
+    /// other entry is left as it is.
+    fn bound_tool(&mut self) {
+        let Self::Tool {
+            content,
+            more,
+            locations,
+            input,
+            result,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let dropped = bound_content(content);
+        *more = more.saturating_add(dropped);
+        bound_locations(locations);
+        bound_raw(input);
+        bound_raw(result);
+    }
+}
+
+/// `content` with each item bounded and the list kept within a
+/// [`ContentBudget`]; returns how many items it dropped.
+fn bound_content(content: &mut Vec<ToolItem>) -> u32 {
+    let mut budget = ContentBudget::new();
+    let mut kept = Vec::with_capacity(content.len().min(MAX_ITEMS));
+    for mut item in content.drain(..) {
+        item.bound();
+        if budget.take(&item) {
+            kept.push(item);
+        }
+    }
+    *content = kept;
+    budget.left_out()
+}
+
+fn bound_locations(locations: &mut Vec<Location>) {
+    locations.truncate(MAX_LOCATIONS);
+    for location in locations {
+        cut_in_place(&mut location.path, MAX_PATH);
+    }
+}
+
+/// A raw value past [`RAW_LIMIT`] cut to end with `…` within it, as the
+/// reducer keeps one.
+fn bound_raw(raw: &mut Option<String>) {
+    if let Some(text) = raw
+        && text.len() > RAW_LIMIT
+    {
+        cut_in_place(text, RAW_LIMIT - '…'.len_utf8());
+        text.push('…');
+    }
+}
+
+/// `text` cut to at most `limit` bytes at a character boundary; whether
+/// it was cut.
+fn cut_in_place(text: &mut String, limit: usize) -> bool {
+    if text.len() <= limit {
+        return false;
+    }
+    let mut cut = limit;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    true
+}
+
+/// How many bytes `value` encodes to, counted as serde_json writes them,
+/// with nothing allocated; one that can't encode counts as `usize::MAX`.
+fn counted<T: Serialize + ?Sized>(value: &T) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(bytes.len());
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => counter.0,
+        Err(_) => usize::MAX,
     }
 }
 
@@ -180,17 +318,18 @@ pub enum ToolStatus {
 }
 
 /// The most text one tool content item holds (a [`ToolItem::Text`]'s text,
-/// a [`FileChange`]'s lines, an [`Output`]'s text; OpenSpec change
-/// `agents-tool-content`, design decision 5). Equal to [`TEXT_CHUNK`], so
-/// any one item fits one event.
+/// a [`FileChange`]'s lines with their framing, an [`Output`]'s text;
+/// OpenSpec change `agents-tool-content`, design decision 5). That one
+/// event fits a frame however its items are grouped is not this bound's
+/// doing but `acp::limits`' invariant I1 (`agents-event-bounds`).
 pub const ITEM_LIMIT: usize = TEXT_CHUNK;
 
 /// The most content items a tool call keeps; later ones are counted in its
 /// `more`.
 pub const MAX_ITEMS: usize = 32;
 
-/// The most text a tool call's items hold together; later items are
-/// counted in its `more`.
+/// The most a tool call's items hold together, by [`ToolItem::wire_len`];
+/// later items are counted in its `more` ([`ContentBudget`]).
 pub const CALL_LIMIT: usize = 256 * 1024;
 
 /// The most text each of a tool call's raw input and raw result keeps.
@@ -217,14 +356,131 @@ pub enum ToolItem {
 }
 
 impl ToolItem {
-    /// The item's text, as [`ITEM_LIMIT`] and [`CALL_LIMIT`] count it.
-    pub fn text_len(&self) -> usize {
+    /// The item's text with its framing, as [`CALL_LIMIT`] counts it
+    /// (`agents-event-bounds` decision 3): a text's bytes; a diff's paths,
+    /// and each kept line's bytes with [`LINE_FRAMING`] and each hunk's
+    /// [`HUNK_FRAMING`]; an output's [`ITEM_LIMIT`] (what its text may
+    /// grow to, whatever it holds yet), its command and directory and
+    /// [`SIGNAL_RESERVE`]. No `ToolOutput` changes it.
+    pub fn wire_len(&self) -> usize {
         match self {
             Self::Text { text, .. } => text.len(),
-            Self::Diff(change) => change.text_len(),
-            Self::Output(output) => output.text.len(),
+            Self::Diff(change) => change.wire_len(),
+            Self::Output(output) => ITEM_LIMIT
+                .saturating_add(output.command.as_ref().map_or(0, String::len))
+                .saturating_add(output.cwd.as_ref().map_or(0, String::len))
+                .saturating_add(SIGNAL_RESERVE),
         }
     }
+
+    /// The item held to its own bounds (design decision 6): a text cut at
+    /// [`ITEM_LIMIT`] and marked `cut`; a diff's paths cut at [`MAX_PATH`]
+    /// and its lines past [`ITEM_LIMIT`] (counted with their framing, as
+    /// the reducer keeps them) dropped into `omitted`, a hunk left empty
+    /// removed; an output's text kept to its suffix by its own rule, its
+    /// directory cut at [`MAX_PATH`], its command at [`TEXT_CHUNK`] and its
+    /// signal name at [`SIGNAL_RESERVE`]. The identity within the bounds,
+    /// and idempotent.
+    pub fn bound(&mut self) {
+        match self {
+            Self::Text { text, cut } => {
+                if cut_in_place(text, ITEM_LIMIT) {
+                    *cut = true;
+                }
+            }
+            Self::Diff(change) => change.bound(),
+            Self::Output(output) => {
+                output.append("");
+                if let Some(command) = &mut output.command {
+                    cut_in_place(command, TEXT_CHUNK);
+                }
+                if let Some(cwd) = &mut output.cwd {
+                    cut_in_place(cwd, MAX_PATH);
+                }
+                if let Some(exit) = &mut output.exit {
+                    exit.bound();
+                }
+            }
+        }
+    }
+}
+
+/// The rule a tool call's items are kept by (`agents-event-bounds`
+/// decision 3), which the reducer applies before it sends them and the fold
+/// applies to what it is sent: at most [`MAX_ITEMS`] items whose
+/// [`ToolItem::wire_len`]s add up to at most [`CALL_LIMIT`]. An item that
+/// doesn't fit is left out and counted, and later ones are still tried.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContentBudget {
+    items: usize,
+    len: usize,
+    left_out: u32,
+}
+
+impl ContentBudget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A budget that already holds `items`, each taken as it stands.
+    pub fn holding<'a>(items: impl IntoIterator<Item = &'a ToolItem>) -> Self {
+        let mut budget = Self::new();
+        for item in items {
+            budget.items += 1;
+            budget.len = budget.len.saturating_add(item.wire_len());
+        }
+        budget
+    }
+
+    /// Whether `item` fits beside what is taken.
+    pub fn fits(&self, item: &ToolItem) -> bool {
+        self.items < MAX_ITEMS && self.len.saturating_add(item.wire_len()) <= CALL_LIMIT
+    }
+
+    /// Takes `item` when it fits, else counts it left out; whether it fit.
+    pub fn take(&mut self, item: &ToolItem) -> bool {
+        if self.fits(item) {
+            self.items += 1;
+            self.len = self.len.saturating_add(item.wire_len());
+            true
+        } else {
+            self.left_out = self.left_out.saturating_add(1);
+            false
+        }
+    }
+
+    /// Counts one item left out without measuring it.
+    pub fn leave_out(&mut self) {
+        self.left_out = self.left_out.saturating_add(1);
+    }
+
+    /// How many items were left out.
+    pub fn left_out(&self) -> u32 {
+        self.left_out
+    }
+}
+
+/// `items` in the pieces one `ToolItems` event each carries (design
+/// decision 2): consecutive items whose [`ToolItem::wire_len`]s add up to
+/// at most [`TEXT_CHUNK`], or one larger item alone. The reducer's live
+/// split and a replay group by it, so both send the same pieces.
+pub fn item_pieces(items: &[ToolItem]) -> Vec<&[ToolItem]> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut len = 0usize;
+    for (at, item) in items.iter().enumerate() {
+        let item_len = item.wire_len();
+        if at > start && len.saturating_add(item_len) > TEXT_CHUNK {
+            pieces.extend(items.get(start..at));
+            start = at;
+            len = 0;
+        }
+        len = len.saturating_add(item_len);
+    }
+    if start < items.len() {
+        pieces.extend(items.get(start..));
+    }
+    pieces
 }
 
 /// One file's change: its operation, its path and its changed lines as
@@ -242,13 +498,74 @@ pub struct FileChange {
 }
 
 impl FileChange {
-    /// The kept lines' text together.
-    pub fn text_len(&self) -> usize {
+    /// The change's paths, its op's name, and its hunks' [`Hunk::wire_len`]
+    /// together.
+    pub fn wire_len(&self) -> usize {
+        let op = match &self.op {
+            FileOp::Move { from } | FileOp::Copy { from } => from.len(),
+            FileOp::Other { name } => name.len(),
+            FileOp::Add | FileOp::Delete | FileOp::Modify => 0,
+        };
         self.hunks
             .iter()
-            .flat_map(|hunk| &hunk.lines)
-            .map(|line| line.text().len())
-            .sum()
+            .map(Hunk::wire_len)
+            .fold(self.path.len().saturating_add(op), usize::saturating_add)
+    }
+
+    /// The change held to its bounds (design decision 6): paths and the
+    /// op's name cut at [`MAX_PATH`]; hunks kept, as the reducer's diff
+    /// keeps them, until one more line (with its [`LINE_FRAMING`], and
+    /// [`HUNK_FRAMING`] with a hunk's first) would pass [`ITEM_LIMIT`],
+    /// the rest counted in `omitted`; a hunk left without lines removed.
+    fn bound(&mut self) {
+        cut_in_place(&mut self.path, MAX_PATH);
+        match &mut self.op {
+            FileOp::Move { from } | FileOp::Copy { from } => {
+                cut_in_place(from, MAX_PATH);
+            }
+            FileOp::Other { name } => {
+                cut_in_place(name, MAX_PATH);
+            }
+            FileOp::Add | FileOp::Delete | FileOp::Modify => {}
+        }
+        let mut len = 0usize;
+        let mut full = false;
+        let mut dropped = 0usize;
+        self.hunks.retain_mut(|hunk| {
+            if full {
+                dropped = dropped.saturating_add(hunk.lines.len());
+                return false;
+            }
+            if hunk.lines.is_empty() {
+                // An empty hunk the reducer never makes: counted whole.
+                if len.saturating_add(HUNK_FRAMING) > ITEM_LIMIT {
+                    full = true;
+                    return false;
+                }
+                len += HUNK_FRAMING;
+                return true;
+            }
+            let mut keep = hunk.lines.len();
+            for (at, line) in hunk.lines.iter().enumerate() {
+                let framing = if at == 0 {
+                    LINE_FRAMING + HUNK_FRAMING
+                } else {
+                    LINE_FRAMING
+                };
+                let grown = len.saturating_add(line.text().len()).saturating_add(framing);
+                if grown > ITEM_LIMIT {
+                    full = true;
+                    keep = at;
+                    break;
+                }
+                len = grown;
+            }
+            dropped = dropped.saturating_add(hunk.lines.len() - keep);
+            hunk.lines.truncate(keep);
+            !hunk.lines.is_empty()
+        });
+        let dropped = u32::try_from(dropped).unwrap_or(u32::MAX);
+        self.omitted = self.omitted.saturating_add(dropped);
     }
 }
 
@@ -266,12 +583,69 @@ pub enum FileOp {
 }
 
 /// A run of changed lines with their context: where it starts in the old
-/// and the new file (1-based), and its lines.
+/// and the new file (1-based), and its lines. One read from the wire starts
+/// at 1 or later and numbers no line past `u32::MAX` on either side
+/// (`agents-event-bounds` decision 7): any other is a [`DecodeError`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "HunkForm")]
 pub struct Hunk {
     pub old_start: u32,
     pub new_start: u32,
     pub lines: Vec<DiffLine>,
+}
+
+impl Hunk {
+    /// Its lines' bytes, each with [`LINE_FRAMING`], and its
+    /// [`HUNK_FRAMING`].
+    pub fn wire_len(&self) -> usize {
+        self.lines
+            .iter()
+            .map(|line| line.text().len().saturating_add(LINE_FRAMING))
+            .fold(HUNK_FRAMING, usize::saturating_add)
+    }
+}
+
+/// A [`Hunk`] as the wire has it, before its numbers are checked.
+#[derive(Deserialize)]
+struct HunkForm {
+    old_start: u32,
+    new_start: u32,
+    lines: Vec<DiffLine>,
+}
+
+impl TryFrom<HunkForm> for Hunk {
+    type Error = String;
+
+    fn try_from(form: HunkForm) -> Result<Self, String> {
+        let old = form
+            .lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Removed(_)))
+            .count();
+        let new = form
+            .lines
+            .iter()
+            .filter(|line| matches!(line, DiffLine::Context(_) | DiffLine::Added(_)))
+            .count();
+        for (side, start, count) in [("old", form.old_start, old), ("new", form.new_start, new)] {
+            if start == 0 {
+                return Err(format!("a hunk's {side} side starts at line 0; lines count from 1"));
+            }
+            // The last line this side numbers: `start + count - 1`.
+            let last = u64::from(start).saturating_add(count as u64).saturating_sub(1);
+            if last > u64::from(u32::MAX) {
+                return Err(format!(
+                    "a hunk's {side} side starts at line {start} and numbers {count} lines, past line {}",
+                    u32::MAX
+                ));
+            }
+        }
+        Ok(Self {
+            old_start: form.old_start,
+            new_start: form.new_start,
+            lines: form.lines,
+        })
+    }
 }
 
 /// One line of a hunk, without its line break. It encodes as one JSON
@@ -393,6 +767,18 @@ impl Output {
 pub enum Exit {
     Code { code: i32 },
     Signal { name: String },
+}
+
+impl Exit {
+    /// A signal's name cut at [`SIGNAL_RESERVE`].
+    pub fn bound(&mut self) {
+        match self {
+            Self::Code { .. } => {}
+            Self::Signal { name } => {
+                cut_in_place(name, SIGNAL_RESERVE);
+            }
+        }
+    }
 }
 
 /// A file a tool call works on, and its line when the agent gave one.
@@ -872,6 +1258,33 @@ impl Event {
         serde_json::to_value(self).unwrap_or_default()
     }
 
+    /// How many bytes the event encodes to, as [`MAX_EVENT`] counts it:
+    /// serde_json's encoding counted as it is written, with nothing
+    /// allocated.
+    pub fn encoded_len(&self) -> usize {
+        counted(self)
+    }
+
+    /// The event's kind, as its encoding's `event` names it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Added { .. } => "added",
+            Self::Appended { .. } => "appended",
+            Self::ToolChanged { .. } => "tool_changed",
+            Self::ToolItems { .. } => "tool_items",
+            Self::ToolOutput { .. } => "tool_output",
+            Self::Answered { .. } => "answered",
+            Self::Queue { .. } => "queue",
+            Self::Turn { .. } => "turn",
+            Self::Agent { .. } => "agent",
+            Self::Conversation { .. } => "conversation",
+            Self::Trimmed { .. } => "trimmed",
+            Self::Window { .. } => "window",
+            Self::Commands { .. } => "commands",
+            Self::Options { .. } => "options",
+        }
+    }
+
     /// Reads an event a peer sent. Fields it doesn't know are ignored; a
     /// value that isn't an object, an unknown kind, an unknown value of one
     /// of the event's enums or a missing field is a [`DecodeError`].
@@ -1034,7 +1447,8 @@ pub enum Activity {
     Error,
 }
 
-/// An entry the log keeps, with its encoded length.
+/// An entry the log keeps, with its measure: its encoded length and
+/// [`ENTRY_FRAMING`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Kept {
     id: EntryId,
@@ -1141,10 +1555,12 @@ impl Transcript {
                         expected: self.next,
                     });
                 }
-                let size = entry.encoded_len();
+                let mut entry = entry.clone();
+                entry.bound_tool();
+                let size = entry.measure();
                 self.entries.push_back(Kept {
                     id: *id,
-                    entry: entry.clone(),
+                    entry,
                     size,
                 });
                 self.size += size;
@@ -1205,6 +1621,7 @@ impl Transcript {
                 if let Some(more) = more {
                     *own_more = *more;
                 }
+                kept.entry.bound_tool();
                 self.resize_entry(*id);
             }
             Event::ToolItems { id, from, items } => {
@@ -1222,6 +1639,7 @@ impl Transcript {
                 }
                 content.truncate(*from as usize);
                 content.extend(items.iter().cloned());
+                kept.entry.bound_tool();
                 self.resize_entry(*id);
             }
             Event::ToolOutput {
@@ -1240,7 +1658,9 @@ impl Transcript {
                 let before = output_fields_len(output);
                 let dropped = output.append(text);
                 if let Some(exit) = exit {
-                    output.exit = Some(exit.clone());
+                    let mut exit = exit.clone();
+                    exit.bound();
+                    output.exit = Some(exit);
                 }
                 let after = output_fields_len(output);
                 // Grown by the text and shrunk by what was dropped, with no
@@ -1371,7 +1791,7 @@ impl Transcript {
         if let Ok(index) = self.index(id)
             && let Some(kept) = self.entries.get_mut(index)
         {
-            let size = kept.entry.encoded_len();
+            let size = kept.entry.measure();
             self.size = self.size.saturating_sub(kept.size) + size;
             kept.size = size;
         }
@@ -1428,7 +1848,8 @@ impl Transcript {
         self.trimmed.map_or(0, |trim| trim.dropped)
     }
 
-    /// The kept entries' encoded length, which the log's bound counts.
+    /// The kept entries' encoded length, each with its [`ENTRY_FRAMING`]:
+    /// what the log's bound, a trim and a page's budget count.
     pub fn encoded_len(&self) -> usize {
         self.size
     }
@@ -1752,7 +2173,10 @@ fn entry_change(event: &Event) -> Option<EntryId> {
 }
 
 /// An entry's `Added`, its text's further `Appended`s and its outcome's
-/// `Answered`.
+/// `Answered`. Each is one of the live events' forms, so each is within
+/// the producer's `MAX_EVENT` (the server's `acp::limits`, invariant I1):
+/// text in pieces of at most [`TEXT_CHUNK`], a tool call's header apart
+/// from its items, grouped by [`item_pieces`].
 fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
     match entry {
         Entry::User { text } => replay_text(id, text, |text| Entry::User { text }, events),
@@ -1791,8 +2215,10 @@ fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
             input,
             result,
         } => {
-            // The entry without its content, then one item per event, so
-            // any one event stays within a frame.
+            // The entry without its content, then its items in the pieces
+            // the live split sends (`agents-event-bounds` decision 2), each
+            // event within `MAX_EVENT` (`acp::limits` I1). A fold of either
+            // form, or of one item an event as before, is the same entry.
             events.push(Event::Added {
                 id,
                 entry: Entry::Tool {
@@ -1807,13 +2233,15 @@ fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
                     result: result.clone(),
                 },
             });
-            events.extend(content.iter().enumerate().map(|(index, item)| {
-                Event::ToolItems {
+            let mut from = 0usize;
+            for piece in item_pieces(content) {
+                events.push(Event::ToolItems {
                     id,
-                    from: u32::try_from(index).unwrap_or(u32::MAX),
-                    items: vec![item.clone()],
-                }
-            }));
+                    from: u32::try_from(from).unwrap_or(u32::MAX),
+                    items: piece.to_vec(),
+                });
+                from += piece.len();
+            }
         }
         Entry::Notice { .. } => events.push(Event::Added {
             id,
@@ -1876,10 +2304,27 @@ pub fn clean(text: &str) -> String {
     cleaned
 }
 
+/// How many bytes [`clean`] would make of `text`, without building it: a
+/// control character it replaces takes U+FFFD's three.
+pub fn cleaned_len(text: &str) -> usize {
+    let mut len = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let keep = match c {
+            '\n' | '\t' => true,
+            '\r' => chars.peek().is_none_or(|next| *next == '\n'),
+            other => !other.is_control(),
+        };
+        len += if keep { c.len_utf8() } else { '\u{FFFD}'.len_utf8() };
+    }
+    len
+}
+
 /// How many bytes `text` takes inside a JSON string, as serde_json escapes
 /// it: `"` and `\` take two, the control characters two (`\b`, `\t`, `\n`,
-/// `\f`, `\r`) or six (`\u00XX`).
-fn escaped_len(text: &str) -> usize {
+/// `\f`, `\r`) or six (`\u00XX`). Cleaned text ([`clean`]) takes at most
+/// twice its bytes.
+pub fn escaped_len(text: &str) -> usize {
     text.bytes()
         .map(|byte| match byte {
             b'"' | b'\\' | 0x08 | b'\t' | b'\n' | 0x0c | b'\r' => 2,
@@ -2591,7 +3036,7 @@ mod tests {
         let one = trimmed
             .entries()
             .next()
-            .map(|(_, entry)| entry.encoded_len())
+            .map(|(_, entry)| entry.measure())
             .unwrap();
         let event = trimmed.trim_to(one * 3).expect("over the limit");
         assert_eq!(
@@ -2648,11 +3093,7 @@ mod tests {
                 outcome: PermissionOutcome::Cancelled,
             })
             .unwrap();
-        let measured: usize = transcript
-            .entries()
-            .map(|(_, entry)| serde_json::to_vec(entry).unwrap().len())
-            .sum();
-        assert_eq!(transcript.encoded_len(), measured);
+        assert_eq!(transcript.encoded_len(), measured(&transcript));
     }
 
     #[test]
@@ -3377,10 +3818,12 @@ mod tests {
         }
     }
 
+    /// The log's measure computed afresh: each entry's encoding and its
+    /// framing.
     fn measured(transcript: &Transcript) -> usize {
         transcript
             .entries()
-            .map(|(_, entry)| serde_json::to_vec(entry).unwrap().len())
+            .map(|(_, entry)| serde_json::to_vec(entry).unwrap().len() + ENTRY_FRAMING)
             .sum()
     }
 
@@ -3744,7 +4187,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_entry_replays_without_content_then_one_item_per_event() {
+    fn a_tool_entry_replays_without_content_then_its_items_grouped() {
         let entry = tool_with(
             "c1",
             vec![text_item("a"), diff_item(), output_item(Some("ls"))],
@@ -3752,12 +4195,13 @@ mod tests {
         );
         let transcript = fold(&[added(1, entry)]).unwrap();
         let replay = transcript.replay();
+        // The two small items in one piece; an output, which counts at
+        // its full `ITEM_LIMIT`, alone (`agents-event-bounds` decision 2).
         assert_eq!(
-            replay[..4],
+            replay[..3],
             [
                 added(1, tool_with("c1", Vec::new(), Some("in"))),
-                items(1, 0, vec![text_item("a")]),
-                items(1, 1, vec![diff_item()]),
+                items(1, 0, vec![text_item("a"), diff_item()]),
                 items(1, 2, vec![output_item(Some("ls"))]),
             ]
         );
@@ -4031,5 +4475,237 @@ mod tests {
                 .iter()
                 .all(|event| matches!(event, Event::Added { .. } | Event::Appended { .. }))
         );
+    }
+
+    // The fold's bounds (OpenSpec change `agents-event-bounds`).
+
+    /// A fold of a tool call update carrying 40 items and a 100 KiB raw
+    /// input holds at most 32 items and a raw input of at most 16 KiB
+    /// (B-7).
+    #[test]
+    fn a_fold_of_a_tool_update_past_the_bounds_holds_them() {
+        let mut transcript = fold(&[added(1, tool("call_1"))]).unwrap();
+        let raw = "x".repeat(100 * 1024);
+        transcript
+            .apply(&Event::ToolChanged {
+                id: EntryId(1),
+                title: None,
+                kind: None,
+                status: None,
+                locations: None,
+                input: Some(Some(raw)),
+                result: None,
+                more: None,
+            })
+            .unwrap();
+        let forty: Vec<ToolItem> = (0..40).map(|n| text_item(&format!("item {n}"))).collect();
+        transcript.apply(&items(1, 0, forty)).unwrap();
+        let Some(Entry::Tool {
+            content,
+            more,
+            input,
+            ..
+        }) = transcript.entry(EntryId(1))
+        else {
+            panic!("no tool entry");
+        };
+        assert!(content.len() <= MAX_ITEMS, "{} items", content.len());
+        assert!(*more >= 8, "more {more}");
+        let input = input.as_deref().unwrap_or_default();
+        assert!(input.len() <= RAW_LIMIT, "a raw input of {}", input.len());
+        assert!(input.ends_with('…'));
+    }
+
+    /// `Event::encoded_len` equals `serde_json::to_vec(event).len()` for
+    /// random events from `fuzz.rs`'s generator (the fixtures' are
+    /// `tests/events.rs`'s).
+    #[test]
+    fn the_encoded_length_of_a_random_event_is_its_encodings() {
+        let mut rng = XorShift::new(0xeb_0001);
+        for _ in 0..2000 {
+            let event = crate::fuzz::any_event(&mut rng);
+            assert_eq!(event.encoded_len(), serde_json::to_vec(&event).unwrap().len());
+        }
+    }
+
+    /// `escaped_len` of a cleaned string is at most twice its bytes, and
+    /// `cleaned_len(t)` is `clean(t).len()`, for random strings with
+    /// controls.
+    #[test]
+    fn cleaned_text_escapes_to_at_most_twice_its_bytes_and_cleaned_len_is_cleans() {
+        let mut rng = XorShift::new(0xeb_0002);
+        let chars = ['a', '"', '\\', '\n', '\t', '\r', '\u{0}', '\u{1b}', '\u{7f}', '\u{85}', 'é', '🦀'];
+        for _ in 0..5000 {
+            let text: String = (0..rng.below(40)).map(|_| chars[rng.below(chars.len())]).collect();
+            let cleaned = clean(&text);
+            assert_eq!(cleaned_len(&text), cleaned.len(), "{text:?}");
+            assert!(escaped_len(&cleaned) <= 2 * cleaned.len(), "{cleaned:?}");
+            assert_eq!(escaped_len(&cleaned) + 2, serde_json::to_vec(&cleaned).unwrap().len());
+        }
+    }
+
+    fn lines_diff(lines: &[&str], hunks: usize) -> ToolItem {
+        ToolItem::Diff(FileChange {
+            op: FileOp::Move { from: "/a".into() },
+            path: "/b/c".into(),
+            hunks: (0..hunks)
+                .map(|n| Hunk {
+                    old_start: 1 + n as u32 * 100,
+                    new_start: 1 + n as u32 * 100,
+                    lines: lines.iter().map(|line| DiffLine::Added((*line).into())).collect(),
+                })
+                .collect(),
+            omitted: 0,
+        })
+    }
+
+    /// `wire_len` of a diff counts 4 bytes a line and 64 a hunk, beside its
+    /// paths.
+    #[test]
+    fn the_wire_length_of_a_diff_counts_its_lines_and_hunks_framing() {
+        assert_eq!(lines_diff(&[], 0).wire_len(), "/b/c".len() + "/a".len());
+        assert_eq!(lines_diff(&["", "", ""], 1).wire_len(), 6 + 3 * LINE_FRAMING + HUNK_FRAMING);
+        assert_eq!(
+            lines_diff(&["ab", "c"], 2).wire_len(),
+            6 + 2 * (3 + 2 * LINE_FRAMING + HUNK_FRAMING)
+        );
+        // The framing is no less than what the encoding adds.
+        let item = lines_diff(&["", ""], 3);
+        let ToolItem::Diff(change) = &item else { unreachable!() };
+        let bare = serde_json::to_vec(&FileChange { hunks: Vec::new(), ..change.clone() }).unwrap().len();
+        assert!(serde_json::to_vec(change).unwrap().len() - bare <= item.wire_len() - 6);
+    }
+
+    /// `wire_len` of an output counts `ITEM_LIMIT`, its command and its
+    /// directory, whatever its text holds.
+    #[test]
+    fn the_wire_length_of_an_output_is_its_limit_command_and_directory() {
+        let empty = ToolItem::Output(Output::default());
+        assert_eq!(empty.wire_len(), ITEM_LIMIT + SIGNAL_RESERVE);
+        let full = ToolItem::Output(Output {
+            command: Some("cargo test".into()),
+            cwd: Some("/p".into()),
+            text: "x".repeat(ITEM_LIMIT),
+            omitted: 9,
+            partial: true,
+            exit: Some(Exit::Signal { name: "KILL".into() }),
+        });
+        assert_eq!(full.wire_len(), ITEM_LIMIT + 10 + 2 + SIGNAL_RESERVE);
+    }
+
+    /// `ContentBudget` keeps at most 32 items whose `wire_len`s add up to at
+    /// most `CALL_LIMIT`, trying later items after one that doesn't fit,
+    /// and counts the rest.
+    #[test]
+    fn a_content_budget_keeps_what_fits_and_counts_the_rest() {
+        let mut budget = ContentBudget::new();
+        let small = text_item("s");
+        for _ in 0..MAX_ITEMS {
+            assert!(budget.take(&small));
+        }
+        assert!(!budget.take(&small));
+        assert_eq!(budget.left_out(), 1);
+        // Three outputs fill most of it; a fourth doesn't fit, a small text
+        // after it still does.
+        let mut budget = ContentBudget::new();
+        let output = ToolItem::Output(Output::default());
+        assert!(budget.take(&output) && budget.take(&output) && budget.take(&output));
+        assert!(!budget.take(&output));
+        assert!(budget.take(&small));
+        assert!(!budget.take(&text_item(&"t".repeat(CALL_LIMIT))));
+        assert_eq!(budget.left_out(), 2);
+        assert!(ContentBudget::holding(&[output.clone(), output.clone(), output.clone()]).fits(&small));
+        assert!(!ContentBudget::holding(&[output.clone(), output.clone(), output.clone()]).fits(&output));
+    }
+
+    /// A replay of a tool entry of 32 small items sends one `ToolItems`; a
+    /// larger item goes alone.
+    #[test]
+    fn a_replay_groups_a_tool_entrys_items_by_the_live_split() {
+        let small: Vec<ToolItem> = (0..MAX_ITEMS).map(|n| text_item(&format!("{n}"))).collect();
+        let log = fold(&[added(1, tool_with("call_1", small.clone(), None))]).unwrap();
+        let replay = log.replay();
+        let pieces: Vec<&Event> = replay
+            .iter()
+            .filter(|event| matches!(event, Event::ToolItems { .. }))
+            .collect();
+        assert_eq!(pieces, [&items(1, 0, small)]);
+        let mixed = vec![
+            text_item("a"),
+            ToolItem::Output(Output::default()),
+            text_item(&"b".repeat(TEXT_CHUNK - 10)),
+            text_item(&"c".repeat(20)),
+        ];
+        let groups: Vec<usize> = item_pieces(&mixed).iter().map(|piece| piece.len()).collect();
+        assert_eq!(groups, [1, 1, 1, 1]);
+        let fits = vec![text_item(&"a".repeat(100)), text_item(&"b".repeat(TEXT_CHUNK - 100))];
+        assert_eq!(item_pieces(&fits).len(), 1);
+    }
+
+    /// A fold of grouped pieces equals a fold of one item an event, which is
+    /// how a format 2 checkpoint written before replays its tool entries.
+    #[test]
+    fn a_fold_of_grouped_pieces_equals_a_fold_of_one_item_an_event() {
+        let mut rng = XorShift::new(0xeb_0003);
+        for _ in 0..300 {
+            let content: Vec<ToolItem> =
+                (0..rng.below(12)).map(|_| crate::fuzz::tool_item(&mut rng)).collect();
+            let entry = tool_with("call_1", content, None);
+            let log = fold(&[added(1, entry)]).unwrap();
+            let Some(Entry::Tool { content, .. }) = log.entry(EntryId(1)) else {
+                unreachable!()
+            };
+            let mut one_each = vec![added(1, tool("call_1"))];
+            for (at, item) in content.iter().enumerate() {
+                one_each.push(items(1, at as u32, vec![item.clone()]));
+            }
+            let mut header = fold(&one_each).unwrap();
+            // The header's `more` is the entry's, as the replay's `Added`
+            // carries it.
+            if let Some(Entry::Tool { more, .. }) = log.entry(EntryId(1)) {
+                header.apply(&Event::ToolChanged {
+                    id: EntryId(1),
+                    title: None,
+                    kind: None,
+                    status: None,
+                    locations: None,
+                    input: None,
+                    result: None,
+                    more: Some(*more),
+                })
+                .unwrap();
+            }
+            assert_eq!(fold(&log.replay()).unwrap(), log);
+            assert_eq!(header.entry(EntryId(1)), log.entry(EntryId(1)));
+        }
+    }
+
+    /// A hunk value that starts at 0, or whose lines would be numbered past
+    /// `u32::MAX`, is a decode error; the last line number itself decodes.
+    #[test]
+    fn a_hunk_numbered_from_0_or_past_the_last_line_is_a_decode_error() {
+        let hunk = |old: u64, new: u64, lines: &[&str]| {
+            serde_json::json!({"event": "tool_items", "id": 1, "from": 0, "items": [
+                {"item": "diff", "op": "modify", "path": "/p",
+                 "hunks": [{"old_start": old, "new_start": new, "lines": lines}]}]})
+        };
+        let max = u64::from(u32::MAX);
+        for value in [
+            hunk(0, 1, &[" a"]),
+            hunk(1, 0, &["+a"]),
+            hunk(max, max, &[" a", " b"]),
+            hunk(max - 1, 1, &["-a", "-b", "-c"]),
+            hunk(1, max, &["+a", "+b"]),
+        ] {
+            let error = Event::from_value(&value).expect_err("a bad hunk");
+            assert!(error.to_string().contains("hunk"), "{error}");
+        }
+        for value in [
+            hunk(max, max, &[" a"]),
+            hunk(max, 1, &["+a", "+b"]),
+            hunk(1, max, &["-a", "-b"]),
+        ] {
+            assert!(Event::from_value(&value).is_ok(), "{value}");
+        }
     }
 }

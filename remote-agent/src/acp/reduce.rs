@@ -59,8 +59,9 @@ use brindle_transcript::{
     StopReason, TEXT_CHUNK, Transcript, TurnState, chunks, clean,
 };
 use brindle_transcript::{
-    CALL_LIMIT, DiffLine, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, Location, MAX_ITEMS,
-    MAX_LOCATIONS, Output as ToolOutputItem, RAW_LIMIT, ToolItem, ToolKind, ToolStatus,
+    ContentBudget, Exit, FileChange, FileOp, HoldReason, ITEM_LIMIT, Location, MAX_EVENT,
+    MAX_LOCATIONS, MAX_PATH, Output as ToolOutputItem, RAW_LIMIT, SIGNAL_RESERVE, ToolItem,
+    ToolKind, ToolStatus, item_pieces,
 };
 
 use super::{diff, plain};
@@ -72,6 +73,10 @@ use super::forms::{
     OfferedOption, OptionKey, OptionKind, OutputForm,
     Patch, Refusal, Request, RequestKind, ToolCall, ToolChange, ToolDetail, ToolItemForm,
     UNSUPPORTED_VERSION, Update,
+};
+use super::limits::{
+    ENTRY_LIMIT, MAX_PERMISSION_ID, MAX_PERMISSION_NAME, MAX_PERMISSION_OPTIONS, MAX_SESSION_ID,
+    MAX_TERMINAL_ID,
 };
 use super::lines::{Lines, Piece};
 use super::rpc::{self, Purpose, Rpc};
@@ -89,19 +94,9 @@ pub struct OpenOutput {
     pub filter: plain::State,
 }
 
-/// The most the log keeps, encoded (decision 14): past it the oldest
-/// entries are dropped whole, with a `Trimmed` event, down to
-/// [`LOG_TRIM_TO`].
-pub const LOG_LIMIT: usize = 16 * 1024 * 1024;
-
-/// What a trim leaves the log at, encoded: a low mark below [`LOG_LIMIT`],
-/// so a long conversation trims once per 4 MiB rather than once per entry,
-/// and each trim's whole checkpoint is rare (OpenSpec change
-/// `agents-log-paging`, decision 6).
-pub const LOG_TRIM_TO: usize = 12 * 1024 * 1024;
-
-/// The longest prompt taken, in bytes of UTF-8 (decision 10).
-pub const MAX_PROMPT: usize = 256 * 1024;
+// The log's bounds and the prompt's live with every other bound, in
+// `acp::limits`; re-exported here, where their readers have found them.
+pub use super::limits::{LOG_LIMIT, LOG_TRIM_TO, MAX_PROMPT};
 
 /// How long a run of lines that aren't ACP messages may go without another
 /// before its notice is written.
@@ -734,11 +729,18 @@ pub struct Output {
 
 /// Steps `session` with one input.
 pub fn step(session: &mut AgentSession, input: Input<'_>, now: Instant) -> Output {
+    run(session, input, now, MAX_EVENT)
+}
+
+/// [`step`] with the most one event may encode to as an argument, which
+/// the tests lower to reach the emit guard (`testing R7`: no environment).
+fn run(session: &mut AgentSession, input: Input<'_>, now: Instant, event_limit: usize) -> Output {
     let mut step = Step {
         s: session,
         out: Output::default(),
         fault: None,
         now,
+        event_limit,
     };
     match input {
         Input::Spawned => step.spawned(),
@@ -990,9 +992,12 @@ impl Ending {
 struct Step<'s> {
     s: &'s mut AgentSession,
     out: Output,
-    /// A fold error from this step's own events: the rest is skipped.
+    /// A fold error from this step's own events, or one too large to
+    /// send: the rest is skipped.
     fault: Option<String>,
     now: Instant,
+    /// The most one event may encode to: [`MAX_EVENT`], lower in tests.
+    event_limit: usize,
 }
 
 impl Step<'_> {
@@ -1008,9 +1013,16 @@ impl Step<'_> {
     // --- emitting -------------------------------------------------------
 
     /// Applies `event` and keeps it for the client; after a fold error,
-    /// does nothing.
+    /// does nothing. An event past the step's `event_limit` (the bounds in
+    /// `acp::limits` rule one out: I1) isn't applied, and fails the
+    /// session saying what it was (`agents-event-bounds` decision 4).
     fn emit(&mut self, event: Event) {
         if self.fault.is_some() {
+            return;
+        }
+        let len = event.encoded_len();
+        if len > self.event_limit {
+            self.fault = Some(oversized(&event, len, self.event_limit));
             return;
         }
         match self.s.transcript.apply(&event) {
@@ -1042,9 +1054,72 @@ impl Step<'_> {
         id
     }
 
-    /// Adds a text entry of `kind`, its text split into `Appended`s, and
-    /// makes it the chunk run.
+    /// Adds a text entry of `kind` holding `text` (continued in more
+    /// entries past [`ENTRY_LIMIT`]), and makes the last the chunk run.
+    /// The first entry's id.
     fn add_text(&mut self, kind: RunKind, text: &str) -> EntryId {
+        let id = self.s.transcript.next_id();
+        self.s.run = None;
+        self.text_run(kind, text);
+        id
+    }
+
+    /// Streams `text` into the chunk run of `kind` (`agents-event-bounds`
+    /// decision 2, A-1): appended to the run's entry while it holds less
+    /// than [`ENTRY_LIMIT`], and continued past it in a new entry of the
+    /// same kind, cut at the last line break in the room when there is
+    /// one, else at a character boundary. With no run of `kind`, it starts
+    /// one, even for no text. So no entry outgrows a trim's low mark, and
+    /// the log stays within [`LOG_LIMIT`] however long a reply.
+    fn text_run(&mut self, kind: RunKind, text: &str) {
+        let mut rest = text;
+        loop {
+            let open = self
+                .s
+                .run
+                .filter(|run| run.kind == kind)
+                // A run at an entry without text (a bug) appends to it
+                // anyway, so the fold refuses it and the handling fails.
+                .and_then(|run| {
+                    let entry = self.s.transcript.entry(run.entry)?;
+                    Some((run.entry, text_len(entry).unwrap_or(0)))
+                });
+            match open {
+                Some((entry, held)) => {
+                    if rest.is_empty() {
+                        return;
+                    }
+                    let (now, later) = within_room(rest, ENTRY_LIMIT.saturating_sub(held));
+                    for piece in chunks(now).filter(|piece| !piece.is_empty()) {
+                        self.emit(Event::Appended {
+                            id: entry,
+                            text: piece.to_owned(),
+                        });
+                    }
+                    rest = later;
+                    if !rest.is_empty() {
+                        // Full: the rest goes in a new entry.
+                        self.s.run = None;
+                    }
+                }
+                None => {
+                    // `rest` shrinks each time round unless it is empty,
+                    // when this is the last, so the loop ends whatever
+                    // `emit` did.
+                    let (now, later) = within_room(rest, ENTRY_LIMIT);
+                    self.new_text_entry(kind, now);
+                    rest = later;
+                    if rest.is_empty() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// A new text entry of `kind` holding `text`, split into `Appended`s,
+    /// made the chunk run.
+    fn new_text_entry(&mut self, kind: RunKind, text: &str) {
         let id = self.s.transcript.next_id();
         let mut pieces = chunks(text);
         let first = pieces.next().unwrap_or_default().to_owned();
@@ -1061,7 +1136,6 @@ impl Step<'_> {
             });
         }
         self.s.run = Some(Run { kind, entry: id });
-        id
     }
 
     fn notice(&mut self, level: NoticeLevel, text: String) {
@@ -1744,19 +1818,7 @@ impl Step<'_> {
         if text.is_empty() {
             return;
         }
-        if let Some(run) = self.s.run
-            && run.kind == kind
-            && self.s.transcript.entry(run.entry).is_some()
-        {
-            for piece in chunks(&text) {
-                self.emit(Event::Appended {
-                    id: run.entry,
-                    text: piece.to_owned(),
-                });
-            }
-        } else {
-            self.add_text(kind, &text);
-        }
+        self.text_run(kind, &text);
     }
 
     /// The tool entry for the agent's call id, when the log still has it.
@@ -1919,7 +1981,14 @@ impl Step<'_> {
     /// decisions 3 to 6), applied to `entry` with every bound before an
     /// event is made: its content, which replaces the entry's only when it
     /// differs; its locations and raw values; and its terminals' output.
-    fn tool_detail(&mut self, entry: EntryId, detail: ToolDetail) {
+    fn tool_detail(&mut self, entry: EntryId, mut detail: ToolDetail) {
+        // A terminal id past `MAX_TERMINAL_ID` is ignored: a cut one could
+        // merge two terminals (`agents-event-bounds` decision 3).
+        detail.outputs.retain(|form| match form {
+            OutputForm::Opened { terminal, .. }
+            | OutputForm::Appended { terminal, .. }
+            | OutputForm::Exited { terminal, .. } => terminal.len() <= MAX_TERMINAL_ID,
+        });
         let opened: BTreeMap<String, (Option<String>, Option<String>)> = detail
             .outputs
             .iter()
@@ -1931,7 +2000,7 @@ impl Step<'_> {
                 } => Some((
                     terminal.clone(),
                     (
-                        cwd.as_ref().map(|cwd| bound(clean(cwd))),
+                        cwd.as_deref().map(path_text),
                         command.as_ref().map(|command| bound(clean(command))),
                     ),
                 )),
@@ -1946,7 +2015,7 @@ impl Step<'_> {
             list.iter()
                 .take(MAX_LOCATIONS)
                 .map(|location| Location {
-                    path: bound(clean(&location.path)),
+                    path: path_text(&location.path),
                     line: location.line,
                 })
                 .collect()
@@ -1962,7 +2031,7 @@ impl Step<'_> {
                     command,
                 } => {
                     let command = command.map(|command| bound(clean(&command)));
-                    let cwd = cwd.map(|cwd| bound(clean(&cwd)));
+                    let cwd = cwd.as_deref().map(path_text);
                     match self.s.outputs.get(&terminal) {
                         None => {
                             let output = ToolOutputItem {
@@ -2007,7 +2076,7 @@ impl Step<'_> {
                             exit: exit.map(|exit| match exit {
                                 Exit::Code { code } => Exit::Code { code },
                                 Exit::Signal { name } => Exit::Signal {
-                                    name: bound(clean(&name)),
+                                    name: cut_at(clean(&name), SIGNAL_RESERVE).0,
                                 },
                             }),
                         });
@@ -2051,33 +2120,40 @@ impl Step<'_> {
         if !last || output.cwd.is_some() || output.command.is_some() {
             return;
         }
-        let output = ToolOutputItem {
+        let output = ToolItem::Output(ToolOutputItem {
             cwd,
             command,
             ..output.clone()
-        };
+        });
+        // Only when the described output still fits the call's budget
+        // beside the items before it (`agents-event-bounds` decision 3).
+        if !ContentBudget::holding(&content[..item as usize]).fits(&output) {
+            return;
+        }
         self.emit(Event::ToolItems {
             id: entry,
             from: item,
-            items: vec![ToolItem::Output(output)],
+            items: vec![output],
         });
     }
 
     /// Appends `output` to `entry`'s content and keeps it open for
-    /// `terminal`, unless the entry is at [`MAX_ITEMS`].
+    /// `terminal`, unless it doesn't fit the call's [`ContentBudget`]
+    /// beside the entry's items ([`MAX_ITEMS`], [`CALL_LIMIT`]).
     fn open_output(&mut self, entry: EntryId, terminal: String, output: ToolOutputItem) {
         let Some(Entry::Tool { content, .. }) = self.s.transcript.entry(entry) else {
             return;
         };
         let at = content.len();
-        if at >= MAX_ITEMS {
+        let output = ToolItem::Output(output);
+        if !ContentBudget::holding(content).fits(&output) {
             return;
         }
         let item = u32::try_from(at).unwrap_or(u32::MAX);
         self.emit(Event::ToolItems {
             id: entry,
             from: item,
-            items: vec![ToolItem::Output(output)],
+            items: vec![output],
         });
         self.keep_open(
             terminal,
@@ -2122,8 +2198,7 @@ impl Step<'_> {
         let (old, title) = (content.clone(), title.clone());
         let mut kept: Vec<ToolItem> = Vec::new();
         let mut terminals: Vec<(String, u32)> = Vec::new();
-        let mut more = 0u32;
-        let mut len = 0usize;
+        let mut budget = ContentBudget::new();
         for form in items {
             let item = match form {
                 ToolItemForm::Content(Content::Text(text)) => text_item(&text),
@@ -2138,19 +2213,17 @@ impl Step<'_> {
                             None => FileOp::Add,
                             Some(_) => FileOp::Modify,
                         },
-                        path: bound(clean(&path)),
-                        hunks: diffed
-                            .hunks
-                            .into_iter()
-                            .map(|mut hunk| {
-                                for line in &mut hunk.lines {
-                                    clean_line(line);
-                                }
-                                hunk
-                            })
-                            .collect(),
+                        path: path_text(&path),
+                        // Cleaned as `diff::hunks` keeps them.
+                        hunks: diffed.hunks,
                         omitted: diffed.omitted,
                     })
+                }
+                ToolItemForm::Terminal { terminal } if terminal.len() > MAX_TERMINAL_ID => {
+                    // Ignored, as its output is (`tool_detail`), and
+                    // counted.
+                    budget.leave_out();
+                    continue;
                 }
                 ToolItemForm::Terminal { terminal } => {
                     let open = self
@@ -2175,9 +2248,7 @@ impl Step<'_> {
                     output
                 }
             };
-            let item_len = item.text_len();
-            if kept.len() >= MAX_ITEMS || len.saturating_add(item_len) > CALL_LIMIT {
-                more = more.saturating_add(1);
+            if !budget.take(&item) {
                 if let Some((_, at)) = terminals.last()
                     && *at as usize == kept.len()
                 {
@@ -2185,9 +2256,9 @@ impl Step<'_> {
                 }
                 continue;
             }
-            len += item_len;
             kept.push(item);
         }
+        let more = budget.left_out();
         // The outputs of this entry the new list no longer names close.
         let named: Vec<&str> = terminals
             .iter()
@@ -2204,28 +2275,21 @@ impl Step<'_> {
         if from == kept.len() && from == old.len() {
             return Some(more);
         }
-        let mut at = from;
-        let mut pieces = vec![Vec::new()];
-        let mut piece_len = 0usize;
-        for item in kept.into_iter().skip(from) {
-            let item_len = item.text_len();
-            if piece_len > 0 && piece_len.saturating_add(item_len) > TEXT_CHUNK {
-                pieces.push(Vec::new());
-                piece_len = 0;
-            }
-            piece_len += item_len;
-            if let Some(piece) = pieces.last_mut() {
-                piece.push(item);
-            }
+        // In the pieces a replay sends too (`item_pieces`); a list that
+        // only shrinks is one empty piece.
+        let changed = kept.get(from..).unwrap_or_default();
+        let mut pieces = item_pieces(changed);
+        if pieces.is_empty() {
+            pieces.push(changed);
         }
+        let mut at = from;
         for items in pieces {
-            let count = items.len();
             self.emit(Event::ToolItems {
                 id: entry,
                 from: u32::try_from(at).unwrap_or(u32::MAX),
-                items,
+                items: items.to_vec(),
             });
-            at += count;
+            at += items.len();
         }
         for (terminal, item) in terminals {
             match self.s.outputs.get_mut(&terminal) {
@@ -2266,16 +2330,31 @@ impl Step<'_> {
             );
             return;
         };
+        // At most `MAX_PERMISSION_OPTIONS`, each with an id an answer can
+        // send back as it came (`agents-event-bounds` decision 3): one that
+        // is empty, past `MAX_PERMISSION_ID` or holds a control character
+        // is left out rather than cut, and counted.
         let mut options = Vec::new();
         let mut unknown = Vec::new();
+        let mut left_out = 0usize;
         for option in request.options {
             match option.kind {
-                OptionKind::Known(kind) => options.push(PermissionOption {
-                    id: option.id,
-                    name: bound(clean(&option.name)),
-                    kind,
-                }),
-                OptionKind::Unknown { name } => unknown.push(clean(&name)),
+                OptionKind::Known(kind) => {
+                    if options.len() >= MAX_PERMISSION_OPTIONS || !sendable_id(&option.id) {
+                        left_out += 1;
+                        continue;
+                    }
+                    options.push(PermissionOption {
+                        id: option.id,
+                        name: cut_at(clean(&option.name), MAX_PERMISSION_NAME).0,
+                        kind,
+                    });
+                }
+                OptionKind::Unknown { name } => {
+                    if unknown.len() < MAX_PERMISSION_OPTIONS {
+                        unknown.push(cut_at(clean(&name), MAX_PERMISSION_NAME).0);
+                    }
+                }
             }
         }
         // The request's tool call is applied first, so the entry its row
@@ -2315,6 +2394,14 @@ impl Step<'_> {
                 format!(
                     "permission request {entry} also offered options of a kind Brindle doesn't know ({}), which aren't shown",
                     unknown.join(", ")
+                ),
+            );
+        }
+        if left_out > 0 {
+            self.notice(
+                NoticeLevel::Info,
+                format!(
+                    "permission request {entry}: {left_out} of its options were left out, past {MAX_PERMISSION_OPTIONS} or with an id Brindle can't send back"
                 ),
             );
         }
@@ -2655,6 +2742,18 @@ impl Step<'_> {
         let greeting = greeting.clone();
         match result {
             Ok(result) => match self.s.rpc.dialect().new_session_result(result) {
+                // Every later request sends the id back, and the
+                // conversation names it: one past `MAX_SESSION_ID` can't be
+                // cut, so the start fails (`agents-event-bounds` decision 3).
+                Ok(created) if created.session_id.is_empty()
+                    || created.session_id.len() > MAX_SESSION_ID
+                    || created.session_id.chars().any(char::is_control) =>
+                {
+                    self.refuse(
+                        "the agent's session id is longer than 1 KiB, or isn't one Brindle can send back"
+                            .to_owned(),
+                    );
+                }
                 Ok(created) => self.ready(created.session_id, greeting, None, created.offered),
                 Err(_) => self.refuse(
                     "the agent's answer to session/new isn't one Brindle can read".to_owned(),
@@ -2878,6 +2977,9 @@ impl Step<'_> {
     fn prompted(&mut self, result: Result<&Value, &RpcError>) {
         match result {
             Ok(result) => match self.s.rpc.dialect().prompt_result(result) {
+                Ok(StopReason::Other { name }) => self.end_turn(Ending::Stop(StopReason::Other {
+                    name: bound(clean(&name)),
+                })),
                 Ok(stop) => self.end_turn(Ending::Stop(stop)),
                 Err(_) => self.end_turn(Ending::Failed(
                     "the agent's answer to the prompt isn't one Brindle can read".to_owned(),
@@ -3642,12 +3744,19 @@ fn text_item(text: &str) -> ToolItem {
 }
 
 /// A raw input or result, cleaned, its end dropped past [`RAW_LIMIT`] with
-/// `…`.
+/// `…`. Cut before it is cleaned, so a long one costs only its bound
+/// (`agents-event-bounds` decision 5); cleaning can lengthen the kept
+/// part, which is cut again.
 fn raw_text(text: &str) -> String {
     let ellipsis = "…";
-    match cut_at(clean(text), RAW_LIMIT) {
-        (text, false) => text,
-        (text, true) => {
+    let mut prefix = RAW_LIMIT.min(text.len());
+    while !text.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let was_cut = prefix < text.len();
+    match cut_at(clean(&text[..prefix]), RAW_LIMIT) {
+        (text, false) if !was_cut => text,
+        (text, _) => {
             let (mut text, _) = cut_at(text, RAW_LIMIT - ellipsis.len());
             text.push_str(ellipsis);
             text
@@ -3655,10 +3764,72 @@ fn raw_text(text: &str) -> String {
     }
 }
 
-/// A diff line's text, cleaned as every text is.
-fn clean_line(line: &mut DiffLine) {
-    let (DiffLine::Context(text) | DiffLine::Added(text) | DiffLine::Removed(text)) = line;
-    *text = clean(text);
+/// Why an event of `len` bytes, past `limit`, wasn't sent: its kind (an
+/// added one's entry kind too) and the entry it is for, or the session's.
+fn oversized(event: &Event, len: usize, limit: usize) -> String {
+    let kind = event.kind();
+    let entry = match event {
+        Event::Added { id, entry } => Some((*id, Some(entry.kind()))),
+        Event::Appended { id, .. }
+        | Event::ToolChanged { id, .. }
+        | Event::ToolItems { id, .. }
+        | Event::ToolOutput { id, .. }
+        | Event::Answered { id, .. } => Some((*id, None)),
+        Event::Queue { .. }
+        | Event::Turn { .. }
+        | Event::Agent { .. }
+        | Event::Conversation { .. }
+        | Event::Trimmed { .. }
+        | Event::Window { .. }
+        | Event::Commands { .. }
+        | Event::Options { .. } => None,
+    };
+    let rest = format!("is {len} bytes; one transcript event may be at most {limit}");
+    match entry {
+        Some((id, entry_kind)) => {
+            let article = if kind.starts_with(['a', 'e', 'i', 'o', 'u']) { "an" } else { "a" };
+            let entry_kind = entry_kind.map(|kind| format!(" ({kind})")).unwrap_or_default();
+            format!("{article} {kind}{entry_kind} event for entry {id} {rest}")
+        }
+        None => format!("the session's {kind} event {rest}"),
+    }
+}
+
+/// Whether an id from the agent can be kept and sent back as it came: not
+/// empty, at most [`MAX_PERMISSION_ID`] bytes, and no control character
+/// (so it encodes to at most twice its bytes, as cleaned text does).
+fn sendable_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_PERMISSION_ID && !id.chars().any(char::is_control)
+}
+
+/// The bytes a user, agent or thought entry's text holds; `None` for any
+/// other entry.
+fn text_len(entry: &Entry) -> Option<usize> {
+    match entry {
+        Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => Some(text.len()),
+        Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
+    }
+}
+
+/// `text` split where an entry with `room` bytes left fills: all of it
+/// when it fits; else up to the last line break within `room` when there
+/// is one, or the last character boundary within it.
+fn within_room(text: &str, room: usize) -> (&str, &str) {
+    if text.len() <= room {
+        return (text, "");
+    }
+    let mut cut = room;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let cut = text[..cut].rfind('\n').map_or(cut, |at| at + 1);
+    text.split_at(cut)
+}
+
+/// A path or a directory, cleaned and cut at [`MAX_PATH`]
+/// (`agents-event-bounds` decision 3).
+fn path_text(path: &str) -> String {
+    cut_at(clean(path), MAX_PATH).0
 }
 
 /// A tool entry's fields beyond its row that an update changes; `None`
@@ -3673,9 +3844,10 @@ struct ToolFields {
 
 #[cfg(test)]
 mod tests {
+    use super::super::limits::FIELD_LIMIT;
     use super::*;
     use brindle_remote_protocol::serde_json::{self, json};
-    use brindle_transcript::{Activity, PermissionKind};
+    use brindle_transcript::{Activity, CALL_LIMIT, DiffLine, MAX_ITEMS, PermissionKind};
 
     /// An agent session under test, with a client's copy of its log folded
     /// from every event `step` returned (checked equal to the session's
@@ -3686,6 +3858,8 @@ mod tests {
         now: Instant,
         events: Vec<Event>,
         sent: Vec<Value>,
+        /// The emit guard's limit, `MAX_EVENT` unless a test lowers it.
+        event_limit: usize,
     }
 
     impl Agent {
@@ -3700,6 +3874,7 @@ mod tests {
                 now: Instant::now(),
                 events: Vec::new(),
                 sent: Vec::new(),
+                event_limit: MAX_EVENT,
             }
         }
 
@@ -3727,7 +3902,7 @@ mod tests {
         }
 
         fn step(&mut self, input: Input<'_>) -> Output {
-            let out = step(&mut self.s, input, self.now);
+            let out = run(&mut self.s, input, self.now, self.event_limit);
             for event in &out.events {
                 assert_eq!(Event::from_value(&event.to_value()).as_ref(), Ok(event));
                 self.client
@@ -4009,6 +4184,7 @@ mod tests {
             out: Output::default(),
             fault: None,
             now: agent.now,
+            event_limit: MAX_EVENT,
         };
         step.tool_change(change(Patch::Keep, Patch::Keep, Patch::Keep));
         step.tool_change(change(Patch::Clear, Patch::Clear, Patch::Clear));
@@ -4237,6 +4413,7 @@ mod tests {
             out: Output::default(),
             fault: None,
             now: agent.now,
+            event_limit: MAX_EVENT,
         };
         step.respawn(Start::New);
         assert!(agent.s.outputs.is_empty());
@@ -4337,6 +4514,7 @@ mod tests {
             out: Output::default(),
             fault: None,
             now: agent.now,
+            event_limit: MAX_EVENT,
         };
         let filler = "f".repeat(TEXT_CHUNK);
         while step.s.transcript.encoded_len() <= LOG_LIMIT {
@@ -6691,7 +6869,7 @@ mod tests {
                     ..
                 } = &entry
                 {
-                    let len: usize = content.iter().map(ToolItem::text_len).sum();
+                    let len: usize = content.iter().map(ToolItem::wire_len).sum();
                     assert!(content.len() <= MAX_ITEMS && len <= CALL_LIMIT, "{name}");
                     assert_eq!(*more, 0, "{name}");
                     assert!(locations.len() <= MAX_LOCATIONS, "{name}");
@@ -9180,5 +9358,461 @@ mod tests {
         agent.exit();
         assert_eq!(agent.feed(&result(id, json!({}))), Output::default());
         assert!(agent.s.transcript.options().is_empty());
+    }
+
+    // --- the bounds in sum (OpenSpec change `agents-event-bounds`) ------
+
+    fn assert_events_fit(out: &Output) {
+        for event in &out.events {
+            let len = event.to_value().to_string().len();
+            assert!(
+                len <= brindle_transcript::MAX_EVENT,
+                "an event of {len} bytes: {}",
+                shape(std::slice::from_ref(event))[0]
+            );
+        }
+    }
+
+    /// A 300,000-line empty diff makes no event past `MAX_EVENT` (A-2,
+    /// task 1.4).
+    #[test]
+    fn a_300000_line_empty_diff_makes_no_event_past_the_limit() {
+        let mut agent = Agent::ready();
+        agent.turn("write");
+        let new = "\n".repeat(300_000);
+        let out = agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "Write",
+            "content": [{"type": "diff", "path": "/p/empty.txt", "oldText": null, "newText": new}]})));
+        assert_events_fit(&out);
+    }
+
+    /// A permission with 20 options named with 64 KiB each makes no event
+    /// past `MAX_EVENT` (A-2, task 1.4).
+    #[test]
+    fn a_permission_of_20_long_named_options_makes_no_event_past_the_limit() {
+        let mut agent = Agent::ready();
+        agent.turn("ask");
+        let name = "n".repeat(64 * 1024);
+        let options: Vec<Value> = (0..20)
+            .map(|n| json!({"optionId": format!("o{n}"), "name": name, "kind": "allow_once"}))
+            .collect();
+        let out = agent.feed(
+            &json!({"jsonrpc": "2.0", "id": 90, "method": "session/request_permission",
+                "params": {"sessionId": "s1", "toolCall": {"toolCallId": "c1", "title": "Write"}, "options": options}})
+            .to_string(),
+        );
+        assert_events_fit(&out);
+    }
+
+    /// A 20 MiB thought streamed in 64 KiB chunks leaves the log within
+    /// `LOG_LIMIT` after every step (A-1, tasks 1.4 and 4.3), and the
+    /// session's checkpoint encodes.
+    #[test]
+    fn a_20_mib_thought_leaves_the_log_within_its_limit_after_every_step() {
+        let mut agent = Agent::ready();
+        agent.turn("think");
+        let piece = "t".repeat(64 * 1024);
+        for _ in 0..(20 * 16) {
+            agent.feed(&chunk("agent_thought_chunk", &piece));
+            let len = agent.s.transcript.encoded_len();
+            assert!(len <= LOG_LIMIT, "a log of {len} bytes");
+        }
+        assert!(super::super::checkpoint::encode(&agent.s).is_ok());
+    }
+
+    /// The texts of the entries after the first (the prompt).
+    fn replies(agent: &Agent) -> Vec<String> {
+        agent
+            .entries()
+            .into_iter()
+            .skip(1)
+            .map(|entry| match entry {
+                Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => text,
+                other => panic!("not text: {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Lines of 100 bytes, `len` bytes in all.
+    fn lined(len: usize) -> String {
+        let line = format!("{}\n", "r".repeat(99));
+        line.repeat(len.div_ceil(100))[..len].to_owned()
+    }
+
+    /// A 2.5 MiB reply streamed in 32 KiB chunks becomes three agent
+    /// entries of at most `ENTRY_LIMIT`, whose texts joined are the reply,
+    /// each cut at a line break when one lies in the room (task 4.3). A
+    /// chunk that fits whole is kept whole: 32 of 32 KiB fill an entry
+    /// exactly, mid-line, and the next starts a new entry; chunks of
+    /// 30,000 bytes cross the limit, and the crossing one is cut at its
+    /// last line break in the room.
+    #[test]
+    fn a_long_reply_continues_in_new_entries_cut_at_line_breaks() {
+        let reply = lined(5 * 512 * 1024);
+        for size in [32 * 1024, 30_000] {
+            let mut agent = Agent::ready();
+            agent.turn("go");
+            for piece in reply.as_bytes().chunks(size) {
+                agent.feed(&said(std::str::from_utf8(piece).expect("ASCII")));
+            }
+            let texts = replies(&agent);
+            assert_eq!(texts.len(), 3, "{size}");
+            assert!(agent.entries()[1..].iter().all(|entry| matches!(entry, Entry::Agent { .. })));
+            assert!(texts.iter().all(|text| text.len() <= ENTRY_LIMIT), "{size}");
+            assert_eq!(texts.concat(), reply, "{size}");
+            if size == 30_000 {
+                assert!(texts[..2].iter().all(|text| text.ends_with('\n')));
+            } else {
+                assert_eq!(texts[0].len(), ENTRY_LIMIT);
+            }
+        }
+        // Without a line break in the room, at a character boundary.
+        let mut agent = Agent::ready();
+        agent.turn("go");
+        let flat = "é".repeat(ENTRY_LIMIT / 2 + 10);
+        for piece in flat.as_bytes().chunks(32 * 1024) {
+            agent.feed(&said(std::str::from_utf8(piece).expect("even cuts of é")));
+        }
+        let texts = replies(&agent);
+        assert_eq!(texts.len(), 2);
+        assert_eq!(texts[0].len(), ENTRY_LIMIT);
+        assert_eq!(texts.concat(), flat);
+    }
+
+    /// A reply of exactly `ENTRY_LIMIT` stays one entry, as before.
+    #[test]
+    fn a_1_mib_reply_stays_one_entry() {
+        let mut agent = Agent::ready();
+        agent.turn("go");
+        let reply = lined(ENTRY_LIMIT);
+        for piece in reply.as_bytes().chunks(32 * 1024) {
+            agent.feed(&said(std::str::from_utf8(piece).expect("ASCII")));
+        }
+        assert_eq!(replies(&agent), [reply]);
+    }
+
+    /// A permission request of `options`, as `(id, name, kind)`.
+    fn asking(options: &[(String, String, &str)]) -> String {
+        let options: Vec<Value> = options
+            .iter()
+            .map(|(id, name, kind)| json!({"optionId": id, "name": name, "kind": kind}))
+            .collect();
+        json!({"jsonrpc": "2.0", "id": 90, "method": "session/request_permission",
+            "params": {"sessionId": "s1", "toolCall": {"toolCallId": "c1", "title": "Write"}, "options": options}})
+        .to_string()
+    }
+
+    fn permission_options(agent: &Agent) -> Vec<PermissionOption> {
+        agent
+            .entries()
+            .into_iter()
+            .find_map(|entry| match entry {
+                Entry::Permission { options, .. } => Some(options),
+                _ => None,
+            })
+            .expect("a permission entry")
+    }
+
+    /// A permission with 20 options of 64 KiB names keeps 16, names cut at
+    /// 4 KiB, and a notice says 4 were left out (task 4.4).
+    #[test]
+    fn a_permission_keeps_16_options_their_names_cut() {
+        let mut agent = Agent::ready();
+        agent.turn("ask");
+        let name = "n".repeat(64 * 1024);
+        let options: Vec<(String, String, &str)> =
+            (0..20).map(|n| (format!("o{n}"), name.clone(), "allow_once")).collect();
+        agent.feed(&asking(&options));
+        let kept = permission_options(&agent);
+        assert_eq!(kept.len(), MAX_PERMISSION_OPTIONS);
+        assert_eq!(kept[15].id, "o15");
+        assert!(kept.iter().all(|option| option.name.len() == MAX_PERMISSION_NAME));
+        assert!(
+            agent.notices().iter().any(|text| text.contains("4 of its options were left out")),
+            "{:?}",
+            agent.notices()
+        );
+    }
+
+    /// An option whose id is 2 KiB, empty or holds `\u{1b}` is left out,
+    /// and a request left with none is answered `cancelled` (task 4.4).
+    #[test]
+    fn an_option_whose_id_cant_be_sent_back_is_left_out() {
+        let mut agent = Agent::ready();
+        agent.turn("ask");
+        let bad = |id: String| (id, "Allow".to_owned(), "allow_once");
+        agent.feed(&asking(&[
+            bad("i".repeat(2048)),
+            bad(String::new()),
+            bad("a\u{1b}b".into()),
+            bad("ok".into()),
+        ]));
+        let kept = permission_options(&agent);
+        assert_eq!(kept.iter().map(|option| option.id.as_str()).collect::<Vec<_>>(), ["ok"]);
+        let mut agent = Agent::ready();
+        agent.turn("ask");
+        agent.feed(&asking(&[bad("i".repeat(2048)), bad(String::new())]));
+        let answer = agent
+            .sent
+            .iter()
+            .rev()
+            .find(|line| line["id"] == 90)
+            .expect("the request answered");
+        assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
+    }
+
+    /// A terminal id of 2 KiB is ignored: its output isn't kept (task 4.4).
+    #[test]
+    fn a_terminal_id_past_its_bound_is_ignored() {
+        let mut agent = Agent::ready();
+        agent.turn("run");
+        let terminal = "t".repeat(2048);
+        agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "run",
+            "kind": "execute", "status": "in_progress", "content": [{"type": "terminal", "terminalId": terminal}],
+            "_meta": {"terminal_info": {"terminal_id": terminal, "cwd": "/w"}}})));
+        agent.feed(&meta(
+            "c1",
+            json!({"terminal_output_delta": {"terminal_id": terminal, "data": "out\n"}}),
+        ));
+        assert!(agent.s.outputs.is_empty());
+        let Entry::Tool { content, more, .. } = tool_entry(&agent, "c1") else {
+            panic!("a tool entry");
+        };
+        assert!(content.is_empty(), "{content:?}");
+        assert_eq!(more, 1, "the terminal item is counted left out");
+    }
+
+    /// 40 locations of 64 KiB paths keep 32, each cut at `MAX_PATH`.
+    #[test]
+    fn locations_keep_32_their_paths_cut() {
+        let mut agent = Agent::ready();
+        agent.turn("read");
+        let path = format!("/{}", "p".repeat(64 * 1024));
+        let locations: Vec<Value> = (0..40).map(|_| json!({"path": path})).collect();
+        let out = agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1",
+            "title": "Read", "locations": locations})));
+        assert_events_fit(&out);
+        let Entry::Tool { locations, .. } = tool_entry(&agent, "c1") else {
+            panic!("a tool entry");
+        };
+        assert_eq!(locations.len(), MAX_LOCATIONS);
+        assert!(locations.iter().all(|location| location.path.len() == MAX_PATH));
+    }
+
+    /// A fourth full output in one call is counted in `more`, not opened:
+    /// three fill `CALL_LIMIT` as `wire_len` counts them (task 4.4).
+    #[test]
+    fn a_fourth_output_in_one_call_is_counted_in_more() {
+        let mut agent = Agent::ready();
+        agent.turn("run");
+        let content: Vec<Value> =
+            (0..4).map(|n| json!({"type": "terminal", "terminalId": format!("t{n}")})).collect();
+        agent.feed(&update(json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "run",
+            "kind": "execute", "status": "in_progress", "content": content,
+            "_meta": {"terminal_info": {"terminal_id": "t0", "cwd": "/w"}}})));
+        let Entry::Tool { content, more, .. } = tool_entry(&agent, "c1") else {
+            panic!("a tool entry");
+        };
+        assert_eq!(content.len(), 3);
+        assert_eq!(more, 1);
+        assert!(!agent.s.outputs.contains_key("t3"));
+        // Nor does output for a terminal nothing opened open past it.
+        agent.feed(&meta(
+            "c1",
+            json!({"terminal_output_delta": {"terminal_id": "t9", "data": "x"}}),
+        ));
+        assert!(!agent.s.outputs.contains_key("t9"));
+        assert_eq!(content_of(&tool_entry(&agent, "c1")).len(), 3);
+    }
+
+    /// A `session/new` answer with a 2 KiB session id fails the start
+    /// saying why, and nothing is sent in its name (task 4.4).
+    #[test]
+    fn a_session_id_past_its_bound_fails_the_start() {
+        for id in ["s".repeat(2048), String::new(), "s\u{1b}1".into()] {
+            let mut agent = Agent::new();
+            agent.step(Input::Spawned);
+            agent.feed(&result(
+                1,
+                json!({"protocolVersion": 1, "agentInfo": {"name": "fake", "version": "1.0"}}),
+            ));
+            let sent = agent.sent.len();
+            agent.feed(&result(2, json!({"sessionId": id})));
+            assert!(
+                matches!(agent.agent_state(), AgentState::Failed { message }
+                    if message == "the agent's session id is longer than 1 KiB, or isn't one Brindle can send back"),
+                "{id:?}: {:?}",
+                agent.agent_state()
+            );
+            assert!(agent.prompt("hi").reply.is_some_and(|reply| reply.is_err()));
+            assert_eq!(agent.sent.len(), sent, "{id:?}: nothing sent in its name");
+        }
+    }
+
+    /// A stop reason named with 100 KiB is cut to `FIELD_LIMIT`.
+    #[test]
+    fn a_long_stop_reasons_name_is_cut() {
+        let mut agent = Agent::ready();
+        let id = agent.turn("go");
+        agent.prompt("next");
+        let out = agent.end(id, &"z".repeat(100 * 1024));
+        assert_events_fit(&out);
+        let TurnState::Ended {
+            stop: StopReason::Other { name },
+        } = agent.turn_state()
+        else {
+            panic!("{:?}", agent.turn_state());
+        };
+        assert_eq!(name.len(), FIELD_LIMIT);
+    }
+
+    /// The piece split counts an output's command and directory, so an
+    /// output with a 60 KiB command and a 10 KiB text item go in two
+    /// `ToolItems` (task 4.4).
+    #[test]
+    fn the_piece_split_counts_an_outputs_command_and_directory() {
+        let mut agent = Agent::ready();
+        agent.turn("run");
+        agent.feed(&tool_call("c1", "run", "in_progress"));
+        let out = agent.feed(&update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "x".repeat(10 * 1024)}},
+                {"type": "terminal", "terminalId": "t1"},
+            ],
+            "_meta": {"terminal_info": {"terminal_id": "t1", "cwd": "/w", "command": "c".repeat(60 * 1024)}}})));
+        let pieces: Vec<usize> = out
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolItems { items, .. } => Some(items.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pieces, [1, 1]);
+    }
+
+    /// `raw_text` of a long value holding controls ends with `…` within
+    /// `RAW_LIMIT`, as it did when it cleaned the whole value first; one
+    /// within the limit is only cleaned (task 4.6).
+    #[test]
+    fn raw_text_cuts_a_long_value_with_an_ellipsis_within_its_limit() {
+        for long in [
+            "\u{1}".repeat(100_000),
+            format!("{}\u{1}", "r".repeat(RAW_LIMIT)),
+            "é".repeat(RAW_LIMIT),
+        ] {
+            let text = raw_text(&long);
+            assert!(text.len() <= RAW_LIMIT, "{}", text.len());
+            assert!(text.ends_with('…'));
+            let old = match cut_at(clean(&long), RAW_LIMIT) {
+                (text, false) => text,
+                (text, true) => format!("{}…", cut_at(text, RAW_LIMIT - "…".len()).0),
+            };
+            assert_eq!(text, old);
+        }
+        assert_eq!(raw_text("a\u{1}b"), "a\u{fffd}b");
+        assert_eq!(raw_text(&"r".repeat(RAW_LIMIT)), "r".repeat(RAW_LIMIT));
+    }
+
+    // --- the emit guard (task 4.5, design decision 4) -------------------
+
+    /// The guard's limit these tests set: room for `fail`'s own events.
+    const LOW_LIMIT: usize = 600;
+
+    fn failure(agent: &Agent) -> String {
+        match agent.agent_state() {
+            AgentState::Failed { message } => message.clone(),
+            other => panic!("not failed: {other:?}"),
+        }
+    }
+
+    /// An `Added` past the limit is not applied, and the session fails
+    /// naming it, its entry and both sizes; after it the step emits only
+    /// `fail`'s events, which the client folds to the server's log.
+    #[test]
+    fn an_added_event_past_the_limit_fails_the_session_naming_it() {
+        let mut agent = Agent::ready();
+        agent.turn("go");
+        agent.event_limit = LOW_LIMIT;
+        let title = "T".repeat(1000);
+        let event = Event::Added {
+            id: EntryId(2),
+            entry: Entry::tool("c1".into(), title.clone(), ToolKind::Edit, ToolStatus::Pending),
+        };
+        let len = event.encoded_len();
+        let out = agent.feed(&tool_call("c1", &title, "pending"));
+        assert_eq!(shape(&out.events), ["turn failed", "agent failed"]);
+        assert_eq!(
+            failure(&agent),
+            format!(
+                "ACP handling failed: an added (tool) event for entry 2 is {len} bytes; one transcript event may be at most {LOW_LIMIT}"
+            )
+        );
+        assert!(agent.s.transcript.entry(EntryId(2)).is_none(), "not applied");
+    }
+
+    /// An `Appended` past the limit fails the session naming `appended`,
+    /// its entry and its size.
+    #[test]
+    fn an_appended_event_past_the_limit_fails_the_session_naming_it() {
+        let mut agent = Agent::ready();
+        agent.turn("go");
+        agent.feed(&said("hi"));
+        agent.event_limit = LOW_LIMIT;
+        let text = "a".repeat(1000);
+        let len = Event::Appended {
+            id: EntryId(2),
+            text: text.clone(),
+        }
+        .encoded_len();
+        let out = agent.feed(&said(&text));
+        assert_eq!(shape(&out.events), ["turn failed", "agent failed"]);
+        assert_eq!(
+            failure(&agent),
+            format!(
+                "ACP handling failed: an appended event for entry 2 is {len} bytes; one transcript event may be at most {LOW_LIMIT}"
+            )
+        );
+        assert_eq!(agent.entries()[1], Entry::Agent { text: "hi".into() });
+    }
+
+    /// A `Queue` event past the limit fails the session naming the
+    /// session's queue event.
+    #[test]
+    fn a_queue_event_past_the_limit_fails_the_session_naming_it() {
+        let mut agent = Agent::ready();
+        agent.turn("go");
+        agent.event_limit = LOW_LIMIT;
+        let text = "q".repeat(1000);
+        let len = Event::Queue {
+            slot: Slot::Waiting { text: text.clone() },
+        }
+        .encoded_len();
+        let out = agent.prompt(&text);
+        assert_eq!(shape(&out.events), ["turn failed", "agent failed"]);
+        assert_eq!(
+            failure(&agent),
+            format!(
+                "ACP handling failed: the session's queue event is {len} bytes; one transcript event may be at most {LOW_LIMIT}"
+            )
+        );
+        assert_eq!(*agent.slot(), Slot::Empty);
+    }
+
+    /// A shown `session/load` replay of a 1.5 MiB user message gives two
+    /// user entries.
+    #[test]
+    fn a_shown_replay_of_a_long_user_message_gives_two_user_entries() {
+        let mut agent = Agent::new();
+        agent.s = AgentSession::continuing(conversation_s1(Continuation::Load), "0.3.0".into());
+        agent.step(Input::Spawned);
+        agent.feed(&initialized(1, both()));
+        let message = lined(3 * 512 * 1024);
+        for piece in message.as_bytes().chunks(32 * 1024) {
+            agent.feed(&chunk("user_message_chunk", std::str::from_utf8(piece).expect("ASCII")));
+        }
+        let texts = replies(&agent);
+        assert_eq!(texts.len(), 2);
+        assert!(agent.entries()[1..].iter().all(|entry| matches!(entry, Entry::User { .. })));
+        assert_eq!(texts.concat(), message);
     }
 }

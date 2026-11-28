@@ -749,18 +749,28 @@ impl Transcript {
     }
 }
 
+/// The most a `TRANSCRIPT` takes around its events:
+/// `{"session":4294967295,"events":[]}`, the longest session id's; each
+/// event after the first adds a comma.
+pub const TRANSCRIPT_ENVELOPE: usize = 34;
+
+/// The most an `AGENT_PAGE` takes around its events:
+/// `{"req":18446744073709551615,"session":4294967295,"events":[],
+/// "last":{"more":false}}`, the longest ids'. No smaller than
+/// [`TRANSCRIPT_ENVELOPE`], so an event that fits a page fits a
+/// `TRANSCRIPT` (`acp::limits` I1 in `brindle-remote-agent`).
+pub const AGENT_PAGE_ENVELOPE: usize = 83;
+
 /// The `TRANSCRIPT` messages that carry `events` for `session` in order,
 /// each holding whole events and fitting one frame. An event that can't fit
 /// a frame on its own is an `InvalidInput` error, as is one that isn't a
-/// JSON object.
+/// JSON object; the core's reducer keeps every event within
+/// `brindle_transcript::MAX_EVENT`, which fits (`acp::limits` I1).
 pub fn pack_transcript(
     session: SessionId,
     events: Vec<serde_json::Value>,
 ) -> io::Result<Vec<Transcript>> {
-    // `{"session":4294967295,"events":[]}`, the longest session id's; each
-    // event after the first adds a comma.
-    const ENVELOPE: usize = 34;
-    Ok(pack_events(session, events, ENVELOPE)?
+    Ok(pack_events(session, events, TRANSCRIPT_ENVELOPE)?
         .into_iter()
         .map(|events| Transcript { session, events })
         .collect())
@@ -776,10 +786,7 @@ pub fn pack_page(
     events: Vec<serde_json::Value>,
     more: bool,
 ) -> io::Result<Vec<AgentPage>> {
-    // `{"req":18446744073709551615,"session":4294967295,"events":[],
-    // "last":{"more":false}}`, the longest ids'.
-    const ENVELOPE: usize = 83;
-    let mut pages: Vec<AgentPage> = pack_events(session, events, ENVELOPE)?
+    let mut pages: Vec<AgentPage> = pack_events(session, events, AGENT_PAGE_ENVELOPE)?
         .into_iter()
         .map(|events| AgentPage {
             req,
@@ -803,7 +810,10 @@ pub fn pack_page(
 }
 
 /// `events` cut into groups of whole events that each fit a frame with an
-/// `envelope` of that many bytes around them.
+/// `envelope` of that many bytes around them. One event too large for a
+/// frame alone is an error; the server's reducer keeps every event within
+/// `brindle_transcript::MAX_EVENT`, which leaves at least
+/// [`AGENT_PAGE_ENVELOPE`] (the server's `acp::limits`, invariant I1).
 fn pack_events(
     session: SessionId,
     events: Vec<serde_json::Value>,
@@ -2085,6 +2095,25 @@ mod tests {
         let largest = serde_json::json!({"t": "x".repeat(fill)});
         let packed = pack_transcript(u32::MAX, vec![largest]).unwrap();
         assert!(ToClient::Transcript(packed[0].clone()).encode().is_ok());
+    }
+
+    /// Each envelope constant equals the encoded length of an empty batch
+    /// with the largest ids (OpenSpec change `agents-event-bounds`).
+    #[test]
+    fn each_envelope_is_an_empty_batchs_length_with_the_largest_ids() {
+        let transcript = Transcript {
+            session: u32::MAX,
+            events: Vec::new(),
+        };
+        assert_eq!(serde_json::to_vec(&transcript).unwrap().len(), TRANSCRIPT_ENVELOPE);
+        let page = AgentPage {
+            req: u64::MAX,
+            session: u32::MAX,
+            events: Vec::new(),
+            last: Some(PageEnd { more: false }),
+        };
+        assert_eq!(serde_json::to_vec(&page).unwrap().len(), AGENT_PAGE_ENVELOPE);
+        const { assert!(AGENT_PAGE_ENVELOPE >= TRANSCRIPT_ENVELOPE) };
     }
 
     #[test]

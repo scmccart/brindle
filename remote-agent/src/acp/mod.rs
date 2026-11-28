@@ -15,6 +15,9 @@
 //! - [`v1`]: ACP v1 decoded into the forms through the schema crate's types,
 //!   and the forms' requests encoded as v1 lines.
 //! - [`diff`]: a file change's hunks from its old and new text.
+//! - [`limits`]: the bounds on what a session holds and sends, and the
+//!   invariants they add up to (every event fits a frame, every
+//!   checkpoint fits a holder).
 //! - [`lines`]: stdout split into bounded lines ([`lines::Lines`]).
 //! - [`plain`]: a command's output as plain text.
 //! - [`rpc`]: the request bookkeeping ([`rpc::Rpc`]), which keeps the
@@ -33,6 +36,7 @@ pub mod dialect;
 pub mod diff;
 pub mod envelope;
 pub mod forms;
+pub mod limits;
 pub mod lines;
 pub mod plain;
 pub mod reduce;

@@ -4,7 +4,9 @@
 //! the same hunks in every core (`only_the_diff_module_names_similar`).
 //! The only file naming `similar` (`ports R3`).
 
-use brindle_transcript::{DiffLine, Hunk, ITEM_LIMIT};
+use brindle_transcript::{
+    DiffLine, HUNK_FRAMING, Hunk, ITEM_LIMIT, LINE_FRAMING, clean, cleaned_len,
+};
 use similar::algorithms::{Capture, Replace, myers};
 use similar::{DiffTag, group_diff_ops};
 
@@ -26,20 +28,32 @@ pub struct Diffed {
 
 /// The hunks that turn `old` into `new`, three lines of context around
 /// each change, starts counted from 1 and lines without their `\n` (a
-/// trailing `\r` stays). A text with a final line break and one without
-/// differ in their last line. Lines are kept until their text together
-/// would pass [`ITEM_LIMIT`]; the rest are counted in `omitted`.
+/// trailing `\r` stays), each [`clean`]ed. A text with a final line break
+/// and one without differ in their last line. Lines are kept until they
+/// would pass [`ITEM_LIMIT`] as [`Hunk::wire_len`] counts them (each
+/// cleaned line's bytes and [`LINE_FRAMING`], each hunk's
+/// [`HUNK_FRAMING`]; `agents-event-bounds` decision 3), which the fold's
+/// own bound leaves as they are; the rest are counted in `omitted`.
 pub fn hunks(old: &str, new: &str) -> Diffed {
+    kept(old, new).done()
+}
+
+fn kept(old: &str, new: &str) -> Keep {
     let mut kept = Keep::default();
     if lines(old).count().saturating_add(lines(new).count()) > MAX_DIFF_LINES {
         let hunk = kept.hunk(1, 1);
-        for line in lines(old) {
-            kept.push(hunk, DiffLine::Removed(line.to_owned()));
+        let removed = lines(old).map(|line| (line, DiffLine::Removed as fn(String) -> DiffLine));
+        let added = lines(new).map(|line| (line, DiffLine::Added as fn(String) -> DiffLine));
+        let mut all = removed.chain(added);
+        // Once one line doesn't fit, the rest are counted in one step,
+        // none of them cleaned or copied.
+        for (line, make) in all.by_ref() {
+            if !kept.push(hunk, line, make) {
+                break;
+            }
         }
-        for line in lines(new) {
-            kept.push(hunk, DiffLine::Added(line.to_owned()));
-        }
-        return kept.done();
+        kept.leave_out(all.count());
+        return kept;
     }
     // Lines are compared with their `\n`, so a final line break counts.
     let old: Vec<&str> = old.split_inclusive('\n').collect();
@@ -60,7 +74,6 @@ pub fn hunks(old: &str, new: &str) -> Diffed {
         let hunk = kept.hunk(first.old_range().start + 1, first.new_range().start + 1);
         for op in &group {
             let (tag, old_range, new_range) = op.as_tag_tuple();
-            let line = |text: &str| strip(text).to_owned();
             let (context, removed, added) = match tag {
                 DiffTag::Equal => (old_range, 0..0, 0..0),
                 DiffTag::Delete => (0..0, old_range, 0..0),
@@ -68,17 +81,17 @@ pub fn hunks(old: &str, new: &str) -> Diffed {
                 DiffTag::Replace => (0..0, old_range, new_range),
             };
             for at in context {
-                kept.push(hunk, DiffLine::Context(line(old[at])));
+                kept.push(hunk, strip(old[at]), DiffLine::Context);
             }
             for at in removed {
-                kept.push(hunk, DiffLine::Removed(line(old[at])));
+                kept.push(hunk, strip(old[at]), DiffLine::Removed);
             }
             for at in added {
-                kept.push(hunk, DiffLine::Added(line(new[at])));
+                kept.push(hunk, strip(new[at]), DiffLine::Added);
             }
         }
     }
-    kept.done()
+    kept
 }
 
 /// `text`'s lines, each without its `\n`.
@@ -94,9 +107,12 @@ fn strip(line: &str) -> &str {
 #[derive(Default)]
 struct Keep {
     hunks: Vec<Hunk>,
+    /// The kept lines' [`Hunk::wire_len`]s together.
     len: usize,
     full: bool,
     omitted: u32,
+    /// How many lines were cleaned (and so copied): the kept ones alone.
+    cleaned: usize,
 }
 
 impl Keep {
@@ -114,18 +130,35 @@ impl Keep {
         Some(self.hunks.len() - 1)
     }
 
-    fn push(&mut self, hunk: Option<usize>, line: DiffLine) {
-        let len = self.len.saturating_add(line.text().len());
-        match hunk.and_then(|at| self.hunks.get_mut(at)) {
-            Some(hunk) if !self.full && len <= ITEM_LIMIT => {
-                hunk.lines.push(line);
-                self.len = len;
-            }
-            Some(_) | None => {
-                self.full = true;
-                self.omitted = self.omitted.saturating_add(1);
-            }
+    /// Keeps `text`, cleaned, as `make`'s line in `hunk` when it fits,
+    /// measuring it before anything is copied; else counts it left out.
+    /// Whether it was kept.
+    fn push(&mut self, hunk: Option<usize>, text: &str, make: fn(String) -> DiffLine) -> bool {
+        let Some(hunk) = hunk.and_then(|at| self.hunks.get_mut(at)).filter(|_| !self.full) else {
+            self.leave_out(1);
+            return false;
+        };
+        let framing = if hunk.lines.is_empty() {
+            LINE_FRAMING + HUNK_FRAMING
+        } else {
+            LINE_FRAMING
+        };
+        let len = self.len.saturating_add(cleaned_len(text)).saturating_add(framing);
+        if len > ITEM_LIMIT {
+            self.full = true;
+            self.leave_out(1);
+            return false;
         }
+        hunk.lines.push(make(clean(text)));
+        self.cleaned += 1;
+        self.len = len;
+        true
+    }
+
+    /// Counts `count` lines left out.
+    fn leave_out(&mut self, count: usize) {
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        self.omitted = self.omitted.saturating_add(count);
     }
 
     fn done(mut self) -> Diffed {
@@ -140,6 +173,7 @@ impl Keep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brindle_transcript::{FileChange, FileOp};
 
     /// `old`'s lines with `hunks` applied, as lines.
     fn apply(old: &str, hunks: &[Hunk]) -> Vec<String> {
@@ -317,12 +351,8 @@ mod tests {
         let old: String = (0..50_000).map(|n| format!("old line {n}\n")).collect();
         let new: String = (0..50_000).map(|n| format!("new line {n}\n")).collect();
         let diffed = hunks(&old, &new);
-        let kept: usize = diffed
-            .hunks
-            .iter()
-            .flat_map(|hunk| &hunk.lines)
-            .map(|line| line.text().len())
-            .sum();
+        // As `wire_len` counts them: the lines with their framing.
+        let kept: usize = diffed.hunks.iter().map(Hunk::wire_len).sum();
         assert!(kept <= ITEM_LIMIT);
         assert!(kept > ITEM_LIMIT - 64, "{kept}");
         let lines: usize = diffed.hunks.iter().map(|hunk| hunk.lines.len()).sum();
@@ -354,6 +384,59 @@ mod tests {
             Some(&DiffLine::Added("y".into()))
         );
         assert_eq!(diffed.omitted, 0);
+    }
+
+    /// A 300,000-line empty diff keeps at most 16,384 lines, counts the
+    /// rest as omitted, and cleans (allocates) no line it doesn't keep
+    /// (`agents-event-bounds` A-2, task 4.2).
+    #[test]
+    fn a_300000_line_empty_diff_keeps_what_fits_and_allocates_no_more() {
+        let new = "\n".repeat(300_000);
+        let kept = kept("", &new);
+        let lines: usize = kept.hunks.iter().map(|hunk| hunk.lines.len()).sum();
+        assert!(lines <= 16_384, "{lines}");
+        assert_eq!(kept.cleaned, lines);
+        let diffed = kept.done();
+        assert_eq!(lines + diffed.omitted as usize, 300_000);
+        let change = FileChange {
+            op: FileOp::Add,
+            path: String::new(),
+            hunks: diffed.hunks,
+            omitted: diffed.omitted,
+        };
+        assert!(change.wire_len() <= ITEM_LIMIT, "{}", change.wire_len());
+    }
+
+    /// Both texts past [`MAX_DIFF_LINES`] give one hunk within
+    /// [`ITEM_LIMIT`] as [`FileChange::wire_len`] counts it, its lines
+    /// cleaned.
+    #[test]
+    fn both_texts_past_the_guard_give_one_hunk_within_the_item_limit() {
+        let old = "o\u{1b}\n".repeat(MAX_DIFF_LINES);
+        let new = "n\n".repeat(MAX_DIFF_LINES);
+        let diffed = hunks(&old, &new);
+        assert_eq!(diffed.hunks.len(), 1);
+        assert_eq!(diffed.hunks[0].lines[0], DiffLine::Removed("o\u{fffd}".into()));
+        let lines = diffed.hunks[0].lines.len();
+        assert_eq!(lines + diffed.omitted as usize, 2 * MAX_DIFF_LINES);
+        let change = FileChange {
+            op: FileOp::Modify,
+            path: String::new(),
+            hunks: diffed.hunks,
+            omitted: diffed.omitted,
+        };
+        assert!(change.wire_len() <= ITEM_LIMIT, "{}", change.wire_len());
+        assert!(change.wire_len() > ITEM_LIMIT - 16, "{}", change.wire_len());
+    }
+
+    /// A compared diff's lines are cleaned as they are kept.
+    #[test]
+    fn a_compared_diffs_lines_are_cleaned() {
+        let diffed = hunks("a\n", "a\u{7}\n");
+        assert_eq!(
+            diffed.hunks[0].lines,
+            [DiffLine::Removed("a".into()), DiffLine::Added("a\u{fffd}".into())]
+        );
     }
 
     #[test]
