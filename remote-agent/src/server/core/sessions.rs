@@ -867,7 +867,8 @@ impl<L: EventLoop> Core<L> {
         // client, as the holder's `SPAWN_FAILED` would.
         self.sessions.insert(id, session);
         if self.send_holder(holder, message) && continues {
-            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: nothing stored yet
+            // Whole: nothing is stored yet.
+            self.write_agent_checkpoint(id, AgentCheckpoint::Stepped(None));
         }
     }
 
@@ -1144,22 +1145,31 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Sends the session's holder a checkpoint of its screen (or an agent's
-    /// state, [`Core::agent_checkpoint`]), covering the output fed since
-    /// the last one: only for a session whose program runs and isn't being
-    /// hung up, once its emulator is rebuilt.
-    /// An agent's is written whole or appended as `at` and what its holder
-    /// stores say ([`policy::agent_checkpoint_form`]).
-    pub(super) fn checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
+    /// Whether session `id` may be checkpointed now: only a session whose
+    /// program runs and isn't being hung up, once its emulator is rebuilt.
+    /// A terminal's checkpoint is [`checkpoint_screen`](Self::checkpoint_screen),
+    /// an agent's [`Core::checkpoint_agent`].
+    pub(super) fn checkpointable(&self, id: SessionId) -> bool {
+        self.sessions.get(&id).is_some_and(|session| {
+            match (session.rebuild, session.life.is_live()) {
+                (Rebuild::Ready, true) => true,
+                (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => false,
+            }
+        })
+    }
+
+    /// Sends terminal session `id`'s holder a checkpoint of its screen,
+    /// always whole, covering the output fed since the last one, when it is
+    /// [`checkpointable`](Self::checkpointable).
+    pub(super) fn checkpoint_screen(&mut self, id: SessionId) {
+        if !self.checkpointable(id) {
+            return;
+        }
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        match (session.rebuild, session.life.is_live()) {
-            (Rebuild::Ready, true) => {}
-            (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => return,
-        }
         let Some(screen) = session.screen() else {
-            return self.agent_checkpoint(id, at);
+            return;
         };
         let bytes = screen.render(id);
         let covers = std::mem::take(&mut screen.since_checkpoint);
@@ -1190,8 +1200,7 @@ impl<L: EventLoop> Core<L> {
         let behind = may_defer && self.holder_behind(holder);
         due.retain(|&(_, since)| is_due(since, behind));
         for (id, _) in due {
-            // A terminal's checkpoint is always whole.
-            self.checkpoint(id, AgentCheckpoint::Stepped(None));
+            self.checkpoint_screen(id);
         }
     }
 
@@ -1206,13 +1215,12 @@ impl<L: EventLoop> Core<L> {
     /// The checkpoint a step-down or a detach takes: a terminal's always,
     /// an agent's as [`policy::agent_checkpoint_due`] says.
     fn checkpoint_at(&mut self, id: SessionId, at: AgentCheckpoint) {
-        let due = match self.sessions.get(&id).map(Session::kind) {
-            Some(SessionKind::Terminal) => true,
-            Some(SessionKind::Agent) => policy::agent_checkpoint_due(at, 0),
-            None => false,
-        };
-        if due {
-            self.checkpoint(id, at);
+        match self.sessions.get(&id).map(Session::kind) {
+            Some(SessionKind::Terminal) => self.checkpoint_screen(id),
+            Some(SessionKind::Agent) if policy::agent_checkpoint_due(at, 0) => {
+                self.checkpoint_agent(id, at);
+            }
+            Some(SessionKind::Agent) | None => {}
         }
     }
 

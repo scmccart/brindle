@@ -904,7 +904,7 @@ impl<L: EventLoop> Core<L> {
         }
         let at = AgentCheckpoint::Stepped(checkpoint);
         if policy::agent_checkpoint_due(at, since) {
-            self.checkpoint(id, at);
+            self.checkpoint_agent(id, at);
         }
         // Nothing reaches an agent being hung up, or gone.
         if !stdin.is_empty() && live {
@@ -942,14 +942,24 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Checkpoints agent session `id` (its liveness already checked by
-    /// [`Core::checkpoint`]), due `at`: its encoded state whole, or a
-    /// segment of the events since the last one appended to what its
-    /// holder stores ([`policy::agent_checkpoint_form`]), covering the
-    /// stdout fed since the last one. A state too large to store fails its
-    /// handling, which `acp::limits`' I2 makes unreachable for a whole
-    /// checkpoint; a segment too large is written whole instead.
-    pub(super) fn agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
+    /// Checkpoints agent session `id`, due `at`, when it is
+    /// [`checkpointable`](Core::checkpointable), as
+    /// [`write_agent_checkpoint`](Core::write_agent_checkpoint) writes it.
+    pub(super) fn checkpoint_agent(&mut self, id: SessionId, at: AgentCheckpoint) {
+        if self.checkpointable(id) {
+            self.write_agent_checkpoint(id, at);
+        }
+    }
+
+    /// Checkpoints agent session `id` (its liveness checked by
+    /// [`Core::checkpoint_agent`], or by a spawn or restart just sent),
+    /// due `at`: its encoded state whole, or a segment of the events since
+    /// the last one appended to what its holder stores
+    /// ([`policy::agent_checkpoint_form`]), covering the stdout fed since
+    /// the last one. A state too large to store fails its handling, which
+    /// `acp::limits`' I2 makes unreachable for a whole checkpoint; a
+    /// segment too large is written whole instead.
+    pub(super) fn write_agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
         let Some(holder) = self.sessions.get(&id).map(|session| session.holder) else {
             return;
         };
@@ -1162,7 +1172,7 @@ impl<L: EventLoop> Core<L> {
             meta,
         });
         if self.send_holder(holder, message) {
-            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: restarted
+            self.write_agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: restarted
         }
     }
 
