@@ -119,7 +119,7 @@ use super::sessions::{Life, PendingReplay, Restart, RestartStage, SpawnRequest, 
 use super::{Core, log};
 use crate::acp::checkpoint;
 use crate::acp::lines::Partial;
-use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused};
+use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused, Store};
 use crate::server::event_loop::{EventLoop, Token};
 use crate::server::fault;
 use crate::server::platform;
@@ -275,6 +275,23 @@ impl Agent {
             unsaved: Vec::new(),
             login_restart: None,
         }
+    }
+
+    /// Its conversation, once it isn't being adopted.
+    pub(super) fn running(&mut self) -> Option<&mut AgentSession> {
+        match &mut self.acp {
+            Acp::Adopting { .. } => None,
+            Acp::Running(acp) => Some(acp),
+        }
+    }
+
+    /// This agent keeping attached text in `store` (OpenSpec change
+    /// `agents-prompt-context`): set at its spawn.
+    pub(super) fn keeping(mut self, store: Store) -> Self {
+        if let Some(acp) = self.running() {
+            *acp.store_mut() = store;
+        }
+        self
     }
 
     /// The holder's stored checkpoint, while adopting.
@@ -474,14 +491,6 @@ pub(super) struct AgentCommand {
 }
 
 impl AgentCommand {
-    pub(super) fn prompt(prompt: client::AgentPrompt) -> Self {
-        Self {
-            req: Some(prompt.req),
-            session: prompt.session,
-            command: Command::prompt(prompt.text),
-        }
-    }
-
     pub(super) fn cancel(target: client::SessionRef) -> Self {
         Self {
             req: None,
@@ -805,19 +814,6 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// `AGENT_ATTACH`: refused until the store is built (OpenSpec change
-    /// `agents-prompt-context`, task 3.1).
-    pub(super) fn client_agent_attach(&mut self, client: Token, attach: client::AgentAttach) {
-        let message = format!("session {}: attachments aren't kept yet", attach.session);
-        self.send_client(client, error(Some(attach.req), Some(attach.session), message));
-    }
-
-    /// `AGENT_READ_ATTACHMENT`: refused until the store is built.
-    pub(super) fn client_agent_read_attachment(&mut self, client: Token, read: client::AgentReadAttachment) {
-        let message = format!("session {}: the session keeps no attachment {}", read.session, read.id);
-        self.send_client(client, error(Some(read.req), Some(read.session), message));
-    }
-
     /// The answer to a list of session `id`'s conversations, to the client
     /// attached now (`agents-session-list` decision 2): `AGENT_CONVERSATIONS`
     /// in one frame, or the `ERROR` naming the session. Dropped with no
@@ -912,6 +908,11 @@ impl<L: EventLoop> Core<L> {
         if let Some(answer) = listed {
             self.send_listed(id, answer);
         }
+        // What the session references may have changed: a prompt queued,
+        // sent or discarded, entries trimmed (`agents-prompt-context`).
+        let references = events
+            .iter()
+            .any(|event| matches!(event, Event::Queue { .. } | Event::Trimmed { .. }));
         if let Some(line) = failure_line(id, &events) {
             log!("{line}");
         }
@@ -959,6 +960,9 @@ impl<L: EventLoop> Core<L> {
         }
         if hang_up {
             self.hang_up(id);
+        }
+        if references {
+            self.store_changed(id);
         }
         reply
     }
@@ -1175,6 +1179,9 @@ impl<L: EventLoop> Core<L> {
         }
         agent.checkpointed = acp.lines().covers();
         agent.acp = Acp::Running(Box::new(acp));
+        // Its store is known again, and its queued prompt's texts read,
+        // before the tail can send that prompt (`agents-prompt-context`).
+        self.store_adopted(id);
         match stepped {
             Stepped::Clean(output) => self.agent_apply(id, output, Delivery::Events),
             Stepped::Faulted(output) => self.agent_faulted(id, output),

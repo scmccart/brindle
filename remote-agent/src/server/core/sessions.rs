@@ -661,12 +661,15 @@ impl Session {
                     scrollback: 0,
                     started: unix_now(),
                 },
-                Content::Agent(Box::new(match (&spawn.conversation, spawn.start) {
-                    (None, None) => Agent::new(cwd.clone()),
-                    // `client_spawn_agent` refuses a spawn naming both.
-                    (None, Some(SpawnStart::Choose)) => Agent::choosing(cwd.clone()),
-                    (Some(conversation), _) => Agent::continuing(conversation),
-                })),
+                Content::Agent(Box::new(
+                    match (&spawn.conversation, spawn.start) {
+                        (None, None) => Agent::new(cwd.clone()),
+                        // `client_spawn_agent` refuses a spawn naming both.
+                        (None, Some(SpawnStart::Choose)) => Agent::choosing(cwd.clone()),
+                        (Some(conversation), _) => Agent::continuing(conversation),
+                    }
+                    .keeping(super::kept::spawn_store(spawn)),
+                )),
                 0,
                 0,
             ),
@@ -1783,6 +1786,8 @@ impl<L: EventLoop> Core<L> {
             return;
         }
         log!("session {id}: detached by client {client}");
+        // Its untaken uploads go with it (`agents-prompt-context`).
+        self.drop_uploads(client, Some(id));
         // A replay it still waited for answers its `ATTACH` first (and, for
         // a session whose program had exited, ends it with its `EXIT`).
         self.send_waiting_replay(id);
