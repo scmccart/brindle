@@ -113,16 +113,19 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 6. Shell: the core encodes once and queues slices
 
-- [ ] 6.1 Write the real-role tests first in `remote-agent/tests/agents.rs`, with the fake ACP agent and gates on files, no sleeps, and watch the first fail on the current shell (`cargo build -p brindle-remote-agent --bin brindle-fake-acp-agent && cargo test -p brindle-remote-agent --test agents`):
+- [x] 6.1 Write the real-role tests first in `remote-agent/tests/agents.rs`, with the fake ACP agent and gates on files, no sleeps, and watch the first fail on the current shell (`cargo build -p brindle-remote-agent --bin brindle-fake-acp-agent && cargo test -p brindle-remote-agent --test agents`):
   - `a_core_killed_while_a_long_line_arrives_applies_the_line_once`: the agent writes a 2 MiB `tool_call_update` line in 64 KiB `send-raw` pieces, the core is checkpointed past 512 KiB at least twice, SIGKILL, the agent finishes the line, a new core adopts, and the client's copy holds the update once.
   - `tool_calls_after_a_restart_keep_their_entries_across_a_core_kill`: the spec scenario "Tool calls carried on after a core restart".
   - `a_restarts_first_checkpoint_is_whole_after_a_partial_line`: design Risks, checked through the holder's stored bytes after the restart.
-- [ ] 6.2 In `server/core/agents.rs`:
+
+  Done: 488c8e0f; the first fails on the shell before the delta shape (5b86ab57: its records held 3 MB of the line's first 1.25 MiB) and passes after, the other two pass on both (flag 12). 15 runs out of 15 pass.
+- [x] 6.2 In `server/core/agents.rs`:
   - `agent_apply` encodes each event once (`serde_json::to_vec` into `JsonObject`), sends `transcript_frames` through a new `Core::send_client_frame` (`clients.rs`), then moves the events into `unsaved`.
   - `agent_checkpoint` passes `std::mem::take(&mut agent.unsaved)` and `&Written` to `encode_segment`, applies the `Segment`'s changes or the `Encoded`'s `Written` to `Stored`, and queues `holder::checkpoint_frames` through a new `Core::send_holder_sliced` (`holders.rs`), which calls `Conn::queue_sliced` (`server/conn.rs`).
   - `send_transcript` and the attach page (`sessions.rs`) and `client_agent_fetch` use `transcript_frames` and `page_frames` with events encoded once.
 
   The module doc's Checkpoints paragraph says segments carry deltas. Verify with 6.1, `cargo test -p brindle-remote-agent --test agents`, `--test upgrade`, `--test core` and `--test holder`.
+  Done: 2cb11532 (`agent_checkpoint`'s part landed with 4.2, flag 11); `send_transcript` takes the encoded events, and `Conn::queue_sliced` has a test against the messages' frames. Every helper test passes: 728 unit, agents 119, core 59, holder 43, manage 14, relay 16, upgrade 18.
 
 ## 7. Docs and checks
 
