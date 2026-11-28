@@ -335,6 +335,10 @@ pub struct AgentView {
     /// The pending permission requests' buttons, in the conversation's
     /// order, keyed by entry and option (`types R3`).
     permissions: Vec<((EntryId, SharedString), FocusHandle)>,
+    /// How many times `refresh` rebuilt [`Self::permissions`] (OpenSpec
+    /// change `agents-absorb-cost`, task 8.1).
+    #[cfg(test)]
+    permission_rebuilds: usize,
     /// The login row as the model last gave it.
     login: LoginRow,
     /// The login row's enabled method buttons, keyed by method id
@@ -451,6 +455,8 @@ impl AgentView {
             scroller,
             prompt,
             permissions: Vec::new(),
+            #[cfg(test)]
+            permission_rebuilds: 0,
             login: LoginRow::None,
             logins: Vec::new(),
             cancel_login: cx.focus_handle(),
@@ -695,6 +701,16 @@ impl AgentView {
             prompt.set_suggestions(suggestions, cx);
             prompt.set_footer(footer, cx);
         });
+        // The set (16 requests at most) as the handles were built from:
+        // kept while it is the same, as while a message streams.
+        let keys = pending.iter().flat_map(|(entry, options)| options.iter().map(move |option| (*entry, option)));
+        if keys.eq(self.permissions.iter().map(|((entry, option), _)| (*entry, option))) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.permission_rebuilds += 1;
+        }
         let mut kept = std::mem::take(&mut self.permissions);
         for (entry, options) in pending {
             for option in options {
