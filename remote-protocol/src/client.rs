@@ -810,7 +810,10 @@ pub fn pack_page(
 }
 
 /// `events` cut into groups of whole events that each fit a frame with an
-/// `envelope` of that many bytes around them.
+/// `envelope` of that many bytes around them. One event too large for a
+/// frame alone is an error; the server's reducer keeps every event within
+/// `brindle_transcript::MAX_EVENT`, which leaves at least
+/// [`AGENT_PAGE_ENVELOPE`] (the server's `acp::limits`, invariant I1).
 fn pack_events(
     session: SessionId,
     events: Vec<serde_json::Value>,

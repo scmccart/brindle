@@ -55,9 +55,12 @@
 //! options themselves are log events. A set of an option out isn't kept.
 //!
 //! **Bounds.** A checkpoint is at most [`MAX_CHECKPOINT_LEN`] (64 MiB, what a
-//! holder keeps): the log's 16 MiB, an 8 MiB partial line, a 256 KiB prompt
-//! and the bookkeeping fit with room to spare (decision 14), and
-//! [`encode`] refuses one past it rather than send what the holder drops.
+//! holder keeps). That a whole one fits is `acp::limits`' invariant I2:
+//! the log's stored form is at most twice its 16 MiB measure, beside an
+//! 8 MiB partial line, the login methods, 64 open outputs and the rest of
+//! the state, `LARGEST_CHECKPOINT` in all, with about 12.7 MiB to spare
+//! (`agents-event-bounds` decision 1). [`encode`] still refuses one past
+//! it rather than send what the holder drops.
 //!
 //! **Reading one never panics** (`railway R5`). A checkpoint that isn't one,
 //! that a newer core wrote in a format this one doesn't know, or whose state

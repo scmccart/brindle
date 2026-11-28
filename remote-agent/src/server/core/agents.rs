@@ -138,7 +138,10 @@ pub(super) struct Agent {
     /// When the reducer asked to be stepped with [`Input::Tick`].
     wake: Option<Instant>,
     /// Its checkpoint came out too large to store, so its handling failed
-    /// and it isn't checkpointed again (the bounds make this unreachable).
+    /// and it isn't checkpointed again. `acp::limits`' I2 makes this
+    /// unreachable: a whole checkpoint is at most `LARGEST_CHECKPOINT`,
+    /// under `MAX_CHECKPOINT_LEN`, which its const assertions and
+    /// `the_frame_and_checkpoint_bounds_follow_from_the_constants` check.
     unstorable: bool,
     /// What its holder stores of its checkpoint (`agents-log-paging`
     /// decision 9).
@@ -858,8 +861,10 @@ impl<L: EventLoop> Core<L> {
     }
 
     /// Sends `events` of session `id` to `client` as `TRANSCRIPT` frames of
-    /// whole events. One that can't fit a frame (the log's bounds rule it
-    /// out) is reported to the client and logged.
+    /// whole events. One that can't fit a frame is reported to the client
+    /// and logged; `acp::limits`' I1 rules it out, since every event the
+    /// reducer emits, replays or pages encodes within `MAX_EVENT`, which
+    /// leaves `TRANSCRIPT_ENVELOPE` of the frame for the batch.
     pub(super) fn send_transcript(&mut self, client: Token, id: SessionId, events: Vec<Value>) {
         match client::pack_transcript(id, events) {
             Ok(messages) => {
@@ -880,7 +885,8 @@ impl<L: EventLoop> Core<L> {
     /// segment of the events since the last one appended to what its
     /// holder stores ([`policy::agent_checkpoint_form`]), covering the
     /// stdout fed since the last one. A state too large to store fails its
-    /// handling.
+    /// handling, which `acp::limits`' I2 makes unreachable for a whole
+    /// checkpoint; a segment too large is written whole instead.
     pub(super) fn agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
         let Some(holder) = self.sessions.get(&id).map(|session| session.holder) else {
             return;

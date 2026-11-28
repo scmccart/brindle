@@ -2173,7 +2173,10 @@ fn entry_change(event: &Event) -> Option<EntryId> {
 }
 
 /// An entry's `Added`, its text's further `Appended`s and its outcome's
-/// `Answered`.
+/// `Answered`. Each is one of the live events' forms, so each is within
+/// the producer's `MAX_EVENT` (the server's `acp::limits`, invariant I1):
+/// text in pieces of at most [`TEXT_CHUNK`], a tool call's header apart
+/// from its items, grouped by [`item_pieces`].
 fn replay_entry(id: EntryId, entry: &Entry, events: &mut Vec<Event>) {
     match entry {
         Entry::User { text } => replay_text(id, text, |text| Entry::User { text }, events),
