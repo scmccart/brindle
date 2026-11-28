@@ -401,6 +401,14 @@ rule, not a convenience.
     (`action_stop()`), the row's enabled buttons (`row_stops()`), and the stop
     button while streaming (`stop_button()`); `focused(window, cx)` says
     which of them has focus (`PromptFocus`), for an owner that reports it.
+    `set_attachments(Vec<AttachmentItem>)` shows the owner's attachments
+    in a wrapping row under the queue row and above the text area, each a
+    bordered chip: the owner's icon, the name cut with an ellipsis, an
+    optional muted detail (`12 KiB`) and a ghost `x` that asks the owner
+    to remove it (`PromptInputEvent::RemoveAttachment(key)`); none hides
+    the row. The chips are no focus stops (`row_stops()` is unchanged):
+    the owner removes them by key, with backspace at the text's start or
+    a command.
   - `Reasoning`: a trigger (lucide `brain`, the owner's label, a chevron
     turned over while open) over muted content; the owner holds `open` and
     flips it from `on_toggle`.
@@ -976,6 +984,11 @@ code comes from there.
   tokens have no warning colour; it defaults to destructive.
 - **The queue row** has no AI Elements counterpart (an addition): a text
   queued apart from the draft, which none of its buttons touch.
+- **The attachments' chips are no focus stops.** AI Elements'
+  `PromptInputAttachment` remove buttons are tab stops. Reason: a prompt
+  may take eight, and Tab from the text area would walk them all before
+  the next control; the owner removes the last with backspace at the
+  text's start and all with a command.
 - **The reason line's action** has no AI Elements counterpart (an
   addition): one labelled button after the reason, for what to do while
   the input can't send (an agent zone's Continue conversation). It is a
