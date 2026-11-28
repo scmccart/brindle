@@ -2228,20 +2228,48 @@ mod tests {
         );
     }
 
+    /// What a segment may hold beyond its events and the partial line's
+    /// new bytes (`agents-checkpoint-deltas` decision 7): the record's
+    /// header and the fields written whole in every record (decision 4),
+    /// at the sizes of these tests' conversations.
+    const RECORD_ALLOWANCE: u64 = 1024;
+
     /// Drives a reducer session the way the core does: checkpoints when
     /// [`agent_checkpoint_due`] says, written as [`agent_checkpoint_form`]
-    /// says, counting the bytes the holder is sent.
+    /// says, counting the bytes the holder is sent and the records, and
+    /// keeping what the holder stores. Every appended segment is checked
+    /// against [`RECORD_ALLOWANCE`] (decision 7's first assertion).
     struct Checkpointing {
         session: crate::acp::reduce::AgentSession,
         stored: Stored,
         unsaved: Vec<brindle_transcript::Event>,
         since: u64,
         written: u64,
+        records: u64,
         wholes_after_trims: u64,
+        /// The encoded length of every event the session applied.
+        added: u64,
+        /// What the holder stores: the last base and its segments.
+        blob: Vec<u8>,
         now: Instant,
     }
 
     impl Checkpointing {
+        fn new(session: crate::acp::reduce::AgentSession) -> Self {
+            Self {
+                session,
+                stored: Stored::Unknown,
+                unsaved: Vec::new(),
+                since: 0,
+                written: 0,
+                records: 0,
+                wholes_after_trims: 0,
+                added: 0,
+                blob: Vec::new(),
+                now: Instant::now(),
+            }
+        }
+
         fn step(&mut self, input: crate::acp::reduce::Input<'_>) -> crate::acp::reduce::Output {
             let fed = match &input {
                 crate::acp::reduce::Input::Stdout(bytes) => bytes.len() as u64,
@@ -2249,6 +2277,7 @@ mod tests {
             };
             let out = crate::acp::reduce::step(&mut self.session, input, self.now);
             self.since += fed;
+            self.added += out.events.iter().map(|event| event.encoded_len() as u64).sum::<u64>();
             self.unsaved.extend(out.events.iter().cloned());
             let at = AgentCheckpoint::Stepped(out.checkpoint);
             if agent_checkpoint_due(at, self.since) {
@@ -2257,29 +2286,54 @@ mod tests {
             out
         }
 
+        /// The bytes the partial line gained since the last checkpoint: at
+        /// most what was fed since.
+        fn partial_gain(&self) -> u64 {
+            match self.session.lines().partial() {
+                crate::acp::lines::Partial::Collecting(bytes) => (bytes.len() as u64).min(self.since),
+                crate::acp::lines::Partial::TooLong { .. }
+                | crate::acp::lines::Partial::Resyncing { .. } => 0,
+            }
+        }
+
         fn checkpoint(&mut self, at: AgentCheckpoint) {
             use crate::acp::checkpoint::{encode, encode_segment};
             let trimmed = self
                 .unsaved
                 .iter()
                 .any(|event| matches!(event, brindle_transcript::Event::Trimmed { .. }));
+            let events_len: u64 = self
+                .unsaved
+                .iter()
+                .map(|event| event.encoded_len() as u64 + 1)
+                .sum();
+            let gain = self.partial_gain();
             let segment = agent_appendable(self.stored, at, trimmed, Adoption::Keep)
                 .then(|| encode_segment(&self.session, &self.unsaved, self.stored.next_seq()).ok())
                 .flatten();
             let len = segment.as_ref().map(|segment| segment.len() as u64);
-            match agent_checkpoint_form(self.stored, at, len, trimmed, Adoption::Keep) {
-                CheckpointForm::Whole => {
+            self.records += 1;
+            match (agent_checkpoint_form(self.stored, at, len, trimmed, Adoption::Keep), segment) {
+                (CheckpointForm::Whole, _) | (CheckpointForm::Append, None) => {
                     let bytes = encode(&self.session).expect("it fits");
                     self.written += bytes.len() as u64;
                     self.stored = Stored::whole(bytes.len() as u64);
+                    self.blob = bytes;
                     if trimmed {
                         self.wholes_after_trims += 1;
                     }
                 }
-                CheckpointForm::Append => {
-                    let len = len.expect("an append has its segment");
+                (CheckpointForm::Append, Some(segment)) => {
+                    let len = segment.len() as u64;
+                    assert!(
+                        len <= events_len + gain + RECORD_ALLOWANCE,
+                        "segment {} is {len} bytes for {events_len} of events and {gain} of \
+                         the partial line",
+                        self.stored.next_seq()
+                    );
                     self.written += len;
                     self.stored = self.stored.appended(len);
+                    self.blob.extend_from_slice(&segment);
                 }
             }
             self.unsaved.clear();
@@ -2301,15 +2355,7 @@ mod tests {
         use brindle_remote_protocol::serde_json::json;
         use crate::acp::limits::LOG_LIMIT;
         use crate::acp::reduce::{AgentSession, Command, Input};
-        let mut core = Checkpointing {
-            session: AgentSession::new("/w".into(), "0.3.0".into()),
-            stored: Stored::Unknown,
-            unsaved: Vec::new(),
-            since: 0,
-            written: 0,
-            wholes_after_trims: 0,
-            now: Instant::now(),
-        };
+        let mut core = Checkpointing::new(AgentSession::new("/w".into(), "0.3.0".into()));
         core.step(Input::Spawned);
         core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": 1,
             "result": {"protocolVersion": 1}}))));
@@ -2345,6 +2391,109 @@ mod tests {
             "{} bytes written for {added} added and {} trims (bound {bound})",
             core.written,
             core.wholes_after_trims
+        );
+    }
+
+    /// `agents-checkpoint-deltas` decision 7: through 5,000 permission-gated
+    /// tool calls and one 8 MiB line arriving in 64 KiB reads, no segment
+    /// grows with the conversation (checked on every append), the bytes
+    /// written stay within 4x what the session added plus a fixed amount
+    /// per record and one base per trim, and what the holder stores
+    /// decodes to the live session.
+    #[test]
+    fn checkpoints_of_a_tool_heavy_conversation_and_a_long_line_write_a_small_multiple_of_what_they_added() {
+        use brindle_remote_protocol::serde_json::{Value, json};
+        use brindle_transcript::{Entry, Event};
+        use crate::acp::lines::MAX_LINE;
+        use crate::acp::limits::LOG_LIMIT;
+        use crate::acp::reduce::{AgentSession, Command, Input};
+        let update = |update: Value| {
+            json_line(json!({"jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": "s1", "update": update}}))
+        };
+        let mut core = Checkpointing::new(AgentSession::new("/w".into(), "0.3.0".into()));
+        core.step(Input::Spawned);
+        core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": 1,
+            "result": {"protocolVersion": 1}}))));
+        core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": 2,
+            "result": {"sessionId": "s1"}}))));
+        let text = "y".repeat(200);
+        let mut call = 0u64;
+        for _ in 0..500 {
+            let out = core.step(Input::Command(Command::Prompt { text: "go on".into() }));
+            assert_eq!(out.reply, Some(Ok(())));
+            let sent: Value = brindle_remote_protocol::serde_json::from_slice(
+                out.stdin.split(|b| *b == b'\n').next().expect("a line"),
+            )
+            .expect("JSON");
+            let prompt = sent["id"].as_u64().expect("the prompt's id");
+            for _ in 0..10 {
+                call += 1;
+                // 30 characters, as Claude's are.
+                let id = format!("toolu_{call:024x}");
+                core.step(Input::Stdout(&update(json!({"sessionUpdate": "tool_call",
+                    "toolCallId": id, "title": "Run", "kind": "execute",
+                    "status": "pending"}))));
+                let out = core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0",
+                    "id": format!("perm-{call}"), "method": "session/request_permission",
+                    "params": {"sessionId": "s1", "toolCall": {"toolCallId": id},
+                        "options": [
+                            {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                            {"optionId": "always", "name": "Always", "kind": "allow_always"},
+                            {"optionId": "reject", "name": "Reject", "kind": "reject_once"}]}}))));
+                let entry = out
+                    .events
+                    .iter()
+                    .find_map(|event| match event {
+                        Event::Added { id, entry: Entry::Permission { .. } } => Some(*id),
+                        _ => None,
+                    })
+                    .expect("the request's entry");
+                let out = core.step(Input::Command(Command::Answer {
+                    entry,
+                    option: Some("allow".into()),
+                }));
+                assert_eq!(out.reply, Some(Ok(())));
+                core.step(Input::Stdout(&update(json!({"sessionUpdate": "tool_call_update",
+                    "toolCallId": id, "status": "completed",
+                    "content": [{"type": "content", "content": {"type": "text", "text": text}}]}))));
+            }
+            core.step(Input::Stdout(&json_line(json!({"jsonrpc": "2.0", "id": prompt,
+                "result": {"stopReason": "end_turn"}}))));
+        }
+        assert_eq!(call, 5_000);
+        // One line of 8 MiB, a diff whose new text fills it, in 64 KiB reads.
+        let envelope = update(json!({"sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_big", "status": "completed",
+            "content": [{"type": "diff", "path": "/w/big.txt", "oldText": null, "newText": ""}]}));
+        let fill = MAX_LINE - (envelope.len() - 1);
+        let mut line = update(json!({"sessionUpdate": "tool_call_update",
+            "toolCallId": "toolu_big", "status": "completed",
+            "content": [{"type": "diff", "path": "/w/big.txt", "oldText": null,
+                "newText": "z".repeat(fill)}]}));
+        assert_eq!(line.pop(), Some(b'\n'));
+        assert_eq!(line.len(), MAX_LINE);
+        for piece in line.chunks(64 * 1024) {
+            core.step(Input::Stdout(piece));
+        }
+        core.step(Input::Stdout(b"\n"));
+        core.checkpoint(AgentCheckpoint::Detach);
+        let added = core.added + MAX_LINE as u64;
+        let bound = 4 * added
+            + RECORD_ALLOWANCE * core.records
+            + core.wholes_after_trims * LOG_LIMIT as u64;
+        assert!(
+            core.written < bound,
+            "{} bytes written for {added} added in {} records and {} trims (bound {bound})",
+            core.written,
+            core.records,
+            core.wholes_after_trims
+        );
+        let decoded = crate::acp::checkpoint::decode(&core.blob, core.now).expect("it reads");
+        assert!(decoded == core.session, "what the holder stores decodes to the live session");
+        eprintln!(
+            "written={} added={added} records={} wholes_after_trims={}",
+            core.written, core.records, core.wholes_after_trims
         );
     }
 }
