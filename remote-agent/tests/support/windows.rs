@@ -447,6 +447,7 @@ pub fn start(bin: &Path, role: &str, dir: &Path, env: &[(&str, &str)]) -> io::Re
             .args(["launch", role, "--ready-handle"])
             .arg((handle.0 as usize).to_string())
             .env("BRINDLE_SERVER_DIR", dir)
+            .env("BRINDLE_CACHE_DIR", dir.join("cache"))
             .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())

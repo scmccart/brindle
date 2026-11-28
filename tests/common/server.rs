@@ -70,9 +70,19 @@ pub fn isolate(command: &mut Command, run: &Isolation) {
         .env("BRINDLE_CONFIG", run.config)
         .env("BRINDLE_STATE_DIR", run.state_dir)
         .env("BRINDLE_SERVER_DIR", run.server_dir)
+        // The attachment store's cache (`agents-prompt-context`): in the
+        // case's server directory, so it is the case's alone and goes
+        // with it.
+        .env("BRINDLE_CACHE_DIR", cache_dir(run.server_dir))
         .env("BRINDLE_NO_SCOPE", "1")
         .env("DISPLAY", run.display)
         .env_remove("WAYLAND_DISPLAY");
+}
+
+/// The cache directory (`BRINDLE_CACHE_DIR`) a run with server directory
+/// `server_dir` is given: `cache` in it, removed with it after the case.
+pub fn cache_dir(server_dir: &Path) -> PathBuf {
+    server_dir.join("cache")
 }
 
 /// The variable that names another terminal server helper. On Windows

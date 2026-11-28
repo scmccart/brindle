@@ -12,4 +12,5 @@ pub mod lock;
 mod piped;
 pub use piped::{PipeCommand, Piped, agent_directory, spawn_piped};
 pub mod pty;
+pub mod store;
 pub mod sys;

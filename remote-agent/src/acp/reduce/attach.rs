@@ -65,14 +65,14 @@ impl Store {
 }
 
 /// `name` in directory `dir`.
-fn join(dir: &str, name: &str, windows: bool) -> String {
+pub fn join(dir: &str, name: &str, windows: bool) -> String {
     let separator = if windows { '\\' } else { '/' };
     let dir = dir.trim_end_matches(|c| c == separator || (windows && c == '/'));
     format!("{dir}{separator}{name}")
 }
 
 /// Whether `path` is absolute on the agent's host.
-fn absolute(path: &str, windows: bool) -> bool {
+pub fn absolute(path: &str, windows: bool) -> bool {
     if !windows {
         return path.starts_with('/');
     }

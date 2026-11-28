@@ -126,6 +126,7 @@ pub fn start_with(
     command
         .args([role, "--ready-fd", "3"])
         .env("BRINDLE_SERVER_DIR", dir)
+        .env("BRINDLE_CACHE_DIR", dir.join("cache"))
         .env("BRINDLE_NO_SCOPE", "1")
         .envs(env.iter().copied())
         .stdin(Stdio::null())
