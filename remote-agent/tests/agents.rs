@@ -3095,12 +3095,41 @@ fn a_fetch_read_with_its_attach_is_refused_until_the_replay_ends() {
 /// The records of the checkpoint the session's holder stores, read by a
 /// test core that adopts it once the client's core is killed.
 fn stored_records(dir: &TempDir, client: &mut TestClient, id: SessionId) -> Vec<(char, u32)> {
+    checkpoint_records(&stored_blob(dir, client, id))
+}
+
+/// The checkpoint the session's holder stores, read as [`stored_records`]
+/// reads it.
+fn stored_blob(dir: &TempDir, client: &mut TestClient, id: SessionId) -> Vec<u8> {
     kill(client.core_pid());
     assert!(client.closes());
     let mut core = TestCore::connect_to(dir);
     let adopted = core.hello(77);
-    let blob = adopted.checkpoints.get(&id).expect("the session's checkpoint");
-    checkpoint_records(blob)
+    adopted.checkpoints.get(&id).expect("the session's checkpoint").clone()
+}
+
+/// Each record of a format 2 checkpoint: its kind, its state and the
+/// partial line's bytes it carries.
+fn checkpoint_parts(blob: &[u8]) -> Vec<(char, Vec<u8>, Vec<u8>)> {
+    fn take(len: usize, rest: &mut &[u8]) -> Vec<u8> {
+        let (taken, left) = rest.split_at(len);
+        *rest = left;
+        taken.to_vec()
+    }
+    fn length(rest: &mut &[u8]) -> usize {
+        u32::from_be_bytes(take(4, rest).try_into().unwrap()) as usize
+    }
+    let mut rest = &blob[6..];
+    let mut records = Vec::new();
+    while !rest.is_empty() {
+        let kind = take(1, &mut rest)[0] as char;
+        take(4, &mut rest);
+        let len = length(&mut rest);
+        let state = take(len, &mut rest);
+        let len = length(&mut rest);
+        records.push((kind, state, take(len, &mut rest)));
+    }
+    records
 }
 
 #[test]
@@ -4309,4 +4338,245 @@ fn a_list_out_at_a_login_restart_is_refused_and_the_next_goes_to_the_new_agent()
     assert_eq!(conversation_ids(&listed), ["s1"]);
     assert_eq!(methods(&record), ["initialize", "session/resume", "session/list"]);
     assert_eq!(methods(&first), ["initialize", "session/new", "session/list", "session/prompt"]);
+}
+
+// OpenSpec change `agents-checkpoint-deltas`, task 6.1: checkpoints in the
+// delta shape across core kills and agent restarts.
+
+/// A 64 KiB piece of a long line's text, numbered so no two are alike.
+fn line_piece(n: usize) -> String {
+    format!("{n:05}{}", "z".repeat(64 * 1024 - 5))
+}
+
+/// How many checkpoints the cores' logs say held more than 512 KiB of a
+/// line.
+fn held_line_checkpoints(dir: &TempDir, id: SessionId) -> usize {
+    let said = format!("session {id}: checkpointed with ");
+    dir.logs()
+        .lines()
+        .filter_map(|line| line.split_once(&said))
+        .filter_map(|(_, rest)| rest.split(' ').next()?.parse::<usize>().ok())
+        .filter(|&held| held > 512 * 1024)
+        .count()
+}
+
+/// A `tool_call` for `call`, pending.
+fn tool_call(call: &str, title: &str) -> String {
+    update(json!({"sessionUpdate": "tool_call", "toolCallId": call, "title": title, "kind": "edit", "status": "pending"}))
+}
+
+/// The log's tool entries: each one's call id and status.
+fn tool_calls(log: &Transcript) -> Vec<(String, ToolStatus)> {
+    log.entries()
+        .filter_map(|(_, entry)| match entry {
+            Entry::Tool { call, status, .. } => Some((call.clone(), *status)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_core_killed_while_a_long_line_arrives_applies_the_line_once() {
+    let token = "token-agent-long-line-kill";
+    let (mut dir, mut client) = agent_core("agent-long-line-kill", &[]);
+    let line = json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1", "update": {
+        "sessionUpdate": "tool_call_update", "toolCallId": "call_1", "status": "completed",
+        "content": [{"type": "content", "content": {"type": "text", "text": "@@"}}]}}})
+    .to_string();
+    let (head, tail) = line.split_once("@@").expect("the text's place");
+    let pieces: Vec<String> = (0..32).map(line_piece).collect();
+    let (mut script, _) = started(&dir.path, "long-line-kill");
+    script.step("expect session/prompt");
+    long_reply(&mut script, 80, MESSAGE_BYTES);
+    script.step(stop("end_turn")).step("expect session/prompt");
+    let second = script.reached();
+    let reply = script.gate();
+    script
+        .step(update(json!({"sessionUpdate": "tool_call", "toolCallId": "call_1", "title": "Run",
+            "kind": "execute", "status": "in_progress"})))
+        .step(ask("perm-1"))
+        .step(format!("send-part {head}"));
+    // 1.25 MiB of the 2 MiB line, then the rest once the core is killed.
+    for piece in &pieces[..20] {
+        script.step(format!("send-part {piece}"));
+    }
+    script.step(r#"expect-response "perm-1""#);
+    let answered = script.reached();
+    let gate = script.gate();
+    for piece in &pieces[20..] {
+        script.step(format!("send-part {piece}"));
+    }
+    script.step(format!("send-raw {tail}")).step(said("after")).step(stop("end_turn"));
+    let finished = script.reached();
+    let (id, _) = spawned(&mut client, &mut dir, detached(&script.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", |log| {
+        said_all(80)(log) && *log.turn() == end(StopReason::EndTurn)
+    });
+    client.prompt(id, "two").unwrap();
+    reaches(&second);
+    // The next core's first checkpoint is a base of the whole 5 MiB log,
+    // so the line's checkpoints are appended to it.
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    client.reconnect_replay();
+    reply.open();
+    let log = client.transcript_until(id, "waits on the permission", blocked);
+    let entry = permissions(&log)[0].0;
+    // The core checkpoints past each 512 KiB of the line; then the answer
+    // is queued after those checkpoints and one of its own, so the agent
+    // reading it says the holder has them all.
+    until("the core checkpoints the line twice", TIMEOUT, || {
+        (held_line_checkpoints(&dir, id) >= 2).then_some(())
+    });
+    client.answer(id, entry, Some("allow-once")).unwrap();
+    reaches(&answered);
+
+    // The records carry the line's bytes once each, in order: each
+    // segment only those that came since the record before it.
+    let blob = stored_blob(&dir, &mut client, id);
+    let records = checkpoint_parts(&blob);
+    let kinds: Vec<char> = records.iter().map(|(kind, _, _)| *kind).collect();
+    assert_eq!(kinds[0], 'B', "{kinds:?}");
+    let pieced = records.iter().filter(|(kind, _, partial)| *kind == 'S' && !partial.is_empty()).count();
+    assert!(pieced >= 2, "{pieced} segments hold part of the line: {kinds:?}");
+    let held: Vec<u8> = records.into_iter().flat_map(|(_, _, partial)| partial).collect();
+    let whole_line = format!("{head}{}{tail}", pieces.concat());
+    assert!(held.len() > 1024 * 1024, "the records hold {} bytes of the line", held.len());
+    assert!(
+        whole_line.as_bytes().starts_with(&held),
+        "the records' {} bytes aren't the line's first bytes",
+        held.len()
+    );
+
+    // The agent finishes the line while no core runs; the next core
+    // rebuilds the part checkpointed, reads the rest from the tail and
+    // applies the line once.
+    gate.open();
+    reaches(&finished);
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, token);
+    dir.track(client.core_pid());
+    client.reconnect_replay();
+    let log = client.transcript_until(id, "has the turn's end", |log| {
+        says(log).last().map(String::as_str) == Some("agent: after") && *log.turn() == end(StopReason::EndTurn)
+    });
+    assert_eq!(tool_calls(&log), [("call_1".to_owned(), ToolStatus::Completed)]);
+    let text = match tool_content(&log).as_slice() {
+        [ToolItem::Text { text, .. }] => text.clone(),
+        other => panic!("{} items, not the line's text", other.len()),
+    };
+    assert!(text.starts_with(&pieces[0][..64]), "{}", &text[..text.len().min(64)]);
+    assert_eq!(notices(&log), Vec::<String>::new());
+    assert!(!dir.logs().contains("truncated"), "{}", dir.logs());
+}
+
+#[test]
+fn tool_calls_after_a_restart_keep_their_entries_across_a_core_kill() {
+    let token = "token-agent-tools-restarted";
+    let (mut dir, mut client) = agent_core("agent-tools-restarted", &[]);
+    let (mut first, _) = continuable(&dir.path, "tools-restarted", RESUME_AND_LOAD);
+    first.step("expect session/prompt").step(tool_call("call_1", "Before")).step(stop("end_turn"));
+    let exit = first.gate();
+    first.step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&first.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", turn_is(end(StopReason::EndTurn)));
+    exit.open();
+    kept(&mut client, id, "has the agent's exit", agent_exited);
+
+    let (mut again, _) = initialized(&dir.path, "tools-restarted-again", RESUME_ONLY);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(tool_call("call_2", "After"))
+        .step(stop("end_turn"))
+        .step("expect session/prompt");
+    let prompted = again.reached();
+    let updates = again.gate();
+    again
+        .step(update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "call_2", "status": "completed"})))
+        .step(update(json!({"sessionUpdate": "tool_call_update", "toolCallId": "call_1", "status": "completed"})))
+        .step(stop("end_turn"));
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the second turn", |log| {
+        tool_calls(log).len() == 2 && *log.turn() == end(StopReason::EndTurn)
+    });
+    // The agent read the third prompt, so the holder has every checkpoint
+    // queued before it.
+    client.prompt(id, "three").unwrap();
+    reaches(&prompted);
+
+    let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
+    client.reconnect_replay();
+    updates.open();
+    let log = client.transcript_until(id, "has the third turn", |log| {
+        tool_calls(log).len() == 3 && *log.turn() == end(StopReason::EndTurn)
+    });
+    // The new agent's call is updated in place; the earlier agent's id is
+    // a new call of this agent's, as it was before the kill.
+    assert_eq!(
+        tool_calls(&log),
+        [
+            ("call_1".to_owned(), ToolStatus::Pending),
+            ("call_2".to_owned(), ToolStatus::Completed),
+            ("call_1".to_owned(), ToolStatus::Completed),
+        ]
+    );
+}
+
+#[test]
+fn a_restarts_first_checkpoint_is_whole_after_a_partial_line() {
+    let token = "token-agent-restart-partial";
+    let (mut dir, mut client) = agent_core("agent-restart-partial", &[]);
+    let left = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"left by the first agent"#;
+    let (mut first, _) = continuable(&dir.path, "restart-partial", RESUME_AND_LOAD);
+    first.step("expect session/prompt").step(said("first")).step(stop("end_turn"));
+    let exit = first.gate();
+    first.step(format!("send-part {left}")).step("exit 1");
+    let (id, _) = spawned(&mut client, &mut dir, client_agent(&first.write()));
+    client.transcript_until(id, "is ready", ready);
+    client.prompt(id, "one").unwrap();
+    client.transcript_until(id, "has the first turn", ended(1));
+    exit.open();
+    kept(&mut client, id, "has the agent's exit", agent_exited);
+
+    let (mut again, _) = initialized(&dir.path, "restart-partial-again", RESUME_ONLY);
+    again
+        .step("expect session/resume")
+        .step("respond {}")
+        .step("expect session/prompt")
+        .step(said("second"))
+        .step(stop("end_turn"))
+        .step("expect session/prompt");
+    let prompted = again.reached();
+    let _held = again.gate();
+    client.restart(id, &again.write()).unwrap();
+    ready_again(&mut client, &mut dir, id);
+    client.prompt(id, "two").unwrap();
+    client.transcript_until(id, "has the second turn", ended(2));
+    client.prompt(id, "three").unwrap();
+    reaches(&prompted);
+
+    // The base was written after the restart, so it holds its notice, and
+    // nothing of the line the first agent left is stored.
+    let blob = stored_blob(&dir, &mut client, id);
+    let records = checkpoint_parts(&blob);
+    assert_eq!(records[0].0, 'B');
+    assert!(String::from_utf8_lossy(&records[0].1).contains(RESTARTED), "the base is from before the restart");
+    assert!(records.iter().all(|(_, _, partial)| partial.is_empty()));
+    assert!(!String::from_utf8_lossy(&blob).contains("left by the first agent"));
+
+    start_core(&dir.path, &[]).unwrap();
+    let mut client = TestClient::hello(&dir.path, token);
+    dir.track(client.core_pid());
+    client.reconnect_replay();
+    let log = client.transcript_until(id, "has the third prompt", |log| {
+        says(log).last().map(String::as_str) == Some("user: three")
+    });
+    assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: second", "user: three"]);
 }

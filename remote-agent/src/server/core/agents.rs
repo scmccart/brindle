@@ -110,6 +110,7 @@ use super::policy::{self, AgentCheckpoint, CheckpointForm, FetchView, Stored};
 use super::sessions::{Life, PendingReplay, Restart, RestartStage, SpawnRequest, command_line};
 use super::{Core, log};
 use crate::acp::checkpoint;
+use crate::acp::lines::Partial;
 use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused};
 use crate::server::event_loop::{EventLoop, Token};
 use crate::server::fault;
@@ -999,7 +1000,8 @@ impl<L: EventLoop> Core<L> {
             }
             Stored::Known { .. } | Stored::Unknown => None,
         };
-        let segment_len = segment.as_ref().map(|segment| segment.bytes.len() as u64);        let form = policy::agent_checkpoint_form(&agent.stored, at, segment_len, trimmed, adoption);
+        let segment_len = segment.as_ref().map(|segment| segment.bytes.len() as u64);
+        let form = policy::agent_checkpoint_form(&agent.stored, at, segment_len, trimmed, adoption);
         let encoded = match (form, segment) {
             (CheckpointForm::Append, Some(segment)) => Ok(ToStore::Append(segment)),
             (CheckpointForm::Append, None) | (CheckpointForm::Whole, _) => {
@@ -1023,6 +1025,15 @@ impl<L: EventLoop> Core<L> {
                         ToHolder::checkpoint_append(id, &segment.bytes, since)
                     }
                 };
+                // Only a line longer than a checkpoint's spacing, or a
+                // moment met while one arrives, is held: rare enough to say.
+                let held = match acp.lines().partial() {
+                    Partial::Collecting(line) => line.len(),
+                    Partial::TooLong { .. } | Partial::Resyncing { .. } => 0,
+                };
+                if held > 0 {
+                    log!("session {id}: checkpointed with {held} bytes of a line still arriving");
+                }
                 for message in messages {
                     self.send_holder(holder, message);
                 }
