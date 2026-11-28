@@ -4,7 +4,8 @@
 
 #[allow(unused_imports)]
 use brindle_transcript::{
-    Activity, AgentState, CALL_LIMIT, ContentBudget, Continuation, Conversation, DecodeError,
+    ATTACHMENT_TEXT, Activity, AgentState, Attachment, AttachmentId, CALL_LIMIT,
+    MAX_ATTACHMENT_NAME, MAX_ATTACHMENTS, ContentBudget, Continuation, Conversation, DecodeError,
     DiffLine, ENTRY_FRAMING, Entry, EntryId, Event, Exit, Fetched, FileChange, FileOp, FoldError,
     HUNK_FRAMING, HoldReason, Hunk, ITEM_LIMIT, LINE_FRAMING, Location, LoginKind, LoginMethod,
     MAX_CHOICES, MAX_COMMANDS, MAX_EVENT, MAX_ITEMS, MAX_LOCATIONS, MAX_OPTIONS, MAX_PATH,

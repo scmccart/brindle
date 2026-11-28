@@ -63,7 +63,7 @@ impl Workspace {
         Some(ZoneAt { tab: tab.id, zone: tab.zones.read(cx).active_id() })
     }
 
-    fn tab_zones(&self, tab: TabId) -> Option<Entity<ZoneTreeView>> {
+    pub(super) fn tab_zones(&self, tab: TabId) -> Option<Entity<ZoneTreeView>> {
         self.tabs.iter().find(|t| t.id == tab).map(|t| t.zones.clone())
     }
 
@@ -336,7 +336,7 @@ impl Workspace {
     }
 
     /// Activates the tab of `at` and focuses that zone.
-    fn show_zone(&mut self, at: ZoneAt, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn show_zone(&mut self, at: ZoneAt, window: &mut Window, cx: &mut Context<Self>) {
         self.activate(Pick::Tab(at.tab), window, cx);
         if let Some(zones) = self.tab_zones(at.tab) {
             zones.update(cx, |zones, cx| zones.focus_zone(at.zone, window, cx));

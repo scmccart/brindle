@@ -1,5 +1,8 @@
 use brindle_remote_protocol::serde_json::Value;
-use brindle_transcript::{Event, HoldReason, PermissionOutcome, Slot, StopReason, TurnState, clean};
+use brindle_transcript::{
+    Attachment, Event, HoldReason, MAX_ATTACHMENTS, NoticeLevel, PermissionOutcome, Slot,
+    StopReason, TurnState, clean,
+};
 
 use crate::acp::envelope::RpcError;
 use crate::acp::forms::{Failure, Request};
@@ -7,7 +10,7 @@ use crate::acp::limits::MAX_PROMPT;
 
 use super::lifecycle::{Ending, Phase};
 use super::text::bound;
-use super::{Moment, Refused, RunKind, Step};
+use super::{Moment, Refused, Step, attach};
 
 impl Step<'_> {
     pub(super) fn prompted(&mut self, result: Result<Value, &RpcError>) {
@@ -36,16 +39,16 @@ impl Step<'_> {
         let cancelling = *self.s.transcript.turn() == TurnState::Cancelling;
         let ready = self.readiness().is_ok();
         let waiting = match self.s.transcript.slot() {
-            Slot::Waiting { text } => Some(text.clone()),
+            Slot::Waiting { text, attachments } => Some((text.clone(), attachments.clone())),
             Slot::Empty | Slot::Held { .. } => None,
         };
         let sends = ready && matches!(ending, Ending::Stop(StopReason::EndTurn));
-        if let Some(text) = waiting {
+        if let Some((text, attachments)) = waiting {
             if sends {
                 self.turn(ending.state());
                 self.emit(Event::Queue { slot: Slot::Empty });
                 self.mark(Moment::QueueChanged);
-                self.send_prompt(text);
+                self.send_prompt(text, attachments);
                 return;
             }
             self.hold_waiting(hold_reason(&ending, cancelling));
@@ -56,35 +59,60 @@ impl Step<'_> {
 
     /// Sends `text` as a new turn: its user entry, the turn working, and
     /// the `session/prompt` line, checkpointed before it is written.
-    fn send_prompt(&mut self, text: String) {
+    fn send_prompt(&mut self, text: String, attachments: Vec<Attachment>) {
         let Phase::Ready { session } = &self.s.phase else {
             return;
         };
         let session = session.clone();
-        self.add_text(RunKind::User, &text);
+        // The parts are built at send time (OpenSpec change
+        // `agents-prompt-context`, decision 6): a queued prompt may go long
+        // after it was attached, to another agent than the one it was
+        // queued for.
+        let (parts, missing) = attach::parts(
+            &text,
+            &attachments,
+            &self.s.texts,
+            &self.s.store,
+            &self.s.cwd,
+            self.s.prompts,
+        );
+        self.add_prompt(&text, attachments);
+        for name in missing {
+            self.notice(
+                NoticeLevel::Warning,
+                format!("the attached text {name:?} is no longer kept, so the prompt went without it"),
+            );
+        }
         // A prompt is no run the agent's chunks extend.
         self.s.process.run = None;
         self.turn(TurnState::Working);
-        let line = self.s.rpc.prompt(&session, &text);
+        let forms: Vec<_> = parts.iter().map(attach::Part::form).collect();
+        let line = self.s.rpc.prompt(&session, &forms);
         self.out.stdin.extend(line);
         self.mark(Moment::BeforeRequest);
     }
 
-    pub(super) fn prompt(&mut self, text: &str) -> Result<(), Refused> {
+    pub(super) fn prompt(&mut self, text: &str, attachments: Vec<Attachment>) -> Result<(), Refused> {
+        if attachments.len() > MAX_ATTACHMENTS {
+            return Err(Refused::TooManyAttachments {
+                count: attachments.len(),
+            });
+        }
         self.readiness()?;
         let text = clean(text);
         if text.len() > MAX_PROMPT {
             return Err(Refused::TooLong { len: text.len() });
         }
+        let attachments = attach::cleaned(attachments)?;
         if !self.running() {
             // A held prompt stays held, untouched (decision 10).
-            self.send_prompt(text);
+            self.send_prompt(text, attachments);
             return Ok(());
         }
         match self.s.transcript.slot() {
             Slot::Empty => {
                 self.emit(Event::Queue {
-                    slot: Slot::Waiting { text },
+                    slot: Slot::Waiting { text, attachments },
                 });
                 self.mark(Moment::QueueChanged);
                 Ok(())
@@ -105,20 +133,23 @@ impl Step<'_> {
     }
 
     pub(super) fn resend(&mut self) -> Result<(), Refused> {
-        let Slot::Held { text, .. } = self.s.transcript.slot() else {
+        let Slot::Held {
+            text, attachments, ..
+        } = self.s.transcript.slot()
+        else {
             return Err(Refused::NoneHeld);
         };
-        let text = text.clone();
+        let (text, attachments) = (text.clone(), attachments.clone());
         self.readiness()?;
         if self.running() {
             self.emit(Event::Queue {
-                slot: Slot::Waiting { text },
+                slot: Slot::Waiting { text, attachments },
             });
             self.mark(Moment::QueueChanged);
         } else {
             self.emit(Event::Queue { slot: Slot::Empty });
             self.mark(Moment::QueueChanged);
-            self.send_prompt(text);
+            self.send_prompt(text, attachments);
         }
         Ok(())
     }
@@ -217,7 +248,7 @@ mod tests {
         assert_eq!(
             agent.entries(),
             [
-                Entry::User { text: "hi".into() },
+                Entry::user("hi"),
                 Entry::Agent {
                     text: "hello".into()
                 }

@@ -455,6 +455,31 @@ fn the_agent_messages_reject_bad_values_without_panicking() {
             client::MSG_AGENT_SET_OPTION,
             format!(r#"{{"req":1,"session":1,"option":"m","value":{{"kind":{value},"value":{value},"on":{value}}}}}"#),
         ));
+        // Attachments (`agents-prompt-context`).
+        cases.push((
+            client::MSG_AGENT_PROMPT,
+            format!(r#"{{"req":1,"session":1,"text":"t","attachments":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_PROMPT,
+            format!(r#"{{"req":1,"session":1,"text":"t","attachments":[{{"kind":{value},"path":{value},"name":{value},"upload":{value}}}]}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_ATTACH,
+            format!(r#"{{"req":{value},"session":{value},"upload":{value},"name":{value},"text":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_AGENT_READ_ATTACHMENT,
+            format!(r#"{{"req":{value},"session":{value},"id":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_ATTACHMENT,
+            format!(r#"{{"req":{value},"session":{value},"id":{value},"text":{value}}}"#),
+        ));
+        cases.push((
+            client::MSG_SPAWN_AGENT,
+            format!(r#"{{"req":1,"command":"a","attachments_dir":{value},"attachments_keep_days":{value}}}"#),
+        ));
     }
     let decoders = decoders();
     for (msg_type, payload) in cases {

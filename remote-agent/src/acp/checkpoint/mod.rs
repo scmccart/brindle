@@ -553,7 +553,7 @@ mod tests {
         let now = Instant::now();
         let out = step(
             &mut session,
-            Input::Command(Command::Prompt { text: "hi".into() }),
+            Input::Command(Command::prompt("hi")),
             now,
         );
         assert_eq!(
@@ -714,6 +714,59 @@ mod tests {
         assert_eq!(decoded, agent.s);
         assert!(matches!(decoded.process.lines.partial(), Partial::Collecting(bytes) if bytes.is_empty()));
         assert_eq!(decoded.methods.len(), 2);
+    }
+
+    /// OpenSpec change `agents-prompt-context`, task 2.5: a held prompt's
+    /// attachments and the store's next id round-trip as a base and as a
+    /// base with segments, the last record's store winning.
+    #[test]
+    fn a_held_prompt_with_attachments_round_trips_as_a_base_and_with_segments() {
+        use brindle_transcript::{Attachment, AttachmentId, HoldReason};
+        let mut agent = Agent::ready();
+        *agent.s.store_mut() = reduce::Store {
+            root: "/c".into(),
+            name: "s".into(),
+            next: 1,
+            keep_days: 14,
+            home: None,
+            windows: false,
+        };
+        let mut stored = Stored::whole(&agent.s);
+        stored.saw(agent.prompt("first"));
+        let id = agent.s.store_mut().take_id();
+        let attachments = vec![
+            Attachment::Text {
+                id,
+                name: "cargo test".into(),
+                bytes: 10,
+            },
+            Attachment::Link {
+                path: "~/a.rs".into(),
+                name: "a.rs".into(),
+            },
+        ];
+        stored.saw(agent.step(Input::Command(Command::Prompt {
+            text: "second".into(),
+            attachments: attachments.clone(),
+        })));
+        stored.append(&agent.s);
+        assert_eq!(stored.decode(agent.now), agent.s);
+        stored.saw(agent.step(Input::Command(Command::Cancel)));
+        stored.saw(agent.feed(&result(3, json!({"stopReason": "cancelled"}))));
+        assert_eq!(
+            *agent.s.transcript.slot(),
+            Slot::Held {
+                text: "second".into(),
+                reason: HoldReason::Cancelled,
+                attachments
+            }
+        );
+        assert_eq!(agent.s.store_mut().take_id(), AttachmentId(2));
+        stored.append(&agent.s);
+        let decoded = stored.decode(agent.now);
+        assert_eq!(decoded, agent.s);
+        assert_eq!(decoded.store().next, 3);
+        assert_eq!(agent.round_trip(), agent.s);
     }
 
     #[test]

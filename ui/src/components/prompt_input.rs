@@ -45,7 +45,7 @@ use crate::actions::{
     PromptSuggestionUp,
 };
 use crate::components::{Button, Textarea, Tooltip, TooltipFor, trigger_label};
-use crate::icon::Icon;
+use crate::icon::{Icon, IconElement};
 use crate::style::{ButtonSize, ButtonVariant};
 use crate::text_area::{TextArea, TextAreaEvent};
 use crate::theme::ActiveTheme;
@@ -150,6 +150,18 @@ pub enum SuggestionKey {
     Escape,
 }
 
+/// An attachment the owner's next prompt takes, shown in a row above the
+/// text area: its icon, its name (cut with an ellipsis), an optional detail
+/// such as `2.1 KiB`, and the owner's key for it, which a press on its
+/// remove mark reports ([`PromptInputEvent::RemoveAttachment`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentItem {
+    pub key: SharedString,
+    pub icon: Icon,
+    pub name: SharedString,
+    pub detail: Option<SharedString>,
+}
+
 /// An item under the text area: the owner's key for it, and its label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FooterItem {
@@ -176,6 +188,9 @@ pub enum PromptInputEvent {
     ResendQueued,
     /// Do what the reason line's action with this key says.
     Action(SharedString),
+    /// Remove the attachment with this key; the row is unchanged until the
+    /// owner changes it.
+    RemoveAttachment(SharedString),
 }
 
 /// What the submit button asks for.
@@ -228,6 +243,8 @@ pub struct PromptInput {
     area: Entity<TextArea>,
     status: PromptStatus,
     queued: Option<Queued>,
+    /// The owner's attachments, in a row under the queue row.
+    attachments: Vec<AttachmentItem>,
     reason: Option<SharedString>,
     /// The reason line's action buttons, in order.
     actions: Vec<PromptAction>,
@@ -264,6 +281,7 @@ impl PromptInput {
             area,
             status: PromptStatus::Ready,
             queued: None,
+            attachments: Vec::new(),
             reason: None,
             actions: Vec::new(),
             suggestions: None,
@@ -338,6 +356,20 @@ impl PromptInput {
 
     /// A line beside the button: why the last submit was refused, why the
     /// input is disabled.
+    /// The attachments the row above the text area shows; none hides it.
+    /// The items are no focus stops: removing one by key is the owner's
+    /// (backspace at the text's start, a command).
+    pub fn set_attachments(&mut self, attachments: Vec<AttachmentItem>, cx: &mut Context<Self>) {
+        if self.attachments != attachments {
+            self.attachments = attachments;
+            cx.notify();
+        }
+    }
+
+    pub fn attachments(&self) -> &[AttachmentItem] {
+        &self.attachments
+    }
+
     pub fn set_reason(&mut self, reason: Option<SharedString>, cx: &mut Context<Self>) {
         if self.reason != reason {
             self.reason = reason;
@@ -721,11 +753,55 @@ impl PromptInput {
             .child(trigger_label(queued.label()).flex_initial().text_color(label_color))
             .children(buttons)
     }
+
+    /// The attachments' row: each item a small bordered chip, wrapping onto
+    /// more lines when the row is full.
+    fn attachment_row(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let t = cx.ui_theme();
+        let (muted, border, radius) = (t.muted_foreground, t.border, t.radius_md());
+        let items = self.attachments.iter().enumerate().map(|(ix, item)| {
+            let key = item.key.clone();
+            let remove = Button::icon_only(gpui::ElementId::NamedInteger("prompt-attachment-remove".into(), ix as u64), Icon::X)
+                .variant(ButtonVariant::Ghost)
+                .size(ButtonSize::IconXs)
+                .tooltip_for("Remove attachment", None)
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(PromptInputEvent::RemoveAttachment(key.clone()))));
+            let selector: SharedString = format!("prompt-attachment-{ix}").into();
+            let remove_selector: SharedString = format!("prompt-attachment-remove-{ix}").into();
+            div()
+                .debug_selector(move || selector.to_string())
+                .flex()
+                .items_center()
+                .gap_1()
+                .max_w(rems(16.))
+                .min_w_0()
+                .pl_2()
+                .rounded(radius)
+                .border_1()
+                .border_color(border)
+                .child(IconElement::new(item.icon).size(rems(0.875)).color(muted))
+                .child(trigger_label(item.name.clone()).min_w(rems(2.)))
+                .when_some(item.detail.clone(), |chip, detail| {
+                    chip.child(div().flex_none().whitespace_nowrap().text_color(muted).child(detail))
+                })
+                .child(div().debug_selector(move || remove_selector.to_string()).child(remove))
+        });
+        div()
+            .debug_selector(|| "prompt-attachments".into())
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .w_full()
+            .min_w_0()
+            .text_size(rems(0.75))
+            .children(items)
+    }
 }
 
 impl Render for PromptInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let row = self.queued.clone().map(|queued| self.queue_row(&queued, cx));
+        let attachments = (!self.attachments.is_empty()).then(|| self.attachment_row(cx));
         let button = self.submit_button(cx);
         let muted = cx.ui_theme().muted_foreground;
         // An outline button after the reason, at the toolbar's height.
@@ -770,6 +846,7 @@ impl Render for PromptInput {
             .w_full()
             .min_w_0()
             .children(row)
+            .children(attachments)
             .children(suggestions)
             // The context wraps the text area alone, so the row's and the
             // toolbar's buttons keep their own enter.
@@ -1031,6 +1108,47 @@ mod tests {
         update(&input, cx, |input, cx| input.set_queued(None, cx));
         assert_eq!(bounds("prompt-area", cx).map(|b| b.top()), Some(px(10.)));
         assert!(input.read_with(cx, |input, _| input.row_stops()).is_empty());
+    }
+
+    fn item(key: &str, name: &str, detail: Option<&str>) -> AttachmentItem {
+        AttachmentItem {
+            key: key.to_string().into(),
+            icon: Icon::FileText,
+            name: name.to_string().into(),
+            detail: detail.map(|detail| detail.to_string().into()),
+        }
+    }
+
+    /// The spec's "Prompt input attachments": the row sits under the queue
+    /// row and above the text area, a long name is cut to the row's width,
+    /// a press on a remove mark asks the owner with its key and changes
+    /// nothing, and the items add no focus stop; none hides the row.
+    #[test]
+    fn the_attachments_row_asks_the_owner_to_remove_and_takes_no_stop() {
+        let (_, input, events, cx) = host();
+        cx.simulate_input("draft");
+        update(&input, cx, |input, cx| input.set_queued(Some(Queued::Waiting { text: "next".into() }), cx));
+        let stops = input.read_with(cx, |input, _| input.row_stops()).len();
+        let long = "cargo test --workspace --locked -- --nocapture and a great deal more besides";
+        let items = vec![item("a", long, Some("12 KiB")), item("b", "main.rs", None)];
+        update(&input, cx, |input, cx| input.set_attachments(items.clone(), cx));
+        let (queue, row, area) = (
+            bounds("prompt-queue-row", cx).expect("the queue row shows"),
+            bounds("prompt-attachments", cx).expect("the row shows"),
+            bounds("prompt-area", cx).expect("drawn"),
+        );
+        assert!(queue.bottom() <= row.top() && row.bottom() <= area.top(), "{queue:?} {row:?} {area:?}");
+        let first = bounds("prompt-attachment-0", cx).expect("drawn");
+        assert!(first.right() <= row.right() + px(0.5), "the long name is cut: {first:?} in {row:?}");
+        click("prompt-attachment-remove-1", cx);
+        assert_eq!(take(&events), [PromptInputEvent::RemoveAttachment("b".into())]);
+        assert_eq!(input.read_with(cx, |input, _| input.attachments().to_vec()), items, "the owner's to change");
+        assert_eq!(input.read_with(cx, |input, _| input.row_stops()).len(), stops, "no stop added");
+        update(&input, cx, |input, cx| {
+            input.set_queued(None, cx);
+            input.set_attachments(Vec::new(), cx);
+        });
+        assert_eq!(bounds("prompt-area", cx).map(|b| b.top()), Some(px(10.)), "no row");
     }
 
     /// The spec's "Held row": send again and discard each ask the owner,

@@ -62,12 +62,78 @@ impl fmt::Display for EntryId {
     }
 }
 
+/// The most attachments one prompt carries (OpenSpec change
+/// `agents-prompt-context`, design decision 2).
+pub const MAX_ATTACHMENTS: usize = 8;
+
+/// The most text one text attachment holds, in bytes: what one client
+/// message carries even if JSON escaping doubles it. Longer text is
+/// refused, never shortened (decision 2).
+pub const ATTACHMENT_TEXT: usize = 256 * 1024;
+
+/// The most an attachment's name keeps, in bytes, cut at a character
+/// boundary by the producer, as a title is.
+pub const MAX_ATTACHMENT_NAME: usize = 256;
+
+/// A kept text attachment's id: the server's, per session, from 1, never
+/// reused (`types R3`). The text's file is named by it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct AttachmentId(pub u64);
+
+impl fmt::Display for AttachmentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// One attachment of a prompt (OpenSpec change `agents-prompt-context`,
+/// design decision 1): a link to a file on the agent's host, by its path as
+/// the client gave it, or a reference to text the server keeps beside the
+/// log. The log, the slot and a checkpoint hold only this, never the text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Attachment {
+    /// A file the agent reads itself: at most [`MAX_PATH`] of its path and
+    /// [`MAX_ATTACHMENT_NAME`] of its name.
+    Link { path: String, name: String },
+    /// Text the server keeps, by its id, its name and its size in bytes.
+    Text {
+        id: AttachmentId,
+        name: String,
+        bytes: u64,
+    },
+}
+
+impl Attachment {
+    /// Its name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Link { name, .. } | Self::Text { name, .. } => name,
+        }
+    }
+
+    /// The kept text's id, for a text attachment.
+    pub fn kept(&self) -> Option<AttachmentId> {
+        match self {
+            Self::Text { id, .. } => Some(*id),
+            Self::Link { .. } => None,
+        }
+    }
+}
+
 /// One entry of the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Entry {
-    /// A prompt the user sent.
-    User { text: String },
+    /// A prompt the user sent, with its attachments in the order they were
+    /// added (left out when there are none, so a prompt without them
+    /// encodes as before attachments existed).
+    User {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
     /// What the agent said.
     Agent { text: String },
     /// What the agent thought aloud.
@@ -111,6 +177,26 @@ pub enum Entry {
 }
 
 impl Entry {
+    /// A user entry with no attachments.
+    pub fn user(text: impl Into<String>) -> Self {
+        Self::User {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A user entry's attachments; none for any other kind.
+    pub fn attachments(&self) -> &[Attachment] {
+        match self {
+            Self::User { attachments, .. } => attachments,
+            Self::Agent { .. }
+            | Self::Thought { .. }
+            | Self::Tool { .. }
+            | Self::Permission { .. }
+            | Self::Notice { .. } => &[],
+        }
+    }
+
     /// A tool call entry with no content.
     pub fn tool(call: String, title: String, kind: ToolKind, status: ToolStatus) -> Self {
         Self::Tool {
@@ -129,7 +215,7 @@ impl Entry {
     /// The text that [`Event::Appended`] grows, for the kinds that have one.
     pub(crate) fn text_mut(&mut self) -> Option<&mut String> {
         match self {
-            Self::User { text } | Self::Agent { text } | Self::Thought { text } => Some(text),
+            Self::User { text, .. } | Self::Agent { text } | Self::Thought { text } => Some(text),
             Self::Tool { .. } | Self::Permission { .. } | Self::Notice { .. } => None,
         }
     }
@@ -762,11 +848,49 @@ pub enum PermissionOutcome {
 pub enum Slot {
     #[default]
     Empty,
-    /// Queued: sent when the running turn ends with `end_turn`.
-    Waiting { text: String },
+    /// Queued: sent when the running turn ends with `end_turn`, with its
+    /// attachments (OpenSpec change `agents-prompt-context`; left out when
+    /// there are none).
+    Waiting {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
     /// Not sent, and not sent on its own: the user sends it again or
     /// discards it.
-    Held { text: String, reason: HoldReason },
+    Held {
+        text: String,
+        reason: HoldReason,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
+    },
+}
+
+impl Slot {
+    /// A waiting prompt with no attachments.
+    pub fn waiting(text: impl Into<String>) -> Self {
+        Self::Waiting {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A held prompt with no attachments.
+    pub fn held(text: impl Into<String>, reason: HoldReason) -> Self {
+        Self::Held {
+            text: text.into(),
+            reason,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// The attachments of the prompt it holds; none when empty.
+    pub fn attachments(&self) -> &[Attachment] {
+        match self {
+            Self::Empty => &[],
+            Self::Waiting { attachments, .. } | Self::Held { attachments, .. } => attachments,
+        }
+    }
 }
 
 /// Why a prompt in the slot is held.
@@ -1319,6 +1443,73 @@ mod tests {
         );
     }
 
+    /// OpenSpec change `agents-prompt-context`, task 1.2: a user entry and
+    /// both slots that hold a prompt carry their attachments in order, each
+    /// form round-trips, and none encodes as before they existed.
+    #[test]
+    fn attachments_round_trip_and_none_encode_as_before() {
+        let attachments = vec![
+            Attachment::Text {
+                id: AttachmentId(5),
+                name: "cargo test".into(),
+                bytes: 3,
+            },
+            Attachment::Link {
+                path: "src/main.rs".into(),
+                name: "main.rs".into(),
+            },
+        ];
+        let events = [
+            Event::Added {
+                id: EntryId(1),
+                entry: Entry::User {
+                    text: "why?".into(),
+                    attachments: attachments.clone(),
+                },
+            },
+            Event::Queue {
+                slot: Slot::Waiting {
+                    text: "next".into(),
+                    attachments: attachments.clone(),
+                },
+            },
+            Event::Queue {
+                slot: Slot::Held {
+                    text: "next".into(),
+                    reason: HoldReason::Failed,
+                    attachments: attachments.clone(),
+                },
+            },
+        ];
+        for event in &events {
+            assert_eq!(Event::from_value(&event.to_value()).as_ref(), Ok(event));
+        }
+        assert_eq!(
+            events[0].to_value()["entry"]["attachments"],
+            serde_json::json!([
+                {"kind": "text", "id": 5, "name": "cargo test", "bytes": 3},
+                {"kind": "link", "path": "src/main.rs", "name": "main.rs"},
+            ])
+        );
+        assert_eq!(
+            Event::Added { id: EntryId(1), entry: Entry::user("why?") }.to_value(),
+            serde_json::json!({"event": "added", "id": 1, "entry": {"type": "user", "text": "why?"}})
+        );
+        for slot in [Slot::held("next", HoldReason::Failed), Slot::waiting("next")] {
+            assert!(Event::Queue { slot }.to_value()["slot"].get("attachments").is_none());
+        }
+        // An unknown kind of attachment is refused, as any unknown value.
+        let mut unknown = events[0].to_value();
+        unknown["entry"]["attachments"][0]["kind"] = "image".into();
+        assert!(Event::from_value(&unknown).is_err());
+        assert_eq!(events[0].clone().to_value()["entry"]["type"], "user");
+        let Event::Added { entry, .. } = &events[0] else { unreachable!() };
+        assert_eq!(entry.attachments(), attachments.as_slice());
+        assert_eq!(attachments[0].kept(), Some(AttachmentId(5)));
+        assert_eq!(attachments[1].kept(), None);
+        assert_eq!(attachments[1].name(), "main.rs");
+    }
+
     #[test]
     fn a_login_demand_without_methods_encodes_as_before_methods_existed() {
         let state = AgentState::LoginRequired {
@@ -1417,9 +1608,7 @@ mod tests {
                 "slot": {"slot": "waiting", "text": "next", "later": true},
             })),
             Ok(Event::Queue {
-                slot: Slot::Waiting {
-                    text: "next".into()
-                }
+                slot: Slot::waiting("next")
             })
         );
     }

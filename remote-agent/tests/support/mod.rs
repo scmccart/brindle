@@ -1005,6 +1005,7 @@ impl TestClient {
                 ToClient::Ok(ok) => ok.req == req,
                 ToClient::Sessions(sessions) => sessions.req == req,
                 ToClient::ServerStatus(status) => status.req == req,
+                ToClient::Attachment(attachment) => attachment.req == req,
                 _ => false,
             };
             if matches {
@@ -1267,12 +1268,51 @@ impl TestClient {
     /// `AGENT_PROMPT`: `text` for the agent, sent now or queued.
     pub fn prompt(&mut self, session: SessionId, text: &str) -> Result<(), client::ErrorMessage> {
         let req = self.take_req();
+        self.send(client::ToCore::AgentPrompt(client::AgentPrompt::text(req, session, text)));
+        self.agent_reply(req)
+    }
+
+    /// `AGENT_PROMPT` with `attachments` (OpenSpec change
+    /// `agents-prompt-context`).
+    pub fn prompt_with(
+        &mut self,
+        session: SessionId,
+        text: &str,
+        attachments: Vec<client::PromptAttachment>,
+    ) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
         self.send(client::ToCore::AgentPrompt(client::AgentPrompt {
+            attachments,
+            ..client::AgentPrompt::text(req, session, text)
+        }));
+        self.agent_reply(req)
+    }
+
+    /// `AGENT_ATTACH`: `text` kept for the session as upload `upload`.
+    pub fn attach_text(&mut self, session: SessionId, upload: u64, name: &str, text: &str) -> Result<(), client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentAttach(client::AgentAttach {
             req,
             session,
+            upload,
+            name: name.into(),
             text: text.into(),
         }));
         self.agent_reply(req)
+    }
+
+    /// `AGENT_READ_ATTACHMENT`: the kept text `id`, or the refusal.
+    pub fn read_attachment(&mut self, session: SessionId, id: u64) -> Result<String, client::ErrorMessage> {
+        let req = self.take_req();
+        self.send(client::ToCore::AgentReadAttachment(client::AgentReadAttachment { req, session, id }));
+        match self.reply(req) {
+            ToClient::Attachment(answer) => {
+                assert_eq!((answer.session, answer.id), (session, id));
+                Ok(answer.text)
+            }
+            ToClient::Error(error) => Err(error),
+            other => panic!("expected ATTACHMENT or ERROR, got {other:?}"),
+        }
     }
 
     /// `AGENT_UNQUEUE`: the prompt in the slot is discarded.
@@ -1716,6 +1756,8 @@ pub fn client_agent(script: &Path) -> client::SpawnAgent {
         profile: None,
         conversation: None,
         start: None,
+        attachments_dir: None,
+        attachments_keep_days: None,
     }
 }
 

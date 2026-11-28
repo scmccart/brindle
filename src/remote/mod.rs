@@ -71,8 +71,26 @@ impl AgentLink {
     /// Sends a prompt while the session runs; the request's id, which its
     /// answer comes back under (`AgentEvent::Reply`), or why nothing was
     /// sent.
-    pub fn prompt(&self, text: &str) -> Result<protocol::RequestId, NotSent> {
-        self.0.prompt(text)
+    pub fn prompt(
+        &self,
+        text: &str,
+        attachments: Vec<protocol::client::PromptAttachment>,
+    ) -> Result<protocol::RequestId, NotSent> {
+        self.0.prompt_with(text, attachments)
+    }
+
+    /// Keeps `text`, named `name`, for the next prompt (`AGENT_ATTACH`, OpenSpec
+    /// change `agents-prompt-context`), as [`AgentLink::prompt`]: the request's
+    /// id is its upload number, which that prompt names.
+    pub fn attach(&self, name: &str, text: &str) -> Result<protocol::RequestId, NotSent> {
+        self.0.attach_text(name, text)
+    }
+
+    /// Reads the kept text `id` (`AGENT_READ_ATTACHMENT`), as
+    /// [`AgentLink::prompt`]: the text comes as `AgentEvent::Attachment` in
+    /// place of a reply.
+    pub fn read_attachment(&self, id: u64) -> Result<protocol::RequestId, NotSent> {
+        self.0.read_attachment(id)
     }
 
     /// Sends the held prompt again, as [`AgentLink::prompt`].
@@ -163,7 +181,19 @@ impl AgentLink {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 impl AgentLink {
-    pub fn prompt(&self, _text: &str) -> Result<protocol::RequestId, NotSent> {
+    pub fn prompt(
+        &self,
+        _text: &str,
+        _attachments: Vec<protocol::client::PromptAttachment>,
+    ) -> Result<protocol::RequestId, NotSent> {
+        match *self {}
+    }
+
+    pub fn attach(&self, _name: &str, _text: &str) -> Result<protocol::RequestId, NotSent> {
+        match *self {}
+    }
+
+    pub fn read_attachment(&self, _id: u64) -> Result<protocol::RequestId, NotSent> {
         match *self {}
     }
 
@@ -417,6 +447,7 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             identity_file,
             ssh_args,
             connect_at_launch: _,
+            attachments_dir: _,
         } => {
             let mut command = Command::new("ssh");
             command.args([
@@ -451,6 +482,7 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             container,
             user,
             connect_at_launch: _,
+            attachments_dir: _,
         } => {
             if engine != "docker" && engine != "podman" {
                 bail!("unsupported container engine {engine:?}; use docker or podman");
@@ -497,7 +529,7 @@ mod tests {
             port: Some(2222),
             identity_file: Some("key file".into()),
             ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let command = remote_command(
             &target,
@@ -538,7 +570,7 @@ mod tests {
             engine: "docker".into(),
             container: "devbox".into(),
             user: Some("1000".into()),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let command =
             remote_command(&target, "/bin/sh", &["-lc".into(), "echo hi".into()]).unwrap();

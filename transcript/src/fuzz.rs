@@ -101,7 +101,10 @@ fn outcome(rng: &mut XorShift) -> PermissionOutcome {
 
 fn entry(rng: &mut XorShift) -> Entry {
     match rng.below(6) {
-        0 => Entry::User { text: text(rng) },
+        0 => Entry::User {
+            text: text(rng),
+            attachments: attachments(rng),
+        },
         1 => Entry::Agent { text: text(rng) },
         2 => Entry::Thought { text: text(rng) },
         3 => Entry::Tool {
@@ -236,7 +239,10 @@ fn locations(rng: &mut XorShift) -> Vec<Location> {
 fn slot(rng: &mut XorShift) -> Slot {
     match rng.below(3) {
         0 => Slot::Empty,
-        1 => Slot::Waiting { text: text(rng) },
+        1 => Slot::Waiting {
+            text: text(rng),
+            attachments: attachments(rng),
+        },
         _ => Slot::Held {
             text: text(rng),
             reason: match rng.below(6) {
@@ -247,8 +253,33 @@ fn slot(rng: &mut XorShift) -> Slot {
                 4 => HoldReason::AgentStopped,
                 _ => HoldReason::OutputLost,
             },
+            attachments: attachments(rng),
         },
     }
+}
+
+/// A prompt's attachments: often none, else up to [`MAX_ATTACHMENTS`] of
+/// either kind (OpenSpec change `agents-prompt-context`).
+fn attachments(rng: &mut XorShift) -> Vec<Attachment> {
+    if rng.chance(2) {
+        return Vec::new();
+    }
+    (0..rng.below(MAX_ATTACHMENTS + 1))
+        .map(|_| {
+            if rng.chance(2) {
+                Attachment::Link {
+                    path: text(rng),
+                    name: text(rng),
+                }
+            } else {
+                Attachment::Text {
+                    id: AttachmentId(rng.next()),
+                    name: text(rng),
+                    bytes: rng.next(),
+                }
+            }
+        })
+        .collect()
 }
 
 fn turn(rng: &mut XorShift) -> TurnState {

@@ -687,15 +687,13 @@ mod tests {
     fn queue_sets_the_slot_from_any_slot_and_never_fails() {
         let slots = [
             Slot::Empty,
-            Slot::Waiting {
-                text: "next".into(),
-            },
-            Slot::Held {
-                text: "held".into(),
-                reason: HoldReason::Stopped {
+            Slot::waiting("next"),
+            Slot::held(
+                "held",
+                HoldReason::Stopped {
                     stop: StopReason::MaxTokens,
                 },
-            },
+            ),
         ];
         for from in &slots {
             for to in &slots {
@@ -915,11 +913,8 @@ mod tests {
     #[test]
     fn the_slot_doesnt_change_the_activity() {
         for slot in [
-            Slot::Waiting { text: "w".into() },
-            Slot::Held {
-                text: "h".into(),
-                reason: HoldReason::Cancelled,
-            },
+            Slot::waiting("w"),
+            Slot::held("h", HoldReason::Cancelled),
         ] {
             let mut transcript = with(ready(), ended(StopReason::EndTurn));
             transcript.apply(&Event::Queue { slot }).unwrap();

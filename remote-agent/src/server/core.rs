@@ -55,7 +55,9 @@
 //!   directory for its life.
 
 mod agents;
+mod attachments;
 mod clients;
+mod kept;
 mod holders;
 mod manage;
 mod policy;
@@ -293,6 +295,14 @@ pub(super) struct Core<L: EventLoop> {
     stopping: Option<Answer>,
     /// Answered once the holders have their checkpoints and `GOODBYE`.
     stepping_down: Option<Answer>,
+    /// Every connection's untaken uploads (OpenSpec change
+    /// `agents-prompt-context`).
+    uploads: attachments::Uploads<Token>,
+    /// What the core knows of each agent session's attachment store.
+    kept: BTreeMap<SessionId, kept::Kept>,
+    /// Whether the default attachments directory was swept once clients
+    /// were first accepted.
+    swept: bool,
 }
 
 impl<L: EventLoop> Core<L> {
@@ -335,6 +345,9 @@ impl<L: EventLoop> Core<L> {
             next_look: Instant::now() + process::PROCESS_LOOK,
             stopping: None,
             stepping_down: None,
+            uploads: attachments::Uploads::default(),
+            kept: BTreeMap::new(),
+            swept: false,
         })
     }
 
@@ -362,6 +375,7 @@ impl<L: EventLoop> Core<L> {
         }
         self.reap_starters();
         self.tick(Instant::now());
+        self.reconcile_stores();
         Ok(())
     }
 

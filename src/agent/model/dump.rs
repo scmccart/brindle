@@ -4,13 +4,14 @@ use crate::agent::login::MethodOffer;
 use crate::agent::markdown;
 use crate::agent::tool;
 use crate::agent::transcript::{
-    AgentState, DiffLine, Entry, EntryId, Exit, FileOp, NoticeLevel, OptionCategory, OptionControl, PermissionOutcome,
+    AgentState, Attachment, DiffLine, Entry, EntryId, Exit, FileOp, NoticeLevel, OptionCategory, OptionControl, PermissionOutcome,
     ToolItem, ToolKind, ToolStatus, TurnState, status_of,
 };
 use crate::terminal::links::Plan;
 use crate::terminal::status::State;
 
 use super::ChatModel;
+use super::attach::{Draft, TextState};
 use super::blocks::BlockBody;
 use super::login::LoginRow;
 use super::paging::Earlier;
@@ -244,20 +245,31 @@ impl ChatModel {
         for (id, entry) in &self.entries {
             out.push_str(&format!("--- entry {id} {}\n", self.entry_line(*id, entry)));
             out.push_str(&self.part_lines(*id, plan));
+            out.push_str(&self.attached_lines(*id, entry));
             out.push_str(&tool_lines(*id, entry));
         }
         if let Some(row) = self.working_row() {
             out.push_str(&format!("--- working {:?}\n", row.text().as_ref()));
         }
+        // A queued prompt's attachments counted only when it has some, so
+        // the line without them reads as before.
+        let counted = |count: usize| if count > 0 { format!(" attachments={count}") } else { String::new() };
         match &self.queue {
             QueueRow::None => {}
-            QueueRow::Waiting { text } => out.push_str(&format!("--- queued waiting {:?}\n", text.as_ref())),
-            QueueRow::Held { text, reason, resend, .. } => {
+            QueueRow::Waiting { text, attachments } => {
+                out.push_str(&format!("--- queued waiting{} {:?}\n", counted(*attachments), text.as_ref()));
+            }
+            QueueRow::Held { text, attachments, reason, resend, .. } => {
                 let resend = match resend {
                     Resend::Available => "yes",
                     Resend::Unavailable(_) => "no",
                 };
-                out.push_str(&format!("--- queued held reason={} resend={resend} {:?}\n", hold_word(reason), text.as_ref()));
+                out.push_str(&format!(
+                    "--- queued held reason={} resend={resend}{} {:?}\n",
+                    hold_word(reason),
+                    counted(*attachments),
+                    text.as_ref()
+                ));
             }
         }
         out.push_str(&format!("--- conversation entries={}", self.entries.len()));
@@ -270,7 +282,9 @@ impl ChatModel {
             Earlier::Loading { .. } => out.push_str(" earlier=loading"),
             Earlier::Failed { count, why } => out.push_str(&format!(" earlier={count} fetch-error={:?}", why.as_ref())),
         }
-        out.push_str(&format!("\n--- prompt status={}", self.prompt_status().word()));
+        out.push('\n');
+        out.push_str(&self.draft_lines());
+        out.push_str(&format!("--- prompt status={}", self.prompt_status().word()));
         if let Some(first) = self.first_shown() {
             out.push_str(&format!(" first={first:?}"));
         }
@@ -288,6 +302,49 @@ impl ChatModel {
         out.push('\n');
         if let Some(completion) = &self.completion {
             out.push_str(&completion.lines());
+        }
+        out
+    }
+
+    /// A user entry's `--- attached` line per attachment (OpenSpec change
+    /// `agents-prompt-context`, decision 10): a kept text's id, size and
+    /// row state, and its text only while shown; a link's path and name.
+    fn attached_lines(&self, id: EntryId, entry: &Entry) -> String {
+        let Entry::User { attachments, .. } = entry else { return String::new() };
+        let mut out = String::new();
+        for (index, attachment) in attachments.iter().enumerate() {
+            out.push_str(&format!("--- attached entry={id} index={index} "));
+            match attachment {
+                Attachment::Text { id: kept, name, bytes } => {
+                    let state = self.row_state(id, index);
+                    out.push_str(&format!("kind=text id={} name={name:?} bytes={bytes} state={}", kept.0, state.name()));
+                    match state {
+                        TextState::Shown(text) => out.push_str(&format!(" {text:?}")),
+                        TextState::Gone(why) => out.push_str(&format!(" why={why:?}")),
+                        TextState::Closed | TextState::Loading => {}
+                    }
+                }
+                Attachment::Link { path, name } => out.push_str(&format!("kind=link path={path:?} name={name:?}")),
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A `--- draft` line per attachment the next prompt takes, each
+    /// holding its text.
+    fn draft_lines(&self) -> String {
+        let mut out = String::new();
+        for (index, draft) in self.drafts().iter().enumerate() {
+            match draft {
+                Draft::Text { name, text } => out.push_str(&format!(
+                    "--- draft index={index} kind=text name={name:?} bytes={} {text:?}\n",
+                    text.len()
+                )),
+                Draft::Link { path, name } => {
+                    out.push_str(&format!("--- draft index={index} kind=link path={path:?} name={name:?}\n"));
+                }
+            }
         }
         out
     }
@@ -366,7 +423,8 @@ impl ChatModel {
 
     pub(super) fn entry_line(&self, id: EntryId, entry: &Entry) -> String {
         match entry {
-            Entry::User { text } => format!("user {text:?}"),
+            Entry::User { text, attachments } if attachments.is_empty() => format!("user {text:?}"),
+            Entry::User { text, attachments } => format!("user attachments={} {text:?}", attachments.len()),
             Entry::Agent { text } => format!("agent {text:?}"),
             Entry::Thought { text } => format!("thought open={} {text:?}", self.thought_open(id)),
             Entry::Tool { call, title, kind, status, content, more, .. } => {
@@ -579,5 +637,50 @@ mod tests {
         zone.feed(&[added(4, agent("[f](file:///etc/hosts)"))]);
         let windows = |uri: &str| crate::terminal::links::plan(uri, "thishost", true);
         assert!(zone.model.wait_text(&found(&zone.model), &windows).contains("action=refuse:no-drive\n"));
+    }
+
+    /// `agents-prompt-context` 4.6 (decision 10): a user entry's count and
+    /// `--- attached` lines in each row state, the draft's lines before the
+    /// prompt's, the queued count, and escaping; `--wait-for` sees them all.
+    #[test]
+    fn the_dump_shows_attachments_the_draft_and_the_queued_count() {
+        use crate::agent::transcript::{Attachment, AttachmentId, Slot};
+        let mut zone = Zone::ready();
+        let kept = Attachment::Text { id: AttachmentId(5), name: "cargo \"test\"".into(), bytes: 262_144 };
+        let link = Attachment::Link { path: "src/main.rs".into(), name: "main.rs".into() };
+        zone.feed(&[
+            added(1, user_with("why does this fail?", vec![kept.clone(), link])),
+            queue(Slot::Waiting { text: "next".into(), attachments: vec![kept] }),
+        ]);
+        zone.model.attach(Draft::text("output from zsh", "a\tb\n")).unwrap();
+        zone.model.attach(Draft::link("C:\\w\\a.rs")).unwrap();
+        let dump = zone.model.describe(1, true, &found(&zone.model), &linux);
+        let expected = "\
+--- entry 1 user attachments=2 \"why does this fail?\"
+--- attached entry=1 index=0 kind=text id=5 name=\"cargo \\\"test\\\"\" bytes=262144 state=closed
+--- attached entry=1 index=1 kind=link path=\"src/main.rs\" name=\"main.rs\"
+--- queued waiting attachments=1 \"next\"
+--- conversation entries=1 at=end earlier=none
+--- draft index=0 kind=text name=\"output from zsh\" bytes=4 \"a\\tb\\n\"
+--- draft index=1 kind=link path=\"C:\\\\w\\\\a.rs\" name=\"a.rs\"
+--- prompt status=ready
+";
+        assert!(dump.ends_with(expected), "{dump}");
+        let wait = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(wait.contains("--- draft index=0 kind=text name=\"output from zsh\" bytes=4 \"a\\tb\\n\"\n"), "{wait}");
+
+        let entry = EntryId(1);
+        zone.model.press_row(entry, 0);
+        zone.model.sent(7, Sent::Read { entry, index: 0 });
+        assert!(zone.model.wait_text(&found(&zone.model), &linux).contains("state=loading\n"));
+        zone.model.attachment_read(7, "ok\n".into());
+        assert!(zone.model.wait_text(&found(&zone.model), &linux).contains("state=shown \"ok\\n\"\n"));
+        zone.model.press_row(entry, 0);
+        assert!(zone.model.wait_text(&found(&zone.model), &linux).contains("state=closed\n"), "closed, its text dropped");
+        assert_eq!(zone.model.press_row(entry, 0), RowPress::Read(5));
+        zone.model.sent(8, Sent::Read { entry, index: 0 });
+        zone.model.replied(8, Err(ReplyError::Failed("attachment 5 is no longer kept".into())));
+        let gone = zone.model.wait_text(&found(&zone.model), &linux);
+        assert!(gone.contains("state=gone why=\"the text is no longer kept\"\n"), "{gone}");
     }
 }

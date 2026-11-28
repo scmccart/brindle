@@ -345,8 +345,30 @@ impl Session {
     /// Sends the agent a prompt (`AGENT_PROMPT`) while the session runs;
     /// the request's id, which its answer comes back under
     /// ([`SessionSink::reply`]), or why nothing was sent.
+    pub fn prompt_with(
+        &self,
+        text: &str,
+        attachments: Vec<crate::remote::protocol::client::PromptAttachment>,
+    ) -> Result<RequestId, NotSent> {
+        self.running(|running| running.prompt(text, attachments))
+    }
+
+    /// The tests' prompt with no attachments.
+    #[cfg(test)]
     pub fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
-        self.running(|running| running.prompt(text))
+        self.prompt_with(text, Vec::new())
+    }
+
+    /// Keeps a text for the session's next prompt (`AGENT_ATTACH`), as
+    /// [`Session::prompt`]; the id is its upload number too.
+    pub fn attach_text(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        self.running(|running| running.attach_text(name, text))
+    }
+
+    /// Reads a kept text (`AGENT_READ_ATTACHMENT`), as [`Session::prompt`];
+    /// the text reaches the sink in place of a reply.
+    pub fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        self.running(|running| running.read_attachment(id))
     }
 
     /// Sends the held prompt again (`AGENT_RESEND`), as [`Session::prompt`].
@@ -1545,6 +1567,7 @@ mod tests {
             profile: "Claude".into(),
             conversation: None,
             start: None,
+            keeping: Default::default(),
         }
     }
 
@@ -1587,7 +1610,7 @@ mod tests {
 
         fn start_turn(&mut self, text: &str) -> Vec<Event> {
             self.running = true;
-            let mut events = vec![self.added(Entry::User { text: text.into() }), Event::Turn { state: TurnState::Working }];
+            let mut events = vec![self.added(Entry::user(text)), Event::Turn { state: TurnState::Working }];
             match text {
                 "hi" => {
                     events.push(self.added(Entry::Agent { text: "hello back".into() }));
@@ -1624,22 +1647,22 @@ mod tests {
                 }
                 ToCore::AgentPrompt(prompt) if self.slot == Slot::Empty => {
                     ok(stream, prompt.req);
-                    let event = self.set_slot(Slot::Waiting { text: prompt.text.clone() });
+                    let event = self.set_slot(Slot::waiting(prompt.text.clone()));
                     transcript(stream, &[event]);
                 }
                 ToCore::AgentPrompt(prompt) => refuse(stream, prompt.req, "a prompt is already queued"),
                 ToCore::AgentCancel(_) if self.running => {
                     self.running = false;
                     let mut events = vec![Event::Turn { state: TurnState::Ended { stop: StopReason::Cancelled } }];
-                    if let Slot::Waiting { text } = self.slot.clone() {
-                        events.push(self.set_slot(Slot::Held { text, reason: HoldReason::Cancelled }));
+                    if let Slot::Waiting { text, attachments } = self.slot.clone() {
+                        events.push(self.set_slot(Slot::Held { text, reason: HoldReason::Cancelled, attachments }));
                     }
                     transcript(stream, &events);
                 }
                 ToCore::AgentResend(request) => match self.slot.clone() {
-                    Slot::Held { text, .. } if self.running => {
+                    Slot::Held { text, attachments, .. } if self.running => {
                         ok(stream, request.req);
-                        let event = self.set_slot(Slot::Waiting { text });
+                        let event = self.set_slot(Slot::Waiting { text, attachments });
                         transcript(stream, &[event]);
                     }
                     Slot::Held { text, .. } => {
@@ -1701,7 +1724,7 @@ mod tests {
     fn says(log: &Transcript) -> Vec<String> {
         log.entries()
             .filter_map(|(_, entry)| match entry {
-                Entry::User { text } => Some(format!("user: {text}")),
+                Entry::User { text, .. } => Some(format!("user: {text}")),
                 Entry::Agent { text } => Some(format!("agent: {text}")),
                 Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
             })
@@ -1745,8 +1768,7 @@ mod tests {
             env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
             policy: client::Policy::Detach,
             profile: Some("Claude".into()),
-            conversation: None,
-            start: None,
+            ..client::SpawnAgent::default()
         };
         assert_eq!(spawn, expected);
         let life = shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
@@ -1771,12 +1793,61 @@ mod tests {
     fn an_agent_session_starts_and_runs_a_turn() {
         let mut agent = agent_session("agent-turn");
         let req = agent.session.prompt("hi").unwrap();
-        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(client::AgentPrompt { req, session: AGENT, text: "hi".into() }));
+        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(client::AgentPrompt::text(req, AGENT, "hi")));
         let ended = |log: &Transcript| *log.turn() == TurnState::Ended { stop: StopReason::EndTurn };
         assert_eq!(shows(&mut agent.feed, "the turn's end", ended), [reply(req)]);
         assert_eq!(says(agent.feed.shared.lock().transcript()), ["user: hi", "agent: hello back"]);
         agent.session.close();
         assert_eq!(recv(&agent.core), ToCore::Close(client::SessionRef { session: AGENT }));
+    }
+
+    /// `agents-prompt-context` 4.1: a text goes out as `AGENT_ATTACH`, its
+    /// upload numbered by its request; the prompt names it in
+    /// `AGENT_PROMPT`'s list beside a link; the user entry folds with its
+    /// references; and a read's `ATTACHMENT` reaches the zone as its text,
+    /// its `ERROR` as the read's refusal.
+    #[test]
+    fn an_attached_text_and_its_read_go_out_and_their_answers_come_back() {
+        use crate::agent::transcript::{Attachment, AttachmentId};
+        use client::PromptAttachment;
+        let kept = Attachment::Text { id: AttachmentId(1), name: "cargo test".into(), bytes: 3 };
+        let link = Attachment::Link { path: "src/a.rs".into(), name: "a.rs".into() };
+        let entry = Entry::User { text: "why?".into(), attachments: vec![kept.clone(), link.clone()] };
+        let mut mini = MiniAgent::default();
+        let mut agent = agent_session_with("agent-attach", None, move |message, stream| match message {
+            ToCore::AgentAttach(attach) => ok(stream, attach.req),
+            ToCore::AgentPrompt(prompt) if !prompt.attachments.is_empty() => {
+                ok(stream, prompt.req);
+                let added = mini.added(entry.clone());
+                let ended = Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } };
+                transcript(stream, &[added, ended]);
+            }
+            ToCore::AgentReadAttachment(read) if read.id == 1 => send(
+                stream,
+                ToClient::Attachment(client::AttachmentText { req: read.req, session: read.session, id: 1, text: "ok\n".into() }),
+            ),
+            ToCore::AgentReadAttachment(read) => refuse(stream, read.req, "attachment 9 is no longer kept"),
+            other => mini.answer(other, stream),
+        });
+        let upload = agent.session.attach_text("cargo test", "ok\n").unwrap();
+        let sent = client::AgentAttach { req: upload, session: AGENT, upload, name: "cargo test".into(), text: "ok\n".into() };
+        assert_eq!(recv(&agent.core), ToCore::AgentAttach(sent));
+        let parts = vec![PromptAttachment::Text { upload }, PromptAttachment::Link { path: "src/a.rs".into(), name: "a.rs".into() }];
+        let prompt = agent.session.prompt_with("why?", parts.clone()).unwrap();
+        let sent = client::AgentPrompt { attachments: parts, ..client::AgentPrompt::text(prompt, AGENT, "why?") };
+        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(sent));
+        let ended = |log: &Transcript| *log.turn() == TurnState::Ended { stop: StopReason::EndTurn };
+        assert_eq!(shows(&mut agent.feed, "the turn's end", ended), [reply(upload), reply(prompt)]);
+        let held: Vec<Entry> = agent.feed.shared.lock().transcript().entries().map(|(_, entry)| entry.clone()).collect();
+        assert_eq!(held, [Entry::User { text: "why?".into(), attachments: vec![kept, link] }]);
+
+        let read = agent.session.read_attachment(1).unwrap();
+        assert_eq!(recv(&agent.core), ToCore::AgentReadAttachment(client::AgentReadAttachment { req: read, session: AGENT, id: 1 }));
+        assert_eq!(next_life(&mut agent.feed), AgentEvent::Attachment { request: read, id: 1, text: "ok\n".into() });
+        let gone = agent.session.read_attachment(9).unwrap();
+        recv(&agent.core);
+        let refused = AgentEvent::Reply { request: gone, outcome: Err(ReplyError::Failed("attachment 9 is no longer kept".into())) };
+        assert_eq!(next_life(&mut agent.feed), refused);
     }
 
     /// `agents-session-recovery` 4.2: an ended agent's restart goes out as
@@ -1984,7 +2055,7 @@ mod tests {
         let working = |log: &Transcript| *log.turn() == TurnState::Working;
         assert_eq!(shows(&mut agent.feed, "the turn", working), [reply(first)]);
         let second = agent.session.prompt("next").unwrap();
-        let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
+        let waiting = |log: &Transcript| *log.slot() == Slot::waiting("next");
         assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(second)]);
         let third = agent.session.prompt("third").unwrap();
         let refused = AgentEvent::Reply { request: third, outcome: Err("a prompt is already queued".into()) };
@@ -1996,9 +2067,9 @@ mod tests {
         assert_eq!(
             sent,
             [
-                ToCore::AgentPrompt(client::AgentPrompt { req: first, session: AGENT, text: "long".into() }),
-                ToCore::AgentPrompt(client::AgentPrompt { req: second, session: AGENT, text: "next".into() }),
-                ToCore::AgentPrompt(client::AgentPrompt { req: third, session: AGENT, text: "third".into() }),
+                ToCore::AgentPrompt(client::AgentPrompt::text(first, AGENT, "long")),
+                ToCore::AgentPrompt(client::AgentPrompt::text(second, AGENT, "next")),
+                ToCore::AgentPrompt(client::AgentPrompt::text(third, AGENT, "third")),
                 ToCore::AgentUnqueue(client::AgentRequest { req: removed, session: AGENT }),
             ]
         );
@@ -2011,10 +2082,10 @@ mod tests {
     #[test]
     fn a_cancel_holds_the_queued_prompt_which_is_resent_or_discarded() {
         let mut agent = agent_session("agent-held");
-        let held = |text: &str| Slot::Held { text: text.into(), reason: HoldReason::Cancelled };
+        let held = |text: &str| Slot::held(text, HoldReason::Cancelled);
         let first = agent.session.prompt("long").unwrap();
         let second = agent.session.prompt("next").unwrap();
-        let waiting = |log: &Transcript| *log.slot() == Slot::Waiting { text: "next".into() };
+        let waiting = |log: &Transcript| *log.slot() == Slot::waiting("next");
         assert_eq!(shows(&mut agent.feed, "the queued prompt", waiting), [reply(first), reply(second)]);
 
         assert_eq!(agent.session.cancel(), Ok(()));
@@ -2044,7 +2115,7 @@ mod tests {
 
         // A held prompt discarded.
         let more = agent.session.prompt("more").unwrap();
-        let queued = |log: &Transcript| *log.slot() == Slot::Waiting { text: "more".into() };
+        let queued = |log: &Transcript| *log.slot() == Slot::waiting("more");
         assert_eq!(shows(&mut agent.feed, "another queued", queued), [reply(more)]);
         assert_eq!(agent.session.cancel(), Ok(()));
         shows(&mut agent.feed, "it held", |log| *log.slot() == held("more"));
@@ -2139,6 +2210,7 @@ mod tests {
             profile: "Fake".into(),
             conversation: None,
             start: None,
+            keeping: Default::default(),
         };
         let (sink, mut feed) = AgentSink::with_fault(Some(b"BRINDLE-FAULT-REAL".to_vec()));
         let session = Session::start_agent_with(move || Ok(starting), request, Box::new(sink));
@@ -2248,7 +2320,7 @@ mod tests {
         assert!(matches!(recv(&core), ToCore::SpawnAgent(_)));
         assert_eq!(next_life(&mut feed), AgentEvent::SessionRunning, "the only life event of a start");
         let req = session.prompt("hi").expect("sent once the session runs");
-        assert_eq!(recv(&core), ToCore::AgentPrompt(client::AgentPrompt { req, session: AGENT, text: "hi".into() }));
+        assert_eq!(recv(&core), ToCore::AgentPrompt(client::AgentPrompt::text(req, AGENT, "hi")));
         drop(connection);
     }
 

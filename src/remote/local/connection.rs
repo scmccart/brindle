@@ -261,6 +261,12 @@ pub trait SessionSink: Send {
             listed.session
         );
     }
+    /// `ATTACHMENT` answering the agent request `request` (an
+    /// `AGENT_READ_ATTACHMENT`, OpenSpec change `agents-prompt-context`): a
+    /// kept text. A terminal's sink never gets one.
+    fn attachment(&mut self, _request: RequestId, kept: client::AttachmentText) {
+        log::debug!("terminal server: attachment {} for session {} dropped", kept.id, kept.session);
+    }
     /// The link to the core went down; the session stays shown, and a
     /// reconnect's replay of it (or its loss) follows.
     fn link_down(&mut self) {}
@@ -1535,7 +1541,7 @@ impl Connection {
         abandon: Option<&Abandon>,
     ) -> Result<Running> {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let AgentSpawnRequest { command, args, cwd, env, profile, conversation, start } = request;
+        let AgentSpawnRequest { command, args, cwd, env, profile, conversation, start, keeping } = request;
         let started = self.ask("start the agent session", abandon, None, |req, reply| {
             let spawn = SpawnAgent {
                 req,
@@ -1547,6 +1553,8 @@ impl Connection {
                 profile: Some(profile),
                 conversation,
                 start,
+                attachments_dir: keeping.dir,
+                attachments_keep_days: keeping.keep_days,
             };
             (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;
@@ -2052,6 +2060,30 @@ impl Connection {
                 };
                 self.deliver(session, &sink, |sink| sink.conversations(req, listed));
             }
+            ToClient::Attachment(kept) => {
+                let (req, session) = (kept.req, kept.session);
+                let waiting = {
+                    let mut state = self.state.lock();
+                    match state.requests.get(&req).map(|pending| &pending.waiting) {
+                        Some(Waiting::Agent { session: asked, .. }) if *asked == session => {
+                            state.requests.remove(&req).map(|pending| pending.waiting)
+                        }
+                        Some(
+                            Waiting::Agent { .. }
+                            | Waiting::Spawn { .. }
+                            | Waiting::Attach { .. }
+                            | Waiting::List(_)
+                            | Waiting::Done(_),
+                        )
+                        | None => None,
+                    }
+                };
+                let Some(Waiting::Agent { sink, .. }) = waiting else {
+                    log::debug!("terminal server: an attachment for session {session} answering no read, dropped");
+                    return;
+                };
+                self.deliver(session, &sink, |sink| sink.attachment(req, kept));
+            }
             ToClient::AgentPage(client::AgentPage { req, session, events, last }) => {
                 let waiting = {
                     let state = self.state.lock();
@@ -2502,7 +2534,9 @@ impl Connection {
             | ToCore::AgentFetch(client::AgentFetch { req, .. })
             | ToCore::AgentList(client::AgentList { req, .. })
             | ToCore::AgentChoose(client::AgentChoose { req, .. })
-            | ToCore::AgentSetOption(client::AgentSetOption { req, .. }) => Some(*req),
+            | ToCore::AgentSetOption(client::AgentSetOption { req, .. })
+            | ToCore::AgentAttach(client::AgentAttach { req, .. })
+            | ToCore::AgentReadAttachment(client::AgentReadAttachment { req, .. }) => Some(*req),
             // No request id the link has to keep: no answer, or one the
             // management requests wait for themselves.
             ToCore::Hello(_)
@@ -2847,6 +2881,8 @@ fn session_of(message: &ToCore) -> Option<(SessionId, &'static str)> {
         | ToCore::AgentList(_)
         | ToCore::AgentChoose(_)
         | ToCore::AgentSetOption(_)
+        | ToCore::AgentAttach(_)
+        | ToCore::AgentReadAttachment(_)
         | ToCore::Hello(_)
         | ToCore::Spawn(_)
         | ToCore::Attach(_)
@@ -3115,9 +3151,28 @@ impl Running {
 
     /// A prompt for the agent (`AGENT_PROMPT`): sent now or queued by the
     /// core, which the transcript tells.
-    pub fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
+    pub fn prompt(&self, text: &str, attachments: Vec<client::PromptAttachment>) -> Result<RequestId, NotSent> {
         let session = self.id;
-        self.agent_request(|req| ToCore::AgentPrompt(AgentPrompt { req, session, text: text.to_string() }))
+        self.agent_request(|req| ToCore::AgentPrompt(AgentPrompt { attachments, ..AgentPrompt::text(req, session, text) }))
+    }
+
+    /// Keeps `text`, named `name`, for the session's next prompt
+    /// (`AGENT_ATTACH`, OpenSpec change `agents-prompt-context`): its upload
+    /// number is the request's id, which is the connection's alone, as an
+    /// upload's must be. `OK` or `ERROR` comes back as any agent request's.
+    pub fn attach_text(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        let session = self.id;
+        self.agent_request(|req| {
+            ToCore::AgentAttach(client::AgentAttach { req, session, upload: req, name: name.into(), text: text.into() })
+        })
+    }
+
+    /// Asks for the kept text `id` a user entry or the queue slot names
+    /// (`AGENT_READ_ATTACHMENT`): its `ATTACHMENT` reaches the sink
+    /// ([`SessionSink::attachment`]) in place of a reply, an `ERROR` as one.
+    pub fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentReadAttachment(client::AgentReadAttachment { req, session, id }))
     }
 
     /// Sends the held prompt again (`AGENT_RESEND`).
@@ -3801,9 +3856,7 @@ mod tests {
             cwd: None,
             env: own.clone(),
             policy: Policy::Detach,
-            profile: None,
-            conversation: None,
-            start: None,
+            ..SpawnAgent::default()
         });
         let restart =
             ToCore::AgentRestart(AgentRestart { req: 6, session: 9, command: "agy".into(), args: Vec::new(), env: own.clone() });

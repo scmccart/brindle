@@ -30,7 +30,8 @@
 //! | `ToolOutput` | a piece or the filter's held line, a [`SIGNAL_RESERVE`] name | 2T + 128 + F |
 //! | `Added` of a permission | call, title, [`MAX_PERMISSION_OPTIONS`] options of [`MAX_PERMISSION_ID`] and [`MAX_PERMISSION_NAME`] | [`PERMISSION_EVENT`] |
 //! | `Answered` | an option id | 2 × [`MAX_PERMISSION_ID`] + F |
-//! | `Queue` | a [`MAX_PROMPT`] prompt, a held slot's [`FIELD_LIMIT`] stop name | [`QUEUE_EVENT`] |
+//! | `Queue` | a [`MAX_PROMPT`] prompt, a held slot's [`FIELD_LIMIT`] stop name, its attachments | [`QUEUE_EVENT`] |
+//! | `Added` of a prompt's user entry | one `chunks` piece, [`MAX_ATTACHMENTS`] attachments of a [`MAX_PATH`] path and a [`MAX_ATTACHMENT_NAME`] name ([`ATTACHMENTS_LEN`]) | [`PROMPT_ADDED_EVENT`] |
 //! | `Turn` | a failure message or stop name | 2T + F |
 //! | `Agent` | `LoginRequired`'s message and `MAX_LOGIN_METHODS_LEN` of methods, or `refuse`'s 6T | 2T + `MAX_LOGIN_METHODS_LEN` + F |
 //! | `Conversation` | a [`MAX_SESSION_ID`] id, the directory the agent was started in (at most 96 KiB as UTF-8), a 256-character title | 2 × (1 KiB + 96 KiB + 1 KiB) + F |
@@ -76,8 +77,8 @@ use brindle_remote_protocol::MAX_FRAME_PAYLOAD_SIZE;
 use brindle_remote_protocol::client::{AGENT_PAGE_ENVELOPE, TRANSCRIPT_ENVELOPE};
 use brindle_remote_protocol::holder::MAX_CHECKPOINT_LEN;
 use brindle_transcript::{
-    ENTRY_FRAMING, ITEM_LIMIT, MAX_EVENT, MAX_ITEMS, MAX_LOCATIONS, MAX_PATH, RAW_LIMIT,
-    SIGNAL_RESERVE, TEXT_CHUNK,
+    ENTRY_FRAMING, ITEM_LIMIT, MAX_ATTACHMENT_NAME, MAX_ATTACHMENTS, MAX_EVENT, MAX_ITEMS,
+    MAX_LOCATIONS, MAX_PATH, RAW_LIMIT, SIGNAL_RESERVE, TEXT_CHUNK,
 };
 
 use super::forms::MAX_LOGIN_METHODS_LEN;
@@ -129,7 +130,9 @@ pub const MAX_SESSION_ID: usize = 1024;
 /// What a whole checkpoint holds beside the log, the partial line, the
 /// login methods and the open outputs: the state events, the phase with its
 /// greeting, login and conversation, the pending permissions' ids, the run,
-/// the lines' state, the option keys and modes, the headers.
+/// the lines' state, the option keys and modes, the attachment store (three
+/// paths of at most `MAX_PATH` bytes, set at the spawn) and the prompt
+/// support, the headers.
 pub const STATE_SLACK: usize = 3 * 1024 * 1024;
 
 /// An event's tag, id and field names, at most.
@@ -157,8 +160,19 @@ pub const PERMISSION_EVENT: usize = 2 * FIELD_LIMIT
     + MAX_PERMISSION_OPTIONS * (2 * MAX_PERMISSION_ID + 2 * MAX_PERMISSION_NAME + 48)
     + EVENT_FIELDS;
 
+/// The most a prompt's attachments encode to (OpenSpec change
+/// `agents-prompt-context`): [`MAX_ATTACHMENTS`] links of a [`MAX_PATH`]
+/// path and a [`MAX_ATTACHMENT_NAME`] name, escaped, with their fields (a
+/// kept text's reference is smaller: a name, an id and a size).
+pub const ATTACHMENTS_LEN: usize =
+    MAX_ATTACHMENTS * (2 * MAX_PATH + 2 * MAX_ATTACHMENT_NAME + 64);
+
 /// The most a `Queue` event encodes to: the largest of all.
-pub const QUEUE_EVENT: usize = 2 * MAX_PROMPT + 2 * FIELD_LIMIT + EVENT_FIELDS;
+pub const QUEUE_EVENT: usize = 2 * MAX_PROMPT + 2 * FIELD_LIMIT + ATTACHMENTS_LEN + EVENT_FIELDS;
+
+/// The most a prompt's user entry's `Added` encodes to: a first chunk of
+/// its text and its attachments.
+pub const PROMPT_ADDED_EVENT: usize = 2 * TEXT_CHUNK + ATTACHMENTS_LEN + EVENT_FIELDS;
 
 /// The largest entry the log can hold, measured: a text entry of
 /// [`ENTRY_LIMIT`], escaped, with its framing and its fields.
@@ -181,6 +195,10 @@ const _: () = assert!(TOOL_HEADER_EVENT <= MAX_EVENT);
 const _: () = assert!(TOOL_ITEMS_EVENT <= MAX_EVENT);
 const _: () = assert!(PERMISSION_EVENT <= MAX_EVENT);
 const _: () = assert!(QUEUE_EVENT <= MAX_EVENT);
+const _: () = assert!(PROMPT_ADDED_EVENT <= MAX_EVENT);
+// The transcript's bound on a kept text is what one `AGENT_ATTACH` and one
+// `ATTACHMENT` frame carry.
+const _: () = assert!(brindle_transcript::ATTACHMENT_TEXT == brindle_remote_protocol::client::MAX_ATTACHMENT_TEXT);
 const _: () = assert!(6 * FIELD_LIMIT + EVENT_FIELDS <= MAX_EVENT);
 const _: () = assert!(2 * FIELD_LIMIT + MAX_LOGIN_METHODS_LEN + EVENT_FIELDS <= MAX_EVENT);
 // I2: every trim makes progress and ends within its mark, and a whole
@@ -197,7 +215,7 @@ mod tests {
     use brindle_remote_protocol::client::pack_transcript;
     use brindle_remote_protocol::serde_json::{Value, json};
     use brindle_transcript::{
-        AgentState, CALL_LIMIT, Continuation, Conversation, Entry, EntryId, Event, Exit,
+        AgentState, Attachment, CALL_LIMIT, Continuation, Conversation, Entry, EntryId, Event, Exit,
         HoldReason, Location, LoginKind, LoginMethod, NoticeLevel, Output, PAGE_BYTES,
         PermissionKind, PermissionOption, PermissionOutcome, Slot, StopReason, ToolItem, ToolKind,
         ToolStatus, Transcript, TurnState,
@@ -271,6 +289,14 @@ mod tests {
                 kind: PermissionKind::RejectAlways,
             })
             .collect();
+        // The most attachments, each a link at its bounds, escaping to
+        // twice its bytes (OpenSpec change `agents-prompt-context`).
+        let attachments: Vec<Attachment> = (0..MAX_ATTACHMENTS)
+            .map(|_| Attachment::Link {
+                path: quotes(MAX_PATH),
+                name: quotes(MAX_ATTACHMENT_NAME),
+            })
+            .collect();
         let events = [
             ("agent text", Event::Added { id, entry: Entry::Agent { text: text.clone() } }),
             ("appended", Event::Appended { id, text: text.clone() }),
@@ -311,6 +337,7 @@ mod tests {
                 slot: Slot::Held {
                     text: quotes(MAX_PROMPT),
                     reason: HoldReason::Stopped { stop: StopReason::Other { name: field.clone() } },
+                    attachments: attachments.clone(),
                 },
             }),
             ("turn", Event::Turn { state: TurnState::Failed { message: field.clone() } }),
@@ -327,6 +354,10 @@ mod tests {
             }),
             ("trimmed", Event::Trimmed { through: id, dropped: u64::MAX }),
             ("window", Event::Window { from: id, earlier: u64::MAX }),
+            ("prompt", Event::Added {
+                id,
+                entry: Entry::User { text: text.clone(), attachments: attachments.clone() },
+            }),
         ];
         for (name, event) in &events {
             assert_fits(name, event);
@@ -366,7 +397,7 @@ mod tests {
         .expect("a trim on an empty log");
         while log.encoded_len() + 100 <= LOG_LIMIT {
             let id = log.next_id();
-            log.apply(&Event::Added { id, entry: Entry::User { text: String::new() } })
+            log.apply(&Event::Added { id, entry: Entry::user("") })
                 .expect("an entry");
         }
         for (name, event) in &events[10..14] {
@@ -393,7 +424,7 @@ mod tests {
         // A stored log is at most twice its measure, for each entry kind's
         // smallest form (decision 1, I2's second fact), at 20-digit ids.
         let smallest = [
-            Entry::User { text: String::new() },
+            Entry::user(""),
             Entry::Agent { text: String::new() },
             Entry::Thought { text: String::new() },
             Entry::Notice { level: NoticeLevel::Info, text: String::new() },
@@ -705,7 +736,7 @@ mod tests {
                     let command = match (waiting, s.transcript().slot()) {
                         (Some((entry, option)), _) => Command::Answer { entry, option },
                         (None, Slot::Held { .. }) => Command::Unqueue,
-                        (None, Slot::Empty | Slot::Waiting { .. }) => Command::Prompt { text },
+                        (None, Slot::Empty | Slot::Waiting { .. }) => Command::prompt(text),
                     };
                     step(&mut s, Input::Command(command), now)
                 }

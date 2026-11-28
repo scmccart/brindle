@@ -74,7 +74,7 @@ use crate::agent::spawn::{AgentRestartRequest, OpenedBy, agent_spawn_request, co
 use crate::agent::transcript::{Conversation, EntryId};
 use crate::config::{Config, Profile};
 use crate::notify::osc::{Notice, Source};
-use crate::remote::protocol::client::OptionValue;
+use crate::remote::protocol::client::{OptionValue, PromptAttachment};
 use crate::remote::protocol::{RequestId, SessionId};
 use crate::remote::{AgentStart, Host, SessionKey, Unsupported};
 use crate::settings::Settings;
@@ -87,7 +87,15 @@ use crate::terminal::status::State;
 /// request's id, which its answer comes back under, or why nothing was
 /// sent ([`NotSent`], which the model decides on: [`ChatModel::not_sent`]).
 pub trait Requests {
-    fn prompt(&self, text: &str) -> Result<RequestId, NotSent>;
+    /// `AGENT_PROMPT` with its attachments, each a link or an upload
+    /// [`Requests::attach`] numbered.
+    fn prompt(&self, text: &str, attachments: Vec<PromptAttachment>) -> Result<RequestId, NotSent>;
+    /// Keeps a text for the next prompt (`AGENT_ATTACH`, OpenSpec change
+    /// `agents-prompt-context`): the request's id is its upload number.
+    fn attach(&self, name: &str, text: &str) -> Result<RequestId, NotSent>;
+    /// Reads a kept text (`AGENT_READ_ATTACHMENT`): it comes as
+    /// [`AgentEvent::Attachment`] in place of a reply.
+    fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent>;
     fn resend(&self) -> Result<RequestId, NotSent>;
     fn unqueue(&self) -> Result<RequestId, NotSent>;
     fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent>;
@@ -131,8 +139,16 @@ fn server_connect() -> Connect {
 }
 
 impl Requests for crate::remote::AgentLink {
-    fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
-        crate::remote::AgentLink::prompt(self, text)
+    fn prompt(&self, text: &str, attachments: Vec<PromptAttachment>) -> Result<RequestId, NotSent> {
+        crate::remote::AgentLink::prompt(self, text, attachments)
+    }
+
+    fn attach(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        crate::remote::AgentLink::attach(self, name, text)
+    }
+
+    fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        crate::remote::AgentLink::read_attachment(self, id)
     }
 
     fn resend(&self) -> Result<RequestId, NotSent> {
@@ -238,7 +254,15 @@ pub enum AgentAsk {
     /// `option`'s choices (a press under the input, an option command
     /// alone).
     Options { option: Option<String> },
+    /// Ask for a path on the agent's host to attach (OpenSpec change
+    /// `agents-prompt-context`, Attach File…).
+    AttachFile,
 }
+
+/// An attachment the zone refused (OpenSpec change `agents-prompt-context`):
+/// its words, for the window's notice line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachRefused(pub String);
 
 /// A set the server refused (OpenSpec change `agents-commands`, flag 11):
 /// its words, for the window's notice line.
@@ -248,6 +272,34 @@ pub struct OptionRefused(pub String);
 /// A list the palette asked for was answered: the page, or why not.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentListed(pub Result<conversations::Page, String>);
+
+/// What dropping `paths` attaches, read on a background task: each file's
+/// draft, or its refusal's words. A directory is looked up and a remote
+/// agent's file read here, at most an attachment's limit and a byte.
+fn read_dropped(paths: &[PathBuf], local: bool) -> Vec<Result<model::Draft, String>> {
+    use std::io::Read as _;
+    let dropped: Vec<model::Dropped> = paths.iter().map(|path| model::Dropped { path: path.clone(), dir: path.is_dir() }).collect();
+    model::drop_plan(&dropped, local)
+        .into_iter()
+        .map(|step| match step {
+            model::DropStep::Attach(draft) => Ok(draft),
+            model::DropStep::Refuse { name, why } => Err(why.text(&name)),
+            model::DropStep::Read { path, name } => {
+                let read = std::fs::File::open(&path).and_then(|file| {
+                    let size = file.metadata()?.len();
+                    let mut bytes = Vec::new();
+                    file.take(transcript::ATTACHMENT_TEXT as u64 + 1).read_to_end(&mut bytes)?;
+                    Ok((size, bytes))
+                });
+                let (size, read) = match read {
+                    Ok((size, bytes)) => (size, Ok(bytes)),
+                    Err(error) => (0, Err(error.to_string())),
+                };
+                model::dropped_text(&name, size, read).map_err(|why| why.text(&name))
+            }
+        })
+        .collect()
+}
 
 /// `profile`'s command on `host`, which a terminal login runs again: its
 /// variable names ignore case where this machine's do, on this machine.
@@ -316,6 +368,7 @@ impl EventEmitter<LoginZone> for Agent {}
 impl EventEmitter<AgentAsk> for Agent {}
 impl EventEmitter<AgentListed> for Agent {}
 impl EventEmitter<OptionRefused> for Agent {}
+impl EventEmitter<AttachRefused> for Agent {}
 
 impl Agent {
     /// Starts an agent of `profile` in a new session of `host`'s terminal
@@ -392,21 +445,25 @@ impl Agent {
         let home = dirs::home_dir();
         let directory = spawn::directory(profile, host, cwd.clone(), &opened, home.as_deref());
         let (sink, feed) = Sink::new();
+        let keeping = spawn::Keeping::of(host, profile, &Settings::get(cx).config.agent);
         let request = {
             let (profile, host) = (profile.clone(), host.clone());
             // Built on the session's thread, as a terminal's spawn request
             // is: it reads Brindle's environment.
             Box::new(move || {
                 let home = dirs::home_dir();
-                shape(agent_spawn_request(
-                    &profile,
-                    &host,
-                    cwd,
-                    &opened,
-                    std::env::vars_os(),
-                    home.as_deref(),
-                    crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
-                ))
+                shape(
+                    agent_spawn_request(
+                        &profile,
+                        &host,
+                        cwd,
+                        &opened,
+                        std::env::vars_os(),
+                        home.as_deref(),
+                        crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
+                    )
+                    .keeping(keeping),
+                )
             })
         };
         let connect = server_connect();
@@ -620,20 +677,24 @@ impl Agent {
         }
         let (sink, feed) = Sink::new();
         feed.shared.lock().start_over();
+        let keeping = spawn::Keeping::of(&self.host, profile, &Settings::get(cx).config.agent);
         let request = {
             let (profile, host, cwd) = (profile.clone(), self.host.clone(), directory.clone());
             // On the session's thread, as a new zone's start.
             Box::new(move || {
                 let home = dirs::home_dir();
-                shape(agent_spawn_request(
-                    &profile,
-                    &host,
-                    Some(cwd),
-                    &OpenedBy::Window,
-                    std::env::vars_os(),
-                    home.as_deref(),
-                    crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
-                ))
+                shape(
+                    agent_spawn_request(
+                        &profile,
+                        &host,
+                        Some(cwd),
+                        &OpenedBy::Window,
+                        std::env::vars_os(),
+                        home.as_deref(),
+                        crate::terminal::process::LOCAL_ENV_IGNORES_CASE,
+                    )
+                    .keeping(keeping),
+                )
             })
         };
         let link = (self.connect)(self.host.clone(), AgentStart::Spawn(request), sink);
@@ -799,13 +860,24 @@ impl Agent {
             AgentEvent::Failed(failure) => self.model.not_started(failure),
             AgentEvent::Broken(reason) => self.model.broken(reason),
             AgentEvent::Reply { request, outcome } => {
+                let read = self.model.reads(request);
                 let replied = self.model.replied(request, outcome);
                 self.apply_replied(replied, cx);
+                // A refused read redraws its row.
+                if read {
+                    self.emit_splices(Due::All, cx);
+                }
                 return;
             }
             AgentEvent::Conversations { request, page } => {
                 let done = self.model.listed(request, page);
                 self.apply_listed(done, cx);
+                return;
+            }
+            AgentEvent::Attachment { request, id: _, text } => {
+                self.model.attachment_read(request, text);
+                self.emit_splices(Due::All, cx);
+                cx.notify();
                 return;
             }
             AgentEvent::Note(text) => {
@@ -889,7 +961,7 @@ impl Agent {
         match first {
             Some(First::Send(text)) => {
                 let sent = self.model.sent_prompt(text.clone(), true);
-                match self.through(|requests| requests.prompt(&text)) {
+                match self.through(|requests| requests.prompt(&text, Vec::new())) {
                     Ok(request) => self.model.sent(request, sent),
                     Err(why) => {
                         let replied = self.model.not_sent(sent, why);
@@ -908,7 +980,7 @@ impl Agent {
     pub fn send_first(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = text.to_string();
         let sent = self.model.sent_prompt(text.clone(), true);
-        self.send(sent, |requests| requests.prompt(&text), cx);
+        self.send(sent, |requests| requests.prompt(&text, Vec::new()), cx);
     }
 
     /// The login row's method `method` was chosen: `AGENT_LOGIN` for an
@@ -995,10 +1067,7 @@ impl Agent {
     /// reason shown.
     pub fn prompt(&mut self, draft: &str, composing: bool, cx: &mut Context<Self>) {
         match self.model.submit(draft, composing) {
-            Submit::Send(text) => {
-                let sent = self.model.sent_prompt(text.clone(), false);
-                self.send(sent, |requests| requests.prompt(&text), cx);
-            }
+            Submit::Send(text) => self.send_prompt(text, cx),
             Submit::Set { option, name, value } => {
                 cx.emit(AgentUpdate::ClearDraft);
                 self.set_option(&option, name, value, cx);
@@ -1009,6 +1078,113 @@ impl Agent {
             }
             Submit::Nothing(_) => cx.notify(),
         }
+    }
+
+    /// Sends prompt `text` with the draft's attachments (OpenSpec change
+    /// `agents-prompt-context`, decision 7): an `AGENT_ATTACH` per text, in
+    /// order, then the `AGENT_PROMPT` naming them by their requests' ids.
+    /// An attach that couldn't go stops the rest; the server's refusals
+    /// come back as replies, the first one shown.
+    fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+        let plan = self.model.send_plan(&text);
+        let mut numbers = Vec::new();
+        for (name, kept) in &plan.uploads {
+            match self.through(|requests| requests.attach(name, kept)) {
+                Ok(request) => {
+                    self.model.sent(request, Sent::Attach);
+                    numbers.push(request);
+                }
+                Err(why) => {
+                    let replied = self.model.not_sent(Sent::Attach, why);
+                    self.apply_replied(replied, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let sent = self.model.sent_prompt(text.clone(), false);
+        let attachments = plan.attachments(&numbers);
+        self.send(sent, |requests| requests.prompt(&text, attachments), cx);
+    }
+
+    /// Adds `draft` to the next prompt's attachments, whether it was; a
+    /// refusal goes to the window's notice line ([`AttachRefused`]), in
+    /// its words for `what`.
+    pub fn attach_draft(&mut self, draft: model::Draft, what: &str, cx: &mut Context<Self>) -> bool {
+        match self.model.attach(draft) {
+            Ok(()) => {
+                cx.notify();
+                true
+            }
+            Err(refusal) => {
+                cx.emit(AttachRefused(refusal.text(what)));
+                false
+            }
+        }
+    }
+
+    /// Files dropped on the zone (decision 8): for an agent on this
+    /// machine each is a link; for one on another host or in a container
+    /// each is read on a background task (`process R13`) and sent as text.
+    /// Each refusal names its file on the notice line; the others are
+    /// attached, in the drop's order.
+    pub fn drop_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let local = self.host.is_local();
+        let read = cx.background_executor().spawn(async move { read_dropped(&paths, local) });
+        cx.spawn(async move |this, cx| {
+            let outcomes = read.await;
+            this.update(cx, |agent, cx| {
+                for outcome in outcomes {
+                    match outcome {
+                        Ok(draft) => {
+                            let name = draft.name().to_string();
+                            agent.attach_draft(draft, &name, cx);
+                        }
+                        Err(refusal) => cx.emit(AttachRefused(refusal)),
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The remove mark of the attachment keyed `key`.
+    pub fn remove_attachment(&mut self, key: model::DraftKey, cx: &mut Context<Self>) {
+        self.model.remove_attachment(key);
+        cx.notify();
+    }
+
+    /// `agent_clear_attachments`.
+    pub fn clear_attachments(&mut self, cx: &mut Context<Self>) {
+        self.model.clear_attachments();
+        cx.notify();
+    }
+
+    /// Backspace in the prompt input, the cursor `at_start` and nothing
+    /// `selected`: whether it removed the last attachment, which keeps the
+    /// key from the input.
+    pub fn backspace_at_start(&mut self, at_start: bool, selected: bool, cx: &mut Context<Self>) -> bool {
+        let removed = self.model.backspace_at_start(at_start, selected);
+        if removed {
+            cx.notify();
+        }
+        removed
+    }
+
+    /// `agent_attach_file`: the window asks for a path.
+    pub fn ask_attach_file(&mut self, cx: &mut Context<Self>) {
+        cx.emit(AgentAsk::AttachFile);
+    }
+
+    /// A press on user entry `entry`'s attachment row `index`: its text
+    /// asked for when the row opens.
+    pub fn press_row(&mut self, entry: EntryId, index: usize, cx: &mut Context<Self>) {
+        if let model::RowPress::Read(id) = self.model.press_row(entry, index) {
+            self.send(Sent::Read { entry, index }, |requests| requests.read_attachment(id), cx);
+        }
+        self.emit_splices(Due::All, cx);
+        cx.notify();
     }
 
     /// Asks the server to set option `option` (named `name`) to `value`

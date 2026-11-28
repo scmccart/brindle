@@ -62,7 +62,9 @@ pub fn start_of(message: &ToCore) -> Option<Start> {
         | ToCore::AgentFetch(_)
         | ToCore::AgentList(_)
         | ToCore::AgentChoose(_)
-        | ToCore::AgentSetOption(_) => None,
+        | ToCore::AgentSetOption(_)
+        | ToCore::AgentAttach(_)
+        | ToCore::AgentReadAttachment(_) => None,
     }
 }
 
@@ -185,7 +187,9 @@ pub fn over_endpoint(message: &ToCore, endpoint: &EndpointEnv) -> Option<(ToCore
         | ToCore::AgentFetch(_)
         | ToCore::AgentList(_)
         | ToCore::AgentChoose(_)
-        | ToCore::AgentSetOption(_) => return None,
+        | ToCore::AgentSetOption(_)
+        | ToCore::AgentAttach(_)
+        | ToCore::AgentReadAttachment(_) => return None,
     };
     Some((message, fallback))
 }
@@ -196,6 +200,7 @@ mod tests {
     use crate::agent::spawn::{OpenedBy, agent_spawn_request};
     use crate::config::{Config, Profile};
     use crate::remote::Host;
+    use crate::remote::protocol::client;
     use crate::remote::protocol::client::{
         AgentFetch, AgentLogin, AgentPermission, AgentPrompt, AgentRequest, Attach, Data, Detach, Hello, Kill, KillTarget, Policy,
         Reparent, Request, Resize, SessionRef, SetLayout,
@@ -247,8 +252,7 @@ mod tests {
             env,
             policy: Policy::Detach,
             profile: Some("Agy".into()),
-            conversation: None,
-            start: None,
+            ..SpawnAgent::default()
         }
     }
 
@@ -278,7 +282,18 @@ mod tests {
             (ToCore::Reparent(Reparent { session: 1, hwnd: 0 }), None),
             (ToCore::SetLayout(SetLayout::default()), None),
             (ToCore::SpawnAgent(spawn_agent(BTreeMap::new())), Some(Start::Program)),
-            (ToCore::AgentPrompt(AgentPrompt { req: 1, session: 1, text: "hi".into() }), None),
+            (ToCore::AgentPrompt(AgentPrompt::text(1, 1, "hi")), None),
+            (
+                ToCore::AgentAttach(client::AgentAttach {
+                    req: 1,
+                    session: 1,
+                    upload: 1,
+                    name: "n".into(),
+                    text: "t".into(),
+                }),
+                None,
+            ),
+            (ToCore::AgentReadAttachment(client::AgentReadAttachment { req: 1, session: 1, id: 1 }), None),
             (ToCore::AgentCancel(session()), None),
             (ToCore::AgentPermission(AgentPermission { req: 1, session: 1, entry: 1, option: None }), None),
             (ToCore::AgentUnqueue(AgentRequest { req: 1, session: 1 }), None),

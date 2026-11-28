@@ -11,8 +11,9 @@
 # one more, -NoLinuxHelper: only a Windows build lacks the Linux helper.
 #
 # It makes a private directory (under /tmp, since the terminal server's
-# socket paths have a 108-byte limit) and points BRINDLE_STATE_DIR and
-# BRINDLE_SERVER_DIR into it. So the launch doesn't hand itself to a Brindle
+# socket paths have a 108-byte limit) and points BRINDLE_STATE_DIR,
+# BRINDLE_SERVER_DIR and BRINDLE_CACHE_DIR (where a local agent's attached
+# text is kept) into it. So the launch doesn't hand itself to a Brindle
 # you already have running, and the sessions run in their own terminal
 # server, which is stopped (and the directory removed) when Brindle exits.
 # --keep keeps the directory, for its logs and config, but still stops the
@@ -134,4 +135,5 @@ fi
 BRINDLE_CONFIG="${config:-$dir/config.toml}" \
 BRINDLE_STATE_DIR="$dir/state" \
 BRINDLE_SERVER_DIR="$dir/server" \
+BRINDLE_CACHE_DIR="$dir/cache" \
     "$bin" "$@"

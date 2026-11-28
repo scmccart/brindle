@@ -120,7 +120,7 @@ fn prompts_go_through_the_model_and_their_answers_come_back() {
         agent.answer(EntryId(9), "allow-once", cx);
     });
     assert_eq!(zone.take_calls(), [Call::Prompt("lost".into())], "nothing else to act on");
-    zone.feed(&[Event::Turn { state: TurnState::Working }, Event::Queue { slot: Slot::Waiting { text: "next".into() } }]);
+    zone.feed(&[Event::Turn { state: TurnState::Working }, Event::Queue { slot: Slot::waiting("next") }]);
     settle(&cx);
     zone.agent.update(&mut cx, |agent, cx| {
         agent.cancel(cx);
@@ -717,4 +717,55 @@ fn a_growing_message_is_drawn_once_per_frame() {
         assert_ne!(model.blocks(), drawn.as_slice());
         assert_eq!(model.message_text(EntryId(2)), Some("a b c d"));
     });
+}
+
+/// `agents-prompt-context` 6.1: a prompt with a draft sends an attach per
+/// text, in order, then the prompt naming them by their requests' ids; an
+/// attach that can't go stops the rest with the draft kept; a refusal
+/// shown on the notice line leaves the draft unchanged.
+#[test]
+fn a_prompt_sends_its_attachments_first_and_names_them() {
+    use crate::agent::model::Draft;
+    use crate::remote::protocol::client::PromptAttachment;
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    let mut refused = cx.events::<AttachRefused, _>(&zone.agent);
+    zone.feed(&[ready()]);
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| {
+        assert!(agent.attach_draft(Draft::text("cargo test", "ok\n"), "the output", cx));
+        assert!(agent.attach_draft(Draft::link("src/a.rs"), "a.rs", cx));
+        assert!(agent.attach_draft(Draft::text("notes", "n\n"), "notes", cx));
+    });
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("why?", false, cx));
+    let link = PromptAttachment::Link { path: "src/a.rs".into(), name: "a.rs".into() };
+    assert_eq!(
+        zone.take_calls(),
+        [
+            Call::Attach("cargo test".into(), "ok\n".into()),
+            Call::Attach("notes".into(), "n\n".into()),
+            Call::PromptWith("why?".into(), vec![PromptAttachment::Text { upload: 1 }, link, PromptAttachment::Text { upload: 2 }]),
+        ]
+    );
+    zone.sink.reply(1, Ok(()));
+    zone.sink.reply(2, Ok(()));
+    zone.sink.reply(3, Ok(()));
+    settle(&cx);
+    zone.agent.read_with(&cx, |agent, _| assert!(agent.model().attachments().is_empty(), "taken, the draft clears"));
+
+    zone.agent.update(&mut cx, |agent, cx| agent.attach_draft(Draft::text("out", "x\n"), "the output", cx));
+    zone.refuse.set(Some(NotSent::Gone));
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("again", false, cx));
+    assert_eq!(zone.take_calls(), [Call::Attach("out".into(), "x\n".into())], "the prompt doesn't go");
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.model().attachments().len(), 1, "the draft is kept"));
+    zone.refuse.set(None);
+
+    zone.agent.update(&mut cx, |agent, cx| {
+        for n in 1..crate::agent::transcript::MAX_ATTACHMENTS {
+            agent.attach_draft(Draft::link(&format!("f{n}")), "f", cx);
+        }
+        assert!(!agent.attach_draft(Draft::link("ninth"), "ninth", cx));
+    });
+    settle(&cx);
+    assert_eq!(drained(&mut refused), [AttachRefused("a prompt takes at most 8 attachments".into())]);
 }

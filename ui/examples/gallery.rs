@@ -819,6 +819,21 @@ impl Gallery {
             // them (OpenSpec change `agents-commands`).
             let item = |key: &str, label: &str| brindle_ui::FooterItem { key: key.to_string().into(), label: label.to_string().into() };
             prompt.set_footer(vec![item("mode", "Auto"), item("model", "Opus"), item("effort", "Medium")], cx);
+            // The next prompt's attachments (OpenSpec change
+            // `agents-prompt-context`): a command's output and a file.
+            let attached = |key: &str, icon, name: &str, detail: Option<&str>| brindle_ui::AttachmentItem {
+                key: key.to_string().into(),
+                icon,
+                name: name.to_string().into(),
+                detail: detail.map(|detail| detail.to_string().into()),
+            };
+            prompt.set_attachments(
+                vec![
+                    attached("0", brindle_ui::Icon::Terminal, "cargo test --workspace --locked", Some("12 KiB")),
+                    attached("1", brindle_ui::Icon::FileText, "main.rs", None),
+                ],
+                cx,
+            );
             prompt
         });
         // A narrow disabled prompt input with a reason (the layout section),
@@ -902,6 +917,7 @@ impl Gallery {
                     PromptInputEvent::SuggestionKey(key) => format!("suggestion-key:{key:?}"),
                     PromptInputEvent::SuggestionPressed(key) => format!("suggestion:{key}"),
                     PromptInputEvent::Footer(key) => format!("footer:{key}"),
+                    PromptInputEvent::RemoveAttachment(key) => format!("remove-attachment:{key}"),
                 };
                 this.prompt_log.push(entry);
                 cx.notify();
@@ -3465,6 +3481,8 @@ mod check {
         c.run_check("prompt-input-reason-action-is-a-stop-asking-the-owner", check).await;
         let check = prompt_suggestions_and_footer(&mut c).await;
         c.run_check("prompt-input-suggestions-take-their-keys-and-the-footer-is-no-stop", check).await;
+        let check = prompt_attachments_add_no_stops(&mut c).await;
+        c.run_check("prompt-input-attachments-add-no-stops", check).await;
         let check = confirmation_space_on_reject(&mut c).await;
         c.run_check("confirmation-space-on-reject-asks-for-it-then-shows-the-outcome", check).await;
         let check = confirmation_described_actions(&mut c).await;
@@ -6122,6 +6140,23 @@ mod check {
             (prompt.row_stops().len(), prompt.action_stops().len(), prompt.footer().len())
         })?;
         ensure!(stops == (0, 0, 3), "the footer's items are {stops:?}, not three items and no stops");
+        Ok(())
+    }
+
+    /// The spec's "Prompt input attachments", "Tab skips them": the
+    /// gallery's prompt shows two attachments, and the window's focus
+    /// stops are the same with them as without.
+    async fn prompt_attachments_add_no_stops(c: &mut Checker) -> Check {
+        use brindle_ui::FocusStops as _;
+        let (shown, with) = c.with(|gallery, _, cx| (gallery.prompt.read(cx).attachments().to_vec(), gallery.stops(cx)))?;
+        ensure!(shown.len() == 2, "the prompt shows {} attachments, not 2", shown.len());
+        let restore = shown.clone();
+        c.with(|gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_attachments(Vec::new(), cx)))?;
+        c.tick().await;
+        let without = c.with(|gallery, _, cx| gallery.stops(cx))?;
+        c.with(move |gallery, _, cx| gallery.prompt.update(cx, |prompt, cx| prompt.set_attachments(restore, cx)))?;
+        c.tick().await;
+        ensure!(with == without, "the attachments changed the stops: {} with, {} without", with.len(), without.len());
         Ok(())
     }
 

@@ -526,7 +526,7 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
     if let Some(remote) = &p.remote {
         let mut target = InlineTable::new();
         match remote {
-            RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _ } => {
+            RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch: _, attachments_dir: _ } => {
                 target.insert("type", Value::from("ssh"));
                 target.insert("host", Value::from(host.as_str()));
                 if let Some(user) = user { target.insert("user", Value::from(user.as_str())); }
@@ -534,7 +534,7 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
                 if let Some(identity) = identity_file { target.insert("identity_file", Value::from(identity.as_str())); }
                 if let Some(args) = strings(ssh_args) { target.insert("ssh_args", args); }
             }
-            RemoteTarget::Container { engine, container, user, connect_at_launch: _ } => {
+            RemoteTarget::Container { engine, container, user, connect_at_launch: _, attachments_dir: _ } => {
                 target.insert("type", Value::from("container"));
                 target.insert("engine", Value::from(engine.as_str()));
                 target.insert("container", Value::from(container.as_str()));
@@ -544,6 +544,9 @@ fn write_profile(table: &mut dyn TableLike, p: &Profile) {
         // Written only when on: off is the default.
         if remote.connects_at_launch() {
             target.insert("connect_at_launch", Value::from(true));
+        }
+        if let Some(dir) = remote.attachments_dir() {
+            target.insert("attachments_dir", Value::from(dir));
         }
         target.fmt();
         set_value(table, "remote", Value::InlineTable(target));
@@ -1246,11 +1249,27 @@ background = "nope"
                 identity_file: Some("~/.ssh/work".into()),
                 ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
                 connect_at_launch: false,
+                attachments_dir: None,
             }),
             ..Default::default()
         };
         upsert_profile(&mut doc, None, &profile).unwrap();
         assert_eq!(reparse(&doc).profiles[1].remote, profile.remote);
+    }
+
+    /// `agents-prompt-context` 1.6b: a remote's `attachments_dir` is kept
+    /// when the profile is saved again, on either kind of target.
+    #[test]
+    fn a_remotes_attachments_dir_survives_a_save() {
+        for open in ["{ type = \"ssh\", host = \"A8\"", "{ type = \"container\", container = \"devbox\""] {
+            let text = format!("[[profiles]]\nname = \"Shell\"\n[[profiles]]\nname = \"R\"\nremote = {open}, attachments_dir = \"~/att\" }}\n");
+            let mut doc = parse(&text).unwrap();
+            let read = reparse(&doc).profiles[1].clone();
+            assert_eq!(read.remote.as_ref().and_then(RemoteTarget::attachments_dir), Some("~/att"));
+            upsert_profile(&mut doc, Some(&ProfileRef { index: 1, name: Some("R".into()) }), &read).unwrap();
+            assert!(doc.to_string().contains("attachments_dir = \"~/att\""), "{doc}");
+            assert_eq!(reparse(&doc).profiles[1].remote, read.remote);
+        }
     }
 
     /// 8.1: `connect_at_launch` on either kind of target, absent, false or
@@ -1287,6 +1306,7 @@ background = "nope"
                 container: "devbox".into(),
                 user: None,
                 connect_at_launch: true,
+                attachments_dir: None,
             }),
             ..Default::default()
         };

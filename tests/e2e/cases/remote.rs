@@ -536,6 +536,63 @@ fn static_fake_agent() -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Where an SSH agent's attached text is kept (OpenSpec change
+/// `agents-prompt-context`, task 7.6a): a local terminal's output sent to
+/// the agent zone over SSH is kept in the container, under the remote's
+/// `attachments_dir` when it names one and else in the container user's
+/// cache directory, and the agent is given that file's URI with the text.
+/// Skips as [`agent_ssh`] does.
+pub fn agent_attach(ctx: &Ctx) -> Result<Outcome> {
+    let needs = match Needs::check(ctx)? {
+        Ok(needs) => needs,
+        Err(skip) => return Ok(skip),
+    };
+    let Some(fake) = static_fake_agent()? else {
+        return Ok(Outcome::Skip(format!(
+            "the static fake ACP agent isn't built ({} is missing): run {}",
+            crate::common::fake_agent::STATIC_LINUX,
+            crate::common::fake_agent::STATIC_LINUX_BUILD
+        )));
+    };
+    let ssh = Ssh::start(ctx, &needs.image, Net::Published)?;
+    use super::agent::{READY, Script, answered, says, stop};
+    let agent = "/usr/local/bin/brindle-fake-acp-agent";
+    ssh.container.copy_to(&fake, agent)?;
+    ssh.container.exec(&["chmod", "755", agent])?;
+    for (label, dir, remote) in [
+        ("default", "/root/.cache/brindle/attachments", String::new()),
+        ("dir", "/root/kept", ", attachments_dir = \"/root/kept\"".to_string()),
+    ] {
+        let (script, received) = (format!("/root/{label}.script"), format!("/root/{label}.jsonl"));
+        let local = Script::initialized(Path::new(&received), super::attach::EMBEDS)
+            .step("expect session/new")
+            .step(r#"respond {"sessionId":"s1"}"#)
+            .step("expect session/prompt")
+            .step(says("Hello!"))
+            .step(stop("end_turn"))
+            .write(ctx, label)?;
+        ssh.container.copy_to(&local, &script)?;
+        let config = ssh.agent_profile(AGENT_PROFILE, agent, &script).replacen(" }\n", &format!("{remote} }}\n"), 1);
+        let run = needs.run(ctx, label, &config).agent(AGENT_PROFILE).wait_for(READY);
+        let out = super::attach::send_output(ctx, run, true, 2, "echo r-$((1+1))", "r-2")
+            .wait_for("draft index=0")
+            .send("look")
+            .key("enter")
+            .wait_for(&answered())
+            .dump_at(30.0)
+            .run()?;
+        super::agent::waited(&out)?;
+        let kept = ssh.container.exec(&["sh", "-c", &format!("find {dir} -type f ! -name expires -exec cat {{}} +")])?;
+        ensure!(kept == "r-2", "{label}: kept under {dir}: {kept:?}");
+        let sent = ssh.container.exec(&["cat", &received])?;
+        ensure!(
+            sent.contains(&format!("\"uri\":\"file://{dir}/")) && sent.contains("\"text\":\"r-2\""),
+            "{label}: the agent was sent {sent}"
+        );
+    }
+    Ok(Outcome::Pass)
+}
+
 /// Quitting leaves an SSH tab's program running, detached in the
 /// container's server, and the next launch restores the tab attached to the
 /// same session: the same program (same pid) and its scrollback.

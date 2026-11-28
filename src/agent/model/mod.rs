@@ -37,6 +37,7 @@ use phase::SessionLife;
 use prompt::FirstState;
 use queue::queue_row;
 
+mod attach;
 mod attention;
 mod blocks;
 mod change;
@@ -54,6 +55,9 @@ mod recovery;
 #[cfg(test)]
 mod harness;
 
+pub use attach::{
+    Attached, Draft, DraftKey, DropStep, Dropped, RowPress, TextState, drop_plan, dropped_text, size,
+};
 pub use attention::WorkingRow;
 pub use blocks::{Block, BlockBody, ShownPart, Splice};
 pub use change::Due;
@@ -70,7 +74,7 @@ pub use prompt::{First, Submit};
 pub use phase::DisabledWhy;
 #[cfg(test)]
 pub use prompt::{ALREADY_QUEUED, UNSENT};
-pub use queue::{QueueRow, Resend, Unqueue};
+pub use queue::{QueueRow, Resend, Unqueue, attachment_count};
 pub use recovery::{NoOffer, Offer, ProfileFound};
 
 /// The client protocol version that carries agent sessions.
@@ -241,6 +245,17 @@ pub struct ChatModel {
     /// Escape closed the list: it stays closed until the text stops being
     /// a command word.
     dismissed: bool,
+    /// The attachments the next prompt takes (OpenSpec change
+    /// `agents-prompt-context`, decision 7).
+    attached: Vec<Attached>,
+    /// The last [`DraftKey`] given.
+    next_draft: u64,
+    /// An `AGENT_ATTACH` of the prompt being sent was refused: its reason
+    /// stays over the prompt's refusal that follows.
+    attach_refused: bool,
+    /// The user entries' kept-text rows not closed, by entry and
+    /// attachment (decision 9): only an open row holds its text.
+    rows: BTreeMap<(EntryId, usize), TextState>,
 }
 
 fn running(turn: &TurnState) -> bool {
@@ -297,6 +312,10 @@ impl ChatModel {
             draft: (String::new(), 0),
             completion: None,
             dismissed: false,
+            attached: Vec::new(),
+            next_draft: 0,
+            attach_refused: false,
+            rows: BTreeMap::new(),
         }
     }
 

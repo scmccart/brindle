@@ -11,8 +11,9 @@
 # run-throwaway.sh takes the same options, less -NoLinuxHelper: only a
 # Windows build lacks the Linux helper.
 #
-# It makes a private directory under %TEMP% and points BRINDLE_STATE_DIR and
-# BRINDLE_SERVER_DIR into it. So the launch doesn't hand itself to a Brindle
+# It makes a private directory under %TEMP% and points BRINDLE_STATE_DIR,
+# BRINDLE_SERVER_DIR and BRINDLE_CACHE_DIR (where a local agent's attached
+# text is kept) into it. So the launch doesn't hand itself to a Brindle
 # you already have running (the single-instance lock and its named pipe are
 # keyed by the state directory), and the sessions run in their own terminal
 # server, which is stopped (and the directory removed) when Brindle exits.
@@ -153,6 +154,7 @@ $previous = @{
     Config = $env:BRINDLE_CONFIG
     State  = $env:BRINDLE_STATE_DIR
     Server = $env:BRINDLE_SERVER_DIR
+    Cache  = $env:BRINDLE_CACHE_DIR
     Helper = $env:BRINDLE_SERVER_HELPER
     Remote = $env:BRINDLE_REMOTE_AGENT
 }
@@ -165,6 +167,7 @@ try {
     $env:BRINDLE_CONFIG = $configPath
     $env:BRINDLE_STATE_DIR = Join-Path $dir 'state'
     $env:BRINDLE_SERVER_DIR = Join-Path $dir 'server'
+    $env:BRINDLE_CACHE_DIR = Join-Path $dir 'cache'
     if ($haveHelper) { $env:BRINDLE_SERVER_HELPER = $helper }
     if ($remoteAgent) { $env:BRINDLE_REMOTE_AGENT = $remoteAgent }
     $start = @{ FilePath = $bin; PassThru = $true }
@@ -187,6 +190,7 @@ try {
         } catch {}
     }
     $env:BRINDLE_SERVER_DIR = $previous.Server
+    $env:BRINDLE_CACHE_DIR = $previous.Cache
     $env:BRINDLE_SERVER_HELPER = $previous.Helper
     $env:BRINDLE_REMOTE_AGENT = $previous.Remote
     if ($Keep) {

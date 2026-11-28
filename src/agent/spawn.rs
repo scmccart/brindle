@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::agent::transcript::Conversation;
-use crate::config::{Config, Profile, ProfileKind};
+use crate::config::{AgentConfig, Config, Profile, ProfileKind};
 use crate::remote::Host;
 use crate::remote::protocol::client::{AgentConversation, SpawnStart};
 
@@ -54,9 +54,49 @@ pub struct AgentSpawnRequest {
     /// conversation to be chosen (`SPAWN_AGENT`'s `start`, OpenSpec change
     /// `agents-session-list` decision 1). Never with `conversation`.
     pub start: Option<SpawnStart>,
+    /// Where the session keeps attached text, and for how long after it
+    /// ends (`SPAWN_AGENT`'s `attachments_dir` and
+    /// `attachments_keep_days`, OpenSpec change `agents-prompt-context`):
+    /// [`Keeping::of`].
+    pub keeping: Keeping,
+}
+
+/// Where an agent session keeps attached text, and for how long.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Keeping {
+    /// `None` is the server's cache directory.
+    pub dir: Option<String>,
+    /// `None` is the server's 14 days.
+    pub keep_days: Option<u32>,
+}
+
+impl Keeping {
+    /// A zone's on `host`, running `profile`: on a remote, `profile`'s
+    /// remote's `attachments_dir` while that remote is still `host` (none is
+    /// the remote user's cache), never `[agent] attachments_dir`, which
+    /// names a local directory; here, `[agent] attachments_dir`. The keep
+    /// time is `[agent]`'s for both. The zone's host is its endpoint, which
+    /// keeps no directory, so the profile names it.
+    pub fn of(host: &Host, profile: &Profile, agent: &AgentConfig) -> Self {
+        let dir = match host {
+            Host::Local => agent.attachments_dir.clone(),
+            Host::Remote(_) => profile
+                .remote
+                .as_ref()
+                .filter(|remote| Host::Remote((*remote).clone()) == *host)
+                .and_then(|remote| remote.attachments_dir())
+                .map(str::to_owned),
+        };
+        Self { dir, keep_days: Some(agent.keep_days()) }
+    }
 }
 
 impl AgentSpawnRequest {
+    /// This start keeping attached text as `keeping` says.
+    pub fn keeping(self, keeping: Keeping) -> Self {
+        Self { keeping, ..self }
+    }
+
     /// This start choosing: initialized, it waits for `AGENT_CHOOSE`
     /// instead of starting a conversation.
     pub fn choosing(self) -> Self {
@@ -173,6 +213,7 @@ pub fn agent_spawn_request(
         profile: profile.name.clone(),
         conversation: None,
         start: None,
+        keeping: Keeping::default(),
     }
 }
 
@@ -201,6 +242,36 @@ mod tests {
     fn request(profile: &Profile, host: &Host, asked: Option<&str>, opened: &OpenedBy) -> AgentSpawnRequest {
         let own = vars(&[("PATH", "/usr/bin"), ("TERM", "xterm-256color"), ("LANG", "C.UTF-8")]);
         agent_spawn_request(profile, host, asked.map(PathBuf::from), opened, own, Some(Path::new(HOME)), false)
+    }
+
+    /// `agents-prompt-context` 1.6c: where attached text is kept, by host.
+    #[test]
+    fn a_local_agent_keeps_text_where_agent_says_and_a_remote_one_where_its_remote_says() {
+        let config = Config::parse(
+            "[agent]\nattachments_dir = \"~/local-att\"\nattachments_keep_days = 3\n\
+             [[profiles]]\nname = \"a\"\nremote = { type = \"ssh\", host = \"A8\", attachments_dir = \"/srv/att\" }\n\
+             [[profiles]]\nname = \"b\"\nremote = { type = \"ssh\", host = \"A8\" }\n\
+             [[profiles]]\nname = \"c\"\nremote = { type = \"container\", container = \"d\", attachments_dir = \"~/c\" }",
+        )
+        .unwrap()
+        .config;
+        // A zone's host is its profile's endpoint, without the directory.
+        let remote = |i: usize| Host::Remote(config.profiles[i].remote.as_ref().unwrap().endpoint());
+        let of = |host: &Host, i: usize| Keeping::of(host, &config.profiles[i], &config.agent);
+        let keeping = |dir: Option<&str>| Keeping { dir: dir.map(str::to_owned), keep_days: Some(3) };
+        assert_eq!(of(&Host::Local, 1), keeping(Some("~/local-att")));
+        assert_eq!(of(&remote(0), 0), keeping(Some("/srv/att")));
+        // Never the local directory for a remote.
+        assert_eq!(of(&remote(1), 1), keeping(None));
+        assert_eq!(of(&remote(2), 2), keeping(Some("~/c")));
+        // A profile now on another remote names nothing for a zone left on
+        // the old one.
+        assert_eq!(of(&remote(2), 0), keeping(None));
+        let defaults = AgentConfig::default();
+        assert_eq!(Keeping::of(&Host::Local, &config.profiles[1], &defaults), Keeping { dir: None, keep_days: Some(14) });
+        let request = request(&agent(""), &Host::Local, None, &OpenedBy::Window);
+        assert_eq!(request.keeping, Keeping::default(), "kept only when asked");
+        assert_eq!(request.keeping(keeping(None)).keeping, keeping(None));
     }
 
     #[test]

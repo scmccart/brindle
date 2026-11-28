@@ -273,6 +273,7 @@ impl<L: EventLoop> Core<L> {
             }
             self.drop_source(old);
             self.client_replaced(old, Instant::now());
+            self.drop_uploads(old, None);
         }
     }
 
@@ -344,9 +345,7 @@ impl<L: EventLoop> Core<L> {
             // Client protocol 4's agent sessions (`agents.rs`), past the
             // gate above.
             ToCore::SpawnAgent(spawn) => self.client_spawn_agent(client, spawn),
-            ToCore::AgentPrompt(prompt) => {
-                self.client_agent_command(client, AgentCommand::prompt(prompt))
-            }
+            ToCore::AgentPrompt(prompt) => self.client_agent_prompt(client, prompt),
             ToCore::AgentCancel(target) => {
                 self.client_agent_command(client, AgentCommand::cancel(target))
             }
@@ -371,6 +370,8 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentSetOption(set) => {
                 self.client_agent_command(client, AgentCommand::set_option(set))
             }
+            ToCore::AgentAttach(attach) => self.client_agent_attach(client, attach),
+            ToCore::AgentReadAttachment(read) => self.client_agent_read_attachment(client, read),
         }
     }
 
@@ -482,6 +483,7 @@ impl<L: EventLoop> Core<L> {
             self.sessions_of(client).len()
         );
         self.client_gone(client, entry.linger, Instant::now());
+        self.drop_uploads(client, None);
     }
 
     /// The token of a connected client, if its `HELLO` named one.
@@ -541,6 +543,7 @@ pub(super) fn unsendable(message: &ToClient, failure: &io::Error) -> ToClient {
         ToClient::Transcript(m) => (None, Some(m.session)),
         ToClient::AgentPage(m) => (Some(m.req), Some(m.session)),
         ToClient::AgentConversations(m) => (Some(m.req), Some(m.session)),
+        ToClient::Attachment(m) => (Some(m.req), Some(m.session)),
     };
     error(req, session, unsendable_text(message, failure))
 }
@@ -561,6 +564,7 @@ fn unsendable_text(message: &ToClient, failure: &io::Error) -> String {
         ToClient::Transcript(_) => "transcript",
         ToClient::AgentPage(_) => "page of earlier entries",
         ToClient::AgentConversations(_) => "list of conversations",
+        ToClient::Attachment(_) => "attached text",
     };
     format!("the terminal server couldn't send its {what}: {failure}")
 }

@@ -133,7 +133,13 @@ pub(super) fn tool_completed(id: u64) -> Event {
 }
 
 pub(super) fn user(text: &str) -> Entry {
-    Entry::User { text: text.into() }
+    Entry::user(text)
+}
+
+/// A user message with attachments (OpenSpec change
+/// `agents-prompt-context`).
+pub(super) fn user_with(text: &str, attachments: Vec<crate::agent::transcript::Attachment>) -> Entry {
+    Entry::User { text: text.into(), attachments }
 }
 
 pub(super) fn agent(text: &str) -> Entry {
@@ -161,11 +167,11 @@ pub(super) fn permission(title: &str) -> Entry {
 }
 
 pub(super) fn waiting() -> Slot {
-    Slot::Waiting { text: "next".into() }
+    Slot::waiting("next")
 }
 
 pub(super) fn held(reason: HoldReason) -> Slot {
-    Slot::Held { text: "next".into(), reason }
+    Slot::held("next", reason)
 }
 
 pub(super) fn texts(model: &ChatModel) -> Vec<String> {
@@ -180,6 +186,7 @@ pub(super) fn texts(model: &ChatModel) -> Vec<String> {
             }
             BlockBody::Tool { title, .. } | BlockBody::Permission { title, .. } => title.to_string(),
             BlockBody::ToolDetail(shown) => format!("{:?}", shown.part),
+            BlockBody::Attached { attachment, state, .. } => format!("{attachment:?} {}", state.name()),
         })
         .collect()
 }

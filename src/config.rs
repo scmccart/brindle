@@ -350,7 +350,7 @@ fn tool_details_when_done<'de, D: serde::Deserializer<'de>>(deserializer: D) -> 
 }
 
 /// `[agent]`: agent zones' settings, global to every agent profile.
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
     /// A running tool call's row.
@@ -359,11 +359,37 @@ pub struct AgentConfig {
     /// A finished tool call's row.
     #[serde(deserialize_with = "tool_details_when_done")]
     pub tool_details_when_done: Shown,
+    /// Where a local agent's attached text is kept (OpenSpec change
+    /// `agents-prompt-context`, decision 1); `None` is the terminal server's
+    /// cache directory. A remote profile's is its remote's
+    /// `attachments_dir`, never this.
+    pub attachments_dir: Option<String>,
+    /// How many days a session's attached text stays after the session
+    /// ends: [`ATTACHMENTS_KEEP_DAYS`] by default, clamped to
+    /// 0–[`MAX_ATTACHMENTS_KEEP_DAYS`] with a finding.
+    pub attachments_keep_days: i64,
 }
+
+/// `[agent] attachments_keep_days`' default.
+pub const ATTACHMENTS_KEEP_DAYS: i64 = 14;
+/// `[agent] attachments_keep_days`' largest value.
+pub const MAX_ATTACHMENTS_KEEP_DAYS: i64 = 3650;
 
 impl Default for AgentConfig {
     fn default() -> Self {
-        Self { tool_details: Shown::Open, tool_details_when_done: Shown::Closed }
+        Self {
+            tool_details: Shown::Open,
+            tool_details_when_done: Shown::Closed,
+            attachments_dir: None,
+            attachments_keep_days: ATTACHMENTS_KEEP_DAYS,
+        }
+    }
+}
+
+impl AgentConfig {
+    /// The keep time, as normalized (0–3650).
+    pub fn keep_days(&self) -> u32 {
+        u32::try_from(self.attachments_keep_days.clamp(0, MAX_ATTACHMENTS_KEEP_DAYS)).unwrap_or_default()
     }
 }
 
@@ -373,6 +399,9 @@ impl Default for AgentConfig {
 /// the endpoint at launch and keep that connection for as long as it runs.
 /// It isn't part of the endpoint: [`RemoteTarget::endpoint`] drops it, and it
 /// is serialized only when set, so the session state never records it.
+/// `attachments_dir` (either kind) is where an agent on the remote keeps
+/// attached text; it isn't part of the endpoint either, and is never
+/// serialized.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq, Hash, serde::Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum RemoteTarget {
@@ -388,6 +417,8 @@ pub enum RemoteTarget {
         ssh_args: Vec<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         connect_at_launch: bool,
+        #[serde(default, skip_serializing)]
+        attachments_dir: Option<String>,
     },
     Container {
         #[serde(default = "default_container_engine")]
@@ -397,6 +428,8 @@ pub enum RemoteTarget {
         user: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         connect_at_launch: bool,
+        #[serde(default, skip_serializing)]
+        attachments_dir: Option<String>,
     },
 }
 
@@ -409,12 +442,26 @@ impl RemoteTarget {
         }
     }
 
-    /// The target as an endpoint, without `connect_at_launch`: what a tab
-    /// on it keeps and the session state records.
+    /// Where an agent on this remote keeps attached text (OpenSpec change
+    /// `agents-prompt-context`): the remote's `attachments_dir`, else the
+    /// remote user's cache directory (`None`).
+    pub fn attachments_dir(&self) -> Option<&str> {
+        match self {
+            Self::Ssh { attachments_dir, .. } | Self::Container { attachments_dir, .. } => attachments_dir.as_deref(),
+        }
+    }
+
+    /// The target as an endpoint, without `connect_at_launch` and
+    /// `attachments_dir`: what a tab on it keeps and the session state
+    /// records.
     pub fn endpoint(&self) -> Self {
         let mut target = self.clone();
         match &mut target {
-            Self::Ssh { connect_at_launch, .. } | Self::Container { connect_at_launch, .. } => *connect_at_launch = false,
+            Self::Ssh { connect_at_launch, attachments_dir, .. }
+            | Self::Container { connect_at_launch, attachments_dir, .. } => {
+                *connect_at_launch = false;
+                *attachments_dir = None;
+            }
         }
         target
     }
@@ -720,6 +767,12 @@ impl Config {
         }
         self.font.size = size;
         self.font.line_height = line_height;
+        let days = self.agent.attachments_keep_days;
+        let kept = days.clamp(0, MAX_ATTACHMENTS_KEEP_DAYS);
+        if kept != days {
+            clamped.push(ConfigFinding::Clamped { key: "agent.attachments_keep_days", given: days as f32, used: kept as f32 });
+            self.agent.attachments_keep_days = kept;
+        }
         (self, clamped)
     }
 
@@ -1011,7 +1064,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.profiles.len(), 2);
         match &config.profiles[0].remote {
-            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch }) => {
+            Some(RemoteTarget::Ssh { host, user, port, identity_file, ssh_args, connect_at_launch, attachments_dir: None }) => {
                 assert_eq!(host, "A8");
                 assert_eq!(user.as_deref(), Some("ubuntu"));
                 assert_eq!(*port, Some(2222));
@@ -1022,7 +1075,7 @@ mod tests {
             _ => panic!("expected ssh remote"),
         }
         match &config.profiles[1].remote {
-            Some(RemoteTarget::Container { engine, container, user, connect_at_launch }) => {
+            Some(RemoteTarget::Container { engine, container, user, connect_at_launch, attachments_dir: None }) => {
                 assert_eq!(engine, "docker");
                 assert_eq!(container, "rust-box");
                 assert_eq!(user, &None);
@@ -1080,6 +1133,7 @@ mod tests {
                 identity_file: None,
                 ssh_args: Vec::new(),
                 connect_at_launch: false,
+                attachments_dir: None,
             }
         );
         assert!(parsed(
@@ -1481,7 +1535,12 @@ mod tests {
 
     #[test]
     fn agent_tool_details_default_open_while_running_and_closed_when_done() {
-        let defaults = AgentConfig { tool_details: Shown::Open, tool_details_when_done: Shown::Closed };
+        let defaults = AgentConfig {
+            tool_details: Shown::Open,
+            tool_details_when_done: Shown::Closed,
+            attachments_dir: None,
+            attachments_keep_days: 14,
+        };
         assert_eq!(AgentConfig::default(), defaults);
         assert_eq!(parsed("").unwrap().agent, defaults);
         assert_eq!(parsed("[agent]").unwrap().agent, defaults);
@@ -1511,6 +1570,48 @@ mod tests {
         }
         let err = format!("{:#}", parsed("[agent]\ntool_details = true").unwrap_err());
         assert!(err.contains("agent.tool_details"), "{err}");
+    }
+
+    // agents-prompt-context 1.6b: where attached text is kept, and for how
+    // long.
+
+    #[test]
+    fn attachments_settings_take_each_value_and_clamp_the_keep_time() {
+        let config = parsed("[agent]\nattachments_dir = \"~/att\"\nattachments_keep_days = 0").unwrap();
+        assert_eq!(config.agent.attachments_dir.as_deref(), Some("~/att"));
+        assert_eq!(config.agent.keep_days(), 0);
+        assert_eq!(parsed("[agent]\nattachments_keep_days = 3650").unwrap().agent.keep_days(), 3650);
+        for (given, used) in [(9999, 3650.0), (-5, 0.0)] {
+            let loaded = Config::parse(&format!("[agent]\nattachments_keep_days = {given}")).unwrap();
+            assert_eq!(loaded.config.agent.keep_days(), used as u32);
+            assert_eq!(
+                loaded.findings,
+                [ConfigFinding::Clamped { key: "agent.attachments_keep_days", given: given as f32, used }]
+            );
+            assert_eq!(
+                loaded.findings[0].to_string(),
+                format!("agent.attachments_keep_days {given} is out of range, using {used}")
+            );
+        }
+        assert!(parsed("[agent]\nattachments_keep_days = \"soon\"").is_err());
+    }
+
+    #[test]
+    fn a_remotes_attachments_dir_is_no_part_of_its_endpoint_or_the_session_state() {
+        let config = parsed(
+            "[[profiles]]\nname = \"a\"\nremote = { type = \"ssh\", host = \"A8\", attachments_dir = \"/srv/att\" }\n\
+             [[profiles]]\nname = \"b\"\nremote = { type = \"ssh\", host = \"A8\" }\n\
+             [[profiles]]\nname = \"c\"\nremote = { type = \"container\", container = \"d\", attachments_dir = \"~/a\" }",
+        )
+        .unwrap();
+        let [a, b, c] = [0, 1, 2].map(|i| config.profiles[i].remote.clone().unwrap());
+        assert_eq!(a.attachments_dir(), Some("/srv/att"));
+        assert_eq!((b.attachments_dir(), c.attachments_dir()), (None, Some("~/a")));
+        assert_ne!(a, b);
+        assert_eq!(a.endpoint(), b.endpoint());
+        assert_eq!(c.endpoint().attachments_dir(), None);
+        let saved = serde_json::to_string(&a).unwrap();
+        assert!(!saved.contains("attachments_dir"), "{saved}");
     }
 
     #[test]

@@ -11,9 +11,10 @@ use gpui::SharedString;
 use crate::agent::markdown::{self, Part};
 use crate::agent::tool::{self, DetailPart, RowState, Shown, ToolPolicy};
 use crate::agent::transcript::{
-    Entry, EntryId, NoticeLevel, PermissionKind, PermissionOption, PermissionOutcome, ToolKind, ToolStatus,
+    Attachment, Entry, EntryId, NoticeLevel, PermissionKind, PermissionOption, PermissionOutcome, ToolKind, ToolStatus,
 };
 
+use super::attach::TextState;
 use super::facts::Rows;
 use super::{BLOCK_LIMIT, ChatModel, Due, running};
 
@@ -53,6 +54,10 @@ pub enum BlockBody {
         shows: Option<EntryId>,
     },
     Notice { level: NoticeLevel, text: SharedString },
+    /// A user message's attachment `index`, in its bubble under its text
+    /// (OpenSpec change `agents-prompt-context`, decision 9): a link by its
+    /// path, a kept text as a row in `state`.
+    Attached { index: usize, attachment: Attachment, state: TextState },
 }
 
 /// Rendered Markdown, shared between the cache and the blocks.
@@ -75,6 +80,8 @@ pub(super) struct ToolDraw {
     state: Option<RowState>,
     detail: Vec<ShownPart>,
     shows: Option<EntryId>,
+    /// A user message's attachments' rows, in order.
+    rows: Vec<TextState>,
 }
 
 /// One item of the conversation's list: an entry, or one part of a message
@@ -196,7 +203,29 @@ pub(super) fn user_blocks(id: EntryId, text: &str, part: usize, from: usize) -> 
 pub(super) fn blocks_of(id: EntryId, entry: &Entry, rendered: &[Part], thought_open: bool, draw: ToolDraw) -> Vec<Block> {
     let one = |body| vec![Block { entry: id, part: 0, start: 0, last: true, body }];
     match entry {
-        Entry::User { text } => user_blocks(id, text, 0, 0),
+        Entry::User { text, attachments } if attachments.is_empty() => user_blocks(id, text, 0, 0),
+        // The bubble ends with its last attachment.
+        Entry::User { text, attachments } => {
+            let mut blocks = user_blocks(id, text, 0, 0);
+            let text_end = text.len();
+            for block in &mut blocks {
+                block.last = false;
+            }
+            let first = blocks.len();
+            let count = attachments.len();
+            blocks.extend(attachments.iter().enumerate().map(|(index, attachment)| Block {
+                entry: id,
+                part: first + index,
+                start: text_end,
+                last: index + 1 == count,
+                body: BlockBody::Attached {
+                    index,
+                    attachment: attachment.clone(),
+                    state: draw.rows.get(index).cloned().unwrap_or(TextState::Closed),
+                },
+            }));
+            blocks
+        }
         Entry::Agent { .. } => rendered
             .iter()
             .enumerate()
@@ -337,18 +366,20 @@ impl ChatModel {
                     RowState::Open => self.shown_parts(id, entry),
                     RowState::Closed | RowState::WithPermission | RowState::Nothing => Vec::new(),
                 };
-                ToolDraw { state: Some(state), detail, shows: None }
+                ToolDraw { state: Some(state), detail, shows: None, rows: Vec::new() }
             }
             Entry::Permission { .. } => {
                 let Some(tool) = self.facts.pending.get(&id).and_then(|pending| pending.tool) else {
                     return ToolDraw::default();
                 };
                 let Some(tool_entry) = self.held(tool) else { return ToolDraw::default() };
-                ToolDraw { state: None, detail: self.shown_parts(tool, tool_entry), shows: Some(tool) }
+                ToolDraw { state: None, detail: self.shown_parts(tool, tool_entry), shows: Some(tool), rows: Vec::new() }
             }
-            Entry::User { .. } | Entry::Agent { .. } | Entry::Thought { .. } | Entry::Notice { .. } => {
-                ToolDraw::default()
-            }
+            Entry::User { attachments, .. } => ToolDraw {
+                rows: (0..attachments.len()).map(|index| self.row_state(id, index).clone()).collect(),
+                ..ToolDraw::default()
+            },
+            Entry::Agent { .. } | Entry::Thought { .. } | Entry::Notice { .. } => ToolDraw::default(),
         }
     }
 
@@ -574,7 +605,8 @@ impl ChatModel {
             | BlockBody::Thought { .. }
             | BlockBody::Tool { .. }
             | BlockBody::ToolDetail(_)
-            | BlockBody::Notice { .. } => None,
+            | BlockBody::Notice { .. }
+            | BlockBody::Attached { .. } => None,
         }
     }
 
@@ -601,7 +633,7 @@ impl ChatModel {
     pub fn message_text(&self, id: EntryId) -> Option<&str> {
         let index = self.entries.binary_search_by_key(&id, |(own, _)| *own).ok()?;
         match &self.entries[index].1 {
-            Entry::Agent { text } | Entry::User { text } => Some(text),
+            Entry::Agent { text } | Entry::User { text, .. } => Some(text),
             Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
         }
     }
@@ -615,7 +647,7 @@ impl ChatModel {
         let mut held = HeldText::default();
         for (_, entry) in &self.entries {
             held.entries += match entry {
-                Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
+                Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
                 Entry::Tool { content, .. } => content
                     .iter()
                     .map(|item| match item {
@@ -634,7 +666,9 @@ impl ChatModel {
         for block in &self.blocks {
             match &block.body {
                 BlockBody::UserText { text } => held.user_parts += text.len(),
-                BlockBody::ToolDetail(_)
+                // An open row's text is the row's, not a copy of an entry's.
+                BlockBody::Attached { .. }
+                | BlockBody::ToolDetail(_)
                 | BlockBody::Permission { .. }
                 | BlockBody::AgentPart { .. }
                 | BlockBody::Thought { .. }
@@ -785,7 +819,7 @@ mod tests {
         let mut zone = Zone::ready();
         zone.feed(&[
             turn(TurnState::Working),
-            added(1, Entry::User { text: "go".into() }),
+            added(1, Entry::user("go")),
             added(2, thought("hmm")),
             added(3, permission("Run cargo test?")),
         ]);

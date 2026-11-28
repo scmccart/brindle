@@ -881,6 +881,58 @@ An agent that needs a login says so, with its own message: log in through the
 agent's own command line, then open a new tab. An agent that exits, or speaks
 another ACP version, leaves its conversation readable.
 
+#### Attachments
+
+A prompt can take up to 8 attachments, shown in a row above the input: a
+file, as a link the agent reads itself, or a text of at most 256 KiB, such
+as a command's output.
+
+- **Send Last Command Output to Agent** (`send_last_output_to_agent`, no
+  default key), in a terminal with [shell integration](#shell-integration),
+  takes what Copy Last Command Output would copy, named by its command line,
+  to the window's agent zone: the only one, or the one you choose from a
+  list, the most recently used first. That zone is shown with its input
+  focused, and nothing is sent until you send the prompt. When there is no
+  output to take, the notice line says why: the shell sends no prompt marks,
+  or the output has left the scrollback (a command that prints more lines
+  at once than `scrollback_lines` holds loses its marks with them).
+- **Attach File…** (`agent_attach_file`) asks for a path on the agent's host,
+  relative to the agent's directory or absolute.
+- **Dropping files** on an agent zone attaches them: as links for an agent on
+  this machine, and as their text for one over SSH or in a container (a
+  directory, or a file that isn't UTF-8 text, is refused).
+- **Backspace** at the very start of the input removes the last attachment,
+  the `×` on an item removes that one, and **Clear Attachments**
+  (`agent_clear_attachments`) removes them all.
+
+Enter with no text sends nothing, attachments or not. A queued prompt keeps
+its attachments, counted in its row, and so does one held and sent again.
+In the conversation, a sent text is a row under its message; a click opens
+it, read back from the server, and closes it again.
+
+The server keeps each attached text in a private directory of the session's
+on the agent's host, so the agent can read it again: under
+`~/.cache/brindle/attachments` (on Windows `%LOCALAPPDATA%\brindle\cache\attachments`),
+or where `attachments_dir` says. A text of at most 64 KiB is sent inside the
+prompt to an agent that takes embedded context (every agent we know of);
+a longer one, or any for an agent that doesn't, is sent as a link to its
+file. The texts stay while the session lives, and for
+`attachments_keep_days` after it ends (0 removes them when it ends):
+
+```toml
+[agent]
+attachments_dir = "~/scratch/brindle-attachments"  # local agents
+attachments_keep_days = 14                          # 0 to 3650
+
+[[profiles]]
+name = "Claude on A8"
+type = "agent"
+command = "claude-code-acp"
+# An agent on a remote keeps its texts there: its user's cache directory,
+# or the remote's own attachments_dir.
+remote = { type = "ssh", host = "a8", attachments_dir = "~/att" }
+```
+
 #### Earlier conversations
 
 An agent that offers ACP's `session/list` can list the conversations it had

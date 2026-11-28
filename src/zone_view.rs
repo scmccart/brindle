@@ -20,7 +20,7 @@ use crate::actions::*;
 use crate::agent::close::{BusyAgent, ClosePlan, Closing, close_plan};
 use crate::agent::model::LoginZoneEnd;
 use crate::agent::conversations::{ZoneAt, ZoneFacts, ZoneRun};
-use crate::agent::{Agent, AgentAsk, LoginZone, OptionRefused};
+use crate::agent::{Agent, AgentAsk, AttachRefused, LoginZone, OptionRefused};
 use crate::agent::spawn::OpenedBy;
 use crate::agent::view::{AgentView, ConfirmLink};
 use brindle_ui::FocusStops as _;
@@ -35,7 +35,7 @@ use crate::terminal::progress::{self, Progress};
 use crate::terminal::status::State;
 use crate::terminal::{Terminal, TerminalEvent};
 use crate::terminal_element::cell_metrics;
-use crate::terminal_view::{GridLayout, LinkFailed, TerminalView};
+use crate::terminal_view::{GridLayout, LinkFailed, SendOutput, TerminalView};
 use crate::theme::Theme;
 use crate::workspace::{program_title, shortcut, terminal_automatic_title};
 use crate::workspace::mark::{Mark, mark};
@@ -684,6 +684,13 @@ pub struct OptionsAsk {
     pub option: Option<String>,
 }
 
+/// Agent zone `zone` asks for a path to attach (OpenSpec change
+/// `agents-prompt-context`, Attach File…).
+#[derive(Clone, Debug)]
+pub struct AttachFileAsk {
+    pub zone: ZoneId,
+}
+
 pub struct ZoneTreeView {
     tree: ZoneTree,
     zones: HashMap<ZoneId, Zone>,
@@ -715,6 +722,10 @@ impl EventEmitter<SplitAsk> for ZoneTreeView {}
 impl EventEmitter<SplitRefused> for ZoneTreeView {}
 impl EventEmitter<ConversationsAsk> for ZoneTreeView {}
 impl EventEmitter<OptionsAsk> for ZoneTreeView {}
+impl EventEmitter<AttachFileAsk> for ZoneTreeView {}
+impl EventEmitter<SendOutput> for ZoneTreeView {}
+/// An attachment an agent zone refused, passed on to the notice line.
+impl EventEmitter<AttachRefused> for ZoneTreeView {}
 /// A set an agent zone's server refused, passed on to the window's notice
 /// line.
 impl EventEmitter<OptionRefused> for ZoneTreeView {}
@@ -793,12 +804,14 @@ impl ZoneTreeView {
                     this.on_zone_terminal_event(id, event, window, cx);
                 });
                 let link_failed = cx.subscribe(&view, |_, _, failed: &LinkFailed, cx| cx.emit(failed.clone()));
+                // Its last command's output, for an agent zone's prompt.
+                let send = cx.subscribe(&view, |_, _, send: &SendOutput, cx| cx.emit(send.clone()));
                 // Without the process name, which the next refresh reads.
                 let title: SharedString = {
                     let t = terminal.read(cx);
                     terminal_automatic_title(t.title(), &profile.name, LOCAL_PATH_STYLE, None).into()
                 };
-                (ZoneContent::Terminal(view), title, vec![events, link_failed])
+                (ZoneContent::Terminal(view), title, vec![events, link_failed, send])
             }
             ZoneStart::Agent(agent) => {
                 let view = cx.new(|cx| AgentView::new(agent.clone(), theme, font_size, window, cx));
@@ -820,11 +833,14 @@ impl ZoneTreeView {
                 let ask = cx.subscribe(&agent, move |_, _, ask: &AgentAsk, cx| match ask {
                     AgentAsk::Conversations => cx.emit(ConversationsAsk { zone: id }),
                     AgentAsk::Options { option } => cx.emit(OptionsAsk { zone: id, option: option.clone() }),
+                    AgentAsk::AttachFile => cx.emit(AttachFileAsk { zone: id }),
                 });
                 // A set the server refused, for the notice line.
                 let refused = cx.subscribe(&agent, |_, _, refused: &OptionRefused, cx| cx.emit(refused.clone()));
+                // An attachment the zone refused, for the notice line too.
+                let attach = cx.subscribe(&agent, |_, _, refused: &AttachRefused, cx| cx.emit(refused.clone()));
                 let title: SharedString = agent.read(cx).title().into();
-                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link, login, ask, refused])
+                (ZoneContent::Agent(view), title, vec![events, link_failed, confirm_link, login, ask, refused, attach])
             }
         };
         let focus = content.focus_handle(cx);
@@ -2125,13 +2141,13 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let devbox = Host::Remote(RemoteTarget::Container {
             engine: "docker".into(),
             container: "devbox".into(),
             user: None,
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let lines = |id: ZoneId| {
             Some(match id.0 {
@@ -2597,7 +2613,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let shell = Profile { name: "Shell".into(), ..Profile::default_shell() };
         let fake = Profile { name: "Fake".into(), ..Profile::default_shell() };

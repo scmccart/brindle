@@ -7,11 +7,14 @@
 //! Pure: values in, values out.
 
 pub use brindle_transcript::{
-    Activity, AgentState, Conversation, DiffLine, Entry, EntryId, Event, Exit, FileChange, FileOp, HoldReason,
+    ATTACHMENT_TEXT, Activity, AgentState, Attachment, Conversation, MAX_ATTACHMENTS, DiffLine, Entry, EntryId, Event, Exit, FileChange, FileOp, HoldReason,
     LoginKind, LoginMethod, NoticeLevel, OptionCategory, OptionChoice, OptionControl, Output, PAGE_BYTES, PermissionKind,
     PermissionOption, PermissionOutcome, SessionOption, Slot, SlashCommand, StopReason, ToolItem, ToolKind, ToolStatus,
     Transcript, TurnState, Window, clean,
 };
+/// The tests' kept-text ids; the app reads them inside an [`Attachment`].
+#[cfg(test)]
+pub use brindle_transcript::AttachmentId;
 
 /// What the zone's tests build tool content with.
 #[cfg(test)]

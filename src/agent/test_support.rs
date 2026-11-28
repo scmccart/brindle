@@ -20,7 +20,7 @@ use crate::agent::{Agent, Connect, Requests};
 use crate::config::{Config, ConfigReport};
 use crate::remote::{AgentStart, Host};
 use crate::remote::SessionKey;
-use crate::remote::protocol::client::OptionValue;
+use crate::remote::protocol::client::{OptionValue, PromptAttachment};
 use crate::remote::protocol::{RequestId, SessionId};
 use crate::settings::Settings;
 
@@ -49,7 +49,13 @@ pub const FAKE_PROFILE: &str = "[[profiles]]\nname = \"Shell\"\n\n[[profiles]]\n
 /// What the zone sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
+    /// A prompt with no attachments.
     Prompt(String),
+    /// A prompt with attachments (OpenSpec change `agents-prompt-context`).
+    PromptWith(String, Vec<PromptAttachment>),
+    /// `AGENT_ATTACH`: a text's name and the text.
+    Attach(String, String),
+    ReadAttachment(u64),
     Resend,
     Unqueue,
     Answer(u64, Option<String>),
@@ -90,8 +96,20 @@ impl FakeRequests {
 }
 
 impl Requests for FakeRequests {
-    fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
-        self.record(Call::Prompt(text.to_string()))
+    fn prompt(&self, text: &str, attachments: Vec<PromptAttachment>) -> Result<RequestId, NotSent> {
+        if attachments.is_empty() {
+            self.record(Call::Prompt(text.to_string()))
+        } else {
+            self.record(Call::PromptWith(text.to_string(), attachments))
+        }
+    }
+
+    fn attach(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        self.record(Call::Attach(name.to_string(), text.to_string()))
+    }
+
+    fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        self.record(Call::ReadAttachment(id))
     }
 
     fn resend(&self) -> Result<RequestId, NotSent> {
@@ -158,7 +176,7 @@ impl Requests for FakeRequests {
 fn fake_connect(calls: Calls, refuse: Rc<Cell<Option<NotSent>>>, starts: Starts, sinks: Sinks) -> Connect {
     Box::new(move |_host, start, mut sink| {
         let start = match start {
-            AgentStart::Spawn(request) => Start::Spawn(request()),
+            AgentStart::Spawn(request) => Start::Spawn(Box::new(request())),
             AgentStart::Attach { session, .. } => Start::Attach(session),
         };
         starts.borrow_mut().push(start);
@@ -173,7 +191,7 @@ fn fake_connect(calls: Calls, refuse: Rc<Cell<Option<NotSent>>>, starts: Starts,
 /// What the fake connect was asked to start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Start {
-    Spawn(AgentSpawnRequest),
+    Spawn(Box<AgentSpawnRequest>),
     Attach(SessionId),
 }
 
@@ -278,7 +296,7 @@ pub fn added(id: u64, entry: Entry) -> Event {
 }
 
 pub fn user(text: &str) -> Entry {
-    Entry::User { text: text.into() }
+    Entry::user(text)
 }
 
 pub fn agent(text: &str) -> Entry {

@@ -83,7 +83,7 @@ In a terminal zone, the `send_last_output_to_agent` action SHALL attach the outp
 - **THEN** the attachment is named `output from zsh`
 
 ### Requirement: What output a terminal sends
-The output sent from a terminal SHALL be the text Copy Last Command Output would copy, with lines joined by a line feed on every platform: what the terminal shows, without the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached and the terminal SHALL keep focus.
+The output sent from a terminal SHALL be the text Copy Last Command Output would copy, with lines joined by a line feed on every platform: what the terminal shows, without the prompt or the command line. When Copy Last Command Output would copy nothing, nothing SHALL be attached, the terminal SHALL keep focus, and the window's notice line SHALL say why: that the shell has sent no prompt marks, or that the last command's output is no longer in the scrollback or was empty.
 
 #### Scenario: The same text as copying
 - **WHEN** the user ran `printf 'one\ntwo\n'` and runs Send Last Command Output to Agent
@@ -98,8 +98,12 @@ The output sent from a terminal SHALL be the text Copy Last Command Output would
 - **THEN** the attachment holds it as one line
 
 #### Scenario: Output that has scrolled away
-- **WHEN** the last command's output has left the scrollback and the user runs Send Last Command Output to Agent
-- **THEN** nothing is attached, and the terminal keeps focus
+- **WHEN** the last command printed more lines than the scrollback holds, so that its output has left the scrollback, and the user runs Send Last Command Output to Agent
+- **THEN** nothing is attached, the terminal keeps focus, and the notice line says the output is no longer in the scrollback
+
+#### Scenario: A shell without prompt marks
+- **WHEN** the shell has sent no prompt mark and the user runs Send Last Command Output to Agent from a key bound to it (the palette doesn't list it then)
+- **THEN** nothing is attached, the terminal keeps focus, and the notice line says the shell sends no prompt marks
 
 ### Requirement: When Send Last Command Output to Agent is listed
 The command palette SHALL list Send Last Command Output to Agent only once the terminal has received a prompt mark, as Copy Last Command Output is, and never in an agent zone.

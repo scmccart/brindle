@@ -1222,7 +1222,7 @@ fn f() {
 ///
 /// A directory module joins file by file, so a file added to it can't skip
 /// the check; its test-only `harness.rs` is test code and stays out.
-const PURE_MODULES: [&str; 93] = [
+const PURE_MODULES: [&str; 98] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1256,6 +1256,7 @@ const PURE_MODULES: [&str; 93] = [
     "src/agent/model/attention.rs",
     "src/agent/model/dump.rs",
     "src/agent/model/options.rs",
+    "src/agent/model/attach.rs",
     "src/agent/conversations.rs",
     "src/agent/commands.rs",
     "src/layout.rs",
@@ -1267,6 +1268,7 @@ const PURE_MODULES: [&str; 93] = [
     "src/workspace/previews.rs",
     "src/workspace/notices.rs",
     "src/workspace/mark.rs",
+    "src/workspace/targets.rs",
     "src/picker/sessions.rs",
     "src/settings_dialog/themes.rs",
     "ui/src/filter.rs",
@@ -1290,6 +1292,7 @@ const PURE_MODULES: [&str; 93] = [
     "remote-agent/src/pty/program.rs",
     "remote-agent/src/pty/stat.rs",
     "remote-agent/src/server/core/policy.rs",
+    "remote-agent/src/server/core/attachments.rs",
     "remote-agent/src/server/holder/policy.rs",
     "remote-agent/src/server/login_env.rs",
     "remote-agent/src/acp/envelope.rs",
@@ -1299,10 +1302,12 @@ const PURE_MODULES: [&str; 93] = [
     "remote-agent/src/acp/v1/encode.rs",
     "remote-agent/src/acp/diff.rs",
     "remote-agent/src/acp/limits.rs",
+    "remote-agent/src/acp/uri.rs",
     "remote-agent/src/acp/plain.rs",
     "remote-agent/src/acp/lines.rs",
     "remote-agent/src/acp/rpc.rs",
     "remote-agent/src/acp/reduce/mod.rs",
+    "remote-agent/src/acp/reduce/attach.rs",
     "remote-agent/src/acp/reduce/lifecycle.rs",
     "remote-agent/src/acp/reduce/turn.rs",
     "remote-agent/src/acp/reduce/tools.rs",

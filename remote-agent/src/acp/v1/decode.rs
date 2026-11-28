@@ -50,7 +50,7 @@ use crate::acp::forms::{
     AgentInfo, Content, ContentKind, Continued, Initialized, Listed, Listing, MAX_LOGIN_ARG,
     MAX_LOGIN_ARGS,
     MAX_LOGIN_DESCRIPTION, MAX_LOGIN_ID, MAX_LOGIN_METHODS, MAX_LOGIN_METHODS_LEN, Methods,
-    NewSession, NotificationKind, Offered, OfferedOption, OptionKey, OptionKind, OutputForm, Patch, PermissionRequest, RequestKind,
+    NewSession, NotificationKind, Offered, OfferedOption, OptionKey, OptionKind, OutputForm, Patch, PermissionRequest, PromptSupport, RequestKind,
     RequestedOption, SessionUpdate, ToolCall, ToolChange, ToolDetail, ToolItemForm,
     Failure, Update,
 };
@@ -88,6 +88,11 @@ pub fn initialize_result(mut result: Value) -> Result<Initialized, BadParams> {
             capabilities.session_capabilities.resume.is_some(),
         ),
         lists: capabilities.session_capabilities.list.is_some(),
+        prompts: PromptSupport {
+            embedded: capabilities.prompt_capabilities.embedded_context,
+            images: capabilities.prompt_capabilities.image,
+        },
+        directories: capabilities.session_capabilities.additional_directories.is_some(),
         agent: response.agent_info.map(|info| AgentInfo {
             name: info.name,
             title: info.title,
@@ -1999,6 +2004,129 @@ mod tests {
         ),
     ];
 
+    /// The captures of a prompt with an attachment (`agents-prompt-context`
+    /// task 1.1, on Windows): `-link` a `resource_link` to a kept file,
+    /// `-no-dirs` the same with `additionalDirectories` taken out of
+    /// `session/new` before the agent read it, `-embedded` a `resource`.
+    const ATTACH_CAPTURES: [(&str, &[u8]); 11] = [
+        (
+            "agy-1.5.17-attach-embedded",
+            include_bytes!("../../../tests/fixtures/acp/agy-1.5.17-attach-embedded.log"),
+        ),
+        (
+            "agy-1.5.17-attach-link",
+            include_bytes!("../../../tests/fixtures/acp/agy-1.5.17-attach-link.log"),
+        ),
+        (
+            "agy-1.5.17-attach-no-dirs",
+            include_bytes!("../../../tests/fixtures/acp/agy-1.5.17-attach-no-dirs.log"),
+        ),
+        (
+            "claude-agent-acp-0.113.0-attach-embedded",
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.113.0-attach-embedded.log"),
+        ),
+        (
+            "claude-agent-acp-0.113.0-attach-link",
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.113.0-attach-link.log"),
+        ),
+        (
+            "claude-agent-acp-0.113.0-attach-no-dirs",
+            include_bytes!("../../../tests/fixtures/acp/claude-agent-acp-0.113.0-attach-no-dirs.log"),
+        ),
+        (
+            "codex-acp-2.12.1-attach-embedded",
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.1-attach-embedded.log"),
+        ),
+        (
+            "codex-acp-2.12.1-attach-link",
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.1-attach-link.log"),
+        ),
+        (
+            "codex-acp-2.12.1-attach-no-dirs",
+            include_bytes!("../../../tests/fixtures/acp/codex-acp-2.12.1-attach-no-dirs.log"),
+        ),
+        (
+            "copilot-1.0.117-attach-embedded",
+            include_bytes!("../../../tests/fixtures/acp/copilot-1.0.117-attach-embedded.log"),
+        ),
+        (
+            "copilot-1.0.117-attach-link",
+            include_bytes!("../../../tests/fixtures/acp/copilot-1.0.117-attach-link.log"),
+        ),
+    ];
+
+    /// Every line of the attachment captures decodes: one start, one turn
+    /// that ended, no permission asked (none of the four asked to read the
+    /// kept file, named directory or not). What Brindle sent is the wire
+    /// shape the change promises: the directory named in `session/new` to
+    /// an agent that takes more directories (but not on a `-no-dirs` run,
+    /// whose wrapper took it out), and the attachment as a `resource_link`
+    /// to a `file:` URI, or embedded as a `resource` with that URI.
+    #[test]
+    fn every_line_of_the_attachment_captures_decodes_and_sent_the_promised_parts() {
+        for (name, bytes) in ATTACH_CAPTURES {
+            let (_, decoded) = decode_capture(bytes);
+            let mut kinds = (0, 0, 0);
+            for line in &decoded {
+                match line {
+                    Ok(Decoded::Bad(why)) => panic!("{name}: {why}"),
+                    Err(malformed) => panic!("{name}: {malformed:?}"),
+                    Ok(Decoded::Initialized(init)) => {
+                        assert_eq!(init.protocol_version, 1, "{name}");
+                        assert!(init.agent.is_some(), "{name}: no agentInfo");
+                        kinds.0 += 1;
+                    }
+                    Ok(Decoded::NewSession) => kinds.1 += 1,
+                    Ok(Decoded::Stopped(stop)) => {
+                        assert_eq!(*stop, StopReason::EndTurn, "{name}");
+                        kinds.2 += 1;
+                    }
+                    Ok(Decoded::Permission(request)) => panic!("{name}: {request:?}"),
+                    Ok(Decoded::Update(_) | Decoded::NotBrindles | Decoded::Ignored) => {}
+                }
+            }
+            assert_eq!(kinds, (1, 1, 1), "{name}");
+
+            let sent: Vec<(String, Value)> = capture_lines(bytes)
+                .into_iter()
+                .filter(|(direction, _)| *direction == "c>a")
+                .filter_map(|(_, line)| match decode(line) {
+                    Ok(Message::Request { method, params, .. }) => Some((method, params)),
+                    Ok(_) | Err(_) => None,
+                })
+                .collect();
+            let params = |method: &str| {
+                sent.iter()
+                    .find(|(m, _)| m == method)
+                    .map(|(_, params)| params.clone())
+                    .unwrap_or_else(|| panic!("{name}: no {method}"))
+            };
+            let named = params("session/new").get("additionalDirectories").cloned();
+            let names_it = !name.starts_with("copilot") && !name.ends_with("-no-dirs");
+            assert_eq!(named.is_some(), names_it, "{name}: {named:?}");
+            if let Some(Value::Array(dirs)) = &named {
+                assert_eq!(dirs.len(), 1, "{name}");
+                assert!(dirs[0].as_str().is_some_and(|d| d.contains("attachments")), "{name}");
+            }
+            let prompt = params("session/prompt");
+            let parts = prompt["prompt"].as_array().cloned().unwrap_or_default();
+            assert_eq!(parts.len(), 2, "{name}");
+            assert_eq!(parts[0]["type"], "text", "{name}");
+            let uri = if name.ends_with("-embedded") {
+                assert_eq!(parts[1]["type"], "resource", "{name}");
+                assert_eq!(parts[1]["resource"]["mimeType"], "text/plain", "{name}");
+                assert_eq!(parts[1]["resource"]["text"], "1\n2\n3\n4\n5\n6\n7\n8\n9\n10", "{name}");
+                parts[1]["resource"]["uri"].clone()
+            } else {
+                assert_eq!(parts[1]["type"], "resource_link", "{name}");
+                assert_eq!(parts[1]["name"], "1..20000", "{name}");
+                parts[1]["uri"].clone()
+            };
+            let uri = uri.as_str().unwrap_or_default().to_string();
+            assert!(uri.starts_with("file:///C:/") && uri.contains("/attachments/"), "{name}: {uri}");
+        }
+    }
+
     /// The result of each answered `initialize` in a capture.
     fn initialize_answers(bytes: &[u8]) -> Vec<Value> {
         let mut asked = Vec::new();
@@ -2040,33 +2168,36 @@ mod tests {
             "gemini-api-key",
             "agent-platform",
         ];
+        // The captures answering an `initialize` that offered
+        // `auth.terminal`: the later ones.
+        let offered_terminal = |n: &str| {
+            n.ends_with("-auth-terminal") || n.contains("-edit-run") || n.contains("-attach-")
+        };
+        // Antigravity's adapter calls itself `agy` from 1.5.17.
+        let is_antigravity = |n: &str| n.starts_with("antigravity") || n.starts_with("agy");
         let mut seen = Vec::new();
-        for (name, bytes) in CAPTURES.iter().chain(AUTH_CAPTURES.iter()) {
+        for (name, bytes) in CAPTURES
+            .iter()
+            .chain(AUTH_CAPTURES.iter())
+            .chain(ATTACH_CAPTURES.iter())
+        {
             for answer in initialize_answers(bytes) {
                 // Every capture but the terminal one: the same with or
                 // without auth.terminal, and nothing left out.
                 for advertised in [true, false] {
                     let read = auth_methods(&answer, advertised);
                     let expected: Vec<&str> = match *name {
-                        // Those answering an `initialize` that offered
-                        // `auth.terminal`.
-                        n if n.starts_with("antigravity")
-                            && (n.ends_with("-auth-terminal") || n.contains("-edit-run"))
-                            && advertised =>
-                        {
+                        n if is_antigravity(n) && offered_terminal(n) && advertised => {
                             antigravity
                                 .iter()
                                 .copied()
                                 .chain(["terminal-login"])
                                 .collect()
                         }
-                        n if n.starts_with("antigravity") => antigravity.to_vec(),
+                        n if is_antigravity(n) => antigravity.to_vec(),
                         // 0.112's two terminal logins, offered to the later
-                        // `initialize` only.
-                        n if n.starts_with("claude-agent-acp")
-                            && n.contains("-edit-run")
-                            && advertised =>
-                        {
+                        // `initialize` only, and 0.113's.
+                        n if n.starts_with("claude-agent-acp") && offered_terminal(n) && advertised => {
                             vec!["claude-ai-login", "console-login"]
                         }
                         n if n.starts_with("claude-agent-acp") => Vec::new(),
@@ -2078,12 +2209,8 @@ mod tests {
                     assert_eq!(ids(&read), expected, "{name} ({advertised})");
                     let dropped = match *name {
                         _ if advertised => 0,
-                        n if n.starts_with("antigravity")
-                            && (n.ends_with("-auth-terminal") || n.contains("-edit-run")) =>
-                        {
-                            1
-                        }
-                        n if n.starts_with("claude-agent-acp") && n.contains("-edit-run") => 2,
+                        n if is_antigravity(n) && offered_terminal(n) => 1,
+                        n if n.starts_with("claude-agent-acp") && offered_terminal(n) => 2,
                         _ => 0,
                     };
                     assert_eq!(
@@ -2097,7 +2224,48 @@ mod tests {
                 seen.push(*name);
             }
         }
-        assert_eq!(seen.len(), 18, "{seen:?}");
+        assert_eq!(seen.len(), 18 + 11, "{seen:?}");
+    }
+
+    /// Design facts of `agents-prompt-context`: every captured agent takes
+    /// embedded context; Claude, Codex and Antigravity take more
+    /// directories, Copilot doesn't.
+    #[test]
+    fn every_captured_initialize_answer_gives_its_prompt_support_and_directories() {
+        let mut seen = 0;
+        for (name, bytes) in CAPTURES
+            .iter()
+            .chain(AUTH_CAPTURES.iter())
+            .chain(ATTACH_CAPTURES.iter())
+        {
+            for answer in initialize_answers(bytes) {
+                let read = initialize_result(answer).unwrap();
+                assert!(read.prompts.embedded, "{name}");
+                let directories = match *name {
+                    n if n.starts_with("copilot") => false,
+                    // The old Claude adapter predates the capability.
+                    n if n.starts_with("claude-code-acp") => read.directories,
+                    _ => true,
+                };
+                assert_eq!(read.directories, directories, "{name}");
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 18 + 11);
+        let read = |capabilities: Value| {
+            initialize_result(json!({"protocolVersion": 1, "agentCapabilities": capabilities})).unwrap()
+        };
+        assert_eq!(read(json!({})).prompts, PromptSupport::default());
+        assert!(!read(json!({})).directories);
+        assert_eq!(
+            read(json!({"promptCapabilities": {"embeddedContext": true, "image": true}})).prompts,
+            PromptSupport { embedded: true, images: true }
+        );
+        // A malformed capability reads as not offered.
+        assert_eq!(read(json!({"promptCapabilities": {"embeddedContext": "yes"}})).prompts, PromptSupport::default());
+        assert_eq!(read(json!({"promptCapabilities": 3})).prompts, PromptSupport::default());
+        assert!(read(json!({"sessionCapabilities": {"additionalDirectories": {}}})).directories);
+        assert!(!read(json!({"sessionCapabilities": {"additionalDirectories": 4}})).directories);
     }
 
     #[test]

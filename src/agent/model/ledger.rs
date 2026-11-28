@@ -6,6 +6,7 @@ use crate::FirstPrompt;
 use crate::agent::transcript::{AgentState, Entry, EntryId, Slot, Window};
 
 use super::{ChatModel, RequestId};
+use super::attach::{Draft, same_attachments};
 use super::choosing::{LaunchChoice, ListDone, ListFor};
 use super::paging::Paging;
 use super::phase::AgentPhase;
@@ -77,6 +78,9 @@ impl ReplyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptSent {
     pub text: String,
+    /// Its attachments (OpenSpec change `agents-prompt-context`, decision
+    /// 13): [`taken`] compares them as well as the text.
+    pub attachments: Vec<Draft>,
     pub after: Option<EntryId>,
 }
 
@@ -99,17 +103,21 @@ pub enum Taken {
 }
 
 /// Whether the core took `prompt`, from the reconnect's replay: the slot
-/// holds its cleaned text (queued behind a turn), or a user entry after the
-/// one the zone held when it was sent does; it can't tell when the replay's
-/// window starts past that entry's successor; else it didn't.
+/// holds its cleaned text and attachments (queued behind a turn), or a user
+/// entry after the one the zone held when it was sent does; it can't tell
+/// when the replay's window starts past that entry's successor; else it
+/// didn't.
 pub fn taken(prompt: &PromptSent, entries: &[(EntryId, Entry)], window: Option<Window>, slot: &Slot) -> Taken {
     let kept = crate::agent::transcript::clean(&prompt.text);
     let queued = match slot {
-        Slot::Waiting { text } | Slot::Held { text, .. } => *text == kept,
+        Slot::Waiting { text, attachments } | Slot::Held { text, attachments, .. } => {
+            *text == kept && same_attachments(&prompt.attachments, attachments)
+        }
         Slot::Empty => false,
     };
     let logged = entries.iter().any(|(id, entry)| {
-        prompt.after.is_none_or(|after| *id > after) && matches!(entry, Entry::User { text } if *text == kept)
+        prompt.after.is_none_or(|after| *id > after)
+            && matches!(entry, Entry::User { text, attachments } if *text == kept && same_attachments(&prompt.attachments, attachments))
     });
     if queued || logged {
         return Taken::Yes;
@@ -147,6 +155,14 @@ pub enum Sent {
     /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`) for the
     /// option named `name`: a refusal goes to the window's notice line.
     SetOption { name: String },
+    /// `AGENT_ATTACH` of a text the prompt sent after it names (OpenSpec
+    /// change `agents-prompt-context`): a refusal is shown beside the
+    /// prompt input, in place of the prompt's own that follows.
+    Attach,
+    /// `AGENT_READ_ATTACHMENT` for user entry `entry`'s attachment `index`:
+    /// its text comes in place of the reply; a refusal says the row's text
+    /// is no longer kept.
+    Read { entry: EntryId, index: usize },
 }
 
 /// What a reply does to the prompt input.
@@ -176,7 +192,12 @@ impl ChatModel {
         match taken {
             Taken::Yes => {
                 self.refusal = None;
-                if first { Replied::Nothing } else { Replied::ClearDraft }
+                if first {
+                    Replied::Nothing
+                } else {
+                    self.attached.clear();
+                    Replied::ClearDraft
+                }
             }
             Taken::No => {
                 self.refusal = Some(PROMPT_NOT_TAKEN.into());
@@ -204,7 +225,9 @@ impl ChatModel {
     /// a typed one): the newest entry the zone holds now, which the replay
     /// is searched after if its answer is lost (decision 5).
     pub fn sent_prompt(&self, text: impl Into<String>, first: bool) -> Sent {
-        let sent = PromptSent { text: text.into(), after: self.entries.last().map(|(id, _)| *id) };
+        // A launch's first prompt has none: `-p` takes no attachments.
+        let attachments = if first { Vec::new() } else { self.drafts() };
+        let sent = PromptSent { text: text.into(), attachments, after: self.entries.last().map(|(id, _)| *id) };
         if first { Sent::FirstPrompt(sent) } else { Sent::Prompt(sent) }
     }
 
@@ -241,7 +264,13 @@ impl ChatModel {
             // A set that couldn't go is said beside the input, as any
             // request's (`agents-commands` decision 9); the server's
             // refusals go to the notice line.
-            Sent::SetOption { .. } => {
+            Sent::SetOption { .. } | Sent::Attach => {
+                self.refusal = Some(text.into());
+                Replied::Nothing
+            }
+            // The row closes again, with why beside the input.
+            Sent::Read { entry, index } => {
+                self.row_closed(entry, index);
                 self.refusal = Some(text.into());
                 Replied::Nothing
             }
@@ -276,6 +305,10 @@ impl ChatModel {
                 self.choosing.launch = Some(LaunchChoice::Last);
                 Replied::Nothing
             }
+            Sent::Read { entry, index } => {
+                self.row_closed(entry, index);
+                Replied::Nothing
+            }
             Sent::Prompt(_)
             | Sent::Resend
             | Sent::Unqueue
@@ -284,7 +317,8 @@ impl ChatModel {
             | Sent::Login
             | Sent::Fetch
             | Sent::Choose
-            | Sent::SetOption { .. } => Replied::Nothing,
+            | Sent::SetOption { .. }
+            | Sent::Attach => Replied::Nothing,
         }
     }
 
@@ -334,7 +368,27 @@ impl ChatModel {
         match outcome {
             (Sent::Prompt(_), Ok(())) => {
                 self.refusal = None;
+                self.attach_refused = false;
+                self.attached.clear();
                 Replied::ClearDraft
+            }
+            // The prompt after it says so, or is refused for it.
+            (Sent::Attach, Ok(())) => Replied::Nothing,
+            (Sent::Attach, Err(why)) => {
+                self.refusal = Some(why);
+                self.attach_refused = true;
+                Replied::Nothing
+            }
+            // Its text comes as `ATTACHMENT`; an `OK` answers none.
+            (Sent::Read { .. }, Ok(())) => Replied::Nothing,
+            (Sent::Read { entry, index }, Err(why)) => {
+                self.row_answered(entry, index, Err(why));
+                Replied::Nothing
+            }
+            // Refused for an attach before it: that one's reason stays.
+            (Sent::Prompt(_), Err(_)) if self.attach_refused => {
+                self.attach_refused = false;
+                Replied::Nothing
             }
             (
                 Sent::FirstPrompt(_) | Sent::Resend | Sent::Unqueue | Sent::Answer(_) | Sent::Restart { .. } | Sent::Login,
@@ -593,7 +647,7 @@ mod tests {
         let mut zone = Zone::ready();
         zone.feed(&[added(1, user("hi")), turn(TurnState::Working)]);
         lose_prompt(&mut zone, "next", false);
-        let absorbed = zone.replay(&[ready(), added(1, user("hi")), turn(TurnState::Working), queue(Slot::Waiting { text: "next".into() })]);
+        let absorbed = zone.replay(&[ready(), added(1, user("hi")), turn(TurnState::Working), queue(Slot::waiting("next"))]);
         assert_eq!((absorbed.replied, zone.model.refusal()), (Some(Replied::ClearDraft), None));
     }
 

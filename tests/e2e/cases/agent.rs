@@ -63,7 +63,7 @@ pub(super) fn says(text: &str) -> String {
 
 /// A fake agent's script, built step by step and written into the case
 /// directory.
-pub(super) struct Script(Vec<String>);
+pub(super) struct Script(pub(super) Vec<String>);
 
 impl Script {
     /// An agent that records what it is sent in `received`, names itself
