@@ -18,7 +18,7 @@ pub(super) const EMBEDS: &str = r#"{"promptCapabilities":{"embeddedContext":true
 
 /// An agent named `name` that records what it is sent in `received`,
 /// takes embedded context and is ready at once.
-fn ready(received: &Path, name: &str) -> Script {
+pub(super) fn ready(received: &Path, name: &str) -> Script {
     Script(vec![
         format!("record {}", received.display()),
         "expect initialize".into(),
@@ -32,13 +32,13 @@ fn ready(received: &Path, name: &str) -> Script {
 
 /// `script`'s agent answering each of `turns` prompts with `Hello!`
 /// ([`answered`]).
-fn answering(script: Script, turns: usize) -> Script {
+pub(super) fn answering(script: Script, turns: usize) -> Script {
     (0..turns).fold(script, |script, _| script.step("expect session/prompt").step(says("Hello!")).step(stop("end_turn")))
 }
 
 /// An agent profile `name` running `script` from `LABEL.script`, as TOML
 /// for the test config.
-fn profile(ctx: &Ctx, name: &str, label: &str, script: Script) -> Result<String> {
+pub(super) fn profile(ctx: &Ctx, name: &str, label: &str, script: Script) -> Result<String> {
     let path = script.write(ctx, label)?;
     Ok(format!(
         "\n[[profiles]]\nname = \"{name}\"\ntype = \"agent\"\ncommand = '{}'\nargs = ['{}']\n",
@@ -62,13 +62,13 @@ pub(super) fn send_output<'a>(ctx: &Ctx, run: Run<'a>, first: bool, tab: usize, 
 }
 
 /// Attach File… with `path` typed into its prompt.
-fn attach_file<'a>(run: Run<'a>, path: &str) -> Run<'a> {
+pub(super) fn attach_file<'a>(run: Run<'a>, path: &str) -> Run<'a> {
     run.action("agent_attach_file").send(path).action("picker_confirm")
 }
 
 /// The parts of each `session/prompt` the agent recording in `received`
 /// was sent, in order.
-fn prompt_parts(received: &Path) -> Result<Vec<Vec<Value>>> {
+pub(super) fn prompt_parts(received: &Path) -> Result<Vec<Vec<Value>>> {
     let text = std::fs::read_to_string(received).map_err(|e| format!("reading {}: {e}", received.display()))?;
     let mut prompts = Vec::new();
     for line in text.lines() {
@@ -123,7 +123,7 @@ fn kept_texts(root: &Path) -> Vec<String> {
 }
 
 /// A prompt part of `kind` (`text`, `resource`, `resource_link`).
-fn parts_of<'a>(parts: &'a [Value], kind: &str) -> Vec<&'a Value> {
+pub(super) fn parts_of<'a>(parts: &'a [Value], kind: &str) -> Vec<&'a Value> {
     parts.iter().filter(|part| part["type"] == kind).collect()
 }
 

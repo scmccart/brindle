@@ -86,6 +86,9 @@ pub fn all() -> Vec<Case> {
         display("windows-agent-batch-hint", agent_batch_hint),
         display("windows-agent-prompt-stdin", agent_prompt_stdin).needs_fake_agent(),
         display("windows-agent-markdown", agent_markdown).needs_fake_agent(),
+        // A drive-letter link and a PowerShell command's output, kept
+        // (`agents-prompt-context`).
+        display("windows-agent-attach", agent_attach).needs_fake_agent(),
         // A diff and its permission detail through the holder on Windows.
         display("windows-agent-tool-diff", super::agent::permission_detail).needs_fake_agent(),
         display("windows-agent-continue", agent_continue).needs_fake_agent(),
@@ -1302,6 +1305,52 @@ fn agent_markdown(ctx: &Ctx) -> Result<Outcome> {
     ensure!(out.dump.agent_blocks(2) == parts, "parts {:#?}", out.dump.agent_blocks(2));
     let links = [link(2, "file:///C:/x", "c", "confirm"), link(2, "file:///etc/hosts", "h", "refuse:no-drive")];
     ensure!(out.dump.agent_links(2) == links, "links {:#?}", out.dump.agent_links(2));
+    Ok(Outcome::Pass)
+}
+
+/// A prompt's attachments on Windows (OpenSpec change
+/// `agents-prompt-context`, task 7.7): a PowerShell command's output, sent
+/// from a tab with Brindle's integration loaded, and Attach File… with a
+/// drive-letter path reach the agent as an embedded text, whose URI names
+/// its kept file under the case's cache directory, and a `file:///C:/…`
+/// link.
+fn agent_attach(ctx: &Ctx) -> Result<Outcome> {
+    use super::attach::{answering, attach_file, parts_of, profile, prompt_parts, ready};
+    let received = ctx.dir.join("attach.jsonl");
+    let config = profile(ctx, "Fake", "attach", answering(ready(&received, "Fake Agent"), 1))?;
+    let bin = ctx.bin.display().to_string().replace('\\', "/");
+    let load = format!("& '{bin}' --shell-integration pwsh | Out-String | Invoke-Expression\r");
+    let run = Run::new(ctx, "run")
+        .config(&config)
+        .agent("Fake")
+        .wait_for(super::agent::READY)
+        .action("new_tab")
+        .wait_for(crate::brindle::PROMPT)
+        .send(&load)
+        .send("'w-' + (1+1)\r")
+        .wait_for("w-2")
+        .action("send_last_output_to_agent")
+        .wait_for("draft index=0 kind=text");
+    let out = attach_file(run, "C:/Temp/notes.md")
+        .wait_for("draft index=1 kind=link path=\"C:/Temp/notes.md\" name=\"notes.md\"")
+        .send("look")
+        .key("enter")
+        .wait_for(&super::agent::answered())
+        .dump_at(20.0)
+        .run()?;
+    super::agent::waited(&out)?;
+    let prompts = prompt_parts(&received)?;
+    let [parts] = prompts.as_slice() else { return Err(format!("prompts {prompts:?}")) };
+    let links = parts_of(parts, "resource_link");
+    ensure!(links.len() == 1 && links[0]["uri"] == "file:///C:/Temp/notes.md", "links {links:?}");
+    let embedded = parts_of(parts, "resource");
+    let [text] = embedded.as_slice() else { return Err(format!("parts {parts:?}")) };
+    ensure!(text["resource"]["text"] == "w-2", "embedded {text}");
+    let uri = text["resource"]["uri"].as_str().unwrap_or_default();
+    let kept = uri.strip_prefix("file:///").ok_or_else(|| format!("not a drive's file URI: {uri}"))?;
+    ensure!(std::fs::read_to_string(kept).ok().as_deref() == Some("w-2"), "kept {kept}");
+    let cache = crate::common::server::cache_dir(&ctx.server_dir).display().to_string().replace('\\', "/");
+    ensure!(kept.to_lowercase().starts_with(&cache.to_lowercase()), "kept {kept}, not under {cache}");
     Ok(Outcome::Pass)
 }
 
