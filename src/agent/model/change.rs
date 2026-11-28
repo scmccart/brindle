@@ -581,6 +581,11 @@ impl ChatModel {
         splices
     }
 
+    /// Whether a settled draw left entries for the next whole one.
+    pub fn draw_left(&self) -> bool {
+        !self.undrawn.entries.is_empty()
+    }
+
     /// The working row's insert or removal, after the blocks' splices, at
     /// the count they left (OpenSpec change `agents-zone-focus-and-scroll`,
     /// decision 5): what changed since the list last had it.

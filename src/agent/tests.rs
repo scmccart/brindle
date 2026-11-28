@@ -680,3 +680,41 @@ fn the_lock_is_free_while_the_zone_renders() {
     assert!(free.len() >= 2, "the zone rendered: {free:?}");
     assert!(free.iter().all(|free| *free), "the lock was held across a render: {free:?}");
 }
+
+/// Decision 5's frame gate: a message growing in updates less than a
+/// frame apart is rendered once per frame, its last text drawn when the
+/// frame ends; one that grows after a quiet frame is drawn at once.
+#[test]
+fn a_growing_message_is_drawn_once_per_frame() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    zone.feed(&[ready(), added(1, user("go")), added(2, agent("a"))]);
+    settle(&cx);
+    let entity = zone.agent.clone();
+    let renders = |cx: &gpui::TestAppContext| entity.read_with(cx, |agent, _| agent.model().render_stats().renders);
+    let blocks = |cx: &gpui::TestAppContext| entity.read_with(cx, |agent, _| agent.model().blocks().to_vec());
+    let executor = cx.executor();
+
+    // A frame after the last draw: drawn at once.
+    let before = renders(&cx);
+    zone.feed(&[Event::Appended { id: EntryId(2), text: " b".into() }]);
+    executor.run_until_parked();
+    assert_eq!(renders(&cx), before + 1, "after a quiet frame");
+
+    // Within the frame: left for its end.
+    let drawn = blocks(&cx);
+    for text in [" c", " d"] {
+        zone.feed(&[Event::Appended { id: EntryId(2), text: text.into() }]);
+        executor.run_until_parked();
+    }
+    assert_eq!(renders(&cx), before + 1, "within the frame");
+    assert_eq!(blocks(&cx), drawn, "drawn as it was");
+    executor.advance_clock(crate::terminal::pace::FRAME);
+    executor.run_until_parked();
+    assert_eq!(renders(&cx), before + 2, "once, at the frame's end");
+    zone.agent.read_with(&cx, |agent, _| {
+        let model = agent.model();
+        assert_ne!(model.blocks(), drawn.as_slice());
+        assert_eq!(model.message_text(EntryId(2)), Some("a b c d"));
+    });
+}
