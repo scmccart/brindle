@@ -486,8 +486,14 @@ impl ConversationsModel {
     pub fn failed(&mut self, why: impl Into<String>) {
         let why = why.into();
         match (&self.state, &self.more) {
+            // A listed page's next one failed: the page stays.
             (ListState::Listed, More::Loading(cursor)) => self.more = More::Failed { cursor: cursor.clone(), why },
-            _ => self.state = ListState::Failed(why),
+            // Anything else fails the list (the pair above reaches its arm
+            // first).
+            (
+                ListState::Starting | ListState::Listing | ListState::Listed | ListState::Failed(_),
+                More::None | More::Available(_) | More::Loading(_) | More::Failed { .. } | More::Capped,
+            ) => self.state = ListState::Failed(why),
         }
     }
 
