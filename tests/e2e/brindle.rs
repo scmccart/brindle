@@ -865,8 +865,10 @@ pub struct Grid {
 }
 
 /// The first words of an agent zone's dump lines ([`Dump::agent`]).
-const AGENT_LINES: [&str; 17] = [
+const AGENT_LINES: [&str; 19] = [
     "agent ",
+    "attached ",
+    "draft ",
     "login ",
     "note ",
     "commands ",
@@ -1172,6 +1174,19 @@ impl Dump {
     /// "TEXT"`.
     pub fn agent_raws(&self, entry: u64) -> Vec<&str> {
         self.entry_lines("raw ", entry)
+    }
+
+    /// User entry `entry`'s attachments (`--- attached entry=N index=I
+    /// kind=K …`, OpenSpec change `agents-prompt-context`), each as
+    /// `index=I kind=K …`.
+    pub fn agent_attached(&self, entry: u64) -> Vec<&str> {
+        self.entry_lines("attached ", entry)
+    }
+
+    /// The prompt input's draft (`--- draft index=I kind=K …`), each
+    /// without `draft `.
+    pub fn agent_draft(&self) -> Vec<&str> {
+        self.agent.iter().filter_map(|line| line.strip_prefix("draft ")).collect()
     }
 
     /// Entry `entry`'s line (`--- entry N KIND …`), without `entry N `.

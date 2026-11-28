@@ -23,14 +23,13 @@ pub struct Output {
 }
 
 impl Workspace {
-    /// The window's agent zones, as the list names them, the active tab's
-    /// the most recent.
+    /// The window's agent zones, as the list names them, ranked by when
+    /// their tab was last active and then by focus within it.
     fn agent_targets(&self, cx: &gpui::App) -> Vec<AgentTarget> {
-        let active = self.active_tab().map(|tab| tab.id);
         self.tabs
             .iter()
             .flat_map(|tab| {
-                let base = if Some(tab.id) == active { 1 << 32 } else { 0 };
+                let base = self.strip.recency(tab.id) << 32;
                 let zones = tab.zones.read(cx);
                 zones
                     .zone_facts(tab.id, base, cx)
@@ -68,14 +67,17 @@ impl Workspace {
         }
     }
 
-    /// `output` joins zone `at`'s draft (or its refusal shows), and that
-    /// zone is shown with its prompt input focused. Nothing is sent.
+    /// `output` joins zone `at`'s draft, and that zone is shown with its
+    /// prompt input focused; or its refusal shows on the notice line and
+    /// focus stays where it was. Nothing is sent.
     pub(super) fn attach_output(&mut self, at: ZoneAt, output: Output, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent) = self.tab_zones(at.tab).and_then(|zones| zones.read(cx).agent_of(at.zone, cx)) else {
             return;
         };
-        agent.update(cx, |agent, cx| agent.attach_draft(Draft::text(&output.name, &output.text), "the output", cx));
-        self.show_zone(at, window, cx);
+        let draft = Draft::text(&output.name, &output.text);
+        if agent.update(cx, |agent, cx| agent.attach_draft(draft, "the output", cx)) {
+            self.show_zone(at, window, cx);
+        }
     }
 
     /// Attach File…: asks for a path on zone `at`'s host and attaches it,

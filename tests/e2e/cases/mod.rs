@@ -8,6 +8,7 @@
 mod win;
 mod agent;
 mod agent_options;
+mod attach;
 mod cards;
 mod clipboard;
 mod cli;
@@ -360,6 +361,13 @@ fn unix() -> Vec<Case> {
         display("agent-option-continue", agent_options::option_continue).needs_fake_agent(),
         display("agent-conversations-cli", conversations::cli).needs_fake_agent(),
         display("agent-conversations-failures", conversations::failures).needs_fake_agent(),
+        display("terminal-to-agent-output", attach::output).needs_fake_agent(),
+        display("terminal-to-agent-choose", attach::choose).needs_fake_agent(),
+        display("agent-attach-file", attach::file).needs_fake_agent(),
+        display("agent-attach-bounds", attach::bounds).needs_fake_agent(),
+        display("agent-attach-queue", attach::queue).needs_fake_agent(),
+        display("agent-attach-restore", attach::restore).needs_fake_agent(),
+        display("agent-attach-settings", attach::settings).needs_fake_agent(),
     ]
 }
 
@@ -373,6 +381,11 @@ pub fn self_test_clipboard() -> Result {
 pub fn self_test_agent_layout() -> Result {
     agent::self_test_layout()?;
     agent::self_test_zone_theme()
+}
+
+/// The attachment cases' dump lines (`--self-test`).
+pub fn self_test_attach() -> Result {
+    attach::self_test()
 }
 
 /// The `agent-earlier-*` cases' long conversation script (`--self-test`).
