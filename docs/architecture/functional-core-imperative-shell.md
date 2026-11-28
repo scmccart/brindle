@@ -119,7 +119,7 @@ These modules mix pure items with shell code, which a text search can't tell apa
 
 | Pure code | What it decides |
 | --- | --- |
-| `src/terminal/pace.rs` (`step`) | when the event task waits |
+| `src/terminal/pace.rs` (`step`, `draw_wait`) | when the event task waits; when an agent zone draws its growing messages |
 | `src/session.rs` (`merge_windows`, `drop_lost_zones`, `record_zones`, `resolve_tab`) | which windows, tabs and zones a launch restores, and the zones a tab is saved with |
 | `src/settings.rs` (`Settings::new`, `Settings::zoomed`) | the fonts and sizes a config and a preview resolve to, and the zoom a key leaves |
 | `src/settings_dialog.rs` (`Model`, `focus_target`), `src/settings_dialog/profiles.rs` (`ProfilesState`, `ProfileEditor`), `src/settings_dialog/fonts.rs` (`FontsState`), `src/settings_dialog/clipboard.rs` (`ClipboardState`) | overlay state and rows, which buttons are enabled, where focus goes, and the `ConfigEdit` each operation writes |

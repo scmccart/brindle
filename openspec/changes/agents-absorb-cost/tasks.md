@@ -78,13 +78,17 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 9. The "after" numbers
 
-- [ ] 9.1 Build the release binary and run `scripts/with-xvfb env BRINDLE_PERF=1 BRINDLE_PERF_BASELINE=<2.6's run dir> cargo test --test perf -- agent-markdown-stream agent-latency agent-tool-output agent-attach-long`. Record in design.md's "As built": renders and rendered bytes before and after for the streamed and trickled runs; each latency case's p50/p90/p99 before and after; and that `agent-attach-long` and `agent-tool-output` didn't get slower. Verify by the recorded table.
+- [x] 9.1 Build the release binary and run `scripts/with-xvfb env BRINDLE_PERF=1 BRINDLE_PERF_BASELINE=<2.6's run dir> cargo test --test perf -- agent-markdown-stream agent-latency agent-tool-output agent-attach-long`. Record in design.md's "As built": renders and rendered bytes before and after for the streamed and trickled runs; each latency case's p50/p90/p99 before and after; and that `agent-attach-long` and `agent-tool-output` didn't get slower. Verify by the recorded table.
+  - Done: run 20261128T100136Z on a7d27374, recorded as "After (task 9.1)": trickled renders 1,861 → 1,100, bytes −42%; tool output and attach unchanged; latency within noise (p95, flag 2).
 
 ## 10. Docs
 
-- [ ] 10.1 `docs/code-map.md`: in the agent entries, the `AgentShared → ChatModel` line says the two halves (take and copy under the lock, apply, render and splice after it, render once per drained update, or per frame with the gate) and replaces "absorbs under the lock"; add the bound sentence of design 8 ("A zone holds its log twice … at most about four times the core's 16 MiB `LOG_LIMIT` with every row open"); the tool call detail entry says an output delta is appended to the zone's copy and redraws that output's parts only. Verify each entry names no removed item (`refresh_facts`, `DetailPart::Text`'s `source`).
-- [ ] 10.2 `CLAUDE.md`: the fake ACP agent's steps list gains `pace`; the performance suite's case list gains `agent-markdown-stream`'s trickled run and render counts and the `agent-latency-quiet` and `agent-latency-trickle` cases; the e2e agent cases and the manual checks need no edit. Verify by reading.
-- [ ] 10.3 No architecture rule or exception changes: `shared.rs`'s lock stays a leaf (`process R14`) and the new `pace::draw_wait`, if built, is pure in a module already in `fcis`'s pure items. Verify `cargo test -p brindle --test architecture`.
+- [x] 10.1 `docs/code-map.md`: in the agent entries, the `AgentShared → ChatModel` line says the two halves (take and copy under the lock, apply, render and splice after it, render once per drained update, or per frame with the gate) and replaces "absorbs under the lock"; add the bound sentence of design 8 ("A zone holds its log twice … at most about four times the core's 16 MiB `LOG_LIMIT` with every row open"); the tool call detail entry says an output delta is appended to the zone's copy and redraws that output's parts only. Verify each entry names no removed item (`refresh_facts`, `DetailPart::Text`'s `source`).
+  - Done in f2c1653b (and the frame gate's sentence); the earlier-messages entry's `prepend_entries` rewritten, `model/`'s module list gains `change` and `facts`; no removed name is left.
+- [x] 10.2 `CLAUDE.md`: the fake ACP agent's steps list gains `pace`; the performance suite's case list gains `agent-markdown-stream`'s trickled run and render counts and the `agent-latency-quiet` and `agent-latency-trickle` cases; the e2e agent cases and the manual checks need no edit. Verify by reading.
+  - Done in f2c1653b.
+- [x] 10.3 No architecture rule or exception changes: `shared.rs`'s lock stays a leaf (`process R14`) and the new `pace::draw_wait`, if built, is pure in a module already in `fcis`'s pure items. Verify `cargo test -p brindle --test architecture`.
+  - Done: no rule or exception changed; `fcis`'s pure-items row for `pace.rs` now names `draw_wait` beside `step`. The architecture test caught `change.rs`'s tests naming `brindle_transcript` directly (fixed in e6909201) and passes, 53 tests.
 
 ## 11. Checks
 
