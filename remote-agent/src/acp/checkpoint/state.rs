@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::time::Instant;
 
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 use brindle_transcript::{
-    Continuation, Conversation, Entry, EntryId, Event, ITEM_LIMIT, LoginMethod, TEXT_CHUNK,
-    ToolItem, Transcript,
+    Continuation, Conversation, Entry, EntryId, Event, ITEM_LIMIT, LoginMethod, ReplayRef,
+    TEXT_CHUNK, ToolItem, Transcript,
 };
 
 use crate::acp::dialect::{Dialect, Unsupported};
@@ -18,14 +19,15 @@ use crate::acp::reduce::{
 };
 use crate::acp::rpc::{Purpose, Rpc};
 
-use super::format::Unreadable;
+use super::format::{Limited, Unreadable};
 
 /// `events` with each run of `Appended`s to one entry merged into as few
-/// as fit [`TEXT_CHUNK`] each: they fold to the same text.
-pub(super) fn merged(events: &[Event]) -> Vec<Event> {
+/// as fit [`TEXT_CHUNK`] each: they fold to the same text. The events are
+/// moved, not copied.
+pub(super) fn merged(events: Vec<Event>) -> Vec<Event> {
     let mut out: Vec<Event> = Vec::with_capacity(events.len());
     for event in events {
-        if let Event::Appended { id, text } = event
+        if let Event::Appended { id, text } = &event
             && let Some(Event::Appended {
                 id: last_id,
                 text: last,
@@ -43,7 +45,7 @@ pub(super) fn merged(events: &[Event]) -> Vec<Event> {
             item,
             text,
             exit,
-        } = event
+        } = &event
             && let Some(Event::ToolOutput {
                 id: last_id,
                 item: last_item,
@@ -57,99 +59,156 @@ pub(super) fn merged(events: &[Event]) -> Vec<Event> {
             last_exit.clone_from(exit);
             continue;
         }
-        out.push(event.clone());
+        out.push(event);
     }
     out
 }
 
-/// Every field of the state but the log, and the partial line's bytes.
-pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
-    let (partial, bytes): (Value, &[u8]) = match session.process.lines.partial() {
-        Partial::Collecting(bytes) => (json!({ "partial": "collecting" }), bytes),
-        Partial::TooLong { len } => (json!({ "partial": "too_long", "len": len }), &[]),
-        Partial::Resyncing { len } => (json!({ "partial": "resyncing", "len": len }), &[]),
+/// The partial line's bytes, all of them.
+pub(super) fn partial_bytes(session: &AgentSession) -> &[u8] {
+    match session.process.lines.partial() {
+        Partial::Collecting(bytes) => bytes,
+        Partial::TooLong { .. } | Partial::Resyncing { .. } => &[],
+    }
+}
+
+/// What a record writes of the fields kept as changes (OpenSpec change
+/// `agents-checkpoint-deltas`, decisions 3 and 4).
+pub(super) struct Changes<'a> {
+    /// `lines.from`: the partial line's bytes written start there; 0 when
+    /// they are written whole, and then left out.
+    pub(super) from: u64,
+    /// The login methods, written when they are `Some`.
+    pub(super) methods: Option<&'a [LoginMethod]>,
+    /// The outputs: each one set or, `None`, closed; written when there is
+    /// one.
+    pub(super) outputs: Vec<(&'a str, Option<&'a OpenOutput>)>,
+}
+
+/// What follows the fields: the base's log or a segment's events.
+pub(super) enum Body<'a> {
+    Log(ReplayRef<'a>),
+    Events(&'a [Event]),
+}
+
+/// A JSON object written a field at a time; the keys are this module's
+/// own names, which need no escaping.
+struct ObjectOut<'w, 'a> {
+    out: &'w mut Limited<'a>,
+    first: bool,
+}
+
+impl<'w, 'a> ObjectOut<'w, 'a> {
+    fn start(out: &'w mut Limited<'a>) -> io::Result<Self> {
+        out.write_all(b"{")?;
+        Ok(Self { out, first: true })
+    }
+
+    /// Writes the key `name`, and gives the writer its value goes to.
+    fn key(&mut self, name: &str) -> io::Result<&mut Limited<'a>> {
+        if !self.first {
+            self.out.write_all(b",")?;
+        }
+        self.first = false;
+        self.out.write_all(b"\"")?;
+        self.out.write_all(name.as_bytes())?;
+        self.out.write_all(b"\":")?;
+        Ok(self.out)
+    }
+
+    fn value(&mut self, name: &str, value: &Value) -> io::Result<()> {
+        serde_json::to_writer(self.key(name)?, value).map_err(io::Error::from)
+    }
+
+    fn end(self) -> io::Result<()> {
+        self.out.write_all(b"}")
+    }
+}
+
+/// Writes `session`'s state into `out` as one JSON object: every field but
+/// the log, those kept as changes as `changes` says, then `body`. The
+/// fields come in a fixed order, the log or events last; the small ones
+/// are built as values, and the log and the events stream from the
+/// session.
+pub(super) fn write_state(
+    out: &mut Limited<'_>,
+    session: &AgentSession,
+    changes: &Changes<'_>,
+    body: Body<'_>,
+) -> io::Result<()> {
+    let mut lines = match session.process.lines.partial() {
+        Partial::Collecting(_) => json!({ "partial": "collecting" }),
+        Partial::TooLong { len } => json!({ "partial": "too_long", "len": len }),
+        Partial::Resyncing { len } => json!({ "partial": "resyncing", "len": len }),
     };
-    let mut lines = partial;
     if let Some(object) = lines.as_object_mut() {
         object.insert("covers".into(), session.process.lines.covers().into());
+        if changes.from > 0 {
+            object.insert("from".into(), changes.from.into());
+        }
     }
-    let mut state = Map::new();
-    state.insert("acp".into(), session.rpc.dialect().version().into());
-    state.insert("cwd".into(), session.cwd.clone().into());
-    state.insert("version".into(), session.version.clone().into());
-    state.insert("phase".into(), phase_value(&session.phase));
-    state.insert("rpc".into(), rpc_value(&session.rpc));
-    state.insert(
-        "run".into(),
-        session.process.run.map_or(Value::Null, |run| {
+    let mut state = ObjectOut::start(out)?;
+    state.value("acp", &session.rpc.dialect().version().into())?;
+    state.value("cwd", &session.cwd.as_str().into())?;
+    state.value("version", &session.version.as_str().into())?;
+    state.value("phase", &phase_value(&session.phase))?;
+    state.value("rpc", &rpc_value(&session.rpc))?;
+    state.value(
+        "run",
+        &session.process.run.map_or(Value::Null, |run| {
             json!({ "kind": run_kind_name(run.kind), "entry": run.entry.0 })
         }),
-    );
-    if session.process.book.tool_epoch != EntryId::FIRST {
-        state.insert("tool_epoch".into(), session.process.book.tool_epoch.0.into());
+    )?;
+    // The tool calls are the log's from here on (decision 2).
+    state.value("tool_epoch", &session.process.book.tool_epoch.0.into())?;
+    // The open outputs (`agents-tool-content` decision 8): a base's all of
+    // them, a segment's those changed, left out when there are none.
+    if !changes.outputs.is_empty() {
+        let outputs: Map<String, Value> = changes
+            .outputs
+            .iter()
+            .map(|(terminal, open)| {
+                let open = open.map_or(Value::Null, open_output_value);
+                ((*terminal).to_owned(), open)
+            })
+            .collect();
+        state.value("outputs", &Value::Object(outputs))?;
     }
-    state.insert(
-        "tools".into(),
-        Value::Object(
-            session
-                .process
-                .book
-                .tools
-                .iter()
-                .map(|(call, entry)| (call.clone(), Value::from(entry.0)))
-                .collect(),
-        ),
-    );
-    // The open outputs (`agents-tool-content` decision 8), left out when
-    // there are none, as a checkpoint from before them has none.
-    if !session.process.book.outputs.is_empty() {
-        state.insert(
-            "outputs".into(),
-            Value::Object(
-                session
-                    .process
-                    .book
-                    .outputs
-                    .iter()
-                    .map(|(terminal, open)| (terminal.clone(), open_output_value(open)))
-                    .collect(),
-            ),
-        );
-    }
-    state.insert(
-        "bad_lines".into(),
-        session.process.bad.map_or(0, |bad| bad.lines).into(),
-    );
-    state.insert("lines".into(), lines);
-    if !session.methods.is_empty() {
-        state.insert("methods".into(), json!(session.methods));
+    state.value(
+        "bad_lines",
+        &session.process.bad.map_or(0, |bad| bad.lines).into(),
+    )?;
+    state.value("lines", &lines)?;
+    if let Some(methods) = changes.methods {
+        serde_json::to_writer(state.key("methods")?, methods).map_err(io::Error::from)?;
     }
     // Left out when false, so a state written before
     // `agents-session-list` reads as one whose agent lists nothing.
     if session.lists {
-        state.insert("lists".into(), json!(true));
+        state.value("lists", &json!(true))?;
     }
     if session.chose {
-        state.insert("chose".into(), json!(true));
+        state.value("chose", &json!(true))?;
     }
     // The options' keys and the modes last in effect (`agents-commands`,
-    // decision 12), left out when empty, as a state from before has none.
+    // decision 12), left out when empty.
     if !session.keys.is_empty() {
-        state.insert(
-            "option_keys".into(),
-            Value::Object(
-                session
-                    .keys
-                    .iter()
-                    .map(|(id, key)| (id.clone(), key.to_value()))
-                    .collect(),
-            ),
-        );
+        let keys: Map<String, Value> = session
+            .keys
+            .iter()
+            .map(|(id, key)| (id.clone(), key.to_value()))
+            .collect();
+        state.value("option_keys", &Value::Object(keys))?;
     }
     if !session.modes.is_empty() {
-        state.insert("modes".into(), json!(session.modes));
+        state.value("modes", &json!(session.modes))?;
     }
-    (state, bytes)
+    match body {
+        Body::Log(log) => serde_json::to_writer(state.key("log")?, &log),
+        Body::Events(events) => serde_json::to_writer(state.key("events")?, events),
+    }
+    .map_err(io::Error::from)?;
+    state.end()
 }
 
 /// A phase as the state's `phase` object. Of the fields
@@ -371,12 +430,121 @@ fn pair<'a>(value: &'a Value, name: &'static str) -> Result<(&'a Value, &'a Valu
     }
 }
 
-/// The session `state` holds, its log folded already (format 2) or read
-/// from its `log` field (format 1).
+/// The partial line a record left, as far as a chain's next record may
+/// continue it: the tool epoch, the stream offset where the line started,
+/// and how many of its bytes the chain holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HeldLine {
+    epoch: EntryId,
+    start: u64,
+    len: u64,
+}
+
+/// What a chain of records leaves of the fields a segment writes as
+/// changes (OpenSpec change `agents-checkpoint-deltas`, decisions 3, 4
+/// and 6): the partial line's bytes, the login methods last written and
+/// the outputs as patched. [`restore`] takes the rest from the last
+/// record.
+pub(super) struct Folded {
+    partial: Vec<u8>,
+    line: Option<HeldLine>,
+    methods: Option<Value>,
+    outputs: Map<String, Value>,
+}
+
+impl Folded {
+    /// What the base `state`, with the line bytes `partial`, holds; its
+    /// `methods` and `outputs` are taken out of it.
+    pub(super) fn base(state: &mut Map<String, Value>, partial: &[u8]) -> Result<Self, Unreadable> {
+        let mut folded = Self {
+            partial: Vec::new(),
+            line: None,
+            methods: None,
+            outputs: Map::new(),
+        };
+        folded.fold(state, partial, true)?;
+        Ok(folded)
+    }
+
+    /// Folds a segment's `state` and line bytes `partial` on.
+    pub(super) fn segment(
+        &mut self,
+        state: &mut Map<String, Value>,
+        partial: &[u8],
+    ) -> Result<(), Unreadable> {
+        self.fold(state, partial, false)
+    }
+
+    fn fold(
+        &mut self,
+        state: &mut Map<String, Value>,
+        partial: &[u8],
+        base: bool,
+    ) -> Result<(), Unreadable> {
+        let epoch = EntryId(number(state, "tool_epoch")?);
+        let lines = object(field(state, "lines")?, "lines")?;
+        let covers = number(lines, "covers")?;
+        let collecting = text(lines, "partial")? == "collecting";
+        let from = match lines.get("from") {
+            None => 0,
+            Some(from) => from.as_u64().ok_or(Unreadable::Field { name: "lines" })?,
+        };
+        if !collecting && !partial.is_empty() {
+            return Err(Unreadable::StrayBytes { len: partial.len() });
+        }
+        if from == 0 {
+            self.partial.clear();
+        } else {
+            // The bytes continue the line the record before held, at the
+            // same place in the same agent process (decision 3).
+            let added = partial.len() as u64;
+            let start = covers.saturating_sub(from.saturating_add(added));
+            let continues = !base
+                && collecting
+                && self.line.is_some_and(|held| {
+                    held.len == from && held.start == start && held.epoch == epoch
+                });
+            if !continues {
+                return Err(Unreadable::PartialGap {
+                    from,
+                    held: self.line.map_or(0, |held| held.len),
+                });
+            }
+        }
+        self.partial.extend_from_slice(partial);
+        let len = self.partial.len() as u64;
+        // Where the encoder put it too (`line_mark`).
+        let start = covers.saturating_sub(len);
+        self.line = collecting.then_some(HeldLine { epoch, start, len });
+        // Written when they changed; `[]` when emptied (decision 4).
+        if let Some(methods) = state.remove("methods") {
+            self.methods = Some(methods);
+        }
+        // Each terminal set or, `null`, closed, in order.
+        if let Some(patch) = state.remove("outputs") {
+            let Value::Object(patch) = patch else {
+                return Err(Unreadable::Field { name: "outputs" });
+            };
+            for (terminal, open) in patch {
+                if open.is_null() {
+                    if self.outputs.remove(&terminal).is_none() {
+                        return Err(Unreadable::Field { name: "outputs" });
+                    }
+                } else {
+                    self.outputs.insert(terminal, open);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The session the last record's `state` holds, with the log folded
+/// already and what the chain `folded` leaves.
 pub(super) fn restore(
     state: &Map<String, Value>,
-    transcript: Option<Transcript>,
-    partial: &[u8],
+    transcript: Transcript,
+    folded: Folded,
     now: Instant,
 ) -> Result<AgentSession, Unreadable> {
     let acp = number(state, "acp")?;
@@ -385,10 +553,6 @@ pub(super) fn restore(
     let cwd = text(state, "cwd")?.to_owned();
     let version = text(state, "version")?.to_owned();
     let phase = restore_phase(object(field(state, "phase")?, "phase")?)?;
-    let transcript = match transcript {
-        Some(transcript) => transcript,
-        None => restore_log(array(state, "log")?)?,
-    };
     let mut rpc = restore_rpc(object(field(state, "rpc")?, "rpc")?)?;
     rpc.speak(dialect);
     let run = field(state, "run")?;
@@ -397,26 +561,18 @@ pub(super) fn restore(
     } else {
         Some(restore_run(object(run, "run")?)?)
     };
-    let tool_epoch = match state.get("tool_epoch") {
-        None => EntryId::FIRST,
-        Some(epoch) => EntryId(epoch.as_u64().ok_or(Unreadable::Field { name: "tool_epoch" })?),
-    };
-    let mut tools = BTreeMap::new();
-    for (call, entry) in object(field(state, "tools")?, "tools")? {
-        let entry = EntryId(entry.as_u64().ok_or(Unreadable::Field { name: "tools" })?);
-        tools.insert(call.clone(), entry);
-    }
+    // The tool calls are the log's from the epoch on (decision 2).
+    let tool_epoch = EntryId(number(state, "tool_epoch")?);
+    let tools = tool_index(&transcript, tool_epoch);
     let mut outputs = BTreeMap::new();
-    if let Some(open) = state.get("outputs") {
-        for (terminal, open) in object(open, "outputs")? {
-            outputs.insert(terminal.clone(), restore_open_output(open)?);
-        }
+    for (terminal, open) in &folded.outputs {
+        outputs.insert(terminal.clone(), restore_open_output(open)?);
     }
     let bad_lines = number(state, "bad_lines")?;
-    let lines = restore_lines(object(field(state, "lines")?, "lines")?, partial)?;
-    let methods: Vec<LoginMethod> = match state.get("methods") {
+    let lines = restore_lines(object(field(state, "lines")?, "lines")?, &folded.partial)?;
+    let methods: Vec<LoginMethod> = match folded.methods {
         None => Vec::new(),
-        Some(methods) => serde_json::from_value(methods.clone())
+        Some(methods) => serde_json::from_value(methods)
             .map_err(|_| Unreadable::Field { name: "methods" })?,
     };
     let flag = |name: &'static str| match state.get(name) {
@@ -465,19 +621,12 @@ pub(super) fn restore(
             });
         }
     }
-    for entry in tools.values() {
-        if !matches!(transcript.entry(*entry), Some(Entry::Tool { .. })) {
-            return Err(Unreadable::Entry {
-                name: "tools",
-                entry: *entry,
-            });
-        }
-    }
-    // And they are the log's tool entries from the epoch on (OpenSpec
-    // change `agents-checkpoint-deltas`, decision 2).
-    if tools != tool_index(&transcript, tool_epoch) {
-        return Err(Unreadable::Field { name: "tools" });
-    }
+    // Each tool call names a tool entry of the log by construction.
+    debug_assert!(
+        tools
+            .values()
+            .all(|entry| matches!(transcript.entry(*entry), Some(Entry::Tool { .. })))
+    );
     for open in outputs.values() {
         let holds = match transcript.entry(open.entry) {
             Some(Entry::Tool { content, .. }) => {
@@ -954,7 +1103,7 @@ mod tests {
     #[test]
     fn an_older_shaped_state_reads_as_a_new_conversation_offering_nothing() {
         let agent = Agent::new();
-        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(state["phase"], json!({"phase": "spawning"}), "encoded as before");
         for (phase, expected) in [
             (json!({"phase": "spawning"}), Phase::Spawning { start: Start::New }),
@@ -978,7 +1127,7 @@ mod tests {
     #[test]
     fn a_malformed_continuing_phase_is_unreadable_naming_its_field() {
         let agent = Agent::new();
-        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         for (phase, name) in [
             (json!({"phase": "spawning", "start": 7}), "start"),
             (
@@ -1045,7 +1194,7 @@ mod tests {
         ));
         assert!(matches!(agent.s.phase, Phase::Choosing { .. }));
         assert_eq!(agent.round_trip(), agent.s);
-        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(state["lists"], json!(true));
         let listed = agent.step(Input::Command(Command::List { req: 9, cursor: None }));
         assert_eq!(listed.reply, Some(Ok(())));
@@ -1064,7 +1213,7 @@ mod tests {
         assert!(agent.s.chose);
         assert!(agent.round_trip().chose);
         // A state written before reads as an agent that lists nothing.
-        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         state.as_object_mut().unwrap().remove("lists");
         assert!(!decode(&rebuild(&state, &partial), agent.now).unwrap().lists);
         state["lists"] = json!("yes");
@@ -1078,13 +1227,13 @@ mod tests {
     fn the_methods_round_trip_and_are_left_out_when_there_are_none() {
         let agent = creating();
         assert_eq!(agent.s.methods.len(), 2);
-        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(state["methods"][1]["kind"], json!("terminal"));
         assert_eq!(agent.round_trip(), agent.s);
-        let (state, _) = state_of(&encode(&Agent::new().s).expect("it fits"));
+        let (state, _) = state_of(&encode(&Agent::new().s).expect("it fits").bytes);
         assert!(state.get("methods").is_none(), "{state}");
         // Methods that don't read are unreadable.
-        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         state["methods"] = json!([{"id": "x"}]);
         assert_eq!(
             decode(&rebuild(&state, &partial), agent.now),
@@ -1103,7 +1252,7 @@ mod tests {
                 ..
             })
         ));
-        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(
             state["phase"],
             json!({"phase": "login_required", "name": "fake", "version": "1.0",
@@ -1125,7 +1274,7 @@ mod tests {
         agent.s.methods = creating().s.methods;
         assert_eq!(agent.prompt("hi").reply, Some(Ok(())));
         agent.feed(&auth_error(3, "expired"));
-        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(state["phase"]["session"], json!("s1"));
         assert_eq!(state["phase"]["message"], json!("expired"));
         assert_eq!(agent.round_trip(), agent.s);
@@ -1140,7 +1289,7 @@ mod tests {
         let out = login_cmd(&mut agent, "oauth-personal");
         let id = sent(&out.stdin)[0]["id"].as_u64().expect("an id");
         assert_eq!(id, 3);
-        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(state["phase"]["phase"], json!("logging_in"));
         assert_eq!(state["phase"]["method"], json!("oauth-personal"));
         assert_eq!(state["rpc"]["outgoing"], json!([[3, "authenticate"]]));
@@ -1175,7 +1324,7 @@ mod tests {
         agent.feed(&auth_error(2, "Authentication required"));
         login_cmd(&mut agent, "oauth-personal");
         agent.step(Input::Command(Command::Cancel));
-        let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, _) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert_eq!(state["phase"]["phase"], json!("login_required"));
         assert_eq!(state["rpc"]["outgoing"], json!([]));
         let mut restored = Agent {
@@ -1259,7 +1408,7 @@ mod tests {
         let mut agent = Agent::ready();
         agent.feed(&update(json!({"sessionUpdate": "session_info_update",
             "title": "Hello.txt file creation"})));
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         assert_eq!(
             logged_conversations(&bytes),
             [json!({"id": "s1", "cwd": "/home/u/src", "continuation": "resume_and_load",
@@ -1285,7 +1434,7 @@ mod tests {
     #[test]
     fn a_checkpoint_written_without_titles_reads_unchanged() {
         let agent = Agent::ready();
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         // An untitled conversation is written as before titles existed.
         assert_eq!(
             logged_conversations(&bytes),
@@ -1402,7 +1551,7 @@ mod tests {
     fn a_partial_line_travels_as_raw_bytes_after_the_state() {
         let mut agent = Agent::ready();
         agent.feed(b"\xff\xfe not UTF-8");
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         assert!(bytes.ends_with(b"\xff\xfe not UTF-8"));
         assert_eq!(decode(&bytes, agent.now).expect("it reads"), agent.s);
     }
@@ -1415,7 +1564,7 @@ mod tests {
         ] {
             let mut agent = Agent::ready();
             agent.s.process.lines = Lines::restore(partial, 9_000_100);
-            let bytes = encode(&agent.s).expect("it fits");
+            let bytes = encode(&agent.s).expect("it fits").bytes;
             assert_eq!(bytes[bytes.len() - 4..], [0, 0, 0, 0], "no line bytes follow");
             assert!(state_of(&bytes).1.is_empty());
             assert_eq!(decode(&bytes, agent.now).expect("it reads"), agent.s);
@@ -1424,7 +1573,7 @@ mod tests {
 
     #[test]
     fn the_header_is_the_magic_and_format_2_then_a_base_record() {
-        let bytes = encode(&Agent::new().s).expect("it fits");
+        let bytes = encode(&Agent::new().s).expect("it fits").bytes;
         assert_eq!(&bytes[..4], b"BACP");
         assert_eq!(&bytes[4..6], &[0, 2]);
         assert_eq!(bytes[6], b'B');
@@ -1438,7 +1587,7 @@ mod tests {
     #[test]
     fn a_state_with_fields_it_doesnt_know_still_reads() {
         let agent = Agent::busy();
-        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         state["later"] = json!({"added": true});
         let rebuilt = rebuild(&state, &partial);
         assert_eq!(decode(&rebuilt, agent.now).expect("it reads"), agent.s);
@@ -1450,7 +1599,7 @@ mod tests {
         agent.feed(b"hello\nworld\n");
         assert_eq!(agent.s.process.bad.map(|bad| bad.lines), Some(2));
         let later = agent.now + std::time::Duration::from_secs(60);
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let adopted = adopt(&bytes, false, "/x", "0.4.0", later);
         assert_eq!(adopted.restored, Ok(()));
         assert_eq!(
@@ -1564,7 +1713,7 @@ mod tests {
         };
         let done = Some(Exit::Code { code: 0 });
         assert_eq!(
-            merged(&[
+            merged(vec![
                 output(1, 0, "a", None),
                 output(1, 0, "b", done.clone()),
                 output(1, 0, "c", None),
@@ -1581,7 +1730,7 @@ mod tests {
         );
         let half = "y".repeat(ITEM_LIMIT / 2 + 1);
         assert_eq!(
-            merged(&[output(1, 0, &half, None), output(1, 0, &half, None)]).len(),
+            merged(vec![output(1, 0, &half, None), output(1, 0, &half, None)]).len(),
             2,
             "a merge never passes ITEM_LIMIT"
         );
@@ -1611,7 +1760,7 @@ mod tests {
     #[test]
     fn an_open_output_naming_no_output_item_is_unreadable() {
         let agent = with_tool_content(None);
-        let (state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         assert!(state["outputs"]["t1"].is_object(), "{state}");
         let mut no_entry = state.clone();
         no_entry["outputs"]["t1"]["entry"] = json!(99);
@@ -1705,7 +1854,7 @@ mod tests {
         }));
         assert_eq!(out.reply, Some(Ok(())));
         assert!(agent.s.rpc.setting());
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let adopted = adopt(&bytes, false, "/home/u/src", "0.3.0", agent.now);
         assert_eq!(adopted.restored, Ok(()));
         assert!(!adopted.session.rpc.setting());
@@ -1716,7 +1865,7 @@ mod tests {
     #[test]
     fn a_checkpoint_from_before_options_reads_with_both_lists_empty() {
         let agent = Agent::busy();
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let (state, partial) = state_of(&bytes);
         assert!(state.get("option_keys").is_none() && state.get("modes").is_none());
         for restored in [decode(&bytes, agent.now), decode(&rebuild(&state, &partial), agent.now)] {
@@ -1727,7 +1876,7 @@ mod tests {
         }
         // Keys that aren't the held options' make it unreadable.
         let agent = with_options();
-        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits"));
+        let (mut state, partial) = state_of(&encode(&agent.s).expect("it fits").bytes);
         state["option_keys"] = json!({"fast": {"config": "fast"}});
         assert_eq!(
             decode(&rebuild(&state, &partial), agent.now),

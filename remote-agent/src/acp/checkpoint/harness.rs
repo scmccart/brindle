@@ -125,7 +125,7 @@ impl Agent {
     }
 
     pub(super) fn round_trip(&self) -> AgentSession {
-        let bytes = encode(&self.s).expect("it fits");
+        let bytes = encode(&self.s).expect("it fits").bytes;
         decode(&bytes, self.now).expect("it reads")
     }
 }
@@ -163,19 +163,32 @@ pub(super) fn login_cmd(agent: &mut Agent, method: &str) -> Output {
     }))
 }
 
-/// A format 1 checkpoint of `state` and the line bytes `partial`, as
-/// builds before format 2 wrote them (still read).
+/// A checkpoint of one base record holding `state` and the line bytes
+/// `partial`: a state edited by hand.
 pub(super) fn rebuild(state: &Value, partial: &[u8]) -> Vec<u8> {
-    let state = state.to_string();
     let mut out = MAGIC.to_vec();
-    out.extend_from_slice(&FORMAT_1.to_be_bytes());
-    out.extend_from_slice(&(state.len() as u32).to_be_bytes());
-    out.extend_from_slice(state.as_bytes());
-    out.extend_from_slice(partial);
+    out.extend_from_slice(&FORMAT.to_be_bytes());
+    out.extend_from_slice(&record(BASE, 0, state, partial));
     out
 }
 
-/// A format 2 checkpoint's base record's state and line bytes.
+/// A record of `kind`, numbered `seq`, of the state `state` and the line
+/// bytes `partial`.
+pub(super) fn record(kind: u8, seq: u32, state: &Value, partial: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_record(
+        &mut out,
+        kind,
+        seq,
+        |out| serde_json::to_writer(out, state).map_err(std::io::Error::from),
+        partial,
+        MAX_CHECKPOINT_LEN,
+    )
+    .expect("it fits");
+    out
+}
+
+/// A checkpoint's base record's state and line bytes.
 pub(super) fn state_of(bytes: &[u8]) -> (Value, Vec<u8>) {
     assert_eq!(&bytes[4..6], &FORMAT.to_be_bytes());
     let mut rest = &bytes[PREFIX_LEN..];
@@ -183,6 +196,36 @@ pub(super) fn state_of(bytes: &[u8]) -> (Value, Vec<u8>) {
     assert_eq!(base.kind, BASE);
     let state = serde_json::from_slice(base.state).expect("JSON");
     (state, base.partial.to_vec())
+}
+
+/// Each record of a checkpoint: its kind, its state and its line bytes.
+pub(super) fn records(bytes: &[u8]) -> Vec<(u8, Value, Vec<u8>)> {
+    let mut rest = &bytes[PREFIX_LEN..];
+    let mut out = Vec::new();
+    while let Some(record) = next_record(&mut rest).expect("a record") {
+        let state = serde_json::from_slice(record.state).expect("JSON");
+        out.push((record.kind, state, record.partial.to_vec()));
+    }
+    out
+}
+
+/// The one record `bytes` hold (a segment as appended): its state and its
+/// line bytes.
+pub(super) fn record_at(mut bytes: &[u8]) -> (Value, Vec<u8>) {
+    let record = next_record(&mut bytes).expect("a record").expect("one");
+    assert!(bytes.is_empty(), "one record");
+    let state = serde_json::from_slice(record.state).expect("JSON");
+    (state, record.partial.to_vec())
+}
+
+/// A checkpoint of the header and `records`.
+pub(super) fn chain(records: &[(u8, Value, Vec<u8>)]) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    out.extend_from_slice(&FORMAT.to_be_bytes());
+    for (seq, (kind, state, partial)) in records.iter().enumerate() {
+        out.extend_from_slice(&record(*kind, seq as u32, state, partial));
+    }
+    out
 }
 
 pub(super) fn assert_not_restored(adopted: &Adopted) {
@@ -203,19 +246,23 @@ pub(super) fn assert_not_restored(adopted: &Adopted) {
     assert_eq!(adopted.output, Output::default());
 }
 
-/// A stored checkpoint the core appends to, as the holder keeps it.
+/// A stored checkpoint the core appends to, as the holder keeps it, and
+/// what its last record holds, as the core keeps it beside.
 pub(super) struct Stored {
     pub(super) bytes: Vec<u8>,
     pub(super) seq: u32,
     pub(super) unsaved: Vec<Event>,
+    pub(super) written: Written,
 }
 
 impl Stored {
     pub(super) fn whole(session: &AgentSession) -> Self {
+        let Encoded { bytes, written } = encode(session).expect("it fits");
         Self {
-            bytes: encode(session).expect("it fits"),
+            bytes,
             seq: 0,
             unsaved: Vec::new(),
+            written,
         }
     }
 
@@ -227,9 +274,10 @@ impl Stored {
 
     pub(super) fn append(&mut self, session: &AgentSession) {
         self.seq += 1;
-        let segment = encode_segment(session, &self.unsaved, self.seq).expect("it fits");
-        self.bytes.extend_from_slice(&segment);
-        self.unsaved.clear();
+        let unsaved = std::mem::take(&mut self.unsaved);
+        let segment = encode_segment(session, unsaved, self.seq, &self.written).expect("it fits");
+        self.bytes.extend_from_slice(&segment.bytes);
+        self.written.apply(segment.changes);
     }
 
     pub(super) fn decode(&self, now: Instant) -> AgentSession {

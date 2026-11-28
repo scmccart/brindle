@@ -118,6 +118,14 @@ use crate::server::platform;
 /// The version an agent's `initialize` names as the client's: the core's.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// A due agent checkpoint, encoded as the holder is to store it.
+enum ToStore {
+    /// Replacing what is stored.
+    Whole(checkpoint::Encoded),
+    /// Appended to it.
+    Append(checkpoint::Segment),
+}
+
 /// Where an agent session's ACP state is.
 enum Acp {
     /// Adopted from a holder, whose checkpoint came (`checkpoint`, empty
@@ -980,32 +988,39 @@ impl<L: EventLoop> Core<L> {
             .unsaved
             .iter()
             .any(|event| matches!(event, Event::Trimmed { .. }));
-        let segment = policy::agent_appendable(agent.stored, at, trimmed, adoption)
-            .then(|| checkpoint::encode_segment(acp, &agent.unsaved, agent.stored.next_seq()).ok())
-            .flatten();
-        let segment_len = segment.as_ref().map(|segment| segment.len() as u64);
-        let form = policy::agent_checkpoint_form(agent.stored, at, segment_len, trimmed, adoption);
+        // The events since the last checkpoint are the segment's, moved;
+        // a whole checkpoint has them in its log.
+        let unsaved = std::mem::take(&mut agent.unsaved);
+        let segment = match &agent.stored {
+            Stored::Known { written, .. }
+                if policy::agent_appendable(&agent.stored, at, trimmed, adoption) =>
+            {
+                checkpoint::encode_segment(acp, unsaved, agent.stored.next_seq(), written).ok()
+            }
+            Stored::Known { .. } | Stored::Unknown => None,
+        };
+        let segment_len = segment.as_ref().map(|segment| segment.bytes.len() as u64);        let form = policy::agent_checkpoint_form(&agent.stored, at, segment_len, trimmed, adoption);
         let encoded = match (form, segment) {
-            (CheckpointForm::Append, Some(segment)) => Ok((CheckpointForm::Append, segment)),
+            (CheckpointForm::Append, Some(segment)) => Ok(ToStore::Append(segment)),
             (CheckpointForm::Append, None) | (CheckpointForm::Whole, _) => {
-                checkpoint::encode(acp).map(|bytes| (CheckpointForm::Whole, bytes))
+                checkpoint::encode(acp).map(ToStore::Whole)
             }
         };
         match encoded {
-            Ok((form, bytes)) => {
+            Ok(to_store) => {
                 let covers = acp.lines().covers();
                 let since = covers.saturating_sub(agent.checkpointed);
                 agent.checkpointed = covers;
-                agent.unsaved.clear();
-                let len = bytes.len() as u64;
-                let messages = match form {
-                    CheckpointForm::Whole => {
-                        agent.stored = Stored::whole(len);
-                        ToHolder::checkpoint(id, &bytes, since)
+                let stored = std::mem::replace(&mut agent.stored, Stored::Unknown);
+                let messages = match to_store {
+                    ToStore::Whole(encoded) => {
+                        agent.stored = Stored::whole(encoded.bytes.len() as u64, encoded.written);
+                        ToHolder::checkpoint(id, &encoded.bytes, since)
                     }
-                    CheckpointForm::Append => {
-                        agent.stored = agent.stored.appended(len);
-                        ToHolder::checkpoint_append(id, &bytes, since)
+                    ToStore::Append(segment) => {
+                        let len = segment.bytes.len() as u64;
+                        agent.stored = stored.appended(len, segment.changes);
+                        ToHolder::checkpoint_append(id, &segment.bytes, since)
                     }
                 };
                 for message in messages {
@@ -1370,12 +1385,12 @@ mod tests {
         // its holder stores is forgotten, so the checkpoint after the fault
         // is whole, never a segment on a base the log no longer matches.
         let mut agent = Agent::new("/home/u".into());
-        agent.stored = Stored::whole(100);
+        agent.stored = Stored::whole(100, checkpoint::Written::default());
         agent.unsaved.push(Event::Agent { state: AgentState::Starting });
         let at = AgentCheckpoint::Stepped(Some(reduce::Moment::Stopped));
-        assert!(policy::agent_appendable(agent.stored, at, false, policy::Adoption::Keep));
+        assert!(policy::agent_appendable(&agent.stored, at, false, policy::Adoption::Keep));
         agent.forget_stored();
-        assert!(!policy::agent_appendable(agent.stored, at, false, policy::Adoption::Keep));
+        assert!(!policy::agent_appendable(&agent.stored, at, false, policy::Adoption::Keep));
         assert!(agent.unsaved.is_empty());
     }
 }

@@ -41,6 +41,7 @@ use brindle_transcript::PAGE_BYTES;
 
 use super::clients::ClientToken;
 use super::sessions::{CHECKPOINT_AFTER, Life, Ownership, RestartStage};
+use crate::acp::checkpoint::{Written, WrittenChanges};
 use crate::acp::reduce::Moment;
 use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, MAX_LINGER, RECONNECT_GRACE, UNUSED_LIMIT};
 use crate::pty::Foreground;
@@ -670,48 +671,61 @@ pub(super) fn agent_checkpoint_due(at: AgentCheckpoint, since: u64) -> bool {
 /// What an agent session's holder stores of its checkpoint, as far as the
 /// core knows (OpenSpec change `agents-log-paging`, decision 9). Kept on
 /// the core's `Agent` only: a core restart starts again at `Unknown`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Stored {
     /// Nothing written to this holder session yet, an adopted session, a
     /// restarted one, or the holder sent an `ERROR` naming the session:
     /// only a whole checkpoint is safe.
     Unknown,
     /// A base of `base` bytes (header included), then `appended` bytes of
-    /// segments, the last numbered `seq`.
-    Known { base: u64, appended: u64, seq: u32 },
+    /// segments, the last numbered `seq`; `written` is what those records
+    /// leave for the next segment (`agents-checkpoint-deltas` decision 5).
+    Known {
+        base: u64,
+        appended: u64,
+        seq: u32,
+        written: Written,
+    },
 }
 
 impl Stored {
     /// The sequence number the next segment takes.
-    pub(super) fn next_seq(self) -> u32 {
+    pub(super) fn next_seq(&self) -> u32 {
         match self {
             Self::Unknown => 1,
             Self::Known { seq, .. } => seq.saturating_add(1),
         }
     }
 
-    /// After a whole checkpoint of `len` bytes.
-    pub(super) fn whole(len: u64) -> Self {
+    /// After a whole checkpoint of `len` bytes, which left `written`.
+    pub(super) fn whole(len: u64, written: Written) -> Self {
         Self::Known {
             base: len,
             appended: 0,
             seq: 0,
+            written,
         }
     }
 
-    /// After a segment of `len` bytes is appended; `Unknown` stays so.
-    pub(super) fn appended(self, len: u64) -> Self {
+    /// After a segment of `len` bytes, which wrote `changes`, is appended;
+    /// `Unknown` stays so.
+    pub(super) fn appended(self, len: u64, changes: WrittenChanges) -> Self {
         match self {
             Self::Unknown => Self::Unknown,
             Self::Known {
                 base,
                 appended,
                 seq,
-            } => Self::Known {
-                base,
-                appended: appended.saturating_add(len),
-                seq: seq.saturating_add(1),
-            },
+                mut written,
+            } => {
+                written.apply(changes);
+                Self::Known {
+                    base,
+                    appended: appended.saturating_add(len),
+                    seq: seq.saturating_add(1),
+                    written,
+                }
+            }
         }
     }
 }
@@ -730,7 +744,7 @@ pub(super) enum CheckpointForm {
 /// the holder is of the core's build. Otherwise the checkpoint is whole
 /// whatever the segment's length.
 pub(super) fn agent_appendable(
-    stored: Stored,
+    stored: &Stored,
     at: AgentCheckpoint,
     trimmed: bool,
     holder: Adoption,
@@ -756,7 +770,7 @@ pub(super) fn agent_appendable(
 /// larger than the base and the whole blob within
 /// [`MAX_CHECKPOINT_LEN`]; whole otherwise.
 pub(super) fn agent_checkpoint_form(
-    stored: Stored,
+    stored: &Stored,
     at: AgentCheckpoint,
     segment_len: Option<u64>,
     trimmed: bool,
@@ -765,7 +779,7 @@ pub(super) fn agent_checkpoint_form(
     if !agent_appendable(stored, at, trimmed, holder) {
         return CheckpointForm::Whole;
     }
-    let (Stored::Known { base, appended, .. }, Some(segment)) = (stored, segment_len) else {
+    let (&Stored::Known { base, appended, .. }, Some(segment)) = (stored, segment_len) else {
         return CheckpointForm::Whole;
     };
     let segments = appended.saturating_add(segment);
@@ -2114,48 +2128,61 @@ mod tests {
 
     // agents-log-paging 2.3: how a checkpoint is written, pages, fetches.
 
-    const KNOWN: Stored = Stored::Known {
-        base: 1000,
-        appended: 400,
-        seq: 3,
-    };
+    /// A base of 1000 bytes and 400 of segments, the last numbered 3; what
+    /// they left doesn't matter here.
+    fn known() -> Stored {
+        Stored::Known {
+            base: 1000,
+            appended: 400,
+            seq: 3,
+            written: Written::default(),
+        }
+    }
     const STEPPED: AgentCheckpoint = AgentCheckpoint::Stepped(None);
 
     #[test]
     fn a_checkpoint_is_appended_to_a_known_base_by_a_holder_of_the_cores_build() {
         assert_eq!(
-            agent_checkpoint_form(KNOWN, STEPPED, Some(100), false, Adoption::Keep),
+            agent_checkpoint_form(&known(), STEPPED, Some(100), false, Adoption::Keep),
             CheckpointForm::Append
         );
         assert_eq!(
-            agent_checkpoint_form(KNOWN, AgentCheckpoint::Detach, Some(600), false, Adoption::Keep),
+            agent_checkpoint_form(&known(), AgentCheckpoint::Detach, Some(600), false, Adoption::Keep),
             CheckpointForm::Append,
             "segments as large as the base still append"
         );
-        assert_eq!(KNOWN.next_seq(), 4);
+        assert_eq!(known().next_seq(), 4);
+        let session = crate::acp::reduce::AgentSession::new("/w".into(), "0.3.0".into());
+        let segment =
+            crate::acp::checkpoint::encode_segment(&session, Vec::new(), 4, &Written::default())
+                .expect("it fits");
+        let encoded = crate::acp::checkpoint::encode(&session).expect("it fits");
         assert_eq!(
-            KNOWN.appended(100),
+            known().appended(100, segment.changes.clone()),
             Stored::Known {
                 base: 1000,
                 appended: 500,
-                seq: 4
-            }
+                seq: 4,
+                written: encoded.written.clone(),
+            },
+            "what the segment wrote is what the stored records leave"
         );
         assert_eq!(
-            Stored::whole(77),
+            Stored::whole(77, encoded.written.clone()),
             Stored::Known {
                 base: 77,
                 appended: 0,
-                seq: 0
+                seq: 0,
+                written: encoded.written,
             }
         );
         assert_eq!(Stored::Unknown.next_seq(), 1);
-        assert_eq!(Stored::Unknown.appended(5), Stored::Unknown);
+        assert_eq!(Stored::Unknown.appended(5, segment.changes), Stored::Unknown);
     }
 
     #[test]
     fn each_reason_to_write_a_checkpoint_whole() {
-        let whole = |stored: Stored,
+        let whole = |stored: &Stored,
                      at: AgentCheckpoint,
                      segment: Option<u64>,
                      trimmed: bool,
@@ -2167,31 +2194,32 @@ mod tests {
             );
         };
         // Unknown: new, adopted, restarted, or after a holder's ERROR.
-        whole(Stored::Unknown, STEPPED, Some(1), false, Adoption::Keep);
+        whole(&Stored::Unknown, STEPPED, Some(1), false, Adoption::Keep);
         // A step-down: the next core adopts one compact base.
-        whole(KNOWN, AgentCheckpoint::StepDown, Some(1), false, Adoption::Keep);
+        whole(&known(), AgentCheckpoint::StepDown, Some(1), false, Adoption::Keep);
         // A trim since the last checkpoint compacts it.
-        whole(KNOWN, STEPPED, Some(1), true, Adoption::Keep);
+        whole(&known(), STEPPED, Some(1), true, Adoption::Keep);
         // The segments would outgrow the base.
-        whole(KNOWN, STEPPED, Some(601), false, Adoption::Keep);
+        whole(&known(), STEPPED, Some(601), false, Adoption::Keep);
         // The blob would pass 64 MiB.
         let big = Stored::Known {
             base: MAX_CHECKPOINT_LEN / 2,
             appended: MAX_CHECKPOINT_LEN / 2 - 10,
             seq: 9,
+            written: Written::default(),
         };
-        whole(big, STEPPED, Some(11), false, Adoption::Keep);
+        whole(&big, STEPPED, Some(11), false, Adoption::Keep);
         assert_eq!(
-            agent_checkpoint_form(big, STEPPED, Some(10), false, Adoption::Keep),
+            agent_checkpoint_form(&big, STEPPED, Some(10), false, Adoption::Keep),
             CheckpointForm::Append,
             "exactly 64 MiB still appends"
         );
         // A segment too large to encode, or none encoded.
-        whole(KNOWN, STEPPED, None, false, Adoption::Keep);
+        whole(&known(), STEPPED, None, false, Adoption::Keep);
         // A draining holder of another build.
-        whole(KNOWN, STEPPED, Some(1), false, Adoption::Drain);
-        assert!(!agent_appendable(KNOWN, STEPPED, false, Adoption::Drain));
-        assert!(agent_appendable(KNOWN, STEPPED, false, Adoption::Keep));
+        whole(&known(), STEPPED, Some(1), false, Adoption::Drain);
+        assert!(!agent_appendable(&known(), STEPPED, false, Adoption::Drain));
+        assert!(agent_appendable(&known(), STEPPED, false, Adoption::Keep));
     }
 
     #[test]
@@ -2308,23 +2336,30 @@ mod tests {
                 .map(|event| event.encoded_len() as u64 + 1)
                 .sum();
             let gain = self.partial_gain();
-            let segment = agent_appendable(self.stored, at, trimmed, Adoption::Keep)
-                .then(|| encode_segment(&self.session, &self.unsaved, self.stored.next_seq()).ok())
-                .flatten();
-            let len = segment.as_ref().map(|segment| segment.len() as u64);
+            let unsaved = std::mem::take(&mut self.unsaved);
+            let segment = match &self.stored {
+                Stored::Known { written, .. }
+                    if agent_appendable(&self.stored, at, trimmed, Adoption::Keep) =>
+                {
+                    encode_segment(&self.session, unsaved, self.stored.next_seq(), written).ok()
+                }
+                Stored::Known { .. } | Stored::Unknown => None,
+            };
+            let len = segment.as_ref().map(|segment| segment.bytes.len() as u64);
             self.records += 1;
-            match (agent_checkpoint_form(self.stored, at, len, trimmed, Adoption::Keep), segment) {
+            let form = agent_checkpoint_form(&self.stored, at, len, trimmed, Adoption::Keep);
+            match (form, segment) {
                 (CheckpointForm::Whole, _) | (CheckpointForm::Append, None) => {
-                    let bytes = encode(&self.session).expect("it fits");
-                    self.written += bytes.len() as u64;
-                    self.stored = Stored::whole(bytes.len() as u64);
-                    self.blob = bytes;
+                    let encoded = encode(&self.session).expect("it fits");
+                    self.written += encoded.bytes.len() as u64;
+                    self.stored = Stored::whole(encoded.bytes.len() as u64, encoded.written);
+                    self.blob = encoded.bytes;
                     if trimmed {
                         self.wholes_after_trims += 1;
                     }
                 }
                 (CheckpointForm::Append, Some(segment)) => {
-                    let len = segment.len() as u64;
+                    let len = segment.bytes.len() as u64;
                     assert!(
                         len <= events_len + gain + RECORD_ALLOWANCE,
                         "segment {} is {len} bytes for {events_len} of events and {gain} of \
@@ -2332,11 +2367,11 @@ mod tests {
                         self.stored.next_seq()
                     );
                     self.written += len;
-                    self.stored = self.stored.appended(len);
-                    self.blob.extend_from_slice(&segment);
+                    let stored = std::mem::replace(&mut self.stored, Stored::Unknown);
+                    self.stored = stored.appended(len, segment.changes);
+                    self.blob.extend_from_slice(&segment.bytes);
                 }
             }
-            self.unsaved.clear();
             self.since = 0;
         }
     }

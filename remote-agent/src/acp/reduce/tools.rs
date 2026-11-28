@@ -1399,7 +1399,7 @@ mod tests {
         agent.turn("edit");
         agent.feed(&tool_call("c1", "Edit", "in_progress"));
         agent.feed(&diff_update("c1", "apple\n", "banana\n"));
-        let bytes = crate::acp::checkpoint::encode(&agent.s).expect("it fits");
+        let bytes = crate::acp::checkpoint::encode(&agent.s).expect("it fits").bytes;
         agent.s = crate::acp::checkpoint::decode(&bytes, agent.now).expect("it decodes");
         assert!(agent.s.process.book.diffs.is_empty());
         let out = agent.feed(&diff_update("c1", "apple\n", "banana\n"));

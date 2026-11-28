@@ -387,7 +387,7 @@ mod tests {
         }
         session.methods = methods;
         session.process.lines = Lines::restore(Partial::Collecting(vec![b'"'; MAX_LINE + 1]), u64::MAX);
-        let bytes = checkpoint::encode(&session).expect("the largest session fits");
+        let bytes = checkpoint::encode(&session).expect("the largest session fits").bytes;
         assert!(bytes.len() as u64 <= LARGEST_CHECKPOINT, "{}", bytes.len());
 
         // A stored log is at most twice its measure, for each entry kind's

@@ -3110,9 +3110,10 @@ fn checkpoints_are_appended_to_the_holders_base_and_adopted_as_one_blob() {
     let (mut script, _) = started(&dir.path, "page-append");
     script.step("expect session/prompt");
     long_reply(&mut script, 16, MESSAGE_BYTES);
+    script.step(stop("end_turn")).step("expect session/prompt");
+    let second = script.reached();
+    let reply = script.gate();
     script
-        .step(stop("end_turn"))
-        .step("expect session/prompt")
         .step(said("short"))
         .step(stop("end_turn"))
         .step("expect session/prompt");
@@ -3125,13 +3126,18 @@ fn checkpoints_are_appended_to_the_holders_base_and_adopted_as_one_blob() {
     client.transcript_until(id, "has the first turn", |log| {
         said_all(16)(log) && *log.turn() == end(StopReason::EndTurn)
     });
+    // The agent read the second prompt, so the holder has every
+    // checkpoint the core queued before its bytes, the first turn's end
+    // among them; the client seeing the turn end says nothing of that.
+    client.prompt(id, "two").unwrap();
+    reaches(&second);
 
     // The next core knows nothing of what the holder stores, so its first
     // checkpoint is a base of the whole 1 MiB log; the second turn's are
     // far smaller, so they are appended to it.
     let mut client = kill_and_restart_core(&mut dir, &mut client, token, || {});
     client.reconnect_replay();
-    client.prompt(id, "two").unwrap();
+    reply.open();
     client.transcript_until(id, "has the second turn", |log| {
         says(log).contains(&"agent: short".to_owned()) && *log.turn() == end(StopReason::EndTurn)
     });
