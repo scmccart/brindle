@@ -784,6 +784,82 @@ fn acp_versions_stay_in_their_modules() {
     );
 }
 
+/// The lines of `lines` (production code, [`production_lines`]) that read
+/// an ACP error code: a version's code constant, a comparison of an
+/// error's `.code`, or a code in JSON-RPC's implementation-defined range
+/// (`-32000` to `-32099`; the standard codes are other prefixes).
+fn error_code_lines(lines: &[(usize, String)]) -> Vec<usize> {
+    lines
+        .iter()
+        .filter(|(_, line)| {
+            ["AUTH_REQUIRED", "UNSUPPORTED_VERSION"]
+                .iter()
+                .any(|name| names_path(line, name))
+                || [".code ==", ".code !=", "-320"]
+                    .iter()
+                    .any(|needle| line.contains(needle))
+        })
+        .map(|(number, _)| *number)
+        .collect()
+}
+
+/// ports R14: a version's error codes are read only in its module
+/// (`acp/v1/`, later `acp/v2/`); the shared ACP code matches
+/// `forms::Failure`, which `Dialect::failure` gives it.
+#[test]
+fn acp_error_codes_stay_in_their_version() {
+    let (_, test_modules) = scan_production();
+    let shared: Vec<String> = production_files()
+        .into_iter()
+        .filter(|file| file.starts_with("remote-agent/src/acp/"))
+        .filter(|file| {
+            !["v1", "v2"]
+                .iter()
+                .any(|version| file.starts_with(&format!("remote-agent/src/acp/{version}/")))
+        })
+        .filter(|file| !in_test_module(file, &test_modules))
+        .collect();
+    assert!(
+        shared.iter().any(|file| file == "remote-agent/src/acp/reduce/mod.rs"),
+        "the reducer is missing from {shared:?}"
+    );
+    let mut found = Vec::new();
+    for file in &shared {
+        let path = root().join(file);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let original: Vec<&str> = text.lines().collect();
+        for number in error_code_lines(&production_lines(&text)) {
+            found.push(format!("{file}:{number}: {}", original[number - 1].trim()));
+        }
+    }
+    assert_none(
+        found,
+        "a version's error codes are read only in its module; the shared code matches \
+         forms::Failure through Dialect::failure (docs/architecture/ports-and-adapters.md R14)",
+    );
+}
+
+/// The scan behind [`acp_error_codes_stay_in_their_version`] finds what it
+/// looks for, so a scan that silently matched nothing would fail here.
+#[test]
+fn the_error_code_check_finds_a_planted_code() {
+    let text = "\
+fn f(error: &RpcError) -> bool {
+    // error.code == AUTH_REQUIRED, in a comment
+    let s = \"-32000\";
+    error.code == -32000
+}
+const AUTH_REQUIRED: i64 = 1;
+fn g(error: &RpcError) -> bool { error.code != UNSUPPORTED_VERSION }
+fn h() -> i64 { -32601 }
+#[cfg(test)]
+mod tests {
+    const UNSUPPORTED_VERSION: i64 = -32022;
+}
+";
+    assert_eq!(error_code_lines(&production_lines(text)), [4, 6, 7]);
+}
+
 /// The transcript crate's one door in the app: no file in `src/` but
 /// `src/agent/transcript.rs` names `brindle_transcript`, so the app reaches
 /// the transcript's types through `crate::agent::transcript` (ports R3).
