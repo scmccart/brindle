@@ -16,7 +16,7 @@ use brindle_remote_protocol::ready::ReadyRead;
 
 use super::clients::error;
 use super::policy::{self, Adoption, HolderView, Placement, Stage};
-use super::sessions::{Session, SpawnRequest};
+use super::sessions::{Life, RestartStage, Session, SpawnRequest};
 use super::{ADOPT_LIMIT, Core, Source, log};
 use crate::server::conn::Conn;
 use crate::server::daemon::{self, ReadyPipe};
@@ -625,16 +625,19 @@ impl<L: EventLoop> Core<L> {
     /// Sends waiting spawns to a holder of the core's build, starting one if
     /// there is none ([`policy::placement`]).
     pub(super) fn place_waiting(&mut self) {
-        if self.waiting.is_empty() {
+        let restarts = self.waiting_restarts();
+        if self.waiting.is_empty() && restarts.is_empty() {
             return;
         }
         let (tokens, views) = self.holder_views();
-        // They go together, so one agent's among them needs a holder that
-        // runs pipe sessions (which runs PTY sessions too).
-        let mode = if self
-            .waiting
-            .iter()
-            .any(|waiting| waiting.spawn.mode() == h1::SpawnMode::Pipes)
+        // They go together, so one agent's among them (a restart's is one)
+        // needs a holder that runs pipe sessions (which runs PTY sessions
+        // too).
+        let mode = if !restarts.is_empty()
+            || self
+                .waiting
+                .iter()
+                .any(|waiting| waiting.spawn.mode() == h1::SpawnMode::Pipes)
         {
             h1::SpawnMode::Pipes
         } else {
@@ -649,20 +652,42 @@ impl<L: EventLoop> Core<L> {
                 for waiting in std::mem::take(&mut self.waiting) {
                     self.send_spawn(holder, waiting);
                 }
+                for id in restarts {
+                    self.send_restart(holder, id);
+                }
             }
             Placement::Start => self.start_holder(),
             Placement::Wait => {}
         }
     }
 
-    /// The waiting spawns fail with `message`: to their clients, or, for a
-    /// restart, as its agent's end ([`Core::restart_failed`]).
+    /// The sessions whose restart waits for a holder, in id order
+    /// ([`RestartStage::Waiting`]).
+    pub(super) fn waiting_restarts(&self) -> Vec<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(_, session)| {
+                matches!(
+                    session.life,
+                    Life::Restarting {
+                        stage: RestartStage::Waiting,
+                        ..
+                    }
+                )
+            })
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
+    /// The waiting spawns fail with `message`: to their clients, and a
+    /// waiting restart as its agent's end ([`Core::restart_failed`]).
     pub(super) fn fail_waiting(&mut self, message: &str) {
         for waiting in std::mem::take(&mut self.waiting) {
-            match waiting.spawn.answers() {
-                Some(req) => self.send_client(waiting.client, error(Some(req), None, message)),
-                None => self.restart_failed(waiting.id, message),
-            }
+            let req = waiting.spawn.answers();
+            self.send_client(waiting.client, error(Some(req), None, message));
+        }
+        for id in self.waiting_restarts() {
+            self.restart_failed(id, message);
         }
     }
 

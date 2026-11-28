@@ -40,7 +40,7 @@ use brindle_remote_protocol::holder::{MAX_CHECKPOINT_LEN, SpawnMode};
 use brindle_transcript::PAGE_BYTES;
 
 use super::clients::ClientToken;
-use super::sessions::{CHECKPOINT_AFTER, Life, Ownership};
+use super::sessions::{CHECKPOINT_AFTER, Life, Ownership, RestartStage};
 use crate::acp::reduce::Moment;
 use super::{CLIENT_QUEUE_HIGH, CLIENT_QUEUE_LOW, MAX_LINGER, RECONNECT_GRACE, UNUSED_LIMIT};
 use crate::pty::Foreground;
@@ -451,6 +451,7 @@ pub(super) fn detach_ends(life: &Life) -> bool {
     match life {
         Life::AgentEnded { .. } => true,
         Life::Starting { .. }
+        | Life::Restarting { .. }
         | Life::Running { .. }
         | Life::HungUp { .. }
         | Life::ExitedAwaitingOwner { .. } => false,
@@ -494,6 +495,7 @@ pub(super) fn restart_refusal(
         Life::AgentEnded { .. } => {}
         Life::Running { .. } if needs_login => {}
         Life::Starting { .. }
+        | Life::Restarting { .. }
         | Life::Running { .. }
         | Life::HungUp { .. }
         | Life::ExitedAwaitingOwner { .. } => return Some(RestartRefusal::NotEnded),
@@ -510,12 +512,98 @@ pub(super) fn grace_fate(policy: Policy, life: &Life) -> GraceFate {
             Life::ExitedAwaitingOwner { .. } | Life::AgentEnded { .. },
             Policy::Kill | Policy::Detach,
         ) => GraceFate::Forget,
-        (Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. }, Policy::Kill) => {
-            GraceFate::HangUp
+        (
+            Life::Starting { .. } | Life::Restarting { .. } | Life::Running { .. } | Life::HungUp { .. },
+            Policy::Kill,
+        ) => GraceFate::HangUp,
+        (
+            Life::Starting { .. } | Life::Restarting { .. } | Life::Running { .. } | Life::HungUp { .. },
+            Policy::Detach,
+        ) => GraceFate::LeaveDetached,
+    }
+}
+
+/// What a holder's loss does to one of its sessions (OpenSpec change
+/// `agents-process-lifecycle`, decision 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LostFate {
+    /// It isn't in the holder (an ended agent, a restart not placed):
+    /// nothing to do.
+    Unheld,
+    /// A placed restart for an attached client: back to waiting, placed
+    /// again.
+    PlaceAgain,
+    /// A placed restart otherwise: the agent ends again, lost.
+    EndRestart,
+    /// A new spawn for an attached client: removed and queued again (an
+    /// empty holder exits, and may not have read it).
+    Requeue,
+    /// A new spawn with no client: removed.
+    Forget,
+    /// An exit kept for its owner: the holder already reported it, and
+    /// its loss changes nothing (an agent's exit adopted with the holder
+    /// and not yet stepped is stepped now, with its code).
+    KeepExit,
+    /// A running agent: its log says it is lost, then [`after_loss`].
+    AgentLost,
+    /// A terminal with its client attached: its replay, then `EXIT` with
+    /// `lost`.
+    ReportLost,
+    /// A terminal with no client: as its exit.
+    Exited,
+}
+
+/// What a holder's loss does to a session in `life` of `kind`, whose
+/// client is `attached` or not.
+pub(super) fn lost_fate(life: &Life, kind: SessionKind, attached: bool) -> LostFate {
+    match life {
+        Life::AgentEnded { .. }
+        | Life::Restarting {
+            stage: RestartStage::Waiting,
+            ..
+        } => LostFate::Unheld,
+        Life::Restarting {
+            stage: RestartStage::Placed { hung_up: false },
+            ..
+        } if attached => LostFate::PlaceAgain,
+        Life::Restarting {
+            stage: RestartStage::Placed { .. },
+            ..
+        } => LostFate::EndRestart,
+        Life::Starting { .. } if attached => LostFate::Requeue,
+        Life::Starting { .. } => LostFate::Forget,
+        Life::ExitedAwaitingOwner { .. } => LostFate::KeepExit,
+        Life::Running { .. } | Life::HungUp { .. } => {
+            match kind {
+                SessionKind::Agent => LostFate::AgentLost,
+                SessionKind::Terminal if attached => LostFate::ReportLost,
+                SessionKind::Terminal => LostFate::Exited,
+            }
         }
-        (Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. }, Policy::Detach) => {
-            GraceFate::LeaveDetached
+    }
+}
+
+/// What follows an agent's loss once its log says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AfterLoss {
+    /// Kept, ended, for its conversation ([`EndFate::Keep`]).
+    Keep,
+    /// Its attached client is told it was lost.
+    ReportLost,
+    /// As its exit.
+    Exited,
+}
+
+/// The second half of [`LostFate::AgentLost`]: an agent that can continue
+/// is kept as [`end_fate`] says; otherwise an attached client is told it
+/// was lost, and with none it ends as its exit.
+pub(super) fn after_loss(ownership: &Ownership, life: &Life, continuable: bool) -> AfterLoss {
+    match end_fate(ownership, life, continuable) {
+        EndFate::Keep => AfterLoss::Keep,
+        EndFate::KeepForOwner | EndFate::Report if ownership.client().is_some() => {
+            AfterLoss::ReportLost
         }
+        EndFate::KeepForOwner | EndFate::Report => AfterLoss::Exited,
     }
 }
 
@@ -944,9 +1032,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
-    use brindle_remote_protocol::client::Spawn;
+    use brindle_remote_protocol::client::{AgentRestart, Spawn};
 
-    use super::super::sessions::SpawnRequest;
+    use super::super::sessions::{Restart, RestartStage, SpawnRequest};
     use super::*;
 
     fn secs(n: u64) -> Duration {
@@ -1245,16 +1333,140 @@ mod tests {
         })
     }
 
+    /// A restart of an ended agent at `stage`.
+    fn restarting(stage: RestartStage) -> Life {
+        Life::Restarting {
+            restart: Restart {
+                restart: AgentRestart {
+                    req: 1,
+                    session: 2,
+                    command: "agent".into(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                },
+                cwd: "/w".into(),
+            },
+            stage,
+        }
+    }
+
     /// One of each kind of life.
-    fn lives() -> [Life; 6] {
+    fn lives() -> [Life; 9] {
         [
             Life::Starting { spawn: spawn(), hung_up: false },
             Life::Starting { spawn: spawn(), hung_up: true },
+            restarting(RestartStage::Waiting),
+            restarting(RestartStage::Placed { hung_up: false }),
+            restarting(RestartStage::Placed { hung_up: true }),
             Life::Running { pid: pid(9) },
             Life::HungUp { pid: pid(9) },
             Life::ExitedAwaitingOwner { code: Some(0), pid: Some(pid(9)) },
             Life::AgentEnded { code: Some(1) },
         ]
+    }
+
+    // agents-process-lifecycle 3.1: what a holder's loss does.
+
+    #[test]
+    fn a_placed_restart_with_its_client_attached_is_placed_again() {
+        let placed = restarting(RestartStage::Placed { hung_up: false });
+        assert_eq!(lost_fate(&placed, SessionKind::Agent, true), LostFate::PlaceAgain);
+    }
+
+    #[test]
+    fn a_placed_restart_with_no_client_ends_as_lost() {
+        let placed = restarting(RestartStage::Placed { hung_up: false });
+        assert_eq!(lost_fate(&placed, SessionKind::Agent, false), LostFate::EndRestart);
+        // Hung up, it ends even with its client there.
+        let hung_up = restarting(RestartStage::Placed { hung_up: true });
+        assert_eq!(lost_fate(&hung_up, SessionKind::Agent, true), LostFate::EndRestart);
+        assert_eq!(lost_fate(&hung_up, SessionKind::Agent, false), LostFate::EndRestart);
+    }
+
+    #[test]
+    fn a_waiting_restart_is_untouched_by_a_holders_loss() {
+        for attached in [false, true] {
+            let waiting = restarting(RestartStage::Waiting);
+            assert_eq!(lost_fate(&waiting, SessionKind::Agent, attached), LostFate::Unheld);
+            let ended = Life::AgentEnded { code: None };
+            assert_eq!(lost_fate(&ended, SessionKind::Agent, attached), LostFate::Unheld);
+        }
+    }
+
+    #[test]
+    fn a_starting_spawn_with_its_client_is_requeued_even_hung_up() {
+        for hung_up in [false, true] {
+            let starting = Life::Starting { spawn: spawn(), hung_up };
+            for kind in [SessionKind::Terminal, SessionKind::Agent] {
+                assert_eq!(lost_fate(&starting, kind, true), LostFate::Requeue);
+                assert_eq!(lost_fate(&starting, kind, false), LostFate::Forget);
+            }
+        }
+    }
+
+    #[test]
+    fn a_running_agent_is_stepped_lost() {
+        for life in [Life::Running { pid: pid(9) }, Life::HungUp { pid: pid(9) }] {
+            for attached in [false, true] {
+                assert_eq!(lost_fate(&life, SessionKind::Agent, attached), LostFate::AgentLost);
+            }
+        }
+    }
+
+    /// C-4: a holder exits once its last session's exit is reported; the
+    /// exit kept for the owner keeps its code.
+    #[test]
+    fn an_exit_kept_for_its_owner_outlives_its_holder() {
+        let exited = Life::ExitedAwaitingOwner { code: Some(1), pid: Some(pid(9)) };
+        for kind in [SessionKind::Terminal, SessionKind::Agent] {
+            for attached in [false, true] {
+                assert_eq!(lost_fate(&exited, kind, attached), LostFate::KeepExit);
+            }
+        }
+    }
+
+    #[test]
+    fn a_terminal_with_its_client_is_reported_lost() {
+        for life in [Life::Running { pid: pid(9) }, Life::HungUp { pid: pid(9) }] {
+            assert_eq!(lost_fate(&life, SessionKind::Terminal, true), LostFate::ReportLost);
+        }
+    }
+
+    #[test]
+    fn a_terminal_with_no_client_ends_as_its_exit() {
+        for life in [Life::Running { pid: pid(9) }, Life::HungUp { pid: pid(9) }] {
+            assert_eq!(lost_fate(&life, SessionKind::Terminal, false), LostFate::Exited);
+        }
+    }
+
+    #[test]
+    fn a_lost_agent_that_can_continue_is_kept_while_wanted() {
+        let t0 = Instant::now();
+        let running = Life::Running { pid: pid(9) };
+        let [attached, lingering, awaiting, _] = ownerships(t0);
+        for ownership in [attached, lingering, awaiting] {
+            assert_eq!(after_loss(&ownership, &running, true), AfterLoss::Keep, "{ownership:?}");
+        }
+    }
+
+    #[test]
+    fn a_lost_agent_not_kept_is_reported_to_its_attached_client() {
+        let running = Life::Running { pid: pid(9) };
+        let hung_up = Life::HungUp { pid: pid(9) };
+        let attached = Ownership::Attached(3);
+        assert_eq!(after_loss(&attached, &running, false), AfterLoss::ReportLost);
+        assert_eq!(after_loss(&attached, &hung_up, true), AfterLoss::ReportLost);
+    }
+
+    #[test]
+    fn a_lost_agent_with_no_client_ends_as_its_exit() {
+        let t0 = Instant::now();
+        let running = Life::Running { pid: pid(9) };
+        let [_, lingering, awaiting, detached] = ownerships(t0);
+        assert_eq!(after_loss(&detached, &running, true), AfterLoss::Exited);
+        assert_eq!(after_loss(&detached, &running, false), AfterLoss::Exited);
+        assert_eq!(after_loss(&lingering, &running, false), AfterLoss::Exited);
+        assert_eq!(after_loss(&awaiting, &running, false), AfterLoss::Exited);
     }
 
     /// One of each kind of ownership, and whether its owner may come back.
@@ -1348,6 +1560,7 @@ mod tests {
                             (Life::Running { .. }, _, false, _)
                             | (
                                 Life::Starting { .. }
+                                | Life::Restarting { .. }
                                 | Life::HungUp { .. }
                                 | Life::ExitedAwaitingOwner { .. },
                                 _,
@@ -1413,9 +1626,10 @@ mod tests {
                 Life::ExitedAwaitingOwner { .. } | Life::AgentEnded { .. } => {
                     (GraceFate::Forget, GraceFate::Forget)
                 }
-                Life::Starting { .. } | Life::Running { .. } | Life::HungUp { .. } => {
-                    (GraceFate::HangUp, GraceFate::LeaveDetached)
-                }
+                Life::Starting { .. }
+                | Life::Restarting { .. }
+                | Life::Running { .. }
+                | Life::HungUp { .. } => (GraceFate::HangUp, GraceFate::LeaveDetached),
             };
             assert_eq!(grace_fate(Policy::Kill, &life), kill, "{life:?}");
             assert_eq!(grace_fate(Policy::Detach, &life), detach, "{life:?}");

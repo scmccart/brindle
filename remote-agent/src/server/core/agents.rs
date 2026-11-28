@@ -55,13 +55,16 @@
 //! - **Continuing:** `AGENT_RESTART` from the attached client
 //!   ([`Core::client_agent_restart`]), refused as
 //!   [`policy::restart_refusal`] says or while the core stops, steps
-//!   `Input::Restart`, updates the listed command and queues a
-//!   `SpawnRequest::Restart`: a `SPAWN_PIPES` under the same session id
-//!   in the conversation's `cwd`, on any H1 3 holder of the core's build,
-//!   answered `OK` at once and never `SPAWNED`. A `SPAWN_FAILED` (or a
-//!   restart abandoned by a hang-up, `STOP` or a takeover) steps
-//!   `Exited { None, message }` and returns it to ended; a holder lost
-//!   before its `SPAWNED` places it again. A `SPAWN_AGENT` naming a
+//!   `Input::Restart`, updates the listed command and makes the session
+//!   `Life::Restarting` (change `agents-process-lifecycle`, decision 4):
+//!   waiting for a holder, then placed with a `SPAWN_PIPES` under the same
+//!   session id in the conversation's `cwd`, on any H1 3 holder of the
+//!   core's build, answered `OK` at once and never `SPAWNED`. A
+//!   `SPAWN_FAILED` steps `Exited { None, message }` and returns it to
+//!   ended; a restart still waiting abandoned by a hang-up (`CLOSE`,
+//!   `KILL`, `STOP`, a takeover, a gone `kill` client) ends the session.
+//!   A holder lost before its `SPAWNED` places it again while its client
+//!   has it ([`policy::lost_fate`]). A `SPAWN_AGENT` naming a
 //!   `conversation` starts as [`Agent::continuing`] in its `cwd`. Either
 //!   is checkpointed right after its `SPAWN_PIPES`, so a core killed
 //!   before `SPAWNED` still continues it. The reducer chooses resume or
@@ -103,11 +106,10 @@ use brindle_transcript::{
 };
 
 use super::clients::error;
-use super::holders::WaitingSpawn;
 use super::policy::{
     self, AgentCheckpoint, AgentRequest, CheckpointForm, FetchView, Stored,
 };
-use super::sessions::{Life, SpawnRequest};
+use super::sessions::{Life, PendingReplay, Restart, SpawnRequest};
 use super::{Core, log};
 use crate::acp::checkpoint;
 use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused};
@@ -221,6 +223,15 @@ impl Agent {
         }
     }
 
+    /// Whether its agent's end has been stepped
+    /// ([`AgentSession::has_ended`]); not while it is adopted.
+    pub(super) fn has_ended(&self) -> bool {
+        match &self.acp {
+            Acp::Adopting { .. } => false,
+            Acp::Running(acp) => acp.has_ended(),
+        }
+    }
+
     /// Whether its agent runs and waits for a login
     /// ([`AgentSession::needs_login`]).
     pub(super) fn needs_login(&self) -> bool {
@@ -328,10 +339,30 @@ pub(super) fn activity(activity: Activity) -> AgentActivity {
     }
 }
 
+/// Which kind of step [`guarded_step`] ran (OpenSpec change
+/// `agents-process-lifecycle`, decision 6).
+enum Stepped {
+    Clean(Output),
+    /// The step panicked; this is the [`Input::Fault`] step's output (or
+    /// an empty one if that panicked too). The session's log may hold
+    /// events that no client and no checkpoint has.
+    Faulted(Output),
+}
+
+/// How a step's events reach the session's attached client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// As `TRANSCRIPT` frames, and into the next checkpoint's segment.
+    Events,
+    /// Not at all: a fresh replay follows, and the next checkpoint is
+    /// whole.
+    Replay,
+}
+
 /// [`reduce::step`] under `catch_unwind`: a panic fails only this
 /// session's ACP handling, as [`Input::Fault`] with the panic's text. A
 /// panic while failing it too leaves the session as it is, logged.
-fn guarded_step(id: SessionId, acp: &mut AgentSession, input: Input<'_>, now: Instant) -> Output {
+fn guarded_step(id: SessionId, acp: &mut AgentSession, input: Input<'_>, now: Instant) -> Stepped {
     let stepped = panic::catch_unwind(AssertUnwindSafe(|| {
         inject_fault(&input);
         let late = late_fault(&input);
@@ -340,20 +371,20 @@ fn guarded_step(id: SessionId, acp: &mut AgentSession, input: Input<'_>, now: In
         output
     }));
     let reason = match stepped {
-        Ok(output) => return output,
+        Ok(output) => return Stepped::Clean(output),
         Err(payload) => fault::describe(&*payload),
     };
     log!("session {id}: ACP handling panicked ({reason}); its agent runs on, refusing prompts");
     let failed = panic::catch_unwind(AssertUnwindSafe(|| {
         reduce::step(acp, Input::Fault { reason }, now)
     }));
-    failed.unwrap_or_else(|payload| {
+    Stepped::Faulted(failed.unwrap_or_else(|payload| {
         log!(
             "session {id}: failing its ACP handling panicked too ({})",
             fault::describe(&*payload)
         );
         Output::default()
-    })
+    }))
 }
 
 /// Panics when the agent's stdout or a prompt holds
@@ -624,10 +655,8 @@ impl<L: EventLoop> Core<L> {
             restart.command
         );
         let command = (restart.command.clone(), restart.args.clone());
-        let spawn = SpawnRequest::Restart { restart, cwd };
-        self.start_again(id, &command.0, &command.1, spawn.clone());
+        self.start_again(id, &command.0, &command.1, Restart { restart, cwd });
         self.send_client(client, ToClient::Ok(client::Request { req }));
-        self.waiting.push(WaitingSpawn { client, id, spawn });
         self.place_waiting();
     }
 
@@ -635,13 +664,13 @@ impl<L: EventLoop> Core<L> {
     /// while its agent needed a login, with a client attached to start it
     /// for, while the core isn't stopping or stepping down. The restart is
     /// dropped either way.
-    pub(super) fn login_restart_due(&mut self, id: SessionId) -> Option<(Token, LoginRestart)> {
+    pub(super) fn login_restart_due(&mut self, id: SessionId) -> Option<LoginRestart> {
         let stopping = self.stopping.is_some() || self.stepping_down.is_some();
         let session = self.sessions.get_mut(&id)?;
         let client = session.ownership.client();
         let restart = session.agent()?.login_restart.take()?;
         match client {
-            Some(client) if !stopping => Some((client, restart)),
+            Some(_) if !stopping => Some(restart),
             Some(_) | None => {
                 log!("session {id}: its restart after a login is dropped: no client to start it for");
                 None
@@ -658,7 +687,6 @@ impl<L: EventLoop> Core<L> {
         &mut self,
         id: SessionId,
         code: Option<i32>,
-        client: Token,
         pending: LoginRestart,
     ) {
         match self.agent_step(id, Input::Restart) {
@@ -680,9 +708,7 @@ impl<L: EventLoop> Core<L> {
             restart.command
         );
         let command = (restart.command.clone(), restart.args.clone());
-        let spawn = SpawnRequest::Restart { restart, cwd };
-        self.start_again(id, &command.0, &command.1, spawn.clone());
-        self.waiting.push(WaitingSpawn { client, id, spawn });
+        self.start_again(id, &command.0, &command.1, Restart { restart, cwd });
         self.place_waiting();
     }
 
@@ -821,14 +847,44 @@ impl<L: EventLoop> Core<L> {
         let Acp::Running(acp) = &mut agent.acp else {
             return None;
         };
-        let output = guarded_step(id, acp, input, now);
-        self.agent_apply(id, output)
+        match guarded_step(id, acp, input, now) {
+            Stepped::Clean(output) => self.agent_apply(id, output, Delivery::Events),
+            Stepped::Faulted(output) => self.agent_faulted(id, output),
+        }
+    }
+
+    /// A step of agent session `id` panicked, and `output` is its fault
+    /// step's (decision 6): what the holder stores no longer matches the
+    /// log, so the next checkpoint is whole; the output is applied without
+    /// its events, and an attached client not waiting for a replay is sent
+    /// a fresh one, the log as the server holds it.
+    fn agent_faulted(&mut self, id: SessionId, output: Output) -> Option<Result<(), Refused>> {
+        if let Some(agent) = self.sessions.get_mut(&id).and_then(|session| session.agent()) {
+            agent.forget_stored();
+        }
+        let reply = self.agent_apply(id, output, Delivery::Replay);
+        let client = self
+            .sessions
+            .get(&id)
+            .filter(|session| session.pending_replay.is_none())
+            .and_then(|session| session.ownership.client());
+        if let Some(client) = client {
+            log!("session {id}: its client is sent the log again after the fault");
+            self.replay(client, id, PendingReplay::reconnect());
+        }
+        reply
     }
 
     /// Applies a step's output, in its order: the events to the attached
-    /// client (unless a replay it waits for has them), a checkpoint when
-    /// due, the agent's stdin, the hang-up. Returns the reply.
-    fn agent_apply(&mut self, id: SessionId, output: Output) -> Option<Result<(), Refused>> {
+    /// client (unless a replay it waits for has them, or `delivery` says a
+    /// replay follows), a checkpoint when due, the agent's stdin, the
+    /// hang-up. Returns the reply.
+    fn agent_apply(
+        &mut self,
+        id: SessionId,
+        output: Output,
+        delivery: Delivery,
+    ) -> Option<Result<(), Refused>> {
         let Output {
             events,
             stdin,
@@ -845,15 +901,19 @@ impl<L: EventLoop> Core<L> {
             log!("{line}");
         }
         let session = self.sessions.get_mut(&id)?;
+        let delivered = match delivery {
+            Delivery::Events => true,
+            Delivery::Replay => false,
+        };
         let client = session
             .ownership
             .client()
-            .filter(|_| session.pending_replay.is_none());
+            .filter(|_| session.pending_replay.is_none() && delivered);
         let live = session.life.is_live();
         let holder = session.holder;
         let agent = session.agent()?;
         agent.wake = wake;
-        if !agent.unstorable {
+        if !agent.unstorable && delivered {
             agent.unsaved.extend(events.iter().cloned());
         }
         let since = match &agent.acp {
@@ -992,6 +1052,7 @@ impl<L: EventLoop> Core<L> {
         let exited = match session.life {
             Life::ExitedAwaitingOwner { code, .. } => Some(code),
             Life::Starting { .. }
+            | Life::Restarting { .. }
             | Life::Running { .. }
             | Life::HungUp { .. }
             | Life::AgentEnded { .. } => None,
@@ -1002,6 +1063,8 @@ impl<L: EventLoop> Core<L> {
         agent.stderr = Some(bytes);
         if let Some(code) = exited {
             self.agent_exited(id, code);
+            // A returning owner's replay waited for the exit (decision 7).
+            self.send_pending_replay(id);
         }
     }
 
@@ -1040,19 +1103,23 @@ impl<L: EventLoop> Core<L> {
         let adopted = panic::catch_unwind(AssertUnwindSafe(|| {
             checkpoint::adopt(stored, truncated, &cwd, VERSION, now)
         }));
-        let (acp, output) = match adopted {
+        let (acp, stepped) = match adopted {
             Ok(adopted) => {
                 if let Err(why) = &adopted.restored {
                     log!("session {id}: {}: {why}", checkpoint::NOT_RESTORED);
                 }
-                (adopted.session, adopted.output)
+                (adopted.session, Stepped::Clean(adopted.output))
             }
+            // A fresh log, which isn't what the holder stores: handled as
+            // a faulted step (decision 6).
             Err(payload) => {
                 let reason = fault::describe(&*payload);
                 log!("session {id}: adopting its conversation panicked ({reason})");
                 let mut acp = AgentSession::new(cwd, VERSION.to_owned());
-                let output = guarded_step(id, &mut acp, Input::Fault { reason }, now);
-                (acp, output)
+                let output = match guarded_step(id, &mut acp, Input::Fault { reason }, now) {
+                    Stepped::Clean(output) | Stepped::Faulted(output) => output,
+                };
+                (acp, Stepped::Faulted(output))
             }
         };
         if truncated {
@@ -1063,7 +1130,10 @@ impl<L: EventLoop> Core<L> {
         }
         agent.checkpointed = acp.lines().covers();
         agent.acp = Acp::Running(Box::new(acp));
-        self.agent_apply(id, output);
+        match stepped {
+            Stepped::Clean(output) => self.agent_apply(id, output, Delivery::Events),
+            Stepped::Faulted(output) => self.agent_faulted(id, output),
+        };
         if !tail.is_empty() {
             self.agent_step(id, Input::Stdout(tail));
         }
@@ -1185,7 +1255,9 @@ mod tests {
     fn a_fault_fails_the_agent_with_its_reason_and_leaves_it_running() {
         let mut acp = AgentSession::new("/home/u".into(), "test".into());
         let now = Instant::now();
-        let output = guarded_step(1, &mut acp, Input::Spawned, now);
+        let Stepped::Clean(output) = guarded_step(1, &mut acp, Input::Spawned, now) else {
+            panic!("the start faulted");
+        };
         assert!(!output.stdin.is_empty(), "initialize goes out");
         // What `guarded_step` steps when the reducer panics: the agent
         // fails with the panic's text.
@@ -1197,5 +1269,17 @@ mod tests {
             AgentState::Failed { message } if message.contains("boom")
         ));
         assert!(!output.hang_up, "the agent runs on");
+
+        // What a faulted step does to the core's agent (decision 6): what
+        // its holder stores is forgotten, so the checkpoint after the fault
+        // is whole, never a segment on a base the log no longer matches.
+        let mut agent = Agent::new("/home/u".into());
+        agent.stored = Stored::whole(100);
+        agent.unsaved.push(Event::Agent { state: AgentState::Starting });
+        let at = AgentCheckpoint::Stepped(Some(reduce::Moment::Stopped));
+        assert!(policy::agent_appendable(agent.stored, at, false, policy::Adoption::Keep));
+        agent.forget_stored();
+        assert!(!policy::agent_appendable(agent.stored, at, false, policy::Adoption::Keep));
+        assert!(agent.unsaved.is_empty());
     }
 }

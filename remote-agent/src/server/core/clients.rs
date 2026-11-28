@@ -255,13 +255,13 @@ impl<L: EventLoop> Core<L> {
             // starting, which ends it ([`Core::hang_up`]).
             let (failed, kept) = std::mem::take(&mut self.waiting)
                 .into_iter()
-                .partition(|waiting| waiting.client == old && !waiting.spawn.is_restart());
+                .partition(|waiting| waiting.client == old);
             self.waiting = kept;
             for waiting in failed {
                 self.send_client(
                     old,
                     error(
-                        waiting.spawn.answers(),
+                        Some(waiting.spawn.answers()),
                         None,
                         "this connection was replaced by a newer one with its token",
                     ),

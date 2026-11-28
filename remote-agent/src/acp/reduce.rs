@@ -439,21 +439,7 @@ impl AgentSession {
     /// offered `session/load` or `session/resume`, and didn't fail its
     /// start (a failed start, a continue's included, stays `Failed`).
     pub fn continuable(&self) -> bool {
-        let ended = match self.phase {
-            Phase::Exited | Phase::Lost => true,
-            Phase::Spawning { .. }
-            | Phase::Initializing { .. }
-            | Phase::Creating { .. }
-            | Phase::Resuming { .. }
-            | Phase::Loading { .. }
-            | Phase::Ready { .. }
-            | Phase::Choosing { .. }
-            | Phase::LoginRequired(_)
-            | Phase::LoggingIn { .. }
-            | Phase::Restarting { .. }
-            | Phase::Refused
-            | Phase::Broken => false,
-        };
+        let ended = self.has_ended();
         let agent_ended = match self.transcript.agent() {
             AgentState::Exited { .. } | AgentState::Lost { .. } => true,
             AgentState::Starting
@@ -469,6 +455,27 @@ impl AgentSession {
                 .transcript
                 .conversation()
                 .is_some_and(|conversation| conversation.continuation.continuable())
+    }
+
+    /// Whether the agent's end (its exit, or its loss with its holder) has
+    /// been stepped: a replay of the log then ends with it (OpenSpec change
+    /// `agents-process-lifecycle`, decision 7).
+    pub fn has_ended(&self) -> bool {
+        match self.phase {
+            Phase::Exited | Phase::Lost => true,
+            Phase::Spawning { .. }
+            | Phase::Initializing { .. }
+            | Phase::Creating { .. }
+            | Phase::Resuming { .. }
+            | Phase::Loading { .. }
+            | Phase::Ready { .. }
+            | Phase::Choosing { .. }
+            | Phase::LoginRequired(_)
+            | Phase::LoggingIn { .. }
+            | Phase::Restarting { .. }
+            | Phase::Refused
+            | Phase::Broken => false,
+        }
     }
 
     /// Whether the agent runs and waits for a login (`agents-login`): an
@@ -8833,6 +8840,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["initialize"]
         );
+    }
+
+    /// C-4: a session has ended once its exit or loss is stepped, and not
+    /// before, nor once its agent is started again.
+    #[test]
+    fn a_session_has_ended_once_its_exit_or_loss_is_stepped() {
+        let mut agent = Agent::ready_offering(both());
+        assert!(!agent.s.has_ended());
+        agent.exit();
+        assert!(agent.s.has_ended());
+        agent.step(Input::Restart);
+        assert!(!agent.s.has_ended(), "started again");
+
+        let mut lost = Agent::ready();
+        lost.step(Input::Lost { message: "its holder ended" });
+        assert!(lost.s.has_ended());
+        // A failed handling isn't an end: the agent runs on.
+        let mut failed = Agent::ready();
+        failed.step(Input::Fault {
+            reason: "boom".into(),
+        });
+        assert!(!failed.s.has_ended());
     }
 
     // --- choosing and listing (agents-session-list) ----------------------
