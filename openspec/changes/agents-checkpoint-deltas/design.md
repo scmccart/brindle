@@ -302,6 +302,27 @@ Nothing to migrate by hand, and nothing is converted: a core with this change ad
 
 **Commit read** (task 1.1): `ad696ca`, the head of `refactor/agents-module-structure` (PR #157) while it was still in CI, not `main`. It holds changes 3, 4 and 5 and `agents-commands`. The branch is rebased onto `main` once #157 merges; the sites above are as found there.
 
+### As built (before)
+
+Decision 7's test (task 1.2) on the unchanged code, release build:
+- It fails assertion 1 at segment 8, in the third turn (call 22): a segment of 1,844 bytes for 793 bytes of events, its `tools` map already 22 entries long.
+- With assertion 1 commented out (locally, not committed): **2,123,919,660 bytes written** for 13,072,007 added, in 11,018 records, no trims. The bound is 63,570,460 bytes, so it is about 33x over it and 162x what was added.
+
+The perf baseline (task 1.3), a release build of the unchanged code at `a713e328` (only the perf cases and the fake agent's `send-part` added), under `scripts/with-xvfb`: run `target-cd/tmp/perf/20261128T071449Z` (its `summary.toml` is kept with this change's task notes).
+
+| case | run | ms |
+| --- | --- | --- |
+| `agent-attach-long` | launch to shown | 2,594 |
+| `agent-tool-output` | streamed (4 KiB) | 2,258 |
+| `agent-tool-output` | whole | 2,254 |
+| `agent-tool-output` | small (32 B) | 2,211 |
+| `agent-tool-heavy` | gate to shown | 4,237 |
+
+Each includes the 1 s step interval before the quit.
+
 ### Flags
 
 1. **The base is #157's head, not `main`.** Task 1.1 asks for `main` after changes 3 to 5 merged; this branch starts at #157's head before its merge, so the sites were read there.
+2. **The fake agent gained `send-part`.** Its `send-raw` writes a whole line, line end included, so it can't write one line in pieces as tasks 1.3 and 6.1 assume. `send-part <text>` writes the text with no line end; a run of them and an empty `send-raw` make one long line. Its text is trimmed as every step's argument is, so the perf case's pieces are compact JSON of `z`s, which the self-test checks.
+3. **`agent-tool-heavy` sends its last message after the long line.** Task 1.3 puts the final message before the line, which would leave the 8 MiB line (B-4) outside the time measured. The case sends the calls, then the line, then the last message, so the time from the gate to the exit covers the line's checkpoints too.
+4. **The cost test's per-segment bound counts the events unmerged.** `merged` is private to the checkpoint module, so `Checkpointing` measures each event's `encoded_len` plus a comma, an upper bound of the merged events' length, and the partial line's gain as the smaller of its length and the stdout fed since the last checkpoint. It also keeps the holder's blob (the last base and its segments), for assertion 3.

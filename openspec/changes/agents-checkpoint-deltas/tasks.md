@@ -15,8 +15,10 @@ Each group writes its tests first and watches them fail before the code they che
   Update `design.md`'s Layer map and decisions 2, 4, 10 and 12 with the paths and names as found, and classify each state field `agents-commands` added by decision 4's rule. Verify by `grep` that every function the design names exists, and record the commit you read in the design's As built.
 
   Done: read at `ad696ca` (#157's head, before it merged; flag 1); the Layer map lists the sites, decisions 2, 4, 10 and 12 name them, and `option_keys` and `modes` stay whole.
-- [ ] 1.2 In `remote-agent/src/server/core/policy.rs`'s `mod tests`, add `checkpoints_of_a_tool_heavy_conversation_and_a_long_line_write_a_small_multiple_of_what_they_added` (design 7). It uses the existing `Checkpointing` helper, extended to count `records` and to check each appended segment against `RECORD_ALLOWANCE` (1 KiB) plus its merged events' encoded length plus the partial's new bytes. Run it on the unchanged code with `cargo test -p brindle-remote-agent --release server::core::policy::tests::checkpoints_of_a_tool_heavy -- --nocapture`, watch it fail on assertion 1, and record the printed `written`, `added` and `records` under "As built (before)" in `design.md`. To get the total before the per-segment assertion stops the run, run it once with that assertion commented out locally; don't commit that edit.
-- [ ] 1.3 Add the measurement runs to the perf suite before any production change (design 15):
+- [x] 1.2 In `remote-agent/src/server/core/policy.rs`'s `mod tests`, add `checkpoints_of_a_tool_heavy_conversation_and_a_long_line_write_a_small_multiple_of_what_they_added` (design 7). It uses the existing `Checkpointing` helper, extended to count `records` and to check each appended segment against `RECORD_ALLOWANCE` (1 KiB) plus its merged events' encoded length plus the partial's new bytes. Run it on the unchanged code with `cargo test -p brindle-remote-agent --release server::core::policy::tests::checkpoints_of_a_tool_heavy -- --nocapture`, watch it fail on assertion 1, and record the printed `written`, `added` and `records` under "As built (before)" in `design.md`. To get the total before the per-segment assertion stops the run, run it once with that assertion commented out locally; don't commit that edit.
+
+  Done (4e91d6f): it fails at segment 8 (1,844 bytes for 793 of events); without assertion 1, 2,123,919,660 bytes written for 13,072,007 added in 11,018 records (flag 4 on the events' measure).
+- [x] 1.3 Add the measurement runs to the perf suite before any production change (design 15):
   - `tests/perf/agent.rs`:
     - `tool_output` gains the `small` run: 1 MiB in 32,768 `terminal_output_delta`s of 32 bytes, written through `output_script`. `[stream]` gains `small_ms`.
     - New `tool_heavy(ctx)`: `tool_heavy_script(record, gate)` sends 3,000 tool calls behind the gate, each a `tool_call`, a `session/request_permission`, a `$/cancel_request` for it and a completing `tool_call_update`. Then a final `agent_message_chunk`, then one 8 MiB `tool_call_update` line written as 128 `send-raw` pieces of 64 KiB and its newline. It measures from the gate to Brindle's exit on a `--wait-for` of the final message, reporting a `[tool_heavy]` table, and skips without the fake agent.
@@ -24,6 +26,8 @@ Each group writes its tests first and watches them fail before the code they che
   - `tests/perf/main.rs`: register the case `agent-tool-heavy`, and `self_test_tool_heavy` in `self_test()`.
 
   Verify that `BRINDLE_PERF=1 cargo test --test perf -- --self-test` passes. Then take the baseline on a release build of the unchanged code with `cargo build --release && scripts/with-xvfb env BRINDLE_PERF=1 cargo test --test perf -- agent-`, and record the run directory and the `agent-attach-long`, `agent-tool-output` and `agent-tool-heavy` numbers in `design.md`'s As built.
+
+  Done (a713e328): self-test passes; baseline run `target-cd/tmp/perf/20261128T071449Z` (flags 2 and 3: `send-part`, the last message after the line).
 
 ## 2. Shared contracts: the transcript's output text and replay, the protocol's packers
 
