@@ -301,6 +301,7 @@ impl ChatModel {
             return None;
         }
         for (id, entry) in &fresh {
+            self.stats.rendered_entry(entry);
             self.keep_render(*id, render_entry(entry));
             self.keep_texts(*id, text_items(entry));
         }
@@ -338,6 +339,7 @@ impl ChatModel {
         self.keep_texts(id, items);
         // An agent message or thought is rendered again whole; the parts
         // that didn't change keep their cached values.
+        self.stats.rendered_entry(&self.entries[index].1);
         let render = render_entry(&self.entries[index].1).map(|(fresh, panicked)| {
             let old = self.rendered.get(&id).map_or(&[][..], Vec::as_slice);
             let same = old.iter().zip(&fresh).take_while(|(old, fresh)| old == fresh).count();
@@ -418,6 +420,7 @@ impl ChatModel {
             if self.texts.get(&(id, item)).is_some_and(|(held, _)| *held == source) {
                 continue;
             }
+            self.stats.rendered(&source);
             let blocks: Arc<[Arc<RichBlock>]> = match std::panic::catch_unwind(|| markdown::render(&source)) {
                 Ok(parts) => parts.into_iter().map(|part| part.block).collect(),
                 Err(_) => {
@@ -751,6 +754,66 @@ impl ChatModel {
             Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
         }
     }
+
+    /// The text each copy of the conversation the zone holds keeps, in
+    /// bytes (OpenSpec change `agents-absorb-cost`, decision 8's table).
+    #[cfg(test)]
+    pub(super) fn held_text(&self) -> HeldText {
+        let rich = |blocks: &[Arc<RichBlock>]| blocks.iter().map(|block| markdown::shown_text(block).len()).sum::<usize>();
+        let mut held = HeldText::default();
+        for (_, entry) in &self.entries {
+            held.entries += match entry {
+                Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
+                Entry::Tool { content, .. } => content
+                    .iter()
+                    .map(|item| match item {
+                        ToolItem::Text { text, .. } => text.len(),
+                        ToolItem::Output(output) => output.text.len(),
+                        ToolItem::Diff(_) => 0,
+                    })
+                    .sum(),
+                Entry::Permission { .. } | Entry::Notice { .. } => 0,
+            };
+        }
+        held.rendered = self.rendered.values().flatten().map(|part| markdown::shown_text(&part.block).len()).sum();
+        held.text_renders = self.texts.values().map(|(_, blocks)| rich(blocks)).sum();
+        held.text_sources = self.texts.values().map(|(source, _)| source.len()).sum();
+        let detail_source = |part: &ShownPart| match &part.part {
+            DetailPart::Text { source, .. } => source.len(),
+            DetailPart::Diff { .. }
+            | DetailPart::Output { .. }
+            | DetailPart::Locations { .. }
+            | DetailPart::Raw { .. }
+            | DetailPart::Mark { .. } => 0,
+        };
+        for block in &self.blocks {
+            match &block.body {
+                BlockBody::UserText { text } => held.user_parts += text.len(),
+                BlockBody::ToolDetail(part) => held.detail_sources += detail_source(part),
+                BlockBody::Permission { detail, .. } => held.detail_sources += detail.iter().map(detail_source).sum::<usize>(),
+                BlockBody::AgentPart { .. } | BlockBody::Thought { .. } | BlockBody::Tool { .. } | BlockBody::Notice { .. } => {}
+            }
+        }
+        held
+    }
+}
+
+/// What [`ChatModel::held_text`] counts: each copy's bytes of text.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct HeldText {
+    /// The zone's copy of the entries (`ChatModel.entries`).
+    pub entries: usize,
+    /// The shown text of the rendered agent messages and thoughts.
+    pub rendered: usize,
+    /// User messages' parts, as their blocks hold them.
+    pub user_parts: usize,
+    /// The shown text of tool text items' renders.
+    pub text_renders: usize,
+    /// Tool text items' sources kept beside their renders.
+    pub text_sources: usize,
+    /// Tool text items' sources in drawn detail parts.
+    pub detail_sources: usize,
 }
 
 #[cfg(test)]
