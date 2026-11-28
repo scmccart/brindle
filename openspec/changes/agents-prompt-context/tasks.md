@@ -89,18 +89,28 @@ Before starting, check that the changes this one builds on are implemented and a
 
 ## 7. End-to-end cases (fake ACP agent)
 
-- [ ] 7.1 `terminal-to-agent-output`: a command's output in a terminal tab becomes a draft in the agent tab, named by its command line, with focus in the prompt input and nothing sent; sending it shows the user message with its attachment's reference, and the fake agent received an embedded resource.
-- [ ] 7.2 `terminal-to-agent-choose`: two agent tabs, the list in most-recently-focused order, choosing the second; and no agent tab giving the notice line.
-- [ ] 7.3 `agent-attach-file`: `agent_attach_file` with a relative path; the fake agent receives the resolved `file://` link; escape attaches nothing; backspace at the start and `agent_clear_attachments` remove.
-- [ ] 7.4 `agent-attach-bounds`: a ninth attachment refused on the notice line; output over 256 KiB refused with its size and the limit, the terminal keeping focus; output between 64 KiB and 256 KiB sent whole as a link to a kept file; blank text with an attachment sends nothing.
-- [ ] 7.5 `agent-attach-queue`: a prompt with an attachment sent during a turn waits with its count, and the agent receives both when the turn ends; a held one sent again keeps it; a discarded one leaves no file.
-- [ ] 7.6 `agent-attach-restore`: quit with a waiting prompt that has an attachment and a sent one in the conversation; the relaunched zone shows both references, and the session's attachment directory, under the case's `BRINDLE_CACHE_DIR`, still holds their texts.
-- [ ] 7.6a `agent-attach-settings`: `[agent] attachments_dir` moves a local agent's kept text; `attachments_keep_days = 0` leaves no directory after the zone is closed; an out-of-range keep time shows the config line. And in `remote-agent-ssh` (Docker): a remote's `attachments_dir` is where the container keeps the text, and a remote with none uses the container user's cache directory.
+- [x] 7.1 `terminal-to-agent-output`: a command's output in a terminal tab becomes a draft in the agent tab, named by its command line, with focus in the prompt input and nothing sent; sending it shows the user message with its attachment's reference, and the fake agent received an embedded resource.
+  Done: 791de70d, `tests/e2e/cases/attach.rs` (`output`); the kept file is read back from the URI.
+- [x] 7.2 `terminal-to-agent-choose`: two agent tabs, the list in most-recently-focused order, choosing the second; and no agent tab giving the notice line.
+  Done: 791de70d; it found the list ranked within each tab only, so the strip now ranks tabs by activation (flag 21).
+- [x] 7.3 `agent-attach-file`: `agent_attach_file` with a relative path; the fake agent receives the resolved `file://` link; escape attaches nothing; backspace at the start and `agent_clear_attachments` remove.
+  Done: 791de70d; each removal is checked by the index the next attachment takes.
+- [x] 7.4 `agent-attach-bounds`: a ninth attachment refused on the notice line; output over 256 KiB refused with its size and the limit, the terminal keeping focus; output between 64 KiB and 256 KiB sent whole as a link to a kept file; blank text with an attachment sends nothing.
+  Done: 791de70d; it found a refused output still showing the agent zone, now leaving focus in the terminal.
+- [x] 7.5 `agent-attach-queue`: a prompt with an attachment sent during a turn waits with its count, and the agent receives both when the turn ends; a held one sent again keeps it; a discarded one leaves no file.
+  Done: 791de70d; the discard is the waiting prompt's removal (`agent_unqueue`).
+- [x] 7.6 `agent-attach-restore`: quit with a waiting prompt that has an attachment and a sent one in the conversation; the relaunched zone shows both references, and the session's attachment directory, under the case's `BRINDLE_CACHE_DIR`, still holds their texts.
+  Done: 791de70d.
+- [x] 7.6a `agent-attach-settings`: `[agent] attachments_dir` moves a local agent's kept text; `attachments_keep_days = 0` leaves no directory after the zone is closed; an out-of-range keep time shows the config line. And in `remote-agent-ssh` (Docker): a remote's `attachments_dir` is where the container keeps the text, and a remote with none uses the container user's cache directory.
+  Done: 791de70d, and the Docker part as its own case, `remote-agent-attach` (ef9f0a22, flag 23), which found a remote's `attachments_dir` never sent (flag 22).
 - [ ] 7.7 Run the cases on Windows (one `windows-agent-*` case with a drive-letter link and a kept text) and in the archive jobs.
+  Written, not yet run: `windows-agent-attach` (a7e5b900), which the `windows-e2e` and `windows-e2e-archive` jobs' filters take, and the Linux archive job's filter now takes `terminal-to-agent-`. It wasn't compiled for Windows here (flag 24); the PR's CI runs it.
 
 ## 8. Docs and checks
 
-- [ ] 8.1 Update `docs/code-map.md` (the terminal server's directories and the store), `README.md` (the Agent tabs section, the terminal action, where attached text is kept and when it goes), and `CLAUDE.md`'s dump description, action notes and manual checks.
-- [ ] 8.2 Tell `agents-acp-v2` what it inherits (its v2 module writes the same three prompt parts and reads the same capability) and `agents-prompt-images` what it builds on (the store, the upload number and `Attachment`).
+- [x] 8.1 Update `docs/code-map.md` (the terminal server's directories and the store), `README.md` (the Agent tabs section, the terminal action, where attached text is kept and when it goes), and `CLAUDE.md`'s dump description, action notes and manual checks.
+  Done: 509d62b7 and e79993f2 (the code map's kept attachments, the client's attachments and protocol 4's messages; README's "Attachments"; CLAUDE.md's dump lines, `BRINDLE_CACHE_DIR`, the new cases and two manual checks).
+- [x] 8.2 Tell `agents-acp-v2` what it inherits (its v2 module writes the same three prompt parts and reads the same capability) and `agents-prompt-images` what it builds on (the store, the upload number and `Attachment`).
+  Done: e79993f2 and the tick commit: the v2 proposal's inherited prompt parts and capability, the images design's "as built" names.
 - [ ] 8.3 Run `cargo test --workspace`, the clippy command from `CLAUDE.md`, both harness self-tests and the e2e suite under `scripts/with-xvfb`; `openspec validate agents-prompt-context --strict`.
 - [ ] 8.4 Manual checks for the user, with `scripts/run-throwaway.sh` and real agent profiles: dropping a file on a local agent's zone (a link) and on an SSH or container agent's zone (text kept, a binary refused), on Linux and on Windows; a pointer press on an item's remove mark, and on a text attachment's row in the conversation to open and close it; a real agent answering about a linked file, about a small attached output, and about one over 64 KiB that it must read from the kept file.
