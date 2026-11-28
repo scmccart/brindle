@@ -52,6 +52,11 @@
 //! - `respond-error-to <id> <code> <message> [<data>]`: answer request
 //!   `id` with an error, its arguments after the id as `respond-error`'s.
 //! - `stderr <text>`: write the text as a line to stderr.
+//! - `pace <ms>`: from then on, each `send`, `send-raw` or `send-part`
+//!   waits until `ms` milliseconds after the previous one was written, so
+//!   a reply trickles in as a real agent's does (OpenSpec change
+//!   `agents-absorb-cost`, decision 5); `pace 0` turns it off. For the
+//!   perf suite, which asserts nothing: a test that asserts gates on files.
 //! - `wait-file <path>`: wait until the file exists, a gate the test
 //!   creates (never a sleep).
 //! - `record-env <path>`: write the agent's environment to the file, one
@@ -70,6 +75,7 @@
 //! (`fcis` R2, R3; `PURE_MODULES`): the binary's `main` does the IO.
 
 use std::fmt;
+use std::time::Duration;
 
 use brindle_remote_protocol::serde_json::{self, Map, Value, json};
 
@@ -127,6 +133,11 @@ pub enum Step {
     WaitFile {
         path: String,
     },
+    /// Each later write waits until `every` after the previous one; zero
+    /// turns it off.
+    Pace {
+        every: Duration,
+    },
     RecordEnv {
         path: String,
     },
@@ -173,6 +184,8 @@ pub enum Problem {
     },
     /// An argument that isn't the JSON it must be.
     BadJson { step: &'static str, error: String },
+    /// A count of milliseconds that isn't a whole, non-negative number.
+    BadMillis { step: &'static str, text: String },
     /// A code that isn't an integer of its range.
     BadCode { step: &'static str, text: String },
     /// A `respond` or `respond-error` before any `expect` of its section:
@@ -196,6 +209,9 @@ impl fmt::Display for BadScript {
             Problem::UnknownStep { word } => write!(f, "{word:?} isn't a step"),
             Problem::Missing { step, what } => write!(f, "{step} needs {what}"),
             Problem::BadJson { step, error } => write!(f, "{step}'s JSON doesn't parse: {error}"),
+            Problem::BadMillis { step, text } => {
+                write!(f, "{step}'s {text:?} isn't a whole number of milliseconds")
+            }
             Problem::BadCode { step, text } => write!(f, "{step}'s code {text:?} isn't a number"),
             Problem::NoRequest { step } => {
                 write!(
@@ -272,6 +288,7 @@ pub fn parse(text: &str) -> Result<Script, BadScript> {
             | Step::RespondErrorTo { .. }
             | Step::Stderr { .. }
             | Step::WaitFile { .. }
+            | Step::Pace { .. }
             | Step::RecordEnv { .. }
             | Step::Exit { .. } => {}
         }
@@ -355,6 +372,15 @@ fn step(word: &str, rest: &str) -> Result<Step, Problem> {
         "stderr" => Step::Stderr {
             text: rest.to_owned(),
         },
+        "pace" => {
+            let text = needed("pace", "a number of milliseconds")?;
+            let ms: u64 = text
+                .parse()
+                .map_err(|_| Problem::BadMillis { step: "pace", text })?;
+            Step::Pace {
+                every: Duration::from_millis(ms),
+            }
+        }
         "wait-file" => Step::WaitFile {
             path: needed("wait-file", "a file")?,
         },
@@ -726,6 +752,47 @@ mod tests {
                 path: "/tmp/case/go".into()
             }
         );
+    }
+
+    #[test]
+    fn pace_takes_milliseconds_and_refuses_anything_else() {
+        assert_eq!(
+            one("pace 10"),
+            Step::Pace {
+                every: Duration::from_millis(10)
+            }
+        );
+        assert_eq!(
+            one("pace 0"),
+            Step::Pace {
+                every: Duration::ZERO
+            }
+        );
+        let bad = problem("send-raw hi\npace");
+        assert_eq!(bad.line, 2, "the line is named");
+        assert_eq!(
+            bad.problem,
+            Problem::Missing {
+                step: "pace",
+                what: "a number of milliseconds"
+            }
+        );
+        for text in ["-5", "1.5", "ten", "10ms"] {
+            let bad = problem(&format!("pace {text}"));
+            assert_eq!(bad.line, 1);
+            assert_eq!(
+                bad.problem,
+                Problem::BadMillis {
+                    step: "pace",
+                    text: text.into()
+                },
+                "{text}"
+            );
+            assert!(
+                bad.to_string().contains("milliseconds"),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

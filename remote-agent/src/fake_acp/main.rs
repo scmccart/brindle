@@ -20,6 +20,9 @@
 //! - **A `wait-file`** looks for its file every 10 ms, with no limit: the
 //!   test that wrote the gate creates the file, and a hang-up ends an agent
 //!   still waiting.
+//! - **A `pace`** spaces the writes after it against a deadline on the
+//!   monotonic clock, so the spacing doesn't drift with the time each write
+//!   takes; the first write after it goes at once.
 //! - **Exit statuses:** a script's own `exit`, 0 after idling, 2 for a usage
 //!   error or a script that doesn't parse, and 3 when a step can't be played
 //!   (stdin closed before an `expect`'s method or an `expect-response`'s
@@ -37,7 +40,7 @@ use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use brindle_remote_protocol::serde_json::Value;
 
@@ -74,6 +77,35 @@ impl std::fmt::Display for Fault {
             }
             Self::Io { what, error } => write!(f, "{what}: {error}"),
         }
+    }
+}
+
+/// The spacing of the writes after a `pace`.
+enum Pacing {
+    Off,
+    /// Each write waits for `next` (none: the first goes at once), and the
+    /// one after it for `every` later.
+    Every { every: Duration, next: Option<Instant> },
+}
+
+impl Pacing {
+    fn every(every: Duration) -> Self {
+        if every.is_zero() {
+            Self::Off
+        } else {
+            Self::Every { every, next: None }
+        }
+    }
+
+    /// Waits for this write's turn.
+    fn wait(&mut self) {
+        let Self::Every { every, next } = self else { return };
+        let now = Instant::now();
+        let at = next.unwrap_or(now);
+        if at > now {
+            thread::sleep(at - now);
+        }
+        *next = Some(at + *every);
     }
 }
 
@@ -142,6 +174,7 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
     let mut all: Option<File> = None;
     let mut last: Option<Last> = None;
     let mut line = Vec::new();
+    let mut pacing = Pacing::Off;
     for step in steps {
         match step {
             Step::Record { path } => record = Some(appending(path)?),
@@ -170,9 +203,19 @@ fn play(steps: &[Step]) -> Result<End, Fault> {
                 };
                 expect(&mut input, &mut line, &what, wanted, records)?;
             }
-            Step::Send { line } => write_line(&mut output, line)?,
-            Step::SendRaw { text } => write_line(&mut output, text)?,
-            Step::SendPart { text } => write_text(&mut output, text)?,
+            Step::Send { line } => {
+                pacing.wait();
+                write_line(&mut output, line)?;
+            }
+            Step::SendRaw { text } => {
+                pacing.wait();
+                write_line(&mut output, text)?;
+            }
+            Step::SendPart { text } => {
+                pacing.wait();
+                write_text(&mut output, text)?;
+            }
+            Step::Pace { every } => pacing = Pacing::every(*every),
             Step::Respond { result } => {
                 let id = answering(last.as_ref())?;
                 write_text(&mut output, &script::result_line(id, result))?;
