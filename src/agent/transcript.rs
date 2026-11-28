@@ -15,7 +15,7 @@ pub use brindle_transcript::{
 
 /// What the zone's tests build tool content with.
 #[cfg(test)]
-pub use brindle_transcript::{Hunk, Location};
+pub use brindle_transcript::{Hunk, ITEM_LIMIT, Location};
 
 /// What the zone's tests build conversations with; the zone itself reads
 /// only whether one is continuable.
