@@ -34,8 +34,8 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use brindle_remote_protocol::SessionId;
-use brindle_remote_protocol::client::{Hello, Policy};
+use brindle_remote_protocol::client::{Hello, Policy, ToCore};
+use brindle_remote_protocol::{RequestId, SessionId};
 use brindle_remote_protocol::holder::{MAX_CHECKPOINT_LEN, SpawnMode};
 use brindle_transcript::PAGE_BYTES;
 
@@ -800,7 +800,6 @@ pub(super) struct FetchView {
 /// Why an `AGENT_FETCH` is refused; its text is the `ERROR`'s.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FetchRefusal {
-    NeedsAgentProtocol(NeedsAgentProtocol),
     NoSession(SessionId),
     NotAgent(SessionId),
     NotAttached(SessionId),
@@ -810,7 +809,6 @@ pub(super) enum FetchRefusal {
 impl fmt::Display for FetchRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NeedsAgentProtocol(refusal) => refusal.fmt(f),
             Self::NoSession(id) => write!(f, "no session {id}"),
             Self::NotAgent(id) => write!(f, "session {id} isn't an agent session"),
             Self::NotAttached(id) => write!(f, "session {id} isn't attached to this client"),
@@ -819,18 +817,15 @@ impl fmt::Display for FetchRefusal {
     }
 }
 
-/// Why a client on `protocol` can't fetch from session `id` (`session`,
-/// if there is one): only the client it is attached to may, once that
-/// client has its replay (decision 5). A fetch reads the core's log, so
-/// the agent's phase doesn't matter.
+/// Why a client can't fetch from session `id` (`session`, if there is
+/// one): only the client it is attached to may, once that client has its
+/// replay (decision 5). A fetch reads the core's log, so the agent's phase
+/// doesn't matter. Its protocol is `handle_client`'s gate's
+/// ([`agent_request`]).
 pub(super) fn agent_fetch_refusal(
     id: SessionId,
     session: Option<FetchView>,
-    protocol: u32,
 ) -> Option<FetchRefusal> {
-    if let Some(refusal) = agent_request_refusal(protocol, AgentRequest::Fetch) {
-        return Some(FetchRefusal::NeedsAgentProtocol(refusal));
-    }
     let Some(session) = session else {
         return Some(FetchRefusal::NoSession(id));
     };
@@ -909,6 +904,73 @@ pub(super) fn agent_request_refusal(
     request: AgentRequest,
 ) -> Option<NeedsAgentProtocol> {
     (protocol < AGENT_PROTOCOL).then_some(NeedsAgentProtocol(request))
+}
+
+/// A client protocol 4 message, as the gate in `handle_client` reads it:
+/// which it is, and the request and session its `ERROR` names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Gated {
+    pub(super) request: AgentRequest,
+    pub(super) req: Option<RequestId>,
+    pub(super) session: Option<SessionId>,
+}
+
+/// The gate `message` passes, when it is an agent message; `None` for
+/// every other. Exhaustive, so a new message is classified to compile.
+pub(super) fn agent_request(message: &ToCore) -> Option<Gated> {
+    let gated = |request, req, session| {
+        Some(Gated {
+            request,
+            req,
+            session,
+        })
+    };
+    match message {
+        ToCore::Hello(_)
+        | ToCore::Spawn(_)
+        | ToCore::Data(_)
+        | ToCore::Resize(_)
+        | ToCore::Close(_)
+        | ToCore::Attach(_)
+        | ToCore::Detach(_)
+        | ToCore::List(_)
+        | ToCore::Kill(_)
+        | ToCore::Status(_)
+        | ToCore::Stop(_)
+        | ToCore::StepDown(_)
+        | ToCore::Reparent(_)
+        | ToCore::SetLayout(_) => None,
+        ToCore::SpawnAgent(spawn) => gated(AgentRequest::Spawn, Some(spawn.req), None),
+        ToCore::AgentPrompt(prompt) => {
+            gated(AgentRequest::Prompt, Some(prompt.req), Some(prompt.session))
+        }
+        ToCore::AgentCancel(target) => gated(AgentRequest::Cancel, None, Some(target.session)),
+        ToCore::AgentPermission(answer) => {
+            gated(AgentRequest::Permission, Some(answer.req), Some(answer.session))
+        }
+        ToCore::AgentUnqueue(request) => {
+            gated(AgentRequest::Unqueue, Some(request.req), Some(request.session))
+        }
+        ToCore::AgentResend(request) => {
+            gated(AgentRequest::Resend, Some(request.req), Some(request.session))
+        }
+        ToCore::AgentRestart(restart) => {
+            gated(AgentRequest::Restart, Some(restart.req), Some(restart.session))
+        }
+        ToCore::AgentLogin(login) => {
+            gated(AgentRequest::Login, Some(login.req), Some(login.session))
+        }
+        ToCore::AgentFetch(fetch) => {
+            gated(AgentRequest::Fetch, Some(fetch.req), Some(fetch.session))
+        }
+        ToCore::AgentList(list) => gated(AgentRequest::List, Some(list.req), Some(list.session)),
+        ToCore::AgentChoose(choose) => {
+            gated(AgentRequest::Choose, Some(choose.req), Some(choose.session))
+        }
+        ToCore::AgentSetOption(set) => {
+            gated(AgentRequest::SetOption, Some(set.req), Some(set.session))
+        }
+    }
 }
 
 /// What [`attach_refusal`] and [`returning`] read of a session.
@@ -1767,6 +1829,180 @@ mod tests {
     }
 
     #[test]
+    fn every_agent_message_is_gated_with_its_request_and_session() {
+        use brindle_remote_protocol::client::{
+            self, AgentChoose, AgentFetch, AgentList, AgentLogin, AgentPermission, AgentPrompt,
+            AgentSetOption, OptionValue, SessionRef, SpawnAgent,
+        };
+        let request = client::AgentRequest { req: 5, session: 9 };
+        let cases = [
+            (
+                ToCore::SpawnAgent(SpawnAgent {
+                    req: 5,
+                    ..SpawnAgent::default()
+                }),
+                AgentRequest::Spawn,
+                Some(5),
+                None,
+            ),
+            (
+                ToCore::AgentPrompt(AgentPrompt {
+                    req: 5,
+                    session: 9,
+                    text: "hi".into(),
+                }),
+                AgentRequest::Prompt,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentCancel(SessionRef { session: 9 }),
+                AgentRequest::Cancel,
+                None,
+                Some(9),
+            ),
+            (
+                ToCore::AgentPermission(AgentPermission {
+                    req: 5,
+                    session: 9,
+                    entry: 3,
+                    option: None,
+                }),
+                AgentRequest::Permission,
+                Some(5),
+                Some(9),
+            ),
+            (ToCore::AgentUnqueue(request.clone()), AgentRequest::Unqueue, Some(5), Some(9)),
+            (ToCore::AgentResend(request), AgentRequest::Resend, Some(5), Some(9)),
+            (
+                ToCore::AgentRestart(AgentRestart {
+                    req: 5,
+                    session: 9,
+                    ..AgentRestart::default()
+                }),
+                AgentRequest::Restart,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentLogin(AgentLogin {
+                    req: 5,
+                    session: 9,
+                    method: "m".into(),
+                }),
+                AgentRequest::Login,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentFetch(AgentFetch {
+                    req: 5,
+                    session: 9,
+                    before: 1,
+                    max_bytes: 0,
+                }),
+                AgentRequest::Fetch,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentList(AgentList {
+                    req: 5,
+                    session: 9,
+                    cursor: None,
+                }),
+                AgentRequest::List,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentChoose(AgentChoose {
+                    req: 5,
+                    session: 9,
+                    conversation: None,
+                }),
+                AgentRequest::Choose,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentSetOption(AgentSetOption {
+                    req: 5,
+                    session: 9,
+                    option: "mode".into(),
+                    value: OptionValue::Toggle { on: true },
+                }),
+                AgentRequest::SetOption,
+                Some(5),
+                Some(9),
+            ),
+        ];
+        for (message, request, req, session) in cases {
+            assert_eq!(
+                agent_request(&message),
+                Some(Gated {
+                    request,
+                    req,
+                    session
+                }),
+                "{message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_terminal_message_is_gated() {
+        use brindle_remote_protocol::client::{
+            Attach, Data, Detach, Kill, KillTarget, Reparent, Request, Resize, SessionRef,
+            SetLayout,
+        };
+        let terminal = match spawn() {
+            SpawnRequest::Terminal(spawn) => spawn,
+            SpawnRequest::Agent { .. } => unreachable!("a terminal's spawn"),
+        };
+        let messages = [
+            ToCore::Hello(Hello::default()),
+            ToCore::Spawn(terminal),
+            ToCore::Data(Data {
+                session: 9,
+                bytes: b"x".to_vec(),
+            }),
+            ToCore::Resize(Resize {
+                session: 9,
+                cols: 80,
+                rows: 24,
+                cell_w: 0,
+                cell_h: 0,
+            }),
+            ToCore::Close(SessionRef { session: 9 }),
+            ToCore::Attach(Attach {
+                req: 5,
+                session: 9,
+                cols: 80,
+                rows: 24,
+                page: None,
+            }),
+            ToCore::Detach(Detach::default()),
+            ToCore::List(Request { req: 5 }),
+            ToCore::Kill(Kill {
+                req: 5,
+                target: KillTarget::All,
+            }),
+            ToCore::Status(Request { req: 5 }),
+            ToCore::Stop(Request { req: 5 }),
+            ToCore::StepDown(Request { req: 5 }),
+            ToCore::Reparent(Reparent {
+                session: 9,
+                hwnd: 0,
+            }),
+            ToCore::SetLayout(SetLayout::default()),
+        ];
+        for message in messages {
+            assert_eq!(agent_request(&message), None, "{message:?}");
+        }
+    }
+
+    #[test]
     fn an_agent_spawn_needs_a_command() {
         for command in ["", "  ", "\t"] {
             assert_eq!(agent_spawn_refusal(command), Some("an agent session needs a command"));
@@ -1974,24 +2210,20 @@ mod tests {
             attached_here,
             replay_pending,
         };
-        let refused = |session, protocol| agent_fetch_refusal(2, session, protocol).map(|r| r.to_string());
+        let refused = |session| agent_fetch_refusal(2, session).map(|r| r.to_string());
         let ready = view(SessionKind::Agent, true, false);
-        assert_eq!(refused(Some(ready), 4), None);
+        assert_eq!(refused(Some(ready)), None);
+        assert_eq!(refused(None).as_deref(), Some("no session 2"));
         assert_eq!(
-            refused(Some(ready), 3).as_deref(),
-            Some("AGENT_FETCH needs client protocol 4")
-        );
-        assert_eq!(refused(None, 4).as_deref(), Some("no session 2"));
-        assert_eq!(
-            refused(Some(view(SessionKind::Terminal, true, false)), 4).as_deref(),
+            refused(Some(view(SessionKind::Terminal, true, false))).as_deref(),
             Some("session 2 isn't an agent session")
         );
         assert_eq!(
-            refused(Some(view(SessionKind::Agent, false, false)), 4).as_deref(),
+            refused(Some(view(SessionKind::Agent, false, false))).as_deref(),
             Some("session 2 isn't attached to this client")
         );
         assert_eq!(
-            refused(Some(view(SessionKind::Agent, true, true)), 4).as_deref(),
+            refused(Some(view(SessionKind::Agent, true, true))).as_deref(),
             Some("session 2's replay hasn't ended")
         );
     }

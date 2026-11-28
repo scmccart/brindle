@@ -11,7 +11,7 @@ use brindle_remote_protocol::client::{self, ErrorMessage, Hello, ToClient, ToCor
 use brindle_remote_protocol::{RequestId, SessionId};
 
 use super::agents::AgentCommand;
-use super::policy::{self, ClientOptions, Mark};
+use super::policy::{self, ClientOptions, Gated, Mark};
 use super::{Core, DEAD_CLIENT_READ_LIMIT, Source, log};
 use crate::server::conn::Conn;
 use crate::server::event_loop::{EventLoop, Interest, Token};
@@ -310,6 +310,19 @@ impl<L: EventLoop> Core<L> {
     }
 
     fn handle_client(&mut self, client: Token, message: ToCore) {
+        // Client protocol 4's agent messages are refused below 4, each
+        // with its own request and session, before anything reads them.
+        if let Some(Gated {
+            request,
+            req,
+            session,
+        }) = policy::agent_request(&message)
+        {
+            let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
+            if let Some(refusal) = policy::agent_request_refusal(protocol, request) {
+                return self.send_client(client, error(req, session, refusal.to_string()));
+            }
+        }
         match message {
             ToCore::Hello(_) => self.send_client(
                 client,
@@ -328,8 +341,8 @@ impl<L: EventLoop> Core<L> {
             ToCore::Status(request) => self.client_status(client, request.req),
             ToCore::Stop(request) => self.client_stop(client, request.req),
             ToCore::StepDown(request) => self.client_step_down(client, request.req),
-            // Client protocol 4's agent sessions (`agents.rs`); each is
-            // refused below 4.
+            // Client protocol 4's agent sessions (`agents.rs`), past the
+            // gate above.
             ToCore::SpawnAgent(spawn) => self.client_spawn_agent(client, spawn),
             ToCore::AgentPrompt(prompt) => {
                 self.client_agent_command(client, AgentCommand::prompt(prompt))
