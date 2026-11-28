@@ -521,7 +521,7 @@ fn agent_ready(log: &Transcript) -> bool {
 fn says(log: &Transcript) -> Vec<String> {
     log.entries()
         .filter_map(|(_, entry)| match entry {
-            Entry::User { text } => Some(format!("user: {text}")),
+            Entry::User { text, .. } => Some(format!("user: {text}")),
             Entry::Agent { text } => Some(format!("agent: {text}")),
             Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
         })
@@ -644,10 +644,7 @@ fn a_held_prompt_survives_an_upgrade_and_is_sent_again() {
     client.prompt(id, "one").unwrap();
     client.prompt(id, "two").unwrap();
     gate.open();
-    let hold = Slot::Held {
-        text: "two".into(),
-        reason: HoldReason::Stopped { stop: StopReason::MaxTokens },
-    };
+    let hold = Slot::held("two", HoldReason::Stopped { stop: StopReason::MaxTokens });
     let before = client.transcript_until(id, "holds the prompt", |log| *log.slot() == hold);
 
     let mut client = upgraded(&mut dir, &mut client, id, pid);

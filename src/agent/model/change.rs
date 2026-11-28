@@ -270,8 +270,8 @@ impl ChatModel {
         Some(match (dirty, own, source) {
             (
                 Dirty::Appended { from_byte },
-                Entry::User { text: own } | Entry::Agent { text: own } | Entry::Thought { text: own },
-                Entry::User { text } | Entry::Agent { text } | Entry::Thought { text },
+                Entry::User { text: own, .. } | Entry::Agent { text: own } | Entry::Thought { text: own },
+                Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text },
             ) if own.len() == from_byte && text.is_char_boundary(from_byte) => {
                 Copied::Tail { from_byte, text: text[from_byte..].to_string() }
             }
@@ -439,7 +439,7 @@ impl ChatModel {
         let mark = match (copied, own) {
             (
                 Copied::Tail { from_byte, text },
-                Entry::User { text: own } | Entry::Agent { text: own } | Entry::Thought { text: own },
+                Entry::User { text: own, .. } | Entry::Agent { text: own } | Entry::Thought { text: own },
             ) if own.len() == from_byte => {
                 own.push_str(&text);
                 self.undrawn.outputs.remove(&id);
@@ -660,7 +660,7 @@ impl ChatModel {
         let (range, fresh) = match entry {
             // A grown user message's earlier parts don't change: only its
             // last and new ones are drawn again.
-            Entry::User { text } if mark == Mark::Grown && !range.is_empty() => {
+            Entry::User { text, .. } if mark == Mark::Grown && !range.is_empty() => {
                 let last = &self.blocks[range.end - 1];
                 (range.end - 1..range.end, super::blocks::user_blocks(id, text, last.part, last.start))
             }

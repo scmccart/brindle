@@ -278,7 +278,7 @@ pub fn added(id: u64, entry: Entry) -> Event {
 }
 
 pub fn user(text: &str) -> Entry {
-    Entry::User { text: text.into() }
+    Entry::user(text)
 }
 
 pub fn agent(text: &str) -> Entry {

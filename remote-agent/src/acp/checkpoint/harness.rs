@@ -103,7 +103,7 @@ impl Agent {
     }
 
     pub(super) fn prompt(&mut self, text: &str) -> Output {
-        self.step(Input::Command(Command::Prompt { text: text.into() }))
+        self.step(Input::Command(Command::prompt(text)))
     }
 
     /// Mid-turn (prompt 3 out) with a tool call, a waiting permission

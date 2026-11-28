@@ -120,7 +120,7 @@ fn prompts_go_through_the_model_and_their_answers_come_back() {
         agent.answer(EntryId(9), "allow-once", cx);
     });
     assert_eq!(zone.take_calls(), [Call::Prompt("lost".into())], "nothing else to act on");
-    zone.feed(&[Event::Turn { state: TurnState::Working }, Event::Queue { slot: Slot::Waiting { text: "next".into() } }]);
+    zone.feed(&[Event::Turn { state: TurnState::Working }, Event::Queue { slot: Slot::waiting("next") }]);
     settle(&cx);
     zone.agent.update(&mut cx, |agent, cx| {
         agent.cancel(cx);

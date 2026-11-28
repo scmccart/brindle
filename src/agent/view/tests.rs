@@ -113,11 +113,11 @@ fn slot(slot: Slot) -> Event {
 }
 
 fn waiting() -> Slot {
-    Slot::Waiting { text: "next".into() }
+    Slot::waiting("next")
 }
 
 fn held() -> Slot {
-    Slot::Held { text: "next".into(), reason: HoldReason::Cancelled }
+    Slot::held("next", HoldReason::Cancelled)
 }
 
 fn permission() -> Entry {
@@ -432,7 +432,7 @@ fn the_draft_is_unchanged_when_a_prompt_becomes_held() {
     let mut f = Fixture::new();
     f.feed(&[ready(), working(), slot(waiting())]);
     f.cx.simulate_input("typing");
-    f.feed(&[ended(StopReason::MaxTokens), slot(Slot::Held { text: "next".into(), reason: HoldReason::Stopped { stop: StopReason::MaxTokens } })]);
+    f.feed(&[ended(StopReason::MaxTokens), slot(Slot::held("next", HoldReason::Stopped { stop: StopReason::MaxTokens }))]);
     assert_eq!(f.draft(), "typing");
     assert!(matches!(f.queued(), Some(Queued::Held { .. })));
 }

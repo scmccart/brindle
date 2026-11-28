@@ -530,7 +530,7 @@ mod tests {
         })));
         assert!(has_detail(&with(base.clone(), |e| if let Entry::Tool { input, .. } = e { *input = Some("{}".into()) })));
         assert!(has_detail(&with(base, |e| if let Entry::Tool { result, .. } = e { *result = Some("ok".into()) })));
-        assert!(!has_detail(&Entry::User { text: "hi".into() }));
+        assert!(!has_detail(&Entry::user("hi")));
     }
 
     #[test]

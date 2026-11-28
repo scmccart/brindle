@@ -1537,7 +1537,7 @@ mod tests {
                     level: NoticeLevel::Info,
                     text: REPLAY_SHOWN.into()
                 },
-                Entry::User { text: "hi".into() },
+                Entry::user("hi"),
                 Entry::Agent {
                     text: "hello".into()
                 },
@@ -1719,7 +1719,7 @@ mod tests {
             .s
             .transcript()
             .entries()
-            .find(|(_, entry)| matches!(entry, Entry::User { text } if text == "again"))
+            .find(|(_, entry)| matches!(entry, Entry::User { text, .. } if text == "again"))
             .map(|(id, entry)| (id, entry.clone()))
             .expect("the prompt's entry");
         assert!(matches!(entry, Entry::User { .. }));

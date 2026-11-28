@@ -325,7 +325,7 @@ fn ended(turns: usize) -> impl FnMut(&Transcript) -> bool {
 fn says(log: &Transcript) -> Vec<String> {
     log.entries()
         .filter_map(|(_, entry)| match entry {
-            Entry::User { text } => Some(format!("user: {text}")),
+            Entry::User { text, .. } => Some(format!("user: {text}")),
             Entry::Agent { text } => Some(format!("agent: {text}")),
             Entry::Thought { .. } | Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
         })
@@ -631,11 +631,11 @@ fn slot_is(slot: Slot) -> impl FnMut(&Transcript) -> bool {
 }
 
 fn waiting(text: &str) -> Slot {
-    Slot::Waiting { text: text.into() }
+    Slot::waiting(text)
 }
 
 fn held(text: &str, reason: HoldReason) -> Slot {
-    Slot::Held { text: text.into(), reason }
+    Slot::held(text, reason)
 }
 
 fn end(stop: StopReason) -> TurnState {
@@ -646,7 +646,7 @@ fn end(stop: StopReason) -> TurnState {
 fn shape(event: &Event) -> String {
     match event {
         Event::Added { entry, .. } => match entry {
-            Entry::User { text } => format!("user {text}"),
+            Entry::User { text, .. } => format!("user {text}"),
             Entry::Agent { text } => format!("agent {text}"),
             Entry::Thought { text } => format!("thought {text}"),
             Entry::Tool { call, .. } => format!("tool {call}"),
@@ -660,8 +660,8 @@ fn shape(event: &Event) -> String {
         Event::Answered { outcome, .. } => format!("answered {outcome:?}"),
         Event::Queue { slot } => match slot {
             Slot::Empty => "queue empty".into(),
-            Slot::Waiting { text } => format!("queue waiting {text}"),
-            Slot::Held { text, reason } => format!("queue held {text} {reason:?}"),
+            Slot::Waiting { text, .. } => format!("queue waiting {text}"),
+            Slot::Held { text, reason, .. } => format!("queue held {text} {reason:?}"),
         },
         Event::Turn { state } => format!("turn {state:?}"),
         Event::Agent { state } => format!("state {state:?}"),
@@ -985,7 +985,7 @@ fn text_passes_unchanged_and_control_characters_are_replaced() {
     assert_eq!(
         entries,
         [
-            &Entry::User { text: "hi".into() },
+            &Entry::user("hi"),
             &Entry::Agent { text: kept.into() },
             &Entry::Thought { text: "clear \u{FFFD}[2J screen".into() },
         ]
@@ -2369,7 +2369,7 @@ fn an_exit_is_kept_for_its_conversation_and_continued_by_resume() {
     assert_eq!(says(&log), ["user: one", "agent: first", "user: two", "agent: second"]);
     let two = log
         .entries()
-        .find_map(|(entry, kept)| matches!(kept, Entry::User { text } if text == "two").then_some(entry));
+        .find_map(|(entry, kept)| matches!(kept, Entry::User { text, .. } if text == "two").then_some(entry));
     assert_eq!(two, Some(next));
     assert_eq!(prompts(&record), ["two"]);
 }
@@ -3006,7 +3006,7 @@ fn an_ended_agents_session_is_fetched_from_before_and_after_it_is_continued() {
     let id = ended_and_kept(&mut client, &mut dir, "page-ended", RESUME_AND_LOAD);
     let (events, more) = client.fetch(id, 2, 1024).unwrap();
     assert!(!more);
-    assert!(matches!(events.as_slice(), [Event::Added { entry: Entry::User { text }, .. }] if text == "one"));
+    assert!(matches!(events.as_slice(), [Event::Added { entry: Entry::User { text, .. }, .. }] if text == "one"));
 
     let (mut again, _) = initialized(&dir.path, "page-ended-again", RESUME_ONLY);
     again.step("expect session/resume").step("respond {}");

@@ -53,8 +53,8 @@ use brindle_remote_protocol::RequestId;
 use brindle_remote_protocol::client::OptionValue;
 use brindle_remote_protocol::serde_json::Value;
 use brindle_transcript::{
-    AgentState, Conversation, Entry, EntryId, Event, LoginMethod, NoticeLevel, Slot, Transcript,
-    TurnState, chunks, clean,
+    AgentState, Attachment, Conversation, Entry, EntryId, Event, LoginMethod, NoticeLevel, Slot,
+    Transcript, TurnState, chunks, clean,
 };
 use brindle_transcript::{HoldReason, MAX_EVENT};
 
@@ -342,8 +342,13 @@ pub enum Input<'a> {
 /// A client's command for an agent session (client protocol 4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// `AGENT_PROMPT`.
-    Prompt { text: String },
+    /// `AGENT_PROMPT`, with its attachments in the client's order, a text
+    /// one already kept by the core under its id (OpenSpec change
+    /// `agents-prompt-context`).
+    Prompt {
+        text: String,
+        attachments: Vec<Attachment>,
+    },
     /// `AGENT_UNQUEUE`: discard the slot's prompt, waiting or held.
     Unqueue,
     /// `AGENT_RESEND`: send the held prompt again.
@@ -370,6 +375,16 @@ pub enum Command {
     /// `AGENT_SET_OPTION`: set the session option `option` to `value`
     /// (OpenSpec change `agents-commands`, decision 4).
     SetOption { option: String, value: OptionValue },
+}
+
+impl Command {
+    /// A prompt of `text` alone.
+    pub fn prompt(text: impl Into<String>) -> Self {
+        Self::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
 }
 
 /// Why a client's command was refused; its text is the `ERROR`'s, which
@@ -694,16 +709,6 @@ impl Step<'_> {
         id
     }
 
-    /// Adds a text entry of `kind` holding `text` (continued in more
-    /// entries past [`ENTRY_LIMIT`]), and makes the last the chunk run.
-    /// The first entry's id.
-    fn add_text(&mut self, kind: RunKind, text: &str) -> EntryId {
-        let id = self.s.transcript.next_id();
-        self.s.process.run = None;
-        self.text_run(kind, text);
-        id
-    }
-
     /// Streams `text` into the chunk run of `kind` (`agents-event-bounds`
     /// decision 2, A-1): appended to the run's entry while it holds less
     /// than [`ENTRY_LIMIT`], and continued past it in a new entry of the
@@ -758,14 +763,45 @@ impl Step<'_> {
         }
     }
 
+    /// Adds a text entry of `kind` holding `text` (continued in more
+    /// entries past [`ENTRY_LIMIT`]), and makes the last the chunk run.
+    /// The first entry's id.
+    #[cfg(test)]
+    fn add_text(&mut self, kind: RunKind, text: &str) -> EntryId {
+        let id = self.s.transcript.next_id();
+        self.s.process.run = None;
+        self.text_run(kind, text);
+        id
+    }
+
     /// A new text entry of `kind` holding `text`, split into `Appended`s,
     /// made the chunk run.
     fn new_text_entry(&mut self, kind: RunKind, text: &str) {
+        self.new_text_entry_with(kind, text, Vec::new());
+    }
+
+    /// A prompt's user entry, with its attachments (OpenSpec change
+    /// `agents-prompt-context`): one entry, since a prompt is at most
+    /// [`MAX_PROMPT`], within [`ENTRY_LIMIT`]. Returns its id.
+    fn add_prompt(&mut self, text: &str, attachments: Vec<Attachment>) -> EntryId {
+        const _: () = assert!(MAX_PROMPT <= ENTRY_LIMIT);
+        let id = self.s.transcript.next_id();
+        self.s.process.run = None;
+        self.new_text_entry_with(RunKind::User, text, attachments);
+        id
+    }
+
+    /// [`Step::new_text_entry`] with a user entry's attachments, which any
+    /// other kind leaves out.
+    fn new_text_entry_with(&mut self, kind: RunKind, text: &str, attachments: Vec<Attachment>) {
         let id = self.s.transcript.next_id();
         let mut pieces = chunks(text);
         let first = pieces.next().unwrap_or_default().to_owned();
         let entry = match kind {
-            RunKind::User => Entry::User { text: first },
+            RunKind::User => Entry::User {
+                text: first,
+                attachments,
+            },
             RunKind::Agent => Entry::Agent { text: first },
             RunKind::Thought => Entry::Thought { text: first },
         };
@@ -796,10 +832,14 @@ impl Step<'_> {
 
     /// Holds a waiting prompt with `reason`; an empty or held slot stays.
     fn hold_waiting(&mut self, reason: HoldReason) {
-        if let Slot::Waiting { text } = self.s.transcript.slot() {
-            let text = text.clone();
+        if let Slot::Waiting { text, attachments } = self.s.transcript.slot() {
+            let (text, attachments) = (text.clone(), attachments.clone());
             self.emit(Event::Queue {
-                slot: Slot::Held { text, reason },
+                slot: Slot::Held {
+                    text,
+                    reason,
+                    attachments,
+                },
             });
             self.mark(Moment::QueueChanged);
         }
@@ -1242,7 +1282,7 @@ impl Step<'_> {
 
     fn command(&mut self, command: Command) {
         let reply = match command {
-            Command::Prompt { text } => self.prompt(&text),
+            Command::Prompt { text, attachments } => self.prompt(&text, attachments),
             Command::Unqueue => self.unqueue(),
             Command::Resend => self.resend(),
             Command::Cancel => {
@@ -1361,7 +1401,7 @@ fn oversized(event: &Event, len: usize, limit: usize) -> String {
 /// other entry.
 fn text_len(entry: &Entry) -> Option<usize> {
     match entry {
-        Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => Some(text.len()),
+        Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text } => Some(text.len()),
         Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => None,
     }
 }
@@ -1661,9 +1701,7 @@ mod tests {
         agent.prompt("a\u{1b}b");
         assert_eq!(
             agent.entries()[0],
-            Entry::User {
-                text: "a\u{fffd}b".into()
-            }
+            Entry::user("a\u{fffd}b")
         );
         assert_eq!(
             agent.last("session/prompt")["params"]["prompt"][0]["text"],
@@ -2605,7 +2643,7 @@ mod tests {
             .into_iter()
             .skip(1)
             .map(|entry| match entry {
-                Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => text,
+                Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text } => text,
                 other => panic!("not text: {other:?}"),
             })
             .collect()
@@ -2963,7 +3001,7 @@ mod tests {
         agent.event_limit = LOW_LIMIT;
         let text = "q".repeat(1000);
         let len = Event::Queue {
-            slot: Slot::Waiting { text: text.clone() },
+            slot: Slot::waiting(text.clone()),
         }
         .encoded_len();
         let out = agent.prompt(&text);

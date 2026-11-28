@@ -443,7 +443,7 @@ fn marked(input: &Input<'_>, marker: Option<&[u8]>) -> bool {
     };
     let bytes: &[u8] = match input {
         Input::Stdout(bytes) => bytes,
-        Input::Command(Command::Prompt { text }) => text.as_bytes(),
+        Input::Command(Command::Prompt { text, .. }) => text.as_bytes(),
         Input::Spawned
         | Input::OutputLost
         | Input::Exited { .. }
@@ -478,7 +478,7 @@ impl AgentCommand {
         Self {
             req: Some(prompt.req),
             session: prompt.session,
-            command: Command::Prompt { text: prompt.text },
+            command: Command::prompt(prompt.text),
         }
     }
 

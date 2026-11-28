@@ -133,7 +133,7 @@ pub(super) fn tool_completed(id: u64) -> Event {
 }
 
 pub(super) fn user(text: &str) -> Entry {
-    Entry::User { text: text.into() }
+    Entry::user(text)
 }
 
 pub(super) fn agent(text: &str) -> Entry {
@@ -161,11 +161,11 @@ pub(super) fn permission(title: &str) -> Entry {
 }
 
 pub(super) fn waiting() -> Slot {
-    Slot::Waiting { text: "next".into() }
+    Slot::waiting("next")
 }
 
 pub(super) fn held(reason: HoldReason) -> Slot {
-    Slot::Held { text: "next".into(), reason }
+    Slot::held("next", reason)
 }
 
 pub(super) fn texts(model: &ChatModel) -> Vec<String> {

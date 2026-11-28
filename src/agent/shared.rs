@@ -287,7 +287,7 @@ impl AgentShared {
 /// without one.
 fn text_len(entry: &Entry) -> usize {
     match entry {
-        Entry::User { text } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
+        Entry::User { text, .. } | Entry::Agent { text } | Entry::Thought { text } => text.len(),
         Entry::Tool { .. } | Entry::Permission { .. } | Entry::Notice { .. } => 0,
     }
 }
@@ -330,7 +330,7 @@ mod tests {
     fn every_event_kind_folds_and_says_what_changed() {
         let mut shared = AgentShared::new();
         let first = [
-            added(1, Entry::User { text: "hi".into() }),
+            added(1, Entry::user("hi")),
             added(2, agent("Hel")),
             added(3, Entry::Thought { text: "hmm".into() }),
             added(4, tool()),
@@ -356,7 +356,7 @@ mod tests {
                 more: None,
             },
             Event::Answered { id: EntryId(5), outcome: PermissionOutcome::Selected { option: "allow-once".into() } },
-            Event::Queue { slot: Slot::Waiting { text: "next".into() } },
+            Event::Queue { slot: Slot::waiting("next") },
             Event::Turn { state: TurnState::Working },
             Event::Agent { state: AgentState::Ready { name: Some("Fake Agent".into()), version: None } },
             added(7, agent("new")),
@@ -402,12 +402,12 @@ mod tests {
     #[test]
     fn a_replay_starts_over_and_carries_the_slot() {
         for slot in [
-            Slot::Waiting { text: "next".into() },
-            Slot::Held { text: "next".into(), reason: HoldReason::Stopped { stop: StopReason::MaxTokens } },
+            Slot::waiting("next"),
+            Slot::held("next", HoldReason::Stopped { stop: StopReason::MaxTokens }),
         ] {
             let mut source = Transcript::new();
             for event in [
-                added(1, Entry::User { text: "hi".into() }),
+                added(1, Entry::user("hi")),
                 added(2, agent("Hello!")),
                 Event::Queue { slot: slot.clone() },
                 Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } },
@@ -549,7 +549,7 @@ mod tests {
     fn a_replay_and_a_page_carry_tool_content() {
         let mut source = Transcript::new();
         for event in [
-            added(1, Entry::User { text: "go".into() }),
+            added(1, Entry::user("go")),
             added(2, tool()),
             items(2, 0, vec![ToolItem::Text { text: "**done**".into(), cut: false }, output("one\n")]),
             out(2, 1, "two\n"),
@@ -619,7 +619,7 @@ mod tests {
 
         let mut source = Transcript::new();
         for event in [
-            added(1, Entry::User { text: "hi".into() }),
+            added(1, Entry::user("hi")),
             Event::Agent { state: AgentState::Ready { name: None, version: None } },
             commands(),
             options(),

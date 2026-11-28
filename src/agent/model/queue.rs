@@ -106,8 +106,8 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
 pub fn queue_row(slot: &Slot, phase: &AgentPhase, life: SessionLife) -> QueueRow {
     match slot {
         Slot::Empty => QueueRow::None,
-        Slot::Waiting { text } => QueueRow::Waiting { text: text.clone().into() },
-        Slot::Held { text, reason } => QueueRow::Held {
+        Slot::Waiting { text, .. } => QueueRow::Waiting { text: text.clone().into() },
+        Slot::Held { text, reason, .. } => QueueRow::Held {
             text: text.clone().into(),
             reason: reason.clone(),
             why: hold_words(reason).into(),
@@ -177,7 +177,7 @@ impl ChatModel {
     pub fn queued_text(&self) -> Option<&str> {
         match &self.slot {
             Slot::Empty => None,
-            Slot::Waiting { text } | Slot::Held { text, .. } => Some(text),
+            Slot::Waiting { text, .. } | Slot::Held { text, .. } => Some(text),
         }
     }
 }
