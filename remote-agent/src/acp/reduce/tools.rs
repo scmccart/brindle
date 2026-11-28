@@ -866,7 +866,7 @@ mod tests {
             panic!("not one output");
         };
         assert!(kept.text.len() <= ITEM_LIMIT && kept.text.starts_with("test case "));
-        assert!(text.ends_with(&kept.text));
+        assert!(text.ends_with(kept.text.as_str()));
         assert_eq!(kept.omitted as usize + kept.text.len(), text.len());
     }
 

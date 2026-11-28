@@ -265,8 +265,7 @@ impl Transcript {
                 // re-encode per piece; `omitted`, `partial` and `exit` are
                 // measured alone.
                 let old = kept.size;
-                let size = (old + escaped_len(text) + after)
-                    .saturating_sub(escaped_len(&dropped) + before);
+                let size = (old + escaped_len(text) + after).saturating_sub(dropped + before);
                 kept.size = size;
                 self.size = self.size.saturating_sub(old) + size;
             }

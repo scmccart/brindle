@@ -398,7 +398,7 @@ pub fn summary(entry: &Entry) -> Option<SharedString> {
 pub fn copy_text(item: &ToolItem) -> String {
     match item {
         ToolItem::Text { text, .. } => text.clone(),
-        ToolItem::Output(output) => output.text.clone(),
+        ToolItem::Output(output) => output.text.to_string(),
         ToolItem::Diff(change) => {
             let (old, new) = match &change.op {
                 FileOp::Add => ("/dev/null".to_string(), change.path.clone()),
@@ -597,7 +597,7 @@ mod tests {
         assert!(!continues_into(&two[0], two.get(1)));
 
         let text: String = (0..120).map(|n| format!("{n}\n")).collect();
-        let mut cut = Output { text: text.clone(), exit: Some(Exit::Code { code: 2 }), ..Output::default() };
+        let mut cut = Output { text: text.clone().into(), exit: Some(Exit::Code { code: 2 }), ..Output::default() };
         cut.omitted = 1000;
         cut.partial = true;
         let parts = detail(&tool(vec![ToolItem::Output(cut)]));

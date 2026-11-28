@@ -3208,7 +3208,7 @@ fn tool_content(log: &Transcript) -> Vec<ToolItem> {
 /// The first tool entry's output: its text and exit.
 fn output_of(log: &Transcript) -> Option<(String, Option<Exit>)> {
     tool_content(log).into_iter().find_map(|item| match item {
-        ToolItem::Output(output) => Some((output.text, output.exit)),
+        ToolItem::Output(output) => Some((output.text.to_string(), output.exit)),
         ToolItem::Text { .. } | ToolItem::Diff(_) => None,
     })
 }

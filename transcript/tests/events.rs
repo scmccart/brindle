@@ -739,7 +739,7 @@ fn fixtures() -> Vec<(&'static str, Event)> {
                         ToolItem::Output(Output {
                             command: None,
                             cwd: None,
-                            text: String::new(),
+                            text: String::new().into(),
                             omitted: 0,
                             partial: false,
                             exit: Some(Exit::Signal {
@@ -774,7 +774,7 @@ fn fixtures() -> Vec<(&'static str, Event)> {
                 vec![ToolItem::Output(Output {
                     command: None,
                     cwd: Some("/p".into()),
-                    text: String::new(),
+                    text: String::new().into(),
                     omitted: 0,
                     partial: false,
                     exit: None,

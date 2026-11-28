@@ -249,7 +249,7 @@ mod tests {
         let output = ToolItem::Output(Output {
             command: Some(field.clone()),
             cwd: Some(quotes(MAX_PATH)),
-            text: quotes(ITEM_LIMIT),
+            text: quotes(ITEM_LIMIT).into(),
             omitted: u64::MAX,
             partial: true,
             exit: Some(Exit::Signal {

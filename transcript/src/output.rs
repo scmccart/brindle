@@ -1,7 +1,113 @@
-use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::ops::Deref;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::event::{is_false, is_zero_u64};
+use crate::fold::escaped_len;
 use crate::{Exit, ITEM_LIMIT};
+
+/// An output's text as it shows (OpenSpec change `agents-checkpoint-deltas`,
+/// decision 10): a buffer and where the shown text starts in it, so an
+/// append past [`ITEM_LIMIT`] advances the start instead of moving the
+/// kept text, and the buffer is compacted once the dropped prefix passes
+/// the limit. It reads, compares, clones, prints and encodes as the shown
+/// text alone, so no reader sees the prefix.
+#[derive(Default)]
+pub struct OutputText {
+    buf: String,
+    /// A character boundary of `buf`; at most [`ITEM_LIMIT`] after an
+    /// append.
+    start: usize,
+}
+
+impl OutputText {
+    pub fn as_str(&self) -> &str {
+        self.buf.get(self.start..).unwrap_or_default()
+    }
+
+    /// The bytes the buffer holds, the dropped prefix included.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+impl Deref for OutputText {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Clone for OutputText {
+    fn clone(&self) -> Self {
+        Self::from(self.as_str())
+    }
+}
+
+impl PartialEq for OutputText {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for OutputText {}
+
+impl PartialEq<str> for OutputText {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for OutputText {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for OutputText {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl fmt::Debug for OutputText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl fmt::Display for OutputText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<String> for OutputText {
+    fn from(buf: String) -> Self {
+        Self { buf, start: 0 }
+    }
+}
+
+impl From<&str> for OutputText {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_owned())
+    }
+}
+
+impl Serialize for OutputText {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for OutputText {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
 
 /// One command's output, as plain text. `omitted` counts the bytes dropped
 /// from its start past [`ITEM_LIMIT`]; `partial` says the kept text starts
@@ -13,7 +119,7 @@ pub struct Output {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    pub text: String,
+    pub text: OutputText,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub omitted: u64,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -28,25 +134,35 @@ impl Output {
     /// (design decision 8): whole lines are dropped from the start, and a
     /// single line longer than the limit keeps its last bytes, cut at a
     /// character boundary. Appending `a` then `b` gives what appending
-    /// `a + b` does. Returns the bytes dropped, for the entry's size.
-    pub(crate) fn append(&mut self, text: &str) -> String {
-        self.text.push_str(text);
+    /// `a + b` does. Returns the escaped length of the bytes dropped, for
+    /// the entry's size. The dropped bytes stay in the buffer until they
+    /// pass the limit ([`OutputText`]), so an append costs amortized
+    /// O(its length).
+    pub(crate) fn append(&mut self, text: &str) -> usize {
+        self.text.buf.push_str(text);
         let cut = self.cut();
         if cut == 0 {
-            return String::new();
+            return 0;
         }
-        let partial = self.text.as_bytes().get(cut - 1) != Some(&b'\n');
-        let dropped: String = self.text.drain(..cut).collect();
-        self.omitted = self.omitted.saturating_add(dropped.len() as u64);
+        let shown = self.text.as_str();
+        let partial = shown.as_bytes().get(cut - 1) != Some(&b'\n');
+        let dropped = shown.get(..cut).map_or(0, escaped_len);
+        self.omitted = self.omitted.saturating_add(cut as u64);
         self.partial = partial;
+        self.text.start += cut;
+        if self.text.start > ITEM_LIMIT {
+            self.text.buf.drain(..self.text.start);
+            self.text.start = 0;
+        }
         dropped
     }
 
-    /// Where the kept text starts: the first line start at or after the
-    /// limit's reach, or failing one the first character boundary there.
-    /// The text's own start is a line start unless it is `partial`.
+    /// Where the kept text starts, as an offset into the shown text: the
+    /// first line start at or after the limit's reach, or failing one the
+    /// first character boundary there. The text's own start is a line
+    /// start unless it is `partial`.
     fn cut(&self) -> usize {
-        let text = &self.text;
+        let text = self.text.as_str();
         let low = text.len().saturating_sub(ITEM_LIMIT);
         if low == 0 && !self.partial {
             return 0;
@@ -149,6 +265,74 @@ mod tests {
         assert_eq!(kept.text, "next");
         assert!(!kept.partial);
         assert_eq!(transcript.encoded_len(), measured(&transcript));
+    }
+
+    /// A-4 (`agents-checkpoint-deltas` decision 10): an output fed far past
+    /// its limit in small pieces keeps a start offset and compacts once
+    /// the dropped prefix passes the limit, so its buffer stays within
+    /// twice the limit plus a piece, and what it shows is what appending
+    /// the whole would keep.
+    #[test]
+    fn an_output_fed_a_mebibyte_in_32_byte_pieces_keeps_its_buffer_within_twice_the_limit() {
+        let line = "test case 000000 ... ok\n";
+        let text: String = (0..)
+            .map(|n| line.replace("000000", &format!("{n:06}")))
+            .take_while({
+                let mut len = 0;
+                move |line| {
+                    len += line.len();
+                    len <= 1024 * 1024
+                }
+            })
+            .collect();
+        let mut pieces = Output::default();
+        let mut dropped = 0;
+        for piece in text.as_bytes().chunks(32) {
+            dropped += pieces.append(std::str::from_utf8(piece).unwrap());
+            assert!(
+                pieces.text.held() <= 2 * ITEM_LIMIT + 32,
+                "{} bytes held",
+                pieces.text.held()
+            );
+        }
+        let mut whole = Output::default();
+        let dropped_whole = whole.append(&text);
+        assert_eq!(pieces, whole);
+        assert_eq!(dropped, dropped_whole, "the dropped text's escaped length");
+        assert!(pieces.text.len() <= ITEM_LIMIT);
+    }
+
+    /// `OutputText` reads, compares, encodes and clones as the text it
+    /// shows, never its dropped prefix.
+    #[test]
+    fn output_text_compares_encodes_and_clones_as_its_visible_text() {
+        let mut output = Output::default();
+        // A first line just under the limit, dropped when the second
+        // passes it: not yet past the limit itself, so not yet compacted.
+        output.append(&format!("{}\n", "a".repeat(ITEM_LIMIT - 3)));
+        output.append("kept\n");
+        assert_eq!(output.text, "kept\n");
+        assert_eq!(output.text.as_str(), "kept\n");
+        assert!(output.text == *"kept\n");
+        assert_eq!(output.text.len(), 5);
+        assert!(output.text.held() > ITEM_LIMIT, "the prefix is still held");
+        assert_eq!(serde_json::to_string(&output.text).unwrap(), r#""kept\n""#);
+        assert_eq!(format!("{:?}", output.text), r#""kept\n""#);
+        let cloned = output.text.clone();
+        assert_eq!(cloned, output.text);
+        assert_eq!(cloned.held(), 5, "a clone holds no dropped prefix");
+        let read: OutputText = serde_json::from_str(r#""kept\n""#).unwrap();
+        assert_eq!(read, output.text);
+        assert_eq!(read.held(), 5);
+        assert_eq!(OutputText::from("x"), OutputText::from(String::from("x")));
+        assert_ne!(OutputText::from("x"), OutputText::from("y"));
+        assert_eq!(OutputText::default(), "");
+        // The output encodes as one whose text was only ever "kept\n".
+        let fresh = Output {
+            text: "kept\n".into(),
+            ..output.clone()
+        };
+        assert_eq!(serde_json::to_vec(&output).unwrap(), serde_json::to_vec(&fresh).unwrap());
     }
 
     /// Folding `ToolOutput(a)` then `ToolOutput(b)` equals folding
