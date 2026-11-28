@@ -1,6 +1,7 @@
 //! The conversations palette (OpenSpec change `agents-session-list`): what
 //! the window knows of its zones for the conversations plans, the palette's
-//! lister and pages, and where a chosen conversation opens.
+//! lister and pages, and where a chosen conversation opens; and the agent
+//! options palette a zone opens the same way (`open_agent_options`).
 
 use std::path::PathBuf;
 
