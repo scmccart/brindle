@@ -303,6 +303,28 @@ Release build of dcbb88b7 (groups 1–2 only), under `scripts/with-xvfb`, run `t
 
 The output column (bytes into the shell) stays at 0.20 ms p50 in both. At 10 ms a chunk is its own update, so the trickled run renders about once per chunk: 1.44 renders per frame, and each render takes the whole growing fence (33 KiB on average).
 
+### After (task 9.1)
+
+Release build of a7d27374 (groups 2–8, frame gate included), under `scripts/with-xvfb`, run `target/tmp/perf/20261128T100136Z` with `BRINDLE_PERF_BASELINE` set to the before run:
+
+| | before | after |
+|---|---|---|
+| streamed: renders (bytes rendered) | 6 (234,976) | 2 (127,456) |
+| trickled: renders (bytes rendered) | 1,861 (62,159,232) | 1,100 (36,373,824) |
+| trickled time | 21,549.87 ms | 21,516.12 ms |
+| streamed / one chunk | 2266.75 / 2263.58 ms | 2258.85 / 2261.69 ms |
+| `agent-tool-output` streamed / one chunk / 32 B | 2256.89 / 2257.22 / 2209.77 ms | 2253.49 / 2252.18 / 2213.66 ms |
+| `agent-attach-long` | 2594 ms (change 6's run, `target-cd/tmp/perf/20261128T071449Z`; the before run here didn't take it) | 2593.19 ms |
+
+| latency (ms), before → after | p50 | p95 | p99 |
+|---|---|---|---|
+| quiet: paint | 7.01 → 8.04 | 9.11 → 9.13 | 9.26 → 9.28 |
+| quiet: frame | 21.94 → 22.99 | 24.05 → 24.05 | 32.04 → 24.13 |
+| trickle: paint | 6.37 → 6.31 | 17.95 → 18.33 | 22.79 → 22.70 |
+| trickle: frame | 20.57 → 20.59 | 35.88 → 35.19 | 46.53 → 45.39 |
+
+The trickled run renders 1,100 times in 21.5 s, under the 1,291 frames of 60 a second, and renders 42% fewer bytes; the run just after 7.3 (`20261128T095930Z`) gave 991, so the count moves by about a tenth run to run. `agent-tool-output` and `agent-attach-long` didn't get slower. The latency cases moved within run-to-run noise: the quiet case runs beside an idle zone, which this change doesn't touch (its p50's +1 ms is that noise), and in the trickle case the reply again ended before the bench (`stream_outlasted = false`, flag 3), so its tail is partly an idle zone's. The shell's latency beside a streaming zone wasn't shown to change either way. Both runs' notes say `X11 :0`: that was `with-xvfb`'s own Xvfb, which took `:0` because no X server held it.
+
 ### Flags
 
 1. The base was #158's head before it merged (above).
