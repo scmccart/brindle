@@ -31,14 +31,16 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 2. Shared contracts: the transcript's output text and replay, the protocol's packers
 
-- [ ] 2.1 Write the tests first in `transcript/src/lib.rs`'s `mod tests` (or `output.rs` after change 5) and watch them fail (`cargo test -p brindle-transcript`):
+- [x] 2.1 Write the tests first in `transcript/src/lib.rs`'s `mod tests` (or `output.rs` after change 5) and watch them fail (`cargo test -p brindle-transcript`):
+  Done: the two output tests in `output.rs`, the replay test in `page.rs`; they failed to build (no `OutputText`, no `replay_ref`).
   - `an_output_fed_a_mebibyte_in_32_byte_pieces_keeps_its_buffer_within_twice_the_limit`: it checks `OutputText`'s buffer length after every append.
   - `output_text_compares_encodes_and_clones_as_its_visible_text`: equality with `&str`, `serde_json::to_string`, `Debug`, a clone holding no dropped prefix, and `Deserialize` from a string.
   - `replaying_by_reference_encodes_the_same_bytes_as_replay`: over 500 `fuzz::random_transcript`s, plus trimmed and windowed ones, `to_vec(&t.replay_ref()) == to_vec(&t.replay())`.
 
   The existing `output_appended_in_pieces_folds_as_appended_whole`, `output_appends_and_keeps_whole_lines_within_the_limit` and `fuzz.rs`' tests must keep passing unchanged.
-- [ ] 2.2 Implement `OutputText` and the new `Output::append` returning the escaped length of what it dropped (design 10). Change the fold's `Event::ToolOutput` arm to use that length. Implement `Transcript::replay_ref` with the private `EventRef` mirror (design 8). In the same commit, update every reader so the workspace builds: `src/agent/tool.rs` (`output.text.as_str()`, and `.to_string()` where a `String` is wanted), `src/agent/model.rs`, `transcript/src/fuzz.rs`, and the `reduce.rs` and `checkpoint.rs` tests. Verify with `cargo test -p brindle-transcript`, `cargo test -p brindle agent::`, `cargo test -p brindle-remote-agent acp::`, and that `transcript/tests/events.rs`' fixture tests pass with no fixture changed (`git status transcript/tests/fixtures` clean).
-- [ ] 2.3 Write the protocol tests first and watch them fail (`cargo test -p brindle-remote-protocol`):
+- [x] 2.2 Implement `OutputText` and the new `Output::append` returning the escaped length of what it dropped (design 10). Change the fold's `Event::ToolOutput` arm to use that length. Implement `Transcript::replay_ref` with the private `EventRef` mirror (design 8). In the same commit, update every reader so the workspace builds: `src/agent/tool.rs` (`output.text.as_str()`, and `.to_string()` where a `String` is wanted), `src/agent/model.rs`, `transcript/src/fuzz.rs`, and the `reduce.rs` and `checkpoint.rs` tests. Verify with `cargo test -p brindle-transcript`, `cargo test -p brindle agent::`, `cargo test -p brindle-remote-agent acp::`, and that `transcript/tests/events.rs`' fixture tests pass with no fixture changed (`git status transcript/tests/fixtures` clean).
+  Done: d04e785b; `replay_ref` walks the replay rather than mirroring `Event` (flag 5); fixtures unchanged, 76 transcript, 260 `agent::` and 440 `acp::` tests pass.
+- [x] 2.3 Write the protocol tests first and watch them fail (`cargo test -p brindle-remote-protocol`):
   - `holder.rs`: `sliced_checkpoint_frames_are_the_bytes_of_the_checkpoint_messages`, for `BlobForm::Whole` and `Append`, for blobs of 0, 1, `CHUNK_LEN` and `3 × CHUNK_LEN + 7` bytes. Each `SlicedFrame`'s type, length, head and body must equal `ToHolder::checkpoint(…)` or `checkpoint_append(…)`'s `encode()`.
   - `client.rs`:
     - `transcript_frames_of_encoded_events_are_the_bytes_of_pack_transcript`;
@@ -46,7 +48,10 @@ Each group writes its tests first and watches them fail before the code they che
     - `an_encoded_event_past_a_frame_is_refused_as_pack_transcript_refuses_it`;
     - `json_object_refuses_bytes_that_dont_start_and_end_as_an_object`.
   - `fuzz.rs`: random bytes through `JsonObject::new` and the packers never panic.
-- [ ] 2.4 Implement `holder::{BlobForm, SlicedFrame, checkpoint_frames}` and `client::{JsonObject, NotAnObject, transcript_frames, page_frames}` (design 8, 9). Each frame's envelope is written by hand, and the grouping is shared with `pack_events` through one sizing function. Update the module docs: `holder.rs` (the checkpoint can be queued from slices, with the same bytes) and `client.rs` (encoded events are packed without being read). Verify with `cargo test -p brindle-remote-protocol`, including `--test transcripts`, with no fixture changed.
+
+  Done: all six, failing to build before 2.4 (`encoded_objects_and_their_packers_never_panic_on_random_bytes` in `fuzz.rs`).
+- [x] 2.4 Implement `holder::{BlobForm, SlicedFrame, checkpoint_frames}` and `client::{JsonObject, NotAnObject, transcript_frames, page_frames}` (design 8, 9). Each frame's envelope is written by hand, and the grouping is shared with `pack_events` through one sizing function. Update the module docs: `holder.rs` (the checkpoint can be queued from slices, with the same bytes) and `client.rs` (encoded events are packed without being read). Verify with `cargo test -p brindle-remote-protocol`, including `--test transcripts`, with no fixture changed.
+  Done: 8978c0a7; 152 lib and 4 transcript tests pass, fixtures unchanged.
 
 ## 3. Pure reducer and codec: the tool epoch, the diff memo, owned arguments
 
