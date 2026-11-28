@@ -20,10 +20,21 @@ pub enum Resend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueueRow {
     None,
-    /// Queued: sent when the running turn ends normally.
-    Waiting { text: SharedString },
+    /// Queued: sent when the running turn ends normally. `attachments` is
+    /// how many it has (OpenSpec change `agents-prompt-context`).
+    Waiting { text: SharedString, attachments: usize },
     /// Not sent, with why in words, and whether send-again works.
-    Held { text: SharedString, reason: HoldReason, why: SharedString, resend: Resend },
+    Held { text: SharedString, attachments: usize, reason: HoldReason, why: SharedString, resend: Resend },
+}
+
+/// The queue row's words for a prompt's `count` attachments, when it has
+/// any: `1 attachment`, `2 attachments`.
+pub fn attachment_count(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1 => Some("1 attachment".into()),
+        n => Some(format!("{n} attachments")),
+    }
 }
 
 /// The name a stop reason has in the dump and the hold's words.
@@ -106,9 +117,12 @@ fn resend_of(phase: &AgentPhase, life: SessionLife) -> Resend {
 pub fn queue_row(slot: &Slot, phase: &AgentPhase, life: SessionLife) -> QueueRow {
     match slot {
         Slot::Empty => QueueRow::None,
-        Slot::Waiting { text, .. } => QueueRow::Waiting { text: text.clone().into() },
-        Slot::Held { text, reason, .. } => QueueRow::Held {
+        Slot::Waiting { text, attachments } => {
+            QueueRow::Waiting { text: text.clone().into(), attachments: attachments.len() }
+        }
+        Slot::Held { text, reason, attachments } => QueueRow::Held {
             text: text.clone().into(),
+            attachments: attachments.len(),
             reason: reason.clone(),
             why: hold_words(reason).into(),
             resend: resend_of(phase, life),
@@ -209,9 +223,10 @@ mod tests {
         for phase in every_phase() {
             for life in [SessionLife::Open, SessionLife::Ended] {
                 assert_eq!(queue_row(&Slot::Empty, &phase, life), QueueRow::None);
-                assert_eq!(queue_row(&waiting(), &phase, life), QueueRow::Waiting { text: "next".into() });
+                assert_eq!(queue_row(&waiting(), &phase, life), QueueRow::Waiting { text: "next".into(), attachments: 0 });
                 for reason in &EVERY_HOLD {
-                    let QueueRow::Held { text, reason: shown, why, resend } = queue_row(&held(reason.clone()), &phase, life)
+                    let QueueRow::Held { text, reason: shown, why, resend, .. } =
+                        queue_row(&held(reason.clone()), &phase, life)
                     else {
                         panic!("{phase:?} {reason:?}")
                     };
@@ -271,5 +286,22 @@ mod tests {
         zone.feed(&[queue(waiting())]);
         zone.model.set_link(Link::Reconnecting);
         assert_eq!(zone.model.unqueue(), Unqueue::Nothing, "nothing is sent while reconnecting");
+    }
+
+    /// `agents-prompt-context` 4.4: the row counts a waiting or held
+    /// prompt's attachments.
+    #[test]
+    fn the_queue_row_counts_its_prompts_attachments() {
+        use crate::agent::transcript::{Attachment, AttachmentId};
+        let kept = |id| Attachment::Text { id: AttachmentId(id), name: "out".into(), bytes: 2 };
+        let phase = AgentPhase::Live(AgentState::Ready { name: None, version: None });
+        let waiting = Slot::Waiting { text: "next".into(), attachments: vec![kept(1), kept(2)] };
+        let row = queue_row(&waiting, &phase, SessionLife::Open);
+        assert_eq!(row, QueueRow::Waiting { text: "next".into(), attachments: 2 });
+        let held = Slot::Held { text: "next".into(), reason: HoldReason::Cancelled, attachments: vec![kept(1)] };
+        assert!(matches!(queue_row(&held, &phase, SessionLife::Open), QueueRow::Held { attachments: 1, .. }));
+        assert_eq!(attachment_count(0), None);
+        assert_eq!(attachment_count(1).as_deref(), Some("1 attachment"));
+        assert_eq!(attachment_count(2).as_deref(), Some("2 attachments"));
     }
 }

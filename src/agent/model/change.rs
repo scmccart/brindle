@@ -128,7 +128,7 @@ pub(super) struct Undrawn {
 }
 
 impl Undrawn {
-    fn mark(&mut self, id: EntryId, mark: Mark) {
+    pub(super) fn mark(&mut self, id: EntryId, mark: Mark) {
         let mark = self.entries.get(&id).map_or(mark, |held| held.and(mark));
         self.entries.insert(id, mark);
     }
@@ -399,6 +399,7 @@ impl ChatModel {
         self.texts.retain(|(id, _), _| *id > through);
         self.by_hand.retain(|id, _| *id > through);
         self.toggled.retain(|id, _| *id > through);
+        self.rows.retain(|(id, _), _| *id > through);
         self.undrawn.trim(through);
         let moved = self.facts.trimmed(through);
         self.undrawn.rows.extend(moved);
@@ -660,7 +661,7 @@ impl ChatModel {
         let (range, fresh) = match entry {
             // A grown user message's earlier parts don't change: only its
             // last and new ones are drawn again.
-            Entry::User { text, .. } if mark == Mark::Grown && !range.is_empty() => {
+            Entry::User { text, attachments } if mark == Mark::Grown && !range.is_empty() && attachments.is_empty() => {
                 let last = &self.blocks[range.end - 1];
                 (range.end - 1..range.end, super::blocks::user_blocks(id, text, last.part, last.start))
             }
@@ -761,7 +762,8 @@ impl ChatModel {
                 | BlockBody::Thought { .. }
                 | BlockBody::Tool { .. }
                 | BlockBody::Permission { .. }
-                | BlockBody::Notice { .. } => None,
+                | BlockBody::Notice { .. }
+                | BlockBody::Attached { .. } => None,
             })
             .collect();
         let Some(span) = Self::output_span(&shown, grown) else { return self.redraw(id) };

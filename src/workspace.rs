@@ -21,6 +21,7 @@ mod notices;
 mod overlays;
 mod previews;
 pub mod tabs;
+mod targets;
 
 pub use tabs::{TabId, TabTarget};
 

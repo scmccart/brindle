@@ -63,6 +63,10 @@ impl SessionSink for Sink {
         Sink::conversations(self, request, listed);
     }
 
+    fn attachment(&mut self, request: RequestId, kept: crate::remote::protocol::client::AttachmentText) {
+        Sink::attachment(self, request, kept);
+    }
+
     fn link_down(&mut self) {
         Sink::link_down(self);
     }

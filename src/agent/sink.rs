@@ -26,7 +26,7 @@ use serde_json::Value;
 
 use crate::agent::conversations::Page;
 use crate::agent::model::{ReplyError, StartFailure};
-use crate::remote::protocol::client::AgentConversations;
+use crate::remote::protocol::client::{AgentConversations, AttachmentText};
 use crate::agent::shared::AgentShared;
 use crate::remote::protocol::RequestId;
 use crate::terminal::events::{Admit, EventGate, Kind, Merge, Recovered};
@@ -64,6 +64,9 @@ pub enum AgentEvent {
     /// (`AGENT_CONVERSATIONS`, OpenSpec change `agents-session-list`), in
     /// place of its reply.
     Conversations { request: RequestId, page: Page },
+    /// The kept text `id` answering the read `request` (`ATTACHMENT`,
+    /// OpenSpec change `agents-prompt-context`), in place of its reply.
+    Attachment { request: RequestId, id: u64, text: String },
     /// The core's word about the session that answers no request (a
     /// refused cancel, a holder's fault report).
     Note(String),
@@ -86,6 +89,7 @@ pub fn kind_of(event: &AgentEvent) -> Kind {
         | AgentEvent::Broken(_)
         | AgentEvent::Reply { .. }
         | AgentEvent::Conversations { .. }
+        | AgentEvent::Attachment { .. }
         | AgentEvent::Note(_)
         | AgentEvent::EndpointNote(_) => Kind::Life,
     }
@@ -264,6 +268,12 @@ impl Sink {
     /// the zone in place of the request's reply.
     pub fn conversations(&mut self, request: RequestId, listed: AgentConversations) {
         self.send(AgentEvent::Conversations { request, page: Page::of(listed) });
+    }
+
+    /// `ATTACHMENT` answering the read `request`: the text goes to the zone
+    /// in place of the request's reply.
+    pub fn attachment(&mut self, request: RequestId, kept: AttachmentText) {
+        self.send(AgentEvent::Attachment { request, id: kept.id, text: kept.text });
     }
 
     pub fn link_down(&mut self) {
@@ -453,6 +463,15 @@ mod tests {
             next: Some("c2".into()),
         };
         assert_eq!(taken(&mut feed), [AgentEvent::Conversations { request: 4, page }]);
+    }
+
+    /// `agents-prompt-context` 4.1: a read's answer reaches the zone as the
+    /// kept text, under its request.
+    #[test]
+    fn a_reads_answer_reaches_the_zone_as_its_text() {
+        let (mut sink, mut feed) = Sink::with_fault(None);
+        sink.attachment(5, AttachmentText { req: 5, session: 7, id: 3, text: "ok\n".into() });
+        assert_eq!(taken(&mut feed), [AgentEvent::Attachment { request: 5, id: 3, text: "ok\n".into() }]);
     }
 
     /// An event that doesn't decode is refused with why; the ones before it

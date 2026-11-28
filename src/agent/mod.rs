@@ -74,7 +74,7 @@ use crate::agent::spawn::{AgentRestartRequest, OpenedBy, agent_spawn_request, co
 use crate::agent::transcript::{Conversation, EntryId};
 use crate::config::{Config, Profile};
 use crate::notify::osc::{Notice, Source};
-use crate::remote::protocol::client::OptionValue;
+use crate::remote::protocol::client::{OptionValue, PromptAttachment};
 use crate::remote::protocol::{RequestId, SessionId};
 use crate::remote::{AgentStart, Host, SessionKey, Unsupported};
 use crate::settings::Settings;
@@ -87,7 +87,15 @@ use crate::terminal::status::State;
 /// request's id, which its answer comes back under, or why nothing was
 /// sent ([`NotSent`], which the model decides on: [`ChatModel::not_sent`]).
 pub trait Requests {
-    fn prompt(&self, text: &str) -> Result<RequestId, NotSent>;
+    /// `AGENT_PROMPT` with its attachments, each a link or an upload
+    /// [`Requests::attach`] numbered.
+    fn prompt(&self, text: &str, attachments: Vec<PromptAttachment>) -> Result<RequestId, NotSent>;
+    /// Keeps a text for the next prompt (`AGENT_ATTACH`, OpenSpec change
+    /// `agents-prompt-context`): the request's id is its upload number.
+    fn attach(&self, name: &str, text: &str) -> Result<RequestId, NotSent>;
+    /// Reads a kept text (`AGENT_READ_ATTACHMENT`): it comes as
+    /// [`AgentEvent::Attachment`] in place of a reply.
+    fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent>;
     fn resend(&self) -> Result<RequestId, NotSent>;
     fn unqueue(&self) -> Result<RequestId, NotSent>;
     fn answer(&self, entry: u64, option: Option<String>) -> Result<RequestId, NotSent>;
@@ -131,8 +139,16 @@ fn server_connect() -> Connect {
 }
 
 impl Requests for crate::remote::AgentLink {
-    fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
-        crate::remote::AgentLink::prompt(self, text)
+    fn prompt(&self, text: &str, attachments: Vec<PromptAttachment>) -> Result<RequestId, NotSent> {
+        crate::remote::AgentLink::prompt(self, text, attachments)
+    }
+
+    fn attach(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        crate::remote::AgentLink::attach(self, name, text)
+    }
+
+    fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        crate::remote::AgentLink::read_attachment(self, id)
     }
 
     fn resend(&self) -> Result<RequestId, NotSent> {
@@ -807,13 +823,24 @@ impl Agent {
             AgentEvent::Failed(failure) => self.model.not_started(failure),
             AgentEvent::Broken(reason) => self.model.broken(reason),
             AgentEvent::Reply { request, outcome } => {
+                let read = self.model.reads(request);
                 let replied = self.model.replied(request, outcome);
                 self.apply_replied(replied, cx);
+                // A refused read redraws its row.
+                if read {
+                    self.emit_splices(Due::All, cx);
+                }
                 return;
             }
             AgentEvent::Conversations { request, page } => {
                 let done = self.model.listed(request, page);
                 self.apply_listed(done, cx);
+                return;
+            }
+            AgentEvent::Attachment { request, id: _, text } => {
+                self.model.attachment_read(request, text);
+                self.emit_splices(Due::All, cx);
+                cx.notify();
                 return;
             }
             AgentEvent::Note(text) => {
@@ -897,7 +924,7 @@ impl Agent {
         match first {
             Some(First::Send(text)) => {
                 let sent = self.model.sent_prompt(text.clone(), true);
-                match self.through(|requests| requests.prompt(&text)) {
+                match self.through(|requests| requests.prompt(&text, Vec::new())) {
                     Ok(request) => self.model.sent(request, sent),
                     Err(why) => {
                         let replied = self.model.not_sent(sent, why);
@@ -916,7 +943,7 @@ impl Agent {
     pub fn send_first(&mut self, text: &str, cx: &mut Context<Self>) {
         let text = text.to_string();
         let sent = self.model.sent_prompt(text.clone(), true);
-        self.send(sent, |requests| requests.prompt(&text), cx);
+        self.send(sent, |requests| requests.prompt(&text, Vec::new()), cx);
     }
 
     /// The login row's method `method` was chosen: `AGENT_LOGIN` for an
@@ -1003,10 +1030,7 @@ impl Agent {
     /// reason shown.
     pub fn prompt(&mut self, draft: &str, composing: bool, cx: &mut Context<Self>) {
         match self.model.submit(draft, composing) {
-            Submit::Send(text) => {
-                let sent = self.model.sent_prompt(text.clone(), false);
-                self.send(sent, |requests| requests.prompt(&text), cx);
-            }
+            Submit::Send(text) => self.send_prompt(text, cx),
             Submit::Set { option, name, value } => {
                 cx.emit(AgentUpdate::ClearDraft);
                 self.set_option(&option, name, value, cx);
@@ -1017,6 +1041,51 @@ impl Agent {
             }
             Submit::Nothing(_) => cx.notify(),
         }
+    }
+
+    /// Sends prompt `text` with the draft's attachments (OpenSpec change
+    /// `agents-prompt-context`, decision 7): an `AGENT_ATTACH` per text, in
+    /// order, then the `AGENT_PROMPT` naming them by their requests' ids.
+    /// An attach that couldn't go stops the rest; the server's refusals
+    /// come back as replies, the first one shown.
+    fn send_prompt(&mut self, text: String, cx: &mut Context<Self>) {
+        let plan = self.model.send_plan(&text);
+        let mut numbers = Vec::new();
+        for (name, kept) in &plan.uploads {
+            match self.through(|requests| requests.attach(name, kept)) {
+                Ok(request) => {
+                    self.model.sent(request, Sent::Attach);
+                    numbers.push(request);
+                }
+                Err(why) => {
+                    let replied = self.model.not_sent(Sent::Attach, why);
+                    self.apply_replied(replied, cx);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        let sent = self.model.sent_prompt(text.clone(), false);
+        let attachments = plan.attachments(&numbers);
+        self.send(sent, |requests| requests.prompt(&text, attachments), cx);
+    }
+
+    /// Adds `draft` to the next prompt's attachments; the refusal, in the
+    /// notice line's words for `what`, when it isn't.
+    pub fn attach_draft(&mut self, draft: model::Draft, what: &str, cx: &mut Context<Self>) -> Result<(), String> {
+        let attached = self.model.attach(draft).map_err(|refusal| refusal.text(what));
+        cx.notify();
+        attached
+    }
+
+    /// A press on user entry `entry`'s attachment row `index`: its text
+    /// asked for when the row opens.
+    pub fn press_row(&mut self, entry: EntryId, index: usize, cx: &mut Context<Self>) {
+        if let model::RowPress::Read(id) = self.model.press_row(entry, index) {
+            self.send(Sent::Read { entry, index }, |requests| requests.read_attachment(id), cx);
+        }
+        self.emit_splices(Due::All, cx);
+        cx.notify();
     }
 
     /// Asks the server to set option `option` (named `name`) to `value`

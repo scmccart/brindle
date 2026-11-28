@@ -3151,9 +3151,28 @@ impl Running {
 
     /// A prompt for the agent (`AGENT_PROMPT`): sent now or queued by the
     /// core, which the transcript tells.
-    pub fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
+    pub fn prompt(&self, text: &str, attachments: Vec<client::PromptAttachment>) -> Result<RequestId, NotSent> {
         let session = self.id;
-        self.agent_request(|req| ToCore::AgentPrompt(AgentPrompt::text(req, session, text)))
+        self.agent_request(|req| ToCore::AgentPrompt(AgentPrompt { attachments, ..AgentPrompt::text(req, session, text) }))
+    }
+
+    /// Keeps `text`, named `name`, for the session's next prompt
+    /// (`AGENT_ATTACH`, OpenSpec change `agents-prompt-context`): its upload
+    /// number is the request's id, which is the connection's alone, as an
+    /// upload's must be. `OK` or `ERROR` comes back as any agent request's.
+    pub fn attach_text(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        let session = self.id;
+        self.agent_request(|req| {
+            ToCore::AgentAttach(client::AgentAttach { req, session, upload: req, name: name.into(), text: text.into() })
+        })
+    }
+
+    /// Asks for the kept text `id` a user entry or the queue slot names
+    /// (`AGENT_READ_ATTACHMENT`): its `ATTACHMENT` reaches the sink
+    /// ([`SessionSink::attachment`]) in place of a reply, an `ERROR` as one.
+    pub fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        let session = self.id;
+        self.agent_request(|req| ToCore::AgentReadAttachment(client::AgentReadAttachment { req, session, id }))
     }
 
     /// Sends the held prompt again (`AGENT_RESEND`).

@@ -345,8 +345,30 @@ impl Session {
     /// Sends the agent a prompt (`AGENT_PROMPT`) while the session runs;
     /// the request's id, which its answer comes back under
     /// ([`SessionSink::reply`]), or why nothing was sent.
+    pub fn prompt_with(
+        &self,
+        text: &str,
+        attachments: Vec<crate::remote::protocol::client::PromptAttachment>,
+    ) -> Result<RequestId, NotSent> {
+        self.running(|running| running.prompt(text, attachments))
+    }
+
+    /// The tests' prompt with no attachments.
+    #[cfg(test)]
     pub fn prompt(&self, text: &str) -> Result<RequestId, NotSent> {
-        self.running(|running| running.prompt(text))
+        self.prompt_with(text, Vec::new())
+    }
+
+    /// Keeps a text for the session's next prompt (`AGENT_ATTACH`), as
+    /// [`Session::prompt`]; the id is its upload number too.
+    pub fn attach_text(&self, name: &str, text: &str) -> Result<RequestId, NotSent> {
+        self.running(|running| running.attach_text(name, text))
+    }
+
+    /// Reads a kept text (`AGENT_READ_ATTACHMENT`), as [`Session::prompt`];
+    /// the text reaches the sink in place of a reply.
+    pub fn read_attachment(&self, id: u64) -> Result<RequestId, NotSent> {
+        self.running(|running| running.read_attachment(id))
     }
 
     /// Sends the held prompt again (`AGENT_RESEND`), as [`Session::prompt`].
@@ -1777,6 +1799,55 @@ mod tests {
         assert_eq!(says(agent.feed.shared.lock().transcript()), ["user: hi", "agent: hello back"]);
         agent.session.close();
         assert_eq!(recv(&agent.core), ToCore::Close(client::SessionRef { session: AGENT }));
+    }
+
+    /// `agents-prompt-context` 4.1: a text goes out as `AGENT_ATTACH`, its
+    /// upload numbered by its request; the prompt names it in
+    /// `AGENT_PROMPT`'s list beside a link; the user entry folds with its
+    /// references; and a read's `ATTACHMENT` reaches the zone as its text,
+    /// its `ERROR` as the read's refusal.
+    #[test]
+    fn an_attached_text_and_its_read_go_out_and_their_answers_come_back() {
+        use crate::agent::transcript::{Attachment, AttachmentId};
+        use client::PromptAttachment;
+        let kept = Attachment::Text { id: AttachmentId(1), name: "cargo test".into(), bytes: 3 };
+        let link = Attachment::Link { path: "src/a.rs".into(), name: "a.rs".into() };
+        let entry = Entry::User { text: "why?".into(), attachments: vec![kept.clone(), link.clone()] };
+        let mut mini = MiniAgent::default();
+        let mut agent = agent_session_with("agent-attach", None, move |message, stream| match message {
+            ToCore::AgentAttach(attach) => ok(stream, attach.req),
+            ToCore::AgentPrompt(prompt) if !prompt.attachments.is_empty() => {
+                ok(stream, prompt.req);
+                let added = mini.added(entry.clone());
+                let ended = Event::Turn { state: TurnState::Ended { stop: StopReason::EndTurn } };
+                transcript(stream, &[added, ended]);
+            }
+            ToCore::AgentReadAttachment(read) if read.id == 1 => send(
+                stream,
+                ToClient::Attachment(client::AttachmentText { req: read.req, session: read.session, id: 1, text: "ok\n".into() }),
+            ),
+            ToCore::AgentReadAttachment(read) => refuse(stream, read.req, "attachment 9 is no longer kept"),
+            other => mini.answer(other, stream),
+        });
+        let upload = agent.session.attach_text("cargo test", "ok\n").unwrap();
+        let sent = client::AgentAttach { req: upload, session: AGENT, upload, name: "cargo test".into(), text: "ok\n".into() };
+        assert_eq!(recv(&agent.core), ToCore::AgentAttach(sent));
+        let parts = vec![PromptAttachment::Text { upload }, PromptAttachment::Link { path: "src/a.rs".into(), name: "a.rs".into() }];
+        let prompt = agent.session.prompt_with("why?", parts.clone()).unwrap();
+        let sent = client::AgentPrompt { attachments: parts, ..client::AgentPrompt::text(prompt, AGENT, "why?") };
+        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(sent));
+        let ended = |log: &Transcript| *log.turn() == TurnState::Ended { stop: StopReason::EndTurn };
+        assert_eq!(shows(&mut agent.feed, "the turn's end", ended), [reply(upload), reply(prompt)]);
+        let held: Vec<Entry> = agent.feed.shared.lock().transcript().entries().map(|(_, entry)| entry.clone()).collect();
+        assert_eq!(held, [Entry::User { text: "why?".into(), attachments: vec![kept, link] }]);
+
+        let read = agent.session.read_attachment(1).unwrap();
+        assert_eq!(recv(&agent.core), ToCore::AgentReadAttachment(client::AgentReadAttachment { req: read, session: AGENT, id: 1 }));
+        assert_eq!(next_life(&mut agent.feed), AgentEvent::Attachment { request: read, id: 1, text: "ok\n".into() });
+        let gone = agent.session.read_attachment(9).unwrap();
+        recv(&agent.core);
+        let refused = AgentEvent::Reply { request: gone, outcome: Err(ReplyError::Failed("attachment 9 is no longer kept".into())) };
+        assert_eq!(next_life(&mut agent.feed), refused);
     }
 
     /// `agents-session-recovery` 4.2: an ended agent's restart goes out as
