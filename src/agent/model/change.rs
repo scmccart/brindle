@@ -508,12 +508,25 @@ impl ChatModel {
     pub fn draw(&mut self, due: Due) -> Vec<Splice> {
         let mut undrawn = std::mem::take(&mut self.undrawn);
         if due == Due::Settled && !undrawn.all {
-            let (grown, rest): (BTreeMap<EntryId, Mark>, BTreeMap<EntryId, Mark>) =
-                undrawn.entries.into_iter().partition(|(_, mark)| *mark == Mark::Grown);
+            // A grown tool call a pending permission shows isn't left: the
+            // permission's detail follows it.
+            let (grown, rest): (BTreeMap<EntryId, Mark>, BTreeMap<EntryId, Mark>) = undrawn
+                .entries
+                .into_iter()
+                .partition(|(id, mark)| *mark == Mark::Grown && !self.facts.shown_by_permission(*id));
             undrawn.entries = rest;
             let (texts, now): (BTreeSet<_>, BTreeSet<_>) =
                 undrawn.texts.into_iter().partition(|(id, _)| grown.contains_key(id));
             undrawn.texts = now;
+            // A left entry's row waits with it: redrawn whole now, its
+            // output's delta would be drawn over parts it no longer has.
+            let rows: BTreeSet<EntryId> = match std::mem::take(&mut undrawn.rows) {
+                Rows::All => self.entries.iter().map(|(id, _)| *id).collect(),
+                Rows::Only(ids) => ids,
+            };
+            let (later, now): (BTreeSet<_>, BTreeSet<_>) = rows.into_iter().partition(|id| grown.contains_key(id));
+            undrawn.rows = Rows::Only(now);
+            self.undrawn.rows = Rows::Only(later);
             self.undrawn.outputs = undrawn.outputs.iter().filter(|(id, _)| grown.contains_key(id)).map(|(k, v)| (*k, *v)).collect();
             self.undrawn.texts = texts;
             self.undrawn.entries = grown;
@@ -665,7 +678,12 @@ impl ChatModel {
                 }
                 .into_iter()
                 .collect();
+                // A permission with no blocks yet is new in this draw: its
+                // own insert draws it, with the call as it is now.
                 for permission in self.facts.showing(id) {
+                    if self.entry_blocks(permission).is_empty() {
+                        continue;
+                    }
                     splices.extend(match output {
                         Some(grown) => self.redraw_permission_output(permission, id, grown),
                         None => self.redraw(permission),
@@ -930,6 +948,56 @@ mod tests {
         assert_eq!(zone.model.draw(Due::All), [], "nothing left to draw");
     }
 
+    /// A tool call's output and a new permission showing it in one update:
+    /// the permission is drawn once, by its own insert, not also by the
+    /// tool's redraw of the permissions showing it.
+    #[test]
+    fn a_tool_change_and_a_new_permission_showing_it_draw_the_permission_once() {
+        let mut zone = Zone::ready();
+        zone.feed(&[added(1, user("go")), turn(TurnState::Working), added(2, in_progress("call_2", vec![output_item("a\n")]))]);
+        zone.feed_batch(&[&[out(2, 0, "b\n")], &[added(3, permission("May I?"))]]);
+        assert_eq!(blocks_of_entry(zone.model.blocks(), 3).len(), 1);
+        in_step_whole(&zone);
+    }
+
+    /// The blocks of entry `id` among `blocks`.
+    fn blocks_of_entry(blocks: &[Block], id: u64) -> Vec<Block> {
+        blocks.iter().filter(|block| block.entry == EntryId(id)).cloned().collect()
+    }
+
+    /// Decision 5's frame gate: a draw within a frame of the last leaves
+    /// the grown entries as they were drawn, except a tool call a pending
+    /// permission shows (its block comes with its handles), and draws the
+    /// new ones; the next whole draw catches up.
+    #[test]
+    fn a_settled_draw_leaves_growing_entries_and_draws_the_rest() {
+        let mut zone = Zone::ready();
+        zone.feed(&[
+            added(1, user("go")),
+            turn(TurnState::Working),
+            added(2, agent("a")),
+            added(3, in_progress("call_2", vec![output_item("1\n")])),
+            added(4, in_progress("c9", vec![output_item("1\n")])),
+            added(5, permission("Run?")),
+        ]);
+        let drawn = zone.model.blocks().to_vec();
+        fold(&mut zone, &[appended(2, " b"), out(3, 0, "2\n"), out(4, 0, "2\n"), added(6, agent("new"))]);
+        zone.absorb_undrawn();
+        let before = zone.model.render_stats();
+        zone.model.draw(Due::Settled);
+        assert_eq!(zone.model.render_stats().renders - before.renders, 1, "the new message alone");
+        let whole = drawn_whole(&zone);
+        let blocks = zone.model.blocks();
+        assert_eq!(blocks_of_entry(blocks, 2), blocks_of_entry(&drawn, 2), "the growing message waits");
+        assert_eq!(blocks_of_entry(blocks, 4), blocks_of_entry(&drawn, 4), "the growing output waits");
+        for id in [3, 5, 6] {
+            assert_eq!(blocks_of_entry(blocks, id), blocks_of_entry(&whole, id), "entry {id} is drawn");
+        }
+        zone.model.draw(Due::All);
+        in_step_whole(&zone);
+        assert_eq!(zone.model.draw(Due::All), [], "nothing left to draw");
+    }
+
     #[test]
     fn a_reset_is_drawn_as_one_splice_of_the_whole_list() {
         let mut zone = Zone::ready();
@@ -1127,6 +1195,14 @@ mod tests {
     /// Generated conversations (decision 7): users, tools across turns,
     /// permissions added and answered, outputs, trims and resets.
     fn generated(seed: u64, steps: usize, mut check: impl FnMut(&Zone)) {
+        generated_drawn(seed, steps, false, &mut check);
+    }
+
+    /// [`generated`], each event its own update; with `settled`, a third
+    /// of the events end with a `Due::Settled` draw (the frame gate's draw
+    /// within a frame), a third with none (an update of several frames),
+    /// and `check` runs only after a whole draw.
+    fn generated_drawn(seed: u64, steps: usize, settled: bool, check: &mut impl FnMut(&Zone)) {
         let mut state = seed;
         let mut next = move |n: u64| {
             state ^= state << 13;
@@ -1184,8 +1260,24 @@ mod tests {
             if matches!(event, Event::Added { .. }) {
                 id += 1;
             }
+            let draw = if settled { next(3) } else { 2 };
+            if draw < 2 {
+                fold(&mut zone, &[event]);
+                zone.absorb_undrawn();
+                if draw == 0 {
+                    zone.model.draw(Due::Settled);
+                }
+                continue;
+            }
             zone.feed(&[event]);
             check(&zone);
+        }
+    }
+
+    #[test]
+    fn settled_draws_between_whole_ones_reach_the_same_blocks() {
+        for seed in 1..=60 {
+            generated_drawn(seed * 0x2545_f491, 80, true, &mut |zone: &Zone| in_step_whole(zone));
         }
     }
 
