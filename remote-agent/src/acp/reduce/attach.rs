@@ -543,6 +543,29 @@ mod tests {
         assert!(agent.last("session/new")["params"].get("additionalDirectories").is_none());
     }
 
+    /// Task 2.6: a continued agent's `initialize` says again what its
+    /// prompts take, so a text embedded for one agent goes as a link to
+    /// the next, with the same store.
+    #[test]
+    fn a_continued_agents_prompt_support_is_its_own() {
+        let mut agent = ready_with(json!({"promptCapabilities": {"embeddedContext": true}, "sessionCapabilities": {"resume": {}}}));
+        let first = kept(&mut agent, 1, "ok");
+        say(&mut agent, "one", vec![first.clone()]);
+        assert_eq!(agent.last("session/prompt")["params"]["prompt"][1]["type"], "resource");
+        let id = agent.last("session/prompt")["id"].as_u64().expect("an id");
+        agent.end(id, "end_turn");
+        agent.exit();
+
+        let id = agent.restart();
+        agent.feed(&super::super::harness::initialized(id, json!({"sessionCapabilities": {"resume": {}}})));
+        agent.feed(&result(id + 1, json!({})));
+        assert_eq!(say(&mut agent, "two", vec![first]), Some(Ok(())));
+        assert_eq!(
+            agent.last("session/prompt")["params"]["prompt"][1],
+            json!({"type": "resource_link", "uri": "file:///home/u/.cache/brindle/attachments/20261128-ab12/1", "name": "t1"})
+        );
+    }
+
     #[test]
     fn a_windows_hosts_parts_have_windows_uris() {
         let store = Store {
