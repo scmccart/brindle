@@ -8,7 +8,8 @@ use gpui::{AnyElement, EntityInputHandler as _, FocusHandle, VisualTestContext, 
 use super::*;
 use crate::agent::test_support::{Call, FAKE_PROFILE, Zone, added, app, ready, set_config, settle, user};
 use crate::agent::transcript::{
-    AgentState, Continuation, Conversation, Entry, Event, HoldReason, PermissionOption, Slot, StopReason, TurnState,
+    AgentState, Continuation, Conversation, Entry, Event, HoldReason, PermissionOption, PermissionOutcome, Slot, StopReason,
+    TurnState,
 };
 
 struct Fixture {
@@ -1381,4 +1382,23 @@ fn a_page_that_arrives_in_a_hidden_zone_asks_for_no_other() {
     set_shown(true, cx);
     settle(cx);
     assert_eq!(fetches(&zone), 2, "shown with the row in view, it asks again");
+}
+
+/// OpenSpec change `agents-absorb-cost` decision 7: the permission
+/// handles are rebuilt only when the pending set changes, not on every
+/// streamed chunk.
+#[test]
+fn a_streaming_message_doesnt_rebuild_permission_handles() {
+    let mut f = Fixture::new();
+    f.feed(&[ready(), added(1, user("go")), working(), added(2, permission()), added(3, crate::agent::test_support::agent("a"))]);
+    let rebuilds = |f: &mut Fixture| f.view.read_with(f.cx, |view, _| view.permission_rebuilds);
+    let before = rebuilds(&mut f);
+    for text in [" b", " c", " d"] {
+        f.feed(&[Event::Appended { id: EntryId(3), text: text.into() }]);
+    }
+    assert_eq!(rebuilds(&mut f), before, "the set didn't change");
+    assert!(f.view.read_with(f.cx, |view, _| view.permission_handle(EntryId(2), "reject-once").is_some()));
+    f.feed(&[Event::Answered { id: EntryId(2), outcome: PermissionOutcome::Cancelled }]);
+    assert_eq!(rebuilds(&mut f), before + 1, "answered: the set changed");
+    assert!(f.view.read_with(f.cx, |view, _| view.permission_handle(EntryId(2), "reject-once").is_none()));
 }
