@@ -14,7 +14,7 @@ use crate::acp::lines::{Lines, Partial};
 use crate::acp::plain::{self, Mode};
 use crate::acp::reduce::{
     AfterLogin, AgentSession, BadRun, Greeting, Log, Login, OpenOutput, Phase, Replay, Run,
-    RunKind, Start, ToolBook,
+    Process, RunKind, Start, ToolBook,
 };
 use crate::acp::rpc::{Purpose, Rpc};
 
@@ -64,14 +64,14 @@ pub(super) fn merged(events: &[Event]) -> Vec<Event> {
 
 /// Every field of the state but the log, and the partial line's bytes.
 pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]) {
-    let (partial, bytes): (Value, &[u8]) = match session.lines.partial() {
+    let (partial, bytes): (Value, &[u8]) = match session.process.lines.partial() {
         Partial::Collecting(bytes) => (json!({ "partial": "collecting" }), bytes),
         Partial::TooLong { len } => (json!({ "partial": "too_long", "len": len }), &[]),
         Partial::Resyncing { len } => (json!({ "partial": "resyncing", "len": len }), &[]),
     };
     let mut lines = partial;
     if let Some(object) = lines.as_object_mut() {
-        object.insert("covers".into(), session.lines.covers().into());
+        object.insert("covers".into(), session.process.lines.covers().into());
     }
     let mut state = Map::new();
     state.insert("acp".into(), session.rpc.dialect().version().into());
@@ -81,7 +81,7 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
     state.insert("rpc".into(), rpc_value(&session.rpc));
     state.insert(
         "run".into(),
-        session.run.map_or(Value::Null, |run| {
+        session.process.run.map_or(Value::Null, |run| {
             json!({ "kind": run_kind_name(run.kind), "entry": run.entry.0 })
         }),
     );
@@ -89,6 +89,7 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
         "tools".into(),
         Value::Object(
             session
+                .process
                 .book
                 .tools
                 .iter()
@@ -98,11 +99,12 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
     );
     // The open outputs (`agents-tool-content` decision 8), left out when
     // there are none, as a checkpoint from before them has none.
-    if !session.book.outputs.is_empty() {
+    if !session.process.book.outputs.is_empty() {
         state.insert(
             "outputs".into(),
             Value::Object(
                 session
+                    .process
                     .book
                     .outputs
                     .iter()
@@ -113,7 +115,7 @@ pub(super) fn state_fields(session: &AgentSession) -> (Map<String, Value>, &[u8]
     }
     state.insert(
         "bad_lines".into(),
-        session.bad.map_or(0, |bad| bad.lines).into(),
+        session.process.bad.map_or(0, |bad| bad.lines).into(),
     );
     state.insert("lines".into(), lines);
     if !session.methods.is_empty() {
@@ -505,16 +507,18 @@ pub(super) fn restore(
     Ok(AgentSession {
         transcript,
         rpc,
-        lines,
+        process: Process {
+            lines,
+            run,
+            bad: (bad_lines > 0).then_some(BadRun {
+                lines: bad_lines,
+                last: now,
+            }),
+            book: ToolBook { tools, outputs },
+        },
         phase,
         cwd,
         version,
-        run,
-        book: ToolBook { tools, outputs },
-        bad: (bad_lines > 0).then_some(BadRun {
-            lines: bad_lines,
-            last: now,
-        }),
         methods,
         lists,
         chose,
@@ -801,7 +805,7 @@ mod tests {
         let agent = Agent::busy();
         assert_eq!(agent.s.rpc.permissions().len(), 1);
         assert!(matches!(agent.s.transcript.slot(), Slot::Waiting { .. }));
-        assert!(agent.s.run.is_none(), "the tool call ended the run");
+        assert!(agent.s.process.run.is_none(), "the tool call ended the run");
         assert_eq!(agent.round_trip(), agent.s);
     }
 
@@ -1290,7 +1294,7 @@ mod tests {
         }
         let trimmed = agent.s.transcript.trim_to(1).expect("entries dropped");
         assert!(matches!(trimmed, Event::Trimmed { .. }));
-        agent.s.run = None;
+        agent.s.process.run = None;
         let restored = agent.round_trip();
         assert_eq!(restored, agent.s);
         assert_eq!(restored.transcript.next_id(), agent.s.transcript.next_id());
@@ -1374,8 +1378,8 @@ mod tests {
     fn covers_counts_every_byte_fed_and_survives() {
         let agent = Agent::busy();
         let restored = agent.round_trip();
-        assert!(agent.s.lines.covers() > 0);
-        assert_eq!(restored.lines.covers(), agent.s.lines.covers());
+        assert!(agent.s.process.lines.covers() > 0);
+        assert_eq!(restored.process.lines.covers(), agent.s.process.lines.covers());
     }
 
     #[test]
@@ -1394,7 +1398,7 @@ mod tests {
             Partial::Resyncing { len: 12 },
         ] {
             let mut agent = Agent::ready();
-            agent.s.lines = Lines::restore(partial, 9_000_100);
+            agent.s.process.lines = Lines::restore(partial, 9_000_100);
             let bytes = encode(&agent.s).expect("it fits");
             assert_eq!(bytes[bytes.len() - 4..], [0, 0, 0, 0], "no line bytes follow");
             assert!(state_of(&bytes).1.is_empty());
@@ -1428,13 +1432,13 @@ mod tests {
     fn a_bad_line_run_keeps_its_count_and_writes_its_notice_a_second_after_adoption() {
         let mut agent = Agent::ready();
         agent.feed(b"hello\nworld\n");
-        assert_eq!(agent.s.bad.map(|bad| bad.lines), Some(2));
+        assert_eq!(agent.s.process.bad.map(|bad| bad.lines), Some(2));
         let later = agent.now + std::time::Duration::from_secs(60);
         let bytes = encode(&agent.s).expect("it fits");
         let adopted = adopt(&bytes, false, "/x", "0.4.0", later);
         assert_eq!(adopted.restored, Ok(()));
         assert_eq!(
-            adopted.session.bad,
+            adopted.session.process.bad,
             Some(BadRun {
                 lines: 2,
                 last: later
@@ -1492,7 +1496,7 @@ mod tests {
     #[test]
     fn a_session_with_tool_content_round_trips_whole_and_as_segments() {
         let agent = with_tool_content(None);
-        let open = agent.s.book.outputs.get("t1").expect("open");
+        let open = agent.s.process.book.outputs.get("t1").expect("open");
         assert_eq!(open.filter.line, "bold");
         let decoded = agent.round_trip();
         assert_eq!(decoded, agent.s);
@@ -1502,7 +1506,7 @@ mod tests {
             json!({"terminal_output_delta": {"terminal_id": "t1", "data": "\u{1b}[3"}}),
             Value::Null,
         ));
-        assert_eq!(agent.s.book.outputs["t1"].filter.mode, Mode::Csi);
+        assert_eq!(agent.s.process.book.outputs["t1"].filter.mode, Mode::Csi);
         let mut restored = Agent {
             s: agent.round_trip(),
             now: agent.now,

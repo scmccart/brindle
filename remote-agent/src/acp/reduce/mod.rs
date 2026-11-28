@@ -125,23 +125,44 @@ pub struct BadRun {
     pub last: Instant,
 }
 
+/// What a session keeps of one agent process, which a respawn resets
+/// whole: its stdout's line in progress, its chunk run, its run of bad
+/// lines and its tool calls and outputs by the agent's ids. The request
+/// ids (`Rpc`) go on across processes, so they aren't here.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::acp) struct Process {
+    pub(in crate::acp) lines: Lines,
+    pub(in crate::acp) run: Option<Run>,
+    pub(in crate::acp) bad: Option<BadRun>,
+    /// The tool calls and open outputs by the agent's ids.
+    pub(in crate::acp) book: ToolBook,
+}
+
+impl Process {
+    /// A process whose stdout hasn't been read yet.
+    pub(in crate::acp) fn new() -> Self {
+        Self {
+            lines: Lines::new(),
+            run: None,
+            bad: None,
+            book: ToolBook::default(),
+        }
+    }
+}
+
 /// One agent session's ACP state: its log, its JSON-RPC bookkeeping, its
-/// stdout's line in progress and the rest of what `step` keeps. The
+/// agent process's state and the rest of what `step` keeps. The
 /// checkpoint (`acp::checkpoint`) encodes it whole.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentSession {
     pub(super) transcript: Transcript,
     pub(super) rpc: Rpc,
-    pub(super) lines: Lines,
+    pub(super) process: Process,
     pub(super) phase: Phase,
     /// The absolute directory `session/new` is given.
     pub(super) cwd: String,
     /// Brindle's version, for `initialize`'s `clientInfo`.
     pub(super) version: String,
-    pub(super) run: Option<Run>,
-    /// The tool calls and open outputs by the agent's ids.
-    pub(super) book: ToolBook,
-    pub(super) bad: Option<BadRun>,
     /// The login methods the agent's `initialize` advertised, in its order
     /// (`agents-login` decision 3), sent with every `LoginRequired`.
     pub(super) methods: Vec<LoginMethod>,
@@ -190,13 +211,10 @@ impl AgentSession {
         Self {
             transcript: Transcript::new(),
             rpc: Rpc::new(),
-            lines: Lines::new(),
+            process: Process::new(),
             phase: Phase::Spawning { start },
             cwd,
             version,
-            run: None,
-            book: ToolBook::default(),
-            bad: None,
             methods: Vec::new(),
             lists: false,
             chose: false,
@@ -261,7 +279,7 @@ impl AgentSession {
 
     /// The stdout line in progress and the bytes fed, for the checkpoint.
     pub fn lines(&self) -> &Lines {
-        &self.lines
+        &self.process.lines
     }
 
     // What the tests look at; the core sees a session through its
@@ -587,7 +605,7 @@ impl Step<'_> {
             self.fail(&reason);
         }
         self.trim();
-        self.out.wake = self.s.bad.map(|bad| bad.last + BAD_RUN_QUIET);
+        self.out.wake = self.s.process.bad.map(|bad| bad.last + BAD_RUN_QUIET);
         self.out
     }
 
@@ -631,7 +649,7 @@ impl Step<'_> {
     /// Adds an entry that isn't text, ending the chunk run.
     fn add(&mut self, entry: Entry) -> EntryId {
         let id = self.s.transcript.next_id();
-        self.s.run = None;
+        self.s.process.run = None;
         self.emit(Event::Added { id, entry });
         id
     }
@@ -641,7 +659,7 @@ impl Step<'_> {
     /// The first entry's id.
     fn add_text(&mut self, kind: RunKind, text: &str) -> EntryId {
         let id = self.s.transcript.next_id();
-        self.s.run = None;
+        self.s.process.run = None;
         self.text_run(kind, text);
         id
     }
@@ -658,6 +676,7 @@ impl Step<'_> {
         loop {
             let open = self
                 .s
+                .process
                 .run
                 .filter(|run| run.kind == kind)
                 // A run at an entry without text (a bug) appends to it
@@ -681,7 +700,7 @@ impl Step<'_> {
                     rest = later;
                     if !rest.is_empty() {
                         // Full: the rest goes in a new entry.
-                        self.s.run = None;
+                        self.s.process.run = None;
                     }
                 }
                 None => {
@@ -717,7 +736,7 @@ impl Step<'_> {
                 text: piece.to_owned(),
             });
         }
-        self.s.run = Some(Run { kind, entry: id });
+        self.s.process.run = Some(Run { kind, entry: id });
     }
 
     fn notice(&mut self, level: NoticeLevel, text: String) {
@@ -823,7 +842,7 @@ impl Step<'_> {
     }
 
     fn stdout(&mut self, bytes: &[u8]) {
-        for piece in self.s.lines.feed(bytes) {
+        for piece in self.s.process.lines.feed(bytes) {
             if !self.reading() {
                 continue;
             }
@@ -846,7 +865,7 @@ impl Step<'_> {
     }
 
     fn output_lost(&mut self) {
-        self.s.lines.cut_front();
+        self.s.process.lines.cut_front();
         if self.ended() {
             return;
         }
@@ -857,7 +876,7 @@ impl Step<'_> {
         let lost = "output was lost while the terminal server restarted";
         if self.s.rpc.forget(Purpose::Prompt) {
             self.hold_waiting(HoldReason::OutputLost);
-            self.s.run = None;
+            self.s.process.run = None;
             self.turn(TurnState::Failed {
                 message: lost.to_owned(),
             });
@@ -915,7 +934,7 @@ impl Step<'_> {
     }
 
     fn tick(&mut self) {
-        if let Some(bad) = self.s.bad
+        if let Some(bad) = self.s.process.bad
             && self.now >= bad.last + BAD_RUN_QUIET
         {
             self.flush_bad();
@@ -925,8 +944,8 @@ impl Step<'_> {
     // --- lines from the agent -------------------------------------------
 
     fn bad_line(&mut self) {
-        let lines = self.s.bad.map_or(0, |bad| bad.lines);
-        self.s.bad = Some(BadRun {
+        let lines = self.s.process.bad.map_or(0, |bad| bad.lines);
+        self.s.process.bad = Some(BadRun {
             lines: lines.saturating_add(1),
             last: self.now,
         });
@@ -934,7 +953,7 @@ impl Step<'_> {
 
     /// Writes the run of bad lines as one notice.
     fn flush_bad(&mut self) {
-        if let Some(bad) = self.s.bad.take() {
+        if let Some(bad) = self.s.process.bad.take() {
             let text = if bad.lines == 1 {
                 "a line from the agent wasn't an ACP message".to_owned()
             } else {
@@ -1227,9 +1246,9 @@ impl Step<'_> {
             | Event::Window { .. } => return,
         };
         self.out.events.push(event);
-        self.s.book.forget_through(through);
-        if self.s.run.is_some_and(|run| run.entry <= through) {
-            self.s.run = None;
+        self.s.process.book.forget_through(through);
+        if self.s.process.run.is_some_and(|run| run.entry <= through) {
+            self.s.process.run = None;
         }
         let dropped: Vec<EntryId> = self
             .s
@@ -1688,7 +1707,7 @@ mod tests {
             b"{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":{\"outcome\":\"cancelled\"}}}\n"
         );
         assert!(agent.s.rpc().permissions().is_empty());
-        assert!(agent.s.book.tools.is_empty());
+        assert!(agent.s.process.book.tools.is_empty());
         assert_eq!(*agent.turn_state(), TurnState::Working);
     }
 
@@ -2692,7 +2711,7 @@ mod tests {
             "c1",
             json!({"terminal_output_delta": {"terminal_id": terminal, "data": "out\n"}}),
         ));
-        assert!(agent.s.book.outputs.is_empty());
+        assert!(agent.s.process.book.outputs.is_empty());
         let Entry::Tool { content, more, .. } = tool_entry(&agent, "c1") else {
             panic!("a tool entry");
         };
@@ -2733,13 +2752,13 @@ mod tests {
         };
         assert_eq!(content.len(), 3);
         assert_eq!(more, 1);
-        assert!(!agent.s.book.outputs.contains_key("t3"));
+        assert!(!agent.s.process.book.outputs.contains_key("t3"));
         // Nor does output for a terminal nothing opened open past it.
         agent.feed(&meta(
             "c1",
             json!({"terminal_output_delta": {"terminal_id": "t9", "data": "x"}}),
         ));
-        assert!(!agent.s.book.outputs.contains_key("t9"));
+        assert!(!agent.s.process.book.outputs.contains_key("t9"));
         assert_eq!(content_of(&tool_entry(&agent, "c1")).len(), 3);
     }
 

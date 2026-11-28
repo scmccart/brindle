@@ -8,13 +8,12 @@ use crate::acp::dialect::{self, Dialect, Unsupported};
 use crate::acp::envelope::RpcError;
 use crate::acp::forms::{AUTH_REQUIRED, Continued, Offered, UNSUPPORTED_VERSION};
 use crate::acp::limits::MAX_SESSION_ID;
-use crate::acp::lines::Lines;
 
 use super::list::MAX_LISTED_ID;
 use super::login::{AfterLogin, Login};
 use super::options::Compare;
 use super::text::{agent_name, bound};
-use super::{Moment, Refused, Step, muted_notice};
+use super::{Moment, Process, Refused, Step, muted_notice};
 
 /// Where the agent's ACP conversation is: what the transcript's
 /// [`AgentState`] can't say (which start request is out, the ACP session
@@ -264,7 +263,7 @@ impl Step<'_> {
         } else {
             self.hold_waiting(HoldReason::AgentStopped);
             if self.running() {
-                self.s.run = None;
+                self.s.process.run = None;
                 self.turn(TurnState::Failed {
                     message: "the agent exited".to_owned(),
                 });
@@ -329,12 +328,9 @@ impl Step<'_> {
         // Normally a no-op: `end` or `restart_for_login` closed the old
         // process. No path resets `Rpc` without closing it.
         self.close_process(Refused::Restarted.to_string(), Closing::Gone);
-        self.s.lines = Lines::new();
-        self.s.run = None;
         // The old agent's calls and terminals are gone with it; their
         // entries and text stay.
-        self.s.book.clear();
-        self.s.bad = None;
+        self.s.process = Process::new();
         self.s.phase = Phase::Spawning { start };
     }
 
@@ -426,7 +422,7 @@ impl Step<'_> {
         );
         self.s.phase = Phase::Broken;
         self.clear_lists();
-        self.s.run = None;
+        self.s.process.run = None;
         self.hold_waiting(HoldReason::AgentStopped);
         if self.running() {
             self.turn(TurnState::Failed {
@@ -716,7 +712,7 @@ impl Step<'_> {
         };
         self.s.chose = false;
         // The replay's last chunk is no run a live chunk extends.
-        self.s.run = None;
+        self.s.process.run = None;
         self.ready(conversation, greeting, notice, offered);
     }
 
@@ -1142,7 +1138,7 @@ mod tests {
         agent.turn("one");
         agent.feed(&tool_call("call_1", "Write", "pending"));
         // A run pointing at the tool entry: the next chunk appends to it.
-        agent.s.run = Some(Run {
+        agent.s.process.run = Some(Run {
             kind: RunKind::Agent,
             entry: EntryId(2),
         });
@@ -1416,7 +1412,7 @@ mod tests {
             assert!(agent.feed(&line).events.is_empty(), "{line}");
         }
         assert_eq!(agent.entries(), kept);
-        assert!(agent.s.book.outputs.is_empty());
+        assert!(agent.s.process.book.outputs.is_empty());
     }
 
     // The title across restarts (agents-session-title decision 3).
@@ -2117,22 +2113,22 @@ mod tests {
     fn a_respawn_leaves_no_state_of_the_old_process() {
         let mut agent = Agent::ready();
         agent.step(Input::Stdout(b"{\"jsonrpc\": \"2.0\", \"method\": \"half"));
-        agent.s.run = Some(Run {
+        agent.s.process.run = Some(Run {
             kind: RunKind::Agent,
             entry: EntryId(1),
         });
-        agent.s.bad = Some(BadRun {
+        agent.s.process.bad = Some(BadRun {
             lines: 3,
             last: agent.now,
         });
-        agent.s.book.tools.insert("c1".into(), EntryId(1));
+        agent.s.process.book.tools.insert("c1".into(), EntryId(1));
         let open = OpenOutput {
             entry: EntryId(1),
             item: 0,
             filter: crate::acp::plain::State::default(),
         };
-        agent.s.book.outputs.insert("t1".into(), open);
-        assert_ne!(agent.s.lines, Lines::new(), "a line in progress");
+        agent.s.process.book.outputs.insert("t1".into(), open);
+        assert_ne!(agent.s.process.lines, Lines::new(), "a line in progress");
         let mut step = Step {
             s: &mut agent.s,
             out: Output::default(),
@@ -2141,9 +2137,6 @@ mod tests {
             event_limit: MAX_EVENT,
         };
         step.respawn(Start::New);
-        assert_eq!(agent.s.lines, Lines::new());
-        assert_eq!(agent.s.run, None);
-        assert_eq!(agent.s.bad, None);
-        assert_eq!(agent.s.book, ToolBook::default());
+        assert_eq!(agent.s.process, Process::new());
     }
 }

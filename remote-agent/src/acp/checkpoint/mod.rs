@@ -257,7 +257,7 @@ mod tests {
         assert!(agent.s.transcript.encoded_len() > limits::LOG_LIMIT - 512 * 1024);
         agent.prompt(&"q".repeat(limits::MAX_PROMPT));
         assert!(matches!(agent.s.transcript.slot(), Slot::Waiting { .. }));
-        agent.s.lines = Lines::restore(
+        agent.s.process.lines = Lines::restore(
             Partial::Collecting(vec![b'"'; super::super::lines::MAX_LINE + 1]),
             0,
         );
@@ -471,7 +471,7 @@ mod tests {
     #[test]
     fn line_bytes_beside_a_partial_that_isnt_collected_are_unreadable() {
         let mut agent = Agent::ready();
-        agent.s.lines = Lines::restore(Partial::Resyncing { len: 3 }, 10);
+        agent.s.process.lines = Lines::restore(Partial::Resyncing { len: 3 }, 10);
         let (state, _) = state_of(&encode(&agent.s).expect("it fits"));
         assert_eq!(
             decode(&rebuild(&state, b"abc"), agent.now),
@@ -534,7 +534,7 @@ mod tests {
         assert_eq!(stored.seq, 3);
         let decoded = stored.decode(agent.now);
         assert_eq!(decoded, agent.s);
-        assert!(matches!(decoded.lines.partial(), Partial::Collecting(bytes) if bytes.is_empty()));
+        assert!(matches!(decoded.process.lines.partial(), Partial::Collecting(bytes) if bytes.is_empty()));
         assert_eq!(decoded.methods.len(), 2);
     }
 

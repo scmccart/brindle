@@ -97,7 +97,7 @@ pub fn adopt(
                 reduce::step(&mut session, Input::OutputLost, now)
             } else {
                 Output {
-                    wake: session.bad.map(|bad| bad.last + BAD_RUN_QUIET),
+                    wake: session.process.bad.map(|bad| bad.last + BAD_RUN_QUIET),
                     ..Output::default()
                 }
             };
@@ -115,7 +115,7 @@ pub fn adopt(
         Err(why) => {
             let mut session = not_restored(&why, cwd, version);
             if truncated {
-                session.lines.cut_front();
+                session.process.lines.cut_front();
             }
             Adopted {
                 session,
@@ -203,7 +203,7 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Event::Queue { .. }))
         );
-        assert!(matches!(session.lines.partial(), Partial::Resyncing { .. }));
+        assert!(matches!(session.process.lines.partial(), Partial::Resyncing { .. }));
     }
 
     #[test]
@@ -317,7 +317,7 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(sent(&adopted.output.stdin)[0]["method"], "initialize");
         assert!(matches!(
-            adopted.session.lines.partial(),
+            adopted.session.process.lines.partial(),
             Partial::Resyncing { .. }
         ));
     }
@@ -333,7 +333,7 @@ mod tests {
         );
         assert_not_restored(&adopted);
         assert!(matches!(
-            adopted.session.lines.partial(),
+            adopted.session.process.lines.partial(),
             Partial::Resyncing { .. }
         ));
     }

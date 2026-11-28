@@ -30,7 +30,7 @@ impl Step<'_> {
     /// `end_turn` with the agent ready, and held after any other ending
     /// (decision 10).
     pub(super) fn end_turn(&mut self, ending: Ending) {
-        self.s.run = None;
+        self.s.process.run = None;
         let cancelling = *self.s.transcript.turn() == TurnState::Cancelling;
         let ready = self.readiness().is_ok();
         let waiting = match self.s.transcript.slot() {
@@ -61,7 +61,7 @@ impl Step<'_> {
         let session = session.clone();
         self.add_text(RunKind::User, &text);
         // A prompt is no run the agent's chunks extend.
-        self.s.run = None;
+        self.s.process.run = None;
         self.turn(TurnState::Working);
         let line = self.s.rpc.prompt(&session, &text);
         self.out.stdin.extend(line);
@@ -160,7 +160,7 @@ impl Step<'_> {
             self.turn(TurnState::Cancelling);
             self.mark(Moment::Permission);
         } else {
-            self.s.run = None;
+            self.s.process.run = None;
             self.turn(TurnState::Ended {
                 stop: StopReason::Cancelled,
             });

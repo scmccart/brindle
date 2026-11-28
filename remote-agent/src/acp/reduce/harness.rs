@@ -335,7 +335,7 @@ pub(super) fn fixture_line(file: &str, n: usize) -> String {
 // --- tool content (`agents-tool-content` decisions 3 to 7) ---------
 
 pub(super) fn tool_entry(agent: &Agent, call: &str) -> Entry {
-    let entry = *agent.s.book.tools.get(call).expect("a tool entry");
+    let entry = *agent.s.process.book.tools.get(call).expect("a tool entry");
     agent.s.transcript.entry(entry).cloned().expect("held")
 }
 

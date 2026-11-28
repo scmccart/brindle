@@ -126,7 +126,7 @@ impl Step<'_> {
                 session: session.clone(),
             },
         };
-        self.s.run = None;
+        self.s.process.run = None;
         self.hold_waiting(HoldReason::LoginRequired);
         self.turn(TurnState::Failed { message });
         self.needs_login(login);
