@@ -208,6 +208,16 @@ impl Zone {
     /// A zone whose session's thread hasn't handed it the running session
     /// yet: nothing told its sink `running`.
     pub fn starting(first: Option<&str>, cx: &mut TestAppContext) -> Self {
+        Self::build(first, true, cx)
+    }
+
+    /// A zone whose start failed: it has no requests to send through, as
+    /// when the server is too old.
+    pub fn no_server(cx: &mut TestAppContext) -> Self {
+        Self::build(None, false, cx)
+    }
+
+    fn build(first: Option<&str>, server: bool, cx: &mut TestAppContext) -> Self {
         let (sink, feed) = Sink::with_fault(None);
         let shared = feed.shared.clone();
         let calls = Calls::default();
@@ -219,7 +229,7 @@ impl Zone {
         let first = first.map(|text| FirstPrompt::new(text.to_string()).unwrap());
         let agent = cx.new(|cx| {
             let model = ChatModel::new("Fake", first);
-            let requests = Some(Box::new(requests) as Box<dyn Requests>);
+            let requests = server.then(|| Box::new(requests) as Box<dyn Requests>);
             Agent::from_parts(model, feed, requests, "fake-acp".into(), Host::Local, None, connect, cx)
         });
         Self { sink, agent, calls, refuse, shared, starts, sinks, next }
