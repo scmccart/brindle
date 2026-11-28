@@ -57,6 +57,8 @@ mod harness;
 pub use attention::WorkingRow;
 pub use blocks::{Block, BlockBody, ShownPart, Splice};
 pub use change::Due;
+#[cfg(test)]
+pub(crate) use change::RENDER_PROBE;
 pub use choosing::{Choose, LaunchChoice, Leaving, ListDone, ListFor, ListerState, OnChoosing, ZoneChoice};
 pub use ledger::{LINK_DOWN, NotSent, Replied, ReplyError, Sent};
 pub use login::{AfterLogin, CancelLogin, LoginChoice, LoginRow, LoginZoneEnd, MethodChoice};
