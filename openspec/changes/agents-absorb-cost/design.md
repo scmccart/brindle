@@ -279,3 +279,36 @@ Nothing to migrate: no stored state changes. The change lands after `agents-modu
 
 1. **Should rendered text be capped?** An agent can make the render larger than its text with images and short emphasized runs. *Recommendation:* count it in `held_text` on an adversarial message in this change's tests, and propose a cap only if it passes a few times the source; a cap would be a visible change (an image shown as `[image: ALT]` alone past it) and needs its own spec.
 2. **`FRAME` is 16 ms whatever the display's rate.** *Recommendation:* keep it equal to `BUDGET`; a 120 Hz display then draws a growing message every other frame, which reads the same.
+
+## As built
+
+Read and built on commit 33cca684, the head of `perf/agents-checkpoint-deltas` (PR #158) before it merged, on `main` at 2bdbeec6; the branch is rebased onto `main` once #158 lands.
+
+### Before (task 2.6)
+
+Release build of dcbb88b7 (groups 1–2 only), under `scripts/with-xvfb`, run `target/tmp/perf/20261128T091937Z` (its `summary.toml` kept with the implementation report):
+
+| | |
+|---|---|
+| `agent-markdown-stream` streamed / one chunk | 2266.75 / 2263.58 ms, `streamed_renders` 6 (234,976 bytes) |
+| trickled (2,048 chunks, `pace 10`) | 21,549.87 ms, `trickled_renders` 1,861 (62,159,232 bytes rendered for 64 KiB) against 60 × 21.55 = 1,293 frames |
+| `agent-tool-output` streamed / one chunk / 32 B | 2256.89 / 2257.22 / 2209.77 ms |
+
+| latency (ms) | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| quiet: paint | 7.01 | 9.11 | 9.26 | 17.25 |
+| quiet: frame | 21.94 | 24.05 | 32.04 | 36.72 |
+| trickle: paint | 6.37 | 17.95 | 22.79 | 32.80 |
+| trickle: frame | 20.57 | 35.88 | 46.53 | 56.05 |
+
+The output column (bytes into the shell) stays at 0.20 ms p50 in both. At 10 ms a chunk is its own update, so the trickled run renders about once per chunk: 1.44 renders per frame, and each render takes the whole growing fence (33 KiB on average).
+
+### Flags
+
+1. The base was #158's head before it merged (above).
+2. The latency report gives p50, p95 and p99, not p90 (task 2.6 names p90): `LatencyResult` has no p90, and adding one would change every case's table. The numbers above are p95.
+3. The trickle case's agent marks its last chunk with `record-env FILE` before its `respond` (the fake agent writes the file when it runs the step), and the case reads whether the file exists when Brindle exits, recorded as `stream_outlasted` in `summary.toml`. At the default 500 samples the bench outlasts the 20 s stream (`stream_outlasted = false`): the trickle case's tail runs beside an idle zone, so its p95 and p99 understate the stream's effect rather than overstate it. The case says so in its output; lengthening the stream was left alone, since design 9 fixes it at 64 KiB.
+4. GPUI's `SharedString` has no `ptr_eq`; `a_reference_used_many_times_shares_one_target` compares `as_ptr()` of the targets and tooltips, which is the same check.
+5. `entries_from_starts_at_the_id_or_the_next_held_one` lives in `fold.rs`'s tests (`lib.rs` has none). Held ids are contiguous, so "an id between two held ones" can't be built; the test covers an id held, the first held, ids trimmed away and below a window, and one past the end.
+6. `HeldText` drops its `detail_sources` count with `DetailPart::Text`'s `source`: no drawn part can hold a source any more, so the count is unrepresentable rather than zero, and `held_text_counts_the_copies` asserts `text_sources` alone.
+7. `copy_text_is_a_unified_diff_the_output_or_the_source` already read a text item's source from the `ToolItem`, so 4.3 left it as it was.
