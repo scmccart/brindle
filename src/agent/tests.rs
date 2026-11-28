@@ -184,6 +184,46 @@ fn life_events_and_leaving_the_session() {
     assert_eq!(ended.take_calls(), [Call::Close]);
 }
 
+/// Once a quit has left the session, nothing more goes through it: no
+/// prompt, layout, close or second detach.
+#[test]
+fn a_quit_leaves_and_sends_nothing_more() {
+    let mut cx = app();
+    let mut zone = Zone::new(None, &mut cx);
+    zone.feed(&[ready()]);
+    settle(&cx);
+    let layout = Some(serde_json::json!({"zones": 1}));
+    zone.agent.update(&mut cx, |agent, cx| {
+        agent.quit_with(layout.clone());
+        agent.prompt("after the quit", false, cx);
+        agent.set_layout(layout.clone());
+        agent.close();
+        agent.quit_with(None);
+    });
+    assert_eq!(zone.take_calls(), [Call::Detach(layout)], "one detach, then nothing");
+    zone.agent.read_with(&cx, |agent, _| assert_eq!(agent.server_session(), None));
+}
+
+/// A zone whose start failed has no session to send to: its input is
+/// disabled as not started, a prompt sends nothing, and so does leaving.
+#[test]
+fn a_failed_start_refuses_a_prompt_as_today() {
+    let mut cx = app();
+    let mut zone = Zone::no_server(&mut cx);
+    zone.sink.failed(&anyhow::anyhow!("the terminal server is too old"));
+    settle(&cx);
+    zone.agent.update(&mut cx, |agent, cx| agent.prompt("hello", false, cx));
+    zone.agent.read_with(&cx, |agent, _| {
+        assert_eq!(agent.model().prompt_status(), model::PromptStatus::Disabled(model::DisabledWhy::NotStarted));
+        assert_eq!(agent.server_session(), None);
+    });
+    zone.agent.update(&mut cx, |agent, _| {
+        agent.set_layout(None);
+        agent.close();
+    });
+    assert!(zone.take_calls().is_empty());
+}
+
 // `agents-session-recovery` 4.3: continuing a conversation.
 
 fn conversation(continuation: Continuation) -> Event {

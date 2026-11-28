@@ -754,10 +754,13 @@ fn acp_versions_stay_in_their_modules() {
         "Dialect's variants are matched only in remote-agent/src/acp/dialect.rs; \
          call its methods (docs/architecture/ports-and-adapters.md R14)",
     );
-    let versionless: Vec<PathBuf> = ["reduce.rs", "rpc.rs", "checkpoint.rs"]
-        .iter()
-        .map(|file| acp.join(file))
-        .collect();
+    let mut versionless = Vec::new();
+    for dir in ["remote-agent/src/acp/reduce", "remote-agent/src/acp/checkpoint"] {
+        let found = sources(dir);
+        assert!(!found.is_empty(), "{dir}/ is missing");
+        versionless.extend(found);
+    }
+    versionless.push(acp.join("rpc.rs"));
     assert_none(
         offenders(&versionless, Scope::All, &["v1::", "v2::"]),
         "the reducer, rpc and the checkpoint read acp/forms.rs, never a version's \
@@ -779,6 +782,82 @@ fn acp_versions_stay_in_their_modules() {
         "only remote-agent/src/acp/forms.rs and acp/v1/ name OptionKey::Modes and \
          OptionKey::Models (docs/architecture/ports-and-adapters.md R14)",
     );
+}
+
+/// The lines of `lines` (production code, [`production_lines`]) that read
+/// an ACP error code: a version's code constant, a comparison of an
+/// error's `.code`, or a code in JSON-RPC's implementation-defined range
+/// (`-32000` to `-32099`; the standard codes are other prefixes).
+fn error_code_lines(lines: &[(usize, String)]) -> Vec<usize> {
+    lines
+        .iter()
+        .filter(|(_, line)| {
+            ["AUTH_REQUIRED", "UNSUPPORTED_VERSION"]
+                .iter()
+                .any(|name| names_path(line, name))
+                || [".code ==", ".code !=", "-320"]
+                    .iter()
+                    .any(|needle| line.contains(needle))
+        })
+        .map(|(number, _)| *number)
+        .collect()
+}
+
+/// ports R14: a version's error codes are read only in its module
+/// (`acp/v1/`, later `acp/v2/`); the shared ACP code matches
+/// `forms::Failure`, which `Dialect::failure` gives it.
+#[test]
+fn acp_error_codes_stay_in_their_version() {
+    let (_, test_modules) = scan_production();
+    let shared: Vec<String> = production_files()
+        .into_iter()
+        .filter(|file| file.starts_with("remote-agent/src/acp/"))
+        .filter(|file| {
+            !["v1", "v2"]
+                .iter()
+                .any(|version| file.starts_with(&format!("remote-agent/src/acp/{version}/")))
+        })
+        .filter(|file| !in_test_module(file, &test_modules))
+        .collect();
+    assert!(
+        shared.iter().any(|file| file == "remote-agent/src/acp/reduce/mod.rs"),
+        "the reducer is missing from {shared:?}"
+    );
+    let mut found = Vec::new();
+    for file in &shared {
+        let path = root().join(file);
+        let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let original: Vec<&str> = text.lines().collect();
+        for number in error_code_lines(&production_lines(&text)) {
+            found.push(format!("{file}:{number}: {}", original[number - 1].trim()));
+        }
+    }
+    assert_none(
+        found,
+        "a version's error codes are read only in its module; the shared code matches \
+         forms::Failure through Dialect::failure (docs/architecture/ports-and-adapters.md R14)",
+    );
+}
+
+/// The scan behind [`acp_error_codes_stay_in_their_version`] finds what it
+/// looks for, so a scan that silently matched nothing would fail here.
+#[test]
+fn the_error_code_check_finds_a_planted_code() {
+    let text = "\
+fn f(error: &RpcError) -> bool {
+    // error.code == AUTH_REQUIRED, in a comment
+    let s = \"-32000\";
+    error.code == -32000
+}
+const AUTH_REQUIRED: i64 = 1;
+fn g(error: &RpcError) -> bool { error.code != UNSUPPORTED_VERSION }
+fn h() -> i64 { -32601 }
+#[cfg(test)]
+mod tests {
+    const UNSUPPORTED_VERSION: i64 = -32022;
+}
+";
+    assert_eq!(error_code_lines(&production_lines(text)), [4, 6, 7]);
 }
 
 /// The transcript crate's one door in the app: no file in `src/` but
@@ -1140,7 +1219,10 @@ fn f() {
 /// items in shell modules are review's. This mirrors that table and changes
 /// with it, in the same commit. `the_neutral_code_is_never_gated` holds the
 /// same files to `fcis R7`.
-const PURE_MODULES: [&str; 69] = [
+///
+/// A directory module joins file by file, so a file added to it can't skip
+/// the check; its test-only `harness.rs` is test code and stays out.
+const PURE_MODULES: [&str; 93] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1161,10 +1243,23 @@ const PURE_MODULES: [&str; 69] = [
     "src/agent/shared.rs",
     "src/agent/markdown.rs",
     "src/agent/tool.rs",
-    "src/agent/model.rs",
+    "src/agent/model/mod.rs",
+    "src/agent/model/phase.rs",
+    "src/agent/model/blocks.rs",
+    "src/agent/model/ledger.rs",
+    "src/agent/model/queue.rs",
+    "src/agent/model/prompt.rs",
+    "src/agent/model/login.rs",
+    "src/agent/model/recovery.rs",
+    "src/agent/model/choosing.rs",
+    "src/agent/model/paging.rs",
+    "src/agent/model/attention.rs",
+    "src/agent/model/dump.rs",
+    "src/agent/model/options.rs",
     "src/agent/conversations.rs",
     "src/agent/commands.rs",
     "src/layout.rs",
+    "src/zone_tree.rs",
     "src/reattach.rs",
     "src/workspace/tabs.rs",
     "src/workspace/launch.rs",
@@ -1207,8 +1302,19 @@ const PURE_MODULES: [&str; 69] = [
     "remote-agent/src/acp/plain.rs",
     "remote-agent/src/acp/lines.rs",
     "remote-agent/src/acp/rpc.rs",
-    "remote-agent/src/acp/reduce.rs",
-    "remote-agent/src/acp/checkpoint.rs",
+    "remote-agent/src/acp/reduce/mod.rs",
+    "remote-agent/src/acp/reduce/lifecycle.rs",
+    "remote-agent/src/acp/reduce/turn.rs",
+    "remote-agent/src/acp/reduce/tools.rs",
+    "remote-agent/src/acp/reduce/permission.rs",
+    "remote-agent/src/acp/reduce/login.rs",
+    "remote-agent/src/acp/reduce/list.rs",
+    "remote-agent/src/acp/reduce/text.rs",
+    "remote-agent/src/acp/reduce/options.rs",
+    "remote-agent/src/acp/checkpoint/mod.rs",
+    "remote-agent/src/acp/checkpoint/format.rs",
+    "remote-agent/src/acp/checkpoint/state.rs",
+    "remote-agent/src/acp/checkpoint/adopt.rs",
     "remote-agent/src/fake_acp/script.rs",
 ];
 

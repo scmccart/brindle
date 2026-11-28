@@ -14,8 +14,8 @@ use crate::config::{Profile, ProfileKey};
 use crate::picker::PaletteRow;
 use crate::remote::Host;
 use crate::remote::protocol::client::{AgentConversations, ListedConversation};
-use crate::workspace::TabId;
-use crate::zone_view::{ZoneId, split_target};
+use crate::workspace::tabs::TabId;
+use crate::zone_tree::{ZoneId, split_target};
 
 /// One conversation an agent listed: its id, and its title and last
 /// activity when the agent gave them (`updated` as the agent's text).
@@ -486,8 +486,14 @@ impl ConversationsModel {
     pub fn failed(&mut self, why: impl Into<String>) {
         let why = why.into();
         match (&self.state, &self.more) {
+            // A listed page's next one failed: the page stays.
             (ListState::Listed, More::Loading(cursor)) => self.more = More::Failed { cursor: cursor.clone(), why },
-            _ => self.state = ListState::Failed(why),
+            // Anything else fails the list (the pair above reaches its arm
+            // first).
+            (
+                ListState::Starting | ListState::Listing | ListState::Listed | ListState::Failed(_),
+                More::None | More::Available(_) | More::Loading(_) | More::Failed { .. } | More::Capped,
+            ) => self.state = ListState::Failed(why),
         }
     }
 

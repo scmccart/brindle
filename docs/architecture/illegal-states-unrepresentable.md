@@ -26,7 +26,7 @@ pub enum Closing { Keeps, Ends }
 
 **Id plus key across servers.** A session is `{ id, key }`: the id is the core's counter, the key a random 128-bit value that tells sessions apart across cores. The state file records both, and a restored zone takes its session only when both match.
 
-**Newtypes for in-process ids.** `ZoneId(u64)` in `zone_view.rs`, `LayerId` in `brindle-ui`.
+**Newtypes for in-process ids.** `ZoneId(u64)` in `zone_tree.rs`, `LayerId` in `brindle-ui`.
 
 **Normalised geometry as its own type.** `UnitRect` holds a zone's rectangle in `[0, 1] x [0, 1]`; pixel rectangles are gpui's `Bounds<Pixels>`. Cell sizes come only from `cell_metrics()` and `fit_grid()`.
 

@@ -1,5 +1,5 @@
-//! A local tab's binary split tree of zones, normalized geometry, and
-//! native GPUI zone chrome.
+//! A local tab's zones (the tree itself is `zone_tree.rs`'s) and their
+//! native GPUI chrome.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -16,11 +16,8 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
     SharedString, Size, Styled, Subscription, Window, div, px, size,
 };
-use serde::{Deserialize, Serialize};
-
 use crate::actions::*;
 use crate::agent::close::{BusyAgent, ClosePlan, Closing, close_plan};
-use crate::agent::login::{self, TerminalLogin};
 use crate::agent::model::LoginZoneEnd;
 use crate::agent::conversations::{ZoneAt, ZoneFacts, ZoneRun};
 use crate::agent::{Agent, AgentAsk, LoginZone, OptionRefused};
@@ -43,6 +40,9 @@ use crate::theme::Theme;
 use crate::workspace::{program_title, shortcut, terminal_automatic_title};
 use crate::workspace::mark::{Mark, mark};
 use crate::motion::{self, Motion};
+pub use crate::zone_tree::{Direction, SplitAxis, ZoneId, ZoneTree, split_target};
+
+mod login;
 
 /// Height of a zone card's header bar, shown when a tab has 2+ zones, its
 /// bottom line included (`brindle_ui::CARD_HEADER_HEIGHT`).
@@ -50,219 +50,6 @@ pub const ZONE_HEADER_HEIGHT: f32 = 28.0;
 /// The gap between a tab's zone cards, and the margin round them; it
 /// replaces the dividers, and the focus ring is drawn in it.
 pub const ZONE_GAP: f32 = 6.0;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ZoneId(pub u64);
-
-/// Which way `FocusZone*` moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SplitAxis {
-    /// Left and right halves (`Split Zone Right`).
-    Horizontal,
-    /// Top and bottom halves (`Split Zone Down`).
-    Vertical,
-}
-
-/// Normalized rectangle in `[0, 1] x [0, 1]`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct UnitRect {
-    pub x: f64,
-    pub y: f64,
-    pub w: f64,
-    pub h: f64,
-}
-
-impl UnitRect {
-    pub const FULL: Self = Self { x: 0.0, y: 0.0, w: 1.0, h: 1.0 };
-
-    pub fn split(self, axis: SplitAxis) -> (Self, Self) {
-        match axis {
-            SplitAxis::Horizontal => {
-                let half = self.w * 0.5;
-                (
-                    Self { x: self.x, y: self.y, w: half, h: self.h },
-                    Self { x: self.x + half, y: self.y, w: half, h: self.h },
-                )
-            }
-            SplitAxis::Vertical => {
-                let half = self.h * 0.5;
-                (
-                    Self { x: self.x, y: self.y, w: self.w, h: half },
-                    Self { x: self.x, y: self.y + half, w: self.w, h: half },
-                )
-            }
-        }
-    }
-
-    fn center_x(self) -> f64 {
-        self.x + self.w * 0.5
-    }
-
-    fn center_y(self) -> f64 {
-        self.y + self.h * 0.5
-    }
-}
-
-/// Binary split tree of zones in a local tab.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ZoneTree {
-    Leaf(ZoneId),
-    Split {
-        axis: SplitAxis,
-        first: Box<ZoneTree>,
-        second: Box<ZoneTree>,
-    },
-}
-
-impl ZoneTree {
-    pub fn new(id: ZoneId) -> Self {
-        Self::Leaf(id)
-    }
-
-    /// Replaces `Leaf(target)` with a `Split` holding `target` in `first`
-    /// and `new_id` in `second`. Returns whether `target` was found.
-    pub fn split(&mut self, target: ZoneId, axis: SplitAxis, new_id: ZoneId) -> bool {
-        match self {
-            Self::Leaf(id) if *id == target => {
-                *self = Self::Split {
-                    axis,
-                    first: Box::new(Self::Leaf(target)),
-                    second: Box::new(Self::Leaf(new_id)),
-                };
-                true
-            }
-            Self::Leaf(_) => false,
-            Self::Split { first, second, .. } => {
-                first.split(target, axis, new_id) || second.split(target, axis, new_id)
-            }
-        }
-    }
-
-    /// Removes `Leaf(target)`, promoting its sibling subtree in place of the
-    /// parent `Split`. Returns `Some(promoted_leaves)` when removed from a
-    /// split, or `None` if `target` was not found (or was the root leaf).
-    pub fn remove(&mut self, target: ZoneId) -> Option<Vec<ZoneId>> {
-        match self {
-            Self::Leaf(_) => None,
-            Self::Split { first, second, .. } => {
-                if matches!(**first, Self::Leaf(id) if id == target) {
-                    let promoted = second.leaves();
-                    *self = (**second).clone();
-                    return Some(promoted);
-                }
-                if matches!(**second, Self::Leaf(id) if id == target) {
-                    let promoted = first.leaves();
-                    *self = (**first).clone();
-                    return Some(promoted);
-                }
-                first.remove(target).or_else(|| second.remove(target))
-            }
-        }
-    }
-
-    /// All leaf IDs in tree order (first before second).
-    pub fn leaves(&self) -> Vec<ZoneId> {
-        let mut out = Vec::new();
-        self.collect_leaves(&mut out);
-        out
-    }
-
-    fn collect_leaves(&self, out: &mut Vec<ZoneId>) {
-        match self {
-            Self::Leaf(id) => out.push(*id),
-            Self::Split { first, second, .. } => {
-                first.collect_leaves(out);
-                second.collect_leaves(out);
-            }
-        }
-    }
-
-    /// Normalized `[0, 1] x [0, 1]` rectangles for every leaf in tree order.
-    pub fn rects(&self) -> Vec<(ZoneId, UnitRect)> {
-        let mut out = Vec::new();
-        self.collect_rects(UnitRect::FULL, &mut out);
-        out
-    }
-
-    fn collect_rects(&self, rect: UnitRect, out: &mut Vec<(ZoneId, UnitRect)>) {
-        match self {
-            Self::Leaf(id) => out.push((*id, rect)),
-            Self::Split { axis, first, second } => {
-                let (r1, r2) = rect.split(*axis);
-                first.collect_rects(r1, out);
-                second.collect_rects(r2, out);
-            }
-        }
-    }
-
-    /// Finds the leaf to focus when moving from `active` in `direction`:
-    /// candidates must overlap on the perpendicular axis and lie in
-    /// `direction`, ranked by nearest primary edge, then closest
-    /// perpendicular center, then tree order.
-    pub fn focus_target(&self, active: ZoneId, direction: Direction) -> Option<ZoneId> {
-        const EPS: f64 = 1e-9;
-        let rects = self.rects();
-        let (_, cur) = rects.iter().copied().find(|(id, _)| *id == active)?;
-
-        let mut best: Option<(ZoneId, f64, f64)> = None;
-        for (id, cand) in rects {
-            if id == active {
-                continue;
-            }
-            let (primary_dist, perp_overlap, perp_dist) = match direction {
-                Direction::Left => {
-                    let dist = cur.x - (cand.x + cand.w);
-                    let overlap = (cur.y + cur.h).min(cand.y + cand.h) - cur.y.max(cand.y);
-                    (dist, overlap, (cur.center_y() - cand.center_y()).abs())
-                }
-                Direction::Right => {
-                    let dist = cand.x - (cur.x + cur.w);
-                    let overlap = (cur.y + cur.h).min(cand.y + cand.h) - cur.y.max(cand.y);
-                    (dist, overlap, (cur.center_y() - cand.center_y()).abs())
-                }
-                Direction::Up => {
-                    let dist = cur.y - (cand.y + cand.h);
-                    let overlap = (cur.x + cur.w).min(cand.x + cand.w) - cur.x.max(cand.x);
-                    (dist, overlap, (cur.center_x() - cand.center_x()).abs())
-                }
-                Direction::Down => {
-                    let dist = cand.y - (cur.y + cur.h);
-                    let overlap = (cur.x + cur.w).min(cand.x + cand.w) - cur.x.max(cand.x);
-                    (dist, overlap, (cur.center_x() - cand.center_x()).abs())
-                }
-            };
-            if primary_dist < -EPS || perp_overlap <= EPS {
-                continue;
-            }
-            let replace = match best {
-                None => true,
-                Some((_, best_primary, best_perp)) => {
-                    if (primary_dist - best_primary).abs() > EPS {
-                        primary_dist < best_primary
-                    } else if (perp_dist - best_perp).abs() > EPS {
-                        perp_dist < best_perp
-                    } else {
-                        // Earlier in tree order wins ties.
-                        false
-                    }
-                }
-            };
-            if replace {
-                best = Some((id, primary_dist, perp_dist));
-            }
-        }
-        best.map(|(id, _, _)| id)
-    }
-}
 
 /// Whether a zone card of outer pixel size `zone_size` (its border, and its
 /// header bar when `has_header` is true, included) can be split in half
@@ -369,35 +156,6 @@ pub fn split_profile_choices(config: &Config) -> Vec<ProfileKey> {
         .chain((0..config.profiles.len()).filter(|&ix| ix != default))
         .filter_map(|ix| config.profile_key(ix))
         .collect()
-}
-
-/// Where a zone of `profile` started by a split of a zone of `split`
-/// running on `split_host` runs: on the split zone's endpoint when the
-/// profile is its own (names match ignoring case, as profile lookups do),
-/// even when the profile's target has moved since; any other profile
-/// where it says.
-pub fn split_host(split: &Profile, split_host: &Host, profile: &Profile) -> Host {
-    if profile.name.eq_ignore_ascii_case(&split.name) { split_host.clone() } else { Host::of(profile) }
-}
-
-/// The directory a split's new zone starts in: the split zone's, when both
-/// run on one endpoint (`same_host`), whatever the new profile's own
-/// directory; else none, and the new zone's start takes its profile's
-/// directory, else the home directory there. A directory never crosses
-/// endpoints.
-pub fn split_cwd(split_dir: Option<PathBuf>, same_host: bool) -> Option<PathBuf> {
-    split_dir.filter(|_| same_host)
-}
-
-/// Where a new zone of `profile` split from a zone of `split` on
-/// `split_host` in `split_dir` runs ([`split_host`]) and the directory it
-/// asks to start in ([`split_cwd`]): the split's rule, which the
-/// conversations palette's directory follows too
-/// (`crate::agent::conversations::list_dir`).
-pub fn split_target(split: &Profile, split_host_now: &Host, split_dir: Option<PathBuf>, profile: &Profile) -> (Host, Option<PathBuf>) {
-    let host = split_host(split, split_host_now, profile);
-    let same_host = *split_host_now == host;
-    (host, split_cwd(split_dir, same_host))
 }
 
 /// What a zone header's menu enables its split items by: whether the zone
@@ -895,12 +653,6 @@ pub fn recorded_leaves(leaves: Vec<ZoneId>, logins: &[ZoneId]) -> Vec<ZoneId> {
     leaves.into_iter().filter(|id| !logins.contains(id)).collect()
 }
 
-/// Where a terminal login's zone goes beside its agent zone: to the right
-/// when the agent zone is wide enough to split that way, else below.
-pub fn login_axis(fits_right: bool) -> SplitAxis {
-    if fits_right { SplitAxis::Horizontal } else { SplitAxis::Vertical }
-}
-
 /// A split of the active zone wants a profile chosen (OpenSpec change
 /// `zones-mixed-tabs`, decision 2): the window asks which of `profiles` in
 /// a palette, and splits `zone` along `axis` with the one chosen
@@ -1138,86 +890,6 @@ impl ZoneTreeView {
             self.zones.iter().filter(|(_, zone)| Self::zone_mark(zone).is_spinner()).map(|(id, _)| *id).collect();
         ids.sort_by_key(|id| (*id != self.active, id.0));
         ids.into_iter().map(|id| format!("--- spinner zone={}\n", id.0)).collect()
-    }
-
-    /// Agent zone `agent_zone` asks for its terminal login's zone, or for
-    /// it to close (Cancel login).
-    fn on_login_zone(&mut self, agent_zone: ZoneId, event: &LoginZone, window: &mut Window, cx: &mut Context<Self>) {
-        if self.shutting_down {
-            return;
-        }
-        match event {
-            LoginZone::Open(plan) => self.open_login_zone(agent_zone, plan.clone(), window, cx),
-            LoginZone::Close => {
-                if let Some(id) = self.login_zone_of(agent_zone) {
-                    self.close_zone_by_id(id, window, cx);
-                }
-            }
-        }
-    }
-
-    /// The terminal login's zone of agent zone `agent_zone`, while open.
-    fn login_zone_of(&self, agent_zone: ZoneId) -> Option<ZoneId> {
-        self.zones.iter().find(|(_, zone)| zone.login_for == Some(agent_zone)).map(|(id, _)| *id)
-    }
-
-    /// The zones running terminal logins.
-    fn login_zones(&self) -> Vec<ZoneId> {
-        self.zones.iter().filter(|(_, zone)| zone.login_for.is_some()).map(|(id, _)| *id).collect()
-    }
-
-    /// Opens a terminal zone beside agent zone `agent_zone` running `plan`
-    /// on that zone's host, in the agent's directory, with its profile's
-    /// environment and the login's variables over it (decision 9), drawn as
-    /// the agent zone is. It isn't a profile's zone: no split starts from
-    /// it, its program ends with the tab or Brindle (a command's terminal,
-    /// `Closing::Ends`), and it takes focus, since the login asks for
-    /// typing. One per agent zone.
-    fn open_login_zone(&mut self, agent_zone: ZoneId, plan: TerminalLogin, window: &mut Window, cx: &mut Context<Self>) {
-        if self.login_zone_of(agent_zone).is_some() {
-            return;
-        }
-        let Some(zone) = self.zones.get(&agent_zone) else { return };
-        let spec = ZoneSpec {
-            profile: zone.profile.clone(),
-            host: zone.host.clone(),
-            theme: zone.theme.clone(),
-            font_size: zone.font_size,
-        };
-        let axis = login_axis(self.fits(agent_zone, SplitAxis::Horizontal, window, cx));
-        let cwd = self.zone_working_directory(agent_zone, cx);
-        let config: Config = Settings::get(cx).config.clone();
-        let ignore_case = spec.host.is_local() && crate::terminal::process::LOCAL_ENV_IGNORES_CASE;
-        let mut profile = spec.profile.clone();
-        profile.env = login::overlay(&profile.env, &plan.env, ignore_case);
-        let new_id = ZoneId(self.next_id);
-        self.next_id += 1;
-        if !self.tree.split(agent_zone, axis, new_id) {
-            return;
-        }
-        let host = spec.host.clone();
-        let command = Some((plan.command, plan.args));
-        let terminal = cx.new(|cx| Terminal::spawn(&profile, &host, command, cwd, &config, cx));
-        self.refresh_zone_title(agent_zone, cx);
-        self.insert_zone(new_id, spec, ZoneStart::Terminal(terminal), window, cx);
-        if let Some(zone) = self.zones.get_mut(&new_id) {
-            zone.login_for = Some(agent_zone);
-        }
-        self.refresh_zone_title(new_id, cx);
-        self.active = new_id;
-        let focus = self.focus_handle(cx);
-        window.focus(&focus);
-        cx.emit(TerminalEvent::TitleChanged);
-        cx.notify();
-    }
-
-    /// Zone `id`'s terminal login ended as `end`: its agent zone hears it,
-    /// once.
-    fn end_login(&mut self, id: ZoneId, end: LoginZoneEnd, cx: &mut Context<Self>) {
-        let Some(agent_zone) = self.zones.get_mut(&id).and_then(|zone| zone.login_for.take()) else { return };
-        let Some(view) = self.zones.get(&agent_zone).and_then(|zone| zone.content.agent_view()) else { return };
-        let agent = view.read(cx).agent().clone();
-        agent.update(cx, |agent, cx| agent.login_zone_ended(end, cx));
     }
 
     fn on_zone_focused(&mut self, id: ZoneId, cx: &mut Context<Self>) {
@@ -2320,116 +1992,6 @@ mod tests {
         assert_eq!(names, ["Work", "Shell", "Claude"]);
     }
 
-    /// A split of the zone's own profile stays on its endpoint after the
-    /// profile's target moved; another profile runs where it says; a
-    /// directory never crosses endpoints.
-    #[test]
-    fn a_split_runs_where_its_profile_says_and_keeps_a_directory_on_its_host() {
-        let ssh = |host: &str| Config::parse(&format!(
-            "[[profiles]]\nname = \"Remote\"\n[profiles.remote]\ntype = \"ssh\"\nhost = \"{host}\"\n"
-        ))
-        .expect("the test config")
-        .config
-        .profiles
-        .remove(0);
-        let (old, moved) = (ssh("old-host"), ssh("new-host"));
-        let local = Profile { name: "Shell".into(), ..Profile::default() };
-        let on_old = Host::of(&old);
-        assert_eq!(split_host(&old, &on_old, &moved), on_old, "its own profile stays where the zone runs");
-        assert_eq!(split_host(&old, &on_old, &local), Host::Local, "another profile runs where it says");
-        assert_eq!(split_host(&local, &Host::Local, &moved), Host::of(&moved));
-        let here = Some(PathBuf::from("/srv/app"));
-        assert_eq!(split_cwd(here.clone(), true), here, "the same host: the split zone's directory");
-        assert_eq!(split_cwd(here.clone(), Host::Local == on_old), None, "remote to local");
-        assert_eq!(split_cwd(here.clone(), on_old == Host::of(&moved)), None, "between two remotes");
-        assert_eq!(split_cwd(None, true), None);
-    }
-
-    #[test]
-    fn tree_split_remove_and_rects() {
-        let z1 = ZoneId(1);
-        let z2 = ZoneId(2);
-        let z3 = ZoneId(3);
-        let mut tree = ZoneTree::new(z1);
-        assert_eq!(tree.leaves(), vec![z1]);
-        assert_eq!(tree.rects(), vec![(z1, UnitRect::FULL)]);
-
-        // Split z1 right -> z1 (left) and z2 (right).
-        assert!(tree.split(z1, SplitAxis::Horizontal, z2));
-        assert_eq!(
-            tree.rects(),
-            vec![
-                (z1, UnitRect { x: 0.0, y: 0.0, w: 0.5, h: 1.0 }),
-                (z2, UnitRect { x: 0.5, y: 0.0, w: 0.5, h: 1.0 }),
-            ]
-        );
-
-        // Split z2 down -> z2 (top-right) and z3 (bottom-right).
-        assert!(tree.split(z2, SplitAxis::Vertical, z3));
-        assert_eq!(
-            tree.rects(),
-            vec![
-                (z1, UnitRect { x: 0.0, y: 0.0, w: 0.5, h: 1.0 }),
-                (z2, UnitRect { x: 0.5, y: 0.0, w: 0.5, h: 0.5 }),
-                (z3, UnitRect { x: 0.5, y: 0.5, w: 0.5, h: 0.5 }),
-            ]
-        );
-
-        // Removing z1 promotes the right subtree (z2 and z3) to fill the tab.
-        let promoted = tree.remove(z1).unwrap();
-        assert_eq!(promoted, vec![z2, z3]);
-        assert_eq!(
-            tree.rects(),
-            vec![
-                (z2, UnitRect { x: 0.0, y: 0.0, w: 1.0, h: 0.5 }),
-                (z3, UnitRect { x: 0.0, y: 0.5, w: 1.0, h: 0.5 }),
-            ]
-        );
-
-        // Removing z2 leaves z3 as the single root leaf.
-        let promoted = tree.remove(z2).unwrap();
-        assert_eq!(promoted, vec![z3]);
-        assert_eq!(tree, ZoneTree::Leaf(z3));
-        assert_eq!(tree.remove(z3), None);
-    }
-
-    #[test]
-    fn directional_focus_navigation() {
-        let z1 = ZoneId(1);
-        let z2 = ZoneId(2);
-        let z3 = ZoneId(3);
-        let mut tree = ZoneTree::new(z1);
-        tree.split(z1, SplitAxis::Horizontal, z2);
-
-        // Side-by-side moves and outer-edge no-ops.
-        assert_eq!(tree.focus_target(z1, Direction::Right), Some(z2));
-        assert_eq!(tree.focus_target(z2, Direction::Left), Some(z1));
-        assert_eq!(tree.focus_target(z1, Direction::Left), None);
-        assert_eq!(tree.focus_target(z2, Direction::Right), None);
-        assert_eq!(tree.focus_target(z1, Direction::Up), None);
-        assert_eq!(tree.focus_target(z1, Direction::Down), None);
-
-        // Split right half into z2 (top-right) and z3 (bottom-right).
-        // Moving right from tall left z1 breaks center-distance tie by tree order -> z2.
-        tree.split(z2, SplitAxis::Vertical, z3);
-        assert_eq!(tree.focus_target(z1, Direction::Right), Some(z2));
-        assert_eq!(tree.focus_target(z2, Direction::Down), Some(z3));
-        assert_eq!(tree.focus_target(z3, Direction::Up), Some(z2));
-        assert_eq!(tree.focus_target(z2, Direction::Left), Some(z1));
-        assert_eq!(tree.focus_target(z3, Direction::Left), Some(z1));
-
-        // When left half is split into top-quarter and bottom-three-quarters
-        // (via two vertical splits on left), perpendicular center picks the closer one.
-        let z4 = ZoneId(4);
-        let z5 = ZoneId(5);
-        tree.split(z1, SplitAxis::Vertical, z4); // z1 top-left, z4 bottom-left
-        tree.split(z4, SplitAxis::Vertical, z5); // z4 mid-left (0.5..0.75), z5 bottom-left (0.75..1.0)
-        // From z5 (center_y = 0.875), moving right goes to z3 (center_y = 0.75) rather than z2 (0.25).
-        assert_eq!(tree.focus_target(z5, Direction::Right), Some(z3));
-        // From z1 (center_y = 0.25), moving right goes to z2 (center_y = 0.25).
-        assert_eq!(tree.focus_target(z1, Direction::Right), Some(z2));
-    }
-
     /// The header menu's items, labelled from the actions table, with the
     /// split items disabled where the zone is too small for them (the
     /// spec's "Too small to split": all disabled, Close Zone enabled) and
@@ -3117,21 +2679,6 @@ mod tests {
             describe_zone_progress(zones, ZoneId(1)),
             "--- progress zone=1 state=normal percent=30\n--- progress zone=3 state=paused percent=70\n"
         );
-    }
-
-    /// `agents-login` decision 9: a terminal login's zone goes right of its
-    /// agent zone when that fits, else below, and is never recorded.
-    #[test]
-    fn a_login_zone_goes_beside_and_is_never_recorded() {
-        assert_eq!(login_axis(true), SplitAxis::Horizontal);
-        assert_eq!(login_axis(false), SplitAxis::Vertical);
-        let leaves = vec![ZoneId(1), ZoneId(2), ZoneId(3)];
-        assert_eq!(recorded_leaves(leaves.clone(), &[]), leaves);
-        assert_eq!(recorded_leaves(leaves, &[ZoneId(2)]), [ZoneId(1), ZoneId(3)]);
-        // The tree without the login zone is the layout a restore rebuilds.
-        let mut tree = ZoneTree::Leaf(ZoneId(1));
-        assert!(tree.split(ZoneId(1), login_axis(true), ZoneId(2)));
-        assert_eq!(recorded_leaves(tree.leaves(), &[ZoneId(2)]), [ZoneId(1)]);
     }
 
     // OpenSpec change `agents-zone-focus-and-scroll`, task 8.1: one press

@@ -407,7 +407,7 @@ pub(super) struct Session {
     pub(super) rows: u16,
     pub(super) ownership: Ownership,
     /// Its holder was told to stop reading it, because its client is behind.
-    paused: bool,
+    pub(super) paused: bool,
     rebuild: Rebuild,
     /// Where its last `SET_META` ends in its holder's connection (a count
     /// of bytes written: [`Core::holder_has`]), until the holder's socket
@@ -771,7 +771,7 @@ fn unix_now() -> u64 {
 }
 
 /// The command line `list` shows; empty for the login shell.
-fn command_line(command: Option<&str>, args: &[String]) -> String {
+pub(super) fn command_line(command: Option<&str>, args: &[String]) -> String {
     match command {
         Some(command) => std::iter::once(command)
             .chain(args.iter().map(String::as_str))
@@ -867,42 +867,8 @@ impl<L: EventLoop> Core<L> {
         // client, as the holder's `SPAWN_FAILED` would.
         self.sessions.insert(id, session);
         if self.send_holder(holder, message) && continues {
-            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: nothing stored yet
-        }
-    }
-
-    /// Places a waiting `AGENT_RESTART` on `holder`: the ended session runs
-    /// its new agent there under its own id, with its meta (the new command
-    /// in it) in the `SPAWN_PIPES`. Its state is stored right after, so a
-    /// core that adopts the agent before its `SPAWNED` continues the
-    /// conversation ([`checkpoint::adopt`](crate::acp::checkpoint::adopt)).
-    /// Nothing for a session that isn't a waiting restart.
-    pub(super) fn send_restart(&mut self, holder: Token, id: SessionId) {
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        let Life::Restarting {
-            restart,
-            stage: stage @ RestartStage::Waiting,
-        } = &mut session.life
-        else {
-            return log!("session {id}: isn't a restart waiting for a holder");
-        };
-        *stage = RestartStage::Placed { hung_up: false };
-        let Restart { restart, cwd } = restart.clone();
-        session.holder = holder;
-        session.paused = false;
-        let meta = session.stored_meta().to_value();
-        let message = ToHolder::SpawnPipes(h1::SpawnPipes {
-            session: id,
-            command: restart.command,
-            args: restart.args,
-            cwd: Some(cwd),
-            env: restart.env,
-            meta,
-        });
-        if self.send_holder(holder, message) {
-            self.agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: restarted
+            // Whole: nothing is stored yet.
+            self.write_agent_checkpoint(id, AgentCheckpoint::Stepped(None));
         }
     }
 
@@ -1012,59 +978,6 @@ impl<L: EventLoop> Core<L> {
         {
             self.send_client(client, error(Some(spawn.answers()), None, message));
         }
-    }
-
-    /// An ended agent session starts again from `restart` (an
-    /// `AGENT_RESTART`'s): waiting for a holder, listed with its new
-    /// `command` and `args`, which its holder gets in the spawn's meta.
-    pub(super) fn start_again(
-        &mut self,
-        id: SessionId,
-        command: &str,
-        args: &[String],
-        restart: Restart,
-    ) {
-        let Some(session) = self.sessions.get_mut(&id) else {
-            return;
-        };
-        session.meta.command = command_line(Some(command), args);
-        session.paused = false;
-        session.life = Life::Restarting {
-            restart,
-            stage: RestartStage::Waiting,
-        };
-        if let Some(agent) = session.agent() {
-            agent.restarted();
-        }
-    }
-
-    /// A restart that couldn't start (`SPAWN_FAILED`, or no holder for it):
-    /// its agent ends as an exit with no code whose standard error is
-    /// `message`, which keeps the session ended for another try.
-    pub(super) fn restart_failed(&mut self, id: SessionId, message: &str) {
-        self.agent_ended(
-            id,
-            None,
-            Input::Exited {
-                code: None,
-                stderr: message.as_bytes(),
-            },
-        );
-    }
-
-    /// A restart still waiting for a holder is hung up (`CLOSE`, `KILL`,
-    /// `STOP`, its client gone): it never starts, and the session ends, as
-    /// a hung-up session's end does, whoever wanted it kept.
-    fn abandon_restart(&mut self, id: SessionId) {
-        log!("session {id}: its restart ends before it was placed");
-        self.agent_step(
-            id,
-            Input::Exited {
-                code: None,
-                stderr: b"",
-            },
-        );
-        self.end_reported(id, None);
     }
 
     /// A session whose holder went away, as [`policy::lost_fate`] says: one
@@ -1232,22 +1145,31 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Sends the session's holder a checkpoint of its screen (or an agent's
-    /// state, [`Core::agent_checkpoint`]), covering the output fed since
-    /// the last one: only for a session whose program runs and isn't being
-    /// hung up, once its emulator is rebuilt.
-    /// An agent's is written whole or appended as `at` and what its holder
-    /// stores say ([`policy::agent_checkpoint_form`]).
-    pub(super) fn checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
+    /// Whether session `id` may be checkpointed now: only a session whose
+    /// program runs and isn't being hung up, once its emulator is rebuilt.
+    /// A terminal's checkpoint is [`checkpoint_screen`](Self::checkpoint_screen),
+    /// an agent's [`Core::checkpoint_agent`].
+    pub(super) fn checkpointable(&self, id: SessionId) -> bool {
+        self.sessions.get(&id).is_some_and(|session| {
+            match (session.rebuild, session.life.is_live()) {
+                (Rebuild::Ready, true) => true,
+                (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => false,
+            }
+        })
+    }
+
+    /// Sends terminal session `id`'s holder a checkpoint of its screen,
+    /// always whole, covering the output fed since the last one, when it is
+    /// [`checkpointable`](Self::checkpointable).
+    pub(super) fn checkpoint_screen(&mut self, id: SessionId) {
+        if !self.checkpointable(id) {
+            return;
+        }
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
-        match (session.rebuild, session.life.is_live()) {
-            (Rebuild::Ready, true) => {}
-            (Rebuild::Ready, false) | (Rebuild::Pending { .. }, true | false) => return,
-        }
         let Some(screen) = session.screen() else {
-            return self.agent_checkpoint(id, at);
+            return;
         };
         let bytes = screen.render(id);
         let covers = std::mem::take(&mut screen.since_checkpoint);
@@ -1278,8 +1200,7 @@ impl<L: EventLoop> Core<L> {
         let behind = may_defer && self.holder_behind(holder);
         due.retain(|&(_, since)| is_due(since, behind));
         for (id, _) in due {
-            // A terminal's checkpoint is always whole.
-            self.checkpoint(id, AgentCheckpoint::Stepped(None));
+            self.checkpoint_screen(id);
         }
     }
 
@@ -1294,13 +1215,12 @@ impl<L: EventLoop> Core<L> {
     /// The checkpoint a step-down or a detach takes: a terminal's always,
     /// an agent's as [`policy::agent_checkpoint_due`] says.
     fn checkpoint_at(&mut self, id: SessionId, at: AgentCheckpoint) {
-        let due = match self.sessions.get(&id).map(Session::kind) {
-            Some(SessionKind::Terminal) => true,
-            Some(SessionKind::Agent) => policy::agent_checkpoint_due(at, 0),
-            None => false,
-        };
-        if due {
-            self.checkpoint(id, at);
+        match self.sessions.get(&id).map(Session::kind) {
+            Some(SessionKind::Terminal) => self.checkpoint_screen(id),
+            Some(SessionKind::Agent) if policy::agent_checkpoint_due(at, 0) => {
+                self.checkpoint_agent(id, at);
+            }
+            Some(SessionKind::Agent) | None => {}
         }
     }
 
@@ -1323,14 +1243,6 @@ impl<L: EventLoop> Core<L> {
         // before it) first, so its client, or a replay, has it before the
         // session's `EXIT`.
         self.agent_exited(id, code);
-        self.ended(id, code);
-    }
-
-    /// An agent session's agent ended as `input` says (an exit with no
-    /// code, or a loss), outside of its holder's `EXITED`: stepped, then
-    /// kept or ended as [`policy::end_fate`] says.
-    pub(super) fn agent_ended(&mut self, id: SessionId, code: Option<i32>, input: Input<'_>) {
-        self.agent_step(id, input);
         self.ended(id, code);
     }
 
@@ -1367,7 +1279,7 @@ impl<L: EventLoop> Core<L> {
 
     /// The session's end is reported, and it is gone: a client still
     /// waiting for its replay gets it first, then the `EXIT`.
-    fn end_reported(&mut self, id: SessionId, code: Option<i32>) {
+    pub(super) fn end_reported(&mut self, id: SessionId, code: Option<i32>) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };
@@ -1657,19 +1569,6 @@ impl<L: EventLoop> Core<L> {
         }
         let holder = session.holder;
         self.send_holder(holder, ToHolder::Hangup(h1::SessionRef { session: id }));
-    }
-
-    /// Ends an ended agent session: it is gone, and a client that has it
-    /// gets its `EXIT` (after a replay it still waits for).
-    fn end_ended(&mut self, id: SessionId, code: Option<i32>) {
-        log!("session {id}: its ended agent's session ends");
-        self.send_waiting_replay(id);
-        let Some(session) = self.sessions.remove(&id) else {
-            return;
-        };
-        if let Some(client) = session.ownership.client() {
-            self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
-        }
     }
 
     /// The session loses its client at `now`, and isn't paused for it any
@@ -1985,7 +1884,7 @@ impl<L: EventLoop> Core<L> {
     /// Sends the replay the session's client still waits for without
     /// waiting for its meta to be stored: the session is ending, or the
     /// client is letting it go. A rebuild is still waited for.
-    fn send_waiting_replay(&mut self, id: SessionId) {
+    pub(super) fn send_waiting_replay(&mut self, id: SessionId) {
         let Some(session) = self.sessions.get_mut(&id) else {
             return;
         };

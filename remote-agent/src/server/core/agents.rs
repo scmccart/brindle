@@ -97,7 +97,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, ToClient};
+use brindle_remote_protocol::client::{self, AgentActivity, AgentInfo, Exit, ToClient};
 use brindle_remote_protocol::holder::{self as h1, ToHolder};
 use brindle_remote_protocol::serde_json::Value;
 use brindle_remote_protocol::{RequestId, SessionId};
@@ -106,10 +106,8 @@ use brindle_transcript::{
 };
 
 use super::clients::error;
-use super::policy::{
-    self, AgentCheckpoint, AgentRequest, CheckpointForm, FetchView, Stored,
-};
-use super::sessions::{Life, PendingReplay, Restart, SpawnRequest};
+use super::policy::{self, AgentCheckpoint, CheckpointForm, FetchView, Stored};
+use super::sessions::{Life, PendingReplay, Restart, RestartStage, SpawnRequest, command_line};
 use super::{Core, log};
 use crate::acp::checkpoint;
 use crate::acp::reduce::{self, AgentSession, Command, Input, ListAnswer, Output, Refused};
@@ -444,7 +442,6 @@ fn marked(input: &Input<'_>, marker: Option<&[u8]>) -> bool {
 
 /// A protocol 4 client's command for an agent session.
 pub(super) struct AgentCommand {
-    pub(super) request: AgentRequest,
     /// The request its `OK` or `ERROR` answers; `None` for `AGENT_CANCEL`.
     pub(super) req: Option<RequestId>,
     pub(super) session: SessionId,
@@ -454,7 +451,6 @@ pub(super) struct AgentCommand {
 impl AgentCommand {
     pub(super) fn prompt(prompt: client::AgentPrompt) -> Self {
         Self {
-            request: AgentRequest::Prompt,
             req: Some(prompt.req),
             session: prompt.session,
             command: Command::Prompt { text: prompt.text },
@@ -463,7 +459,6 @@ impl AgentCommand {
 
     pub(super) fn cancel(target: client::SessionRef) -> Self {
         Self {
-            request: AgentRequest::Cancel,
             req: None,
             session: target.session,
             command: Command::Cancel,
@@ -472,7 +467,6 @@ impl AgentCommand {
 
     pub(super) fn answer(answer: client::AgentPermission) -> Self {
         Self {
-            request: AgentRequest::Permission,
             req: Some(answer.req),
             session: answer.session,
             command: Command::Answer {
@@ -484,7 +478,6 @@ impl AgentCommand {
 
     pub(super) fn unqueue(request: client::AgentRequest) -> Self {
         Self {
-            request: AgentRequest::Unqueue,
             req: Some(request.req),
             session: request.session,
             command: Command::Unqueue,
@@ -493,7 +486,6 @@ impl AgentCommand {
 
     pub(super) fn resend(request: client::AgentRequest) -> Self {
         Self {
-            request: AgentRequest::Resend,
             req: Some(request.req),
             session: request.session,
             command: Command::Resend,
@@ -503,7 +495,6 @@ impl AgentCommand {
     /// `AGENT_LOGIN` (OpenSpec change `agents-login`).
     pub(super) fn login(login: client::AgentLogin) -> Self {
         Self {
-            request: AgentRequest::Login,
             req: Some(login.req),
             session: login.session,
             command: Command::Login {
@@ -516,7 +507,6 @@ impl AgentCommand {
     /// `AGENT_CONVERSATIONS` once the agent answers, not by `OK`.
     pub(super) fn list(list: client::AgentList) -> Self {
         Self {
-            request: AgentRequest::List,
             req: Some(list.req),
             session: list.session,
             command: Command::List {
@@ -529,7 +519,6 @@ impl AgentCommand {
     /// `AGENT_CHOOSE` (`agents-session-list`).
     pub(super) fn choose(choose: client::AgentChoose) -> Self {
         Self {
-            request: AgentRequest::Choose,
             req: Some(choose.req),
             session: choose.session,
             command: Command::Choose {
@@ -541,7 +530,6 @@ impl AgentCommand {
     /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`).
     pub(super) fn set_option(set: client::AgentSetOption) -> Self {
         Self {
-            request: AgentRequest::SetOption,
             req: Some(set.req),
             session: set.session,
             command: Command::SetOption {
@@ -553,15 +541,14 @@ impl AgentCommand {
 }
 
 impl<L: EventLoop> Core<L> {
-    /// `SPAWN_AGENT`: refused below protocol 4 and with no command; else
+    /// `SPAWN_AGENT` (which `handle_client` refuses below protocol 4):
+    /// refused with no command; else
     /// queued for a holder that runs pipe sessions, in the absolute
     /// directory its agent will work in. One that continues a conversation
     /// works in the conversation's directory, which ACP ties it to.
     pub(super) fn client_spawn_agent(&mut self, client: Token, spawn: client::SpawnAgent) {
-        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
-        let refusal = policy::agent_request_refusal(protocol, AgentRequest::Spawn)
-            .map(|refusal| refusal.to_string())
-            .or_else(|| policy::agent_spawn_refusal(&spawn.command).map(str::to_owned))
+        let refusal = policy::agent_spawn_refusal(&spawn.command)
+            .map(str::to_owned)
             .or_else(|| {
                 (spawn.conversation.is_some() && spawn.start.is_some())
                     .then(|| "SPAWN_AGENT can't both continue a conversation and choose one".to_owned())
@@ -580,8 +567,8 @@ impl<L: EventLoop> Core<L> {
     /// ended agent session the client has attached is started again with
     /// the command given, in its conversation's directory, under its own
     /// id, key and meta (the command updated), on any holder of the
-    /// core's build. Refused below protocol 4, for a session the client
-    /// hasn't attached, while the core stops or steps down, and as
+    /// core's build. Refused (below protocol 4 by `handle_client`) for a
+    /// session the client hasn't attached, while the core stops or steps down, and as
     /// [`policy::restart_refusal`] says; the reducer's own refusal
     /// ([`Input::Restart`]) comes last. `OK` once the spawn is queued; what
     /// follows comes as transcript events.
@@ -593,10 +580,6 @@ impl<L: EventLoop> Core<L> {
     /// none yet.
     pub(super) fn client_agent_restart(&mut self, client: Token, restart: client::AgentRestart) {
         let (req, id) = (restart.req, restart.session);
-        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
-        if let Some(refusal) = policy::agent_request_refusal(protocol, AgentRequest::Restart) {
-            return self.send_client(client, error(Some(req), Some(id), refusal.to_string()));
-        }
         let stopping = self.stopping.is_some() || self.stepping_down.is_some();
         let Some(session) = self.attached_session(client, id, Some(req)) else {
             return;
@@ -717,15 +700,10 @@ impl<L: EventLoop> Core<L> {
     /// the session; none for a cancel the reducer took).
     pub(super) fn client_agent_command(&mut self, client: Token, command: AgentCommand) {
         let AgentCommand {
-            request,
             req,
             session: id,
             command,
         } = command;
-        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
-        if let Some(refusal) = policy::agent_request_refusal(protocol, request) {
-            return self.send_client(client, error(req, Some(id), refusal.to_string()));
-        }
         let Some(session) = self.attached_session(client, id, req) else {
             return;
         };
@@ -770,13 +748,12 @@ impl<L: EventLoop> Core<L> {
             before,
             max_bytes,
         } = fetch;
-        let protocol = self.clients.get(&client).map_or(0, |entry| entry.protocol);
         let view = self.sessions.get(&id).map(|session| FetchView {
             kind: session.kind(),
             attached_here: session.ownership.client() == Some(client),
             replay_pending: session.pending_replay.is_some(),
         });
-        if let Some(refusal) = policy::agent_fetch_refusal(id, view, protocol) {
+        if let Some(refusal) = policy::agent_fetch_refusal(id, view) {
             return self.send_client(client, error(Some(req), Some(id), refusal.to_string()));
         }
         let budget = policy::page_budget(Some(max_bytes));
@@ -927,7 +904,7 @@ impl<L: EventLoop> Core<L> {
         }
         let at = AgentCheckpoint::Stepped(checkpoint);
         if policy::agent_checkpoint_due(at, since) {
-            self.checkpoint(id, at);
+            self.checkpoint_agent(id, at);
         }
         // Nothing reaches an agent being hung up, or gone.
         if !stdin.is_empty() && live {
@@ -965,14 +942,24 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
-    /// Checkpoints agent session `id` (its liveness already checked by
-    /// [`Core::checkpoint`]), due `at`: its encoded state whole, or a
-    /// segment of the events since the last one appended to what its
-    /// holder stores ([`policy::agent_checkpoint_form`]), covering the
-    /// stdout fed since the last one. A state too large to store fails its
-    /// handling, which `acp::limits`' I2 makes unreachable for a whole
-    /// checkpoint; a segment too large is written whole instead.
-    pub(super) fn agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
+    /// Checkpoints agent session `id`, due `at`, when it is
+    /// [`checkpointable`](Core::checkpointable), as
+    /// [`write_agent_checkpoint`](Core::write_agent_checkpoint) writes it.
+    pub(super) fn checkpoint_agent(&mut self, id: SessionId, at: AgentCheckpoint) {
+        if self.checkpointable(id) {
+            self.write_agent_checkpoint(id, at);
+        }
+    }
+
+    /// Checkpoints agent session `id` (its liveness checked by
+    /// [`Core::checkpoint_agent`], or by a spawn or restart just sent),
+    /// due `at`: its encoded state whole, or a segment of the events since
+    /// the last one appended to what its holder stores
+    /// ([`policy::agent_checkpoint_form`]), covering the stdout fed since
+    /// the last one. A state too large to store fails its handling, which
+    /// `acp::limits`' I2 makes unreachable for a whole checkpoint; a
+    /// segment too large is written whole instead.
+    pub(super) fn write_agent_checkpoint(&mut self, id: SessionId, at: AgentCheckpoint) {
         let Some(holder) = self.sessions.get(&id).map(|session| session.holder) else {
             return;
         };
@@ -1151,6 +1138,115 @@ impl<L: EventLoop> Core<L> {
             .collect();
         for id in due {
             self.agent_step(id, Input::Tick);
+        }
+    }
+
+    /// Places a waiting `AGENT_RESTART` on `holder`: the ended session runs
+    /// its new agent there under its own id, with its meta (the new command
+    /// in it) in the `SPAWN_PIPES`. Its state is stored right after, so a
+    /// core that adopts the agent before its `SPAWNED` continues the
+    /// conversation ([`checkpoint::adopt`](crate::acp::checkpoint::adopt)).
+    /// Nothing for a session that isn't a waiting restart.
+    pub(super) fn send_restart(&mut self, holder: Token, id: SessionId) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let Life::Restarting {
+            restart,
+            stage: stage @ RestartStage::Waiting,
+        } = &mut session.life
+        else {
+            return log!("session {id}: isn't a restart waiting for a holder");
+        };
+        *stage = RestartStage::Placed { hung_up: false };
+        let Restart { restart, cwd } = restart.clone();
+        session.holder = holder;
+        session.paused = false;
+        let meta = session.stored_meta().to_value();
+        let message = ToHolder::SpawnPipes(h1::SpawnPipes {
+            session: id,
+            command: restart.command,
+            args: restart.args,
+            cwd: Some(cwd),
+            env: restart.env,
+            meta,
+        });
+        if self.send_holder(holder, message) {
+            self.write_agent_checkpoint(id, AgentCheckpoint::Stepped(None)); // whole: restarted
+        }
+    }
+
+    /// An ended agent session starts again from `restart` (an
+    /// `AGENT_RESTART`'s): waiting for a holder, listed with its new
+    /// `command` and `args`, which its holder gets in the spawn's meta.
+    pub(super) fn start_again(
+        &mut self,
+        id: SessionId,
+        command: &str,
+        args: &[String],
+        restart: Restart,
+    ) {
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        session.meta.command = command_line(Some(command), args);
+        session.paused = false;
+        session.life = Life::Restarting {
+            restart,
+            stage: RestartStage::Waiting,
+        };
+        if let Some(agent) = session.agent() {
+            agent.restarted();
+        }
+    }
+
+    /// A restart that couldn't start (`SPAWN_FAILED`, or no holder for it):
+    /// its agent ends as an exit with no code whose standard error is
+    /// `message`, which keeps the session ended for another try.
+    pub(super) fn restart_failed(&mut self, id: SessionId, message: &str) {
+        self.agent_ended(
+            id,
+            None,
+            Input::Exited {
+                code: None,
+                stderr: message.as_bytes(),
+            },
+        );
+    }
+
+    /// A restart still waiting for a holder is hung up (`CLOSE`, `KILL`,
+    /// `STOP`, its client gone): it never starts, and the session ends, as
+    /// a hung-up session's end does, whoever wanted it kept.
+    pub(super) fn abandon_restart(&mut self, id: SessionId) {
+        log!("session {id}: its restart ends before it was placed");
+        self.agent_step(
+            id,
+            Input::Exited {
+                code: None,
+                stderr: b"",
+            },
+        );
+        self.end_reported(id, None);
+    }
+
+    /// An agent session's agent ended as `input` says (an exit with no
+    /// code, or a loss), outside of its holder's `EXITED`: stepped, then
+    /// kept or ended as [`policy::end_fate`] says.
+    pub(super) fn agent_ended(&mut self, id: SessionId, code: Option<i32>, input: Input<'_>) {
+        self.agent_step(id, input);
+        self.ended(id, code);
+    }
+
+    /// Ends an ended agent session: it is gone, and a client that has it
+    /// gets its `EXIT` (after a replay it still waits for).
+    pub(super) fn end_ended(&mut self, id: SessionId, code: Option<i32>) {
+        log!("session {id}: its ended agent's session ends");
+        self.send_waiting_replay(id);
+        let Some(session) = self.sessions.remove(&id) else {
+            return;
+        };
+        if let Some(client) = session.ownership.client() {
+            self.send_client(client, ToClient::Exit(Exit { session: id, code, lost: None }));
         }
     }
 }

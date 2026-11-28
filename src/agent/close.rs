@@ -7,7 +7,7 @@
 //! Pure: the shell gathers each zone's kind, name and shown status.
 
 use crate::terminal::status::State;
-use crate::zone_view::ZoneId;
+use crate::zone_tree::ZoneId;
 
 /// What makes an agent busy for closing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

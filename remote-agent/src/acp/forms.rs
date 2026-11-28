@@ -13,11 +13,18 @@ use brindle_transcript::{
 
 use super::envelope::Id;
 
-/// ACP's error codes the core reads: authentication required (decision
-/// 17), and an `initialize` refused for its version (decision 4). The codes
-/// the core sends are `rpc`'s.
-pub const AUTH_REQUIRED: i64 = -32000;
-pub const UNSUPPORTED_VERSION: i64 = -32022;
+/// What an agent's error answer means to the core, whatever its version's
+/// codes (`Dialect::failure`; the codes the core sends are `rpc`'s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// The agent needs a login first (decision 17).
+    AuthRequired,
+    /// `initialize` was refused for its version (decision 4), naming the
+    /// versions the agent supports when it gave a readable list.
+    VersionRefused { supported: Option<Vec<u16>> },
+    /// Any other failure, shown by its message.
+    Other,
+}
 
 /// A request from the agent, by its method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

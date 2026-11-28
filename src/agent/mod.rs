@@ -60,9 +60,9 @@ use parking_lot::Mutex;
 use crate::FirstPrompt;
 use crate::agent::login::{AgentCommand, TerminalLogin};
 use crate::agent::model::{
-    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Link, ListDone, ListFor,
-    Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice, Submit,
-    Unqueue,
+    Absorbed, AfterLogin, CancelLogin, ChatModel, Fetch, First, KeyOutcome, LaunchChoice, Leaving, Link, ListDone,
+    ListFor, Choose, LoginChoice, LoginZoneEnd, NotSent, Offer, OnChoosing, ProfileFound, Replied, Sent, Splice,
+    Submit, Unqueue,
 };
 use crate::agent::commands::CompletionKey;
 use crate::agent::spawn::AgentSpawnRequest;
@@ -258,12 +258,28 @@ fn agent_command(profile: &Profile, host: &Host) -> AgentCommand {
     }
 }
 
-/// Whether the zone has let its session go (closed it or detached it on a
-/// quit): once is enough.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Held {
-    Holding,
+/// The zone's hold on its session.
+enum Hold {
+    /// The session's requests: everything the zone sends goes through
+    /// them.
+    Open(Box<dyn Requests>),
+    /// The start failed (the server can't run agent sessions): there is
+    /// nothing to send to.
+    NoServer,
+    /// The zone let its session go (closed it, or detached it on a quit):
+    /// once is enough, and nothing more is sent.
     Left,
+}
+
+impl Hold {
+    /// The hold of a zone started with `requests`, `None` when its start
+    /// failed.
+    fn of(requests: Option<Box<dyn Requests>>) -> Self {
+        match requests {
+            Some(requests) => Self::Open(requests),
+            None => Self::NoServer,
+        }
+    }
 }
 
 /// An agent zone's session and its model: the entity that drains the
@@ -273,12 +289,11 @@ pub struct Agent {
     /// The fold the reader thread writes, read only while absorbing a
     /// change (a leaf lock), never while rendering.
     shared: Arc<Mutex<AgentShared>>,
-    requests: Option<Box<dyn Requests>>,
+    hold: Hold,
     /// The profile's command, for the alerts.
     command: String,
     host: Host,
     directory: Option<PathBuf>,
-    held: Held,
     /// The profile the session was started with, when it isn't the zone's
     /// (a zone attached under a substitute profile): a continue looks this
     /// one up. `None`: the zone's own, following a rename.
@@ -472,11 +487,10 @@ impl Agent {
             _settings: settings,
             model,
             shared,
-            requests,
+            hold: Hold::of(requests),
             command,
             host,
             directory,
-            held: Held::Holding,
             session_profile: None,
             connect,
             _events: Self::drain(events, taker, cx),
@@ -515,7 +529,7 @@ impl Agent {
     /// agent on the session, or starts a new session continuing it.
     /// Nothing when there is no offer, or once the zone let its session go.
     pub fn continue_conversation(&mut self, cx: &mut Context<Self>) {
-        if self.held == Held::Left {
+        if matches!(self.hold, Hold::Left) {
             return;
         }
         let (found, profile) = self.profile_found(&Settings::get(cx).config);
@@ -555,10 +569,18 @@ impl Agent {
         cx.notify();
     }
 
+    /// The requests of the session the zone holds, while it holds one.
+    fn requests(&self) -> Option<&dyn Requests> {
+        match &self.hold {
+            Hold::Open(requests) => Some(requests.as_ref()),
+            Hold::NoServer | Hold::Left => None,
+        }
+    }
+
     /// Sends through the zone's session; [`NotSent::Gone`] when it has
-    /// none (it never started).
+    /// none (it never started, or the zone let it go).
     fn through<T>(&self, send: impl FnOnce(&dyn Requests) -> Result<T, NotSent>) -> Result<T, NotSent> {
-        self.requests.as_deref().ok_or(NotSent::Gone).and_then(send)
+        self.requests().ok_or(NotSent::Gone).and_then(send)
     }
 
     /// A new session of `profile`'s agent continuing `conversation`, in its
@@ -585,10 +607,9 @@ impl Agent {
         close_old: bool,
         cx: &mut Context<Self>,
     ) {
-        if let (Held::Holding, Some(requests), true) = (self.held, &self.requests, close_old) {
+        if let (Hold::Open(requests), true) = (&self.hold, close_old) {
             requests.close();
         }
-        self.held = Held::Holding;
         let (sink, feed) = Sink::new();
         feed.shared.lock().start_over();
         let request = {
@@ -616,12 +637,12 @@ impl Agent {
         self._events = Self::drain(events, taker, cx);
         let absorbed = self.model.respawning();
         self.apply_absorbed(absorbed, cx);
-        self.requests = match link {
-            Ok(requests) => Some(requests),
+        self.hold = match link {
+            Ok(requests) => Hold::Open(requests),
             Err(unsupported) => {
                 let absorbed = self.model.not_started(model::StartFailure::NoServer(unsupported.to_string()));
                 self.apply_absorbed(absorbed, cx);
-                None
+                Hold::NoServer
             }
         };
         cx.notify();
@@ -660,7 +681,7 @@ impl Agent {
             self.choose(None, cx);
             return;
         }
-        if self.held == Held::Left {
+        if matches!(self.hold, Hold::Left) {
             return;
         }
         let (_, Some(profile)) = self.profile_found(&Settings::get(cx).config) else { return };
@@ -679,7 +700,7 @@ impl Agent {
     /// (a choice from a list another zone's agent gave): a new session
     /// continuing it replaces the zone's, the old one closed.
     pub fn continue_listed(&mut self, id: &str, cx: &mut Context<Self>) {
-        if self.held == Held::Left {
+        if matches!(self.hold, Hold::Left) {
             return;
         }
         let (_, Some(profile)) = self.profile_found(&Settings::get(cx).config) else { return };
@@ -752,9 +773,9 @@ impl Agent {
                 self.model.absorb(shared.transcript(), changes)
             }
             AgentEvent::Replay(true) => return,
-            AgentEvent::Replay(false) => match self.model.link() {
-                Link::Reconnecting => self.model.set_link(Link::Up),
-                Link::Up => return,
+            AgentEvent::Replay(false) => match self.model.replay_ended() {
+                Some(absorbed) => absorbed,
+                None => return,
             },
             AgentEvent::LinkDown => self.model.set_link(Link::Reconnecting),
             AgentEvent::SessionRunning => self.model.session_running(),
@@ -1136,35 +1157,30 @@ impl Agent {
     /// The session (id and key) a quit leaves for the next launch, while
     /// the zone holds one that is open ([`ChatModel::keeps_session`]).
     pub fn server_session(&self) -> Option<(SessionId, Option<SessionKey>)> {
-        match self.held {
-            Held::Holding if self.model.keeps_session() => self.requests.as_ref()?.id_and_key(),
-            Held::Holding | Held::Left => None,
+        match &self.hold {
+            Hold::Open(requests) if self.model.keeps_session() => requests.id_and_key(),
+            Hold::Open(_) | Hold::NoServer | Hold::Left => None,
         }
     }
 
     /// The user closed the zone: the session ends (`CLOSE`). Once is
     /// enough.
     pub fn close(&mut self) {
-        if let (Held::Holding, Some(requests)) = (self.held, &self.requests) {
+        if let Hold::Open(requests) = std::mem::replace(&mut self.hold, Hold::Left) {
             requests.close();
         }
-        self.held = Held::Left;
     }
 
     /// Brindle is quitting: the session is left running, detached with its
     /// tab's `layout` (every agent session is kept: there is no agent
     /// `-e`). Done explicitly, never in a drop (`process R16`).
     pub fn quit_with(&mut self, layout: Option<serde_json::Value>) {
-        if let (Held::Holding, Some(requests)) = (self.held, &self.requests) {
-            // A session still choosing has nothing to bring back: it ends
-            // (OpenSpec change `agents-session-list` decision 12).
-            if self.model.started_choosing() || self.model.is_choosing() {
-                requests.close();
-            } else {
-                requests.detach_with(layout);
+        if let Hold::Open(requests) = std::mem::replace(&mut self.hold, Hold::Left) {
+            match self.model.leave_on_quit() {
+                Leaving::Close => requests.close(),
+                Leaving::Detach => requests.detach_with(layout),
             }
         }
-        self.held = Held::Left;
     }
 
     /// Where the agent a conversations palette lists through is
@@ -1182,7 +1198,7 @@ impl Agent {
     /// Keeps the core's copy of the tab's layout current while the session
     /// is open.
     pub fn set_layout(&self, layout: Option<serde_json::Value>) {
-        if let (Held::Holding, true, Some(requests)) = (self.held, self.model.keeps_session(), &self.requests) {
+        if let (Hold::Open(requests), true) = (&self.hold, self.model.keeps_session()) {
             requests.set_layout(layout);
         }
     }
