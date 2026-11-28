@@ -20,6 +20,7 @@ pub mod mark;
 mod notices;
 mod overlays;
 mod previews;
+mod send_output;
 pub mod tabs;
 mod targets;
 
@@ -35,7 +36,7 @@ use self::tabs::{Pick, Removed, Shift, Tabs};
 use crate::actions::*;
 use crate::agent::conversations::ZoneAt;
 use crate::agent::commands::OptionPick;
-use crate::agent::{Agent, OptionRefused};
+use crate::agent::{Agent, AttachRefused, OptionRefused};
 use crate::agent::spawn::OpenedBy;
 use crate::config::{Config, Profile, ProfileKey, ProfileKind};
 use crate::TabKind;
@@ -64,10 +65,10 @@ use crate::terminal::context::Badge;
 use crate::terminal::progress::Progress;
 use crate::terminal::status::State;
 use crate::terminal::{Request99, Terminal, TerminalEvent};
-use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, TerminalView};
+use crate::terminal_view::{GridLayout, LinkFailed, PointerStep, SendOutput, TerminalView};
 use crate::theme::Theme;
 use crate::zone_view::{
-    CloseZoneAsk, ConversationsAsk, OptionsAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
+    AttachFileAsk, CloseZoneAsk, ConversationsAsk, OptionsAsk, SplitAsk, SplitAxis, SplitRefused, SplitWith, ZONE_GAP, ZoneId, ZoneMenuRequest, ZoneSpec, ZoneStart,
     ZoneTreeView, describe_badge, ui_badge,
 };
 use crate::agent::close::{BusyAgent, ClosePlan, close_plan, close_text, describe_busy};
@@ -377,6 +378,9 @@ enum PaletteKind {
     /// change `agents-commands`): what each row does, by row, for the zone
     /// `from`.
     AgentOptions { from: ZoneAt, picks: Vec<OptionPick> },
+    /// Which agent zone takes a terminal's output (OpenSpec change
+    /// `agents-prompt-context`): the zones by row, and the output.
+    AgentTarget { targets: Vec<ZoneAt>, output: send_output::Output },
 }
 
 impl PaletteKind {
@@ -389,6 +393,7 @@ impl PaletteKind {
             Self::SplitProfile { .. } => PaletteRole::SplitProfile,
             Self::Conversations(_) | Self::ConversationsProfile { .. } => PaletteRole::Conversations,
             Self::AgentOptions { .. } => PaletteRole::AgentOptions,
+            Self::AgentTarget { .. } => PaletteRole::AgentTarget,
         }
     }
 }
@@ -1441,6 +1446,18 @@ impl Workspace {
                 this.open_agent_options(ZoneAt { tab, zone: ask.zone }, ask.option.as_deref(), window, cx);
             }),
             cx.subscribe(view, |this, _, OptionRefused(text): &OptionRefused, cx| this.show_notice(text.clone(), cx)),
+            // A prompt's attachments (OpenSpec change
+            // `agents-prompt-context`): Attach File…'s path, a terminal's
+            // output for an agent zone, and a refused attachment.
+            cx.subscribe_in(view, window, |this, view, ask: &AttachFileAsk, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.ask_attach_file(ZoneAt { tab, zone: ask.zone }, window, cx);
+            }),
+            cx.subscribe_in(view, window, |this, view, send: &SendOutput, window, cx| {
+                let Some(tab) = this.tabs.iter().find(|t| &t.zones == view).map(|t| t.id) else { return };
+                this.send_output(tab, send, window, cx);
+            }),
+            cx.subscribe(view, |this, _, AttachRefused(text): &AttachRefused, cx| this.show_notice(text.clone(), cx)),
         ]
     }
 
@@ -2125,9 +2142,14 @@ impl Workspace {
             .and_then(|t| t.zones.read(cx).active_content().and_then(|c| c.agent_view().cloned()))
             .map_or((false, false), |view| view.read(cx).agent().read(cx).model().has_options());
         let profiles = &Self::settings(cx).profiles;
+        let agent_attachments = self
+            .active_tab()
+            .and_then(|t| t.zones.read(cx).active_content().and_then(|c| c.agent_view().cloned()))
+            .is_some_and(|view| !view.read(cx).agent().read(cx).model().attachments().is_empty());
         let facts = PaletteFacts {
             agent_options,
             agent_modes,
+            agent_attachments,
             terminal_profiles: profiles.iter().any(|p| p.kind() == ProfileKind::Terminal),
             agent_profiles: profiles.iter().any(|p| p.kind() == ProfileKind::Agent),
             zone: if agent { PaletteZone::Agent } else { PaletteZone::Terminal },
@@ -2229,6 +2251,13 @@ impl Workspace {
             PaletteKind::AgentOptions { from, picks } => {
                 let (from, pick) = (*from, picks.get(ix).cloned());
                 self.agent_options_confirmed(from, pick, window, cx);
+            }
+            PaletteKind::AgentTarget { targets, output } => {
+                let (at, output) = (targets.get(ix).copied(), output.clone());
+                self.dismiss_overlay(window, cx);
+                if let Some(at) = at {
+                    self.attach_output(at, output, window, cx);
+                }
             }
             PaletteKind::ConversationsProfile { keys, from } => {
                 let (key, from) = (keys.get(ix).cloned(), *from);
@@ -2386,7 +2415,8 @@ impl Workspace {
                     | PaletteKind::SplitProfile { .. }
                     | PaletteKind::Conversations(_)
                     | PaletteKind::ConversationsProfile { .. }
-                    | PaletteKind::AgentOptions { .. },
+                    | PaletteKind::AgentOptions { .. }
+                    | PaletteKind::AgentTarget { .. },
                 ..
             }
             | Overlay::Settings

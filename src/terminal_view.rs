@@ -222,6 +222,18 @@ pub struct LinkFailed(pub String);
 
 impl EventEmitter<LinkFailed> for TerminalView {}
 
+/// The last command's output, for an agent zone's next prompt (OpenSpec
+/// change `agents-prompt-context`, Send Last Command Output to Agent): the
+/// text, and the command line that made it when the shell reported one.
+/// The window picks the zone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SendOutput {
+    pub command: Option<String>,
+    pub text: String,
+}
+
+impl EventEmitter<SendOutput> for TerminalView {}
+
 const BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 /// How far the mouse clipboard label sits down and right of the pointer.
@@ -481,6 +493,14 @@ impl TerminalView {
     fn copy_last_output(&mut self, _: &CopyLastOutput, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = self.terminal.read(cx).last_output_text() {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    /// `send_last_output_to_agent`: nothing when Copy Last Command Output
+    /// would copy nothing.
+    fn send_last_output(&mut self, _: &SendLastOutputToAgent, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((text, command)) = self.terminal.read(cx).last_output_to_send() {
+            cx.emit(SendOutput { command, text });
         }
     }
 
@@ -865,6 +885,7 @@ impl Render for TerminalView {
             .on_action(cx.listener(|this, _: &JumpToNextPrompt, _, cx| this.jump_to_prompt(false, cx)))
             .on_action(cx.listener(Self::select_last_output))
             .on_action(cx.listener(Self::copy_last_output))
+            .on_action(cx.listener(Self::send_last_output))
             .on_action(cx.listener(Self::copy_last_command))
             .on_action(cx.listener(Self::find))
             .on_action(cx.listener(Self::find_next))

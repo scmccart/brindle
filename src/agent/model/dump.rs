@@ -335,7 +335,7 @@ impl ChatModel {
     /// holding its text.
     fn draft_lines(&self) -> String {
         let mut out = String::new();
-        for (index, draft) in self.attachments().iter().enumerate() {
+        for (index, draft) in self.drafts().iter().enumerate() {
             match draft {
                 Draft::Text { name, text } => out.push_str(&format!(
                     "--- draft index={index} kind=text name={name:?} bytes={} {text:?}\n",

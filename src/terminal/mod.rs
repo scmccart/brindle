@@ -1221,6 +1221,23 @@ impl Terminal {
     /// ([`Marks::last_command_line`]), as text to copy ([`copied_text`]).
     /// `None` until a prompt mark has been seen ([`Self::has_prompt_marks`]):
     /// without one, a program's stray `B`/`E` marks aren't a shell's.
+    /// The last command's output for an agent's prompt (OpenSpec change
+    /// `agents-prompt-context`, decision 8): the text Copy Last Command
+    /// Output copies, with its lines joined by `\n` on every platform, and
+    /// the command line that made it; `None` when there is no output to
+    /// send (no prompt mark, none left in the scrollback, or empty).
+    pub fn last_output_to_send(&self) -> Option<(String, Option<String>)> {
+        let text = {
+            let term = self.term.lock();
+            last_output_string(&term, &self.marks.lock()).map(|text| copied_text(&text, LineEnd::Lf))?
+        };
+        if text.is_empty() || !self.has_prompt_marks() {
+            return None;
+        }
+        let command = self.last_command_line_text().map(|line| line.trim().to_string()).filter(|line| !line.is_empty());
+        Some((text, command))
+    }
+
     pub fn last_command_line_text(&self) -> Option<String> {
         let term = self.term.lock();
         let marks = self.marks.lock();

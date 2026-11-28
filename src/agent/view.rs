@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
+    App, AppContext as _, ClipboardItem, Context, ElementId, Entity, EventEmitter, ExternalPaths, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, Modifiers, ParentElement as _, Pixels, Render, SharedString,
     StatefulInteractiveElement as _, Styled as _, Subscription, WeakEntity, Window, div, prelude::FluentBuilder as _,
 };
@@ -31,19 +31,19 @@ use brindle_ui::{
     PageDirection, PromptAction, PromptFocus, PromptInput, PromptInputEvent, PromptStatus as UiStatus, Queued, Reasoning,
     Resend as UiResend, Response, RichBlock, Shimmer, TextAreaEvent, Tool, ToolStatus as UiToolStatus, TooltipFor as _,
 };
-use brindle_ui::{FooterItem, Suggestion, SuggestionKey, Suggestions};
+use brindle_ui::{AttachmentItem, FooterItem, Suggestion, SuggestionKey, Suggestions, TextInputBackspace};
 
 use crate::agent::commands::{Completion, CompletionKey, OptionItem};
 use brindle_ui::{Code, CodeBlock, Diff, IconElement};
 
 use crate::actions::{
-    AgentCancel, AgentContinue, AgentConversations, AgentNextMode, AgentOptions, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
+    AgentAttachFile, AgentCancel, AgentClearAttachments, AgentContinue, AgentConversations, AgentNextMode, AgentOptions, AgentResend, AgentScrollToBottom, AgentSubmit, AgentUnqueue, CopyLastAgentMessage, CopyLastCodeBlock,
     CopyQueuedPrompt, ScrollPageDown, ScrollPageUp, ScrollToBottom, ToggleAgentThoughts, ToggleAgentToolDetails,
 };
 use crate::agent::login::MethodOffer;
 use crate::agent::markdown::{LinkAction, link_action};
 use crate::agent::model::{
-    self as model, AgentPhase, Block, BlockBody, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus,
+    self as model, AgentPhase, Attached, Block, BlockBody, Draft, DraftKey, ChatModel, Earlier, LoginRow, MethodChoice, NoOffer, Offer, PromptStatus,
     QueueRow, Resend, ShownPart, TextState, WorkingRow, ZoneChoice,
 };
 use crate::agent::tool::{self, DetailPart};
@@ -223,6 +223,32 @@ pub fn suggestions_of(completion: &Completion) -> Suggestions {
         })
         .collect();
     Suggestions { rows, highlighted: completion.highlighted }
+}
+
+/// The prompt input's attachment items for the draft (OpenSpec change
+/// `agents-prompt-context`), each keyed by its [`DraftKey`]: a link by its
+/// name with its path as the detail, a text with its size.
+pub fn attachment_items(draft: &[Attached]) -> Vec<AttachmentItem> {
+    draft
+        .iter()
+        .map(|Attached { key, draft }| {
+            let icon = match draft {
+                Draft::Link { .. } => Icon::FileText,
+                Draft::Text { .. } => Icon::Terminal,
+            };
+            AttachmentItem {
+                key: key.0.to_string().into(),
+                icon,
+                name: draft.name().to_string().into(),
+                detail: Some(draft.detail().into()),
+            }
+        })
+        .collect()
+}
+
+/// The draft key a remove mark's item key names.
+pub fn draft_key_of(key: &str) -> Option<DraftKey> {
+    key.parse().ok().map(DraftKey)
 }
 
 /// The prompt input's footer for the options under it, each keyed by its
@@ -654,6 +680,11 @@ impl AgentView {
                 let id = id.to_string();
                 self.agent.update(cx, |agent, cx| agent.footer_pressed(&id, cx));
             }
+            PromptInputEvent::RemoveAttachment(key) => {
+                if let Some(key) = draft_key_of(key) {
+                    self.agent.update(cx, |agent, cx| agent.remove_attachment(key, cx));
+                }
+            }
             PromptInputEvent::Action(key) => {
                 let choice = [ZoneChoice::Continue, ZoneChoice::Conversations, ZoneChoice::New]
                     .into_iter()
@@ -704,9 +735,11 @@ impl AgentView {
         self.login = login;
         let suggestions = agent.model().completion().map(suggestions_of);
         let footer = footer_of(&agent.model().option_items());
+        let attachments = attachment_items(agent.model().attachments());
         self.prompt.update(cx, |prompt, cx| {
             prompt.set_status(state.status, cx);
             prompt.set_queued(state.queued, cx);
+            prompt.set_attachments(attachments, cx);
             prompt.set_reason(state.reason, cx);
             prompt.set_actions(prompt_actions(&state.actions), cx);
             prompt.set_suggestions(suggestions, cx);
@@ -807,6 +840,32 @@ impl AgentView {
     /// `agent_next_mode`: the mode after the current one.
     fn next_mode(&mut self, _: &AgentNextMode, _: &mut Window, cx: &mut Context<Self>) {
         self.agent.update(cx, |agent, cx| agent.next_mode(cx));
+    }
+
+    /// `agent_attach_file`: the window asks for a path.
+    fn attach_file(&mut self, _: &AgentAttachFile, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.ask_attach_file(cx));
+    }
+
+    /// `agent_clear_attachments`.
+    fn clear_attachments(&mut self, _: &AgentClearAttachments, _: &mut Window, cx: &mut Context<Self>) {
+        self.agent.update(cx, |agent, cx| agent.clear_attachments(cx));
+    }
+
+    /// Backspace in the prompt input, before the text area takes it (a
+    /// capture listener): at the very start of the text with nothing
+    /// selected it removes the last attachment, and the text area never
+    /// sees the key; otherwise it goes on to the text area.
+    fn backspace(&mut self, _: &TextInputBackspace, window: &mut Window, cx: &mut Context<Self>) {
+        let area = self.prompt.read(cx).area().read(cx);
+        if !area.is_focused(window) {
+            return;
+        }
+        let selection = area.selection();
+        let (at_start, selected) = (selection.end == 0, !selection.is_empty());
+        if self.agent.update(cx, |agent, cx| agent.backspace_at_start(at_start, selected, cx)) {
+            cx.stop_propagation();
+        }
     }
 
     fn copy_queued(&mut self, _: &CopyQueuedPrompt, _: &mut Window, cx: &mut Context<Self>) {
@@ -1391,7 +1450,7 @@ impl Render for AgentView {
         // The scope's set (the zone's tokens), one source with the
         // components inside.
         let tokens = cx.ui_theme();
-        let (bg, fg) = (tokens.background, tokens.foreground);
+        let (bg, fg, ring) = (tokens.background, tokens.foreground, tokens.ring);
         let prompt_handle = self.prompt.read(cx).focus_handle(cx);
         let content = div()
             .key_context("AgentZone")
@@ -1418,6 +1477,9 @@ impl Render for AgentView {
             .on_action(cx.listener(Self::options))
             .on_action(cx.listener(Self::next_mode))
             .on_action(cx.listener(Self::copy_queued))
+            .on_action(cx.listener(Self::attach_file))
+            .on_action(cx.listener(Self::clear_attachments))
+            .capture_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::copy_last))
             .on_action(cx.listener(Self::copy_last_code))
             .on_action(cx.listener(Self::toggle_thoughts))
@@ -1489,9 +1551,24 @@ impl Render for AgentView {
                             .pb_3()
                             .children(alert)
                             .children(login)
-                            .child(self.prompt.clone()),
+                            // Files hovering over the zone highlight the
+                            // prompt input they would join.
+                            .child(
+                                div()
+                                    .debug_selector(|| "agent-prompt-drop".into())
+                                    .rounded(tokens.radius_md())
+                                    .border_1()
+                                    .border_color(gpui::transparent_black())
+                                    .drag_over::<ExternalPaths>(move |style, _, _, _| style.border_color(ring))
+                                    .child(self.prompt.clone()),
+                            ),
                     ),
-            );
+            )
+            // Files dropped anywhere on the zone (decision 8).
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, _, cx| {
+                let paths = paths.paths().to_vec();
+                this.agent.update(cx, |agent, cx| agent.drop_paths(paths, cx));
+            }));
         RemScope { size, child: content.into_any_element() }
     }
 }

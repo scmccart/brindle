@@ -87,7 +87,7 @@ pub fn size(bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     let scaled = |unit: u64, name: &str| {
         let tenths = (bytes * 10 + unit / 2) / unit;
-        if tenths % 10 == 0 { format!("{} {name}", tenths / 10) } else { format!("{}.{} {name}", tenths / 10, tenths % 10) }
+        if tenths.is_multiple_of(10) { format!("{} {name}", tenths / 10) } else { format!("{}.{} {name}", tenths / 10, tenths % 10) }
     };
     if bytes < KIB {
         format!("{bytes} bytes")
@@ -278,10 +278,28 @@ pub enum RowPress {
     Nothing,
 }
 
+/// A draft attachment's identity in the zone (`types R3`): the prompt
+/// input's remove mark names it, so a press removes the item it was drawn
+/// for even after the list changed. Never reused while the zone lives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DraftKey(pub u64);
+
+/// An attachment of the next prompt, with its key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attached {
+    pub key: DraftKey,
+    pub draft: Draft,
+}
+
 impl ChatModel {
-    /// The attachments the next prompt takes.
-    pub fn attachments(&self) -> &[Draft] {
+    /// The attachments the next prompt takes, with their keys.
+    pub fn attachments(&self) -> &[Attached] {
         &self.attached
+    }
+
+    /// The attachments the next prompt takes.
+    pub fn drafts(&self) -> Vec<Draft> {
+        self.attached.iter().map(|attached| attached.draft.clone()).collect()
     }
 
     /// Adds `draft` to the next prompt's attachments, or says why not.
@@ -294,7 +312,8 @@ impl ChatModel {
         {
             return Err(AttachRefusal::TooLong { bytes: text.len() as u64, limit: ATTACHMENT_TEXT as u64 });
         }
-        self.attached.push(draft);
+        self.next_draft += 1;
+        self.attached.push(Attached { key: DraftKey(self.next_draft), draft });
         Ok(())
     }
 
@@ -305,11 +324,10 @@ impl ChatModel {
         at_start && !selected && self.attached.pop().is_some()
     }
 
-    /// The remove mark of attachment `index`.
-    pub fn remove_attachment(&mut self, index: usize) {
-        if index < self.attached.len() {
-            self.attached.remove(index);
-        }
+    /// The remove mark of the attachment keyed `key`; nothing once it is
+    /// gone.
+    pub fn remove_attachment(&mut self, key: DraftKey) {
+        self.attached.retain(|attached| attached.key != key);
     }
 
     /// Clear Attachments.
@@ -321,7 +339,7 @@ impl ChatModel {
     /// new sequence, whose refusals are its own.
     pub fn send_plan(&mut self, text: &str) -> SendPlan {
         self.attach_refused = false;
-        send_plan(text, &self.attached)
+        send_plan(text, &self.drafts())
     }
 
     /// The row of user entry `entry`'s attachment `index`, as it is drawn.
@@ -439,7 +457,7 @@ mod tests {
         assert_eq!(refused, Err(AttachRefusal::TooLong { bytes: 262_145, limit: 262_144 }));
         let words = AttachRefusal::TooLong { bytes: 1024 * 1024, limit: 262_144 }.text("the output");
         assert_eq!(words, "the output is 1 MiB, and an attachment takes at most 256 KiB");
-        assert_eq!(zone.model.attachments(), [Draft::text("whole", &whole)]);
+        assert_eq!(zone.model.drafts(), [Draft::text("whole", &whole)]);
     }
 
     /// Task 4.2: backspace at the very start with nothing selected removes
@@ -453,10 +471,29 @@ mod tests {
         assert!(!zone.model.backspace_at_start(true, true), "a selection");
         assert_eq!(zone.model.attachments().len(), 2);
         assert!(zone.model.backspace_at_start(true, false));
-        assert_eq!(zone.model.attachments(), [Draft::link("a")]);
-        zone.model.remove_attachment(5);
-        zone.model.remove_attachment(0);
+        assert_eq!(zone.model.drafts(), [Draft::link("a")]);
+        assert!(zone.model.backspace_at_start(true, false));
         assert!(!zone.model.backspace_at_start(true, false), "none left: the input's");
+    }
+
+    /// Task 6.1: a remove mark names its item by key, so a press removes
+    /// the item it was drawn for even after the list changed, and a key
+    /// once removed removes nothing.
+    #[test]
+    fn a_remove_mark_removes_its_own_item_by_key() {
+        let mut zone = Zone::ready();
+        for name in ["a", "b", "c"] {
+            zone.model.attach(Draft::link(name)).unwrap();
+        }
+        let keys: Vec<DraftKey> = zone.model.attachments().iter().map(|attached| attached.key).collect();
+        zone.model.backspace_at_start(true, false);
+        zone.model.remove_attachment(keys[1]);
+        assert_eq!(zone.model.drafts(), [Draft::link("a")]);
+        zone.model.remove_attachment(keys[1]);
+        zone.model.remove_attachment(keys[2]);
+        assert_eq!(zone.model.drafts(), [Draft::link("a")]);
+        zone.model.attach(Draft::link("d")).unwrap();
+        assert!(!keys.contains(&zone.model.attachments()[1].key), "a new key");
         zone.model.attach(Draft::link("c")).unwrap();
         zone.model.clear_attachments();
         assert!(zone.model.attachments().is_empty());

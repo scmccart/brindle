@@ -39,6 +39,15 @@ pub enum Target {
 /// The notice line's words when no agent zone is open.
 pub const NO_AGENT_ZONE: &str = "no agent zone is open";
 
+/// What a command's output is named as an attachment: its command line
+/// when the shell reported one, else `output from` the tab's title.
+pub fn output_name(command: Option<&str>, tab_title: &str) -> String {
+    match command.map(str::trim).filter(|line| !line.is_empty()) {
+        Some(line) => line.to_string(),
+        None => format!("output from {tab_title}"),
+    }
+}
+
 /// Where an attachment from a terminal goes, given the window's agent zones
 /// in any order.
 pub fn target_plan(mut zones: Vec<AgentTarget>) -> Target {
@@ -47,7 +56,7 @@ pub fn target_plan(mut zones: Vec<AgentTarget>) -> Target {
         1 => Target::One(zones[0].at),
         _ => {
             // Ties keep the window's order.
-            zones.sort_by(|a, b| b.recency.cmp(&a.recency));
+            zones.sort_by_key(|zone| std::cmp::Reverse(zone.recency));
             Target::Ask(zones)
         }
     }
@@ -78,6 +87,14 @@ mod tests {
         };
         let order: Vec<(u64, u64)> = asked.iter().map(|z| (z.at.tab.0, z.at.zone.0)).collect();
         assert_eq!(order, [(2, 4), (1, 2), (3, 5), (1, 1)]);
+    }
+
+    #[test]
+    fn output_is_named_by_its_command_line_else_by_its_tab() {
+        assert_eq!(output_name(Some("cargo test"), "zsh"), "cargo test");
+        assert_eq!(output_name(Some("  ls -la \n"), "zsh"), "ls -la");
+        assert_eq!(output_name(Some("  "), "zsh"), "output from zsh");
+        assert_eq!(output_name(None, "~/src — bash"), "output from ~/src — bash");
     }
 
     #[test]

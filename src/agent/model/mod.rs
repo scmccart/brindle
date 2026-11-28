@@ -56,8 +56,7 @@ mod recovery;
 mod harness;
 
 pub use attach::{
-    AttachRefusal, Draft, DropRefusal, DropStep, Dropped, PlanPart, RowPress, SendPlan, TextState, drop_plan,
-    dropped_text, size,
+    Attached, Draft, DraftKey, DropStep, Dropped, RowPress, TextState, drop_plan, dropped_text, size,
 };
 pub use attention::WorkingRow;
 pub use blocks::{Block, BlockBody, ShownPart, Splice};
@@ -248,7 +247,9 @@ pub struct ChatModel {
     dismissed: bool,
     /// The attachments the next prompt takes (OpenSpec change
     /// `agents-prompt-context`, decision 7).
-    attached: Vec<Draft>,
+    attached: Vec<Attached>,
+    /// The last [`DraftKey`] given.
+    next_draft: u64,
     /// An `AGENT_ATTACH` of the prompt being sent was refused: its reason
     /// stays over the prompt's refusal that follows.
     attach_refused: bool,
@@ -312,6 +313,7 @@ impl ChatModel {
             completion: None,
             dismissed: false,
             attached: Vec::new(),
+            next_draft: 0,
             attach_refused: false,
             rows: BTreeMap::new(),
         }

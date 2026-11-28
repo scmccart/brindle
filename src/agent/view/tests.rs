@@ -334,6 +334,40 @@ fn enter_during_a_turn_queues_and_with_the_slot_taken_keeps_the_text() {
     assert_eq!(f.reason().as_ref().map(SharedString::as_ref), Some(crate::agent::model::ALREADY_QUEUED));
 }
 
+/// `agents-prompt-context` 6.1: the draft's items show in the prompt
+/// input's row; backspace at the very start removes the last one and
+/// leaves the text, while backspace after text deletes a character and
+/// leaves the draft; Clear Attachments removes them all.
+#[test]
+fn backspace_at_the_start_takes_the_last_attachment_and_not_the_text() {
+    use crate::agent::model::Draft;
+    let mut f = Fixture::new();
+    f.feed(&[ready()]);
+    f.zone.agent.update(f.cx, |agent, cx| {
+        agent.attach_draft(Draft::link("a.rs"), "a.rs", cx);
+        agent.attach_draft(Draft::link("b.rs"), "b.rs", cx);
+    });
+    f.settle();
+    let names = |f: &mut Fixture| -> Vec<String> {
+        f.view.read_with(f.cx, |view, cx| view.prompt.read(cx).attachments().iter().map(|i| i.name.to_string()).collect())
+    };
+    assert_eq!(names(&mut f), ["a.rs", "b.rs"]);
+    f.cx.simulate_input("x");
+    f.cx.simulate_keystrokes("backspace");
+    assert_eq!((f.draft(), names(&mut f).len()), (String::new(), 2), "the text's character went");
+    f.cx.simulate_keystrokes("backspace");
+    f.settle();
+    assert_eq!(names(&mut f), ["a.rs"], "at the start: the last attachment");
+    f.cx.simulate_input("y");
+    f.cx.simulate_keystrokes("home backspace");
+    f.settle();
+    assert_eq!((f.draft(), names(&mut f)), ("y".to_string(), Vec::<String>::new()), "the text stays");
+    f.zone.agent.update(f.cx, |agent, cx| agent.attach_draft(Draft::link("c.rs"), "c.rs", cx));
+    f.cx.dispatch_action(crate::actions::AgentClearAttachments);
+    f.settle();
+    assert!(names(&mut f).is_empty());
+}
+
 /// With no turn running, a held prompt doesn't block a new one: enter
 /// sends it and the held one stays.
 #[test]
@@ -564,6 +598,20 @@ fn the_prompt_state_follows_the_model() {
     assert_eq!(queued_of(&QueueRow::Waiting { text: "a".into(), attachments: 0 }), Some(Queued::Waiting { text: "a".into() }));
     let counted = queued_of(&QueueRow::Waiting { text: "next".into(), attachments: 2 });
     assert_eq!(counted, Some(Queued::Waiting { text: "next · 2 attachments".into() }));
+    // The draft's items, keyed by their draft keys (agents-prompt-context
+    // 6.1): a text with its size, a link with its path.
+    let mut model = ChatModel::new("Fake", None);
+    model.attach(Draft::text("cargo test", &"x".repeat(2150))).unwrap();
+    model.attach(Draft::link("src/main.rs")).unwrap();
+    let items = attachment_items(model.attachments());
+    let shown: Vec<(&str, Icon, &str, Option<&str>)> =
+        items.iter().map(|i| (i.key.as_ref(), i.icon, i.name.as_ref(), i.detail.as_ref().map(|d| d.as_ref()))).collect();
+    assert_eq!(
+        shown,
+        [("1", Icon::Terminal, "cargo test", Some("2.1 KiB")), ("2", Icon::FileText, "main.rs", Some("src/main.rs"))]
+    );
+    assert_eq!(draft_key_of("2"), Some(DraftKey(2)));
+    assert_eq!(draft_key_of("x"), None);
     assert_eq!(tool_status(ToolStatus::InProgress), UiToolStatus::Running);
     assert_eq!(tool_icon(ToolKind::Execute), Icon::Terminal);
 }
