@@ -1267,11 +1267,7 @@ impl TestClient {
     /// `AGENT_PROMPT`: `text` for the agent, sent now or queued.
     pub fn prompt(&mut self, session: SessionId, text: &str) -> Result<(), client::ErrorMessage> {
         let req = self.take_req();
-        self.send(client::ToCore::AgentPrompt(client::AgentPrompt {
-            req,
-            session,
-            text: text.into(),
-        }));
+        self.send(client::ToCore::AgentPrompt(client::AgentPrompt::text(req, session, text)));
         self.agent_reply(req)
     }
 
@@ -1716,6 +1712,8 @@ pub fn client_agent(script: &Path) -> client::SpawnAgent {
         profile: None,
         conversation: None,
         start: None,
+        attachments_dir: None,
+        attachments_keep_days: None,
     }
 }
 

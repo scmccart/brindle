@@ -25,8 +25,8 @@
 //! |   12 | `STEP_DOWN`     | client → core | `req`                                                          |
 //! |   13 | `REPARENT`      | client → core | `session, hwnd` (reserved; a Linux core refuses it)            |
 //! |   14 | `SET_LAYOUT`    | client → core | `session, layout?` (protocol 3 only)                           |
-//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?, conversation?, start?` (protocol 4) |
-//! |   16 | `AGENT_PROMPT`  | client → core | `req, session, text` (protocol 4)                              |
+//! |   15 | `SPAWN_AGENT`   | client → core | `req, command, args, cwd, env, policy, profile?, conversation?, start?, attachments_dir?, attachments_keep_days?` (protocol 4) |
+//! |   16 | `AGENT_PROMPT`  | client → core | `req, session, text, attachments?` (protocol 4)                |
 //! |   17 | `AGENT_CANCEL`  | client → core | `session` (protocol 4)                                         |
 //! |   18 | `AGENT_PERMISSION` | client → core | `req, session, entry, option?` (protocol 4)                 |
 //! |   19 | `AGENT_UNQUEUE` | client → core | `req, session` (protocol 4)                                    |
@@ -35,6 +35,8 @@
 //! |   22 | `AGENT_LOGIN`   | client → core | `req, session, method` (protocol 4)                            |
 //! |   23 | `AGENT_FETCH`   | client → core | `req, session, before, max_bytes` (protocol 4)                 |
 //! |   24 | `AGENT_SET_OPTION` | client → core | `req, session, option, value` (protocol 4)                  |
+//! |   25 | `AGENT_ATTACH`  | client → core | `req, session, upload, name, text` (protocol 4)                |
+//! |   26 | `AGENT_READ_ATTACHMENT` | client → core | `req, session, id` (protocol 4)                        |
 //! |   31 | `AGENT_LIST`    | client → core | `req, session, cursor?` (protocol 4)                           |
 //! |   64 | `AGENT_CHOOSE`  | client → core | `req, session, conversation?` (protocol 4)                     |
 //! |   32 | `WELCOME`       | core → client | `protocol, core_version, core_build, pid, holder_protocols`    |
@@ -49,6 +51,7 @@
 //! |   41 | `PROCESS`       | core → client | `session, name?, cwd?` (protocol 2 only)                       |
 //! |   42 | `TRANSCRIPT`    | core → client | `session, events: [object]` (protocol 4)                       |
 //! |   43 | `AGENT_PAGE`    | core → client | `req, session, events: [object], last?: {more}` (protocol 4)   |
+//! |   44 | `ATTACHMENT`    | core → client | `req, session, id, text` (protocol 4)                          |
 //! |   45 | `AGENT_CONVERSATIONS` | core → client | `req, session, conversations: [{id, title?, updated?}], next?` (protocol 4) |
 //!
 //! The two directions share one number space: clients' messages are below
@@ -171,6 +174,19 @@
 //!   options list) to `value` ([`OptionValue`]): `OK` means asked (or
 //!   already so), and the agent's answer arrives as transcript events.
 //!   Any client attached to the session may send it, during a turn too.
+//! - Attachments (OpenSpec change `agents-prompt-context`, amending
+//!   protocol 4 before it shipped): `AGENT_ATTACH` → `OK` or `ERROR`
+//!   keeps a text of at most [`MAX_ATTACHMENT_TEXT`] for the session as
+//!   the connection's upload `upload`; `AGENT_PROMPT`'s `attachments`
+//!   ([`PromptAttachment`], in order) names links and uploads, and a prompt
+//!   naming an upload the connection doesn't hold is refused. An upload is
+//!   the connection's until a prompt takes it; the core removes a refused
+//!   prompt's uploads and a closed connection's untaken ones.
+//!   `AGENT_READ_ATTACHMENT` → `ATTACHMENT` or `ERROR` reads a kept text
+//!   back by the id a user entry or the queue slot names. `SPAWN_AGENT`'s
+//!   `attachments_dir` and `attachments_keep_days` say where the session
+//!   keeps them and for how long after it ends. Only the client that has
+//!   the session attached may send these.
 //!
 //! A client below 4 isn't shown agent sessions, and is refused an `ATTACH`
 //! of one with an `ERROR` naming the session. Nothing else differs from
@@ -225,7 +241,11 @@ pub const MSG_AGENT_LOGIN: u8 = 22;
 pub const MSG_AGENT_FETCH: u8 = 23;
 /// Protocol 4 (`agents-commands`).
 pub const MSG_AGENT_SET_OPTION: u8 = 24;
-/// Protocol 4 (`agents-session-list`; 25 to 30 are kept for the changes
+/// Protocol 4 (`agents-prompt-context`).
+pub const MSG_AGENT_ATTACH: u8 = 25;
+/// Protocol 4 (`agents-prompt-context`).
+pub const MSG_AGENT_READ_ATTACHMENT: u8 = 26;
+/// Protocol 4 (`agents-session-list`; 27 to 30 are kept for the changes
 /// planned before it).
 pub const MSG_AGENT_LIST: u8 = 31;
 /// Protocol 4 (`agents-session-list`): the first of the clients' second
@@ -246,8 +266,9 @@ pub const MSG_PROCESS: u8 = 41;
 pub const MSG_TRANSCRIPT: u8 = 42;
 /// Protocol 4.
 pub const MSG_AGENT_PAGE: u8 = 43;
-/// Protocol 4 (`agents-session-list`; 44 is kept for a change planned
-/// before it).
+/// Protocol 4 (`agents-prompt-context`).
+pub const MSG_ATTACHMENT: u8 = 44;
+/// Protocol 4 (`agents-session-list`).
 pub const MSG_AGENT_CONVERSATIONS: u8 = 45;
 
 /// Bytes for one session: input from the client, output from the core.
@@ -549,6 +570,16 @@ pub struct SpawnAgent {
     /// `AGENT_CHOOSE` (OpenSpec change `agents-session-list`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start: Option<SpawnStart>,
+    /// Where the session keeps attached text on the agent's host, `~`
+    /// expanded with the server's home there (OpenSpec change
+    /// `agents-prompt-context`); left out, the server's cache directory's
+    /// `attachments`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments_dir: Option<String>,
+    /// How many days kept text stays after the session ends; left out,
+    /// 14. The server clamps it to 3650.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments_keep_days: Option<u32>,
 }
 
 /// `SPAWN_AGENT`'s `start`.
@@ -704,11 +735,88 @@ impl AgentPage {
 }
 
 /// `AGENT_PROMPT` (protocol 4): plain text for the agent, sent now or
-/// queued.
+/// queued, with its attachments in order (OpenSpec change
+/// `agents-prompt-context`; left out when there are none).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentPrompt {
     pub req: RequestId,
     pub session: SessionId,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<PromptAttachment>,
+}
+
+impl AgentPrompt {
+    /// A prompt of `text` alone.
+    pub fn text(req: RequestId, session: SessionId, text: impl Into<String>) -> Self {
+        Self {
+            req,
+            session,
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+}
+
+/// One of an `AGENT_PROMPT`'s attachments: a file on the agent's host, by
+/// its path as the user gave it, or a text this connection uploaded with
+/// `AGENT_ATTACH`, by its `upload` number.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptAttachment {
+    Link { path: String, name: String },
+    Text { upload: u64 },
+}
+
+/// The most text one `AGENT_ATTACH` carries, and one `ATTACHMENT`
+/// answers with, in bytes of UTF-8 once cleaned as a prompt is (no control
+/// character but `\n`, `\t` and `\r` before `\n`): what one frame holds
+/// even when JSON escaping doubles it (asserted below).
+/// `brindle-transcript`'s `ATTACHMENT_TEXT` is the same bound, and the
+/// server checks they agree.
+pub const MAX_ATTACHMENT_TEXT: usize = 256 * 1024;
+
+/// The most an `AGENT_ATTACH` takes beside its text, escaped: its numbers,
+/// field names and a cleaned name of at most 256 bytes, escaped to twice
+/// its bytes.
+pub const ATTACH_ENVELOPE: usize = 2 * 1024;
+
+const _: () = assert!(2 * MAX_ATTACHMENT_TEXT + ATTACH_ENVELOPE <= crate::MAX_FRAME_PAYLOAD_SIZE);
+
+/// `AGENT_ATTACH` (protocol 4, OpenSpec change `agents-prompt-context`):
+/// keep `text` for the session as the upload `upload`, a number the
+/// client picks, unique on its connection, which a later `AGENT_PROMPT`
+/// names. Answered `OK` or `ERROR`. The upload is the connection's until a
+/// prompt takes it: a refused prompt's uploads, and all those untaken when
+/// the connection closes, are removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAttach {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub upload: u64,
+    pub name: String,
+    pub text: String,
+}
+
+/// `AGENT_READ_ATTACHMENT` (protocol 4, `agents-prompt-context`): the text
+/// the session keeps as attachment `id` (an id from a user entry's or the
+/// queue slot's attachments), answered by `ATTACHMENT` or `ERROR`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentReadAttachment {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub id: u64,
+}
+
+/// `ATTACHMENT` (protocol 4, `agents-prompt-context`): the answer to an
+/// `AGENT_READ_ATTACHMENT`, the whole kept text (at most
+/// [`MAX_ATTACHMENT_TEXT`]), with the session as the other agent answers
+/// carry it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachmentText {
+    pub req: RequestId,
+    pub session: SessionId,
+    pub id: u64,
     pub text: String,
 }
 
@@ -1083,6 +1191,10 @@ pub enum ToCore {
     AgentChoose(AgentChoose),
     /// Protocol 4: set one of the session's options.
     AgentSetOption(AgentSetOption),
+    /// Protocol 4: keep a text for a later prompt.
+    AgentAttach(AgentAttach),
+    /// Protocol 4: read a kept text back.
+    AgentReadAttachment(AgentReadAttachment),
 }
 
 impl ToCore {
@@ -1114,6 +1226,8 @@ impl ToCore {
             Self::AgentList(m) => wire::json(MSG_AGENT_LIST, m),
             Self::AgentChoose(m) => wire::json(MSG_AGENT_CHOOSE, m),
             Self::AgentSetOption(m) => wire::json(MSG_AGENT_SET_OPTION, m),
+            Self::AgentAttach(m) => wire::json(MSG_AGENT_ATTACH, m),
+            Self::AgentReadAttachment(m) => wire::json(MSG_AGENT_READ_ATTACHMENT, m),
         }
     }
 
@@ -1149,6 +1263,10 @@ impl ToCore {
             MSG_AGENT_SET_OPTION => {
                 Self::AgentSetOption(wire::from_json("AGENT_SET_OPTION", frame)?)
             }
+            MSG_AGENT_ATTACH => Self::AgentAttach(wire::from_json("AGENT_ATTACH", frame)?),
+            MSG_AGENT_READ_ATTACHMENT => {
+                Self::AgentReadAttachment(wire::from_json("AGENT_READ_ATTACHMENT", frame)?)
+            }
             other => return Err(wire::unknown_type("client-to-core", other)),
         })
     }
@@ -1177,6 +1295,8 @@ pub enum ToClient {
     AgentPage(AgentPage),
     /// Protocol 4: the answer to an `AGENT_LIST`.
     AgentConversations(AgentConversations),
+    /// Protocol 4: the answer to an `AGENT_READ_ATTACHMENT`.
+    Attachment(AttachmentText),
 }
 
 impl ToClient {
@@ -1204,6 +1324,7 @@ impl ToClient {
                 wire::json(MSG_AGENT_PAGE, m)
             }
             Self::AgentConversations(m) => wire::json(MSG_AGENT_CONVERSATIONS, m),
+            Self::Attachment(m) => wire::json(MSG_ATTACHMENT, m),
         }
     }
 
@@ -1233,6 +1354,7 @@ impl ToClient {
             MSG_AGENT_CONVERSATIONS => {
                 Self::AgentConversations(wire::from_json("AGENT_CONVERSATIONS", frame)?)
             }
+            MSG_ATTACHMENT => Self::Attachment(wire::from_json("ATTACHMENT", frame)?),
             other => return Err(wire::unknown_type("core-to-client", other)),
         })
     }
@@ -1363,6 +1485,8 @@ pub(crate) mod samples {
                 profile: Some("Claude".into()),
                 conversation: None,
                 start: None,
+                attachments_dir: None,
+                attachments_keep_days: None,
             }),
             ToCore::SpawnAgent(SpawnAgent {
                 req: 15,
@@ -1377,11 +1501,33 @@ pub(crate) mod samples {
                     cwd: "/home/u/src".into(),
                 }),
                 start: None,
+                attachments_dir: Some("~/brindle-attachments".into()),
+                attachments_keep_days: Some(0),
+            }),
+            ToCore::AgentPrompt(AgentPrompt::text(10, 9, "Write notes.md\n")),
+            ToCore::AgentAttach(AgentAttach {
+                req: 25,
+                session: 9,
+                upload: 1,
+                name: "cargo test".into(),
+                text: "test result: FAILED\n".into(),
             }),
             ToCore::AgentPrompt(AgentPrompt {
-                req: 10,
+                req: 26,
                 session: 9,
-                text: "Write notes.md\n".into(),
+                text: "why does this fail?".into(),
+                attachments: vec![
+                    PromptAttachment::Text { upload: 1 },
+                    PromptAttachment::Link {
+                        path: "src/main.rs".into(),
+                        name: "main.rs".into(),
+                    },
+                ],
+            }),
+            ToCore::AgentReadAttachment(AgentReadAttachment {
+                req: 27,
+                session: 9,
+                id: 5,
             }),
             ToCore::AgentCancel(SessionRef { session: 9 }),
             ToCore::AgentPermission(AgentPermission {
@@ -1599,6 +1745,12 @@ pub(crate) mod samples {
                 conversations: Vec::new(),
                 next: None,
             }),
+            ToClient::Attachment(AttachmentText {
+                req: 27,
+                session: 9,
+                id: 5,
+                text: "test result: FAILED\n".into(),
+            }),
             ToClient::ServerStatus(ServerStatus {
                 req: 6,
                 core_version: "0.3.0".into(),
@@ -1652,7 +1804,7 @@ mod tests {
             types.push(frame.msg_type);
             assert_eq!(&ToCore::decode(&frame).unwrap(), message);
         }
-        for expected in (MSG_DATA..=MSG_AGENT_SET_OPTION).chain([MSG_AGENT_LIST, MSG_AGENT_CHOOSE])
+        for expected in (MSG_DATA..=MSG_AGENT_READ_ATTACHMENT).chain([MSG_AGENT_LIST, MSG_AGENT_CHOOSE])
         {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
@@ -1667,7 +1819,7 @@ mod tests {
             assert_eq!(&ToClient::decode(&frame).unwrap(), message);
         }
         assert!(types.contains(&MSG_DATA));
-        for expected in (MSG_WELCOME..=MSG_AGENT_PAGE).chain([MSG_AGENT_CONVERSATIONS]) {
+        for expected in MSG_WELCOME..=MSG_AGENT_CONVERSATIONS {
             assert!(types.contains(&expected), "no sample of type {expected}");
         }
     }
@@ -1792,9 +1944,40 @@ mod tests {
         }
     }
 
+    /// A text at the bound that escapes to twice its bytes (line breaks,
+    /// quotes), under a name at its bound escaping so too, fits one
+    /// `AGENT_ATTACH` and one `ATTACHMENT` frame. Both sides send texts and
+    /// names cleaned as prompts are (`brindle-transcript`'s `clean`: no
+    /// control character but `\n`, `\t` and `\r` before `\n`), so nothing
+    /// escapes to more.
+    #[test]
+    fn the_largest_attachment_fits_one_frame() {
+        let largest = |text: &str| {
+            let attach = ToCore::AgentAttach(AgentAttach {
+                req: u64::MAX,
+                session: u32::MAX,
+                upload: u64::MAX,
+                name: "\"".repeat(256),
+                text: text.into(),
+            });
+            let frame = attach.encode().expect("fits a frame");
+            assert_eq!(ToCore::decode(&frame).unwrap(), attach);
+            let read = ToClient::Attachment(AttachmentText {
+                req: u64::MAX,
+                session: u32::MAX,
+                id: u64::MAX,
+                text: text.into(),
+            });
+            let frame = read.encode().expect("fits a frame");
+            assert_eq!(ToClient::decode(&frame).unwrap(), read);
+        };
+        largest(&"\n".repeat(MAX_ATTACHMENT_TEXT));
+        largest(&"\"".repeat(MAX_ATTACHMENT_TEXT));
+    }
+
     #[test]
     fn unknown_and_wrong_direction_types_are_invalid_data() {
-        for msg_type in [0, 23, 30, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, 45, 63, 65, 255] {
+        for msg_type in [0, 23, 27, 30, MSG_WELCOME, MSG_OK, MSG_PROCESS, MSG_TRANSCRIPT, 43, MSG_ATTACHMENT, 45, 63, 65, 255] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
             let error = ToCore::decode(&frame).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
@@ -1810,8 +1993,10 @@ mod tests {
             MSG_AGENT_LIST,
             MSG_AGENT_CHOOSE,
             MSG_AGENT_SET_OPTION,
+            MSG_AGENT_ATTACH,
+            MSG_AGENT_READ_ATTACHMENT,
             43,
-            44,
+            46,
             255,
         ] {
             let frame = Frame::new(msg_type, b"{}".to_vec()).unwrap();
@@ -2002,6 +2187,94 @@ mod tests {
             let frame = Frame::new(MSG_AGENT_SET_OPTION, payload.to_vec()).unwrap();
             assert!(ToCore::decode(&frame).is_err(), "{payload:?}");
         }
+        // AGENT_PROMPT's attachments are left out when there are none, so
+        // a plain prompt encodes as before, and tagged by kind otherwise.
+        let frame = ToCore::AgentPrompt(AgentPrompt::text(4, 5, "hi")).encode().unwrap();
+        assert_eq!(frame.payload, br#"{"req":4,"session":5,"text":"hi"}"#);
+        let frame = ToCore::AgentPrompt(AgentPrompt {
+            attachments: vec![
+                PromptAttachment::Link {
+                    path: "~/a.rs".into(),
+                    name: "a.rs".into(),
+                },
+                PromptAttachment::Text { upload: 2 },
+            ],
+            ..AgentPrompt::text(4, 5, "hi")
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame.payload,
+            br#"{"req":4,"session":5,"text":"hi","attachments":[{"kind":"link","path":"~/a.rs","name":"a.rs"},{"kind":"text","upload":2}]}"#
+        );
+        // AGENT_ATTACH is 25, AGENT_READ_ATTACHMENT 26 and ATTACHMENT 44.
+        let frame = ToCore::AgentAttach(AgentAttach {
+            req: 4,
+            session: 5,
+            upload: 1,
+            name: "cargo test".into(),
+            text: "ok\n".into(),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(frame.msg_type, 25);
+        assert_eq!(
+            frame.payload,
+            br#"{"req":4,"session":5,"upload":1,"name":"cargo test","text":"ok\n"}"#
+        );
+        let frame = ToCore::AgentReadAttachment(AgentReadAttachment {
+            req: 4,
+            session: 5,
+            id: 3,
+        })
+        .encode()
+        .unwrap();
+        assert_eq!((frame.msg_type, &frame.payload[..]), (26, &br#"{"req":4,"session":5,"id":3}"#[..]));
+        let frame = ToClient::Attachment(AttachmentText {
+            req: 4,
+            session: 5,
+            id: 3,
+            text: "ok".into(),
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            (frame.msg_type, &frame.payload[..]),
+            (44, &br#"{"req":4,"session":5,"id":3,"text":"ok"}"#[..])
+        );
+        for (msg_type, payload) in [
+            (MSG_AGENT_PROMPT, &br#"{"req":4,"session":5,"text":"hi","attachments":[{"kind":"text"}]}"#[..]),
+            (MSG_AGENT_PROMPT, br#"{"req":4,"session":5,"text":"hi","attachments":[{"kind":"link","path":"a"}]}"#),
+            (MSG_AGENT_PROMPT, br#"{"req":4,"session":5,"text":"hi","attachments":[{"kind":"image","upload":1}]}"#),
+            (MSG_AGENT_PROMPT, br#"{"req":4,"session":5,"text":"hi","attachments":{"kind":"text","upload":1}}"#),
+            (MSG_AGENT_PROMPT, br#"{"req":4,"session":5,"text":"hi","attachments":[{"kind":"text","upload":-1}]}"#),
+            (MSG_AGENT_ATTACH, br#"{"req":4,"session":5,"name":"n","text":"t"}"#),
+            (MSG_AGENT_ATTACH, br#"{"req":4,"session":5,"upload":1,"text":"t"}"#),
+            (MSG_AGENT_ATTACH, br#"{"req":4,"session":5,"upload":1,"name":"n","text":7}"#),
+            (MSG_AGENT_READ_ATTACHMENT, br#"{"req":4,"session":5}"#),
+            (MSG_AGENT_READ_ATTACHMENT, br#"{"req":4,"session":5,"id":"3"}"#),
+        ] {
+            let frame = Frame::new(msg_type, payload.to_vec()).unwrap();
+            assert!(ToCore::decode(&frame).is_err(), "{payload:?}");
+        }
+        for payload in [&br#"{"req":4,"session":5,"id":3}"#[..], br#"{"req":4,"session":5,"text":"t"}"#] {
+            let frame = Frame::new(MSG_ATTACHMENT, payload.to_vec()).unwrap();
+            assert!(ToClient::decode(&frame).is_err(), "{payload:?}");
+        }
+        // SPAWN_AGENT's attachment settings are left out when unset.
+        let frame = ToCore::SpawnAgent(SpawnAgent {
+            req: 1,
+            command: "agent".into(),
+            attachments_dir: Some("/data/brindle".into()),
+            attachments_keep_days: Some(0),
+            ..Default::default()
+        })
+        .encode()
+        .unwrap();
+        assert_eq!(
+            frame.payload,
+            br#"{"req":1,"command":"agent","args":[],"cwd":null,"env":{},"policy":"kill","attachments_dir":"/data/brindle","attachments_keep_days":0}"#
+        );
         // A conversation without its id is refused.
         let frame = Frame::new(
             MSG_SPAWN_AGENT,

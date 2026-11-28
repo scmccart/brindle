@@ -53,12 +53,15 @@ macro_rules! forms {
 forms!(to_core_form, TO_CORE_FORMS, client::ToCore, "client::ToCore::":
     Hello, Spawn, Data, Resize, Close, Attach, Detach, List, Kill, Status, Stop, StepDown,
     Reparent, SetLayout, SpawnAgent, AgentPrompt, AgentCancel, AgentPermission, AgentUnqueue,
-    AgentResend, AgentRestart, AgentLogin, AgentFetch, AgentList, AgentChoose, AgentSetOption);
+    AgentResend, AgentRestart, AgentLogin, AgentFetch, AgentList, AgentChoose, AgentSetOption,
+    AgentAttach, AgentReadAttachment);
 forms!(option_value_form, OPTION_VALUE_FORMS, client::OptionValue, "client::OptionValue::":
     Choice, Toggle);
+forms!(prompt_attachment_form, PROMPT_ATTACHMENT_FORMS, client::PromptAttachment,
+    "client::PromptAttachment::": Link, Text);
 forms!(to_client_form, TO_CLIENT_FORMS, client::ToClient, "client::ToClient::":
     Welcome, Error, Spawned, Data, Exit, ReplayStart, ReplayEnd, Sessions, ServerStatus, Ok,
-    Process, Transcript, AgentPage, AgentConversations);
+    Process, Transcript, AgentPage, AgentConversations, Attachment);
 forms!(to_holder_form, TO_HOLDER_FORMS, holder::ToHolder, "holder::ToHolder::":
     Hello, Spawn, Input, Resize, Hangup, CheckpointBegin, CheckpointChunk, CheckpointEnd, Drain,
     Goodbye, Reparent, Pause, Resume, SetMeta, SpawnPipes, CheckpointAppend);
@@ -154,6 +157,7 @@ fn expected_forms() -> Vec<&'static str> {
         PERMISSION_OPTION_FORMS,
         PAGE_END_FORMS,
         OPTION_VALUE_FORMS,
+        PROMPT_ATTACHMENT_FORMS,
     ]
     .concat()
 }
@@ -221,6 +225,9 @@ impl Step {
                 }
                 if let client::ToCore::AgentSetOption(set) = message {
                     forms.push(option_value_form(&set.value));
+                }
+                if let client::ToCore::AgentPrompt(prompt) = message {
+                    forms.extend(prompt.attachments.iter().map(prompt_attachment_form));
                 }
                 forms
             }
@@ -1541,7 +1548,150 @@ fn transcripts() -> Vec<Transcript> {
     .chain(paging_transcripts())
     .chain(session_list_transcripts())
     .chain(options_transcripts())
+    .chain(attachment_transcripts())
     .collect()
+}
+
+fn attach(req: u64, session: u32, upload: u64, name: &str, text: &str) -> Step {
+    c(client::ToCore::AgentAttach(client::AgentAttach {
+        req,
+        session,
+        upload,
+        name: name.into(),
+        text: text.into(),
+    }))
+}
+
+fn prompt_with(req: u64, session: u32, text: &str, attachments: Vec<client::PromptAttachment>) -> Step {
+    c(client::ToCore::AgentPrompt(client::AgentPrompt {
+        attachments,
+        ..client::AgentPrompt::text(req, session, text)
+    }))
+}
+
+fn link(path: &str, name: &str) -> client::PromptAttachment {
+    client::PromptAttachment::Link {
+        path: path.into(),
+        name: name.into(),
+    }
+}
+
+fn upload(upload: u64) -> client::PromptAttachment {
+    client::PromptAttachment::Text { upload }
+}
+
+/// Transcripts added by `agents-prompt-context`, within protocol 4 before
+/// it shipped (its design decision 3).
+fn attachment_transcripts() -> Vec<Transcript> {
+    let output = "test result: FAILED. 1 passed; 1 failed\n";
+    vec![
+        Transcript {
+            name: "client-agent-attachments",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with attachments: an agent session started with its attachments directory and keep time, a command's output uploaded and sent with a link, the user entry holding both references, the kept text read back, and a prompt with an attachment queued during a turn and sent after it.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                c(client::ToCore::SpawnAgent(client::SpawnAgent {
+                    req: 1,
+                    command: "fake-acp-agent".into(),
+                    args: vec!["--script".into(), "/home/u/attach.script".into()],
+                    cwd: Some("~/src".into()),
+                    env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
+                    policy: Policy::Detach,
+                    profile: Some("Agent".into()),
+                    attachments_dir: Some("~/brindle-attachments".into()),
+                    attachments_keep_days: Some(7),
+                    ..Default::default()
+                })),
+                spawned(1, 1, 5000),
+                transcript(1, vec![conversation("resume_and_load"), ready()]),
+                attach(2, 1, 1, "cargo test", output),
+                ok(2),
+                prompt_with(3, 1, "why does this fail?", vec![upload(1), link("src/main.rs", "main.rs")]),
+                ok(3),
+                transcript(
+                    1,
+                    vec![
+                        added(
+                            1,
+                            json!({"type": "user", "text": "why does this fail?", "attachments": [
+                                {"kind": "text", "id": 1, "name": "cargo test", "bytes": output.len()},
+                                {"kind": "link", "path": "src/main.rs", "name": "main.rs"},
+                            ]}),
+                        ),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+                c(client::ToCore::AgentReadAttachment(client::AgentReadAttachment {
+                    req: 4,
+                    session: 1,
+                    id: 1,
+                })),
+                s(client::ToClient::Attachment(client::AttachmentText {
+                    req: 4,
+                    session: 1,
+                    id: 1,
+                    text: output.into(),
+                })),
+                attach(5, 1, 2, "output from zsh", "warning: unused\n"),
+                ok(5),
+                prompt_with(6, 1, "and this?", vec![upload(2)]),
+                ok(6),
+                transcript(
+                    1,
+                    vec![queue(json!({"slot": "waiting", "text": "and this?", "attachments": [
+                        {"kind": "text", "id": 2, "name": "output from zsh", "bytes": 16},
+                    ]}))],
+                ),
+                transcript(
+                    1,
+                    vec![
+                        added(2, text_entry("agent", "The second test expects 3.")),
+                        turn(json!({"turn": "ended", "stop": {"reason": "end_turn"}})),
+                        queue(json!({"slot": "empty"})),
+                        added(
+                            3,
+                            json!({"type": "user", "text": "and this?", "attachments": [
+                                {"kind": "text", "id": 2, "name": "output from zsh", "bytes": 16},
+                            ]}),
+                        ),
+                        turn(json!({"turn": "working"})),
+                    ],
+                ),
+            ],
+        },
+        Transcript {
+            name: "client-agent-attachments-refused",
+            protocol: Protocol::Client4,
+            about: "Protocol 4 with attachments: an upload number used twice, a prompt naming an upload the connection doesn't hold, a ninth attachment, a refused prompt's upload removed with it, and a read of an attachment the session doesn't keep.",
+            steps: vec![
+                hello_4(TOKEN),
+                welcome_4(),
+                spawn_choosing(1),
+                spawned(1, 1, 5000),
+                transcript(1, vec![choosing(None)]),
+                attach(2, 1, 1, "cargo test", "ok\n"),
+                ok(2),
+                attach(3, 1, 1, "cargo test", "ok\n"),
+                error(Some(3), Some(1), "session 1: upload 1 is already on this connection"),
+                prompt_with(4, 1, "hi", vec![upload(7)]),
+                error(Some(4), Some(1), "session 1: this connection holds no upload 7"),
+                prompt_with(5, 1, "hi", vec![link("a", "a"); 9]),
+                error(Some(5), Some(1), "session 1: a prompt takes at most 8 attachments, not 9"),
+                prompt_with(6, 1, "hi", vec![upload(1)]),
+                error(Some(6), Some(1), "session 1: the agent isn't ready"),
+                prompt_with(7, 1, "hi", vec![upload(1)]),
+                error(Some(7), Some(1), "session 1: this connection holds no upload 1"),
+                c(client::ToCore::AgentReadAttachment(client::AgentReadAttachment {
+                    req: 8,
+                    session: 1,
+                    id: 3,
+                })),
+                error(Some(8), Some(1), "session 1: the session keeps no attachment 3"),
+            ],
+        },
+    ]
 }
 
 fn set_option(req: u64, session: u32, option: &str, value: client::OptionValue) -> Step {
@@ -1597,8 +1747,7 @@ fn options_transcripts() -> Vec<Transcript> {
                     env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
                     policy: Policy::Detach,
                     profile: Some("Agent".into()),
-                    conversation: None,
-                    start: None,
+                    ..Default::default()
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 1,
@@ -1721,8 +1870,8 @@ fn spawn_choosing(req: u64) -> Step {
         env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
         policy: Policy::Detach,
         profile: Some("Agent".into()),
-        conversation: None,
         start: Some(client::SpawnStart::Choose),
+        ..Default::default()
     }))
 }
 
@@ -1846,11 +1995,7 @@ fn session_list_transcripts() -> Vec<Transcript> {
                 spawn_choosing(1),
                 spawned(1, 1, 5000),
                 transcript(1, vec![choosing(None)]),
-                c(client::ToCore::AgentPrompt(client::AgentPrompt {
-                    req: 2,
-                    session: 1,
-                    text: "hi".into(),
-                })),
+                c(client::ToCore::AgentPrompt(client::AgentPrompt::text(2, 1, "hi"))),
                 error(Some(2), Some(1), "session 1: the agent isn't ready"),
                 list(3, 1, None),
                 list(4, 1, None),
@@ -1958,11 +2103,7 @@ fn welcome_4() -> Step {
 }
 
 fn prompt(req: u64, session: u32, text: &str) -> Step {
-    c(client::ToCore::AgentPrompt(client::AgentPrompt {
-        req,
-        session,
-        text: text.into(),
-    }))
+    c(client::ToCore::AgentPrompt(client::AgentPrompt::text(req, session, text)))
 }
 
 fn answer(req: u64, session: u32, entry: u64, option: Option<&str>) -> Step {
@@ -2404,8 +2545,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     ]),
                     policy: Policy::Detach,
                     profile: Some("Agent".into()),
-                    conversation: None,
-                    start: None,
+                    ..Default::default()
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 1,
@@ -2542,7 +2682,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                         id: CONVERSATION.into(),
                         cwd: "/home/u/src".into(),
                     }),
-                    start: None,
+                    ..Default::default()
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 13,
@@ -2591,8 +2731,7 @@ fn agent_transcripts() -> Vec<Transcript> {
                     env: BTreeMap::from([("HOME".into(), "/home/u".into())]),
                     policy: Policy::Detach,
                     profile: Some("Agent".into()),
-                    conversation: None,
-                    start: None,
+                    ..Default::default()
                 })),
                 s(client::ToClient::Spawned(client::Spawned {
                     req: 1,

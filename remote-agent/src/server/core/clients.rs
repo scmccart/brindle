@@ -371,6 +371,8 @@ impl<L: EventLoop> Core<L> {
             ToCore::AgentSetOption(set) => {
                 self.client_agent_command(client, AgentCommand::set_option(set))
             }
+            ToCore::AgentAttach(attach) => self.client_agent_attach(client, attach),
+            ToCore::AgentReadAttachment(read) => self.client_agent_read_attachment(client, read),
         }
     }
 
@@ -541,6 +543,7 @@ pub(super) fn unsendable(message: &ToClient, failure: &io::Error) -> ToClient {
         ToClient::Transcript(m) => (None, Some(m.session)),
         ToClient::AgentPage(m) => (Some(m.req), Some(m.session)),
         ToClient::AgentConversations(m) => (Some(m.req), Some(m.session)),
+        ToClient::Attachment(m) => (Some(m.req), Some(m.session)),
     };
     error(req, session, unsendable_text(message, failure))
 }
@@ -561,6 +564,7 @@ fn unsendable_text(message: &ToClient, failure: &io::Error) -> String {
         ToClient::Transcript(_) => "transcript",
         ToClient::AgentPage(_) => "page of earlier entries",
         ToClient::AgentConversations(_) => "list of conversations",
+        ToClient::Attachment(_) => "attached text",
     };
     format!("the terminal server couldn't send its {what}: {failure}")
 }

@@ -1745,8 +1745,7 @@ mod tests {
             env: BTreeMap::from([("AGENT_KEY".to_string(), "1".to_string())]),
             policy: client::Policy::Detach,
             profile: Some("Claude".into()),
-            conversation: None,
-            start: None,
+            ..client::SpawnAgent::default()
         };
         assert_eq!(spawn, expected);
         let life = shows(&mut feed, "the agent ready", |log| matches!(log.agent(), AgentState::Ready { .. }));
@@ -1771,7 +1770,7 @@ mod tests {
     fn an_agent_session_starts_and_runs_a_turn() {
         let mut agent = agent_session("agent-turn");
         let req = agent.session.prompt("hi").unwrap();
-        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(client::AgentPrompt { req, session: AGENT, text: "hi".into() }));
+        assert_eq!(recv(&agent.core), ToCore::AgentPrompt(client::AgentPrompt::text(req, AGENT, "hi")));
         let ended = |log: &Transcript| *log.turn() == TurnState::Ended { stop: StopReason::EndTurn };
         assert_eq!(shows(&mut agent.feed, "the turn's end", ended), [reply(req)]);
         assert_eq!(says(agent.feed.shared.lock().transcript()), ["user: hi", "agent: hello back"]);
@@ -1996,9 +1995,9 @@ mod tests {
         assert_eq!(
             sent,
             [
-                ToCore::AgentPrompt(client::AgentPrompt { req: first, session: AGENT, text: "long".into() }),
-                ToCore::AgentPrompt(client::AgentPrompt { req: second, session: AGENT, text: "next".into() }),
-                ToCore::AgentPrompt(client::AgentPrompt { req: third, session: AGENT, text: "third".into() }),
+                ToCore::AgentPrompt(client::AgentPrompt::text(first, AGENT, "long")),
+                ToCore::AgentPrompt(client::AgentPrompt::text(second, AGENT, "next")),
+                ToCore::AgentPrompt(client::AgentPrompt::text(third, AGENT, "third")),
                 ToCore::AgentUnqueue(client::AgentRequest { req: removed, session: AGENT }),
             ]
         );
@@ -2248,7 +2247,7 @@ mod tests {
         assert!(matches!(recv(&core), ToCore::SpawnAgent(_)));
         assert_eq!(next_life(&mut feed), AgentEvent::SessionRunning, "the only life event of a start");
         let req = session.prompt("hi").expect("sent once the session runs");
-        assert_eq!(recv(&core), ToCore::AgentPrompt(client::AgentPrompt { req, session: AGENT, text: "hi".into() }));
+        assert_eq!(recv(&core), ToCore::AgentPrompt(client::AgentPrompt::text(req, AGENT, "hi")));
         drop(connection);
     }
 
