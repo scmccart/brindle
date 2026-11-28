@@ -798,9 +798,7 @@ mod tests {
     use super::super::*;
     use super::*;
     use crate::agent::shared::Changes;
-    use brindle_transcript::ITEM_LIMIT;
-
-    use crate::agent::transcript::{Event, Output, PermissionOutcome, StopReason, ToolStatus};
+    use crate::agent::transcript::{Event, ITEM_LIMIT, Output, PermissionOutcome, StopReason, ToolStatus};
 
     fn appended(id: u64, text: &str) -> Event {
         Event::Appended { id: EntryId(id), text: text.into() }
