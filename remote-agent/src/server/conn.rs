@@ -5,6 +5,7 @@
 use std::io::{self, Read, Write};
 use std::time::{Duration, Instant};
 
+use brindle_remote_protocol::holder::SlicedFrame;
 use brindle_remote_protocol::{FRAME_HEADER_LEN, Frame, MAX_FRAME_PAYLOAD_SIZE};
 
 use super::event_loop::{Interest, Source};
@@ -126,6 +127,18 @@ impl Conn {
         self.output
             .extend_from_slice(&(frame.payload.len() as u32).to_be_bytes());
         self.output.extend_from_slice(&frame.payload);
+    }
+
+    /// Adds a frame given as its payload's head and a slice of the bytes it
+    /// carries: the same bytes [`Conn::queue`] adds for the whole frame,
+    /// with no frame built (OpenSpec change `agents-checkpoint-deltas`,
+    /// decision 8).
+    pub fn queue_sliced(&mut self, frame: &SlicedFrame<'_>) {
+        self.output.push(frame.msg_type);
+        self.output
+            .extend_from_slice(&(frame.payload_len() as u32).to_be_bytes());
+        self.output.extend_from_slice(frame.head());
+        self.output.extend_from_slice(frame.body);
     }
 
     /// Bytes waiting to be sent.
@@ -313,6 +326,31 @@ mod tests {
         assert_eq!(sender.queued(), 0);
         drop(sender);
         assert!(receiver.read_available().unwrap(), "EOF");
+    }
+
+    /// A checkpoint queued from slices is the bytes of its messages
+    /// queued as frames, whole or appended.
+    #[test]
+    fn a_sliced_checkpoint_queues_the_bytes_of_its_messages() {
+        use brindle_remote_protocol::holder::{BlobForm, ToHolder, checkpoint_frames};
+        let bytes: Vec<u8> = (0..200_000u32).map(|n| n as u8).collect();
+        for form in [BlobForm::Whole, BlobForm::Append] {
+            let (a, _peer_a) = Stream::pair().unwrap();
+            let (b, _peer_b) = Stream::pair().unwrap();
+            let mut sliced = Conn::new(a).unwrap();
+            let mut framed = Conn::new(b).unwrap();
+            for frame in checkpoint_frames(7, &bytes, 99, form) {
+                sliced.queue_sliced(&frame);
+            }
+            let messages = match form {
+                BlobForm::Whole => ToHolder::checkpoint(7, &bytes, 99),
+                BlobForm::Append => ToHolder::checkpoint_append(7, &bytes, 99),
+            };
+            for message in messages {
+                framed.queue(&message.encode().unwrap());
+            }
+            assert!(sliced.output == framed.output, "{form:?}");
+        }
     }
 
     /// Linux only: a socket takes part of a write. A Windows pipe takes

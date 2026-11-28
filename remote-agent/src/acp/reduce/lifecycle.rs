@@ -329,8 +329,8 @@ impl Step<'_> {
         // process. No path resets `Rpc` without closing it.
         self.close_process(Refused::Restarted.to_string(), Closing::Gone);
         // The old agent's calls and terminals are gone with it; their
-        // entries and text stay.
-        self.s.process = Process::new();
+        // entries and text stay, before the new process's tool epoch.
+        self.s.process = Process::starting_at(self.s.transcript.next_id());
         self.s.phase = Phase::Spawning { start };
     }
 
@@ -435,7 +435,7 @@ impl Step<'_> {
         self.mark(Moment::Stopped);
     }
 
-    pub(super) fn initialized(&mut self, result: Result<&Value, &RpcError>) {
+    pub(super) fn initialized(&mut self, result: Result<Value, &RpcError>) {
         let Phase::Initializing { start } = &self.s.phase else {
             return;
         };
@@ -444,7 +444,7 @@ impl Step<'_> {
         // one the session speaks.
         let newest = Dialect::newest().version();
         match result {
-            Ok(result) => match dialect::spoken(result).map(Dialect::from_version) {
+            Ok(result) => match dialect::spoken(&result).map(Dialect::from_version) {
                 None => self.refuse(
                     "the agent's answer to initialize isn't one Brindle can read".to_owned(),
                 ),
@@ -479,8 +479,10 @@ impl Step<'_> {
     }
 
     /// `initialize`'s answer, read in the version it names.
-    fn speaking(&mut self, dialect: Dialect, start: Start, result: &Value) {
+    fn speaking(&mut self, dialect: Dialect, start: Start, result: Value) {
         self.s.rpc.speak(dialect);
+        // Read by hand first, so the answer then moves into the decoder.
+        let methods = dialect.auth_methods(&result, true);
         match dialect.initialize_result(result) {
             Ok(initialized) => {
                 let (name, version) = initialized.agent.map_or((None, None), |agent| {
@@ -492,7 +494,7 @@ impl Step<'_> {
                     continuation: initialized.continuation,
                 };
                 self.s.lists = initialized.lists;
-                self.keep_methods(dialect.auth_methods(result, true));
+                self.keep_methods(methods);
                 self.start(start, greeting);
             }
             Err(_) => self
@@ -604,7 +606,7 @@ impl Step<'_> {
         Ok(())
     }
 
-    pub(super) fn created(&mut self, result: Result<&Value, &RpcError>) {
+    pub(super) fn created(&mut self, result: Result<Value, &RpcError>) {
         let Phase::Creating { greeting } = &self.s.phase else {
             return;
         };
@@ -642,7 +644,7 @@ impl Step<'_> {
     /// `agents-session-recovery`): the conversation continues in the same
     /// ACP session, with the notice its way calls for; `-32000` needs a
     /// login; any other error, or an answer Brindle can't read, fails it.
-    pub(super) fn continued(&mut self, result: Result<&Value, &RpcError>) {
+    pub(super) fn continued(&mut self, result: Result<Value, &RpcError>) {
         let (greeting, conversation, log, notice, how) = match &self.s.phase {
             Phase::Resuming {
                 greeting,
@@ -2140,7 +2142,9 @@ mod tests {
             now: agent.now,
             event_limit: MAX_EVENT,
         };
+        let next = step.s.transcript.next_id();
         step.respawn(Start::New);
-        assert_eq!(agent.s.process, Process::new());
+        assert_eq!(agent.s.process, Process::starting_at(next));
+        assert_eq!(agent.s.process.book.tool_epoch, next);
     }
 }

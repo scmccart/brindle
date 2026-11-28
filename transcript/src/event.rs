@@ -1662,7 +1662,7 @@ mod tests {
         let full = ToolItem::Output(Output {
             command: Some("cargo test".into()),
             cwd: Some("/p".into()),
-            text: "x".repeat(ITEM_LIMIT),
+            text: "x".repeat(ITEM_LIMIT).into(),
             omitted: 9,
             partial: true,
             exit: Some(Exit::Signal { name: "KILL".into() }),

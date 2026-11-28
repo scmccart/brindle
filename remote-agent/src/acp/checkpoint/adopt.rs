@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn an_untruncated_adoption_changes_nothing() {
         let agent = Agent::busy();
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let adopted = adopt(&bytes, false, "/elsewhere", "9.9.9", agent.now);
         assert_eq!(adopted.restored, Ok(()));
         assert_eq!(adopted.session, agent.s);
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn a_truncated_adoption_fails_the_pending_prompt_and_holds_the_waiting_one() {
         let agent = Agent::busy();
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let adopted = adopt(&bytes, true, "/home/u/src", "0.3.0", agent.now);
         assert_eq!(adopted.restored, Ok(()));
         let session = &adopted.session;
@@ -197,7 +197,7 @@ mod tests {
         let held = agent.s.transcript.slot().clone();
         assert!(matches!(held, Slot::Held { .. }));
         assert_eq!(agent.prompt("third").reply, Some(Ok(())));
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let adopted = adopt(&bytes, true, "/home/u/src", "0.3.0", agent.now);
         assert_eq!(*adopted.session.transcript.slot(), held);
         assert!(matches!(
@@ -241,7 +241,7 @@ mod tests {
         });
         assert_eq!(agent.step(Input::Restart).reply, Some(Ok(())));
         let entries = agent.s.transcript.entries().count();
-        let bytes = encode(&agent.s).expect("it fits");
+        let bytes = encode(&agent.s).expect("it fits").bytes;
         let mut adopted = adopt(&bytes, false, "/elsewhere", "0.3.0", agent.now);
         assert_eq!(adopted.restored, Ok(()));
         assert!(matches!(adopted.session.phase, Phase::Initializing { .. }));
@@ -267,7 +267,7 @@ mod tests {
             title: None,
         };
         let fresh = AgentSession::continuing(conversation, "0.3.0".into());
-        let bytes = encode(&fresh).expect("it fits");
+        let bytes = encode(&fresh).expect("it fits").bytes;
         let mut adopted = adopt(&bytes, false, "/elsewhere", "0.3.0", agent.now);
         assert_eq!(sent(&adopted.output.stdin)[0]["method"], "initialize");
         let out = step(

@@ -195,50 +195,96 @@ impl Transcript {
         suffix
     }
 
+    /// [`Transcript::replay`] as a value that serializes as the JSON array
+    /// `replay()` encodes to, written event by event (OpenSpec change
+    /// `agents-checkpoint-deltas`, decision 8): one entry's events are
+    /// made at a time, so the whole log is never copied to be encoded.
+    pub fn replay_ref(&self) -> ReplayRef<'_> {
+        ReplayRef { transcript: self }
+    }
+
     pub(crate) fn replay_from(&self, start: usize) -> Vec<Event> {
         let mut events = Vec::with_capacity(self.entries.len() - start + 6);
+        let collected: Result<(), std::convert::Infallible> = self.replay_each(start, &mut |event| {
+            events.push(event);
+            Ok(())
+        });
+        match collected {
+            Ok(()) => events,
+        }
+    }
+
+    /// Hands each event of the replay from entry index `start` to `emit`,
+    /// in order, stopping at its first error.
+    fn replay_each<E>(
+        &self,
+        start: usize,
+        emit: &mut dyn FnMut(Event) -> Result<(), E>,
+    ) -> Result<(), E> {
         if let Some(trim) = self.trimmed {
-            events.push(Event::Trimmed {
+            emit(Event::Trimmed {
                 through: trim.through,
                 dropped: trim.dropped,
-            });
+            })?;
         }
         let earlier = start as u64 + self.window.map_or(0, |window| window.earlier);
         if earlier > 0 {
             let from = self.entries.get(start).map_or(self.next, |kept| kept.id);
-            events.push(Event::Window { from, earlier });
+            emit(Event::Window { from, earlier })?;
         }
+        let mut scratch = Vec::new();
         for kept in self.entries.range(start..) {
-            replay_entry(kept.id, &kept.entry, &mut events);
+            replay_entry(kept.id, &kept.entry, &mut scratch);
+            for event in scratch.drain(..) {
+                emit(event)?;
+            }
         }
         match &self.slot {
             Slot::Empty => {}
             slot @ (Slot::Waiting { .. } | Slot::Held { .. }) => {
-                events.push(Event::Queue { slot: slot.clone() })
+                emit(Event::Queue { slot: slot.clone() })?;
             }
         }
         if let Some(conversation) = &self.conversation {
-            events.push(Event::Conversation {
+            emit(Event::Conversation {
                 conversation: conversation.clone(),
-            });
+            })?;
         }
-        events.push(Event::Turn {
+        emit(Event::Turn {
             state: self.turn.clone(),
-        });
-        events.push(Event::Agent {
+        })?;
+        emit(Event::Agent {
             state: self.agent.clone(),
-        });
+        })?;
         if !self.commands.is_empty() {
-            events.push(Event::Commands {
+            emit(Event::Commands {
                 commands: self.commands.clone(),
-            });
+            })?;
         }
         if !self.options.is_empty() {
-            events.push(Event::Options {
+            emit(Event::Options {
                 options: self.options.clone(),
-            });
+            })?;
         }
-        events
+        Ok(())
+    }
+}
+
+/// A log's replay to be serialized ([`Transcript::replay_ref`]): the JSON
+/// array of [`Transcript::replay`]'s events, byte for byte, written into
+/// whatever serializer the caller gives it.
+#[derive(Clone, Copy)]
+pub struct ReplayRef<'a> {
+    transcript: &'a Transcript,
+}
+
+impl serde::Serialize for ReplayRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(None)?;
+        self.transcript
+            .replay_each(0, &mut |event| seq.serialize_element(&event))?;
+        seq.end()
     }
 }
 
@@ -342,6 +388,36 @@ mod tests {
     use crate::fuzz::{XorShift, random_transcript};
     use crate::harness::*;
     use crate::*;
+
+    /// `agents-checkpoint-deltas` decision 8: the replay streamed from the
+    /// log (`replay_ref`) encodes byte for byte as the collected one, over
+    /// random logs, trimmed ones and windowed ones.
+    #[test]
+    fn replaying_by_reference_encodes_the_same_bytes_as_replay() {
+        let mut rng = XorShift::new(0x7a5c_0de1);
+        let same = |transcript: &Transcript| {
+            assert_eq!(
+                serde_json::to_vec(&transcript.replay_ref()).unwrap(),
+                serde_json::to_vec(&transcript.replay()).unwrap()
+            );
+        };
+        let (mut trimmed, mut windowed) = (0, 0);
+        for _ in 0..500 {
+            let transcript = random_transcript(&mut rng);
+            same(&transcript);
+            let mut cut = transcript.clone();
+            if cut.trim_to(cut.encoded_len() / 2).is_some() {
+                trimmed += 1;
+                same(&cut);
+            }
+            if let Some(from) = transcript.entries().nth(1).map(|(id, _)| id) {
+                windowed += 1;
+                same(&transcript.suffix(from));
+            }
+        }
+        assert!(trimmed > 50 && windowed > 50, "{trimmed} trimmed, {windowed} windowed");
+        same(&Transcript::new());
+    }
 
     #[test]
     fn a_replay_folds_back_to_the_same_log() {

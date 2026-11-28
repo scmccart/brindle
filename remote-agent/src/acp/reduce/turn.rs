@@ -10,9 +10,9 @@ use super::text::bound;
 use super::{Moment, Refused, RunKind, Step};
 
 impl Step<'_> {
-    pub(super) fn prompted(&mut self, result: Result<&Value, &RpcError>) {
+    pub(super) fn prompted(&mut self, result: Result<Value, &RpcError>) {
         match result {
-            Ok(result) => match self.s.rpc.dialect().prompt_result(result) {
+            Ok(result) => match self.s.rpc.dialect().prompt_result(&result) {
                 Ok(StopReason::Other { name }) => self.end_turn(Ending::Stop(StopReason::Other {
                     name: bound(clean(&name)),
                 })),

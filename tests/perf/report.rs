@@ -43,8 +43,30 @@ pub struct StreamResult {
     pub whole_ms: f64,
     /// `streamed_ms - whole_ms`: what streaming costs over one parse.
     pub difference_ms: f64,
+    /// Gate to exit, streamed in 32-byte pieces (`agent-tool-output`'s
+    /// third run, OpenSpec change `agents-checkpoint-deltas`); absent from
+    /// the other cases and from runs made before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub small_ms: Option<f64>,
     /// The step interval Brindle waits between seeing the last line and
     /// quitting, part of both times.
+    pub step_interval_ms: f64,
+}
+
+/// A tool-heavy agent turn (OpenSpec change `agents-checkpoint-deltas`,
+/// design.md decision 15): permission-gated tool calls and one long line,
+/// timed in milliseconds from the gate to Brindle's exit on a
+/// `--wait-for` of the turn's last message.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolHeavyResult {
+    /// The tool calls, each asking a permission the agent withdraws.
+    pub calls: u64,
+    /// The long line's length.
+    pub line_bytes: u64,
+    /// Gate to exit.
+    pub turn_ms: f64,
+    /// The step interval Brindle waits between seeing the last message and
+    /// quitting, part of `turn_ms`.
     pub step_interval_ms: f64,
 }
 
@@ -77,6 +99,9 @@ pub struct Summary {
     /// Absent from runs made before the attach case existed.
     #[serde(default)]
     pub attach: BTreeMap<String, AttachResult>,
+    /// Absent from runs made before the tool-heavy case existed.
+    #[serde(default)]
+    pub tool_heavy: BTreeMap<String, ToolHeavyResult>,
 }
 
 impl Summary {
@@ -223,16 +248,29 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
         if !out.is_empty() {
             out.push('\n');
         }
-        let mut rows = vec![["stream (ms)", "streamed", "one chunk", "difference", "chunks"].map(String::from).to_vec()];
+        // The 32-byte run's column shows only when a case has one.
+        let small = summary.stream.values().any(|result| result.small_ms.is_some());
+        let mut header = ["stream (ms)", "streamed", "one chunk", "difference", "chunks"].map(String::from).to_vec();
+        if small {
+            header.push("32 B pieces".into());
+        }
+        let mut rows = vec![header];
         for (case, result) in &summary.stream {
             let base = baseline.and_then(|b| b.stream.get(case));
-            rows.push(vec![
+            let mut row = vec![
                 case.clone(),
                 cell(result.streamed_ms, base.map(|b| b.streamed_ms), false),
                 cell(result.whole_ms, base.map(|b| b.whole_ms), false),
                 cell(result.difference_ms, base.map(|b| b.difference_ms), false),
                 result.chunks.to_string(),
-            ]);
+            ];
+            if small {
+                row.push(match result.small_ms {
+                    Some(ms) => cell(ms, base.and_then(|b| b.small_ms), false),
+                    None => "-".into(),
+                });
+            }
+            rows.push(row);
         }
         out.push_str(&table(&rows));
     }
@@ -248,6 +286,22 @@ pub fn render(summary: &Summary, baseline: Option<&Summary>) -> String {
                 cell(result.attach_ms, base.map(|b| b.attach_ms), false),
                 result.entries.to_string(),
                 format!("{:.1}", result.bytes as f64 / (1024.0 * 1024.0)),
+            ]);
+        }
+        out.push_str(&table(&rows));
+    }
+    if !summary.tool_heavy.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        let mut rows = vec![["tool-heavy (ms)", "gate to shown", "calls", "line MiB"].map(String::from).to_vec()];
+        for (case, result) in &summary.tool_heavy {
+            let base = baseline.and_then(|b| b.tool_heavy.get(case));
+            rows.push(vec![
+                case.clone(),
+                cell(result.turn_ms, base.map(|b| b.turn_ms), false),
+                result.calls.to_string(),
+                format!("{:.1}", result.line_bytes as f64 / (1024.0 * 1024.0)),
             ]);
         }
         out.push_str(&table(&rows));
@@ -292,7 +346,8 @@ pub fn self_test_render() -> Result {
         again.latency == current.latency
             && again.throughput == current.throughput
             && again.stream == current.stream
-            && again.attach == current.attach,
+            && again.attach == current.attach
+            && again.tool_heavy == current.tool_heavy,
         "round trip lost data"
     );
     // A summary from before the stream cases still loads, with none.

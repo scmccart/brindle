@@ -96,9 +96,9 @@ impl Step<'_> {
     /// The agent's answer to the list for `req`: the session's directory's
     /// conversations, bounded; or its error, a login it needs included,
     /// which a choosing or ready agent then waits for as for any request.
-    pub(super) fn listed(&mut self, req: RequestId, result: Result<&Value, &RpcError>) {
+    pub(super) fn listed(&mut self, req: RequestId, result: Result<Value, &RpcError>) {
         let result = match result {
-            Ok(value) => match self.s.rpc.dialect().list_result(value) {
+            Ok(value) => match self.s.rpc.dialect().list_result(&value) {
                 Ok(listing) => Ok(page(listing, &self.s.cwd)),
                 Err(_) => Err("the agent's answer to the list isn't one Brindle can read".to_owned()),
             },

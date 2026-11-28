@@ -70,7 +70,12 @@ impl Dialect {
         }
     }
 
-    pub fn initialize_result(self, result: &Value) -> Result<Initialized, BadParams> {
+    // The decoders that reach `serde_json::from_value` take their value by
+    // value, so it moves into the schema crate's types (OpenSpec change
+    // `agents-checkpoint-deltas`, decision 12); those that read by hand
+    // borrow it.
+
+    pub fn initialize_result(self, result: Value) -> Result<Initialized, BadParams> {
         match self {
             Self::V1 => v1::decode::initialize_result(result),
         }
@@ -89,7 +94,7 @@ impl Dialect {
         }
     }
 
-    pub fn new_session_result(self, result: &Value) -> Result<NewSession, BadParams> {
+    pub fn new_session_result(self, result: Value) -> Result<NewSession, BadParams> {
         match self {
             Self::V1 => v1::decode::new_session_result(result),
         }
@@ -97,7 +102,7 @@ impl Dialect {
 
     /// A continue's answer: the options it offers (OpenSpec change
     /// `agents-commands`, decision 12).
-    pub fn continued_result(self, how: Continued, result: &Value) -> Result<Offered, BadParams> {
+    pub fn continued_result(self, how: Continued, result: Value) -> Result<Offered, BadParams> {
         match self {
             Self::V1 => v1::decode::continued_result(how, result),
         }
@@ -145,13 +150,13 @@ impl Dialect {
         }
     }
 
-    pub fn session_update(self, params: &Value) -> Result<SessionUpdate, BadParams> {
+    pub fn session_update(self, params: Value) -> Result<SessionUpdate, BadParams> {
         match self {
             Self::V1 => v1::decode::session_update(params),
         }
     }
 
-    pub fn permission_request(self, params: &Value) -> Result<PermissionRequest, BadParams> {
+    pub fn permission_request(self, params: Value) -> Result<PermissionRequest, BadParams> {
         match self {
             Self::V1 => v1::decode::permission_request(params),
         }

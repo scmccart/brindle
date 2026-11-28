@@ -292,6 +292,37 @@ fn the_protocol_2_fields_and_relay_frames_reject_bad_values_without_panicking() 
 /// value of the wrong type, out of range or hostile: each is `Ok` or an
 /// `InvalidData` error. A `TRANSCRIPT` event that isn't an object and a
 /// `STDERR_TAIL` past its limit are errors, whatever else the frame holds.
+/// Random bytes, sometimes braced, through `JsonObject::new` and the
+/// packers of encoded events (`agents-checkpoint-deltas` decision 9): each
+/// is accepted or refused, never a panic, and what a packer accepts fits
+/// its frames.
+#[test]
+fn encoded_objects_and_their_packers_never_panic_on_random_bytes() {
+    let mut rng = XorShift::new(0x0b1e_c7ed);
+    for round in 0..2000 {
+        let objects: Vec<client::JsonObject> = (0..rng.below(6))
+            .filter_map(|_| {
+                let len = rng.below(if round % 50 == 0 { 300_000 } else { 64 });
+                let mut bytes = rng.bytes(len);
+                if rng.below(3) > 0 {
+                    bytes.insert(0, b'{');
+                    bytes.push(b'}');
+                }
+                client::JsonObject::new(bytes).ok()
+            })
+            .collect();
+        for frames in [
+            client::transcript_frames(rng.next() as u32, &objects),
+            client::page_frames(rng.next(), rng.next() as u32, &objects, rng.below(2) == 0),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(frames.iter().all(|frame| frame.payload.len() <= crate::MAX_FRAME_PAYLOAD_SIZE));
+        }
+    }
+}
+
 #[test]
 fn the_agent_messages_reject_bad_values_without_panicking() {
     let bad = [

@@ -1058,7 +1058,7 @@ mod tests {
                 "{:?}",
                 acp.transcript().agent()
             );
-            checkpoint::encode(&acp).unwrap()
+            checkpoint::encode(&acp).unwrap().bytes
         }
 
         struct Test {

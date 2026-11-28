@@ -49,13 +49,14 @@ use std::time::Instant;
 use common::Selection;
 use common::server::{Suite, private_dir};
 pub use common::Result;
-use report::{AttachResult, LatencyResult, StreamResult, Summary, ThroughputResult};
+use report::{AttachResult, LatencyResult, StreamResult, Summary, ThroughputResult, ToolHeavyResult};
 
 pub enum Measured {
     Latency(LatencyResult),
     Throughput(ThroughputResult),
     Stream(StreamResult),
     Attach(AttachResult),
+    ToolHeavy(ToolHeavyResult),
     Skip(String),
 }
 
@@ -103,6 +104,7 @@ fn cases() -> Vec<Case> {
         Case { name: "agent-markdown-stream", run: agent::markdown_stream },
         Case { name: "agent-attach-long", run: agent::attach_long },
         Case { name: "agent-tool-output", run: agent::tool_output },
+        Case { name: "agent-tool-heavy", run: agent::tool_heavy },
     ]
 }
 
@@ -256,6 +258,10 @@ fn main() {
                 println!("measured {} ({took:.0}s)", case.name);
                 summary.attach.insert(case.name.into(), result);
             }
+            Ok(Measured::ToolHeavy(result)) => {
+                println!("measured {} ({took:.0}s)", case.name);
+                summary.tool_heavy.insert(case.name.into(), result);
+            }
             Ok(Measured::Skip(why)) => println!("skipped  {}: {why}", case.name),
             Err(why) => {
                 println!("FAILED   {} ({took:.0}s): {why}", case.name);
@@ -326,6 +332,7 @@ fn self_test() -> i32 {
         ("agent stream", agent::self_test),
         ("agent attach", agent::self_test_attach),
         ("agent tool output", agent::self_test_tool_output),
+        ("agent tool heavy", agent::self_test_tool_heavy),
         ("fake agent lookup", common::fake_agent::self_test),
     ];
     let mut failed = 0;

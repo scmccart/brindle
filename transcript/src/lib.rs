@@ -62,8 +62,8 @@ pub use event::{
     ToolStatus, TurnState, clean, cleaned_len, item_pieces,
 };
 pub use fold::{Activity, FoldError, chunks, escaped_len};
-pub use output::Output;
-pub use page::{Fetched, PAGE_BYTES, Window};
+pub use output::{Output, OutputText};
+pub use page::{Fetched, PAGE_BYTES, ReplayRef, Window};
 
 /// An entry the log keeps, with its measure: its encoded length and
 /// [`ENTRY_FRAMING`].

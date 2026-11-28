@@ -86,7 +86,7 @@ pub use list::ListAnswer;
 pub use login::{AfterLogin, Login};
 pub use text::session_title;
 pub use tools::{MAX_OPEN_OUTPUTS, OpenOutput};
-pub(super) use tools::ToolBook;
+pub(super) use tools::{ToolBook, tool_index};
 
 #[cfg(test)]
 pub(super) use permission::pending_permissions;
@@ -139,13 +139,20 @@ pub(in crate::acp) struct Process {
 }
 
 impl Process {
-    /// A process whose stdout hasn't been read yet.
+    /// A new session's process, whose stdout hasn't been read yet.
     pub(in crate::acp) fn new() -> Self {
+        Self::starting_at(EntryId::FIRST)
+    }
+
+    /// A process whose first entry will be `epoch` (OpenSpec change
+    /// `agents-checkpoint-deltas`, decision 2): the log's next id when it
+    /// is respawned.
+    pub(in crate::acp) fn starting_at(epoch: EntryId) -> Self {
         Self {
             lines: Lines::new(),
             run: None,
             bad: None,
-            book: ToolBook::default(),
+            book: ToolBook::starting_at(epoch),
         }
     }
 }
@@ -1027,7 +1034,7 @@ impl Step<'_> {
             Message::Request { id, method, params } => {
                 self.flush_bad();
                 match self.s.rpc.dialect().request_kind(&method) {
-                    RequestKind::Permission => self.permission(id, &params),
+                    RequestKind::Permission => self.permission(id, params),
                     RequestKind::Unoffered => {
                         self.out
                             .stdin
@@ -1042,7 +1049,7 @@ impl Step<'_> {
             Message::Notification { method, params } => {
                 match self.s.rpc.dialect().notification_kind(&method) {
                     NotificationKind::SessionUpdate => {
-                        match self.s.rpc.dialect().session_update(&params) {
+                        match self.s.rpc.dialect().session_update(params) {
                             Ok(update) => {
                                 self.flush_bad();
                                 self.update(update);
@@ -1068,7 +1075,7 @@ impl Step<'_> {
             Message::Response { id, result } => {
                 self.flush_bad();
                 if let Some(purpose) = self.s.rpc.answered(&id) {
-                    self.response(purpose, Ok(&result));
+                    self.response(purpose, Ok(result));
                 }
             }
             Message::Error { id, error } => {
@@ -1217,7 +1224,9 @@ impl Step<'_> {
 
     // --- answers to the core's requests ---------------------------------
 
-    fn response(&mut self, purpose: Purpose, result: Result<&Value, &RpcError>) {
+    /// An answer to a request of ours, owned, so a decoder moves it
+    /// (`agents-checkpoint-deltas` decision 12).
+    fn response(&mut self, purpose: Purpose, result: Result<Value, &RpcError>) {
         match purpose {
             Purpose::Initialize => self.initialized(result),
             Purpose::NewSession => self.created(result),

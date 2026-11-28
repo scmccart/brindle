@@ -38,14 +38,22 @@ See proposal.md for why. The state this design starts from, at `5f335dc`:
 
 | Part | Kind | Crate, file |
 | --- | --- | --- |
-| Record shapes, `Written`, `encode`, `encode_segment`, `decode` and the delta fold | pure (`PURE_MODULES`) | `brindle-remote-agent`, `acp/checkpoint.rs` (after change 5: `checkpoint/{format,state}.rs`) |
-| `tool_epoch`, the derived tool index, the diff memo, the permission's call moved | pure reducer | `acp/reduce.rs` (after change 5: `reduce/tools.rs`, `ToolBook`) |
+| Record shapes, `Written`, `encode`, `encode_segment`, `decode` and the delta fold | pure (`PURE_MODULES`) | `brindle-remote-agent`: `acp/checkpoint/mod.rs` (`encode`, `encode_within`, `encode_segment`, `decode`, `decode_2`), `checkpoint/state.rs` (`state_fields`, `merged`, `restore`, `restore_lines`, `fold_log`), `checkpoint/format.rs` (`push_record`, `next_record`, `Unreadable`) |
+| `tool_epoch`, the derived tool index, the diff memo, the permission's call moved | pure reducer | `acp/reduce/tools.rs` (`ToolBook`, `add_tool`, `tool_content`), `reduce/mod.rs` (`Step::trim`), `reduce/lifecycle.rs` (`Step::respawn`), `reduce/permission.rs` (`Step::permission`) |
 | Owned `Dialect` arguments | pure codec | `acp/dialect.rs`, `acp/v1/decode.rs` |
 | `Stored::Known` carrying `Written`, and the appendability rules | pure policy | `server/core/policy.rs` |
 | Encoding events once, queueing sliced frames | shell (loop handlers) | `server/core/agents.rs`, `sessions.rs`, `holders.rs`, `clients.rs`, `server/conn.rs` |
 | `checkpoint_frames` and `SlicedFrame`; `JsonObject`, `transcript_frames` and `page_frames` | shared wire, pure | `brindle-remote-protocol`, `holder.rs`, `client.rs` |
-| `OutputText`, `Output::append`, `Transcript::replay_ref` | shared, pure | `brindle-transcript`, `lib.rs` (after change 5: `output.rs`, `page.rs`) |
+| `OutputText`, `Output::append`, `Transcript::replay_ref` | shared, pure | `brindle-transcript`: `output.rs` (`Output`, `append`), `fold.rs` (the `ToolOutput` arm, `Transcript::replay`) |
 | Readers of `Output::text` | app model and view helper | `src/agent/tool.rs`, `src/agent/model.rs` |
+
+**Sites as found at `ad696ca`** (task 1.1; the head of `refactor/agents-module-structure`, PR #157, before it merged, so changes 3, 4 and 5 and `agents-commands` are in):
+- Change 5 split the checkpoint into `checkpoint/{mod,format,state,adopt,harness}.rs`: `encode_within`, `encode_segment` and `decode_2` are in `mod.rs`, `state_fields`, `merged`, `restore` and `restore_lines` in `state.rs`, `push_record` and `FORMAT_1` in `format.rs`.
+- `Output::append` is in `transcript/src/output.rs`, and the fold's `Event::ToolOutput` arm in `transcript/src/fold.rs`.
+- `tools` and `outputs` are `ToolBook`'s (`reduce/tools.rs`), held as `Process.book` (`reduce/mod.rs`). `trim` (`reduce/mod.rs`) calls `ToolBook::forget_through`. `respawn` (`reduce/lifecycle.rs`) replaces the whole `Process` with `Process::new()`, so `tool_epoch` is set there, after the reset. `methods` stayed a top-level `AgentSession` field.
+- `raw` is in `v1/decode.rs`, `raw(value: Option<&Value>)`, with change 3's bounded writer `pretty_capped`/`Capped`.
+- Change 4's "agent gone" step is `Step::close_process(why, Closing)` (`reduce/lifecycle.rs`), which `end`, `respawn`, `restart_for_login`, `refuse` and `fail` call. It closes requests only; the process state is reset in `respawn` alone, and `Output` carries no "process changed" flag (Open Questions, 2).
+- `agents-commands`' state fields are `option_keys` (`AgentSession.keys`, one per held option, at most 32) and `modes` (`AgentSession.modes`, one value per mode option). Both are small under decision 4's rule and stay whole. `lists` and `chose` are flags. There is no `Busy` mark in the state.
 
 Every decision lives in a pure function or type (`fcis R1`). The handlers gather, call `checkpoint::encode*` and `policy::*`, and queue what comes back. No crate reference changes (`ports R1`, `R3`): `brindle-remote-protocol` learns nothing about transcripts. It packs opaque JSON objects, as it already carries them as opaque `Value`s.
 
@@ -64,7 +72,7 @@ A record without `tool_epoch` is `Unreadable::Field { name: "tool_epoch" }`. A c
 
 ### 2. The tool index is rebuilt from the log (`types R10`, `fcis R1`)
 
-`AgentSession` gains `tool_epoch: EntryId`: the first entry id that belongs to the running agent process. `AgentSession::starting` sets it to `EntryId::FIRST`. `respawn` sets it to `self.s.transcript.next_id()` where it clears `tools`. After change 4 that happens in the one "agent gone" step, and after change 5 in `ToolBook::clear`, which takes the next id.
+`ToolBook` (`reduce/tools.rs`) gains `tool_epoch: EntryId`: the first entry id that belongs to the running agent process. A new session's book starts at the first id. `respawn` (`reduce/lifecycle.rs`) replaces the whole `Process`, the book with it, and then sets the epoch to `self.s.transcript.next_id()`, through `Process::starting_at(next_id)`.
 
 The invariant: `tools` equals `{ call → id | the log keeps Entry::Tool { call, .. } at id, id ≥ tool_epoch }`. Three facts make it hold:
 - `add_tool` is the only insert, and it adds that entry.
@@ -107,7 +115,7 @@ A delta-shaped record's `lines` object gains an optional `from: u64`. The record
 | `outputs` | ≤ `MAX_OPEN_OUTPUTS` (64) × a line of ≤ `ITEM_LIMIT` (64 KiB), so ≤ 4 MiB | a patch: `{ terminal: open-output }` for each output added or changed since `Written.outputs`, and `{ terminal: null }` for each closed one; left out when none changed |
 | `tools` | — | never (decision 2) |
 
-The rule for a future field: a field bounded under 1 KiB in the typical case, and under 64 KiB at worst, is written whole. A larger one is written when it changed, or as a patch. This change records the rule in the module doc's format table. `agents-commands`' option keys, `Busy` mark and kept modes (at most 32 options) are small and stay whole. `agents-plans`' `dismissed` (up to 4 MiB) must be written when it changed.
+The rule for a future field: a field bounded under 1 KiB in the typical case, and under 64 KiB at worst, is written whole. A larger one is written when it changed, or as a patch. This change records the rule in the module doc's format table. `agents-commands`' fields as found at `ad696ca` are `option_keys` (a key per held option, at most 32) and `modes` (a value per mode option): both small, so they stay whole, left out when empty as today. `agents-plans`' `dismissed` (up to 4 MiB) must be written when it changed.
 
 The base writes `methods` and `outputs` whole, left out when empty, as today. Decoding a delta-shaped chain: `methods` absent in a segment keeps the previous value, and present replaces it; `outputs` patch entries set or remove keys in order. A `null` for a terminal the chain doesn't hold is `Unreadable::Field { name: "outputs" }`. `restore` then checks the final map as today: each entry names an `Output` item of a kept tool entry.
 
@@ -202,7 +210,7 @@ In `agent_apply` the events are encoded for the client first, then moved into `u
 
 `Output::append(&mut self, text) -> usize` pushes, works out `cut` on the visible text as today, and advances `start` by `cut` instead of draining. It returns the escaped length of the dropped bytes (`escaped_len` of that slice, computed before advancing) instead of a `String`. When `start` passes `ITEM_LIMIT` it compacts once (`buf.drain(..start)`, `start = 0`). That is a 64 KiB memmove at most once per 64 KiB appended, so an append is amortized O(delta).
 
-The fold's `Event::ToolOutput` arm uses the returned length in place of `escaped_len(&dropped)`, and its size arithmetic is otherwise unchanged. `encoded_len`, equality, serialization and every fold result are unchanged. The existing `output_appended_in_pieces_folds_as_appended_whole` and `output_appends_and_keeps_whole_lines_within_the_limit` hold, as does `fuzz.rs`' "appending `a` then `b` equals appending `a + b`" property. A new test appends 1 MiB in 32-byte pieces and checks that the buffer never exceeds 2 × `ITEM_LIMIT` plus a piece.
+`Output` and `append` are in `transcript/src/output.rs`; `OutputText` goes beside them. The fold's `Event::ToolOutput` arm (`transcript/src/fold.rs`) uses the returned length in place of `escaped_len(&dropped)`, and its size arithmetic is otherwise unchanged. `encoded_len`, equality, serialization and every fold result are unchanged. The existing `output_appended_in_pieces_folds_as_appended_whole` and `output_appends_and_keeps_whole_lines_within_the_limit` hold, as does `fuzz.rs`' "appending `a` then `b` equals appending `a + b`" property. A new test appends 1 MiB in 32-byte pieces and checks that the buffer never exceeds 2 × `ITEM_LIMIT` plus a piece.
 
 Readers: `src/agent/tool.rs` (`output.text.as_str()`, and `output.text.clone()` becomes `output.text.to_string()`), `src/agent/model.rs`'s dump (`{:?}` prints the same), `reduce.rs` and `checkpoint.rs` tests, and `fuzz.rs`. The open-output filter state in `reduce.rs` (`plain::State`) is unrelated.
 
@@ -240,7 +248,8 @@ In `v1/decode.rs`:
 - `tool_detail(taken: Map<String, Value>)` takes it by value;
 - `tool_item(item: Value)` and each location move into `from_value`;
 - `chunk(update: Value)` moves;
-- `raw(value: Option<Value>)` moves a string, and change 3's bounded writer keeps its own signature for the rest.
+- `raw(value: Option<Value>)` moves a string, and change 3's bounded writer (`pretty_capped`, as found) keeps its own signature for the rest;
+- `continued_result` reaches `resume_result` and `load_result`, which move too. `set_option_result` (`agents-commands`) reads by hand and keeps `&Value`.
 
 In `reduce.rs`, `message` passes `params` by value, and `response(purpose, Result<Value, &RpcError>)` and the per-purpose handlers take the owned result. `speaking` reads `auth_methods(&result)` before handing `result` to `initialize_result`.
 
@@ -291,4 +300,53 @@ Nothing to migrate by hand, and nothing is converted: a core with this change ad
 
 ## As built
 
-To be filled in by tasks 1.2, 7.3 and 7.4: the decision 7 test's written and added bytes before and after, and the three perf cases' numbers before and after against a baseline from the build before this change.
+**Commit read** (task 1.1): `ad696ca`, the head of `refactor/agents-module-structure` (PR #157) while it was still in CI, not `main`. It holds changes 3, 4 and 5 and `agents-commands`. The branch is rebased onto `main` once #157 merges; the sites above are as found there.
+
+### As built (before)
+
+Decision 7's test (task 1.2) on the unchanged code, release build:
+- It fails assertion 1 at segment 8, in the third turn (call 22): a segment of 1,844 bytes for 793 bytes of events, its `tools` map already 22 entries long.
+- With assertion 1 commented out (locally, not committed): **2,123,919,660 bytes written** for 13,072,007 added, in 11,018 records, no trims. The bound is 63,570,460 bytes, so it is about 33x over it and 162x what was added.
+
+The perf baseline (task 1.3), a release build of the unchanged code at `a713e328` (only the perf cases and the fake agent's `send-part` added), under `scripts/with-xvfb`: run `target-cd/tmp/perf/20261128T071449Z` (its `summary.toml` is kept with this change's task notes).
+
+| case | run | ms |
+| --- | --- | --- |
+| `agent-attach-long` | launch to shown | 2,594 |
+| `agent-tool-output` | streamed (4 KiB) | 2,258 |
+| `agent-tool-output` | whole | 2,254 |
+| `agent-tool-output` | small (32 B) | 2,211 |
+| `agent-tool-heavy` | gate to shown | 4,237 |
+
+Each includes the 1 s step interval before the quit.
+
+### As built (after)
+
+Decision 7's test (task 5.1), release build, at `877ffa0b`: it passes all three assertions. **32,264,203 bytes written** for 13,072,007 added, in 11,018 records, no trims: 2.5x what was added and half the bound of 63,570,460, against 2,123,919,660 before (66x less).
+
+The perf cases (task 7.4), release build at `eed667c6`, headless under `scripts/with-xvfb`, run `target-cd/tmp/perf/20261128T090343Z` against 1.3's `20261128T071449Z`. Each includes the 1 s step interval:
+
+| case | before (ms) | after (ms) |
+| --- | --- | --- |
+| `agent-attach-long` | 2,594 | 2,594 |
+| `agent-tool-output` streamed (256 × 4 KiB) | 2,258 | 2,251 |
+| `agent-tool-output` whole | 2,254 | 2,253 |
+| `agent-tool-output` small (32,768 × 32 B) | 2,211 | 2,207 |
+| `agent-tool-heavy` (3,000 calls, an 8 MiB line) | 4,237 | 2,248 |
+
+The tool-heavy turn takes 2 s less (47%), and now takes about what the other cases take (`agent-markdown-stream`: 2,270 against 2,268 before), mostly the step interval and the window's start. The others don't move: the attach is bounded by the page it replays, and the output runs by the client's fold, which `OutputText` makes O(delta) but which was never the limit at these sizes in a release build.
+
+### Flags
+
+1. **The base is #157's head, not `main`.** Task 1.1 asks for `main` after changes 3 to 5 merged; this branch starts at #157's head before its merge, so the sites were read there.
+2. **The fake agent gained `send-part`.** Its `send-raw` writes a whole line, line end included, so it can't write one line in pieces as tasks 1.3 and 6.1 assume. `send-part <text>` writes the text with no line end; a run of them and an empty `send-raw` make one long line. Its text is trimmed as every step's argument is, so the perf case's pieces are compact JSON of `z`s, which the self-test checks.
+3. **`agent-tool-heavy` sends its last message after the long line.** Task 1.3 puts the final message before the line, which would leave the 8 MiB line (B-4) outside the time measured. The case sends the calls, then the line, then the last message, so the time from the gate to the exit covers the line's checkpoints too.
+4. **The cost test's per-segment bound counts the events unmerged.** `merged` is private to the checkpoint module, so `Checkpointing` measures each event's `encoded_len` plus a comma, an upper bound of the merged events' length, and the partial line's gain as the smaller of its length and the stdout fed since the last checkpoint. It also keeps the holder's blob (the last base and its segments), for assertion 3.
+5. **`replay_ref` walks the replay instead of mirroring `Event`.** Decision 8's private `EventRef` mirror would be a second copy of `Event`'s serde shape (tags, renames, skips) kept in step by a test. Instead `replay_from` is one walker, `replay_each`, that hands each replay event to a closure: `replay()` collects them, and `ReplayRef`'s `Serialize` writes each into the sequence as it is made. Only one entry's events exist at a time (an entry's text chunks, or a tool's items), so the log is never copied whole, and the bytes are `replay()`'s by construction; the 500-transcript test (plus trimmed and windowed logs) still pins it. `SlicedFrame`'s head is 12 bytes (a session id and a `u64`), not 16, which is all a checkpoint frame's head holds.
+6. **The tool index is checked at every reducer step, and `add_tool` indexes only what the log took.** Besides the property test, the reducer tests' `Agent::step` asserts `tools == tool_index(log, tool_epoch)` after every step, as it already checks the client's fold. `add_tool` inserted the call even when its `Added` was refused by a faulted step, leaving a call naming an id the log never took (and the next entry could take it); it now inserts only an entry the log holds. This can't be shown failing through the reducer's inputs: a fault there is the step's oversized or unfoldable own event, which the bounds rule out, so the guard is kept as the invariant's statement rather than as a fix. Between tasks 3.2 and 4.2 the checkpoint wrote `tool_epoch` beside `tools` (only when past the first id, so the pinned bytes stayed), and `restore` checked the two agree.
+7. **The state is written field by field, not through a derived `StateOut`.** The helper has no `serde` dependency (it reaches `serde_json` through `brindle-remote-protocol`'s re-export), so it can't derive `Serialize`, and adding one is a new dependency. `state.rs`' `write_state` writes the object's keys itself (fixed names, no escaping needed) and each value through `serde_json::to_writer`: the small fields as `Value`s, the methods, the log (`ReplayRef`) and the merged events from the session. The order is fixed (`acp` … `modes`, then `log` or `events`); a nested `json!` object still follows `preserve_order`, as before. `Limited` doesn't fail a write past the limit: it counts the bytes and keeps none, so `TooLarge` still names the record's whole length, and `out` never passes the limit (`a_checkpoint_past_the_limit_is_refused_while_it_is_written`).
+8. **In a debug build the streamed serialization is slower, and it flipped a racy test.** `serde_json`'s `io::Write` serializer is instantiated in the helper crate, which a dev build compiles at opt-level 0 (only dependencies get 2), while `Value::to_string` runs inside `serde_json`: 500 KB of events take about 12 ms to stream against 0.7 ms through a `Value` in a debug build, and less than either in a release build. `checkpoints_are_appended_to_the_holders_base_and_adopted_as_one_blob` (a known flake, about 1 in 35) killed its core as soon as the client saw the first turn end, which the core sends before it writes that turn's checkpoint; with the slower debug encode it failed every run (the next core adopted an older checkpoint and a truncated tail). The race is fixed at its cause: the test sends the second prompt and waits for the agent to read it, so every checkpoint queued before it is in the holder, then kills the core and opens the reply's gate. 20 runs out of 20 pass after.
+9. **The decoder places a held line where the encoder does.** `LineMark.start` is `covers - len`, saturating, on both sides: a hand-built state (the 64 MiB test's) can hold a partial longer than its `covers`, and a delta after it is judged the same way it was written.
+10. **Two checks moved.** `restore`'s "each tool call names a tool entry" holds by construction now, so it is a `debug_assert!` and `Unreadable::Entry { name: "tools" }` is gone; and line bytes beside a partial that isn't collected are refused in any record (`StrayBytes`), not only in the last.
+11. **The checkpoint tests append across a restart.** The harness's `Stored` doesn't forget what is stored when the agent restarts, as the core does (`Agent::restarted`), so the random steps write deltas across respawns and exercise `LineMark`'s epoch guard; they pass. The core's write path (`write_agent_checkpoint`) moved to `Written` in the same commit as 4.2, since the crate doesn't build apart: `mem::take` of `unsaved` and `encode_segment` against `Stored::Known`'s `written`. Task 6.2's frames from slices came after (`2cb11532`).
+12. **Two of the three real-role tests can't fail on the earlier shell, and the long-line one needed a base to append to.** The old shell was correct, only costly: it wrote the whole partial line into each record, and its size rule then rewrote the checkpoint whole, so a final blob of one base read the same as the delta chain. `a_core_killed_while_a_long_line_arrives_applies_the_line_once` therefore first builds a 5 MiB log and restarts the core, so the next core's first checkpoint is a 5 MiB base and the line's checkpoints are appended to it; it then reads the holder's records and asserts they carry the line's bytes once each, in order, which fails on `5b86ab57` (3 MB for 1.25 MiB of line) and passes after. The tool-call and restart tests pin behaviour both shells have (the epoch rebuild and the whole first checkpoint), as the scenarios ask. To know the core has read 1 MiB of a line it hasn't ended, the long-line test waits for the core's log: each checkpoint that holds part of a line now logs its length (`session N: checkpointed with B bytes of a line still arriving`), which is rare, and the permission answered after it orders those checkpoints before the kill.
