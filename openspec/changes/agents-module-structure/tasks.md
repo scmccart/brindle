@@ -4,7 +4,7 @@ No behaviour changes. A **move** task is one commit: it moves code and its tests
 
 ## 1. Re-open the sites and take the baseline
 
-- [ ] 1.1 Re-read the cited sites on `main`, after `agents-commands` (PR #151) and changes 1–4 (`agents-client-state-fixes`, `agents-zone-focus-and-scroll`, `agents-event-bounds`, `agents-process-lifecycle`) have merged; if one hasn't, stop and wait for it (design decision 26). Under a dated "Re-read on main" note in design.md's Context, record for each table in decisions 2–8 and 17 the items that moved, were renamed or were added, and assign the additions by the tables' "Joins" column:
+- [x] 1.1 Re-read the cited sites on `main`, after `agents-commands` (PR #151) and changes 1–4 (`agents-client-state-fixes`, `agents-zone-focus-and-scroll`, `agents-event-bounds`, `agents-process-lifecycle`) have merged; if one hasn't, stop and wait for it (design decision 26). Under a dated "Re-read on main" note in design.md's Context, record for each table in decisions 2–8 and 17 the items that moved, were renamed or were added, and assign the additions by the tables' "Joins" column:
   - `remote-agent/src/acp/reduce.rs`, `checkpoint.rs`, `forms.rs`, `dialect.rs`, `v1/decode.rs`, `limits.rs` (change 3);
   - `remote-agent/src/server/core/{sessions,agents,clients,policy}.rs` (change 4's `Life::Restarting`, `lost_fate`; #151's `AgentSetOption`);
   - `transcript/src/lib.rs` (change 1's `clean`, change 3's bounds, #151's commands and options);
@@ -12,7 +12,9 @@ No behaviour changes. A **move** task is one commit: it moves code and its tests
   - `src/workspace.rs` 1456–1780 and `src/zone_view.rs` (login and zone-tree ranges).
 
   Decide Open Question 1 (where #151's reducer and model code go) and record it. Verify: `git log -1 --oneline origin/main` names the base the note was taken on.
-- [ ] 1.2 Take the baseline the checks compare against: list every `pub` item of `transcript/src/lib.rs` (`grep -nE '^pub (fn|struct|enum|const|type|mod|use)'`), and run `cargo test --workspace --locked` and `cargo clippy --locked --workspace --all-targets -- -D warnings` on the base. Verify: both pass on the base and the list is in the PR description's notes.
+  - Done: the note names `8081050` (`origin/main`) plus change 4 at `cd8a586`, its PR #156 still in CI and treated as merged (flagged). Open Question 1: `reduce/options.rs` and `model/options.rs`.
+- [x] 1.2 Take the baseline the checks compare against: list every `pub` item of `transcript/src/lib.rs` (`grep -nE '^pub (fn|struct|enum|const|type|mod|use)'`), and run `cargo test --workspace --locked` and `cargo clippy --locked --workspace --all-targets -- -D warnings` on the base. Verify: both pass on the base and the list is in the PR description's notes.
+  - Done: 59 `pub` items (named in `transcript/tests/public_paths.rs`, 2.1). Both pass on the base: `brindle` 1311 (2 ignored), `architecture` 51, `brindle-remote` 696, its integration tests 116 + 59 + 43 + 14 + 16 + 18, the fake agent 31, `brindle-remote-protocol` 146 + 4, `brindle-term-core` 202 + 9, `brindle-transcript` 73, `brindle-ui` 319.
 
 ## 2. Shared crate: `brindle-transcript`
 
