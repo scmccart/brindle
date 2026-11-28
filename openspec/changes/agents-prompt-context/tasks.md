@@ -56,24 +56,36 @@ Before starting, check that the changes this one builds on are implemented and a
 
 ## 4. Brindle's model
 
-- [ ] 4.1 Extend `src/agent/shared.rs`, `transcript.rs` and the client for the three messages and the references; verify with unit tests folding a user entry with attachments, a replay, and each message's encoding.
-- [ ] 4.2 Add to `src/agent/model.rs`: the draft, `attach` with its refusals (`TooMany`, `TooLong { bytes, limit }`, never shortening), `send_plan`, `backspace_at_start`, clearing, and keeping text and draft on any refusal in the sequence; verify with unit tests for each, including the count at its edge, a text of exactly the limit accepted and one byte over refused with both numbers in its message, the plan's order, a refusal of the second attach, and backspace with a selection or mid-text leaving the draft alone.
-- [ ] 4.3 Add the pure `drop_plan(paths, host)` and `dropped_text(name, bytes)`; verify with unit tests for a local, an SSH and a container host, a directory, invalid UTF-8, an empty file, and a file one byte over the limit.
-- [ ] 4.4 Add the conversation's attachment rows: a link's path; a text's row with `TextState::{Closed, Loading, Shown, Gone}`, the read request on opening, the text through `CodeBlock`, and the text dropped on closing; the queue row's count; verify with unit tests for each transition, an answer arriving after the row was closed, and a replayed message.
-- [ ] 4.5 Add `target_plan(agent_zones)` in `src/workspace.rs` (none, one, ask; most recently focused first); verify with unit tests for each and for zones in several tabs.
-- [ ] 4.6 Extend the dump (`describe`, `wait_text`) with `attachments=`, `--- attached`, `--- draft` and the queued count; verify with unit tests for each form, each row state and escaping.
+- [x] 4.1 Extend `src/agent/shared.rs`, `transcript.rs` and the client for the three messages and the references; verify with unit tests folding a user entry with attachments, a replay, and each message's encoding.
+  Done: 80be6f37; `session.rs`'s `an_attached_text_and_its_read_go_out_and_their_answers_come_back` and `model/attach.rs`'s `a_user_message_draws_its_attachments_under_its_text` (flag 15).
+- [x] 4.2 Add to `src/agent/model.rs`: the draft, `attach` with its refusals (`TooMany`, `TooLong { bytes, limit }`, never shortening), `send_plan`, `backspace_at_start`, clearing, and keeping text and draft on any refusal in the sequence; verify with unit tests for each, including the count at its edge, a text of exactly the limit accepted and one byte over refused with both numbers in its message, the plan's order, a refusal of the second attach, and backspace with a selection or mid-text leaving the draft alone.
+  Done: 80be6f37, in `src/agent/model/attach.rs` (flag 16); `PromptSent` records the attachments and `taken` compares them.
+- [x] 4.3 Add the pure `drop_plan(paths, host)` and `dropped_text(name, bytes)`; verify with unit tests for a local, an SSH and a container host, a directory, invalid UTF-8, an empty file, and a file one byte over the limit.
+  Done: 80be6f37; `drop_plan(paths, local)` takes whether the agent runs here, since SSH and container hosts read alike, and `dropped_text` takes the file's size beside its first bytes.
+- [x] 4.4 Add the conversation's attachment rows: a link's path; a text's row with `TextState::{Closed, Loading, Shown, Gone}`, the read request on opening, the text through `CodeBlock`, and the text dropped on closing; the queue row's count; verify with unit tests for each transition, an answer arriving after the row was closed, and a replayed message.
+  Done: 80be6f37; each row a `BlockBody::Attached` part of the message's bubble (flag 17).
+- [x] 4.5 Add `target_plan(agent_zones)` in `src/workspace.rs` (none, one, ask; most recently focused first); verify with unit tests for each and for zones in several tabs.
+  Done: 80be6f37, in the pure `src/workspace/targets.rs` (`PURE_MODULES`), with `output_name`.
+- [x] 4.6 Extend the dump (`describe`, `wait_text`) with `attachments=`, `--- attached`, `--- draft` and the queued count; verify with unit tests for each form, each row state and escaping.
+  Done: 80be6f37; a gone row's line adds `why="…"`.
 
 ## 5. brindle-ui
 
-- [ ] 5.1 Add `PromptInput::set_attachments` and the row (icon, name with an ellipsis, detail, remove mark; no keyboard stop; a press on the mark asks the owner with the key); verify with component tests that `row_stops` is unchanged, a long name is cut, and the press reports its key; add it to the gallery.
+- [x] 5.1 Add `PromptInput::set_attachments` and the row (icon, name with an ellipsis, detail, remove mark; no keyboard stop; a press on the mark asks the owner with the key); verify with component tests that `row_stops` is unchanged, a long name is cut, and the press reports its key; add it to the gallery.
+  Done: c449d11d, with the gallery check `prompt-input-attachments-add-no-stops` and a listed difference in `ui/README.md`.
 
 ## 6. The zone and the terminal
 
-- [ ] 6.1 Wire the draft into `src/agent/view.rs`: the row from the model, backspace at the start, the remove mark, running `send_plan` on submit, refusals beside the input and on the notice line.
-- [ ] 6.2 Add `agent_attach_file` ("Attach File…", a palette prompt) and `agent_clear_attachments` ("Clear Attachments") to `ACTIONS`, handled only by `AgentView`, the second listed only with attachments; verify with unit tests for the palette's listing.
-- [ ] 6.3 Handle files dropped on an agent zone: `drop_plan`, links attached at once, files for a remote agent read on a background task (at most `ATTACHMENT_TEXT` + 1 bytes) and passed to `dropped_text`, each refusal on the notice line; the prompt input highlighted while files hover. Nothing is read on the UI thread (`process R13`).
-- [ ] 6.4 Add `send_last_output_to_agent` to `ACTIONS`, handled by `TerminalView` (listed after a prompt mark, as Copy Last Command Output is, and taking the same text with `\n` line ends), which hands the text and its name to the workspace; the workspace runs `target_plan`, opens the list when asked, attaches, activates the tab and focuses the prompt input; verify with unit tests for the listing rule, the names (`cargo test`, `output from TITLE`), and nothing attached when the copy command would copy nothing.
-- [ ] 6.5 Draw the conversation's attachment rows and the queue row's count.
+- [x] 6.1 Wire the draft into `src/agent/view.rs`: the row from the model, backspace at the start, the remove mark, running `send_plan` on submit, refusals beside the input and on the notice line.
+  Done: bb17064c; backspace is a capture listener on `TextInputBackspace`, and the remove mark names its item by a `DraftKey` (flag 18).
+- [x] 6.2 Add `agent_attach_file` ("Attach File…", a palette prompt) and `agent_clear_attachments` ("Clear Attachments") to `ACTIONS`, handled only by `AgentView`, the second listed only with attachments; verify with unit tests for the palette's listing.
+  Done: bb17064c, `PaletteFacts::agent_attachments`; the prompt is the window's (`AgentAsk::AttachFile`).
+- [x] 6.3 Handle files dropped on an agent zone: `drop_plan`, links attached at once, files for a remote agent read on a background task (at most `ATTACHMENT_TEXT` + 1 bytes) and passed to `dropped_text`, each refusal on the notice line; the prompt input highlighted while files hover. Nothing is read on the UI thread (`process R13`).
+  Done: bb17064c, `Agent::drop_paths`; the directory lookup is on the background task too (flag 19). A drop can't be driven, so it is a manual check (8.4).
+- [x] 6.4 Add `send_last_output_to_agent` to `ACTIONS`, handled by `TerminalView` (listed after a prompt mark, as Copy Last Command Output is, and taking the same text with `\n` line ends), which hands the text and its name to the workspace; the workspace runs `target_plan`, opens the list when asked, attaches, activates the tab and focuses the prompt input; verify with unit tests for the listing rule, the names (`cargo test`, `output from TITLE`), and nothing attached when the copy command would copy nothing.
+  Done: bb17064c, `Terminal::last_output_to_send` and `workspace/send_output.rs`; the list is a palette of its own (`PaletteRole::AgentTarget`, flag 20).
+- [x] 6.5 Draw the conversation's attachment rows and the queue row's count.
+  Done: 80be6f37 (`attached_element`, the queue row's `next · 2 attachments`).
 
 ## 7. End-to-end cases (fake ACP agent)
 
