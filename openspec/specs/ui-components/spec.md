@@ -463,6 +463,22 @@ A message scroller SHALL show a list of items of different heights, scrolled to 
 - **WHEN** the user scrolls a message scroller up and an item is added at the end
 - **THEN** the items in view don't move, and the scroll button shows
 
+#### Scenario: The item at the top grows
+- **WHEN** a message scroller is scrolled away with an item's middle at the view's top, and the owner replaces that item with a taller one
+- **THEN** the item's lines in view don't move
+
+#### Scenario: The item at the top shrinks above the view
+- **WHEN** a message scroller is scrolled away 400 pixels into an item, and the owner replaces that item with one 100 pixels tall
+- **THEN** the item after it is at the view's top
+
+#### Scenario: Items inserted at the start
+- **WHEN** a message scroller, at its end or scrolled away with its top row out of view, has items inserted before its first item
+- **THEN** the items in view don't move, and the owner learns whether the top row is in view only from the next frame drawn
+
+#### Scenario: Every item measured again
+- **WHEN** a message scroller is scrolled away with an item's middle at the view's top, and the owner has every item measured again after their text size doubled
+- **THEN** that item is still at the view's top, at the same fraction of its height, and the items above and below have their new heights as they scroll into view
+
 ### Requirement: Messages
 A message SHALL show one turn's text in a bubble, aligned to the end for the person and to the start for the other side, the person's in the muted colours and the other's on the card. The other side's bubble SHALL fill the width of its row. The person's bubble SHALL be as wide as its text, up to four fifths of the row. A message drawn in parts SHALL give every part the same width, so its parts form one bubble with straight edges. A message SHALL keep its text's line breaks and wrap long lines, and SHALL be able to carry actions shown while the pointer is over it.
 
@@ -720,3 +736,18 @@ Given footer items, a prompt input SHALL show them under its textarea as small l
 #### Scenario: Tab skips them
 - **WHEN** the textarea has focus and the user presses tab
 - **THEN** focus doesn't land on a footer item
+
+### Requirement: Revealing an item in a message scroller
+The owner SHALL be able to ask a message scroller to reveal an item. An item wholly in view SHALL stay where it is. Otherwise the scroller SHALL scroll the least distance that shows it whole, or its top when it is taller than the view, measured from what the view showed last, and SHALL follow its end again when that shows its end.
+
+#### Scenario: Above the view
+- **WHEN** a message scroller is at its end and the owner asks it to reveal an item above the view
+- **THEN** that item's top is at the view's top, and the scroll button shows
+
+#### Scenario: Already in view
+- **WHEN** the owner asks a message scroller to reveal an item that is wholly in view
+- **THEN** nothing in view moves
+
+#### Scenario: The last item
+- **WHEN** a message scroller is scrolled away and the owner asks it to reveal its last item, which fits in the view
+- **THEN** the last item's end is at the view's bottom, and the scroller follows its end again

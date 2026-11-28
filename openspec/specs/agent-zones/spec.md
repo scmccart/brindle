@@ -248,6 +248,26 @@ The conversation SHALL scroll, and SHALL stay at its end while new text arrives 
 - **WHEN** the user has scrolled up to the top of the entries the zone holds, and earlier entries are loaded above them
 - **THEN** the lines in view stay put, and the earlier entries are above them
 
+#### Scenario: Reading a code block while it streams
+- **WHEN** the agent streams a code block longer than the zone, and the user scrolls up into its middle while it still grows
+- **THEN** the lines of the code block in view stay put as more lines arrive below them
+
+#### Scenario: Reading a thought while it streams
+- **WHEN** the user has scrolled the middle of a streaming thought to the top of the view
+- **THEN** the lines of the thought in view stay put as it grows
+
+#### Scenario: Reading a command's output while it runs
+- **WHEN** the user has scrolled the middle of an open tool call row's command output to the top of the view while the command runs
+- **THEN** the lines of the output in view stay put as output arrives
+
+#### Scenario: A config reload while reading back
+- **WHEN** the user has scrolled up and the config is reloaded, or the settings dialog previews a theme
+- **THEN** the lines in view stay put
+
+#### Scenario: A zoom while reading back
+- **WHEN** the user has scrolled up and zooms in or out
+- **THEN** the entry that was at the top of the view is still at its top, at the same place in its text, and nothing jumps as other entries scroll into view
+
 ### Requirement: Keyboard path through an agent zone
 An agent zone SHALL be operable from the keyboard alone. Tab and shift-tab SHALL move focus among the prompt input, the queue row's buttons while it shows, the login row's method buttons or its "Cancel login" button while it shows, the buttons of pending permission rows, and the stop button while a turn runs, in that order and wrapping, and SHALL NOT leave the zone. Keyboard focus SHALL go to the prompt input when the zone is focused.
 
@@ -834,6 +854,10 @@ When an agent session has entries before the oldest one its zone holds, the conv
 - **WHEN** a zone is restored on a long conversation the agent titled near its start
 - **THEN** the zone's title and its tab's title are the conversation's title before any earlier entry is fetched
 
+#### Scenario: A page that arrives in a hidden tab
+- **WHEN** an agent zone showing the "Earlier messages" item has fetched a page, and the user switches to another tab before it arrives
+- **THEN** the page is added and no further page is fetched until the zone is shown again and the item is still in view
+
 ### Requirement: Tool call details
 An open tool call row SHALL show its detail below its line: the tool call's content items in the agent's order, then its locations as paths with their lines. Raw input and raw result SHALL be shown, as text, only when the tool call has no content items. A text item SHALL be rendered as agent messages are. Where content was left out, the detail SHALL say how much.
 
@@ -1303,3 +1327,53 @@ The `agent_next_mode` action SHALL ask the server to set the session's mode opti
 #### Scenario: No mode option
 - **WHEN** the session has no option of category mode
 - **THEN** the command palette doesn't list Next Agent Mode
+
+### Requirement: A pointer press keeps focus in the zone
+A pointer press of any button in an agent zone on anything that doesn't take focus itself (message text, a thought's label, a tool call row, a message's copy button, the "Earlier messages" item, the jump-to-end button, the space between them) SHALL put keyboard focus in the zone's prompt input. A press on a control that takes focus (the prompt input, a button of a permission row, the login row, the queue row, the stop button) SHALL give focus to that control.
+
+#### Scenario: A press on a message
+- **WHEN** the prompt input has focus and the user presses on the text of an agent message
+- **THEN** the prompt input still has focus, and typed text goes into it
+
+#### Scenario: A press on a thought's label
+- **WHEN** the prompt input has focus and the user presses a closed thought's label
+- **THEN** the thought opens and the prompt input still has focus
+
+#### Scenario: A press on a tool call row
+- **WHEN** the prompt input has focus and the user presses the line of a tool call row that opens
+- **THEN** the row opens and the prompt input still has focus
+
+#### Scenario: A press on a message's copy button
+- **WHEN** the prompt input has focus and the user presses an agent message's copy button
+- **THEN** the clipboard holds the message's Markdown source, and the prompt input still has focus
+
+#### Scenario: From a permission button to the text
+- **WHEN** a permission row's `Reject` button has focus and the user presses on a message's text
+- **THEN** the prompt input has focus
+
+#### Scenario: Escape after a press
+- **WHEN** a turn is running, the user presses on a message's text, then presses escape
+- **THEN** the turn ends as cancelled
+
+#### Scenario: A press in an inactive zone
+- **WHEN** a tab holds a terminal zone with focus and an agent zone, and the user presses on a message's text in the agent zone
+- **THEN** the agent zone is the active zone and its prompt input has focus
+
+#### Scenario: A press on a permission button
+- **WHEN** the prompt input has focus and the user presses a pending permission row's `Reject` button
+- **THEN** the agent receives `Reject`
+
+### Requirement: A focused permission button is in view
+When keyboard focus moves with tab or shift-tab onto a button of a pending permission row that isn't wholly in view, the conversation SHALL scroll the least distance that shows the row, its top when the row is taller than the view. When a permission button has focus and the user scrolls its row wholly out of view, focus SHALL go back to the prompt input.
+
+#### Scenario: Tab to a request below the view
+- **WHEN** the user has scrolled up, a permission request arrives below the view, and the user presses tab in the prompt input
+- **THEN** the conversation scrolls to show the request's row with its `Reject` button focused, and enter answers `Reject`
+
+#### Scenario: A request already in view
+- **WHEN** a pending permission row is wholly in view and the user tabs onto its button
+- **THEN** the conversation doesn't scroll
+
+#### Scenario: Scrolled away from a focused button
+- **WHEN** a permission row's button has focus and the user scrolls the row out of view with the wheel
+- **THEN** the prompt input has focus, and the request stays pending

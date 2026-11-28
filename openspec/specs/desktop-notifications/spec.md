@@ -94,7 +94,7 @@ The `[notifications]` table SHALL enable or disable each source with `bell`, `os
 - **THEN** no notification appears, and the tab still shows its status dot
 
 ### Requirement: Rate limits
-Notifications SHALL be rate limited: at most one bell notification per tab every 5 seconds; per tab, at most 3 program (OSC) notifications at once, then one every 2 seconds; across all tabs, at most 10 at once, then one every 2 seconds. Notifications over a limit SHALL be dropped. A tab's bell notification SHALL replace its previous one instead of adding another.
+Notifications SHALL be rate limited: at most one bell notification per tab every 5 seconds; per tab, at most 3 program (OSC) notifications at once, then one every 2 seconds; per tab, apart from those, at most 3 agent notifications at once, then one every 2 seconds; across all tabs, at most 10 at once, then one every 2 seconds. Notifications over a limit SHALL be dropped. A tab's bell notification SHALL replace its previous one instead of adding another.
 
 #### Scenario: Bell storm
 - **WHEN** a background tab rings the bell 100 times within a second
@@ -103,6 +103,10 @@ Notifications SHALL be rate limited: at most one bell notification per tab every
 #### Scenario: Notification loop
 - **WHEN** a background tab prints 50 OSC 9 messages within a second
 - **THEN** three notifications appear
+
+#### Scenario: An agent beside a noisy terminal
+- **WHEN** a background tab holds a terminal zone that prints three OSC 9 messages within a second, and an agent zone whose agent then asks permission
+- **THEN** four notifications appear, the last titled for the agent's permission
 
 ### Requirement: Delivery never blocks the window
 Notifications SHALL be sent without blocking the window: on Linux to the desktop's freedesktop notification service, and on Windows as toast notifications shown under Brindle's name and icon. If notifications can't be delivered, because there is no notification service or because the system or the user has turned Brindle's notifications off, they SHALL be dropped with a logged warning and the terminal SHALL keep working.
@@ -286,7 +290,7 @@ A notification raised with `c=1` SHALL, when it closes for any reason (dismissed
 - **THEN** one notification titled `Done — <tab title>` appears, with Brindle's own icon
 
 ### Requirement: Agent notifications
-An agent zone whose status becomes `blocked`, `done` or `error` from another status SHALL raise a desktop notification, subject to the focus rule and the program rate limits. Its title SHALL be the zone's profile name, followed by ` needs permission` for a request, then ` — <zone title>` when the zone's title differs from the profile's name, then ` — <tab title>` when the tab has a manual title that is neither. Its body SHALL be the request's text, `Done`, or the failure's message. Replayed conversations SHALL NOT notify.
+An agent zone whose status becomes `blocked`, `done` or `error` from another status SHALL raise a desktop notification, subject to the focus rule and the agent rate limits. Its title SHALL be the zone's profile name, followed by ` needs permission` for a request, then ` — <zone title>` when the zone's title differs from the profile's name, then ` — <tab title>` when the tab has a manual title that is neither. Its body SHALL be the request's text, `Done`, or the failure's message. Replayed conversations SHALL NOT notify.
 
 #### Scenario: Permission in a background tab
 - **WHEN** the agent of profile `Fake`, in a background tab with no manual title and a zone the agent hasn't named, asks `Run cargo test?`
