@@ -32,6 +32,11 @@ fn spawn(ctx: &Ctx, label: &str, args: &[&str]) -> Result<Child> {
 /// Starts Brindle with `config` (written as `<label>-config.toml`); its
 /// stderr goes to `<label>.log`.
 pub fn spawn_with(ctx: &Ctx, label: &str, config: &str, args: &[&str]) -> Result<Child> {
+    spawn_env(ctx, label, config, args, &[])
+}
+
+/// [`spawn_with`], with `env` set for Brindle after the isolation.
+pub fn spawn_env(ctx: &Ctx, label: &str, config: &str, args: &[&str], env: &[(&str, &str)]) -> Result<Child> {
     let config_path = ctx.dir.join(format!("{label}-config.toml"));
     std::fs::write(&config_path, config).map_err(|e| e.to_string())?;
     let log = std::fs::File::create(ctx.dir.join(format!("{label}.log"))).map_err(|e| e.to_string())?;
@@ -44,6 +49,7 @@ pub fn spawn_with(ctx: &Ctx, label: &str, config: &str, args: &[&str]) -> Result
         &Isolation { config: &config_path, state_dir: &state, server_dir: &ctx.server_dir, display: &ctx.display },
     );
     command
+        .envs(env.iter().copied())
         .args(args)
         .stdout(Stdio::piped())
         .stderr(log)
@@ -52,7 +58,7 @@ pub fn spawn_with(ctx: &Ctx, label: &str, config: &str, args: &[&str]) -> Result
 }
 
 /// Waits for Brindle to exit, killing it after `limit`. Returns its stdout.
-fn wait(mut child: Child, label: &str, limit: Duration) -> Result<String> {
+pub fn wait(mut child: Child, label: &str, limit: Duration) -> Result<String> {
     let deadline = Instant::now() + limit;
     while child.try_wait().map_err(|e| e.to_string())?.is_none() {
         if Instant::now() > deadline {

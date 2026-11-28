@@ -1,7 +1,8 @@
 //! Opt-in performance suite: keystroke latency (`--latency-bench`) and
 //! vtebench throughput, in a local shell tab, a Markdown reply streamed
 //! into an agent zone by the fake ACP agent, a long agent conversation
-//! attached again, and a command's output streamed into a tool call's row.
+//! attached again, a command's output streamed into a tool call's row, and
+//! a shell's key echo beside an agent zone that is idle or streaming.
 //! It reports numbers and never fails on them.
 //!
 //! ```sh
@@ -105,6 +106,8 @@ fn cases() -> Vec<Case> {
         Case { name: "agent-attach-long", run: agent::attach_long },
         Case { name: "agent-tool-output", run: agent::tool_output },
         Case { name: "agent-tool-heavy", run: agent::tool_heavy },
+        Case { name: "agent-latency-quiet", run: agent::latency_quiet },
+        Case { name: "agent-latency-trickle", run: agent::latency_trickle },
     ]
 }
 
@@ -333,6 +336,7 @@ fn self_test() -> i32 {
         ("agent attach", agent::self_test_attach),
         ("agent tool output", agent::self_test_tool_output),
         ("agent tool heavy", agent::self_test_tool_heavy),
+        ("agent latency", agent::self_test_latency),
         ("fake agent lookup", common::fake_agent::self_test),
     ];
     let mut failed = 0;

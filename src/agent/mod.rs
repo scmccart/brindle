@@ -1166,6 +1166,7 @@ impl Agent {
     /// The user closed the zone: the session ends (`CLOSE`). Once is
     /// enough.
     pub fn close(&mut self) {
+        self.log_renders();
         if let Hold::Open(requests) = std::mem::replace(&mut self.hold, Hold::Left) {
             requests.close();
         }
@@ -1175,11 +1176,22 @@ impl Agent {
     /// tab's `layout` (every agent session is kept: there is no agent
     /// `-e`). Done explicitly, never in a drop (`process R16`).
     pub fn quit_with(&mut self, layout: Option<serde_json::Value>) {
+        self.log_renders();
         if let Hold::Open(requests) = std::mem::replace(&mut self.hold, Hold::Left) {
             match self.model.leave_on_quit() {
                 Leaving::Close => requests.close(),
                 Leaving::Detach => requests.detach_with(layout),
             }
+        }
+    }
+
+    /// Logs how much the zone rendered (OpenSpec change
+    /// `agents-absorb-cost`, decision 4), once, when it is left: the perf
+    /// suite reads the line.
+    fn log_renders(&self) {
+        if !matches!(self.hold, Hold::Left) {
+            let stats = self.model.render_stats();
+            log::debug!("agent renders={} bytes={}", stats.renders, stats.bytes);
         }
     }
 
