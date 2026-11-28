@@ -55,7 +55,7 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 3. Pure reducer and codec: the tool epoch, the diff memo, owned arguments
 
-- [ ] 3.1 Write the tests first in `remote-agent/src/acp/reduce.rs` (or `reduce/tools.rs`) and watch them fail (`cargo test -p brindle-remote-agent acp::reduce`):
+- [x] 3.1 Write the tests first in `remote-agent/src/acp/reduce.rs` (or `reduce/tools.rs`) and watch them fail (`cargo test -p brindle-remote-agent acp::reduce`):
   - `the_tool_index_is_always_the_logs_tool_entries_from_the_epoch`: a property over 300 seeded runs of 60 random steps (tool calls with repeated ids, updates, permissions, trims forced by long chunks, exits and restarts by `Input::Restart`), asserting `s.tools == tool_index(&s.transcript, s.tool_epoch)` after every step.
   - `a_restart_moves_the_tool_epoch_past_the_earlier_agents_entries`.
   - `the_memo_hands_back_the_kept_diff_only_for_the_same_path_and_texts_at_the_same_item`: tests the pure lookup `DiffMemo::reused(entry, index, digest, old) -> Option<ToolItem>` directly. There is no counter or seam around `diff::hunks` (`ports R6`).
@@ -64,12 +64,17 @@ Each group writes its tests first and watches them fail before the code they che
   - `the_diff_memo_forgets_trimmed_entries_and_everything_at_a_restart`.
   - `a_restored_session_repeating_a_diff_emits_nothing`: decode a checkpoint, so the memo is empty, then repeat the diff.
   - The existing `a_permissions_tool_call_brings_its_content_but_never_its_title` and `a_permission_requests_title_falls_back_to_its_tool_calls` must stay green across the move of the call.
-- [ ] 3.2 Implement `tool_epoch`, `tool_index`, `DiffMemo` (always-equal `PartialEq`, documented as design 11 says), the memo's use in `tool_content`, its pruning in `trim` and in the respawn or "agent gone" step, and the permission's call moved (design 2, 11). Verify with 3.1 and the whole `acp::reduce` module.
-- [ ] 3.3 Make `Dialect`'s decoders take owned values (design 12): `dialect.rs`'s signatures, `v1/decode.rs`'s `split`, `tool_detail`, `tool_item`, `chunk`, locations and `raw`, and the reducer's `message`, `response` and per-purpose handlers. Add `v1/decode.rs` tests:
+
+  Done: in `reduce/tools.rs`, failing to build first (no `tool_epoch`, `tool_index`, `DiffMemo`); the harness's `Agent::step` also asserts the index after every step of every reducer test (flag 6).
+- [x] 3.2 Implement `tool_epoch`, `tool_index`, `DiffMemo` (always-equal `PartialEq`, documented as design 11 says), the memo's use in `tool_content`, its pruning in `trim` and in the respawn or "agent gone" step, and the permission's call moved (design 2, 11). Verify with 3.1 and the whole `acp::reduce` module.
+  Done: 3011cc7b; `add_tool` indexes only an entry the log took, and the checkpoint carries the epoch until 4.2 (flag 6); 447 `acp::` tests pass.
+- [x] 3.3 Make `Dialect`'s decoders take owned values (design 12): `dialect.rs`'s signatures, `v1/decode.rs`'s `split`, `tool_detail`, `tool_item`, `chunk`, locations and `raw`, and the reducer's `message`, `response` and per-purpose handlers. Add `v1/decode.rs` tests:
   - `a_tool_update_moved_into_the_decoder_keeps_every_field`;
   - `a_permission_request_moved_into_the_decoder_keeps_its_call_and_options`.
 
   Verify with `cargo test -p brindle-remote-agent acp::` and `cargo test -p brindle --test architecture` (`acp_versions_stay_in_their_modules`).
+
+  Done: 5a71638a; 449 `acp::` and 53 architecture tests pass. An update's kind and an unknown item's type are copied out before the value moves, a few bytes each.
 
 ## 4. Pure checkpoint: the delta shape, earlier checkpoints refused, one buffer
 
