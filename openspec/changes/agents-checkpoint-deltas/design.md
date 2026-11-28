@@ -38,14 +38,22 @@ See proposal.md for why. The state this design starts from, at `5f335dc`:
 
 | Part | Kind | Crate, file |
 | --- | --- | --- |
-| Record shapes, `Written`, `encode`, `encode_segment`, `decode` and the delta fold | pure (`PURE_MODULES`) | `brindle-remote-agent`, `acp/checkpoint.rs` (after change 5: `checkpoint/{format,state}.rs`) |
-| `tool_epoch`, the derived tool index, the diff memo, the permission's call moved | pure reducer | `acp/reduce.rs` (after change 5: `reduce/tools.rs`, `ToolBook`) |
+| Record shapes, `Written`, `encode`, `encode_segment`, `decode` and the delta fold | pure (`PURE_MODULES`) | `brindle-remote-agent`: `acp/checkpoint/mod.rs` (`encode`, `encode_within`, `encode_segment`, `decode`, `decode_2`), `checkpoint/state.rs` (`state_fields`, `merged`, `restore`, `restore_lines`, `fold_log`), `checkpoint/format.rs` (`push_record`, `next_record`, `Unreadable`) |
+| `tool_epoch`, the derived tool index, the diff memo, the permission's call moved | pure reducer | `acp/reduce/tools.rs` (`ToolBook`, `add_tool`, `tool_content`), `reduce/mod.rs` (`Step::trim`), `reduce/lifecycle.rs` (`Step::respawn`), `reduce/permission.rs` (`Step::permission`) |
 | Owned `Dialect` arguments | pure codec | `acp/dialect.rs`, `acp/v1/decode.rs` |
 | `Stored::Known` carrying `Written`, and the appendability rules | pure policy | `server/core/policy.rs` |
 | Encoding events once, queueing sliced frames | shell (loop handlers) | `server/core/agents.rs`, `sessions.rs`, `holders.rs`, `clients.rs`, `server/conn.rs` |
 | `checkpoint_frames` and `SlicedFrame`; `JsonObject`, `transcript_frames` and `page_frames` | shared wire, pure | `brindle-remote-protocol`, `holder.rs`, `client.rs` |
-| `OutputText`, `Output::append`, `Transcript::replay_ref` | shared, pure | `brindle-transcript`, `lib.rs` (after change 5: `output.rs`, `page.rs`) |
+| `OutputText`, `Output::append`, `Transcript::replay_ref` | shared, pure | `brindle-transcript`: `output.rs` (`Output`, `append`), `fold.rs` (the `ToolOutput` arm, `Transcript::replay`) |
 | Readers of `Output::text` | app model and view helper | `src/agent/tool.rs`, `src/agent/model.rs` |
+
+**Sites as found at `ad696ca`** (task 1.1; the head of `refactor/agents-module-structure`, PR #157, before it merged, so changes 3, 4 and 5 and `agents-commands` are in):
+- Change 5 split the checkpoint into `checkpoint/{mod,format,state,adopt,harness}.rs`: `encode_within`, `encode_segment` and `decode_2` are in `mod.rs`, `state_fields`, `merged`, `restore` and `restore_lines` in `state.rs`, `push_record` and `FORMAT_1` in `format.rs`.
+- `Output::append` is in `transcript/src/output.rs`, and the fold's `Event::ToolOutput` arm in `transcript/src/fold.rs`.
+- `tools` and `outputs` are `ToolBook`'s (`reduce/tools.rs`), held as `Process.book` (`reduce/mod.rs`). `trim` (`reduce/mod.rs`) calls `ToolBook::forget_through`. `respawn` (`reduce/lifecycle.rs`) replaces the whole `Process` with `Process::new()`, so `tool_epoch` is set there, after the reset. `methods` stayed a top-level `AgentSession` field.
+- `raw` is in `v1/decode.rs`, `raw(value: Option<&Value>)`, with change 3's bounded writer `pretty_capped`/`Capped`.
+- Change 4's "agent gone" step is `Step::close_process(why, Closing)` (`reduce/lifecycle.rs`), which `end`, `respawn`, `restart_for_login`, `refuse` and `fail` call. It closes requests only; the process state is reset in `respawn` alone, and `Output` carries no "process changed" flag (Open Questions, 2).
+- `agents-commands`' state fields are `option_keys` (`AgentSession.keys`, one per held option, at most 32) and `modes` (`AgentSession.modes`, one value per mode option). Both are small under decision 4's rule and stay whole. `lists` and `chose` are flags. There is no `Busy` mark in the state.
 
 Every decision lives in a pure function or type (`fcis R1`). The handlers gather, call `checkpoint::encode*` and `policy::*`, and queue what comes back. No crate reference changes (`ports R1`, `R3`): `brindle-remote-protocol` learns nothing about transcripts. It packs opaque JSON objects, as it already carries them as opaque `Value`s.
 
@@ -64,7 +72,7 @@ A record without `tool_epoch` is `Unreadable::Field { name: "tool_epoch" }`. A c
 
 ### 2. The tool index is rebuilt from the log (`types R10`, `fcis R1`)
 
-`AgentSession` gains `tool_epoch: EntryId`: the first entry id that belongs to the running agent process. `AgentSession::starting` sets it to `EntryId::FIRST`. `respawn` sets it to `self.s.transcript.next_id()` where it clears `tools`. After change 4 that happens in the one "agent gone" step, and after change 5 in `ToolBook::clear`, which takes the next id.
+`ToolBook` (`reduce/tools.rs`) gains `tool_epoch: EntryId`: the first entry id that belongs to the running agent process. A new session's book starts at the first id. `respawn` (`reduce/lifecycle.rs`) replaces the whole `Process`, the book with it, and then sets the epoch to `self.s.transcript.next_id()`, through `Process::starting_at(next_id)`.
 
 The invariant: `tools` equals `{ call → id | the log keeps Entry::Tool { call, .. } at id, id ≥ tool_epoch }`. Three facts make it hold:
 - `add_tool` is the only insert, and it adds that entry.
@@ -107,7 +115,7 @@ A delta-shaped record's `lines` object gains an optional `from: u64`. The record
 | `outputs` | ≤ `MAX_OPEN_OUTPUTS` (64) × a line of ≤ `ITEM_LIMIT` (64 KiB), so ≤ 4 MiB | a patch: `{ terminal: open-output }` for each output added or changed since `Written.outputs`, and `{ terminal: null }` for each closed one; left out when none changed |
 | `tools` | — | never (decision 2) |
 
-The rule for a future field: a field bounded under 1 KiB in the typical case, and under 64 KiB at worst, is written whole. A larger one is written when it changed, or as a patch. This change records the rule in the module doc's format table. `agents-commands`' option keys, `Busy` mark and kept modes (at most 32 options) are small and stay whole. `agents-plans`' `dismissed` (up to 4 MiB) must be written when it changed.
+The rule for a future field: a field bounded under 1 KiB in the typical case, and under 64 KiB at worst, is written whole. A larger one is written when it changed, or as a patch. This change records the rule in the module doc's format table. `agents-commands`' fields as found at `ad696ca` are `option_keys` (a key per held option, at most 32) and `modes` (a value per mode option): both small, so they stay whole, left out when empty as today. `agents-plans`' `dismissed` (up to 4 MiB) must be written when it changed.
 
 The base writes `methods` and `outputs` whole, left out when empty, as today. Decoding a delta-shaped chain: `methods` absent in a segment keeps the previous value, and present replaces it; `outputs` patch entries set or remove keys in order. A `null` for a terminal the chain doesn't hold is `Unreadable::Field { name: "outputs" }`. `restore` then checks the final map as today: each entry names an `Output` item of a kept tool entry.
 
@@ -202,7 +210,7 @@ In `agent_apply` the events are encoded for the client first, then moved into `u
 
 `Output::append(&mut self, text) -> usize` pushes, works out `cut` on the visible text as today, and advances `start` by `cut` instead of draining. It returns the escaped length of the dropped bytes (`escaped_len` of that slice, computed before advancing) instead of a `String`. When `start` passes `ITEM_LIMIT` it compacts once (`buf.drain(..start)`, `start = 0`). That is a 64 KiB memmove at most once per 64 KiB appended, so an append is amortized O(delta).
 
-The fold's `Event::ToolOutput` arm uses the returned length in place of `escaped_len(&dropped)`, and its size arithmetic is otherwise unchanged. `encoded_len`, equality, serialization and every fold result are unchanged. The existing `output_appended_in_pieces_folds_as_appended_whole` and `output_appends_and_keeps_whole_lines_within_the_limit` hold, as does `fuzz.rs`' "appending `a` then `b` equals appending `a + b`" property. A new test appends 1 MiB in 32-byte pieces and checks that the buffer never exceeds 2 × `ITEM_LIMIT` plus a piece.
+`Output` and `append` are in `transcript/src/output.rs`; `OutputText` goes beside them. The fold's `Event::ToolOutput` arm (`transcript/src/fold.rs`) uses the returned length in place of `escaped_len(&dropped)`, and its size arithmetic is otherwise unchanged. `encoded_len`, equality, serialization and every fold result are unchanged. The existing `output_appended_in_pieces_folds_as_appended_whole` and `output_appends_and_keeps_whole_lines_within_the_limit` hold, as does `fuzz.rs`' "appending `a` then `b` equals appending `a + b`" property. A new test appends 1 MiB in 32-byte pieces and checks that the buffer never exceeds 2 × `ITEM_LIMIT` plus a piece.
 
 Readers: `src/agent/tool.rs` (`output.text.as_str()`, and `output.text.clone()` becomes `output.text.to_string()`), `src/agent/model.rs`'s dump (`{:?}` prints the same), `reduce.rs` and `checkpoint.rs` tests, and `fuzz.rs`. The open-output filter state in `reduce.rs` (`plain::State`) is unrelated.
 
@@ -240,7 +248,8 @@ In `v1/decode.rs`:
 - `tool_detail(taken: Map<String, Value>)` takes it by value;
 - `tool_item(item: Value)` and each location move into `from_value`;
 - `chunk(update: Value)` moves;
-- `raw(value: Option<Value>)` moves a string, and change 3's bounded writer keeps its own signature for the rest.
+- `raw(value: Option<Value>)` moves a string, and change 3's bounded writer (`pretty_capped`, as found) keeps its own signature for the rest;
+- `continued_result` reaches `resume_result` and `load_result`, which move too. `set_option_result` (`agents-commands`) reads by hand and keeps `&Value`.
 
 In `reduce.rs`, `message` passes `params` by value, and `response(purpose, Result<Value, &RpcError>)` and the per-purpose handlers take the owned result. `speaking` reads `auth_methods(&result)` before handing `result` to `initialize_result`.
 
@@ -291,4 +300,8 @@ Nothing to migrate by hand, and nothing is converted: a core with this change ad
 
 ## As built
 
-To be filled in by tasks 1.2, 7.3 and 7.4: the decision 7 test's written and added bytes before and after, and the three perf cases' numbers before and after against a baseline from the build before this change.
+**Commit read** (task 1.1): `ad696ca`, the head of `refactor/agents-module-structure` (PR #157) while it was still in CI, not `main`. It holds changes 3, 4 and 5 and `agents-commands`. The branch is rebased onto `main` once #157 merges; the sites above are as found there.
+
+### Flags
+
+1. **The base is #157's head, not `main`.** Task 1.1 asks for `main` after changes 3 to 5 merged; this branch starts at #157's head before its merge, so the sites were read there.

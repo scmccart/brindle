@@ -4,7 +4,7 @@ Each group writes its tests first and watches them fail before the code they che
 
 ## 1. Re-open the sites and take the numbers before
 
-- [ ] 1.1 Re-open the cited sites on `main`, after `agents-commands` (PR #151) and changes 3, 4 and 5 (`agents-event-bounds`, `agents-process-lifecycle`, `agents-module-structure`) have merged. Find where each item now lives:
+- [x] 1.1 Re-open the cited sites on `main`, after `agents-commands` (PR #151) and changes 3, 4 and 5 (`agents-event-bounds`, `agents-process-lifecycle`, `agents-module-structure`) have merged. Find where each item now lives:
   - `state_fields`, `encode_segment`, `decode_2`, `restore` and `push_record`, which may be in `checkpoint/{format,state,adopt}.rs`;
   - `Output::append`, which may be in `transcript/src/output.rs`;
   - `tools`, `outputs`, `respawn` and `trim`, which may be in `ToolBook` or `reduce/tools.rs`;
@@ -13,6 +13,8 @@ Each group writes its tests first and watches them fail before the code they che
   - `agents-commands`' state fields.
 
   Update `design.md`'s Layer map and decisions 2, 4, 10 and 12 with the paths and names as found, and classify each state field `agents-commands` added by decision 4's rule. Verify by `grep` that every function the design names exists, and record the commit you read in the design's As built.
+
+  Done: read at `ad696ca` (#157's head, before it merged; flag 1); the Layer map lists the sites, decisions 2, 4, 10 and 12 name them, and `option_keys` and `modes` stay whole.
 - [ ] 1.2 In `remote-agent/src/server/core/policy.rs`'s `mod tests`, add `checkpoints_of_a_tool_heavy_conversation_and_a_long_line_write_a_small_multiple_of_what_they_added` (design 7). It uses the existing `Checkpointing` helper, extended to count `records` and to check each appended segment against `RECORD_ALLOWANCE` (1 KiB) plus its merged events' encoded length plus the partial's new bytes. Run it on the unchanged code with `cargo test -p brindle-remote-agent --release server::core::policy::tests::checkpoints_of_a_tool_heavy -- --nocapture`, watch it fail on assertion 1, and record the printed `written`, `added` and `records` under "As built (before)" in `design.md`. To get the total before the per-segment assertion stops the run, run it once with that assertion commented out locally; don't commit that edit.
 - [ ] 1.3 Add the measurement runs to the perf suite before any production change (design 15):
   - `tests/perf/agent.rs`:
