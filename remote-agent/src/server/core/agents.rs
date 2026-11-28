@@ -805,6 +805,19 @@ impl<L: EventLoop> Core<L> {
         }
     }
 
+    /// `AGENT_ATTACH`: refused until the store is built (OpenSpec change
+    /// `agents-prompt-context`, task 3.1).
+    pub(super) fn client_agent_attach(&mut self, client: Token, attach: client::AgentAttach) {
+        let message = format!("session {}: attachments aren't kept yet", attach.session);
+        self.send_client(client, error(Some(attach.req), Some(attach.session), message));
+    }
+
+    /// `AGENT_READ_ATTACHMENT`: refused until the store is built.
+    pub(super) fn client_agent_read_attachment(&mut self, client: Token, read: client::AgentReadAttachment) {
+        let message = format!("session {}: the session keeps no attachment {}", read.session, read.id);
+        self.send_client(client, error(Some(read.req), Some(read.session), message));
+    }
+
     /// The answer to a list of session `id`'s conversations, to the client
     /// attached now (`agents-session-list` decision 2): `AGENT_CONVERSATIONS`
     /// in one frame, or the `ERROR` naming the session. Dropped with no

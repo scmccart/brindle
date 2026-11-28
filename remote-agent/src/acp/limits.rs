@@ -194,6 +194,9 @@ const _: () = assert!(TOOL_ITEMS_EVENT <= MAX_EVENT);
 const _: () = assert!(PERMISSION_EVENT <= MAX_EVENT);
 const _: () = assert!(QUEUE_EVENT <= MAX_EVENT);
 const _: () = assert!(PROMPT_ADDED_EVENT <= MAX_EVENT);
+// The transcript's bound on a kept text is what one `AGENT_ATTACH` and one
+// `ATTACHMENT` frame carry.
+const _: () = assert!(brindle_transcript::ATTACHMENT_TEXT == brindle_remote_protocol::client::MAX_ATTACHMENT_TEXT);
 const _: () = assert!(6 * FIELD_LIMIT + EVENT_FIELDS <= MAX_EVENT);
 const _: () = assert!(2 * FIELD_LIMIT + MAX_LOGIN_METHODS_LEN + EVENT_FIELDS <= MAX_EVENT);
 // I2: every trim makes progress and ends within its mark, and a whole

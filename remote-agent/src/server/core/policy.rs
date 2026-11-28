@@ -878,6 +878,10 @@ pub(super) enum AgentRequest {
     Choose,
     /// `AGENT_SET_OPTION` (OpenSpec change `agents-commands`).
     SetOption,
+    /// `AGENT_ATTACH` (OpenSpec change `agents-prompt-context`).
+    Attach,
+    /// `AGENT_READ_ATTACHMENT` (`agents-prompt-context`).
+    ReadAttachment,
 }
 
 impl AgentRequest {
@@ -895,6 +899,8 @@ impl AgentRequest {
             Self::List => "AGENT_LIST",
             Self::Choose => "AGENT_CHOOSE",
             Self::SetOption => "AGENT_SET_OPTION",
+            Self::Attach => "AGENT_ATTACH",
+            Self::ReadAttachment => "AGENT_READ_ATTACHMENT",
         }
     }
 }
@@ -983,6 +989,12 @@ pub(super) fn agent_request(message: &ToCore) -> Option<Gated> {
         }
         ToCore::AgentSetOption(set) => {
             gated(AgentRequest::SetOption, Some(set.req), Some(set.session))
+        }
+        ToCore::AgentAttach(attach) => {
+            gated(AgentRequest::Attach, Some(attach.req), Some(attach.session))
+        }
+        ToCore::AgentReadAttachment(read) => {
+            gated(AgentRequest::ReadAttachment, Some(read.req), Some(read.session))
         }
     }
 }
@@ -1859,13 +1871,22 @@ mod tests {
                 Some(5),
                 None,
             ),
+            (ToCore::AgentPrompt(AgentPrompt::text(5, 9, "hi")), AgentRequest::Prompt, Some(5), Some(9)),
             (
-                ToCore::AgentPrompt(AgentPrompt {
+                ToCore::AgentAttach(client::AgentAttach {
                     req: 5,
                     session: 9,
-                    text: "hi".into(),
+                    upload: 1,
+                    name: "n".into(),
+                    text: "t".into(),
                 }),
-                AgentRequest::Prompt,
+                AgentRequest::Attach,
+                Some(5),
+                Some(9),
+            ),
+            (
+                ToCore::AgentReadAttachment(client::AgentReadAttachment { req: 5, session: 9, id: 1 }),
+                AgentRequest::ReadAttachment,
                 Some(5),
                 Some(9),
             ),
