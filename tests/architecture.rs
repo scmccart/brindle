@@ -754,9 +754,13 @@ fn acp_versions_stay_in_their_modules() {
         "Dialect's variants are matched only in remote-agent/src/acp/dialect.rs; \
          call its methods (docs/architecture/ports-and-adapters.md R14)",
     );
-    let mut versionless = sources("remote-agent/src/acp/reduce");
-    assert!(!versionless.is_empty(), "remote-agent/src/acp/reduce/ is missing");
-    versionless.extend(["rpc.rs", "checkpoint.rs"].iter().map(|file| acp.join(file)));
+    let mut versionless = Vec::new();
+    for dir in ["remote-agent/src/acp/reduce", "remote-agent/src/acp/checkpoint"] {
+        let found = sources(dir);
+        assert!(!found.is_empty(), "{dir}/ is missing");
+        versionless.extend(found);
+    }
+    versionless.push(acp.join("rpc.rs"));
     assert_none(
         offenders(&versionless, Scope::All, &["v1::", "v2::"]),
         "the reducer, rpc and the checkpoint read acp/forms.rs, never a version's \
@@ -1142,7 +1146,7 @@ fn f() {
 ///
 /// A directory module joins file by file, so a file added to it can't skip
 /// the check; its test-only `harness.rs` is test code and stays out.
-const PURE_MODULES: [&str; 77] = [
+const PURE_MODULES: [&str; 80] = [
     "term-core/src/progress.rs",
     "term-core/src/context.rs",
     "term-core/src/pointer.rs",
@@ -1218,7 +1222,10 @@ const PURE_MODULES: [&str; 77] = [
     "remote-agent/src/acp/reduce/list.rs",
     "remote-agent/src/acp/reduce/text.rs",
     "remote-agent/src/acp/reduce/options.rs",
-    "remote-agent/src/acp/checkpoint.rs",
+    "remote-agent/src/acp/checkpoint/mod.rs",
+    "remote-agent/src/acp/checkpoint/format.rs",
+    "remote-agent/src/acp/checkpoint/state.rs",
+    "remote-agent/src/acp/checkpoint/adopt.rs",
     "remote-agent/src/fake_acp/script.rs",
 ];
 

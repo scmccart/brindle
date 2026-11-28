@@ -546,7 +546,7 @@ pub fn assert_hung_up(session: SessionId, code: Option<i32>) {
 
 /// The records of an agent checkpoint of format 2 (`BACP`, `u16` 2, then
 /// each record's kind, sequence number, JSON state and partial line; see
-/// `acp/checkpoint.rs`), as `(kind, seq)`: what a holder stores of a base
+/// `acp/checkpoint/format.rs`), as `(kind, seq)`: what a holder stores of a base
 /// and the segments appended to it, read without decoding the states.
 #[track_caller]
 pub fn checkpoint_records(blob: &[u8]) -> Vec<(char, u32)> {
