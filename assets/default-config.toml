@@ -60,9 +60,20 @@ when = "unfocused"
 # and other content: "open" or "closed" while the call runs (tool_details),
 # and once it has finished (tool_details_when_done). A row you open or close
 # by hand stays as you left it.
+#
+# Text attached to a prompt (a command's output, a file dropped on a remote
+# agent's zone) is kept in a file beside the agent, so the agent can read it
+# again. attachments_dir is where, for a local agent: by default the terminal
+# server's cache directory (~/.cache/brindle/attachments, or
+# %LOCALAPPDATA%\brindle\cache\attachments on Windows). A remote profile
+# names its own with `attachments_dir` in its remote table. Each
+# conversation's texts stay attachments_keep_days days after its zone is
+# closed (0 to 3650; 0 removes them at once).
 [agent]
 tool_details = "open"
 tool_details_when_done = "closed"
+# attachments_dir = "~/.cache/brindle/attachments"
+attachments_keep_days = 14
 
 # ---------------------------------------------------------------------------
 # Profiles. Open the new-tab palette with ctrl-shift-space, or open profile N

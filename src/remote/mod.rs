@@ -417,6 +417,7 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             identity_file,
             ssh_args,
             connect_at_launch: _,
+            attachments_dir: _,
         } => {
             let mut command = Command::new("ssh");
             command.args([
@@ -451,6 +452,7 @@ pub fn remote_command(target: &RemoteTarget, program: &str, args: &[String]) -> 
             container,
             user,
             connect_at_launch: _,
+            attachments_dir: _,
         } => {
             if engine != "docker" && engine != "podman" {
                 bail!("unsupported container engine {engine:?}; use docker or podman");
@@ -497,7 +499,7 @@ mod tests {
             port: Some(2222),
             identity_file: Some("key file".into()),
             ssh_args: vec!["-o".into(), "BatchMode=yes".into()],
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let command = remote_command(
             &target,
@@ -538,7 +540,7 @@ mod tests {
             engine: "docker".into(),
             container: "devbox".into(),
             user: Some("1000".into()),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let command =
             remote_command(&target, "/bin/sh", &["-lc".into(), "echo hi".into()]).unwrap();

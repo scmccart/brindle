@@ -1541,7 +1541,7 @@ impl Connection {
         abandon: Option<&Abandon>,
     ) -> Result<Running> {
         let abandon = abandon.map(|abandon| (Arc::downgrade(self), abandon));
-        let AgentSpawnRequest { command, args, cwd, env, profile, conversation, start } = request;
+        let AgentSpawnRequest { command, args, cwd, env, profile, conversation, start, keeping } = request;
         let started = self.ask("start the agent session", abandon, None, |req, reply| {
             let spawn = SpawnAgent {
                 req,
@@ -1553,8 +1553,8 @@ impl Connection {
                 profile: Some(profile),
                 conversation,
                 start,
-                attachments_dir: None,
-                attachments_keep_days: None,
+                attachments_dir: keeping.dir,
+                attachments_keep_days: keeping.keep_days,
             };
             (Waiting::Spawn { sink, reply }, Some(ToCore::SpawnAgent(spawn)))
         })?;

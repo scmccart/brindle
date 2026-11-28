@@ -484,7 +484,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         assert_eq!(remote_profile(&started_with(Some("A8")), &c3, &config), None);
     }
@@ -496,7 +496,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         })
     }
 
@@ -714,7 +714,7 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         });
         let local = Host::Local;
         // The last tab on A8 went; B9 has another tab left.

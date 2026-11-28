@@ -129,10 +129,10 @@ mod tests {
             port: None,
             identity_file: None,
             ssh_args: Vec::new(),
-            connect_at_launch: false,
+            connect_at_launch: false, attachments_dir: None,
         };
         let container =
-            RemoteTarget::Container { engine: "docker".into(), container: "box".into(), user: None, connect_at_launch: false };
+            RemoteTarget::Container { engine: "docker".into(), container: "box".into(), user: None, connect_at_launch: false, attachments_dir: None };
         [Host::Local, Host::Remote(ssh), Host::Remote(container)]
     }
 
